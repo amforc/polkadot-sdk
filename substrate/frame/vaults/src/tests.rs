@@ -16,9 +16,9 @@
 // limitations under the License.
 
 use crate::{
-	mock::*, BadDebt, CollateralManager, CurrentLiquidationAmount, Error, Event, HoldReason,
-	InitialCollateralizationRatio, LiquidationPenalty, MaxLiquidationAmount, MaxPositionAmount,
-	MaximumIssuance, MinimumCollateralizationRatio, MinimumDeposit, MinimumMint,
+	mock::*, BadDebt, CappedBalance, CollateralManager, CurrentLiquidationAmount, Error, Event,
+	HoldReason, InitialCollateralizationRatio, LiquidationPenalty, MaxLiquidationAmount,
+	MaxPositionAmount, MaximumIssuance, MinimumCollateralizationRatio, MinimumDeposit, MinimumMint,
 	OracleStalenessThreshold, Pallet as VaultsPallet, PaymentBreakdown, StabilityFee,
 	StaleVaultThreshold, VaultStatus, Vaults as VaultsStorage,
 };
@@ -2235,7 +2235,7 @@ mod liquidation_limits {
 	fn auction_callback_reduces_current_amount() {
 		new_test_ext().execute_with(|| {
 			// Manually set CurrentLiquidationAmount to simulate an active auction
-			CurrentLiquidationAmount::<Test>::put(1000 * PUSD);
+			CurrentLiquidationAmount::<Test>::put(CappedBalance::new_unchecked(1000 * PUSD));
 
 			// Simulate auction collecting 400 pUSD
 			assert_ok!(Vaults::test_reduce_liquidation_amount(400 * PUSD));
@@ -2257,7 +2257,7 @@ mod liquidation_limits {
 	fn auction_shortfall_increases_bad_debt_and_reduces_current_amount() {
 		new_test_ext().execute_with(|| {
 			// Setup: Simulate an auction started with 1000 pUSD tab
-			CurrentLiquidationAmount::<Test>::put(1000 * PUSD);
+			CurrentLiquidationAmount::<Test>::put(CappedBalance::new_unchecked(1000 * PUSD));
 
 			// Initially no bad debt
 			assert_eq!(BadDebt::<Test>::get(), 0);
