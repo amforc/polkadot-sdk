@@ -313,7 +313,7 @@ pub mod pallet {
 	pub type MomentOf<T> = <<T as Config>::TimeProvider as Time>::Moment;
 
 	/// Capped balance bounded by [`MaxLiquidationAmount`].
-	pub type CappedBalanceOf<T> = CappedBalance<BalanceOf<T>, MaxLiquidationAmount<T>>;
+	pub type LiquidationAmountOf<T> = CappedBalance<BalanceOf<T>, MaxLiquidationAmount<T>>;
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
