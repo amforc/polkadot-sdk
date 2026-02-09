@@ -178,7 +178,7 @@ pub use weights::WeightInfo;
 
 // Re-exports for external consumers
 pub use sp_pusd::{
-	AuctionsHandler, CappedBalance, CappedBalanceError, CollateralManager, DebtComponents,
+	AuctionsHandler, CappedValue, CappedValueError, CollateralManager, DebtComponents,
 	PaymentBreakdown,
 };
 
@@ -214,7 +214,7 @@ pub trait ProvidePrice {
 #[frame_support::pallet]
 pub mod pallet {
 	use super::{
-		AuctionsHandler, CappedBalance, CappedBalanceError, CollateralManager, DebtComponents,
+		AuctionsHandler, CappedValue, CappedValueError, CollateralManager, DebtComponents,
 		PaymentBreakdown, ProvidePrice,
 	};
 	use crate::WeightInfo;
@@ -313,7 +313,7 @@ pub mod pallet {
 	pub type MomentOf<T> = <<T as Config>::TimeProvider as Time>::Moment;
 
 	/// Capped balance bounded by [`MaxLiquidationAmount`].
-	pub type LiquidationAmountOf<T> = CappedBalance<BalanceOf<T>, MaxLiquidationAmount<T>>;
+	pub type LiquidationAmountOf<T> = CappedValue<BalanceOf<T>, MaxLiquidationAmount<T>>;
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
@@ -525,7 +525,8 @@ pub mod pallet {
 	/// It increases when auctions start and decreases when auctions complete
 	/// or are cancelled (via callbacks from the Auctions pallet).
 	#[pallet::storage]
-	pub type CurrentLiquidationAmount<T: Config> = StorageValue<_, CappedBalanceOf<T>, ValueQuery>;
+	pub type CurrentLiquidationAmount<T: Config> =
+		StorageValue<_, LiquidationAmountOf<T>, ValueQuery>;
 
 	/// Cursor for `on_idle` pagination.
 	///
@@ -1282,8 +1283,8 @@ pub mod pallet {
 				// Track only principal - interest/penalty are protocol revenue, not solvency risk.
 				CurrentLiquidationAmount::<T>::try_mutate(|capped| {
 					capped.try_add(principal).map_err(|err| match err {
-						CappedBalanceError::Overflow => Error::<T>::ArithmeticOverflow,
-						CappedBalanceError::ExceedsMax => Error::<T>::ExceedsMaxLiquidationAmount,
+						CappedValueError::Overflow => Error::<T>::ArithmeticOverflow,
+						CappedValueError::ExceedsMax => Error::<T>::ExceedsMaxLiquidationAmount,
 					})
 				})?;
 
