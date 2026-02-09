@@ -153,7 +153,7 @@ impl<Balance: Saturating + Copy> PaymentBreakdown<Balance> {
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Encode, Decode, TypeInfo, MaxEncodedLen)]
 #[scale_info(skip_type_params(M))]
-pub struct CappedBalance<B, M>(B, PhantomData<M>);
+pub struct CappedValue<B, M>(B, PhantomData<M>);
 
 // TODO: I don't really like this manual `impl`, I'm open to suggestions!
 //
