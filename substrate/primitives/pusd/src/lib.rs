@@ -21,6 +21,7 @@
 //!
 //! # Types
 //!
+//! - [`CappedValue`]: Balance value with type-safe bounded mutations
 //! - [`DebtComponents`]: Breakdown of debt (principal, interest, penalty) for liquidations
 //! - [`PaymentBreakdown`]: How a payment is distributed during auction takes
 //!
@@ -33,12 +34,16 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use codec::{Decode, Encode, MaxEncodedLen};
+use core::marker::PhantomData;
 use frame_support::{
 	pallet_prelude::{DispatchError, DispatchResult},
-	traits::tokens::Balance,
+	traits::{tokens::Balance, Get},
 };
 use scale_info::TypeInfo;
-use sp_runtime::{FixedPointOperand, FixedU128, Saturating};
+use sp_runtime::{
+	traits::{CheckedAdd, Zero},
+	FixedPointOperand, FixedU128, Saturating,
+};
 /// Debt components for liquidation auctions.
 ///
 /// Represents the breakdown of debt that must be recovered during a liquidation auction.
@@ -109,6 +114,191 @@ impl<Balance: Saturating + Copy> PaymentBreakdown<Balance> {
 	/// Total payment amount.
 	pub fn total(&self) -> Balance {
 		self.burn().saturating_add(self.penalty_paid)
+	}
+}
+
+/// A balance value with a type-safe bound on its maximum.
+///
+/// The type parameter `M` must implement `Get<B>` to provide the maximum value.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Option A: limit from a storage value.
+/// #[pallet::storage]
+/// pub type MaxLiquidationAmount<T: Config> = StorageValue<_, BalanceOf<T>, ValueQuery>;
+/// pub type CappedValueOf<T> = CappedValue<BalanceOf<T>, MaxLiquidationAmount<T>>;
+///
+/// // Option B: limit from a constant.
+/// #[pallet::constant]
+/// type MaxAmount: Get<BalanceOf<Self>>;
+/// pub type CappedValueOf<T> = CappedValue<BalanceOf<T>, T::MaxAmount>;
+///
+/// // Storage uses the capped type
+/// #[pallet::storage]
+/// pub type CurrentLiquidationAmount<T: Config> =
+///     StorageValue<_, CappedValueOf<T>, ValueQuery>;
+///
+/// // Increment - limit auto-fetched from M
+/// CurrentLiquidationAmount::<T>::try_mutate(|v| v.try_add(amount))?;
+///
+/// // Decrement (always safe, uses Saturating trait)
+/// CurrentLiquidationAmount::<T>::mutate(|v| {
+///     *v = v.saturating_sub(CappedValueOf::<T>::new_unchecked(amount));
+/// });
+///
+/// // Read via Deref
+/// let current: BalanceOf<T> = *CurrentLiquidationAmount::<T>::get();
+///
+/// // Check remaining headroom before the cap
+/// let headroom = CurrentLiquidationAmount::<T>::get().remaining_capacity();
+/// ```
+#[derive(PartialEq, Eq, Encode, Decode, TypeInfo, MaxEncodedLen)]
+#[scale_info(skip_type_params(M))]
+pub struct CappedValue<B, M>(B, PhantomData<M>);
+
+// TODO: I don't really like this manual `impl`, I'm open to suggestions!
+// 
+// Manual impls: the derive macros would require `M: Trait`, but `M` is typically a
+// `StorageValue` type which doesn't implement `Debug`, `Clone`, or `Copy`.
+// These impls only bound `B`.
+impl<B: core::fmt::Debug, M> core::fmt::Debug for CappedValue<B, M> {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_tuple("CappedValue").field(&self.0).finish()
+	}
+}
+
+impl<B: Clone, M> Clone for CappedValue<B, M> {
+	fn clone(&self) -> Self {
+		Self(self.0.clone(), PhantomData)
+	}
+}
+
+impl<B: Copy, M> Copy for CappedValue<B, M> {}
+
+/// Error returned by [`CappedValue::try_new`] and [`CappedValue::try_add`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CappedValueError {
+	/// The addition overflowed.
+	Overflow,
+	/// The new value would exceed the configured maximum.
+	ExceedsMax,
+}
+
+impl<B: Default, M> Default for CappedValue<B, M> {
+	fn default() -> Self {
+		Self(B::default(), PhantomData)
+	}
+}
+
+impl<B: Zero, M> CappedValue<B, M> {
+	/// Create a new capped balance initialized to zero.
+	pub fn zero() -> Self {
+		Self(B::zero(), PhantomData)
+	}
+}
+
+impl<B, M> CappedValue<B, M> {
+	/// Create a new capped balance with the given value, without validating against the cap.
+	///
+	/// Use this for genesis, migrations, or tests where storage may not be available.
+	/// Prefer [`try_new`](Self::try_new) at runtime when storage is accessible.
+	pub const fn new_unchecked(value: B) -> Self {
+		Self(value, PhantomData)
+	}
+
+	/// Get the inner value.
+	pub fn into_inner(self) -> B {
+		self.0
+	}
+}
+
+impl<B: CheckedAdd + Ord + Copy, M: Get<B>> CappedValue<B, M> {
+	/// Create a new capped balance, validating that `value` does not exceed the cap.
+	///
+	/// The maximum is fetched from `M` at call time.
+	pub fn try_new(value: B) -> Result<Self, CappedValueError> {
+		let max = M::get();
+		if value > max {
+			return Err(CappedValueError::ExceedsMax);
+		}
+		Ok(Self(value, PhantomData))
+	}
+
+	/// Try to add `amount`, failing if result exceeds the max or overflows.
+	///
+	/// The maximum is fetched from `M` at call time.
+	pub fn try_add(&mut self, amount: B) -> Result<(), CappedValueError> {
+		let max = M::get();
+		let new_value = self.0.checked_add(&amount).ok_or(CappedValueError::Overflow)?;
+		if new_value > max {
+			return Err(CappedValueError::ExceedsMax);
+		}
+		self.0 = new_value;
+		Ok(())
+	}
+}
+
+impl<B: Saturating + Ord + Copy, M: Get<B>> Saturating for CappedValue<B, M> {
+	fn saturating_add(self, rhs: Self) -> Self {
+		let max = M::get();
+		let result = self.0.saturating_add(rhs.0);
+		if result > max {
+			Self(max, PhantomData)
+		} else {
+			Self(result, PhantomData)
+		}
+	}
+
+	fn saturating_sub(self, rhs: Self) -> Self {
+		Self(self.0.saturating_sub(rhs.0), PhantomData)
+	}
+
+	fn saturating_mul(self, rhs: Self) -> Self {
+		let max = M::get();
+		let result = self.0.saturating_mul(rhs.0);
+		if result > max {
+			Self(max, PhantomData)
+		} else {
+			Self(result, PhantomData)
+		}
+	}
+
+	fn saturating_pow(self, exp: usize) -> Self {
+		let max = M::get();
+		let result = self.0.saturating_pow(exp);
+		if result > max {
+			Self(max, PhantomData)
+		} else {
+			Self(result, PhantomData)
+		}
+	}
+}
+
+impl<B: Saturating + Ord + Copy + Zero, M: Get<B>> CappedValue<B, M> {
+	/// Returns how much can still be added before hitting the cap.
+	///
+	/// Returns zero if the current value already meets or exceeds the cap.
+	pub fn remaining_capacity(&self) -> B {
+		let max = M::get();
+		if self.0 >= max {
+			B::zero()
+		} else {
+			max.saturating_sub(self.0)
+		}
+	}
+}
+
+impl<B, M> core::ops::Deref for CappedValue<B, M> {
+	type Target = B;
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
+impl<B: PartialEq, M> PartialEq<B> for CappedValue<B, M> {
+	fn eq(&self, other: &B) -> bool {
+		self.0 == *other
 	}
 }
 

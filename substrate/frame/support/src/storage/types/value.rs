@@ -20,7 +20,7 @@
 use crate::{
 	storage::{
 		generator::StorageValue as StorageValueT,
-		types::{OptionQuery, QueryKindTrait, StorageEntryMetadataBuilder},
+		types::{OptionQuery, QueryKindTrait, StorageEntryMetadataBuilder, ValueQuery},
 		StorageAppend, StorageDecodeLength, StorageTryAppend,
 	},
 	traits::{Get, GetDefault, StorageInfo, StorageInstance},
@@ -89,6 +89,17 @@ where
 	}
 	fn storage_value_final_key() -> [u8; 32] {
 		Prefix::prefix_hash()
+	}
+}
+
+impl<Prefix, Value, OnEmpty> Get<Value> for StorageValue<Prefix, Value, ValueQuery, OnEmpty>
+where
+	Prefix: StorageInstance,
+	Value: FullCodec + 'static,
+	OnEmpty: Get<Value> + 'static,
+{
+	fn get() -> Value {
+		<Self as crate::storage::StorageValue<Value>>::get()
 	}
 }
 
@@ -457,5 +468,26 @@ mod test {
 			WithLen::append(3);
 			assert_eq!(WithLen::decode_len(), Some(1));
 		});
+	}
+
+	#[test]
+	fn value_query_implements_get() {
+		type A = StorageValue<Prefix, u32, ValueQuery, ADefault>;
+
+		TestExternalities::default().execute_with(|| {
+			// Returns OnEmpty default when storage is empty.
+			assert_eq!(<A as Get<u32>>::get(), 97);
+
+			// Returns stored value after put.
+			A::put(42);
+			assert_eq!(<A as Get<u32>>::get(), 42);
+
+			// Reverts to default after kill.
+			A::kill();
+			assert_eq!(<A as Get<u32>>::get(), 97);
+		});
+
+		// Note: OptionQuery storage values intentionally do NOT implement Get<V>,
+		// because their query type is Option<V>, not V.
 	}
 }

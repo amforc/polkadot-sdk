@@ -177,7 +177,10 @@ pub use pallet::*;
 pub use weights::WeightInfo;
 
 // Re-exports for external consumers
-pub use sp_pusd::{AuctionsHandler, CollateralManager, DebtComponents, PaymentBreakdown};
+pub use sp_pusd::{
+	AuctionsHandler, CappedValue, CappedValueError, CollateralManager, DebtComponents,
+	PaymentBreakdown,
+};
 
 /// TODO: Update/import this trait from the Oracle as soon as it is implemented.
 /// Trait for providing timestamped asset prices via oracle.
@@ -211,7 +214,8 @@ pub trait ProvidePrice {
 #[frame_support::pallet]
 pub mod pallet {
 	use super::{
-		AuctionsHandler, CollateralManager, DebtComponents, PaymentBreakdown, ProvidePrice,
+		AuctionsHandler, CappedValue, CappedValueError, CollateralManager, DebtComponents,
+		PaymentBreakdown, ProvidePrice,
 	};
 	use crate::WeightInfo;
 
@@ -307,6 +311,9 @@ pub mod pallet {
 
 	/// Type alias for the timestamp moment type from the time provider.
 	pub type MomentOf<T> = <<T as Config>::TimeProvider as Time>::Moment;
+
+	/// Capped balance bounded by [`MaxLiquidationAmount`].
+	pub type LiquidationAmountOf<T> = CappedValue<BalanceOf<T>, MaxLiquidationAmount<T>>;
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
@@ -518,7 +525,8 @@ pub mod pallet {
 	/// It increases when auctions start and decreases when auctions complete
 	/// or are cancelled (via callbacks from the Auctions pallet).
 	#[pallet::storage]
-	pub type CurrentLiquidationAmount<T: Config> = StorageValue<_, BalanceOf<T>, ValueQuery>;
+	pub type CurrentLiquidationAmount<T: Config> =
+		StorageValue<_, LiquidationAmountOf<T>, ValueQuery>;
 
 	/// Cursor for `on_idle` pagination.
 	///
@@ -1273,17 +1281,12 @@ pub mod pallet {
 
 				// Check if liquidation would exceed hard limit.
 				// Track only principal - interest/penalty are protocol revenue, not solvency risk.
-				let current_liquidation = CurrentLiquidationAmount::<T>::get();
-				let max_liquidation = MaxLiquidationAmount::<T>::get();
-				let new_liquidation_amount = current_liquidation
-					.checked_add(&principal)
-					.ok_or(Error::<T>::ArithmeticOverflow)?;
-				ensure!(
-					new_liquidation_amount <= max_liquidation,
-					Error::<T>::ExceedsMaxLiquidationAmount
-				);
-
-				CurrentLiquidationAmount::<T>::put(new_liquidation_amount);
+				CurrentLiquidationAmount::<T>::try_mutate(|capped| {
+					capped.try_add(principal).map_err(|err| match err {
+						CappedValueError::Overflow => Error::<T>::ArithmeticOverflow,
+						CappedValueError::ExceedsMax => Error::<T>::ExceedsMaxLiquidationAmount,
+					})
+				})?;
 
 				// Emit penalty collected event
 				if !penalty_pusd.is_zero() {
@@ -1929,8 +1932,8 @@ pub mod pallet {
 			}
 
 			// Reduce CurrentLiquidationAmount by principal paid (tracks solvency risk only)
-			CurrentLiquidationAmount::<T>::mutate(|current| {
-				*current = current.saturating_sub(payment.principal_paid);
+			CurrentLiquidationAmount::<T>::mutate(|capped| {
+				*capped = capped.saturating_sub(CappedValue::new_unchecked(payment.principal_paid));
 			});
 
 			Self::deposit_event(Event::AuctionDebtCollected { amount: payment.total() });
@@ -1968,8 +1971,8 @@ pub mod pallet {
 
 			// Record shortfall as bad debt
 			if !shortfall.is_zero() {
-				CurrentLiquidationAmount::<T>::mutate(|current| {
-					*current = current.saturating_sub(shortfall);
+				CurrentLiquidationAmount::<T>::mutate(|capped| {
+					*capped = capped.saturating_sub(CappedValue::new_unchecked(shortfall));
 				});
 
 				BadDebt::<T>::mutate(|bad_debt| {
@@ -2072,8 +2075,8 @@ pub mod pallet {
 		/// Reduce CurrentLiquidationAmount (simulates debt collection in auction).
 		/// Test-only helper for isolated unit testing.
 		pub fn test_reduce_liquidation_amount(amount: BalanceOf<T>) -> DispatchResult {
-			CurrentLiquidationAmount::<T>::mutate(|current| {
-				*current = current.saturating_sub(amount);
+			CurrentLiquidationAmount::<T>::mutate(|capped| {
+				*capped = capped.saturating_sub(CappedValue::new_unchecked(amount));
 			});
 			Self::deposit_event(Event::AuctionDebtCollected { amount });
 			Ok(())
@@ -2086,8 +2089,8 @@ pub mod pallet {
 			shortfall: BalanceOf<T>,
 		) -> DispatchResult {
 			if !shortfall.is_zero() {
-				CurrentLiquidationAmount::<T>::mutate(|current| {
-					*current = current.saturating_sub(shortfall);
+				CurrentLiquidationAmount::<T>::mutate(|capped| {
+					*capped = capped.saturating_sub(CappedValue::new_unchecked(shortfall));
 				});
 				BadDebt::<T>::mutate(|bad_debt| {
 					bad_debt.saturating_accrue(shortfall);
