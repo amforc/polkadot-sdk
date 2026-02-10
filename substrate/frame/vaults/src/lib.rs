@@ -1933,7 +1933,7 @@ pub mod pallet {
 
 			// Reduce CurrentLiquidationAmount by principal paid (tracks solvency risk only)
 			CurrentLiquidationAmount::<T>::mutate(|capped| {
-				capped.saturating_sub(payment.principal_paid);
+				*capped = capped.saturating_sub(CappedValue::new_unchecked(payment.principal_paid));
 			});
 
 			Self::deposit_event(Event::AuctionDebtCollected { amount: payment.total() });
@@ -1972,7 +1972,7 @@ pub mod pallet {
 			// Record shortfall as bad debt
 			if !shortfall.is_zero() {
 				CurrentLiquidationAmount::<T>::mutate(|capped| {
-					capped.saturating_sub(shortfall);
+					*capped = capped.saturating_sub(CappedValue::new_unchecked(shortfall));
 				});
 
 				BadDebt::<T>::mutate(|bad_debt| {
@@ -2076,7 +2076,7 @@ pub mod pallet {
 		/// Test-only helper for isolated unit testing.
 		pub fn test_reduce_liquidation_amount(amount: BalanceOf<T>) -> DispatchResult {
 			CurrentLiquidationAmount::<T>::mutate(|capped| {
-				capped.saturating_sub(amount);
+				*capped = capped.saturating_sub(CappedValue::new_unchecked(amount));
 			});
 			Self::deposit_event(Event::AuctionDebtCollected { amount });
 			Ok(())
@@ -2090,7 +2090,7 @@ pub mod pallet {
 		) -> DispatchResult {
 			if !shortfall.is_zero() {
 				CurrentLiquidationAmount::<T>::mutate(|capped| {
-					capped.saturating_sub(shortfall);
+					*capped = capped.saturating_sub(CappedValue::new_unchecked(shortfall));
 				});
 				BadDebt::<T>::mutate(|bad_debt| {
 					bad_debt.saturating_accrue(shortfall);

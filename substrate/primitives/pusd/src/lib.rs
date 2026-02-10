@@ -142,8 +142,10 @@ impl<Balance: Saturating + Copy> PaymentBreakdown<Balance> {
 /// // Increment - limit auto-fetched from M
 /// CurrentLiquidationAmount::<T>::try_mutate(|v| v.try_add(amount))?;
 ///
-/// // Decrement (always safe)
-/// CurrentLiquidationAmount::<T>::mutate(|v| v.saturating_sub(amount));
+/// // Decrement (always safe, uses Saturating trait)
+/// CurrentLiquidationAmount::<T>::mutate(|v| {
+///     *v = v.saturating_sub(CappedValueOf::<T>::new_unchecked(amount));
+/// });
 ///
 /// // Read via Deref
 /// let current: BalanceOf<T> = *CurrentLiquidationAmount::<T>::get();
@@ -151,19 +153,28 @@ impl<Balance: Saturating + Copy> PaymentBreakdown<Balance> {
 /// // Check remaining headroom before the cap
 /// let headroom = CurrentLiquidationAmount::<T>::get().remaining_capacity();
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Encode, Decode, TypeInfo, MaxEncodedLen)]
+#[derive(PartialEq, Eq, Encode, Decode, TypeInfo, MaxEncodedLen)]
 #[scale_info(skip_type_params(M))]
 pub struct CappedValue<B, M>(B, PhantomData<M>);
 
 // TODO: I don't really like this manual `impl`, I'm open to suggestions!
-//
-// Manual impl: `#[derive(Debug)]` would require `M: Debug`, but `M` is typically a
-// `StorageValue` type which doesn't implement `Debug`. This impl only bounds `B: Debug`.
+// 
+// Manual impls: the derive macros would require `M: Trait`, but `M` is typically a
+// `StorageValue` type which doesn't implement `Debug`, `Clone`, or `Copy`.
+// These impls only bound `B`.
 impl<B: core::fmt::Debug, M> core::fmt::Debug for CappedValue<B, M> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_tuple("CappedValue").field(&self.0).finish()
 	}
 }
+
+impl<B: Clone, M> Clone for CappedValue<B, M> {
+	fn clone(&self) -> Self {
+		Self(self.0.clone(), PhantomData)
+	}
+}
+
+impl<B: Copy, M> Copy for CappedValue<B, M> {}
 
 /// Error returned by [`CappedValue::try_new`] and [`CappedValue::try_add`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,10 +239,39 @@ impl<B: CheckedAdd + Ord + Copy, M: Get<B>> CappedValue<B, M> {
 	}
 }
 
-impl<B: Saturating + Copy, M> CappedValue<B, M> {
-	/// Subtract `amount`, saturating at zero.
-	pub fn saturating_sub(&mut self, amount: B) {
-		self.0 = self.0.saturating_sub(amount);
+impl<B: Saturating + Ord + Copy, M: Get<B>> Saturating for CappedValue<B, M> {
+	fn saturating_add(self, rhs: Self) -> Self {
+		let max = M::get();
+		let result = self.0.saturating_add(rhs.0);
+		if result > max {
+			Self(max, PhantomData)
+		} else {
+			Self(result, PhantomData)
+		}
+	}
+
+	fn saturating_sub(self, rhs: Self) -> Self {
+		Self(self.0.saturating_sub(rhs.0), PhantomData)
+	}
+
+	fn saturating_mul(self, rhs: Self) -> Self {
+		let max = M::get();
+		let result = self.0.saturating_mul(rhs.0);
+		if result > max {
+			Self(max, PhantomData)
+		} else {
+			Self(result, PhantomData)
+		}
+	}
+
+	fn saturating_pow(self, exp: usize) -> Self {
+		let max = M::get();
+		let result = self.0.saturating_pow(exp);
+		if result > max {
+			Self(max, PhantomData)
+		} else {
+			Self(result, PhantomData)
+		}
 	}
 }
 
