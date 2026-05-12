@@ -10447,6 +10447,7 @@ dependencies = [
  "pallet-example-tasks",
  "pallet-hrmp-para",
  "pallet-hrmp-relay",
+ "pallet-linked-list",
  "pallet-registrar-para",
  "pallet-registrar-relay",
  "pallet-transaction-storage",
