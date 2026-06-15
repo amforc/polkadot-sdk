@@ -3,7 +3,10 @@ use crate::{
 	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
-use frame::deps::frame_support::{assert_noop, assert_ok};
+use frame::deps::{
+	frame_support::{assert_noop, assert_ok},
+	sp_runtime::DispatchResult,
+};
 use pallet_linked_list::SortedListInterface;
 
 // Opening a vault from an account whose free balance is below the requested
@@ -35,7 +38,7 @@ fn adjust_vault_via_deposit_then_borrow() {
 			DOT,
 			300,
 			None,
-			None,
+			1,
 			Position::endpoints_only(),
 		));
 		assert_eq!(held(DOT, 1), 1_200);
@@ -60,7 +63,7 @@ fn borrow_with_recipient_mints_to_recipient_not_owner() {
 			DOT,
 			300,
 			None,
-			Some(4),
+			4,
 			Position::endpoints_only(),
 		));
 
@@ -82,7 +85,7 @@ fn withdraw_collateral_with_recipient_transfers_to_recipient() {
 			RuntimeOrigin::signed(1),
 			DOT,
 			250,
-			Some(4),
+			4,
 		));
 
 		assert_eq!(held(DOT, 1), 2_750);
@@ -341,27 +344,25 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 }
 
 #[test]
-fn redemption_slot_overwrites_previous_owner() {
+fn redemption_slot_rejects_second_owner() {
 	use pusd_primitives::{RedemptionAllocation, VaultRedemptionInterface};
-	fn park(owner: AccountId) {
+	fn park(owner: AccountId) -> DispatchResult {
 		let post_touch = <crate::Pallet<Test> as VaultRedemptionInterface<
 			AccountId,
 			AssetId,
 			Balance,
 		>>::touch_for_redemption(DOT, owner)
 		.expect("touch");
-		// Leave 150 — below the 200 minimum debt, above zero — so the vault
-		// goes Dormant and parks.
 		let allocation = RedemptionAllocation {
 			debt_to_cancel: post_touch - 150,
 			collateral_to_redeemer: (post_touch - 150) / 10,
 			fee_collateral_retained: 0,
 		};
-		assert_ok!(<crate::Pallet<Test> as VaultRedemptionInterface<
+		<crate::Pallet<Test> as VaultRedemptionInterface<
 			AccountId,
 			AssetId,
 			Balance,
-		>>::apply_redemption(DOT, owner, 7, allocation));
+		>>::apply_redemption(DOT, owner, 7, allocation)
 	}
 	fn parked() -> Option<AccountId> {
 		crate::pallet::BranchStates::<Test>::get(DOT)
@@ -374,10 +375,11 @@ fn redemption_slot_overwrites_previous_owner() {
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
 		assert_ok!(open(3, DOT, 1_000, 500, rate_pct(3, 100)));
 
-		park(1);
+		assert_ok!(park(1));
 		assert_eq!(parked(), Some(1));
-		park(2);
-		assert_eq!(parked(), Some(2), "second parking overwrites the first");
-		assert!(vault_status(DOT, 1).is_dormant(), "overwritten owner stays Dormant");
+		assert_eq!(park(2).unwrap_err(), crate::Error::<Test>::DormantTargetOccupied.into());
+		assert_eq!(parked(), Some(1), "slot still points at the first owner");
+		assert!(vault_status(DOT, 1).is_dormant(), "first dormant intact");
+		assert!(vault_status(DOT, 2).is_active(), "second vault stays Active (apply rolled back)");
 	});
 }

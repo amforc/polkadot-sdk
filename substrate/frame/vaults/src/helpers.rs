@@ -6,8 +6,8 @@
 use crate::{
 	math,
 	pallet::{
-		BalanceOf, BranchConfigs, BranchStates, Branches, Config, Error, Event, HoldReason,
-		MomentOf, Pallet, Vaults,
+		BalanceOf, BranchConfigs, BranchStates, Config, Error, Event, HoldReason, MomentOf, Pallet,
+		Vaults,
 	},
 	recovery,
 	types::{
@@ -39,7 +39,7 @@ use frame::{
 	prelude::*,
 };
 use pallet_linked_list::{ListError, Position, SortedListInterface};
-use pusd_primitives::ProvidePrice;
+use pusd_primitives::{OnBranchRegistered, ProvidePrice};
 
 pub(crate) fn moment_to_millis<T: Config>(m: MomentOf<T>) -> u64 {
 	use frame::deps::sp_runtime::traits::SaturatedConversion;
@@ -164,8 +164,9 @@ pub(crate) use branch::{
 	ensure_not_frozen, refresh_branch, register_branch, update_branch_config, validate_rate,
 };
 pub(crate) use ops::{
-	borrow, change_rate, close_vault, deposit_collateral_for, enter_final_recovery,
-	exit_final_recovery, on_idle_walk, open_vault, poke, repay_for, withdraw_collateral,
+	activate_dormant, borrow, change_rate, close_vault, deposit_collateral_for,
+	enter_final_recovery, exit_final_recovery, on_idle_walk, open_vault, poke, repay_for,
+	withdraw_collateral,
 };
 pub(crate) use views::{
 	predict_upfront_fee_borrow, predict_upfront_fee_open, predict_upfront_fee_rate_change,

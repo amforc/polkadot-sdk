@@ -3,9 +3,7 @@ use frame::deps::{
 	frame_support::{assert_noop, assert_ok},
 	sp_runtime::FixedU128,
 };
-use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, VaultLiquidationInterface,
-};
+use pusd_primitives::{KeeperCompensation, LiquidationAllocation, OffsetAllocation};
 
 #[test]
 fn liquidate_only_vault_returns_last_vault_error() {
@@ -13,8 +11,8 @@ fn liquidate_only_vault_returns_last_vault_error() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		// Drop the price so the vault is severely undercollateralized — but
-		// the trait-level `prepare_liquidation` still rejects on the
-		// last-vault rule before any solvency check.
+		// `execute_liquidation` still rejects on the last-vault rule before any
+		// allocation is built.
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		assert_noop!(liquidate(DOT, 1), crate::Error::<Test>::LastVaultCannotBeLiquidated);
 	});
@@ -34,138 +32,85 @@ fn liquidate_succeeds_when_a_second_vault_exists() {
 }
 
 #[test]
-fn prepare_liquidation_rejects_healthy_vault() {
+fn execute_liquidation_rejects_healthy_vault() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
 		// Price 10 → CR = 1000 * 10 / 500 = 20 ≫ MCR 1.1.
-		assert_noop!(liquidate(DOT, 1), crate::Error::<Test>::UnsafeCollateralizationRatio);
+		assert_noop!(liquidate(DOT, 1), crate::Error::<Test>::VaultNotLiquidatable);
 	});
 }
 
 #[test]
-fn prepare_liquidation_rejects_final_recovery_vault() {
+fn execute_liquidation_rejects_final_recovery_vault() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), 1, DOT));
-
-		assert_noop!(
-			<crate::Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, Balance>>::prepare_liquidation(
-				DOT, 1,
-			),
-			crate::Error::<Test>::VaultInFinalRecovery
-		);
+		assert_noop!(liquidate(DOT, 1), crate::Error::<Test>::VaultInFinalRecovery);
 	});
 }
 
 #[test]
-fn prepare_liquidation_rejects_frozen_branch() {
+fn execute_liquidation_rejects_frozen_branch() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
-
-		assert_noop!(
-			<crate::Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, Balance>>::prepare_liquidation(
-				DOT, 1,
-			),
-			crate::Error::<Test>::BranchFrozen
-		);
+		assert_noop!(liquidate(DOT, 1), crate::Error::<Test>::BranchFrozen);
 	});
 }
 
-// Finalizing a vault that was never prepared would delete the row while its
-// contribution still sits in the branch aggregates. The derived-status gate
-// refuses anything that is not Dormant (prepared vaults are de-listed).
+// An allocation that offsets more debt than the vault owes is rejected, and the
+// single-transaction model rolls the rejection back atomically — the vault row
+// and branch aggregates are untouched — so a follow-up valid allocation still
+// succeeds.
 #[test]
-fn finalize_without_prepare_is_rejected() {
-	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
-		// Vault 1 is still Active (in the rate index): finalize must refuse.
-		let alloc = LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 1, debt: 0, collateral: 0 },
-			redistribution_collateral: 0,
-			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
-		};
-		assert_noop!(
-			<crate::Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, Balance>>::finalize_liquidation(
-				DOT, 1, alloc,
-			),
-			crate::Error::<Test>::LiquidationNotPrepared
-		);
-	});
-}
-
-#[test]
-fn finalize_liquidation_rejects_offset_debt_above_post_touch_debt() {
+fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		let post_touch = <crate::Pallet<Test> as VaultLiquidationInterface<
-			AccountId,
-			AssetId,
-			Balance,
-		>>::prepare_liquidation(DOT, 1)
-		.expect("prepare succeeds");
 
-		let alloc = LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 10, debt: post_touch + 1, collateral: 0 },
-			redistribution_collateral: 0,
-			keeper: KeeperCompensation { recipient: 10, collateral: 0 },
-		};
 		assert_noop!(
-			<crate::Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, Balance>>::finalize_liquidation(
-				DOT, 1, alloc,
-			),
+			liquidate_with(DOT, 1, |post_touch| LiquidationAllocation {
+				offset: OffsetAllocation { recipient: 10, debt: post_touch + 1, collateral: 0 },
+				redistribution_collateral: 0,
+				keeper: KeeperCompensation { recipient: 10, collateral: 0 },
+			}),
 			crate::Error::<Test>::InvalidLiquidationAllocation
 		);
 		assert!(crate::pallet::Vaults::<Test>::contains_key(DOT, 1));
 
-		let valid = LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, 1, |post_touch| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 10, debt: post_touch, collateral: 0 },
 			redistribution_collateral: 0,
 			keeper: KeeperCompensation { recipient: 10, collateral: 0 },
-		};
-		assert_ok!(<crate::Pallet<Test> as VaultLiquidationInterface<
-			AccountId,
-			AssetId,
-			Balance,
-		>>::finalize_liquidation(DOT, 1, valid,));
+		}));
 	});
 }
 
+// An allocation paying out more collateral than is held is rejected and rolls
+// back atomically.
 #[test]
-fn finalize_liquidation_rejects_collateral_payout_above_held() {
+fn execute_liquidation_rejects_collateral_payout_above_held() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		let _ = <crate::Pallet<Test> as VaultLiquidationInterface<
-			AccountId,
-			AssetId,
-			Balance,
-		>>::prepare_liquidation(DOT, 1)
-		.expect("prepare succeeds");
 		let held = held(DOT, 1);
 
-		let alloc = LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 10, debt: 0, collateral: held + 1 },
-			redistribution_collateral: 0,
-			keeper: KeeperCompensation { recipient: 10, collateral: 0 },
-		};
 		assert_noop!(
-			<crate::Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, Balance>>::finalize_liquidation(
-				DOT, 1, alloc,
-			),
+			liquidate_with(DOT, 1, |_post_touch| LiquidationAllocation {
+				offset: OffsetAllocation { recipient: 10, debt: 0, collateral: held + 1 },
+				redistribution_collateral: 0,
+				keeper: KeeperCompensation { recipient: 10, collateral: 0 },
+			}),
 			crate::Error::<Test>::InvalidLiquidationAllocation
 		);
 		assert!(crate::pallet::Vaults::<Test>::contains_key(DOT, 1));

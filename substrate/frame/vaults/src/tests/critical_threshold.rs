@@ -64,7 +64,7 @@ fn safety_mode_blocks_borrow_alone() {
 				DOT,
 				200,
 				None,
-				None,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::SafetyModeTcrWorsening
@@ -92,7 +92,7 @@ fn safety_mode_allows_borrow_after_large_deposit() {
 			DOT,
 			200,
 			None,
-			None,
+			1,
 			Position::endpoints_only(),
 		));
 	});
@@ -106,7 +106,7 @@ fn safety_mode_blocks_withdraw_alone() {
 	build_and_execute(|| {
 		enter_safety_mode_single_vault();
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 1, None,),
+			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 1, 1,),
 			crate::Error::<Test>::SafetyModeTcrWorsening
 		);
 	});
@@ -130,7 +130,7 @@ fn safety_mode_allows_repay_then_withdraw() {
 			RuntimeOrigin::signed(1),
 			DOT,
 			100,
-			None,
+			1,
 		));
 	});
 }
@@ -242,7 +242,7 @@ fn safety_mode_allows_close_zero_collateral() {
 			RuntimeOrigin::signed(2),
 			DOT,
 			residual,
-			None,
+			2,
 		));
 		assert_eq!(held(DOT, 2), 0);
 		// Drop into Safety. Closing the empty vault does not change branch
@@ -278,7 +278,7 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 				DOT,
 				0,
 				None,
-				None,
+				2,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
@@ -300,7 +300,7 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 			DOT,
 			0,
 			None,
-			None,
+			2,
 			Position::endpoints_only(),
 		));
 	});
@@ -321,7 +321,7 @@ fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 		// Withdrawing any collateral fails because post-CR < ICR (and so does
 		// pre-CR; the per-call gate uses the post-state).
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(2), DOT, 1, None,),
+			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(2), DOT, 1, 2,),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
 
@@ -337,12 +337,9 @@ fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 		));
 		// Withdraw 1 DOT now — vault 2 CR is huge, branch is in Normal mode
 		// well above Safety, so the per-call gate passes from both directions.
-		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
-			RuntimeOrigin::signed(2),
-			DOT,
-			1,
-			None,
-		));
+		assert_ok!(
+			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(2), DOT, 1, 2,)
+		);
 	});
 }
 

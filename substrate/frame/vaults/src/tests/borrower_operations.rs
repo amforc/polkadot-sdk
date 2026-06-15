@@ -39,7 +39,7 @@ fn withdraw_more_than_held_reverts() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 2_000, None,),
+			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 2_000, 1,),
 			crate::Error::<Test>::InsufficientCollateral
 		);
 	});
@@ -55,7 +55,7 @@ fn withdraw_breaking_cr_reverts() {
 		// 1000 DOT @ $10 backs 500 pUSD — withdrawing 950 leaves
 		// 50 DOT × $10 = $500, CR == 100% < ICR 120%.
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 950, None),
+			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 950, 1),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
 	});
@@ -78,18 +78,15 @@ fn zero_amount_ops_are_no_ops() {
 			DOT,
 			0,
 		));
-		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
-			RuntimeOrigin::signed(1),
-			DOT,
-			0,
-			None,
-		));
+		assert_ok!(
+			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 0, 1,)
+		);
 		assert_ok!(crate::Pallet::<Test>::borrow(
 			RuntimeOrigin::signed(1),
 			DOT,
 			0,
 			None,
-			None,
+			1,
 			Position::endpoints_only(),
 		));
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, 0));

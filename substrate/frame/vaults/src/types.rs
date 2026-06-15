@@ -2,7 +2,8 @@
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::deps::sp_runtime::{
-	traits::Saturating, FixedPointNumber, FixedPointOperand, FixedU128, Permill,
+	traits::{Saturating, Zero},
+	FixedPointNumber, FixedPointOperand, FixedU128, Permill,
 };
 use scale_info::TypeInfo;
 
@@ -149,6 +150,29 @@ pub struct RedistSnapshot {
 	pub weight_per_stake: FixedU128,
 }
 
+/// Branch-local interest timebase. Interest accrues in `interest_time(now)`
+/// units rather than raw wall-clock time so that freezing a branch suspends
+/// accrual without ever rewinding the clock. See [`BranchState::interest_time`].
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+	Default,
+)]
+pub struct InterestClock<Moment> {
+	/// Wall-clock epoch used to keep interest time relative and bounded.
+	pub epoch_base: Moment,
+	/// Completed frozen-window duration since `epoch_base`.
+	pub frozen_elapsed: Moment,
+}
+
 /// Per-vault state. The vault's collateral lives on the `VaultCollateral`
 /// hold for `(owner, collateral_id)` and is intentionally NOT stored here.
 /// `redistribution_stake` mirrors the vault's *current* eligible collateral:
@@ -164,7 +188,7 @@ pub struct RedistSnapshot {
 pub struct Vault<Balance, Moment> {
 	pub debt: VaultDebt<Balance>,
 	pub annual_rate: FixedU128,
-	pub last_interest_update: Moment,
+	pub last_interest_time: Moment,
 	pub last_rate_update: Moment,
 	pub redistribution_stake: Balance,
 	pub redist_snapshot: RedistSnapshot,
@@ -198,7 +222,7 @@ pub struct BranchDebt<Balance, Moment> {
 	pub pending_redist_principal: Balance,
 	pub bad_debt: Balance,
 	pub weighted_principal_sum: Balance,
-	pub last_interest_update: Moment,
+	pub last_interest_time: Moment,
 }
 
 /// Current-collateral redistribution stake totals for one collateral branch.
@@ -248,9 +272,9 @@ pub struct BranchState<AccountId, Balance, Moment> {
 	pub stakes: BranchStakes<Balance>,
 	pub rounding: BranchRounding<Balance>,
 	pub redist: RedistSnapshot,
-	pub epoch: Moment,
+	pub interest_clock: InterestClock<Moment>,
 	pub next_final_recovery_nonce: u128,
-	pub last_dormant_vault_owner: Option<AccountId>,
+	pub dormant_redemption_target: Option<AccountId>,
 	pub idle_cursor: Option<AccountId>,
 	pub frozen: Option<FrozenState<Moment>>,
 }
@@ -258,6 +282,44 @@ pub struct BranchState<AccountId, Balance, Moment> {
 impl<AccountId, Balance, Moment> BranchState<AccountId, Balance, Moment> {
 	pub fn is_frozen(&self) -> bool {
 		self.frozen.is_some()
+	}
+}
+
+impl<AccountId, Balance, Moment: Saturating + Zero + Copy> BranchState<AccountId, Balance, Moment> {
+	/// Branch-local interest time at wall-clock `now`: `now` less the epoch base,
+	/// the completed frozen-window duration, and any in-progress frozen window.
+	/// Non-decreasing and constant while the branch is Frozen, so interest never
+	/// accrues across a freeze. See SPEC §5.2.
+	pub fn interest_time(&self, now: Moment) -> Moment {
+		let current_frozen = match &self.frozen {
+			Some(state) => now.saturating_sub(state.entered_at),
+			None => Moment::zero(),
+		};
+		now.saturating_sub(self.interest_clock.epoch_base)
+			.saturating_sub(self.interest_clock.frozen_elapsed)
+			.saturating_sub(current_frozen)
+	}
+}
+
+impl<AccountId: PartialEq, Balance, Moment> BranchState<AccountId, Balance, Moment> {
+	/// Clear the single dormant redemption slot, but only if it currently points
+	/// at `owner`. No-op otherwise.
+	pub fn release_dormant_target(&mut self, owner: &AccountId) {
+		if self.dormant_redemption_target.as_ref() == Some(owner) {
+			self.dormant_redemption_target = None;
+		}
+	}
+
+	/// Park `owner` in the dormant redemption slot, returning `false` (without
+	/// mutating) when a *different* debt-bearing vault already holds it.
+	pub fn try_park_dormant_target(&mut self, owner: AccountId) -> bool {
+		match &self.dormant_redemption_target {
+			Some(existing) if existing != &owner => false,
+			_ => {
+				self.dormant_redemption_target = Some(owner);
+				true
+			},
+		}
 	}
 }
 
@@ -512,14 +574,14 @@ mod tests {
 				pending_redist_principal: 0,
 				bad_debt: 0,
 				weighted_principal_sum: weighted,
-				last_interest_update: 0,
+				last_interest_time: 0,
 			},
 			stakes: BranchStakes { total: 0, weighted_sum: 0 },
 			rounding: BranchRounding::default(),
 			redist: RedistSnapshot::default(),
-			epoch: 0,
+			interest_clock: InterestClock { epoch_base: 0, frozen_elapsed: 0 },
 			next_final_recovery_nonce: 0,
-			last_dormant_vault_owner: None,
+			dormant_redemption_target: None,
 			idle_cursor: None,
 			frozen: None,
 		}

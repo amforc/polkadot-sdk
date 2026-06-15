@@ -225,7 +225,7 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 			DOT,
 			50,
 			None,
-			None,
+			2,
 			Position::endpoints_only(),
 		));
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), 3, DOT, 50));
@@ -262,7 +262,7 @@ fn borrow_full_state_changes() {
 			DOT,
 			500,
 			None,
-			None,
+			1,
 			Position::endpoints_only(),
 		));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
@@ -295,7 +295,7 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 			DOT,
 			500,
 			Some(rate_pct(5, 100)),
-			None,
+			1,
 			Position::endpoints_only(),
 		));
 
@@ -332,7 +332,7 @@ fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
 				DOT,
 				500,
 				Some(rate_pct(101, 100)),
-				None,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::RateOutOfBounds

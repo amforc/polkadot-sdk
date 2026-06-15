@@ -156,7 +156,7 @@ pub(crate) fn pending_touch_for<T: Config>(
 	// redistributed principal since redistribution. Timestamps here are in
 	// branch interest time — the common origin cancels in the subtraction and
 	// keeps the products at branch-age scale; both writers of
-	// `debt_time_per_stake` must use the same interest-time origin.
+	// `debt_time_per_stake` (here and `execute_liquidation`) must use this origin.
 	let now_fp = FixedU128::saturating_from_integer(moment_to_millis::<T>(tau));
 	let extra_per_stake =
 		now_fp.saturating_mul(delta_debt_per_stake).saturating_sub(delta_dt_per_stake);
