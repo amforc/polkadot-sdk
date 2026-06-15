@@ -22,9 +22,7 @@ fn enter_safety_mode_single_vault() {
 	assert!(!BranchStates::<Test>::get(DOT).expect("branch state").is_frozen());
 }
 
-// There is no MCR-band liquidation test here because
-// `pallet-vaults::prepare_liquidation` performs no MCR/ICR check itself — that
-// gate lives in the orchestrator (`pallet-stability-pool`). The vault pallet's
+// The vault pallet's
 // liquidation guards are: branch frozen, vault in FinalRecovery, last vault.
 
 // In Safety mode, opening a vault whose CR is above ICR but below the branch
@@ -138,11 +136,7 @@ fn safety_mode_allows_repay_then_withdraw() {
 }
 
 // Withdrawing collateral with too-low (or no) matching repayment reduces to
-// `safety_mode_blocks_withdraw_alone` above. There is no single atomic `adjust`
-// extrinsic combining collateral and debt deltas, so the per-call safety gate
-// fires standalone the moment `withdraw_collateral` would worsen TCR. No
-// additional coverage.
-
+// `safety_mode_blocks_withdraw_alone` above.
 // In Normal mode, a premature rate change that would push TCR below the
 // safety threshold reverts. The upfront fee bumps
 // `bs.debt.minted_interest` and lowers post-TCR; if pre-TCR is

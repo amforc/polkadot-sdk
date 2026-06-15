@@ -444,7 +444,7 @@ pub mod pallet {
 		}
 
 		/// First `n` vault owners in actual redemption order: `FinalRecovery`
-		/// FIFO first, then `last_dormant_vault_owner`, then the rate index
+		/// FIFO first, then `dormant_redemption_target`, then the rate index
 		/// tail-first.
 		pub fn redemption_queue_head(
 			collateral_id: T::AssetId,

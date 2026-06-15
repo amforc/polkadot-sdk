@@ -17,10 +17,6 @@ fn open_vault_fails_without_balance() {
 	});
 }
 
-// There is no single `adjust_vault` extrinsic — adjustments are applied
-// through the per-action dispatchables (`deposit_collateral_for`, `borrow`,
-// `withdraw_collateral`, `repay_for`). This exercises a +collateral then
-// +debt sequence and asserts the end-state shows both deltas.
 #[test]
 fn adjust_vault_via_deposit_then_borrow() {
 	build_and_execute(|| {
@@ -258,7 +254,7 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 
 // A redemption-driven dormant
 // residual that is repaid to zero auto-closes (and clears any matching
-// `last_dormant_vault_owner` pointer).
+// `dormant_redemption_target` pointer).
 #[test]
 fn repay_for_to_zero_closes_dormant_vault() {
 	build_and_execute(|| {
@@ -281,7 +277,7 @@ fn repay_for_to_zero_closes_dormant_vault() {
 		assert!(Vaults::<Test>::get(DOT, 1).is_none());
 		assert_eq!(held(DOT, 1), 0);
 		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("bs");
-		assert_eq!(bs.last_dormant_vault_owner, None);
+		assert_eq!(bs.dormant_redemption_target, None);
 	});
 }
 
@@ -370,7 +366,7 @@ fn redemption_slot_overwrites_previous_owner() {
 	fn parked() -> Option<AccountId> {
 		crate::pallet::BranchStates::<Test>::get(DOT)
 			.expect("branch state")
-			.last_dormant_vault_owner
+			.dormant_redemption_target
 	}
 	build_and_execute(|| {
 		register_default_branch();

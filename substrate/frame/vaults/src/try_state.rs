@@ -11,7 +11,7 @@ use crate::{
 };
 use frame::{
 	deps::{
-		frame_support::traits::fungibles::InspectHold,
+		frame_support::traits::{fungibles::InspectHold, Time},
 		sp_runtime::{
 			traits::{One, Saturating, UniqueSaturatedInto, Zero},
 			FixedPointNumber, FixedU128,
@@ -27,15 +27,23 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		let rate_list = VaultListId::Rate(c.clone());
 		let recovery_list = VaultListId::FinalRecovery(c.clone());
 		check_branch_identities::<T>(c, &rate_list, &recovery_list)?;
-		// Mirrors `pallet-assets`'s "Σ per-account balances == supply" check:
-		// `last_dormant_vault_owner` must point at a Dormant vault.
 		if let Some(bs) = BranchStates::<T>::get(c) {
-			if let Some(owner) = bs.last_dormant_vault_owner.clone() {
+			let tau = bs.interest_time(T::TimeProvider::now());
+			if bs.debt.last_interest_time > tau {
+				return Err("branch last_interest_time ahead of interest_time(now)".into());
+			}
+			for (_owner, vault) in Vaults::<T>::iter_prefix(c) {
+				if vault.last_interest_time > tau {
+					return Err("vault last_interest_time ahead of interest_time(now)".into());
+				}
+			}
+			// `dormant_redemption_target`, when set, must point at a Dormant vault.
+			if let Some(owner) = bs.dormant_redemption_target.clone() {
 				let Some(vault) = Vaults::<T>::get(c, &owner) else {
-					return Err("last_dormant_vault_owner points at missing vault".into());
+					return Err("dormant_redemption_target points at missing vault".into());
 				};
 				if !vault.status::<T>(c, &owner).is_dormant() {
-					return Err("last_dormant_vault_owner points at non-Dormant".into());
+					return Err("dormant_redemption_target points at non-Dormant".into());
 				}
 			}
 		}
