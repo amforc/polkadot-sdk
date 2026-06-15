@@ -182,7 +182,7 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 			DOT,
 			200,
 			None,
-			None,
+			1,
 			Position::endpoints_only(),
 		));
 		// Touch B too so its share is reconciled.

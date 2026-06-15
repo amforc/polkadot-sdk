@@ -221,7 +221,7 @@ fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
 				DOT,
 				100,
 				None,
-				None,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::VaultInFinalRecovery
@@ -231,7 +231,7 @@ fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 1, None),
+			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 1, 1),
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
@@ -273,6 +273,52 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 		assert_eq!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, 10), alloc::vec![2]);
 		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("bs");
 		assert_eq!(bs.dormant_redemption_target, Some(1));
+	});
+}
+
+// A FinalRecovery vault that would exit into a
+// sub-MinimumDebt Dormant cannot displace an occupied dormant slot, the exit is
+// rejected and the vault stays in FinalRecovery.
+#[test]
+fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
+	build_and_execute(|| {
+		register_default_branch();
+		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(2, rate_pct(5, 100));
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		// Push both FR vaults below MinimumDebt but non-zero.
+		direct_redeem(1, 99, 350);
+		direct_redeem(2, 98, 350);
+
+		// First exit parks vault 1 in the (empty) dormant slot.
+		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
+			RuntimeOrigin::signed(99),
+			1,
+			DOT,
+			Position::endpoints_only(),
+		));
+		assert!(vault_status(DOT, 1).is_dormant());
+		assert_eq!(
+			crate::pallet::BranchStates::<Test>::get(DOT).unwrap().dormant_redemption_target,
+			Some(1)
+		);
+
+		// Vault 2 also needs the slot, but it is held by a different debt-bearing
+		// vault → the exit is rejected and vault 2 stays in FinalRecovery.
+		assert_noop!(
+			crate::Pallet::<Test>::exit_final_recovery(
+				RuntimeOrigin::signed(99),
+				2,
+				DOT,
+				Position::endpoints_only(),
+			),
+			crate::Error::<Test>::DormantTargetOccupied
+		);
+		assert!(vault_status(DOT, 2).is_final_recovery());
+		assert_eq!(
+			crate::pallet::BranchStates::<Test>::get(DOT).unwrap().dormant_redemption_target,
+			Some(1)
+		);
 	});
 }
 
@@ -331,8 +377,11 @@ fn final_recovery_rescue_deposit_then_exit() {
 	});
 }
 
+// Redemption targeting is tiered with a cutoff, not concatenated.
+// While the FinalRecovery FIFO is non-empty, only its head is exposed — even
+// with a dormant target and rate-index vaults present behind it.
 #[test]
-fn redemption_queue_composes_recovery_dormant_and_rate_index() {
+fn redemption_queue_head_gates_on_final_recovery() {
 	build_and_execute(|| {
 		register_default_branch();
 
@@ -347,9 +396,8 @@ fn redemption_queue_composes_recovery_dormant_and_rate_index() {
 		direct_redeem(3, 10, 350);
 		assert!(vault_status(DOT, 3).is_dormant());
 
-		assert_eq!(
-			crate::Pallet::<Test>::redemption_queue_head(DOT, 10),
-			alloc::vec![1, 2, 3, 4, 5]
-		);
+		// Only the FinalRecovery head (1), regardless of `n`; the dormant target
+		// (3) and rate-index tail (4, 5) stay gated behind it.
+		assert_eq!(crate::Pallet::<Test>::redemption_queue_head(DOT, 10), alloc::vec![1]);
 	});
 }

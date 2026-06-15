@@ -54,4 +54,8 @@ pub struct FrozenState<Moment> {
 /// depending on `pallet-vaults` directly. Returns `None` for unknown branches.
 pub trait BranchModeProvider<AssetId> {
 	fn mode(collateral_id: &AssetId) -> Option<BranchMode>;
+
+	fn is_registered(collateral_id: &AssetId) -> bool {
+		Self::mode(collateral_id).is_some()
+	}
 }

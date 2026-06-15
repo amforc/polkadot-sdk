@@ -215,7 +215,7 @@ fn dormant_owner_borrowing_above_min_debt_revives_to_active() {
 			DOT,
 			500,
 			None,
-			None,
+			1,
 			Position::endpoints_only(),
 		));
 		assert!(vault_status(DOT, 1).is_active());
@@ -223,6 +223,78 @@ fn dormant_owner_borrowing_above_min_debt_revives_to_active() {
 		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(&rate_list(DOT), &1));
 		let bs = BranchStates::<Test>::get(DOT).unwrap();
 		assert_eq!(bs.dormant_redemption_target, None);
+	});
+}
+
+// `activate_dormant` is the permissionless revival path: touch never re-activates
+// a Dormant vault, but once its fully-accrued debt is back at/above
+// MinimumDebt a hint-bearing `activate_dormant` flips it to Active and clears the
+// slot.
+#[test]
+fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
+	build_and_execute(|| {
+		register_default_branch();
+		// Vault 1 carries the lower rate so it sits at the redemption tail; its
+		// rate is still high enough that accrued interest lifts the dormant
+		// remainder back over MinimumDebt (200) within a year.
+		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(50, 100)));
+		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(60, 100)));
+		assert_ok!(redeem(DOT, 3, 350));
+		assert!(vault_status(DOT, 1).is_dormant());
+		assert_eq!(BranchStates::<Test>::get(DOT).unwrap().dormant_redemption_target, Some(1));
+
+		advance_time(365 * ONE_DAY_MS);
+		// Touch alone never re-activates a Dormant, even past MinimumDebt.
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), 1, DOT));
+		assert!(vault_status(DOT, 1).is_dormant(), "touch never re-activates a Dormant");
+
+		assert_ok!(crate::Pallet::<Test>::activate_dormant(
+			RuntimeOrigin::signed(9),
+			1,
+			DOT,
+			Position::endpoints_only(),
+		));
+		assert!(vault_status(DOT, 1).is_active());
+		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(&rate_list(DOT), &1));
+		assert_eq!(BranchStates::<Test>::get(DOT).unwrap().dormant_redemption_target, None);
+	});
+}
+
+#[test]
+fn activate_dormant_rejects_below_minimum_debt() {
+	build_and_execute(|| {
+		register_default_branch();
+		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(redeem(DOT, 3, 350)); // vault 1 → Dormant, debt ~150 < 200
+		assert!(vault_status(DOT, 1).is_dormant());
+		assert_noop!(
+			crate::Pallet::<Test>::activate_dormant(
+				RuntimeOrigin::signed(9),
+				1,
+				DOT,
+				Position::endpoints_only(),
+			),
+			crate::Error::<Test>::DebtBelowMinimum
+		);
+		assert!(vault_status(DOT, 1).is_dormant());
+	});
+}
+
+#[test]
+fn activate_dormant_rejects_active_vault() {
+	build_and_execute(|| {
+		register_default_branch();
+		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		assert_noop!(
+			crate::Pallet::<Test>::activate_dormant(
+				RuntimeOrigin::signed(9),
+				1,
+				DOT,
+				Position::endpoints_only(),
+			),
+			crate::Error::<Test>::InvalidVaultStatus
+		);
 	});
 }
 
@@ -298,7 +370,7 @@ fn dormant_borrow_below_min_debt_reverts() {
 				DOT,
 				1,
 				None,
-				None,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::DebtBelowMinimum

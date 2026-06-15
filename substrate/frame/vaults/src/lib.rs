@@ -87,7 +87,7 @@ pub mod pallet {
 		prelude::*,
 	};
 	use pallet_linked_list::{Position, PriorityProvider, SortedListInterface};
-	use pusd_primitives::{BranchModeProvider, OnBranchYield, ProvidePrice};
+	use pusd_primitives::{BranchModeProvider, OnBranchRegistered, OnBranchYield, ProvidePrice};
 
 	pub type BalanceOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
 		<T as frame_system::Config>::AccountId,
@@ -141,6 +141,10 @@ pub mod pallet {
 		/// Runtime-configured destination for the residual (non-SP) share of
 		/// minted pUSD fees.
 		type FeeHandler: OnUnbalanced<StableCreditOf<Self>>;
+
+		/// Invoked by `register_branch` so sibling pallets seed their own
+		/// per-branch rows.
+		type OnBranchRegistered: OnBranchRegistered<Self::AssetId>;
 
 		/// Time provider for fee accrual using UNIX timestamps in millis.
 		/// Moments must convert to `u64` so the pallet can compute durations
@@ -207,10 +211,9 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Per-branch governance/risk parameters. A registered branch always has
-	/// a row.
+	/// Per-branch governance/risk parameters.
 	#[pallet::storage]
-	pub type BranchConfigs<T: Config> = StorageMap<
+	pub type BranchConfigs<T: Config> = CountedStorageMap<
 		_,
 		Twox64Concat,
 		T::AssetId,
@@ -231,11 +234,6 @@ pub mod pallet {
 		GetDefault,
 		T::MaxBranches,
 	>;
-
-	/// Bounded registry of supported collateral branches.
-	#[pallet::storage]
-	pub type Branches<T: Config> =
-		StorageValue<_, BoundedVec<T::AssetId, T::MaxBranches>, ValueQuery>;
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -302,6 +300,12 @@ pub mod pallet {
 		ModeChanged { collateral_id: T::AssetId, old_mode: BranchMode, new_mode: BranchMode },
 		/// Governance updated one branch-config parameter.
 		ParameterUpdated { collateral_id: T::AssetId, parameter: types::ParameterId },
+		/// Governance changed the branch debt ceiling.
+		DebtCeilingUpdated {
+			collateral_id: T::AssetId,
+			old_value: BalanceOf<T>,
+			new_value: BalanceOf<T>,
+		},
 		/// A new collateral branch was registered.
 		BranchRegistered { collateral_id: T::AssetId },
 		/// A redemption cancelled vault debt in exchange for collateral.
@@ -394,9 +398,12 @@ pub mod pallet {
 		/// Redistribution per-stake math overflowed; the liquidation cannot
 		/// be finalized with these amounts.
 		RedistributionWouldOverflow,
-		/// `finalize_liquidation` was called for a vault that
-		/// `prepare_liquidation` never detached.
-		LiquidationNotPrepared,
+		/// The vault is not eligible for liquidation (fully-accrued CR at or
+		/// above MCR).
+		VaultNotLiquidatable,
+		/// The branch's single `dormant_redemption_target` slot is already held
+		/// by a different debt-bearing vault.
+		DormantTargetOccupied,
 	}
 
 	#[pallet::hooks]
@@ -440,7 +447,7 @@ pub mod pallet {
 
 		/// Registered branches.
 		pub fn branches() -> alloc::vec::Vec<T::AssetId> {
-			Branches::<T>::get().into_inner()
+			BranchConfigs::<T>::iter_keys().collect()
 		}
 
 		/// First `n` vault owners in actual redemption order: `FinalRecovery`
@@ -594,7 +601,7 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
 			amount: BalanceOf<T>,
-			recipient: Option<T::AccountId>,
+			recipient: T::AccountId,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 			helpers::withdraw_collateral::<T>(who, collateral_id, amount, recipient)
@@ -609,7 +616,7 @@ pub mod pallet {
 			collateral_id: T::AssetId,
 			amount: BalanceOf<T>,
 			maybe_new_rate: Option<FixedU128>,
-			recipient: Option<T::AccountId>,
+			recipient: T::AccountId,
 			hint: Position<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -782,10 +789,17 @@ pub mod pallet {
 				matches!(level, VaultsManagerLevel::Full) || value <= cfg.debt_ceiling,
 				Error::<T>::DefensiveActionNotDefensive
 			);
+			let old_value = cfg.debt_ceiling;
 			helpers::update_branch_config::<T>(
 				&collateral_id,
 				BranchConfigUpdate::DebtCeiling(value),
-			)
+			)?;
+			Self::deposit_event(Event::DebtCeilingUpdated {
+				collateral_id,
+				old_value,
+				new_value: value,
+			});
+			Ok(())
 		}
 
 		#[pallet::call_index(15)]
@@ -918,6 +932,22 @@ pub mod pallet {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
 			ensure!(matches!(level, VaultsManagerLevel::Full), Error::<T>::InsufficientPrivilege);
 			helpers::clear_governance_frozen_mode::<T>(&collateral_id)
+		}
+
+		/// Permissionless: revive a `Dormant` vault whose fully-accrued debt is
+		/// back at or above `MinimumDebt`, reinserting it into the rate index at
+		/// the caller-supplied `hint`. Returns `Pays::No` on a successful flip.
+		#[pallet::call_index(24)]
+		#[pallet::weight(T::WeightInfo::activate_dormant())]
+		pub fn activate_dormant(
+			origin: OriginFor<T>,
+			owner: T::AccountId,
+			collateral_id: T::AssetId,
+			hint: Position<T::AccountId>,
+		) -> DispatchResultWithPostInfo {
+			let _ = ensure_signed(origin)?;
+			helpers::activate_dormant::<T>(owner, collateral_id, hint)?;
+			Ok(Pays::No.into())
 		}
 	}
 

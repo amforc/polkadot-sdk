@@ -4,9 +4,7 @@
 //! `next_block` and end-to-end by the runtime's pre-upgrade hook.
 
 use crate::{
-	pallet::{
-		BalanceOf, BranchConfigs, BranchStates, Branches, Config, HoldReason, Pallet, Vaults,
-	},
+	pallet::{BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, Vaults},
 	types::VaultListId,
 };
 use frame::{
@@ -22,8 +20,9 @@ use frame::{
 use pallet_linked_list::SortedListInterface;
 
 pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
-	let branches = Branches::<T>::get();
-	for c in branches.iter() {
+	// The `BranchConfigs` key set is the canonical registry (SPEC §4.4).
+	for c in BranchConfigs::<T>::iter_keys() {
+		let c = &c;
 		let rate_list = VaultListId::Rate(c.clone());
 		let recovery_list = VaultListId::FinalRecovery(c.clone());
 		check_branch_identities::<T>(c, &rate_list, &recovery_list)?;
@@ -58,7 +57,9 @@ fn check_branch_identities<T: Config>(
 	rate_list: &VaultListId<T::AssetId>,
 	recovery_list: &VaultListId<T::AssetId>,
 ) -> Result<(), TryRuntimeError> {
-	let Some(bs) = BranchStates::<T>::get(c) else { return Ok(()) };
+	let Some(bs) = BranchStates::<T>::get(c) else {
+		return Err("registered branch missing BranchState".into());
+	};
 	let cumul_debt_ps = bs.redist.debt_per_stake;
 	let cumul_collat_ps = bs.redist.collat_per_stake;
 
