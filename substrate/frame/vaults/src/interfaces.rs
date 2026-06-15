@@ -123,8 +123,8 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 			let bs = maybe_bs.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
 			// The row vanishes below; a parked dormant pointer to this owner
 			// must not survive it.
-			if bs.last_dormant_vault_owner.as_ref() == Some(&owner) {
-				bs.last_dormant_vault_owner = None;
+			if bs.dormant_redemption_target.as_ref() == Some(&owner) {
+				bs.dormant_redemption_target = None;
 			}
 			// The redistribution collateral stays counted in
 			// branch collateral until vault touch moves it to the recipient's
@@ -141,9 +141,9 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 				let weight_per_stake =
 					math::redist_weight_per_stake(redistributed_debt, avg_rate, bs.stakes.total)
 						.ok_or(Error::<T>::RedistributionWouldOverflow)?;
-				let now_fp = FixedU128::saturating_from_integer(helpers::millis_diff::<T>(
-					T::TimeProvider::now(),
-					bs.epoch,
+				let now = T::TimeProvider::now();
+				let now_fp = FixedU128::saturating_from_integer(helpers::moment_to_millis::<T>(
+					bs.interest_time(now),
 				));
 				bs.redist.debt_per_stake = bs.redist.debt_per_stake.saturating_add(debt_per_stake);
 				bs.redist.collat_per_stake =
@@ -240,7 +240,7 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 }
 
 impl<T: Config> VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>> for Pallet<T> {
-	/// Priority order: `FinalRecovery` FIFO head, then `last_dormant_vault_owner`,
+	/// Priority order: `FinalRecovery` FIFO head, then `dormant_redemption_target`,
 	/// then the rate-index tail.
 	fn next_redemption_target(collateral_id: T::AssetId) -> Option<T::AccountId> {
 		helpers::redemption_targets::<T>(&collateral_id).next()
@@ -316,11 +316,11 @@ impl<T: Config> VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>
 			}
 			if matches!(status, VaultStatus::Active | VaultStatus::Dormant) {
 				if new_total.is_zero() {
-					if bs.last_dormant_vault_owner.as_ref() == Some(&owner) {
-						bs.last_dormant_vault_owner = None;
+					if bs.dormant_redemption_target.as_ref() == Some(&owner) {
+						bs.dormant_redemption_target = None;
 					}
 				} else if new_total < cfg.minimum_debt {
-					bs.last_dormant_vault_owner = Some(owner.clone());
+					bs.dormant_redemption_target = Some(owner.clone());
 				}
 			}
 			Ok(())
