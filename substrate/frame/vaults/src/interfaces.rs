@@ -36,16 +36,23 @@ use frame::deps::{
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
-	LiquidationAllocation, ProvidePrice, RedemptionAllocation, VaultBadDebtInterface,
-	VaultLiquidationInterface, VaultRedemptionInterface,
+	LiquidationAllocation, LiquidationSnapshot, ProvidePrice, RedemptionAllocation,
+	VaultBadDebtInterface, VaultLiquidationInterface, VaultRedemptionInterface,
 };
 
 impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>> for Pallet<T> {
 	#[transactional]
-	fn prepare_liquidation(
+	fn execute_liquidation<BuildAllocation>(
 		collateral_id: T::AssetId,
 		owner: T::AccountId,
-	) -> Result<BalanceOf<T>, DispatchError> {
+		build_allocation: BuildAllocation,
+	) -> DispatchResult
+	where
+		BuildAllocation:
+			FnOnce(
+				LiquidationSnapshot<BalanceOf<T>>,
+			) -> Result<LiquidationAllocation<T::AccountId, BalanceOf<T>>, DispatchError>,
+	{
 		helpers::ensure_not_frozen::<T>(&collateral_id)?;
 		let now = T::TimeProvider::now();
 		let price = <T::Oracle as ProvidePrice>::provide_price(&collateral_id)?.price;
@@ -56,54 +63,30 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 			!vault.status::<T>(&collateral_id, &owner).is_final_recovery(),
 			Error::<T>::VaultInFinalRecovery
 		);
+
 		let post_touch_debt = vault.debt.total();
+		let held = T::CollateralAssets::balance_on_hold(
+			collateral_id.clone(),
+			&HoldReason::VaultCollateral.into(),
+			&owner,
+		);
+		// Only a vault whose fully-accrued CR is
+		// below MCR is liquidatable.
 		let cfg = helpers::branch_cfg_of::<T>(&collateral_id)?;
-		// Defense-in-depth (DESIGN.md §9.1): refuse to prepare a liquidation
-		// for a vault whose fully-accrued CR is still at or above MCR.
-		let held = T::CollateralAssets::balance_on_hold(
-			collateral_id.clone(),
-			&HoldReason::VaultCollateral.into(),
-			&owner,
-		);
-		helpers::ensure_below_mcr::<T>(held, post_touch_debt, price, &cfg)?;
-		BranchStates::<T>::try_mutate(&collateral_id, |maybe| -> Result<_, DispatchError> {
-			let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-			ensure!(
-				bs.stakes.total != vault.redistribution_stake,
-				Error::<T>::LastVaultCannotBeLiquidated
-			);
-			bs.detach_vault(&vault);
-			Ok(())
-		})?;
-		// Dormant vaults aren't in the rate index, so absorb exactly the
-		// not-found case; any other failure is index corruption.
-		match T::VaultLists::remove(&VaultListId::Rate(collateral_id), &owner) {
-			Ok(()) | Err(ListError::ItemNotFound) => {},
-			Err(_) => return Err(Error::<T>::RateIndexInvariantBroken.into()),
-		}
+		let cr = math::collateralization_ratio::<BalanceOf<T>>(held, post_touch_debt, price)
+			.ok_or(Error::<T>::VaultNotLiquidatable)?;
+		ensure!(cr < cfg.minimum_collateralization_ratio, Error::<T>::VaultNotLiquidatable);
 
-		Ok(post_touch_debt)
-	}
-
-	#[transactional]
-	fn finalize_liquidation(
-		collateral_id: T::AssetId,
-		owner: T::AccountId,
-		allocation: LiquidationAllocation<T::AccountId, BalanceOf<T>>,
-	) -> DispatchResult {
-		let vault = helpers::vault_of::<T>(&collateral_id, &owner)?;
-		// A prepared vault was detached from the aggregates and de-listed, so
-		// its derived status is `Dormant`.
+		// The candidate must not be the only eligible redistribution recipient.
 		ensure!(
-			vault.status::<T>(&collateral_id, &owner).is_dormant(),
-			Error::<T>::LiquidationNotPrepared
+			helpers::branch_state_of::<T>(&collateral_id)?.stakes.total !=
+				vault.redistribution_stake,
+			Error::<T>::LastVaultCannotBeLiquidated
 		);
-		let post_touch_debt = vault.debt.total();
-		let held = T::CollateralAssets::balance_on_hold(
-			collateral_id.clone(),
-			&HoldReason::VaultCollateral.into(),
-			&owner,
-		);
+
+		// Hand the fully-accrued snapshot to the orchestrator.
+		let allocation =
+			build_allocation(LiquidationSnapshot { debt: post_touch_debt, collateral: held })?;
 		if allocation.offset.debt > post_touch_debt {
 			return Err(Error::<T>::InvalidLiquidationAllocation.into());
 		}
@@ -121,11 +104,12 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 			!redistributed_debt.is_zero() || !allocation.redistribution_collateral.is_zero();
 		BranchStates::<T>::try_mutate(&collateral_id, |maybe_bs| -> Result<_, DispatchError> {
 			let bs = maybe_bs.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
+			// Exclude the liquidated vault from the branch aggregates and the
+			// redistribution recipient set before sizing per-stake shares.
+			bs.detach_vault(&vault);
 			// The row vanishes below; a parked dormant pointer to this owner
 			// must not survive it.
-			if bs.dormant_redemption_target.as_ref() == Some(&owner) {
-				bs.dormant_redemption_target = None;
-			}
+			bs.release_dormant_target(&owner);
 			// The redistribution collateral stays counted in
 			// branch collateral until vault touch moves it to the recipient's
 			// hold, so only the SP-offset + keeper portions leave the total.
@@ -141,7 +125,6 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 				let weight_per_stake =
 					math::redist_weight_per_stake(redistributed_debt, avg_rate, bs.stakes.total)
 						.ok_or(Error::<T>::RedistributionWouldOverflow)?;
-				let now = T::TimeProvider::now();
 				let now_fp = FixedU128::saturating_from_integer(helpers::moment_to_millis::<T>(
 					bs.interest_time(now),
 				));
@@ -174,6 +157,13 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 			}
 			Ok(())
 		})?;
+
+		// Dormant vaults aren't in the rate index, so absorb exactly the
+		// not-found case; any other failure is index corruption.
+		match T::VaultLists::remove(&VaultListId::Rate(collateral_id.clone()), &owner) {
+			Ok(()) | Err(ListError::ItemNotFound) => {},
+			Err(_) => return Err(Error::<T>::RateIndexInvariantBroken.into()),
+		}
 
 		if !allocation.redistribution_collateral.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
@@ -316,11 +306,12 @@ impl<T: Config> VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>
 			}
 			if matches!(status, VaultStatus::Active | VaultStatus::Dormant) {
 				if new_total.is_zero() {
-					if bs.dormant_redemption_target.as_ref() == Some(&owner) {
-						bs.dormant_redemption_target = None;
-					}
-				} else if new_total < cfg.minimum_debt {
-					bs.dormant_redemption_target = Some(owner.clone());
+					bs.release_dormant_target(&owner);
+				} else if new_total < cfg.minimum_debt && !bs.try_park_dormant_target(owner.clone())
+				{
+					// A stale snapshot that would displace a different
+					// debt-bearing Dormant fails.
+					return Err(Error::<T>::DormantTargetOccupied.into());
 				}
 			}
 			Ok(())

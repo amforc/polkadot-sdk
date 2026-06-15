@@ -76,7 +76,7 @@ fn borrow_emits_borrowed() {
 			DOT,
 			500,
 			None,
-			None,
+			1,
 			Position::endpoints_only(),
 		));
 		assert_event(crate::Event::Borrowed {
@@ -97,7 +97,7 @@ fn withdraw_collateral_emits_collateral_withdrawn() {
 			RuntimeOrigin::signed(1),
 			DOT,
 			100,
-			None,
+			1,
 		));
 		assert_event(crate::Event::CollateralWithdrawn {
 			collateral_id: DOT,
@@ -301,6 +301,19 @@ fn enter_final_recovery_emits_status_change_and_fifo_entry() {
 			owner: 1,
 			old_status: crate::types::VaultStatus::Active,
 			new_status: crate::types::VaultStatus::FinalRecovery,
+		});
+	});
+}
+
+#[test]
+fn set_debt_ceiling_emits_debt_ceiling_updated() {
+	build_and_execute(|| {
+		register_default_branch();
+		assert_ok!(crate::Pallet::<Test>::set_debt_ceiling(RuntimeOrigin::root(), DOT, 50_000_000));
+		assert_event(crate::Event::DebtCeilingUpdated {
+			collateral_id: DOT,
+			old_value: 100_000_000,
+			new_value: 50_000_000,
 		});
 	});
 }

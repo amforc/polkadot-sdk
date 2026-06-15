@@ -6,7 +6,9 @@
 
 use crate::{
 	helpers,
-	pallet::{BalanceOf, BranchStates, Branches, Config, HoldReason, MomentOf, Pallet, Vaults},
+	pallet::{
+		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, MomentOf, Pallet, Vaults,
+	},
 	types::{BranchConfig, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
 };
@@ -248,10 +250,12 @@ fn recovery_cycle<T: Config>(
 }
 
 fn prefill_branches<T: Config>(count: u32) {
-	let ids: Vec<T::AssetId> = (0..count).map(T::BenchmarkHelper::synth_asset_id).collect();
-	let bounded: BoundedVec<T::AssetId, T::MaxBranches> =
-		ids.try_into().expect("prefill count <= MaxBranches");
-	Branches::<T>::put(bounded);
+	// The registry is the `BranchConfigs` key set, and its counted variant tracks
+	// the capacity gate, so seeding configs is enough to fill the registry.
+	for seed in 0..count {
+		let asset = T::BenchmarkHelper::synth_asset_id(seed);
+		BranchConfigs::<T>::insert(asset, default_branch_config::<T>());
+	}
 }
 
 #[benchmarks]
@@ -318,7 +322,7 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller.clone()), asset.clone(), withdraw, None);
+		_(RawOrigin::Signed(caller.clone()), asset.clone(), withdraw, caller.clone());
 
 		assert!(Vaults::<T>::contains_key(&asset, &caller));
 		Ok(())
@@ -348,7 +352,14 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller.clone()), asset.clone(), extra_debt, new_rate, None, hint);
+		_(
+			RawOrigin::Signed(caller.clone()),
+			asset.clone(),
+			extra_debt,
+			new_rate,
+			caller.clone(),
+			hint,
+		);
 
 		assert!(Vaults::<T>::contains_key(&asset, &caller));
 		Ok(())
@@ -524,6 +535,65 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 		let caller: T::AccountId = whitelisted_caller();
 		let hint = worst_case_head_hint::<T>(&seeds)?;
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(caller), owner.clone(), asset.clone(), hint);
+
+		assert_eq!(Pallet::<T>::vault_status(asset, owner), Some(VaultStatus::Active));
+		Ok(())
+	}
+
+	#[benchmark]
+	fn activate_dormant() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		// A background vault keeps the branch alive while the target is dormant.
+		let background = funded_account::<T>("background", &asset);
+		Pallet::<T>::open_vault(
+			RawOrigin::Signed(background).into(),
+			asset.clone(),
+			balance::<T>(SEED_COLL),
+			balance::<T>(SEED_DEBT),
+			rate(5, 100),
+			Position::endpoints_only(),
+		)?;
+		let owner = funded_account::<T>("target", &asset);
+		let owner_rate = rate(5, 100);
+		Pallet::<T>::open_vault(
+			RawOrigin::Signed(owner.clone()).into(),
+			asset.clone(),
+			balance::<T>(SEED_COLL),
+			balance::<T>(SEED_DEBT),
+			owner_rate,
+			Position::endpoints_only(),
+		)?;
+		// Redeem the target to just below `minimum_debt`, leaving a debt-bearing
+		// Dormant vault outside the rate index.
+		let total_debt = <Pallet<T> as VaultRedemptionInterface<
+			T::AccountId,
+			T::AssetId,
+			BalanceOf<T>,
+		>>::touch_for_redemption(asset.clone(), owner.clone())?;
+		let remaining = balance::<T>(199);
+		let redeemer: T::AccountId = whitelisted_caller();
+		<Pallet<T> as VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>>::apply_redemption(
+			asset.clone(),
+			owner.clone(),
+			redeemer,
+			RedemptionAllocation {
+				debt_to_cancel: total_debt.saturating_sub(remaining),
+				collateral_to_redeemer: BalanceOf::<T>::zero(),
+				fee_collateral_retained: BalanceOf::<T>::zero(),
+			},
+		)?;
+		assert_eq!(
+			Pallet::<T>::vault_status(asset.clone(), owner.clone()),
+			Some(VaultStatus::Dormant)
+		);
+		// Accrue interest until the fully-accrued debt is back at/above
+		// `minimum_debt`, so the vault is activation-eligible.
+		T::BenchmarkHelper::advance_time(ONE_HOUR_MS.saturating_mul(24 * 365 * 2));
+		let hint = T::VaultLists::find_position(&VaultListId::Rate(asset.clone()), owner_rate);
+		let caller: T::AccountId = whitelisted_caller();
 
 		#[extrinsic_call]
 		_(RawOrigin::Signed(caller), owner.clone(), asset.clone(), hint);
