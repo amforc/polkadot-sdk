@@ -6,7 +6,7 @@ pub fn compute_tcr<T: Config>(
 	price: FixedU128,
 	now: MomentOf<T>,
 ) -> Result<FixedU128, DispatchError> {
-	let elapsed = millis_diff::<T>(now, bs.debt.last_interest_update);
+	let elapsed = millis_diff::<T>(bs.interest_time(now), bs.debt.last_interest_time);
 	let pending_aggregate =
 		math::simple_interest_ceil(bs.debt.weighted_principal_sum, FixedU128::one(), elapsed);
 	let total_debt = bs
@@ -28,27 +28,24 @@ pub fn compute_tcr<T: Config>(
 		.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 }
 
-/// Mint and route newly accrued aggregate interest. After this call, the
-/// branch debt's `last_interest_update` is `now` and its `minted_interest`
-/// reflects the freshly minted total.
+/// Mint and route newly accrued aggregate interest. After this call, the branch
+/// debt's `last_interest_time` equals `interest_time(now)` and its
+/// `minted_interest` reflects the freshly minted total. While the branch is
+/// Frozen `interest_time(now)` is constant, so repeated calls mint nothing.
 pub fn update_aggregate_interest<T: Config>(
 	collateral_id: &T::AssetId,
 	now: MomentOf<T>,
 ) -> Result<(), DispatchError> {
 	BranchStates::<T>::try_mutate(collateral_id, |maybe| -> Result<_, DispatchError> {
 		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		// Frozen branches do not accrue further aggregate interest.
-		if bs.is_frozen() {
-			bs.debt.last_interest_update = now;
-			return Ok(());
-		}
-		let elapsed = millis_diff::<T>(now, bs.debt.last_interest_update);
+		let tau = bs.interest_time(now);
+		let elapsed = millis_diff::<T>(tau, bs.debt.last_interest_time);
 		if elapsed == 0 {
 			return Ok(());
 		}
 		let new_interest =
 			math::simple_interest_ceil(bs.debt.weighted_principal_sum, FixedU128::one(), elapsed);
-		bs.debt.last_interest_update = now;
+		bs.debt.last_interest_time = tau;
 		if new_interest.is_zero() {
 			return Ok(());
 		}
@@ -128,7 +125,8 @@ pub(crate) fn pending_touch_for<T: Config>(
 	bs: &BranchState<T::AccountId, BalanceOf<T>, MomentOf<T>>,
 	now: MomentOf<T>,
 ) -> PendingTouch<BalanceOf<T>> {
-	let elapsed = millis_diff::<T>(now, vault.last_interest_update);
+	let tau = bs.interest_time(now);
+	let elapsed = millis_diff::<T>(tau, vault.last_interest_time);
 	let principal_interest =
 		math::simple_interest_floor(vault.debt.principal, vault.annual_rate, elapsed);
 
@@ -155,11 +153,11 @@ pub(crate) fn pending_touch_for<T: Config>(
 	// `(now - last_redist) * delta_debt_per_stake - delta_debt_time_per_stake`
 	// is the area-under-the-curve giving redistributed-debt × time-since
 	// per stake. Multiply by `rate / year` for the interest accrued on the
-	// redistributed principal since redistribution. Timestamps here are
-	// epoch-relative — the common origin cancels in the subtraction and keeps
-	// the products at branch-age scale; both writers of
-	// `debt_time_per_stake` must use the same origin.
-	let now_fp = FixedU128::saturating_from_integer(millis_diff::<T>(now, bs.epoch));
+	// redistributed principal since redistribution. Timestamps here are in
+	// branch interest time — the common origin cancels in the subtraction and
+	// keeps the products at branch-age scale; both writers of
+	// `debt_time_per_stake` must use the same interest-time origin.
+	let now_fp = FixedU128::saturating_from_integer(moment_to_millis::<T>(tau));
 	let extra_per_stake =
 		now_fp.saturating_mul(delta_debt_per_stake).saturating_sub(delta_dt_per_stake);
 	let rate_factor = vault
@@ -247,7 +245,7 @@ pub fn touch_vault<T: Config>(
 	if vault.redist_snapshot != bs.redist {
 		vault.redist_snapshot = bs.redist;
 	}
-	vault.last_interest_update = now;
+	vault.last_interest_time = bs.interest_time(now);
 
 	// FinalRecovery vaults are excluded from stake accounting entirely; their
 	// `redistribution_stake` is zeroed on entry and stays zero until they exit.

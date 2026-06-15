@@ -172,7 +172,7 @@ fn finalize_liquidation_rejects_collateral_payout_above_held() {
 	});
 }
 
-// Liquidating the vault parked as `last_dormant_vault_owner` must clear the
+// Liquidating the vault parked as `dormant_redemption_target` must clear the
 // pointer along with the row, or it dangles at a missing vault.
 #[test]
 fn liquidating_parked_dormant_owner_clears_pointer() {
@@ -184,7 +184,7 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 		// parks it as the next redemption target.
 		assert_ok!(redeem(DOT, 3, 350));
 		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
-		assert_eq!(bs.last_dormant_vault_owner, Some(1));
+		assert_eq!(bs.dormant_redemption_target, Some(1));
 
 		// Crash the price so the dormant husk is liquidatable, then liquidate.
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
@@ -192,6 +192,6 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 
 		assert!(crate::pallet::Vaults::<Test>::get(DOT, 1).is_none());
 		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
-		assert_eq!(bs.last_dormant_vault_owner, None, "pointer cleared with the row");
+		assert_eq!(bs.dormant_redemption_target, None, "pointer cleared with the row");
 	});
 }

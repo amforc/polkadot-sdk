@@ -12,7 +12,7 @@ use crate::{
 	recovery,
 	types::{
 		BranchConfig, BranchDebt, BranchMode, BranchStakes, BranchState, DebtPayment, FrozenReason,
-		FrozenState, RedistSnapshot, Vault, VaultDebt, VaultListId, VaultStatus,
+		FrozenState, InterestClock, RedistSnapshot, Vault, VaultDebt, VaultListId, VaultStatus,
 	},
 	weights::WeightInfo,
 };
@@ -41,7 +41,7 @@ use frame::{
 use pallet_linked_list::{ListError, Position, SortedListInterface};
 use pusd_primitives::ProvidePrice;
 
-fn moment_to_millis<T: Config>(m: MomentOf<T>) -> u64 {
+pub(crate) fn moment_to_millis<T: Config>(m: MomentOf<T>) -> u64 {
 	use frame::deps::sp_runtime::traits::SaturatedConversion;
 	m.saturated_into::<u64>()
 }

@@ -17,6 +17,12 @@ use pallet_linked_list::SortedListInterface;
 
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 
+// Branch interest time at wall-clock `now` — the value `touch_vault` stamps into
+// `last_interest_time`. Differs from raw `now` by the branch epoch base.
+fn interest_time_at(asset: AssetId, now: Moment) -> Moment {
+	crate::pallet::BranchStates::<Test>::get(asset).unwrap().interest_time(now)
+}
+
 // Helper: top up `who`'s pUSD balance by `delta` so that subsequent
 // repay_for / etc. doesn't trip on the upfront-fee residual.
 fn top_up_pusd(who: AccountId, donor: AccountId, delta: Balance) {
@@ -43,19 +49,28 @@ fn open_sets_annual_rate() {
 }
 
 #[test]
-fn open_sets_last_interest_update_to_now() {
+fn open_sets_last_interest_time_to_now() {
 	build_and_execute(|| {
 		register_default_branch();
 		let t0 = pallet_timestamp::Pallet::<Test>::get();
 		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(5, 100)));
-		assert_eq!(Vaults::<Test>::get(DOT, 1).unwrap().last_interest_update, t0);
+		assert_eq!(
+			Vaults::<Test>::get(DOT, 1).unwrap().last_interest_time,
+			interest_time_at(DOT, t0)
+		);
 		// Advance time, open a second vault — last-update for that vault is
 		// the new `now`, while the first vault keeps its original stamp.
 		advance_time(1_000);
 		let t1 = pallet_timestamp::Pallet::<Test>::get();
 		assert_ok!(open(2, DOT, 1_000, 2_000, rate_pct(5, 100)));
-		assert_eq!(Vaults::<Test>::get(DOT, 1).unwrap().last_interest_update, t0);
-		assert_eq!(Vaults::<Test>::get(DOT, 2).unwrap().last_interest_update, t1);
+		assert_eq!(
+			Vaults::<Test>::get(DOT, 1).unwrap().last_interest_time,
+			interest_time_at(DOT, t0)
+		);
+		assert_eq!(
+			Vaults::<Test>::get(DOT, 2).unwrap().last_interest_time,
+			interest_time_at(DOT, t1)
+		);
 	});
 }
 
@@ -116,7 +131,7 @@ fn change_rate_sets_new_rate() {
 	});
 }
 
-// Post-cooldown change_rate refreshes last_interest_update and folds the
+// Post-cooldown change_rate refreshes last_interest_time and folds the
 // elapsed simple interest into `vault.debt.interest`. With no upfront fee
 // charged (cooldown elapsed), the interest-bearing principal is unchanged.
 //
@@ -146,11 +161,11 @@ fn change_rate_post_cooldown_full_state() {
 		));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 
-		// last_interest_update == now (touch ran inside change_rate).
-		assert_eq!(v_post.last_interest_update, now_before_call);
+		// last_interest_time == now (touch ran inside change_rate).
+		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 		// No fee charged post-cooldown, so principal is unchanged.
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
-		// Pending interest at the new last_interest_update is zero by
+		// Pending interest at the new last_interest_time is zero by
 		// construction (touch_vault moved any sim-pending into the accrued
 		// component). Accrued grew by the materialised pending.
 		assert!(v_post.debt.interest >= v_pre.debt.interest);
@@ -222,7 +237,7 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 	});
 }
 
-// Borrow refreshes last_interest_update, applies pending into accrued,
+// Borrow refreshes last_interest_time, applies pending into accrued,
 // charges the upfront fee, and grows recorded principal by exactly the
 // borrowed amount.
 //
@@ -252,8 +267,8 @@ fn borrow_full_state_changes() {
 		));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 
-		// last_interest_update advances to now.
-		assert_eq!(v_post.last_interest_update, now_before_call);
+		// last_interest_time advances to now.
+		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 		// Recorded principal grew by exactly the borrowed amount.
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
 		// Accrued grew by exactly the upfront fee (no sim-pending to
@@ -328,7 +343,7 @@ fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
 	});
 }
 
-// Repay refreshes last_interest_update, settles pending interest, reduces
+// Repay refreshes last_interest_time, settles pending interest, reduces
 // entire debt by the repaid amount, and reduces recorded debt by the
 // principal portion.
 #[test]
@@ -351,7 +366,7 @@ fn repay_full_state_changes() {
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, 500));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 
-		assert_eq!(v_post.last_interest_update, now_before_call);
+		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 
 		// Entire debt reduces by the repaid amount (since `poke` already
 		// folded prior pending interest into accrued, `repay_for(500)`
@@ -369,7 +384,7 @@ fn repay_full_state_changes() {
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal - pay_principal);
 	});
 }
-// Poke is permissionless, refreshes last_interest_update, materialises
+// Poke is permissionless, refreshes last_interest_time, materialises
 // sim-pending into accrued, and leaves principal unchanged.
 //
 // Storage exposes only `interest_bearing_debt + accrued_interest`, i.e. the
@@ -390,10 +405,10 @@ fn poke_full_state_changes() {
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), 1, DOT));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 
-		assert_eq!(v_post.last_interest_update, now_before_call);
+		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 		// Recorded principal unchanged.
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
-		// Pending at the new last_interest_update is zero by construction; the
+		// Pending at the new last_interest_time is zero by construction; the
 		// accrued component grew by the materialised sim-pending.
 		assert!(v_post.debt.interest >= v_pre.debt.interest);
 	});
@@ -423,7 +438,7 @@ fn poke_after_full_repayment_errors_vault_not_found() {
 	});
 }
 
-// Redemption refreshes last_interest_update on the redeemed vault, applies
+// Redemption refreshes last_interest_time on the redeemed vault, applies
 // pending interest, reduces entire debt by the redeemed amount, and reduces
 // recorded debt accordingly. Tested through the `VaultRedemptionInterface`
 // trait (no `redeem` extrinsic exists yet).
@@ -446,7 +461,7 @@ fn redemption_full_state_changes() {
 		assert_eq!(target, 1);
 
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
-		assert_eq!(v_post.last_interest_update, now_before_call);
+		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 
 		// Entire debt reduces by the redeemed amount.
 		let entire_pre = v_pre.debt.principal + v_pre.debt.interest;

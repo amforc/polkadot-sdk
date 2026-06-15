@@ -272,7 +272,7 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 		assert!(vault_status(DOT, 1).is_dormant());
 		assert_eq!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, 10), alloc::vec![2]);
 		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("bs");
-		assert_eq!(bs.last_dormant_vault_owner, Some(1));
+		assert_eq!(bs.dormant_redemption_target, Some(1));
 	});
 }
 
