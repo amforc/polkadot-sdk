@@ -140,10 +140,9 @@ pub fn withdraw_collateral<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 	amount: BalanceOf<T>,
-	recipient: Option<T::AccountId>,
+	recipient: T::AccountId,
 ) -> Result<(), DispatchError> {
 	ensure_not_frozen::<T>(&collateral_id)?;
-	let recipient = recipient.unwrap_or(owner.clone());
 
 	let now = T::TimeProvider::now();
 	let price = T::Oracle::provide_price(&collateral_id)?.price;
@@ -206,11 +205,10 @@ pub fn borrow<T: Config>(
 	collateral_id: T::AssetId,
 	amount: BalanceOf<T>,
 	maybe_new_rate: Option<FixedU128>,
-	recipient: Option<T::AccountId>,
+	recipient: T::AccountId,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
 	ensure_not_frozen::<T>(&collateral_id)?;
-	let recipient = recipient.unwrap_or(owner.clone());
 
 	let now = T::TimeProvider::now();
 	let price = T::Oracle::provide_price(&collateral_id)?.price;
@@ -264,8 +262,8 @@ pub fn borrow<T: Config>(
 	let post_tcr = compute_tcr::<T>(&bs_after, price, now)?;
 	enforce_mode_rules::<T>(&cfg, &bs_before, pre_tcr, post_tcr, false)?;
 
-	if dormant_to_active && bs_after.dormant_redemption_target.as_ref() == Some(&owner) {
-		bs_after.dormant_redemption_target = None;
+	if dormant_to_active {
+		bs_after.release_dormant_target(&owner);
 	}
 
 	T::StableAsset::mint_into(&recipient, amount)?;
@@ -495,9 +493,7 @@ fn close_inner<T: Config>(
 	}
 	bs_after.detach_vault(vault);
 	bs_after.remove_collateral(coll);
-	if bs_after.dormant_redemption_target.as_ref() == Some(owner) {
-		bs_after.dormant_redemption_target = None;
-	}
+	bs_after.release_dormant_target(owner);
 
 	// Closing the last debt-bearing vault settles the branch.
 	let branch_empties = bs_after.is_empty_of_liability();
@@ -660,8 +656,10 @@ pub fn exit_final_recovery<T: Config>(
 		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
 		vault.redist_snapshot = bs.redist;
 		bs.refresh_vault_stake(vault.annual_rate, BalanceOf::<T>::zero(), coll);
-		if !rejoin_active && !total_debt.is_zero() {
-			bs.dormant_redemption_target = Some(owner.clone());
+		// Park a sub-`MinimumDebt` Dormant only in a free slot; never displace an
+		// existing debt-bearing target.
+		if !rejoin_active && !total_debt.is_zero() && !bs.try_park_dormant_target(owner.clone()) {
+			return Err(Error::<T>::DormantTargetOccupied.into());
 		}
 		Ok(())
 	})?;
@@ -684,6 +682,45 @@ pub fn exit_final_recovery<T: Config>(
 	Ok(())
 }
 
+/// Permissionless Dormant → Active revival. Touches the vault, requires it to be
+/// `Dormant` with fully-accrued `Debt >= MinimumDebt`, reinserts it into the rate
+/// index at `hint`, and clears the dormant redemption slot if it pointed here.
+#[require_transactional]
+pub fn activate_dormant<T: Config>(
+	owner: T::AccountId,
+	collateral_id: T::AssetId,
+	hint: Position<T::AccountId>,
+) -> Result<(), DispatchError> {
+	ensure_not_frozen::<T>(&collateral_id)?;
+	let now = T::TimeProvider::now();
+	update_aggregate_interest::<T>(&collateral_id, now)?;
+	let vault = touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
+	ensure!(vault.status::<T>(&collateral_id, &owner).is_dormant(), Error::<T>::InvalidVaultStatus);
+	let cfg = branch_cfg_of::<T>(&collateral_id)?;
+	ensure!(vault.debt.total() >= cfg.minimum_debt, Error::<T>::DebtBelowMinimum);
+
+	T::VaultLists::insert(
+		VaultListId::Rate(collateral_id.clone()),
+		owner.clone(),
+		vault.annual_rate,
+		hint,
+	)
+	.map_err(map_error::<T>)?;
+	BranchStates::<T>::mutate(&collateral_id, |maybe| {
+		if let Some(bs) = maybe {
+			bs.release_dormant_target(&owner);
+		}
+	});
+
+	Pallet::<T>::deposit_event(Event::VaultStatusChanged {
+		collateral_id,
+		owner,
+		old_status: VaultStatus::Dormant,
+		new_status: VaultStatus::Active,
+	});
+	Ok(())
+}
+
 /// Refresh the next handful of vaults across each branch using the cursor.
 pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 	let per_call = T::WeightInfo::on_idle_one_vault();
@@ -701,7 +738,8 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 		let _ = with_storage_layer(|| touch_vault::<T>(collateral_id, owner, now));
 		true
 	};
-	for collateral_id in Branches::<T>::get().iter() {
+	for collateral_id in BranchConfigs::<T>::iter_keys() {
+		let collateral_id = &collateral_id;
 		if budget == 0 || (remaining.saturating_sub(consumed)).any_lt(per_call) {
 			break;
 		}

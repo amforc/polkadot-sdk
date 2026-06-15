@@ -226,6 +226,7 @@ impl pallet_vaults::Config for Test {
 	type SpYieldSink = DropYieldSink;
 	type SpYieldShare = SpYieldShare;
 	type FeeHandler = DropFeeHandler;
+	type OnBranchRegistered = ();
 	type TimeProvider = Timestamp;
 	type ManagerOrigin = VaultsManagerOrigin;
 	type PalletId = VaultsPalletId;
@@ -463,13 +464,10 @@ pub fn liquidate_with(
 	owner: AccountId,
 	build: impl FnOnce(Balance) -> LiquidationAllocation<AccountId, Balance>,
 ) -> DispatchResult {
-	let post_touch =
-		<Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, Balance>>::prepare_liquidation(
-			asset.clone(), owner,
-		)?;
-	let alloc = build(post_touch);
-	<Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, Balance>>::finalize_liquidation(
-		asset, owner, alloc,
+	<Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, Balance>>::execute_liquidation(
+		asset,
+		owner,
+		|snapshot| Ok(build(snapshot.debt)),
 	)
 }
 

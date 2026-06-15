@@ -46,10 +46,10 @@ pub fn register_branch<T: Config>(
 		T::CollateralAssets::asset_exists(collateral_id.clone()),
 		Error::<T>::UnknownCollateral
 	);
-	Branches::<T>::try_mutate(|list| -> Result<_, DispatchError> {
-		list.try_push(collateral_id.clone()).map_err(|_| Error::<T>::TooManyBranches)?;
-		Ok(())
-	})?;
+	ensure!(
+		BranchConfigs::<T>::count() < <T::MaxBranches as Get<u32>>::get(),
+		Error::<T>::TooManyBranches
+	);
 	BranchConfigs::<T>::insert(&collateral_id, config);
 	let now = T::TimeProvider::now();
 	BranchStates::<T>::insert(
@@ -78,6 +78,7 @@ pub fn register_branch<T: Config>(
 			frozen: None,
 		},
 	);
+	T::OnBranchRegistered::on_branch_registered(&collateral_id)?;
 	Pallet::<T>::deposit_event(Event::BranchRegistered { collateral_id });
 	Ok(())
 }
@@ -107,13 +108,22 @@ pub fn enable_frozen_mode<T: Config>(collateral_id: &T::AssetId) -> Result<(), D
 	if branch_state_of::<T>(collateral_id)?.is_frozen() {
 		return Ok(());
 	}
-	// Mint interest up to the entry moment so the frozen window itself accrues
-	// nothing; after this, `interest_time(now)` is pinned until unfreeze.
+	enter_frozen::<T>(collateral_id, FrozenReason::Governance)
+}
+
+/// Flush interest up to `now`, then persist `Frozen { reason, entered_at: now }`
+/// and emit `ModeChanged`. The pre-freeze flush pins `interest_time(now)` so the
+/// frozen window itself accrues nothing.
+#[require_transactional]
+fn enter_frozen<T: Config>(
+	collateral_id: &T::AssetId,
+	reason: FrozenReason,
+) -> Result<(), DispatchError> {
 	let now = T::TimeProvider::now();
 	update_aggregate_interest::<T>(collateral_id, now)?;
 	BranchStates::<T>::try_mutate(collateral_id, |maybe| -> Result<_, DispatchError> {
 		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		bs.frozen = Some(FrozenState { reason: FrozenReason::Governance, entered_at: now });
+		bs.frozen = Some(FrozenState { reason, entered_at: now });
 		Pallet::<T>::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
 			old_mode: BranchMode::Normal,
@@ -153,19 +163,7 @@ pub fn refresh_branch<T: Config>(collateral_id: &T::AssetId) -> Result<(), Dispa
 }
 
 fn freeze_oracle<T: Config>(collateral_id: &T::AssetId) -> Result<(), DispatchError> {
-	// Mint interest up to the entry moment so the frozen window accrues nothing.
-	let now = T::TimeProvider::now();
-	update_aggregate_interest::<T>(collateral_id, now)?;
-	BranchStates::<T>::try_mutate(collateral_id, |maybe| -> Result<_, DispatchError> {
-		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		bs.frozen = Some(FrozenState { reason: FrozenReason::OracleFailure, entered_at: now });
-		Pallet::<T>::deposit_event(Event::ModeChanged {
-			collateral_id: collateral_id.clone(),
-			old_mode: BranchMode::Normal,
-			new_mode: BranchMode::Frozen,
-		});
-		Ok(())
-	})
+	enter_frozen::<T>(collateral_id, FrozenReason::OracleFailure)
 }
 
 fn clear_frozen<T: Config>(

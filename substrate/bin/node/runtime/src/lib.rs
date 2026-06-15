@@ -3287,6 +3287,7 @@ impl pallet_vaults::Config for Runtime {
 	type SpYieldSink = ();
 	type SpYieldShare = VaultsSpYieldShare;
 	type FeeHandler = ();
+	type OnBranchRegistered = ();
 	type TimeProvider = Timestamp;
 	type ManagerOrigin = EnsureVaultsManager;
 	type PalletId = VaultsPalletId;
