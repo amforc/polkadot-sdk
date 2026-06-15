@@ -31,7 +31,7 @@ pub fn open_vault<T: Config>(
 	let vault = Vault {
 		debt: VaultDebt { principal: initial_debt, interest: upfront_fee },
 		annual_rate,
-		last_interest_update: now,
+		last_interest_time: bs_before.interest_time(now),
 		last_rate_update: now,
 		redistribution_stake: initial_collateral,
 		redist_snapshot: bs_before.redist,
@@ -264,8 +264,8 @@ pub fn borrow<T: Config>(
 	let post_tcr = compute_tcr::<T>(&bs_after, price, now)?;
 	enforce_mode_rules::<T>(&cfg, &bs_before, pre_tcr, post_tcr, false)?;
 
-	if dormant_to_active && bs_after.last_dormant_vault_owner.as_ref() == Some(&owner) {
-		bs_after.last_dormant_vault_owner = None;
+	if dormant_to_active && bs_after.dormant_redemption_target.as_ref() == Some(&owner) {
+		bs_after.dormant_redemption_target = None;
 	}
 
 	T::StableAsset::mint_into(&recipient, amount)?;
@@ -495,8 +495,8 @@ fn close_inner<T: Config>(
 	}
 	bs_after.detach_vault(vault);
 	bs_after.remove_collateral(coll);
-	if bs_after.last_dormant_vault_owner.as_ref() == Some(owner) {
-		bs_after.last_dormant_vault_owner = None;
+	if bs_after.dormant_redemption_target.as_ref() == Some(owner) {
+		bs_after.dormant_redemption_target = None;
 	}
 
 	// Closing the last debt-bearing vault settles the branch.
@@ -621,7 +621,7 @@ pub fn enter_final_recovery<T: Config>(
 /// - if `debt >= MinimumDebt` rejoins the rate index using the caller-supplied `hint` (status →
 ///   Active, O(1) with valid hint),
 /// - otherwise leaves the vault out of the index (status → Dormant) and parks the owner in
-///   `last_dormant_vault_owner` so the next redemption can pick it up. The `hint` argument is
+///   `dormant_redemption_target` so the next redemption can pick it up. The `hint` argument is
 ///   ignored in the Dormant branch.
 #[require_transactional]
 pub fn exit_final_recovery<T: Config>(
@@ -661,7 +661,7 @@ pub fn exit_final_recovery<T: Config>(
 		vault.redist_snapshot = bs.redist;
 		bs.refresh_vault_stake(vault.annual_rate, BalanceOf::<T>::zero(), coll);
 		if !rejoin_active && !total_debt.is_zero() {
-			bs.last_dormant_vault_owner = Some(owner.clone());
+			bs.dormant_redemption_target = Some(owner.clone());
 		}
 		Ok(())
 	})?;
@@ -709,7 +709,7 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 		// live oracle. Ignore errors: a stuck branch just stays as-is.
 		let _ = refresh_branch::<T>(collateral_id);
 		// One aggregate-interest mint per branch; touch_vault has no work to do
-		// until the branch's `last_interest_update` advances.
+		// until the branch's `last_interest_time` advances.
 		if update_aggregate_interest::<T>(collateral_id, now).is_err() {
 			continue;
 		}
@@ -718,7 +718,7 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 		let initial_cursor = branch.idle_cursor.or_else(|| T::VaultLists::head(&rate_list));
 		let mut cursor = initial_cursor.clone();
 		let final_recovery_head = recovery::next_target::<T>(collateral_id);
-		let last_dormant = branch.last_dormant_vault_owner;
+		let dormant_target = branch.dormant_redemption_target;
 
 		while budget > 0 {
 			let Some(owner) = cursor.clone() else { break };
@@ -745,7 +745,7 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 		if let Some(owner) = final_recovery_head {
 			try_extra(owner, &mut budget, &mut consumed);
 		}
-		if let Some(owner) = last_dormant {
+		if let Some(owner) = dormant_target {
 			try_extra(owner, &mut budget, &mut consumed);
 		}
 

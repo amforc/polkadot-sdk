@@ -44,7 +44,7 @@ fn open_vault_emits_canonical_events() {
 }
 
 // A third-party deposit emits CollateralDeposited (`from` = caller, `owner` =
-// vault owner); there is no single combined "adjust" event.
+// vault owner).
 #[test]
 fn deposit_collateral_emits_collateral_deposited() {
 	build_and_execute(|| {

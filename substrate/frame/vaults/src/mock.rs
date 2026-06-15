@@ -443,8 +443,7 @@ pub fn open(
 }
 
 /// Drive a liquidation through the trait surface. The allocation absorbs all
-/// post-touch debt into the offset path (orchestrator-side coll movement is
-/// not modeled — there is no Stability Pool in the unit-test mock); held
+/// post-touch debt into the offset path; held
 /// collateral falls through to the owner as surplus. Use this when a test
 /// just needs the vault row removed.
 pub fn liquidate(asset: AssetId, owner: AccountId) -> DispatchResult {
