@@ -56,7 +56,7 @@ fn list_from_tail<T: Config>(list: VaultListId<T::AssetId>) -> impl Iterator<Ite
 }
 
 /// The source of a branch's redemption-order priority, riskiest first:
-/// `FinalRecovery` FIFO (oldest first) → `last_dormant_vault_owner` → rate index
+/// `FinalRecovery` FIFO (oldest first) → `dormant_redemption_target` → rate index
 /// (tail-first). Lazy and allocation-free: consumers `take(n)` for the queue
 /// view or `.next()` for the next target, and only the tiers they reach are
 /// read from storage.
@@ -66,7 +66,7 @@ pub(crate) fn redemption_targets<T: Config>(
 	let fifo = list_from_tail::<T>(VaultListId::FinalRecovery(collateral_id.clone()));
 	let dormant_branch = collateral_id.clone();
 	let dormant = core::iter::once(()).flat_map(move |()| {
-		BranchStates::<T>::get(&dormant_branch).and_then(|bs| bs.last_dormant_vault_owner)
+		BranchStates::<T>::get(&dormant_branch).and_then(|bs| bs.dormant_redemption_target)
 	});
 	let rate = list_from_tail::<T>(VaultListId::Rate(collateral_id.clone()));
 	fifo.chain(dormant).chain(rate)

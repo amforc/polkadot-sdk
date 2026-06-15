@@ -62,7 +62,8 @@ pub fn register_branch<T: Config>(
 				pending_redist_principal: BalanceOf::<T>::zero(),
 				bad_debt: BalanceOf::<T>::zero(),
 				weighted_principal_sum: BalanceOf::<T>::zero(),
-				last_interest_update: now,
+				// Interest time is 0 at the epoch base (`now`); see `interest_time`.
+				last_interest_time: Zero::zero(),
 			},
 			stakes: BranchStakes {
 				total: BalanceOf::<T>::zero(),
@@ -70,9 +71,9 @@ pub fn register_branch<T: Config>(
 			},
 			rounding: crate::types::BranchRounding::default(),
 			redist: RedistSnapshot::default(),
-			epoch: now,
+			interest_clock: InterestClock { epoch_base: now, frozen_elapsed: Zero::zero() },
 			next_final_recovery_nonce: 0,
-			last_dormant_vault_owner: None,
+			dormant_redemption_target: None,
 			idle_cursor: None,
 			frozen: None,
 		},
@@ -103,19 +104,21 @@ pub fn update_branch_config<T: Config>(
 
 #[require_transactional]
 pub fn enable_frozen_mode<T: Config>(collateral_id: &T::AssetId) -> Result<(), DispatchError> {
+	if branch_state_of::<T>(collateral_id)?.is_frozen() {
+		return Ok(());
+	}
+	// Mint interest up to the entry moment so the frozen window itself accrues
+	// nothing; after this, `interest_time(now)` is pinned until unfreeze.
+	let now = T::TimeProvider::now();
+	update_aggregate_interest::<T>(collateral_id, now)?;
 	BranchStates::<T>::try_mutate(collateral_id, |maybe| -> Result<_, DispatchError> {
 		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		if !bs.is_frozen() {
-			bs.frozen = Some(FrozenState {
-				reason: FrozenReason::Governance,
-				entered_at: T::TimeProvider::now(),
-			});
-			Pallet::<T>::deposit_event(Event::ModeChanged {
-				collateral_id: collateral_id.clone(),
-				old_mode: BranchMode::Normal,
-				new_mode: BranchMode::Frozen,
-			});
-		}
+		bs.frozen = Some(FrozenState { reason: FrozenReason::Governance, entered_at: now });
+		Pallet::<T>::deposit_event(Event::ModeChanged {
+			collateral_id: collateral_id.clone(),
+			old_mode: BranchMode::Normal,
+			new_mode: BranchMode::Frozen,
+		});
 		Ok(())
 	})
 }
@@ -131,8 +134,8 @@ pub(crate) fn ensure_not_frozen<T: Config>(
 /// Reconcile the branch's `Frozen { OracleFailure }` state with the live
 /// oracle (DESIGN.md §8.4 / §10.1). Permissionless. Behaviour:
 ///
-/// - oracle healthy + branch frozen for `OracleFailure` → clear `frozen` and advance
-///   `last_interest_update` to suspend accrual across the Frozen window.
+/// - oracle healthy + branch frozen for `OracleFailure` → fold the frozen window into
+///   `interest_clock.frozen_elapsed`, then clear `frozen`, suspending accrual across the window.
 /// - oracle failing + branch not frozen → persist `Frozen { OracleFailure }`.
 /// - branch frozen for `Governance` → no-op (use `clear_governance_frozen_mode`).
 /// - all other combinations → no-op `Ok`.
@@ -150,12 +153,12 @@ pub fn refresh_branch<T: Config>(collateral_id: &T::AssetId) -> Result<(), Dispa
 }
 
 fn freeze_oracle<T: Config>(collateral_id: &T::AssetId) -> Result<(), DispatchError> {
+	// Mint interest up to the entry moment so the frozen window accrues nothing.
+	let now = T::TimeProvider::now();
+	update_aggregate_interest::<T>(collateral_id, now)?;
 	BranchStates::<T>::try_mutate(collateral_id, |maybe| -> Result<_, DispatchError> {
 		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		bs.frozen = Some(FrozenState {
-			reason: FrozenReason::OracleFailure,
-			entered_at: T::TimeProvider::now(),
-		});
+		bs.frozen = Some(FrozenState { reason: FrozenReason::OracleFailure, entered_at: now });
 		Pallet::<T>::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
 			old_mode: BranchMode::Normal,
@@ -173,11 +176,16 @@ fn clear_frozen<T: Config>(
 	let now = T::TimeProvider::now();
 	BranchStates::<T>::try_mutate(collateral_id, |maybe| -> Result<_, DispatchError> {
 		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
+		// Fold the frozen window into `frozen_elapsed` so that
+		// `interest_time(now)` stays continuous: the next aggregate-interest
+		// update charges only for time after the unfreeze.
+		let entered_at = bs.frozen.as_ref().map(|state| state.entered_at);
+		if let Some(entered_at) = entered_at {
+			let frozen_window = now.saturating_sub(entered_at);
+			bs.interest_clock.frozen_elapsed =
+				bs.interest_clock.frozen_elapsed.saturating_add(frozen_window);
+		}
 		bs.frozen = None;
-		// Suspend interest accrual across the Frozen window (DESIGN.md §8.4):
-		// restart the clock at `now` so the next aggregate-interest update
-		// only charges from the unfreeze moment forward.
-		bs.debt.last_interest_update = now;
 		Pallet::<T>::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
 			old_mode,
