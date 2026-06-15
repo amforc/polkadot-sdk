@@ -30,10 +30,10 @@ pub struct KeeperCompensation<AccountId, Balance> {
 }
 
 /// Allocation produced by the liquidation orchestrator and applied by
-/// [`VaultLiquidationInterface::finalize_liquidation`].
+/// [`VaultLiquidationInterface::execute_liquidation`].
 ///
-/// Redistributed debt is derived inside `finalize_liquidation` as
-/// `post_touch_debt - offset.debt`, so the orchestrator only needs to specify
+/// Redistributed debt is derived inside `execute_liquidation` as
+/// `snapshot.debt - offset.debt`, so the orchestrator only needs to specify
 /// the collateral split.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
@@ -44,25 +44,28 @@ pub struct LiquidationAllocation<AccountId, Balance> {
 	pub keeper: KeeperCompensation<AccountId, Balance>,
 }
 
-/// Two-call liquidation hook. The vault pallet implements both calls; the
-/// orchestrator (`pallet-liquidation` or equivalent) drives them in a single
-/// dispatch.
-pub trait VaultLiquidationInterface<AccountId, AssetId, Balance> {
-	/// Update aggregate interest, touch the vault, apply pending
-	/// redistribution, remove it from the rate index, subtract its post-touch
-	/// contributions from branch aggregates, and return the post-touch debt
-	/// the orchestrator must settle.
-	fn prepare_liquidation(
-		collateral_id: AssetId,
-		owner: AccountId,
-	) -> Result<Balance, DispatchError>;
+/// Fully-accrued vault figures handed to the allocation builder. These are the
+/// post-touch numbers the orchestrator must size its allocation against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LiquidationSnapshot<Balance> {
+	/// Post-touch total debt to settle.
+	pub debt: Balance,
+	/// Collateral currently held against the vault.
+	pub collateral: Balance,
+}
 
-	/// Re-read the post-touch debt and held collateral, validate the
-	/// allocation against current state, advance redistribution accumulators,
-	/// pay offset/keeper/owner-surplus, and remove the vault row.
-	fn finalize_liquidation(
+/// Returning `Err` from `build_allocation`, or producing an invalid allocation,
+/// rolls the whole call back, so a rejected liquidation never leaves partial
+/// state behind.
+pub trait VaultLiquidationInterface<AccountId, AssetId, Balance> {
+	fn execute_liquidation<BuildAllocation>(
 		collateral_id: AssetId,
 		owner: AccountId,
-		allocation: LiquidationAllocation<AccountId, Balance>,
-	) -> DispatchResult;
+		build_allocation: BuildAllocation,
+	) -> DispatchResult
+	where
+		BuildAllocation: FnOnce(
+			LiquidationSnapshot<Balance>,
+		)
+			-> Result<LiquidationAllocation<AccountId, Balance>, DispatchError>;
 }

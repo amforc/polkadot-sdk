@@ -13,6 +13,7 @@ pub trait WeightInfo {
 	fn poke() -> Weight;
 	fn enter_final_recovery() -> Weight;
 	fn exit_final_recovery() -> Weight;
+	fn activate_dormant() -> Weight;
 	fn register_branch() -> Weight;
 	fn set_param() -> Weight;
 	fn enable_frozen_mode() -> Weight;
@@ -50,6 +51,9 @@ impl WeightInfo for () {
 		Weight::zero()
 	}
 	fn exit_final_recovery() -> Weight {
+		Weight::zero()
+	}
+	fn activate_dormant() -> Weight {
 		Weight::zero()
 	}
 	fn register_branch() -> Weight {
