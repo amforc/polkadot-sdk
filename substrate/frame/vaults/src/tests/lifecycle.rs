@@ -8,7 +8,6 @@ use crate::{
 	pallet::{BranchStates, Vaults},
 	tests::{rate_pct, vault_status},
 };
-use frame::deps::frame_support::{assert_err, assert_noop, assert_ok};
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::BranchModeProvider;
 
@@ -16,9 +15,9 @@ use pusd_primitives::BranchModeProvider;
 fn register_branch_creates_state() {
 	build_and_execute(|| {
 		register_default_branch();
-		let bs = BranchStates::<Test>::get(DOT).expect("branch registered");
-		assert_eq!(bs.total_collateral, 0);
-		assert!(!bs.is_frozen());
+		let state = BranchStates::<Test>::get(DOT).expect("branch registered");
+		assert_eq!(state.total_collateral, 0);
+		assert!(!state.is_frozen());
 	});
 }
 
@@ -236,8 +235,8 @@ fn refresh_branch_persists_frozen_on_oracle_failure() {
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_oracle_available(false);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT));
-		let bs = BranchStates::<Test>::get(DOT).expect("bs");
-		let frozen = bs.frozen.expect("frozen persisted");
+		let state = BranchStates::<Test>::get(DOT).expect("state");
+		let frozen = state.frozen.expect("frozen persisted");
 		assert!(matches!(frozen.reason, crate::FrozenReason::OracleFailure));
 	});
 }
@@ -324,11 +323,32 @@ fn poke_during_frozen_is_noop() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
-		let bs_pre = BranchStates::<Test>::get(DOT).expect("bs");
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), 1, DOT));
-		let bs_post = BranchStates::<Test>::get(DOT).expect("bs");
+		let branch_state_pre = BranchStates::<Test>::get(DOT).expect("state");
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, 1));
+		let branch_state_post = BranchStates::<Test>::get(DOT).expect("state");
 		// No interest minted while frozen.
-		assert_eq!(bs_pre.debt.minted_interest, bs_post.debt.minted_interest);
-		assert!(bs_post.is_frozen(), "poke does not clear Frozen");
+		assert_eq!(branch_state_pre.debt.minted_interest, branch_state_post.debt.minted_interest);
+		assert!(branch_state_post.is_frozen(), "poke does not clear Frozen");
+	});
+}
+
+#[test]
+fn frozen_poke_pins_interest_clock_without_minting() {
+	build_and_execute(|| {
+		register_default_branch();
+		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
+		let before = BranchStates::<Test>::get(DOT).expect("branch state");
+
+		let elapsed: Moment = 24 * 3_600 * 1_000;
+		advance_time(elapsed);
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, 1));
+
+		let after = BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
+		assert_eq!(
+			after.debt.last_interest_time, before.debt.last_interest_time,
+			"interest clock pinned across the frozen window"
+		);
 	});
 }

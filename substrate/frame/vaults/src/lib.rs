@@ -32,8 +32,8 @@ pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
 	BranchConfig, BranchConfigUpdate, BranchDebt, BranchMode, BranchStakes, BranchState,
-	DebtPayment, FrozenReason, FrozenState, ParameterId, RedistSnapshot, Vault, VaultDebt,
-	VaultListId, VaultStatus, VaultsManagerLevel,
+	DebtPayment, FrozenReason, FrozenState, RedistributionSnapshot, Vault, VaultDebt, VaultListId,
+	VaultStatus, VaultsManagerLevel,
 };
 pub use weights::WeightInfo;
 
@@ -47,7 +47,7 @@ pub trait BenchmarkHelper<AssetId, AccountId, Balance> {
 	/// Must be hold-capable for [`HoldReason::VaultCollateral`].
 	fn collateral_asset_id() -> AssetId;
 	fn mint_collateral(asset_id: AssetId, who: &AccountId, amount: Balance);
-	fn set_oracle_price(asset_id: AssetId, price: frame::deps::sp_runtime::FixedU128);
+	fn set_oracle_price(asset_id: AssetId, price: frame::arithmetic::FixedU128);
 	fn advance_time(ms: u64);
 	fn synth_asset_id(seed: u32) -> AssetId;
 }
@@ -62,7 +62,7 @@ macro_rules! log {
 			target: $crate::LOG_TARGET,
 			concat!("[{:?}] [{}] ", $pattern),
 			<frame_system::Pallet<T>>::block_number(),
-			<$crate::Pallet::<T> as frame::deps::frame_support::traits::PalletInfoAccess>::name()
+			<$crate::Pallet::<T> as frame::traits::PalletInfoAccess>::name()
 			$(, $values)*
 		)
 	};
@@ -73,18 +73,12 @@ pub mod pallet {
 	use super::*;
 	use crate::{helpers, recovery, types::VaultsManagerLevel};
 	use frame::{
-		deps::{
-			frame_support::{
-				traits::{
-					fungible::{self, Balanced as FungibleBalanced, Mutate as FungibleMutate},
-					fungibles::{Inspect as FungiblesInspect, MutateHold as FungiblesMutateHold},
-					OnUnbalanced, Time,
-				},
-				PalletId,
-			},
-			sp_runtime::{traits::AccountIdConversion, FixedPointOperand, FixedU128, Permill},
-		},
 		prelude::*,
+		traits::{
+			fungible::{Balanced as FungibleBalanced, Mutate as FungibleMutate},
+			fungibles::{Inspect as FungiblesInspect, MutateHold as FungiblesMutateHold},
+			Time,
+		},
 	};
 	use pallet_linked_list::{Position, PriorityProvider, SortedListInterface};
 	use pusd_primitives::{BranchModeProvider, OnBranchRegistered, OnBranchYield, ProvidePrice};
@@ -92,7 +86,11 @@ pub mod pallet {
 	pub type BalanceOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
 		<T as frame_system::Config>::AccountId,
 	>>::Balance;
-	pub type MomentOf<T> = <<T as Config>::TimeProvider as Time>::Moment;
+
+	/// Pallet-local time unit: UNIX milliseconds. All vault accounting is done
+	/// in concrete `u64` milliseconds rather than a generic `Moment`; the time
+	/// provider's `Moment` is pinned to `Millis` via [`Config::TimeProvider`].
+	pub type Millis = u64;
 	pub type StableCreditOf<T> =
 		fungible::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAsset>;
 
@@ -126,7 +124,7 @@ pub mod pallet {
 			+ FungibleBalanced<Self::AccountId>;
 
 		/// The Oracle providing timestamped asset prices.
-		type Oracle: ProvidePrice<AssetId = Self::AssetId, Moment = MomentOf<Self>>;
+		type Oracle: ProvidePrice<AssetId = Self::AssetId, Moment = Millis>;
 
 		/// Branch-aware sink for the SP share of minted yield. Implemented by
 		/// `pallet-stability-pool` in production. Must consume the credit and
@@ -146,10 +144,8 @@ pub mod pallet {
 		/// per-branch rows.
 		type OnBranchRegistered: OnBranchRegistered<Self::AssetId>;
 
-		/// Time provider for fee accrual using UNIX timestamps in millis.
-		/// Moments must convert to `u64` so the pallet can compute durations
-		/// in milliseconds.
-		type TimeProvider: Time;
+		/// Time provider for fee accrual. Its `Moment` is pinned to [`Millis`].
+		type TimeProvider: Time<Moment = Millis>;
 
 		/// Origin allowed to update protocol parameters. Returns the manager
 		/// tier so the call site can gate non-defensive operations.
@@ -207,7 +203,7 @@ pub mod pallet {
 		T::AssetId,
 		Blake2_128Concat,
 		T::AccountId,
-		Vault<BalanceOf<T>, MomentOf<T>>,
+		Vault<BalanceOf<T>>,
 		OptionQuery,
 	>;
 
@@ -217,7 +213,7 @@ pub mod pallet {
 		_,
 		Twox64Concat,
 		T::AssetId,
-		BranchConfig<BalanceOf<T>, MomentOf<T>>,
+		BranchConfig<BalanceOf<T>>,
 		OptionQuery,
 		GetDefault,
 		T::MaxBranches,
@@ -229,7 +225,7 @@ pub mod pallet {
 		_,
 		Twox64Concat,
 		T::AssetId,
-		BranchState<T::AccountId, BalanceOf<T>, MomentOf<T>>,
+		BranchState<T::AccountId, BalanceOf<T>>,
 		OptionQuery,
 		GetDefault,
 		T::MaxBranches,
@@ -299,13 +295,7 @@ pub mod pallet {
 		/// The branch entered or left `Frozen` mode.
 		ModeChanged { collateral_id: T::AssetId, old_mode: BranchMode, new_mode: BranchMode },
 		/// Governance updated one branch-config parameter.
-		ParameterUpdated { collateral_id: T::AssetId, parameter: types::ParameterId },
-		/// Governance changed the branch debt ceiling.
-		DebtCeilingUpdated {
-			collateral_id: T::AssetId,
-			old_value: BalanceOf<T>,
-			new_value: BalanceOf<T>,
-		},
+		ParameterUpdated { collateral_id: T::AssetId, update: BranchConfigUpdate<BalanceOf<T>> },
 		/// A new collateral branch was registered.
 		BranchRegistered { collateral_id: T::AssetId },
 		/// A redemption cancelled vault debt in exchange for collateral.
@@ -412,10 +402,7 @@ pub mod pallet {
 			assert!(<T::MaxBranches as Get<u32>>::get() > 0, "`MaxBranches` must be > 0");
 		}
 
-		fn on_idle(
-			_block: BlockNumberFor<T>,
-			remaining: frame::deps::frame_support::weights::Weight,
-		) -> frame::deps::frame_support::weights::Weight {
+		fn on_idle(_block: BlockNumberFor<T>, remaining: Weight) -> Weight {
 			helpers::on_idle_walk::<T>(remaining)
 		}
 
@@ -586,8 +573,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::deposit_collateral_for())]
 		pub fn deposit_collateral_for(
 			origin: OriginFor<T>,
-			owner: T::AccountId,
 			collateral_id: T::AssetId,
+			owner: T::AccountId,
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let from = ensure_signed(origin)?;
@@ -629,8 +616,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::repay_for())]
 		pub fn repay_for(
 			origin: OriginFor<T>,
-			owner: T::AccountId,
 			collateral_id: T::AssetId,
+			owner: T::AccountId,
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let from = ensure_signed(origin)?;
@@ -669,8 +656,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::poke())]
 		pub fn poke(
 			origin: OriginFor<T>,
-			owner: T::AccountId,
 			collateral_id: T::AssetId,
+			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
 			helpers::poke::<T>(owner, collateral_id)
@@ -682,8 +669,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::enter_final_recovery())]
 		pub fn enter_final_recovery(
 			origin: OriginFor<T>,
-			owner: T::AccountId,
 			collateral_id: T::AssetId,
+			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
 			helpers::enter_final_recovery::<T>(owner, collateral_id)
@@ -696,8 +683,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::exit_final_recovery())]
 		pub fn exit_final_recovery(
 			origin: OriginFor<T>,
-			owner: T::AccountId,
 			collateral_id: T::AssetId,
+			owner: T::AccountId,
 			hint: Position<T::AccountId>,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
@@ -709,7 +696,7 @@ pub mod pallet {
 		pub fn register_branch(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			config: BranchConfig<BalanceOf<T>, MomentOf<T>>,
+			config: BranchConfig<BalanceOf<T>>,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
 			ensure!(matches!(level, VaultsManagerLevel::Full), Error::<T>::InsufficientPrivilege);
@@ -721,18 +708,18 @@ pub mod pallet {
 		pub fn set_minimum_collateralization_ratio(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: FixedU128,
+			ratio: FixedU128,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
-			let cfg = helpers::branch_cfg_of::<T>(&collateral_id)?;
+			let config = helpers::branch_config_of::<T>(&collateral_id)?;
 			ensure!(
 				matches!(level, VaultsManagerLevel::Full) ||
-					value >= cfg.minimum_collateralization_ratio,
+					ratio >= config.minimum_collateralization_ratio,
 				Error::<T>::DefensiveActionNotDefensive
 			);
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::MinimumCollateralizationRatio(value),
+				BranchConfigUpdate::MinimumCollateralizationRatio(ratio),
 			)
 		}
 
@@ -741,18 +728,18 @@ pub mod pallet {
 		pub fn set_initial_collateralization_ratio(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: FixedU128,
+			ratio: FixedU128,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
-			let cfg = helpers::branch_cfg_of::<T>(&collateral_id)?;
+			let config = helpers::branch_config_of::<T>(&collateral_id)?;
 			ensure!(
 				matches!(level, VaultsManagerLevel::Full) ||
-					value >= cfg.initial_collateralization_ratio,
+					ratio >= config.initial_collateralization_ratio,
 				Error::<T>::DefensiveActionNotDefensive
 			);
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::InitialCollateralizationRatio(value),
+				BranchConfigUpdate::InitialCollateralizationRatio(ratio),
 			)
 		}
 
@@ -761,18 +748,18 @@ pub mod pallet {
 		pub fn set_safety_collateralization_ratio(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: FixedU128,
+			ratio: FixedU128,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
-			let cfg = helpers::branch_cfg_of::<T>(&collateral_id)?;
+			let config = helpers::branch_config_of::<T>(&collateral_id)?;
 			ensure!(
 				matches!(level, VaultsManagerLevel::Full) ||
-					value >= cfg.safety_collateralization_ratio,
+					ratio >= config.safety_collateralization_ratio,
 				Error::<T>::DefensiveActionNotDefensive
 			);
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::SafetyCollateralizationRatio(value),
+				BranchConfigUpdate::SafetyCollateralizationRatio(ratio),
 			)
 		}
 
@@ -781,25 +768,18 @@ pub mod pallet {
 		pub fn set_debt_ceiling(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: BalanceOf<T>,
+			ceiling: BalanceOf<T>,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
-			let cfg = helpers::branch_cfg_of::<T>(&collateral_id)?;
+			let config = helpers::branch_config_of::<T>(&collateral_id)?;
 			ensure!(
-				matches!(level, VaultsManagerLevel::Full) || value <= cfg.debt_ceiling,
+				matches!(level, VaultsManagerLevel::Full) || ceiling <= config.debt_ceiling,
 				Error::<T>::DefensiveActionNotDefensive
 			);
-			let old_value = cfg.debt_ceiling;
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::DebtCeiling(value),
-			)?;
-			Self::deposit_event(Event::DebtCeilingUpdated {
-				collateral_id,
-				old_value,
-				new_value: value,
-			});
-			Ok(())
+				BranchConfigUpdate::DebtCeiling(ceiling),
+			)
 		}
 
 		#[pallet::call_index(15)]
@@ -807,13 +787,13 @@ pub mod pallet {
 		pub fn set_minimum_debt(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: BalanceOf<T>,
+			minimum_debt: BalanceOf<T>,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
 			ensure!(matches!(level, VaultsManagerLevel::Full), Error::<T>::InsufficientPrivilege);
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::MinimumDebt(value),
+				BranchConfigUpdate::MinimumDebt(minimum_debt),
 			)
 		}
 
@@ -822,13 +802,13 @@ pub mod pallet {
 		pub fn set_minimum_collateral(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: BalanceOf<T>,
+			minimum_collateral: BalanceOf<T>,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
 			ensure!(matches!(level, VaultsManagerLevel::Full), Error::<T>::InsufficientPrivilege);
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::MinimumCollateral(value),
+				BranchConfigUpdate::MinimumCollateral(minimum_collateral),
 			)
 		}
 
@@ -841,10 +821,11 @@ pub mod pallet {
 			max_rate: FixedU128,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
-			let cfg = helpers::branch_cfg_of::<T>(&collateral_id)?;
+			let config = helpers::branch_config_of::<T>(&collateral_id)?;
 			ensure!(
 				matches!(level, VaultsManagerLevel::Full) ||
-					(max_rate <= cfg.maximum_borrow_rate && min_rate >= cfg.minimum_borrow_rate),
+					(max_rate <= config.maximum_borrow_rate &&
+						min_rate >= config.minimum_borrow_rate),
 				Error::<T>::DefensiveActionNotDefensive
 			);
 			helpers::update_branch_config::<T>(
@@ -858,13 +839,13 @@ pub mod pallet {
 		pub fn set_upfront_fee_period(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: MomentOf<T>,
+			period: Millis,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
 			ensure!(matches!(level, VaultsManagerLevel::Full), Error::<T>::InsufficientPrivilege);
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::UpfrontFeePeriod(value),
+				BranchConfigUpdate::UpfrontFeePeriod(period),
 			)
 		}
 
@@ -873,13 +854,13 @@ pub mod pallet {
 		pub fn set_rate_adjustment_cooldown(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: MomentOf<T>,
+			cooldown: Millis,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
 			ensure!(matches!(level, VaultsManagerLevel::Full), Error::<T>::InsufficientPrivilege);
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::RateAdjustmentCooldown(value),
+				BranchConfigUpdate::RateAdjustmentCooldown(cooldown),
 			)
 		}
 
@@ -888,13 +869,13 @@ pub mod pallet {
 		pub fn set_redistribution_penalty(
 			origin: OriginFor<T>,
 			collateral_id: T::AssetId,
-			value: Permill,
+			penalty: Permill,
 		) -> DispatchResult {
 			let level = T::ManagerOrigin::ensure_origin(origin)?;
 			ensure!(matches!(level, VaultsManagerLevel::Full), Error::<T>::InsufficientPrivilege);
 			helpers::update_branch_config::<T>(
 				&collateral_id,
-				BranchConfigUpdate::RedistributionPenalty(value),
+				BranchConfigUpdate::RedistributionPenalty(penalty),
 			)
 		}
 
@@ -941,8 +922,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::activate_dormant())]
 		pub fn activate_dormant(
 			origin: OriginFor<T>,
-			owner: T::AccountId,
 			collateral_id: T::AssetId,
+			owner: T::AccountId,
 			hint: Position<T::AccountId>,
 		) -> DispatchResultWithPostInfo {
 			let _ = ensure_signed(origin)?;

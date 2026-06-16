@@ -12,16 +12,16 @@ pub fn view_vault_cr<T: Config>(
 	owner: &T::AccountId,
 ) -> Option<FixedU128> {
 	let vault = Vaults::<T>::get(collateral_id, owner)?;
-	let bs = BranchStates::<T>::get(collateral_id)?;
+	let state = BranchStates::<T>::get(collateral_id)?;
 	let now = T::TimeProvider::now();
-	let coll = T::CollateralAssets::balance_on_hold(
+	let collateral = T::CollateralAssets::balance_on_hold(
 		collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
 		owner,
 	);
 	let price = T::Oracle::provide_price(collateral_id).ok()?.price;
-	let pending = pending_touch_for::<T>(&vault, &bs, now);
-	let total_coll = coll.saturating_add(pending.collateral);
+	let pending = pending_touch_for::<T>(&vault, &state, now);
+	let total_coll = collateral.saturating_add(pending.collateral);
 	let total_debt = vault
 		.debt
 		.total()
@@ -31,10 +31,10 @@ pub fn view_vault_cr<T: Config>(
 }
 
 pub fn view_branch_tcr<T: Config>(collateral_id: &T::AssetId) -> Option<FixedU128> {
-	let bs = BranchStates::<T>::get(collateral_id)?;
+	let state = BranchStates::<T>::get(collateral_id)?;
 	let price = T::Oracle::provide_price(collateral_id).ok()?.price;
 	let now = T::TimeProvider::now();
-	compute_tcr::<T>(&bs, price, now).ok()
+	compute_tcr::<T>(&state, price, now).ok()
 }
 
 /// Lazily walk a vault list from its tail, following `prev` pointers — the same
@@ -64,7 +64,7 @@ pub(crate) fn redemption_targets<T: Config>(
 	collateral_id: &T::AssetId,
 ) -> impl Iterator<Item = T::AccountId> {
 	let priority = recovery::next_target::<T>(collateral_id).or_else(|| {
-		BranchStates::<T>::get(collateral_id).and_then(|bs| bs.dormant_redemption_target)
+		BranchStates::<T>::get(collateral_id).and_then(|state| state.dormant_redemption_target)
 	});
 	// The rate index is walked only when no FinalRecovery/Dormant target gates it.
 	let rate = priority
@@ -106,7 +106,9 @@ pub fn predict_upfront_fee_open<T: Config>(
 	annual_rate: FixedU128,
 ) -> BalanceOf<T> {
 	match (BranchConfigs::<T>::get(collateral_id), BranchStates::<T>::get(collateral_id)) {
-		(Some(cfg), Some(bs)) => open_upfront_fee::<T>(&bs, &cfg, initial_debt, annual_rate),
+		(Some(config), Some(state)) => {
+			open_upfront_fee::<T>(&state, &config, initial_debt, annual_rate)
+		},
 		_ => BalanceOf::<T>::zero(),
 	}
 }
@@ -117,20 +119,19 @@ pub fn predict_upfront_fee_borrow<T: Config>(
 	debt_increase: BalanceOf<T>,
 	maybe_new_rate: Option<FixedU128>,
 ) -> BalanceOf<T> {
-	let (cfg, bs, vault) = match predict_inputs::<T>(collateral_id, owner) {
-		Some(t) => t,
-		None => return BalanceOf::<T>::zero(),
+	let Some((config, state, vault)) = predict_inputs::<T>(collateral_id, owner) else {
+		return BalanceOf::<T>::zero();
 	};
 	let new_rate = maybe_new_rate.unwrap_or(vault.annual_rate);
 	let now = T::TimeProvider::now();
 	let cooldown_elapsed =
-		now.saturating_sub(vault.last_rate_update) >= cfg.rate_adjustment_cooldown;
+		now.saturating_sub(vault.last_rate_update) >= config.rate_adjustment_cooldown;
 	let rate_change_fee_base = if maybe_new_rate.is_some() && !cooldown_elapsed {
 		vault.debt.principal
 	} else {
 		BalanceOf::<T>::zero()
 	};
-	simulate_borrow::<T>(&bs, &cfg, &vault, debt_increase, new_rate, rate_change_fee_base).1
+	simulate_borrow::<T>(&state, &config, &vault, debt_increase, new_rate, rate_change_fee_base).1
 }
 
 pub fn predict_upfront_fee_rate_change<T: Config>(
@@ -138,26 +139,25 @@ pub fn predict_upfront_fee_rate_change<T: Config>(
 	owner: &T::AccountId,
 	new_rate: FixedU128,
 ) -> BalanceOf<T> {
-	let (cfg, bs, vault) = match predict_inputs::<T>(collateral_id, owner) {
-		Some(t) => t,
-		None => return BalanceOf::<T>::zero(),
+	let Some((config, state, vault)) = predict_inputs::<T>(collateral_id, owner) else {
+		return BalanceOf::<T>::zero();
 	};
 	let now = T::TimeProvider::now();
 	let cooldown_elapsed =
-		now.saturating_sub(vault.last_rate_update) >= cfg.rate_adjustment_cooldown;
-	simulate_change_rate::<T>(&bs, &cfg, &vault, new_rate, cooldown_elapsed).1
+		now.saturating_sub(vault.last_rate_update) >= config.rate_adjustment_cooldown;
+	simulate_change_rate::<T>(&state, &config, &vault, new_rate, cooldown_elapsed).1
 }
 
-/// Read the `(cfg, branch state, vault)` triple for a `predict_*` view.
+/// Read the `(config, branch state, vault)` triple for a `predict_*` view.
 /// Returns `None` if any row is missing — the predict APIs treat that as
 /// "no fee" rather than an error.
 fn predict_inputs<T: Config>(
 	collateral_id: &T::AssetId,
 	owner: &T::AccountId,
 ) -> Option<(
-	BranchConfig<BalanceOf<T>, MomentOf<T>>,
-	BranchState<T::AccountId, BalanceOf<T>, MomentOf<T>>,
-	Vault<BalanceOf<T>, MomentOf<T>>,
+	BranchConfig<BalanceOf<T>>,
+	BranchState<T::AccountId, BalanceOf<T>>,
+	Vault<BalanceOf<T>>,
 )> {
 	Some((
 		BranchConfigs::<T>::get(collateral_id)?,

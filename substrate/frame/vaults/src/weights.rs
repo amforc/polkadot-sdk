@@ -1,6 +1,6 @@
 //! Placeholder weight info. Real benchmarks land in a follow-up.
 
-use frame::deps::frame_support::weights::Weight;
+use frame::prelude::Weight;
 
 pub trait WeightInfo {
 	fn open_vault() -> Weight;

@@ -15,9 +15,7 @@ mod rate_index;
 mod redemptions;
 mod redistribution_accounting;
 
-use frame::deps::sp_runtime::FixedU128;
-
-use crate::mock::{AccountId, AssetId, Test};
+use crate::mock::{AccountId, AssetId, FixedU128, Test};
 
 pub(super) fn rate_pct(num: u128, denom: u128) -> FixedU128 {
 	FixedU128::from_rational(num, denom)

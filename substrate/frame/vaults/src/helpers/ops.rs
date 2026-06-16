@@ -1,6 +1,5 @@
 use super::*;
 
-#[require_transactional]
 pub fn open_vault<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
@@ -9,58 +8,56 @@ pub fn open_vault<T: Config>(
 	annual_rate: FixedU128,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
-	ensure!(!Vaults::<T>::contains_key(&collateral_id, &owner), Error::<T>::VaultAlreadyExists);
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
-	ensure!(initial_debt >= cfg.minimum_debt, Error::<T>::DebtBelowMinimum);
-	ensure!(initial_collateral >= cfg.minimum_collateral, Error::<T>::InsufficientCollateral);
-	validate_rate::<T>(&cfg, annual_rate)?;
-
-	let now = T::TimeProvider::now();
-	let price = T::Oracle::provide_price(&collateral_id)?.price;
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-
-	let bs_before = branch_state_of::<T>(&collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
 	ensure!(
-		bs_before.debt.principal.saturating_add(initial_debt) <= cfg.debt_ceiling,
+		!Vaults::<T>::contains_key(&context.collateral_id, &owner),
+		Error::<T>::VaultAlreadyExists
+	);
+	let config = branch_config_of::<T>(&context.collateral_id)?;
+	ensure!(initial_debt >= config.minimum_debt, Error::<T>::DebtBelowMinimum);
+	ensure!(initial_collateral >= config.minimum_collateral, Error::<T>::InsufficientCollateral);
+	validate_rate::<T>(&config, annual_rate)?;
+	let price = T::Oracle::provide_price(&context.collateral_id)?.price;
+
+	ensure!(
+		context.state.debt.principal.saturating_add(initial_debt) <= config.debt_ceiling,
 		Error::<T>::DebtCeilingExceeded
 	);
 
-	let upfront_fee = open_upfront_fee::<T>(&bs_before, &cfg, initial_debt, annual_rate);
+	let upfront_fee = open_upfront_fee::<T>(&context.state, &config, initial_debt, annual_rate);
 
 	let vault = Vault {
 		debt: VaultDebt { principal: initial_debt, interest: upfront_fee },
 		annual_rate,
-		last_interest_time: bs_before.interest_time(now),
-		last_rate_update: now,
+		last_interest_time: context.state.interest_time(context.now),
+		last_rate_update: context.now,
 		redistribution_stake: initial_collateral,
-		redist_snapshot: bs_before.redist,
+		redistribution_snapshot: context.state.redistribution,
 	};
 
 	let total_debt = initial_debt.saturating_add(upfront_fee);
-	ensure_above_icr::<T>(initial_collateral, total_debt, price, &cfg)?;
+	ensure_above_icr::<T>(initial_collateral, total_debt, price, &config)?;
 
-	let pre_tcr = compute_tcr::<T>(&bs_before, price, now)?;
-	let mut bs_after = bs_before.clone();
-	bs_after.attach_vault(&vault);
-	bs_after.add_collateral(initial_collateral);
-	let post_tcr = compute_tcr::<T>(&bs_after, price, now)?;
-	enforce_mode_rules::<T>(&cfg, &bs_before, pre_tcr, post_tcr, false)?;
+	let pre_tcr = compute_tcr::<T>(&context.state, price, context.now)?;
+	let mut branch_state_after = context.state.clone();
+	branch_state_after.attach_vault(&vault);
+	branch_state_after.add_collateral(initial_collateral);
+	let post_tcr = compute_tcr::<T>(&branch_state_after, price, context.now)?;
+	enforce_mode_rules::<T>(&config, &context.state, pre_tcr, post_tcr, false)?;
+	context.state = branch_state_after;
+
 	T::CollateralAssets::hold(
-		collateral_id.clone(),
+		context.collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
 		&owner,
 		initial_collateral,
 	)?;
-
 	T::StableAsset::mint_into(&owner, initial_debt)?;
-	charge_upfront_fee::<T>(&collateral_id, &owner, upfront_fee);
-
-	Vaults::<T>::insert(&collateral_id, &owner, &vault);
-	BranchStates::<T>::insert(&collateral_id, &bs_after);
+	context.charge_upfront_fee(&owner, upfront_fee);
 
 	T::VaultLists::insert(
-		VaultListId::Rate(collateral_id.clone()),
+		VaultListId::Rate(context.collateral_id.clone()),
 		owner.clone(),
 		annual_rate,
 		hint,
@@ -68,43 +65,39 @@ pub fn open_vault<T: Config>(
 	.map_err(map_error::<T>)?;
 
 	Pallet::<T>::deposit_event(Event::Borrowed {
-		collateral_id: collateral_id.clone(),
+		collateral_id: context.collateral_id.clone(),
 		owner: owner.clone(),
 		recipient: owner.clone(),
 		amount: initial_debt,
 	});
 	Pallet::<T>::deposit_event(Event::CollateralDeposited {
-		collateral_id: collateral_id.clone(),
+		collateral_id: context.collateral_id.clone(),
 		owner: owner.clone(),
 		from: owner.clone(),
 		amount: initial_collateral,
 	});
-	Pallet::<T>::deposit_event(Event::VaultOpened { collateral_id, owner });
+	Pallet::<T>::deposit_event(Event::VaultOpened {
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
+	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
-/// Permissionless deposit. This call does not change debt, so a target that
-/// is still `Dormant` after `touch_vault` (i.e. accrued interest hasn't lifted
-/// debt above `MinimumDebt`) is rejected. If touch auto-revived the vault to
-/// `Active`, the deposit proceeds against the now-Active row.
-#[require_transactional]
+/// Permissionless deposit. Dormant vaults must be revived by borrowing.
 pub fn deposit_collateral_for<T: Config>(
 	from: T::AccountId,
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 	amount: BalanceOf<T>,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
-	ensure!(Vaults::<T>::contains_key(&collateral_id, &owner), Error::<T>::VaultNotFound);
-	let now = T::TimeProvider::now();
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let mut vault =
-		touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	let status = vault.status::<T>(&collateral_id, &owner);
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let TouchedVault { mut vault, status } = context.touch(&owner)?;
 	ensure!(!status.is_dormant(), Error::<T>::DebtBelowMinimum);
 
 	T::CollateralAssets::transfer_and_hold(
-		collateral_id.clone(),
+		context.collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
 		&from,
 		&owner,
@@ -114,70 +107,60 @@ pub fn deposit_collateral_for<T: Config>(
 		Fortitude::Polite,
 	)?;
 
-	let attach_stake = status.is_active();
-	let old_stake = vault.redistribution_stake;
-	let new_stake = old_stake.saturating_add(amount);
-
-	BranchStates::<T>::try_mutate(&collateral_id, |maybe| -> Result<_, DispatchError> {
-		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		bs.add_collateral(amount);
-		if attach_stake {
-			bs.refresh_vault_stake(vault.annual_rate, old_stake, new_stake);
-		}
-		Ok(())
-	})?;
-	if attach_stake {
+	context.state.add_collateral(amount);
+	if status.is_active() {
+		let old_stake = vault.redistribution_stake;
+		let new_stake = old_stake.saturating_add(amount);
+		context.state.refresh_vault_stake(vault.annual_rate, old_stake, new_stake);
 		vault.redistribution_stake = new_stake;
-		Vaults::<T>::insert(&collateral_id, &owner, &vault);
 	}
 
-	Pallet::<T>::deposit_event(Event::CollateralDeposited { collateral_id, owner, from, amount });
+	Pallet::<T>::deposit_event(Event::CollateralDeposited {
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
+		from,
+		amount,
+	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
-#[require_transactional]
 pub fn withdraw_collateral<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 	amount: BalanceOf<T>,
 	recipient: T::AccountId,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let price = T::Oracle::provide_price(&context.collateral_id)?.price;
+	let TouchedVault { mut vault, status } = context.touch(&owner)?;
+	ensure!(!status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
-	let now = T::TimeProvider::now();
-	let price = T::Oracle::provide_price(&collateral_id)?.price;
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let mut vault =
-		touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	ensure!(
-		!vault.status::<T>(&collateral_id, &owner).is_final_recovery(),
-		Error::<T>::VaultInFinalRecovery
-	);
-
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
-	let bs_before = branch_state_of::<T>(&collateral_id)?;
-	let coll = T::CollateralAssets::balance_on_hold(
-		collateral_id.clone(),
-		&HoldReason::VaultCollateral.into(),
-		&owner,
-	);
-	ensure!(coll >= amount, Error::<T>::InsufficientCollateral);
+	let config = branch_config_of::<T>(&context.collateral_id)?;
+	let collateral = vault.redistribution_stake;
+	ensure!(collateral >= amount, Error::<T>::InsufficientCollateral);
 
 	let total_debt = vault.debt.total();
-	let new_coll = coll.saturating_sub(amount);
+	let new_collateral = collateral.saturating_sub(amount);
 	if !total_debt.is_zero() {
-		ensure_above_icr::<T>(new_coll, total_debt, price, &cfg)?;
+		ensure_above_icr::<T>(new_collateral, total_debt, price, &config)?;
 	}
 
-	let pre_tcr = compute_tcr::<T>(&bs_before, price, now)?;
-	let mut bs_after = bs_before.clone();
-	bs_after.remove_collateral(amount);
-	bs_after.refresh_vault_stake(vault.annual_rate, vault.redistribution_stake, new_coll);
-	let post_tcr = compute_tcr::<T>(&bs_after, price, now)?;
-	enforce_mode_rules::<T>(&cfg, &bs_before, pre_tcr, post_tcr, false)?;
+	let pre_tcr = compute_tcr::<T>(&context.state, price, context.now)?;
+	let mut branch_state_after = context.state.clone();
+	branch_state_after.remove_collateral(amount);
+	branch_state_after.refresh_vault_stake(
+		vault.annual_rate,
+		vault.redistribution_stake,
+		new_collateral,
+	);
+	let post_tcr = compute_tcr::<T>(&branch_state_after, price, context.now)?;
+	enforce_mode_rules::<T>(&config, &context.state, pre_tcr, post_tcr, false)?;
+	context.state = branch_state_after;
 
 	T::CollateralAssets::transfer_on_hold(
-		collateral_id.clone(),
+		context.collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
 		&owner,
 		&recipient,
@@ -187,19 +170,17 @@ pub fn withdraw_collateral<T: Config>(
 		Fortitude::Polite,
 	)?;
 
-	vault.redistribution_stake = new_coll;
-	Vaults::<T>::insert(&collateral_id, &owner, &vault);
-	BranchStates::<T>::insert(&collateral_id, &bs_after);
+	vault.redistribution_stake = new_collateral;
 	Pallet::<T>::deposit_event(Event::CollateralWithdrawn {
-		collateral_id,
-		owner,
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
 		recipient,
 		amount,
 	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
-#[require_transactional]
 pub fn borrow<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
@@ -208,87 +189,83 @@ pub fn borrow<T: Config>(
 	recipient: T::AccountId,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
-
-	let now = T::TimeProvider::now();
-	let price = T::Oracle::provide_price(&collateral_id)?.price;
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let mut vault =
-		touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	let pre_status = vault.status::<T>(&collateral_id, &owner);
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let price = T::Oracle::provide_price(&context.collateral_id)?.price;
+	let TouchedVault { mut vault, status: pre_status } = context.touch(&owner)?;
 	ensure!(!pre_status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
+	let config = branch_config_of::<T>(&context.collateral_id)?;
 	let old_rate = vault.annual_rate;
 	let new_rate = maybe_new_rate.unwrap_or(old_rate);
-	validate_rate::<T>(&cfg, new_rate)?;
+	validate_rate::<T>(&config, new_rate)?;
 
-	let bs_before = branch_state_of::<T>(&collateral_id)?;
 	let new_ib_debt = vault.debt.principal.saturating_add(amount);
 	ensure!(
-		bs_before.debt.principal.saturating_add(amount) <= cfg.debt_ceiling,
+		context.state.debt.principal.saturating_add(amount) <= config.debt_ceiling,
 		Error::<T>::DebtCeilingExceeded
 	);
 
 	let cooldown_elapsed =
-		now.saturating_sub(vault.last_rate_update) >= cfg.rate_adjustment_cooldown;
+		context.now.saturating_sub(vault.last_rate_update) >= config.rate_adjustment_cooldown;
 	let rate_change_fee_base = if maybe_new_rate.is_some() && !cooldown_elapsed {
 		vault.debt.principal
 	} else {
 		BalanceOf::<T>::zero()
 	};
-	let (mut bs_after, upfront_fee) =
-		simulate_borrow::<T>(&bs_before, &cfg, &vault, amount, new_rate, rate_change_fee_base);
-	bs_after.debt.minted_interest = bs_after.debt.minted_interest.saturating_add(upfront_fee);
+	let (mut branch_state_after, upfront_fee) = simulate_borrow::<T>(
+		&context.state,
+		&config,
+		&vault,
+		amount,
+		new_rate,
+		rate_change_fee_base,
+	);
+	branch_state_after.debt.minted_interest =
+		branch_state_after.debt.minted_interest.saturating_add(upfront_fee);
 
-	let dormant_to_active = pre_status.is_dormant() && new_ib_debt >= cfg.minimum_debt;
+	let dormant_to_active = pre_status.is_dormant() && new_ib_debt >= config.minimum_debt;
 	vault.debt.principal = new_ib_debt;
 	vault.debt.interest = vault.debt.interest.saturating_add(upfront_fee);
 	if maybe_new_rate.is_some() {
 		vault.annual_rate = new_rate;
-		vault.last_rate_update = now;
+		vault.last_rate_update = context.now;
 	}
-	ensure!(vault.debt.principal >= cfg.minimum_debt, Error::<T>::DebtBelowMinimum);
+	ensure!(vault.debt.principal >= config.minimum_debt, Error::<T>::DebtBelowMinimum);
 
-	let coll = T::CollateralAssets::balance_on_hold(
-		collateral_id.clone(),
-		&HoldReason::VaultCollateral.into(),
-		&owner,
-	);
+	let collateral = vault.redistribution_stake;
 	let total_debt = vault.debt.total();
-	ensure_above_icr::<T>(coll, total_debt, price, &cfg)?;
+	ensure_above_icr::<T>(collateral, total_debt, price, &config)?;
 
-	let pre_tcr = compute_tcr::<T>(&bs_before, price, now)?;
-	let post_tcr = compute_tcr::<T>(&bs_after, price, now)?;
-	enforce_mode_rules::<T>(&cfg, &bs_before, pre_tcr, post_tcr, false)?;
+	let pre_tcr = compute_tcr::<T>(&context.state, price, context.now)?;
+	let post_tcr = compute_tcr::<T>(&branch_state_after, price, context.now)?;
+	enforce_mode_rules::<T>(&config, &context.state, pre_tcr, post_tcr, false)?;
+	context.state = branch_state_after;
 
 	if dormant_to_active {
-		bs_after.release_dormant_target(&owner);
+		context.state.release_dormant_target(&owner);
 	}
 
 	T::StableAsset::mint_into(&recipient, amount)?;
-	charge_upfront_fee::<T>(&collateral_id, &owner, upfront_fee);
-
-	BranchStates::<T>::insert(&collateral_id, &bs_after);
-	Vaults::<T>::insert(&collateral_id, &owner, &vault);
+	context.charge_upfront_fee(&owner, upfront_fee);
 
 	if dormant_to_active {
 		T::VaultLists::insert(
-			VaultListId::Rate(collateral_id.clone()),
+			VaultListId::Rate(context.collateral_id.clone()),
 			owner.clone(),
 			new_rate,
 			hint,
 		)
 		.map_err(map_error::<T>)?;
 		Pallet::<T>::deposit_event(Event::VaultStatusChanged {
-			collateral_id: collateral_id.clone(),
+			collateral_id: context.collateral_id.clone(),
 			owner: owner.clone(),
 			old_status: VaultStatus::Dormant,
 			new_status: VaultStatus::Active,
 		});
 	} else if old_rate != new_rate {
 		T::VaultLists::re_insert(
-			VaultListId::Rate(collateral_id.clone()),
+			VaultListId::Rate(context.collateral_id.clone()),
 			owner.clone(),
 			new_rate,
 			hint,
@@ -298,36 +275,36 @@ pub fn borrow<T: Config>(
 
 	if old_rate != new_rate {
 		Pallet::<T>::deposit_event(Event::BorrowRateChanged {
-			collateral_id: collateral_id.clone(),
+			collateral_id: context.collateral_id.clone(),
 			owner: owner.clone(),
 			old_rate,
 			new_rate,
 		});
 	}
-	Pallet::<T>::deposit_event(Event::Borrowed { collateral_id, owner, recipient, amount });
+	Pallet::<T>::deposit_event(Event::Borrowed {
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
+		recipient,
+		amount,
+	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
-#[require_transactional]
 pub fn repay_for<T: Config>(
 	from: T::AccountId,
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 	amount: BalanceOf<T>,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
-	let now = T::TimeProvider::now();
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let mut vault =
-		touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	let pre_status = vault.status::<T>(&collateral_id, &owner);
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let TouchedVault { mut vault, status: pre_status } = context.touch(&owner)?;
 	ensure!(!pre_status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
+	let config = branch_config_of::<T>(&context.collateral_id)?;
 
-	// Cap at the outstanding debt: debt accrues per millisecond, so an exact
-	// full repayment cannot be predicted at signing time. `amount >= debt`
-	// burns only the debt and closes the vault below.
+	// Cap overpayment at the touched debt.
 	let repay = amount.min(vault.debt.total());
 	T::StableAsset::burn_from(
 		&from,
@@ -338,335 +315,284 @@ pub fn repay_for<T: Config>(
 	)?;
 
 	let payment = vault.debt.cancel(repay);
-	// `repay` was capped at `vault.debt.total()`, so `cancel` returns it in
-	// full; debug-only because runtime dispatch must not panic.
 	debug_assert_eq!(payment.total(), repay);
 
-	// User repayments must leave `Debt == 0` (and close in
-	// same op) OR `Debt >= MinimumDebt`.
 	let new_total = vault.debt.total();
-	if !new_total.is_zero() && new_total < cfg.minimum_debt {
+	if !new_total.is_zero() && new_total < config.minimum_debt {
 		return Err(Error::<T>::DebtWouldBecomeDust.into());
 	}
 
 	if new_total.is_zero() {
-		let price = T::Oracle::provide_price(&collateral_id)?.price;
+		let price = T::Oracle::provide_price(&context.collateral_id)?.price;
 		Pallet::<T>::deposit_event(Event::Repaid {
-			collateral_id: collateral_id.clone(),
+			collateral_id: context.collateral_id.clone(),
 			owner: owner.clone(),
 			from,
 			amount: repay,
 		});
 		close_inner::<T>(
-			&collateral_id,
+			context,
 			&owner,
 			&owner,
 			&vault,
 			pre_status,
-			&cfg,
-			now,
+			&config,
 			price,
 			Some((payment, vault.annual_rate)),
 		)?;
 		return Ok(());
 	}
 
-	BranchStates::<T>::try_mutate(&collateral_id, |maybe| -> Result<_, DispatchError> {
-		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		bs.apply_debt_payment(payment, vault.annual_rate, vault.debt.principal);
-		Ok(())
-	})?;
-
-	Vaults::<T>::insert(&collateral_id, &owner, &vault);
-	Pallet::<T>::deposit_event(Event::Repaid { collateral_id, owner, from, amount: repay });
+	context
+		.state
+		.apply_debt_payment(payment, vault.annual_rate, vault.debt.principal);
+	Pallet::<T>::deposit_event(Event::Repaid {
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
+		from,
+		amount: repay,
+	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
-#[require_transactional]
 pub fn change_rate<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 	new_rate: FixedU128,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
-	let now = T::TimeProvider::now();
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let mut vault =
-		touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	ensure!(vault.status::<T>(&collateral_id, &owner).is_active(), Error::<T>::InvalidVaultStatus);
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let TouchedVault { mut vault, status } = context.touch(&owner)?;
+	ensure!(status.is_active(), Error::<T>::InvalidVaultStatus);
 	let old_rate = vault.annual_rate;
 	if old_rate == new_rate {
+		context.commit_with_vault(&owner, &vault);
 		return Ok(());
 	}
 
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
-	validate_rate::<T>(&cfg, new_rate)?;
+	let config = branch_config_of::<T>(&context.collateral_id)?;
+	validate_rate::<T>(&config, new_rate)?;
 
-	// Build the post-change branch state in a clone so we can compute
-	// `post_tcr` and run `enforce_mode_rules` BEFORE applying anything.
-	let bs_before = branch_state_of::<T>(&collateral_id)?;
 	let cooldown_elapsed =
-		now.saturating_sub(vault.last_rate_update) >= cfg.rate_adjustment_cooldown;
-	let (mut bs_after, upfront_fee) =
-		simulate_change_rate::<T>(&bs_before, &cfg, &vault, new_rate, cooldown_elapsed);
-	bs_after.debt.minted_interest = bs_after.debt.minted_interest.saturating_add(upfront_fee);
+		context.now.saturating_sub(vault.last_rate_update) >= config.rate_adjustment_cooldown;
+	let (mut branch_state_after, upfront_fee) =
+		simulate_change_rate::<T>(&context.state, &config, &vault, new_rate, cooldown_elapsed);
+	branch_state_after.debt.minted_interest =
+		branch_state_after.debt.minted_interest.saturating_add(upfront_fee);
 
-	// Gates premature changes that would worsen TCR in Safety mode and rate
-	// changes that would push the branch into Safety mode from Normal.
-	let price = T::Oracle::provide_price(&collateral_id)?.price;
-	let pre_tcr = compute_tcr::<T>(&bs_before, price, now)?;
-	let post_tcr = compute_tcr::<T>(&bs_after, price, now)?;
-	enforce_mode_rules::<T>(&cfg, &bs_before, pre_tcr, post_tcr, false)?;
+	let price = T::Oracle::provide_price(&context.collateral_id)?.price;
+	let pre_tcr = compute_tcr::<T>(&context.state, price, context.now)?;
+	let post_tcr = compute_tcr::<T>(&branch_state_after, price, context.now)?;
+	enforce_mode_rules::<T>(&config, &context.state, pre_tcr, post_tcr, false)?;
+	context.state = branch_state_after;
 
-	charge_upfront_fee::<T>(&collateral_id, &owner, upfront_fee);
-
-	BranchStates::<T>::insert(&collateral_id, &bs_after);
+	context.charge_upfront_fee(&owner, upfront_fee);
 
 	vault.annual_rate = new_rate;
-	vault.last_rate_update = now;
+	vault.last_rate_update = context.now;
 	vault.debt.interest = vault.debt.interest.saturating_add(upfront_fee);
-	Vaults::<T>::insert(&collateral_id, &owner, &vault);
 
 	T::VaultLists::re_insert(
-		VaultListId::Rate(collateral_id.clone()),
+		VaultListId::Rate(context.collateral_id.clone()),
 		owner.clone(),
 		new_rate,
 		hint,
 	)
 	.map_err(map_error::<T>)?;
 	Pallet::<T>::deposit_event(Event::BorrowRateChanged {
-		collateral_id,
-		owner,
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
 		old_rate,
 		new_rate,
 	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
-#[require_transactional]
 pub fn close_vault<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 	recipient: Option<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
 	let recipient = recipient.unwrap_or(owner.clone());
-
-	let now = T::TimeProvider::now();
-	let price = T::Oracle::provide_price(&collateral_id)?.price;
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let vault = touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	let status = vault.status::<T>(&collateral_id, &owner);
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let price = T::Oracle::provide_price(&context.collateral_id)?.price;
+	let TouchedVault { vault, status } = context.touch(&owner)?;
 	ensure!(vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
-	close_inner::<T>(&collateral_id, &owner, &recipient, &vault, status, &cfg, now, price, None)
+	let config = branch_config_of::<T>(&context.collateral_id)?;
+	close_inner::<T>(context, &owner, &recipient, &vault, status, &config, price, None)
 }
 
-/// Apply a vault close. Caller must have already touched the vault and confirmed
-/// `vault.debt.total() == 0` (or supplies `maybe_payment` whose application
-/// zeroes the debt). Detaches branch aggregates, runs the Safety-mode TCR
-/// check, releases held collateral, deletes the row, and emits `VaultClosed`.
-#[require_transactional]
+/// Shared close path. Consumes the operation context at commit.
 #[allow(clippy::too_many_arguments)]
 fn close_inner<T: Config>(
-	collateral_id: &T::AssetId,
+	mut context: OpContext<T>,
 	owner: &T::AccountId,
 	recipient: &T::AccountId,
-	vault: &Vault<BalanceOf<T>, MomentOf<T>>,
+	vault: &Vault<BalanceOf<T>>,
 	status: VaultStatus,
-	cfg: &BranchConfig<BalanceOf<T>, MomentOf<T>>,
-	now: MomentOf<T>,
+	config: &BranchConfig<BalanceOf<T>>,
 	price: FixedU128,
 	maybe_payment: Option<(DebtPayment<BalanceOf<T>>, FixedU128)>,
 ) -> Result<(), DispatchError> {
-	let coll = T::CollateralAssets::balance_on_hold(
-		collateral_id.clone(),
+	// FinalRecovery stake is zero, so use the live hold.
+	let collateral = T::CollateralAssets::balance_on_hold(
+		context.collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
 		owner,
 	);
-	let bs_before = branch_state_of::<T>(collateral_id)?;
-	let mut bs_after = bs_before.clone();
+	let mut branch_state_after = context.state.clone();
 	if let Some((payment, rate)) = maybe_payment {
-		bs_after.apply_debt_payment(payment, rate, vault.debt.principal);
+		branch_state_after.apply_debt_payment(payment, rate, vault.debt.principal);
 	}
-	bs_after.detach_vault(vault);
-	bs_after.remove_collateral(coll);
-	bs_after.release_dormant_target(owner);
+	branch_state_after.detach_vault(vault);
+	branch_state_after.remove_collateral(collateral);
+	branch_state_after.release_dormant_target(owner);
 
-	// Closing the last debt-bearing vault settles the branch.
-	let branch_empties = bs_after.is_empty_of_liability();
-	if branch_empties {
-		let orphan = bs_after.sweep_orphan_debt();
-		if !orphan.is_zero() {
-			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id: collateral_id.clone(),
-				amount: orphan,
-			});
-		}
-	}
+	let branch_empties = branch_state_after.is_empty_of_liability();
+	// Sweep now — it mutates `branch_state_after` ahead of the TCR check — but defer the
+	// event until the close is past every fallible step, just before commit.
+	let orphan_debt = if branch_empties {
+		branch_state_after.sweep_orphan_debt()
+	} else {
+		BalanceOf::<T>::zero()
+	};
 
-	let pre_tcr = compute_tcr::<T>(&bs_before, price, now)?;
-	let post_tcr = compute_tcr::<T>(&bs_after, price, now)?;
-	enforce_mode_rules::<T>(cfg, &bs_before, pre_tcr, post_tcr, branch_empties)?;
+	let pre_tcr = compute_tcr::<T>(&context.state, price, context.now)?;
+	let post_tcr = compute_tcr::<T>(&branch_state_after, price, context.now)?;
+	enforce_mode_rules::<T>(config, &context.state, pre_tcr, post_tcr, branch_empties)?;
+	context.state = branch_state_after;
 
-	if !coll.is_zero() {
+	if !collateral.is_zero() {
 		T::CollateralAssets::transfer_on_hold(
-			collateral_id.clone(),
+			context.collateral_id.clone(),
 			&HoldReason::VaultCollateral.into(),
 			owner,
 			recipient,
-			coll,
+			collateral,
 			Precision::Exact,
 			Restriction::Free,
 			Fortitude::Polite,
 		)?;
 	}
 
-	BranchStates::<T>::insert(collateral_id, &bs_after);
-
 	match status {
 		VaultStatus::Active => {
-			// Active vaults are in the rate index by invariant; a failed
-			// removal is corruption, not a condition to absorb.
-			T::VaultLists::remove(&VaultListId::Rate(collateral_id.clone()), owner)
+			// Active vaults must be in the rate index.
+			T::VaultLists::remove(&VaultListId::Rate(context.collateral_id.clone()), owner)
 				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		},
 		VaultStatus::FinalRecovery => {
-			recovery::remove::<T>(collateral_id, owner)?;
+			recovery::remove::<T>(&context.collateral_id, owner)?;
 		},
 		VaultStatus::Dormant => {},
 	}
 
-	Vaults::<T>::remove(collateral_id, owner);
-
+	if !orphan_debt.is_zero() {
+		Pallet::<T>::deposit_event(Event::BadDebtRecorded {
+			collateral_id: context.collateral_id.clone(),
+			amount: orphan_debt,
+		});
+	}
 	Pallet::<T>::deposit_event(Event::VaultClosed {
-		collateral_id: collateral_id.clone(),
+		collateral_id: context.collateral_id.clone(),
 		owner: owner.clone(),
 		recipient: recipient.clone(),
 	});
+	context.commit_removing_vault(owner);
 	Ok(())
 }
 
-#[require_transactional]
 pub fn poke<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 ) -> Result<(), DispatchError> {
-	let now = T::TimeProvider::now();
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	Ok(())
+	OpContext::<T>::refresh(collateral_id, &owner)
 }
 
-#[require_transactional]
 pub fn enter_final_recovery<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
-	let now = T::TimeProvider::now();
-	let price = T::Oracle::provide_price(&collateral_id)?.price;
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let mut vault =
-		touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	ensure!(vault.status::<T>(&collateral_id, &owner).is_active(), Error::<T>::InvalidVaultStatus);
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let price = T::Oracle::provide_price(&context.collateral_id)?.price;
+	let TouchedVault { mut vault, status } = context.touch(&owner)?;
+	ensure!(status.is_active(), Error::<T>::InvalidVaultStatus);
 
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
-	let coll = T::CollateralAssets::balance_on_hold(
-		collateral_id.clone(),
-		&HoldReason::VaultCollateral.into(),
-		&owner,
-	);
+	let config = branch_config_of::<T>(&context.collateral_id)?;
+	let collateral = vault.redistribution_stake;
 	let total_debt = vault.debt.total();
-	ensure_below_mcr::<T>(coll, total_debt, price, &cfg)?;
+	ensure_below_mcr::<T>(collateral, total_debt, price, &config)?;
 
-	// Last eligible redistribution recipient: the candidate is the only
-	// stake-bearer left, so `bs.stakes.total == vault.redistribution_stake`.
-	let bs_check = branch_state_of::<T>(&collateral_id)?;
-	ensure!(bs_check.stakes.total == vault.redistribution_stake, Error::<T>::NotLastEligibleVault);
+	ensure!(
+		context.state.stakes.total == vault.redistribution_stake,
+		Error::<T>::NotLastEligibleVault
+	);
 
-	T::VaultLists::remove(&VaultListId::Rate(collateral_id.clone()), &owner)
+	T::VaultLists::remove(&VaultListId::Rate(context.collateral_id.clone()), &owner)
 		.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
-	BranchStates::<T>::try_mutate(&collateral_id, |maybe| -> Result<_, DispatchError> {
-		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		bs.refresh_vault_stake(
-			vault.annual_rate,
-			vault.redistribution_stake,
-			BalanceOf::<T>::zero(),
-		);
-		Ok(())
-	})?;
+	context.state.refresh_vault_stake(
+		vault.annual_rate,
+		vault.redistribution_stake,
+		BalanceOf::<T>::zero(),
+	);
 	vault.redistribution_stake = BalanceOf::<T>::zero();
-	Vaults::<T>::insert(&collateral_id, &owner, &vault);
-	recovery::append::<T>(&collateral_id, owner.clone())?;
+	recovery::append::<T>(&mut context.state, &context.collateral_id, owner.clone())?;
 
 	Pallet::<T>::deposit_event(Event::VaultStatusChanged {
-		collateral_id,
-		owner,
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
 		old_status: VaultStatus::Active,
 		new_status: VaultStatus::FinalRecovery,
 	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
-/// Permissionless explicit `FinalRecovery` exit. Touches the vault, checks
-/// the fully-accrued CR is at or above the MCR, re-adds the stake + weighted
-/// stake contribution, then either:
-/// - if `debt >= MinimumDebt` rejoins the rate index using the caller-supplied `hint` (status →
-///   Active, O(1) with valid hint),
-/// - otherwise leaves the vault out of the index (status → Dormant) and parks the owner in
-///   `dormant_redemption_target` so the next redemption can pick it up. The `hint` argument is
-///   ignored in the Dormant branch.
-#[require_transactional]
+/// Explicit `FinalRecovery` exit. Rejoins the rate index only above `MinimumDebt`.
 pub fn exit_final_recovery<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
-	let now = T::TimeProvider::now();
-	let price = T::Oracle::provide_price(&collateral_id)?.price;
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let mut vault =
-		touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	ensure!(
-		vault.status::<T>(&collateral_id, &owner).is_final_recovery(),
-		Error::<T>::InvalidVaultStatus
-	);
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let price = T::Oracle::provide_price(&context.collateral_id)?.price;
+	let TouchedVault { mut vault, status } = context.touch(&owner)?;
+	ensure!(status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
 
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
-	let coll = T::CollateralAssets::balance_on_hold(
-		collateral_id.clone(),
+	let config = branch_config_of::<T>(&context.collateral_id)?;
+	let collateral = T::CollateralAssets::balance_on_hold(
+		context.collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
 		&owner,
 	);
 	let total_debt = vault.debt.total();
-	ensure_at_or_above_mcr::<T>(coll, total_debt, price, &cfg)?;
+	ensure_at_or_above_mcr::<T>(collateral, total_debt, price, &config)?;
 
-	let rejoin_active = total_debt >= cfg.minimum_debt;
+	let rejoin_active = total_debt >= config.minimum_debt;
 	let new_status = if rejoin_active { VaultStatus::Active } else { VaultStatus::Dormant };
 
-	recovery::remove::<T>(&collateral_id, &owner)?;
-	// Stamp the snapshot and set redistribution_stake to the
-	// current held collateral *before* rejoining recipient accounting.
-	vault.redistribution_stake = coll;
-	BranchStates::<T>::try_mutate(&collateral_id, |maybe| -> Result<_, DispatchError> {
-		let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-		vault.redist_snapshot = bs.redist;
-		bs.refresh_vault_stake(vault.annual_rate, BalanceOf::<T>::zero(), coll);
-		// Park a sub-`MinimumDebt` Dormant only in a free slot; never displace an
-		// existing debt-bearing target.
-		if !rejoin_active && !total_debt.is_zero() && !bs.try_park_dormant_target(owner.clone()) {
-			return Err(Error::<T>::DormantTargetOccupied.into());
-		}
-		Ok(())
-	})?;
-	Vaults::<T>::insert(&collateral_id, &owner, &vault);
+	recovery::remove::<T>(&context.collateral_id, &owner)?;
+	vault.redistribution_stake = collateral;
+	vault.redistribution_snapshot = context.state.redistribution;
+	context
+		.state
+		.refresh_vault_stake(vault.annual_rate, BalanceOf::<T>::zero(), collateral);
+	if !rejoin_active &&
+		!total_debt.is_zero() &&
+		!context.state.try_park_dormant_target(owner.clone())
+	{
+		return Err(Error::<T>::DormantTargetOccupied.into());
+	}
 	if rejoin_active {
 		T::VaultLists::insert(
-			VaultListId::Rate(collateral_id.clone()),
+			VaultListId::Rate(context.collateral_id.clone()),
 			owner.clone(),
 			vault.annual_rate,
 			hint,
@@ -674,50 +600,44 @@ pub fn exit_final_recovery<T: Config>(
 		.map_err(map_error::<T>)?;
 	}
 	Pallet::<T>::deposit_event(Event::VaultStatusChanged {
-		collateral_id,
-		owner,
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
 		old_status: VaultStatus::FinalRecovery,
 		new_status,
 	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
-/// Permissionless Dormant → Active revival. Touches the vault, requires it to be
-/// `Dormant` with fully-accrued `Debt >= MinimumDebt`, reinserts it into the rate
-/// index at `hint`, and clears the dormant redemption slot if it pointed here.
-#[require_transactional]
+/// Permissionless Dormant to Active revival.
 pub fn activate_dormant<T: Config>(
 	owner: T::AccountId,
 	collateral_id: T::AssetId,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	ensure_not_frozen::<T>(&collateral_id)?;
-	let now = T::TimeProvider::now();
-	update_aggregate_interest::<T>(&collateral_id, now)?;
-	let vault = touch_vault::<T>(&collateral_id, &owner, now)?.ok_or(Error::<T>::VaultNotFound)?;
-	ensure!(vault.status::<T>(&collateral_id, &owner).is_dormant(), Error::<T>::InvalidVaultStatus);
-	let cfg = branch_cfg_of::<T>(&collateral_id)?;
-	ensure!(vault.debt.total() >= cfg.minimum_debt, Error::<T>::DebtBelowMinimum);
+	let mut context = OpContext::<T>::load(collateral_id)?;
+	context.ensure_not_frozen()?;
+	let TouchedVault { vault, status } = context.touch(&owner)?;
+	ensure!(status.is_dormant(), Error::<T>::InvalidVaultStatus);
+	let config = branch_config_of::<T>(&context.collateral_id)?;
+	ensure!(vault.debt.total() >= config.minimum_debt, Error::<T>::DebtBelowMinimum);
 
 	T::VaultLists::insert(
-		VaultListId::Rate(collateral_id.clone()),
+		VaultListId::Rate(context.collateral_id.clone()),
 		owner.clone(),
 		vault.annual_rate,
 		hint,
 	)
 	.map_err(map_error::<T>)?;
-	BranchStates::<T>::mutate(&collateral_id, |maybe| {
-		if let Some(bs) = maybe {
-			bs.release_dormant_target(&owner);
-		}
-	});
+	context.state.release_dormant_target(&owner);
 
 	Pallet::<T>::deposit_event(Event::VaultStatusChanged {
-		collateral_id,
-		owner,
+		collateral_id: context.collateral_id.clone(),
+		owner: owner.clone(),
 		old_status: VaultStatus::Dormant,
 		new_status: VaultStatus::Active,
 	});
+	context.commit_with_vault(&owner, &vault);
 	Ok(())
 }
 
@@ -727,15 +647,15 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 	if remaining.any_lt(per_call) {
 		return Weight::zero();
 	}
-	let now = T::TimeProvider::now();
 	let mut consumed = Weight::zero();
 	let mut budget = T::MaxOnIdleVaultRefresh::get();
 	let touch_one = |collateral_id: &T::AssetId, owner: &T::AccountId| -> bool {
-		// Returns `true` iff a touch landed (budget consumed); `false` to stop.
 		if !Vaults::<T>::contains_key(collateral_id, owner) {
 			return true;
 		}
-		let _ = with_storage_layer(|| touch_vault::<T>(collateral_id, owner, now));
+		let _ = with_storage_layer::<(), DispatchError, _>(|| {
+			OpContext::<T>::refresh(collateral_id.clone(), owner)
+		});
 		true
 	};
 	for collateral_id in BranchConfigs::<T>::iter_keys() {
@@ -743,14 +663,7 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 		if budget == 0 || (remaining.saturating_sub(consumed)).any_lt(per_call) {
 			break;
 		}
-		// Keep oracle-induced Frozen state in sync with the
-		// live oracle. Ignore errors: a stuck branch just stays as-is.
-		let _ = refresh_branch::<T>(collateral_id);
-		// One aggregate-interest mint per branch; touch_vault has no work to do
-		// until the branch's `last_interest_time` advances.
-		if update_aggregate_interest::<T>(collateral_id, now).is_err() {
-			continue;
-		}
+		let _ = with_storage_layer::<(), DispatchError, _>(|| refresh_branch::<T>(collateral_id));
 		let Some(branch) = BranchStates::<T>::get(collateral_id) else { continue };
 		let rate_list = VaultListId::Rate(collateral_id.clone());
 		let initial_cursor = branch.idle_cursor.or_else(|| T::VaultLists::head(&rate_list));
@@ -789,8 +702,8 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 
 		if cursor != initial_cursor {
 			BranchStates::<T>::mutate(collateral_id, |maybe| {
-				if let Some(bs) = maybe {
-					bs.idle_cursor = cursor.take();
+				if let Some(state) = maybe {
+					state.idle_cursor = cursor.take();
 				}
 			});
 		}

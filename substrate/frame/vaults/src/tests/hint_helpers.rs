@@ -2,10 +2,7 @@ use crate::{
 	mock::*,
 	tests::{rate_pct, vault_status},
 };
-use frame::deps::{
-	frame_support::{assert_noop, assert_ok, traits::fungible::Mutate as FungibleMutate},
-	sp_runtime::FixedU128,
-};
+use frame::traits::fungible::Mutate as FungibleMutate;
 use pallet_linked_list::SortedListInterface;
 
 fn fund_account(who: AccountId) {
@@ -96,7 +93,7 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 		fund_account(21);
 		assert_ok!(open(21, DOT, 1_000, 500, rate_pct(1, 100)));
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), 21, DOT));
+		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, 21));
 
 		// Restore the price and seed a long index so the tail re-insertion at 1%
 		// needs more than the repair budget.
@@ -107,8 +104,8 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(
 				RuntimeOrigin::signed(99),
-				21,
 				DOT,
+				21,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::InvalidPositionHints

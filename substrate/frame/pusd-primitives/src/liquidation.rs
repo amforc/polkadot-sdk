@@ -54,18 +54,20 @@ pub struct LiquidationSnapshot<Balance> {
 	pub collateral: Balance,
 }
 
+/// What a `build_allocation` closure returns: the orchestrator's collateral and
+/// debt split, or a `DispatchError` that rolls the whole liquidation back.
+pub type AllocationResult<AccountId, Balance> =
+	Result<LiquidationAllocation<AccountId, Balance>, DispatchError>;
+
 /// Returning `Err` from `build_allocation`, or producing an invalid allocation,
 /// rolls the whole call back, so a rejected liquidation never leaves partial
 /// state behind.
 pub trait VaultLiquidationInterface<AccountId, AssetId, Balance> {
-	fn execute_liquidation<BuildAllocation>(
+	fn execute_liquidation(
 		collateral_id: AssetId,
 		owner: AccountId,
-		build_allocation: BuildAllocation,
-	) -> DispatchResult
-	where
-		BuildAllocation: FnOnce(
+		build_allocation: impl FnOnce(
 			LiquidationSnapshot<Balance>,
-		)
-			-> Result<LiquidationAllocation<AccountId, Balance>, DispatchError>;
+		) -> AllocationResult<AccountId, Balance>,
+	) -> DispatchResult;
 }

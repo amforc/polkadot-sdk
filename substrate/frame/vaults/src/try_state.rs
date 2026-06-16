@@ -26,9 +26,9 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		let rate_list = VaultListId::Rate(c.clone());
 		let recovery_list = VaultListId::FinalRecovery(c.clone());
 		check_branch_identities::<T>(c, &rate_list, &recovery_list)?;
-		if let Some(bs) = BranchStates::<T>::get(c) {
-			let tau = bs.interest_time(T::TimeProvider::now());
-			if bs.debt.last_interest_time > tau {
+		if let Some(state) = BranchStates::<T>::get(c) {
+			let tau = state.interest_time(T::TimeProvider::now());
+			if state.debt.last_interest_time > tau {
 				return Err("branch last_interest_time ahead of interest_time(now)".into());
 			}
 			for (_owner, vault) in Vaults::<T>::iter_prefix(c) {
@@ -37,7 +37,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				}
 			}
 			// `dormant_redemption_target`, when set, must point at a Dormant vault.
-			if let Some(owner) = bs.dormant_redemption_target.clone() {
+			if let Some(owner) = state.dormant_redemption_target.clone() {
 				let Some(vault) = Vaults::<T>::get(c, &owner) else {
 					return Err("dormant_redemption_target points at missing vault".into());
 				};
@@ -57,11 +57,11 @@ fn check_branch_identities<T: Config>(
 	rate_list: &VaultListId<T::AssetId>,
 	recovery_list: &VaultListId<T::AssetId>,
 ) -> Result<(), TryRuntimeError> {
-	let Some(bs) = BranchStates::<T>::get(c) else {
+	let Some(state) = BranchStates::<T>::get(c) else {
 		return Err("registered branch missing BranchState".into());
 	};
-	let cumul_debt_ps = bs.redist.debt_per_stake;
-	let cumul_collat_ps = bs.redist.collat_per_stake;
+	let cumul_debt_ps = state.redistribution.debt_per_stake;
+	let cumul_collat_ps = state.redistribution.collateral_per_stake;
 
 	let mut sum_stake = BalanceOf::<T>::zero();
 	let mut sum_owner_held = BalanceOf::<T>::zero();
@@ -101,56 +101,62 @@ fn check_branch_identities<T: Config>(
 			return Err("vault.redistribution_stake != held collateral".into());
 		}
 		sum_stake = sum_stake.saturating_add(vault.redistribution_stake);
-		let snap = vault.redist_snapshot;
+		let snap = vault.redistribution_snapshot;
 		let delta_debt = cumul_debt_ps.saturating_sub(snap.debt_per_stake);
 		sum_pending_debt_share = sum_pending_debt_share
 			.saturating_add(delta_debt.saturating_mul_int(vault.redistribution_stake));
-		let delta_collat = cumul_collat_ps.saturating_sub(snap.collat_per_stake);
+		let delta_collat = cumul_collat_ps.saturating_sub(snap.collateral_per_stake);
 		sum_pending_collat_share = sum_pending_collat_share
 			.saturating_add(delta_collat.saturating_mul_int(vault.redistribution_stake));
 		n_live_vaults = n_live_vaults.saturating_add(1);
 	}
 
-	if bs.stakes.total != sum_stake {
+	if state.stakes.total != sum_stake {
 		return Err("total_stakes != Σ active+dormant vault.redistribution_stake".into());
 	}
 	// Every writer moves principal on the branch and the vault by the same
 	// amount, so this identity is exact (the prepare→finalize liquidation gap
 	// is intra-extrinsic and invisible at block end).
-	if bs.debt.principal != sum_principal {
+	if state.debt.principal != sum_principal {
 		return Err("branch principal != Σ vault principal".into());
 	}
 	// Every stake mutation swaps full `floor(rate · stake)` contributions, so
 	// this identity is exact as well.
-	if bs.stakes.weighted_sum != sum_weighted_stake {
+	if state.stakes.weighted_sum != sum_weighted_stake {
 		return Err("stakes.weighted_sum != Σ floor(rate · stake)".into());
 	}
 	check_weighted_principal_sum::<T>(
 		c,
-		bs.debt.weighted_principal_sum,
-		bs.debt.pending_redist_principal.saturating_add(bs.rounding.ownerless_pusd_debt),
+		state.debt.weighted_principal_sum,
+		state
+			.debt
+			.pending_redistribution_principal
+			.saturating_add(state.rounding.ownerless_pusd_debt),
 		sum_weighted_principal,
 		n_live_vaults,
 	)?;
 
 	let tolerance: BalanceOf<T> = n_live_vaults.unique_saturated_into();
 
-	let debt_drift = if bs.debt.pending_redist_principal >= sum_pending_debt_share {
-		bs.debt.pending_redist_principal.saturating_sub(sum_pending_debt_share)
+	let debt_drift = if state.debt.pending_redistribution_principal >= sum_pending_debt_share {
+		state
+			.debt
+			.pending_redistribution_principal
+			.saturating_sub(sum_pending_debt_share)
 	} else {
-		sum_pending_debt_share.saturating_sub(bs.debt.pending_redist_principal)
+		sum_pending_debt_share.saturating_sub(state.debt.pending_redistribution_principal)
 	};
 	if debt_drift > tolerance {
-		return Err("pending redist principal drift exceeds rounding tolerance".into());
+		return Err("pending redistribution principal drift exceeds rounding tolerance".into());
 	}
 
-	let held_redist = T::CollateralAssets::balance_on_hold(
+	let held_redistribution = T::CollateralAssets::balance_on_hold(
 		c.clone(),
 		&HoldReason::VaultCollateral.into(),
 		&Pallet::<T>::redistribution_account(),
 	);
-	let physical = sum_owner_held.saturating_add(held_redist);
-	if bs.total_collateral != physical {
+	let physical = sum_owner_held.saturating_add(held_redistribution);
+	if state.total_collateral != physical {
 		return Err("total_collateral != Σ owner-held + redistribution-account hold".into());
 	}
 
@@ -159,13 +165,13 @@ fn check_branch_identities<T: Config>(
 	// flooring may leave shares slightly below the held amount; treat the gap
 	// as tolerance plus the explicit ownerless bucket.
 	let claimed_plus_surplus =
-		sum_pending_collat_share.saturating_add(bs.rounding.ownerless_collateral_surplus);
-	let collat_drift = if held_redist >= claimed_plus_surplus {
-		held_redist.saturating_sub(claimed_plus_surplus)
+		sum_pending_collat_share.saturating_add(state.rounding.ownerless_collateral_surplus);
+	let collateral_drift = if held_redistribution >= claimed_plus_surplus {
+		held_redistribution.saturating_sub(claimed_plus_surplus)
 	} else {
-		claimed_plus_surplus.saturating_sub(held_redist)
+		claimed_plus_surplus.saturating_sub(held_redistribution)
 	};
-	if collat_drift > tolerance {
+	if collateral_drift > tolerance {
 		return Err("pending collateral share drift exceeds rounding tolerance".into());
 	}
 	Ok(())
@@ -181,10 +187,10 @@ fn check_weighted_principal_sum<T: Config>(
 	if weighted_principal_sum < sum_weighted_principal {
 		return Err("weighted_principal_sum below Σ floor(rate · principal)".into());
 	}
-	let Some(cfg) = BranchConfigs::<T>::get(c) else {
+	let Some(config) = BranchConfigs::<T>::get(c) else {
 		return Err("registered branch without config".into());
 	};
-	let rate_bound = cfg.maximum_borrow_rate.max(FixedU128::one());
+	let rate_bound = config.maximum_borrow_rate.max(FixedU128::one());
 	let w_pending = rate_bound.saturating_mul_int(pending_pool);
 	let slack: BalanceOf<T> = n_live_vaults.saturating_add(1).unique_saturated_into();
 	let upper = sum_weighted_principal.saturating_add(w_pending).saturating_add(slack);

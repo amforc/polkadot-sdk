@@ -43,11 +43,20 @@ pub enum FrozenReason {
 
 /// Stored `Frozen` state attached to `BranchState` while frozen.
 #[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
 )]
-pub struct FrozenState<Moment> {
+pub struct FrozenState {
 	pub reason: FrozenReason,
-	pub entered_at: Moment,
+	pub entered_at: u64,
 }
 
 /// Read-only hook letting other pUSD pallets observe a branch's mode without
