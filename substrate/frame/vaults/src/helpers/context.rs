@@ -57,6 +57,38 @@ impl<T: Config> OpContext<T> {
 		Ok(())
 	}
 
+	/// The branch's rate-index list id.
+	pub fn rate_list(&self) -> VaultListId<T::AssetId> {
+		VaultListId::Rate(self.collateral_id.clone())
+	}
+
+	/// Oracle price for this context's collateral.
+	pub fn price(&self) -> Result<FixedU128, DispatchError> {
+		Ok(T::Oracle::provide_price(&self.collateral_id)?.price)
+	}
+
+	/// Branch config for this context's collateral.
+	pub fn config(&self) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
+		branch_config_of::<T>(&self.collateral_id)
+	}
+
+	/// Adopt `next` as the branch state, but only if the TCR mode rules permit
+	/// the pre→post transition. `is_settlement` relaxes the worsening checks on
+	/// the liquidation/close settlement paths (see [`enforce_mode_rules`]).
+	pub fn transition(
+		&mut self,
+		next: BranchState<T::AccountId, BalanceOf<T>>,
+		config: &BranchConfig<BalanceOf<T>>,
+		price: FixedU128,
+		is_settlement: bool,
+	) -> Result<(), DispatchError> {
+		let pre_tcr = compute_tcr::<T>(&self.state, price, self.now)?;
+		let post_tcr = compute_tcr::<T>(&next, price, self.now)?;
+		enforce_mode_rules::<T>(config, &self.state, pre_tcr, post_tcr, is_settlement)?;
+		self.state = next;
+		Ok(())
+	}
+
 	/// Apply pending interest/redistribution to a vault row in memory.
 	pub fn touch(
 		&mut self,
