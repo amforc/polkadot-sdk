@@ -1,5 +1,4 @@
 use crate::{mock::*, pallet::Vaults, tests::rate_pct};
-use frame::deps::frame_support::{assert_noop, assert_ok};
 
 // `close_vault` requires zero debt; with debt outstanding it returns
 // `DebtOutstanding`. The separate "system needs at least one vault" guard
@@ -25,7 +24,7 @@ fn repay_into_dust_window_reverts() {
 		// borrow=1000, min_debt=200. Repay 850 would leave 150 < 200.
 		assert_ok!(open(1, DOT, 1_000, 1_000, rate_pct(5, 100)));
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, 850),
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 850),
 			crate::Error::<Test>::DebtWouldBecomeDust
 		);
 	});
@@ -74,8 +73,8 @@ fn zero_amount_ops_are_no_ops() {
 
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
-			1,
 			DOT,
+			1,
 			0,
 		));
 		assert_ok!(
@@ -89,7 +88,7 @@ fn zero_amount_ops_are_no_ops() {
 			1,
 			Position::endpoints_only(),
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, 0));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 0));
 
 		let post = Vaults::<Test>::get(DOT, 1).expect("vault stored");
 		assert_eq!(pre.debt.principal, post.debt.principal);

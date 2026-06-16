@@ -4,10 +4,6 @@ use crate::{
 	mock::*,
 	tests::{rate_pct, vault_status},
 };
-use frame::deps::{
-	frame_support::{assert_noop, assert_ok},
-	sp_runtime::{FixedPointNumber, FixedU128},
-};
 use pusd_primitives::{RedemptionAllocation, VaultRedemptionInterface};
 
 fn low_recovery_price() -> FixedU128 {
@@ -18,7 +14,7 @@ fn enter_recovery(who: AccountId, rate: FixedU128) {
 	set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 	assert_ok!(open(who, DOT, 1_000, 500, rate));
 	set_price(DOT, low_recovery_price());
-	assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), who, DOT,));
+	assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, who,));
 }
 
 fn direct_redeem(owner: AccountId, redeemer: AccountId, amount: Balance) {
@@ -74,7 +70,7 @@ fn enter_final_recovery_rejects_non_last_eligible_vault() {
 		set_price(DOT, low_recovery_price());
 
 		assert_noop!(
-			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), 1, DOT),
+			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, 1),
 			crate::Error::<Test>::NotLastEligibleVault
 		);
 	});
@@ -87,7 +83,7 @@ fn enter_final_recovery_rejects_vault_above_mcr() {
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 
 		assert_noop!(
-			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), 1, DOT),
+			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, 1),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
 	});
@@ -105,8 +101,8 @@ fn final_recovery_middle_exit_splices_queue() {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
 			RuntimeOrigin::signed(42),
-			2,
 			DOT,
+			2,
 			Position::endpoints_only(),
 		));
 
@@ -124,8 +120,8 @@ fn exit_final_recovery_rejects_when_cr_still_below_mcr() {
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(
 				RuntimeOrigin::signed(99),
-				1,
 				DOT,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
@@ -144,8 +140,8 @@ fn exit_final_recovery_rejects_non_final_recovery_vault() {
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(
 				RuntimeOrigin::signed(99),
-				1,
 				DOT,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::InvalidVaultStatus
@@ -161,7 +157,7 @@ fn frozen_branch_rejects_enter_final_recovery() {
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
 		// The frozen check precedes the CR / last-eligible checks.
 		assert_noop!(
-			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), 1, DOT),
+			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, 1),
 			crate::Error::<Test>::BranchFrozen
 		);
 	});
@@ -176,8 +172,8 @@ fn frozen_branch_rejects_exit_final_recovery() {
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(
 				RuntimeOrigin::signed(99),
-				1,
 				DOT,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::BranchFrozen
@@ -204,8 +200,8 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 		let vault = crate::pallet::Vaults::<Test>::get(DOT, 1).expect("vault stored");
 		assert_eq!(vault.debt.total(), 0);
 		assert_eq!(vault.redistribution_stake, held(DOT, 1));
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("bs");
-		assert_eq!(bs.stakes.total, held(DOT, 1));
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("state");
+		assert_eq!(state.stakes.total, held(DOT, 1));
 	});
 }
 
@@ -227,7 +223,7 @@ fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, 100),
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 100),
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
@@ -264,15 +260,15 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 		// hint is ignored. Pass a deliberately invalid one to prove it.
 		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
 			RuntimeOrigin::signed(99),
-			1,
 			DOT,
+			1,
 			Position::between(999, 998),
 		));
 		// Vault is no longer in FR FIFO and not in the rate index — it's Dormant.
 		assert!(vault_status(DOT, 1).is_dormant());
 		assert_eq!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, 10), alloc::vec![2]);
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("bs");
-		assert_eq!(bs.dormant_redemption_target, Some(1));
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("state");
+		assert_eq!(state.dormant_redemption_target, Some(1));
 	});
 }
 
@@ -293,8 +289,8 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 		// First exit parks vault 1 in the (empty) dormant slot.
 		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
 			RuntimeOrigin::signed(99),
-			1,
 			DOT,
+			1,
 			Position::endpoints_only(),
 		));
 		assert!(vault_status(DOT, 1).is_dormant());
@@ -308,8 +304,8 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(
 				RuntimeOrigin::signed(99),
-				2,
 				DOT,
+				2,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::DormantTargetOccupied
@@ -331,8 +327,8 @@ fn deposit_into_final_recovery_keeps_stake_zero() {
 		let before = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
-			1,
 			DOT,
+			1,
 			10_000,
 		));
 
@@ -359,14 +355,14 @@ fn final_recovery_rescue_deposit_then_exit() {
 		// exit. Stake re-syncs from the hold on the way out.
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
-			1,
 			DOT,
+			1,
 			10_000,
 		));
 		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
 			RuntimeOrigin::signed(99),
-			1,
 			DOT,
+			1,
 			Position::endpoints_only(),
 		));
 
@@ -399,5 +395,29 @@ fn redemption_queue_head_gates_on_final_recovery() {
 		// Only the FinalRecovery head (1), regardless of `n`; the dormant target
 		// (3) and rate-index tail (4, 5) stay gated behind it.
 		assert_eq!(crate::Pallet::<Test>::redemption_queue_head(DOT, 10), alloc::vec![1]);
+	});
+}
+
+#[test]
+fn final_recovery_nonce_persists_across_cycles() {
+	build_and_execute(|| {
+		register_default_branch();
+		enter_recovery(1, rate_pct(1, 100));
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_eq!(state.next_final_recovery_nonce, 1);
+
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
+			RuntimeOrigin::signed(42),
+			DOT,
+			1,
+			Position::endpoints_only(),
+		));
+		set_price(DOT, low_recovery_price());
+		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, 1));
+
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_eq!(state.next_final_recovery_nonce, 2);
+		assert_eq!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, 10), alloc::vec![1]);
 	});
 }

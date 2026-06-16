@@ -1,10 +1,8 @@
 //! Storage and value types for `pallet-vaults`.
 
+use crate::Millis;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::deps::sp_runtime::{
-	traits::{Saturating, Zero},
-	FixedPointNumber, FixedPointOperand, FixedU128, Permill,
-};
+use frame::arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, Permill, Saturating};
 use scale_info::TypeInfo;
 
 pub use pusd_primitives::{BranchMode, FrozenReason, FrozenState};
@@ -143,8 +141,8 @@ impl<Balance: Ord + Saturating + Copy> VaultDebt<Balance> {
 	Debug,
 	Default,
 )]
-pub struct RedistSnapshot {
-	pub collat_per_stake: FixedU128,
+pub struct RedistributionSnapshot {
+	pub collateral_per_stake: FixedU128,
 	pub debt_per_stake: FixedU128,
 	pub debt_time_per_stake: FixedU128,
 	pub weight_per_stake: FixedU128,
@@ -166,11 +164,11 @@ pub struct RedistSnapshot {
 	Debug,
 	Default,
 )]
-pub struct InterestClock<Moment> {
+pub struct InterestClock {
 	/// Wall-clock epoch used to keep interest time relative and bounded.
-	pub epoch_base: Moment,
+	pub epoch_base: Millis,
 	/// Completed frozen-window duration since `epoch_base`.
-	pub frozen_elapsed: Moment,
+	pub frozen_elapsed: Millis,
 }
 
 /// Per-vault state. The vault's collateral lives on the `VaultCollateral`
@@ -185,20 +183,20 @@ pub struct InterestClock<Moment> {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct Vault<Balance, Moment> {
+pub struct Vault<Balance> {
 	pub debt: VaultDebt<Balance>,
 	pub annual_rate: FixedU128,
-	pub last_interest_time: Moment,
-	pub last_rate_update: Moment,
+	pub last_interest_time: Millis,
+	pub last_rate_update: Millis,
 	pub redistribution_stake: Balance,
-	pub redist_snapshot: RedistSnapshot,
+	pub redistribution_snapshot: RedistributionSnapshot,
 }
 
 /// Branch governance/risk parameters.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct BranchConfig<Balance, Moment> {
+pub struct BranchConfig<Balance> {
 	pub minimum_collateralization_ratio: FixedU128,
 	pub initial_collateralization_ratio: FixedU128,
 	pub safety_collateralization_ratio: FixedU128,
@@ -207,8 +205,8 @@ pub struct BranchConfig<Balance, Moment> {
 	pub minimum_collateral: Balance,
 	pub minimum_borrow_rate: FixedU128,
 	pub maximum_borrow_rate: FixedU128,
-	pub upfront_fee_period: Moment,
-	pub rate_adjustment_cooldown: Moment,
+	pub upfront_fee_period: Millis,
+	pub rate_adjustment_cooldown: Millis,
 	pub redistribution_penalty: Permill,
 }
 
@@ -216,13 +214,13 @@ pub struct BranchConfig<Balance, Moment> {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct BranchDebt<Balance, Moment> {
+pub struct BranchDebt<Balance> {
 	pub principal: Balance,
 	pub minted_interest: Balance,
-	pub pending_redist_principal: Balance,
+	pub pending_redistribution_principal: Balance,
 	pub bad_debt: Balance,
 	pub weighted_principal_sum: Balance,
-	pub last_interest_time: Moment,
+	pub last_interest_time: Millis,
 }
 
 /// Current-collateral redistribution stake totals for one collateral branch.
@@ -266,42 +264,34 @@ pub struct BranchRounding<Balance> {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct BranchState<AccountId, Balance, Moment> {
+pub struct BranchState<AccountId, Balance> {
 	pub total_collateral: Balance,
-	pub debt: BranchDebt<Balance, Moment>,
+	pub debt: BranchDebt<Balance>,
 	pub stakes: BranchStakes<Balance>,
 	pub rounding: BranchRounding<Balance>,
-	pub redist: RedistSnapshot,
-	pub interest_clock: InterestClock<Moment>,
+	pub redistribution: RedistributionSnapshot,
+	pub interest_clock: InterestClock,
 	pub next_final_recovery_nonce: u128,
 	pub dormant_redemption_target: Option<AccountId>,
 	pub idle_cursor: Option<AccountId>,
-	pub frozen: Option<FrozenState<Moment>>,
+	pub frozen: Option<FrozenState>,
 }
 
-impl<AccountId, Balance, Moment> BranchState<AccountId, Balance, Moment> {
+impl<AccountId, Balance> BranchState<AccountId, Balance> {
 	pub fn is_frozen(&self) -> bool {
 		self.frozen.is_some()
 	}
-}
 
-impl<AccountId, Balance, Moment: Saturating + Zero + Copy> BranchState<AccountId, Balance, Moment> {
-	/// Branch-local interest time at wall-clock `now`: `now` less the epoch base,
-	/// the completed frozen-window duration, and any in-progress frozen window.
-	/// Non-decreasing and constant while the branch is Frozen, so interest never
-	/// accrues across a freeze. See SPEC §5.2.
-	pub fn interest_time(&self, now: Moment) -> Moment {
-		let current_frozen = match &self.frozen {
-			Some(state) => now.saturating_sub(state.entered_at),
-			None => Moment::zero(),
-		};
+	pub fn interest_time(&self, now: Millis) -> Millis {
+		let current_frozen =
+			self.frozen.as_ref().map_or(0, |state| now.saturating_sub(state.entered_at));
 		now.saturating_sub(self.interest_clock.epoch_base)
 			.saturating_sub(self.interest_clock.frozen_elapsed)
 			.saturating_sub(current_frozen)
 	}
 }
 
-impl<AccountId: PartialEq, Balance, Moment> BranchState<AccountId, Balance, Moment> {
+impl<AccountId: PartialEq, Balance> BranchState<AccountId, Balance> {
 	/// Clear the single dormant redemption slot, but only if it currently points
 	/// at `owner`. No-op otherwise.
 	pub fn release_dormant_target(&mut self, owner: &AccountId) {
@@ -323,11 +313,9 @@ impl<AccountId: PartialEq, Balance, Moment> BranchState<AccountId, Balance, Mome
 	}
 }
 
-impl<AccountId, Balance: FixedPointOperand + Saturating, Moment>
-	BranchState<AccountId, Balance, Moment>
-{
+impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, Balance> {
 	/// Add a vault's full contribution to branch debt/stake aggregates.
-	pub fn attach_vault(&mut self, vault: &Vault<Balance, Moment>) {
+	pub fn attach_vault(&mut self, vault: &Vault<Balance>) {
 		let rate_x_debt = vault.annual_rate.saturating_mul_int(vault.debt.principal);
 		let rate_x_stake = vault.annual_rate.saturating_mul_int(vault.redistribution_stake);
 		self.debt.principal = self.debt.principal.saturating_add(vault.debt.principal);
@@ -345,7 +333,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating, Moment>
 	/// keep this sum-of-contributions invariant intact, so removal is the
 	/// exact inverse — recompute the same `(rate * debt, rate * stake)`
 	/// products and subtract.
-	pub fn detach_vault(&mut self, vault: &Vault<Balance, Moment>) {
+	pub fn detach_vault(&mut self, vault: &Vault<Balance>) {
 		let rate_x_debt = vault.annual_rate.saturating_mul_int(vault.debt.principal);
 		let rate_x_stake = vault.annual_rate.saturating_mul_int(vault.redistribution_stake);
 		self.debt.principal = self.debt.principal.saturating_sub(vault.debt.principal);
@@ -417,7 +405,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating, Moment>
 	pub fn is_empty_of_liability(&self) -> bool {
 		self.debt.principal.is_zero() &&
 			self.stakes.total.is_zero() &&
-			self.debt.pending_redist_principal.is_zero()
+			self.debt.pending_redistribution_principal.is_zero()
 	}
 
 	/// Sweep the orphan debt counters into `bad_debt`, returning the swept
@@ -431,7 +419,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating, Moment>
 	}
 }
 
-impl<AccountId, Balance: Ord + Saturating + Copy, Moment> BranchState<AccountId, Balance, Moment> {
+impl<AccountId, Balance: Ord + Saturating + Copy> BranchState<AccountId, Balance> {
 	/// Deposit ownerless pUSD debt, netting against any existing ownerless
 	/// surplus first. Preserves the invariant `surplus * debt == 0`.
 	pub fn add_ownerless_pusd_debt(&mut self, amount: Balance) {
@@ -460,38 +448,9 @@ impl<AccountId, Balance: Ord + Saturating + Copy, Moment> BranchState<AccountId,
 	}
 }
 
-/// Identifier for the parameter changed by an `Event::ParameterUpdated`
-/// emission. Lets indexers filter governance changes without consulting the
-/// extrinsic call data.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
-pub enum ParameterId {
-	MinimumCollateralizationRatio,
-	InitialCollateralizationRatio,
-	SafetyCollateralizationRatio,
-	DebtCeiling,
-	MinimumDebt,
-	MinimumCollateral,
-	BorrowRateBounds,
-	UpfrontFeePeriod,
-	RateAdjustmentCooldown,
-	RedistributionPenalty,
-}
-
-/// Atomic update to a single field of `BranchConfig`. Carries both the
-/// `ParameterId` tag (for event emission) and the new value, so the two can't
-/// drift.
-pub enum BranchConfigUpdate<Balance, Moment> {
+/// Atomic update to a single field of `BranchConfig`.
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
+pub enum BranchConfigUpdate<Balance> {
 	MinimumCollateralizationRatio(FixedU128),
 	InitialCollateralizationRatio(FixedU128),
 	SafetyCollateralizationRatio(FixedU128),
@@ -499,42 +458,27 @@ pub enum BranchConfigUpdate<Balance, Moment> {
 	MinimumDebt(Balance),
 	MinimumCollateral(Balance),
 	BorrowRateBounds { min: FixedU128, max: FixedU128 },
-	UpfrontFeePeriod(Moment),
-	RateAdjustmentCooldown(Moment),
+	UpfrontFeePeriod(Millis),
+	RateAdjustmentCooldown(Millis),
 	RedistributionPenalty(Permill),
 }
 
-impl<Balance, Moment> BranchConfigUpdate<Balance, Moment> {
-	pub fn parameter_id(&self) -> ParameterId {
+impl<Balance> BranchConfigUpdate<Balance> {
+	pub fn apply_to(self, config: &mut BranchConfig<Balance>) {
 		match self {
-			Self::MinimumCollateralizationRatio(_) => ParameterId::MinimumCollateralizationRatio,
-			Self::InitialCollateralizationRatio(_) => ParameterId::InitialCollateralizationRatio,
-			Self::SafetyCollateralizationRatio(_) => ParameterId::SafetyCollateralizationRatio,
-			Self::DebtCeiling(_) => ParameterId::DebtCeiling,
-			Self::MinimumDebt(_) => ParameterId::MinimumDebt,
-			Self::MinimumCollateral(_) => ParameterId::MinimumCollateral,
-			Self::BorrowRateBounds { .. } => ParameterId::BorrowRateBounds,
-			Self::UpfrontFeePeriod(_) => ParameterId::UpfrontFeePeriod,
-			Self::RateAdjustmentCooldown(_) => ParameterId::RateAdjustmentCooldown,
-			Self::RedistributionPenalty(_) => ParameterId::RedistributionPenalty,
-		}
-	}
-
-	pub fn apply_to(self, cfg: &mut BranchConfig<Balance, Moment>) {
-		match self {
-			Self::MinimumCollateralizationRatio(v) => cfg.minimum_collateralization_ratio = v,
-			Self::InitialCollateralizationRatio(v) => cfg.initial_collateralization_ratio = v,
-			Self::SafetyCollateralizationRatio(v) => cfg.safety_collateralization_ratio = v,
-			Self::DebtCeiling(v) => cfg.debt_ceiling = v,
-			Self::MinimumDebt(v) => cfg.minimum_debt = v,
-			Self::MinimumCollateral(v) => cfg.minimum_collateral = v,
+			Self::MinimumCollateralizationRatio(v) => config.minimum_collateralization_ratio = v,
+			Self::InitialCollateralizationRatio(v) => config.initial_collateralization_ratio = v,
+			Self::SafetyCollateralizationRatio(v) => config.safety_collateralization_ratio = v,
+			Self::DebtCeiling(v) => config.debt_ceiling = v,
+			Self::MinimumDebt(v) => config.minimum_debt = v,
+			Self::MinimumCollateral(v) => config.minimum_collateral = v,
 			Self::BorrowRateBounds { min, max } => {
-				cfg.minimum_borrow_rate = min;
-				cfg.maximum_borrow_rate = max;
+				config.minimum_borrow_rate = min;
+				config.maximum_borrow_rate = max;
 			},
-			Self::UpfrontFeePeriod(v) => cfg.upfront_fee_period = v,
-			Self::RateAdjustmentCooldown(v) => cfg.rate_adjustment_cooldown = v,
-			Self::RedistributionPenalty(v) => cfg.redistribution_penalty = v,
+			Self::UpfrontFeePeriod(v) => config.upfront_fee_period = v,
+			Self::RateAdjustmentCooldown(v) => config.rate_adjustment_cooldown = v,
+			Self::RedistributionPenalty(v) => config.redistribution_penalty = v,
 		}
 	}
 }
@@ -565,20 +509,20 @@ pub enum VaultsManagerLevel {
 mod tests {
 	use super::*;
 
-	fn branch_state(principal: u128, weighted: u128) -> BranchState<u64, u128, u64> {
+	fn make_branch_state(principal: u128, weighted: u128) -> BranchState<u64, u128> {
 		BranchState {
 			total_collateral: 0,
 			debt: BranchDebt {
 				principal,
 				minted_interest: 0,
-				pending_redist_principal: 0,
+				pending_redistribution_principal: 0,
 				bad_debt: 0,
 				weighted_principal_sum: weighted,
 				last_interest_time: 0,
 			},
 			stakes: BranchStakes { total: 0, weighted_sum: 0 },
 			rounding: BranchRounding::default(),
-			redist: RedistSnapshot::default(),
+			redistribution: RedistributionSnapshot::default(),
 			interest_clock: InterestClock { epoch_base: 0, frozen_elapsed: 0 },
 			next_final_recovery_nonce: 0,
 			dormant_redemption_target: None,
@@ -593,18 +537,18 @@ mod tests {
 		// `floor(rate * delta)` update would subtract floor(0.3 * 1) = 0 and
 		// strand the weighted sum at 3.
 		let rate = FixedU128::from_rational(3u128, 10u128);
-		let mut bs = branch_state(10, 3);
-		bs.apply_debt_payment(DebtPayment { interest: 0, principal: 1 }, rate, 9);
-		assert_eq!(bs.debt.principal, 9);
-		assert_eq!(bs.debt.weighted_principal_sum, 2);
+		let mut state = make_branch_state(10, 3);
+		state.apply_debt_payment(DebtPayment { interest: 0, principal: 1 }, rate, 9);
+		assert_eq!(state.debt.principal, 9);
+		assert_eq!(state.debt.weighted_principal_sum, 2);
 	}
 
 	#[test]
 	fn apply_debt_payment_full_payoff_clears_contribution() {
 		let rate = FixedU128::from_rational(3u128, 10u128);
-		let mut bs = branch_state(10, 3);
-		bs.apply_debt_payment(DebtPayment { interest: 0, principal: 10 }, rate, 0);
-		assert_eq!(bs.debt.principal, 0);
-		assert_eq!(bs.debt.weighted_principal_sum, 0);
+		let mut state = make_branch_state(10, 3);
+		state.apply_debt_payment(DebtPayment { interest: 0, principal: 10 }, rate, 0);
+		assert_eq!(state.debt.principal, 0);
+		assert_eq!(state.debt.weighted_principal_sum, 0);
 	}
 }

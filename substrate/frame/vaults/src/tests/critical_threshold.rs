@@ -3,22 +3,18 @@ use crate::{
 	pallet::{BranchStates, Vaults},
 	tests::{rate_pct, vault_status},
 };
-use frame::deps::{
-	frame_support::{assert_noop, assert_ok},
-	sp_runtime::FixedU128,
-};
 
 /// Open one vault, then drop the oracle price so the branch enters Safety
 /// mode (TCR ≈ 125.87% — between ICR=120% and Safety=130%).
 ///
-/// pre-state: bs.total_collateral=1000 DOT, bs.total_ib=5000 pUSD, price=$6.30.
+/// pre-state: state.total_collateral=1000 DOT, state.total_ib=5000 pUSD, price=$6.30.
 /// Vault (acct 1) starts at CR=199.6% before the price drop and stays the
 /// only vault on the branch.
 fn enter_safety_mode_single_vault() {
 	register_default_branch();
 	assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(5, 100)));
 	set_price(DOT, FixedU128::from_rational(63u128, 10u128));
-	// Sanity: `bs.frozen` must remain `None`; mode is *derived* from TCR.
+	// Sanity: `state.frozen` must remain `None`; mode is *derived* from TCR.
 	assert!(!BranchStates::<Test>::get(DOT).expect("branch state").is_frozen());
 }
 
@@ -81,8 +77,8 @@ fn safety_mode_allows_borrow_after_large_deposit() {
 		enter_safety_mode_single_vault();
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
-			1,
 			DOT,
+			1,
 			200,
 		));
 		// post-deposit TCR ≈ 1200*6.3/5005 ≈ 151%. Now borrow a moderate amount
@@ -123,7 +119,7 @@ fn safety_mode_allows_repay_then_withdraw() {
 		enter_safety_mode_single_vault();
 		// Repay 3000 pUSD: total debt drops from 5005 to ~2005, TCR rises to
 		// 1000*6.3/2005 ≈ 314%. Branch exits Safety mode.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, 3_000));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 3_000));
 		// Now withdraw 100 DOT — TCR drops to 900*6.3/2005 ≈ 282%, still in
 		// Normal mode and well above Safety threshold.
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
@@ -139,7 +135,7 @@ fn safety_mode_allows_repay_then_withdraw() {
 // `safety_mode_blocks_withdraw_alone` above.
 // In Normal mode, a premature rate change that would push TCR below the
 // safety threshold reverts. The upfront fee bumps
-// `bs.debt.minted_interest` and lowers post-TCR; if pre-TCR is
+// `state.debt.minted_interest` and lowers post-TCR; if pre-TCR is
 // just above Safety, post-TCR can land below it.
 #[test]
 fn normal_mode_blocks_premature_rate_change_pulling_into_safety() {
@@ -210,17 +206,17 @@ fn safety_mode_blocks_close_with_collateral() {
 		// Top up acct 2's pUSD so the repay can cover principal + upfront fee.
 		let v = Vaults::<Test>::get(DOT, 2).expect("vault stored");
 		let total = v.debt.principal + v.debt.interest;
-		let _ = <Pusd as frame::deps::frame_support::traits::fungible::Mutate<u64>>::transfer(
+		let _ = <Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&1,
 			&2,
 			v.debt.interest,
-			frame::deps::frame_support::traits::tokens::Preservation::Expendable,
+			frame::traits::tokens::Preservation::Expendable,
 		);
 		// Drop the price; the post-close TCR will be below the safety
 		// threshold, so the auto-close inside repay_for must revert.
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), 2, DOT, total),
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, 2, total),
 			crate::Error::<Test>::WouldEnterSafetyMode
 		);
 	});
@@ -288,8 +284,8 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 		// ICR (200 DOT * 2.10 / 205 ≈ 204.9%).
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
-			2,
 			DOT,
+			2,
 			100,
 		));
 		// borrow(+0) now passes the CR gate. The TCR check passes too because
@@ -326,13 +322,13 @@ fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 		);
 
 		// Top up enough collateral to lift the branch back out of Safety
-		// mode entirely (target TCR > 130%). bs.total_debt ≈ 5206; we need
+		// mode entirely (target TCR > 130%). state.total_debt ≈ 5206; we need
 		// total_coll * 2.10 / 5206 ≥ 1.30 → total_coll ≥ 3223 DOT, so a
 		// deposit of 3000 DOT puts us comfortably in Normal mode.
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
-			2,
 			DOT,
+			2,
 			3_000,
 		));
 		// Withdraw 1 DOT now — vault 2 CR is huge, branch is in Normal mode

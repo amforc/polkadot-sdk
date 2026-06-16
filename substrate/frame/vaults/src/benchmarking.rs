@@ -6,9 +6,7 @@
 
 use crate::{
 	helpers,
-	pallet::{
-		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, MomentOf, Pallet, Vaults,
-	},
+	pallet::{BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, Vaults},
 	types::{BranchConfig, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
 };
@@ -18,7 +16,7 @@ use frame::{
 	deps::{
 		frame_support::traits::{
 			fungible::Mutate as FungibleMutate, fungibles::MutateHold as FungiblesMutateHold,
-			EnsureOrigin, Time,
+			EnsureOrigin,
 		},
 		sp_runtime::{
 			traits::{SaturatedConversion, Zero},
@@ -35,11 +33,11 @@ const ACCOUNT_FUNDING: u128 = 10_000_000;
 const SEED_COLL: u128 = 1_000_000;
 /// Must exceed `default_branch_config::minimum_debt` (200).
 const SEED_DEBT: u128 = 300;
-/// Price drop that pushes a `coll=200, debt=300` vault below the 110% MCR,
+/// Price drop that pushes a `collateral=200, debt=300` vault below the 110% MCR,
 /// so `enter_final_recovery` accepts it.
 const RECOVERY_TRIGGER_PRICE: u32 = 1;
-/// One hour in milliseconds — enough for `update_aggregate_interest` and
-/// `touch_vault` to accrue non-zero interest at the default 5% vault rate.
+/// One hour in milliseconds — enough for a vault refresh to accrue
+/// non-zero interest at the default 5% vault rate.
 const ONE_HOUR_MS: u64 = 60 * 60 * 1_000;
 const RECOVERY_VAULT_COLL: u128 = 200;
 const REDIST_PER_STAKE_NUM: u128 = 1;
@@ -56,7 +54,7 @@ fn rate(numerator: u128, denominator: u128) -> FixedU128 {
 	FixedU128::from_rational(numerator, denominator)
 }
 
-fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>, MomentOf<T>> {
+fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
 	const DAY_MS: u64 = 24 * 3_600 * 1_000;
 	BranchConfig {
 		minimum_collateralization_ratio: rate(110, 100),
@@ -67,8 +65,8 @@ fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>, MomentOf<T>>
 		minimum_collateral: balance::<T>(1),
 		minimum_borrow_rate: rate(1, 1_000),
 		maximum_borrow_rate: rate(100, 100),
-		upfront_fee_period: (7 * DAY_MS).saturated_into(),
-		rate_adjustment_cooldown: DAY_MS.saturated_into(),
+		upfront_fee_period: 7 * DAY_MS,
+		rate_adjustment_cooldown: DAY_MS,
 		redistribution_penalty: Permill::from_percent(5),
 	}
 }
@@ -114,14 +112,15 @@ struct RateBounds {
 }
 
 fn rate_bounds<T: Config>(asset: &T::AssetId) -> Result<RateBounds, BenchmarkError> {
-	let cfg = helpers::branch_cfg_of::<T>(asset)
+	let config = helpers::branch_config_of::<T>(asset)
 		.map_err(|_| BenchmarkError::Stop("missing branch config"))?;
 	let count = T::VaultLists::repair_budget().saturating_add(2);
-	let safety_floor =
-		cfg.minimum_borrow_rate.saturating_mul(FixedU128::saturating_from_integer(2u32));
+	let safety_floor = config
+		.minimum_borrow_rate
+		.saturating_mul(FixedU128::saturating_from_integer(2u32));
 	// Use half of `maximum_borrow_rate` as the ceiling so `above = safety_ceiling`
 	// always satisfies `validate_rate`.
-	let safety_ceiling = cfg
+	let safety_ceiling = config
 		.maximum_borrow_rate
 		.const_checked_div(FixedU128::saturating_from_integer(2u32))
 		.ok_or(BenchmarkError::Stop("maximum_borrow_rate halving overflowed"))?;
@@ -186,31 +185,32 @@ fn worst_case_head_hint<T: Config>(
 	Ok(Position::between(seeds[s - 1].clone(), seeds[s].clone()))
 }
 
-/// Plant a non-trivial branch redistribution snapshot so every `touch_vault`
-/// call enters the `snap != redist` branch with non-zero `redist_collat` and
-/// `redist_debt_principal`.
+/// Plant a non-trivial branch redistribution snapshot so every vault touch
+/// enters the `snap != redistribution` branch with non-zero `redistribution_collateral` and
+/// `redistribution_debt_principal`.
 fn seed_pending_redistribution<T: Config>(asset: &T::AssetId) -> Result<(), BenchmarkError> {
 	let per_stake = rate(REDIST_PER_STAKE_NUM, REDIST_PER_STAKE_DEN);
 	let weight_per_stake = rate(REDIST_WEIGHT_PER_STAKE_NUM, REDIST_WEIGHT_PER_STAKE_DEN);
 
-	let redist_acct = Pallet::<T>::redistribution_account();
+	let redistribution_account_id = Pallet::<T>::redistribution_account();
 	let pre_stage = balance::<T>(REDIST_PRESTAGE_COLL);
-	T::BenchmarkHelper::mint_collateral(asset.clone(), &redist_acct, pre_stage);
+	T::BenchmarkHelper::mint_collateral(asset.clone(), &redistribution_account_id, pre_stage);
 	T::CollateralAssets::hold(
 		asset.clone(),
 		&HoldReason::VaultCollateral.into(),
-		&redist_acct,
+		&redistribution_account_id,
 		pre_stage,
 	)
 	.map_err(|_| BenchmarkError::Stop("hold on redistribution account failed"))?;
 
 	BranchStates::<T>::try_mutate(asset, |maybe| -> Result<(), BenchmarkError> {
-		let bs = maybe.as_mut().ok_or(BenchmarkError::Stop("branch missing"))?;
-		bs.redist.debt_per_stake = per_stake;
-		bs.redist.collat_per_stake = per_stake;
-		bs.redist.weight_per_stake = weight_per_stake;
-		bs.redist.debt_time_per_stake = FixedU128::zero();
-		bs.debt.pending_redist_principal = per_stake.saturating_mul_int(bs.stakes.total);
+		let state = maybe.as_mut().ok_or(BenchmarkError::Stop("branch missing"))?;
+		state.redistribution.debt_per_stake = per_stake;
+		state.redistribution.collateral_per_stake = per_stake;
+		state.redistribution.weight_per_stake = weight_per_stake;
+		state.redistribution.debt_time_per_stake = FixedU128::zero();
+		state.debt.pending_redistribution_principal =
+			per_stake.saturating_mul_int(state.stakes.total);
 		Ok(())
 	})
 }
@@ -239,8 +239,8 @@ fn recovery_cycle<T: Config>(
 	let keeper: T::AccountId = whitelisted_caller();
 	Pallet::<T>::enter_final_recovery(
 		RawOrigin::Signed(keeper).into(),
-		owner.clone(),
 		asset.clone(),
+		owner.clone(),
 	)?;
 	T::BenchmarkHelper::set_oracle_price(
 		asset.clone(),
@@ -268,13 +268,13 @@ mod benchmarks {
 		let asset = register_default_branch::<T>()?;
 		let seeds = seed_worst_case_chain::<T>(&asset)?;
 		let caller = funded_account::<T>("caller", &asset);
-		let coll = balance::<T>(SEED_COLL);
+		let collateral = balance::<T>(SEED_COLL);
 		let debt = balance::<T>(SEED_DEBT);
 		let hint = worst_case_head_hint::<T>(&seeds)?;
 		let new_rate = rate_bounds::<T>(&asset)?.above;
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller.clone()), asset.clone(), coll, debt, new_rate, hint);
+		_(RawOrigin::Signed(caller.clone()), asset.clone(), collateral, debt, new_rate, hint);
 
 		assert!(Vaults::<T>::contains_key(&asset, &caller));
 		Ok(())
@@ -298,7 +298,7 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), owner.clone(), asset.clone(), deposit);
+		_(RawOrigin::Signed(caller), asset.clone(), owner.clone(), deposit);
 
 		assert!(Vaults::<T>::contains_key(&asset, &owner));
 		Ok(())
@@ -385,7 +385,7 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), owner.clone(), asset.clone(), amount);
+		_(RawOrigin::Signed(caller), asset.clone(), owner.clone(), amount);
 
 		assert!(Vaults::<T>::contains_key(&asset, &owner));
 		Ok(())
@@ -490,7 +490,7 @@ mod benchmarks {
 		let caller: T::AccountId = whitelisted_caller();
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), owner.clone(), asset.clone());
+		_(RawOrigin::Signed(caller), asset.clone(), owner.clone());
 
 		assert!(Vaults::<T>::contains_key(&asset, &owner));
 		Ok(())
@@ -518,7 +518,7 @@ mod benchmarks {
 		let caller: T::AccountId = whitelisted_caller();
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), owner.clone(), asset.clone());
+		_(RawOrigin::Signed(caller), asset.clone(), owner.clone());
 
 		assert_eq!(Pallet::<T>::vault_status(asset, owner), Some(VaultStatus::FinalRecovery));
 		Ok(())
@@ -537,7 +537,7 @@ mod benchmarks {
 		let hint = worst_case_head_hint::<T>(&seeds)?;
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), owner.clone(), asset.clone(), hint);
+		_(RawOrigin::Signed(caller), asset.clone(), owner.clone(), hint);
 
 		assert_eq!(Pallet::<T>::vault_status(asset, owner), Some(VaultStatus::Active));
 		Ok(())
@@ -596,7 +596,7 @@ mod benchmarks {
 		let caller: T::AccountId = whitelisted_caller();
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), owner.clone(), asset.clone(), hint);
+		_(RawOrigin::Signed(caller), asset.clone(), owner.clone(), hint);
 
 		assert_eq!(Pallet::<T>::vault_status(asset, owner), Some(VaultStatus::Active));
 		Ok(())
@@ -607,11 +607,11 @@ mod benchmarks {
 		let prefill = <T::MaxBranches as Get<u32>>::get().saturating_sub(1);
 		prefill_branches::<T>(prefill);
 		let asset = T::BenchmarkHelper::collateral_asset_id();
-		let cfg = default_branch_config::<T>();
+		let config = default_branch_config::<T>();
 		let origin = manager_origin::<T>()?;
 
 		#[extrinsic_call]
-		_(origin, asset.clone(), cfg);
+		_(origin, asset.clone(), config);
 
 		assert!(BranchStates::<T>::contains_key(&asset));
 		Ok(())
@@ -656,13 +656,11 @@ mod benchmarks {
 		)?;
 		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
-		let now = T::TimeProvider::now();
 
 		#[block]
 		{
 			if Vaults::<T>::contains_key(&asset, &owner) {
-				let _ = crate::helpers::update_aggregate_interest::<T>(&asset, now);
-				let _ = crate::helpers::touch_vault::<T>(&asset, &owner, now);
+				let _ = crate::helpers::OpContext::<T>::refresh(asset.clone(), &owner);
 				let _ = T::VaultLists::neighbors(&VaultListId::Rate(asset.clone()), &owner);
 			}
 		}

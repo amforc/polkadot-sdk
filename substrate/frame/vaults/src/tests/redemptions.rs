@@ -3,10 +3,6 @@ use crate::{
 	pallet::{BranchStates, Vaults},
 	tests::{rate_pct, vault_status},
 };
-use frame::deps::{
-	frame_support::{assert_noop, assert_ok},
-	sp_runtime::FixedU128,
-};
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{RedemptionAllocation, VaultRedemptionInterface};
 
@@ -34,8 +30,8 @@ fn fully_redeemed_vault_becomes_dormant_and_leaves_rate_index() {
 		let v = Vaults::<Test>::get(DOT, 1).unwrap();
 		assert!(vault_status(DOT, 1).is_dormant());
 		assert_eq!(v.debt.principal + v.debt.interest, 0);
-		let bs = BranchStates::<Test>::get(DOT).unwrap();
-		assert_eq!(bs.dormant_redemption_target, None);
+		let state = BranchStates::<Test>::get(DOT).unwrap();
+		assert_eq!(state.dormant_redemption_target, None);
 		// Rate index no longer contains acct 1.
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
 			&rate_list(DOT),
@@ -58,8 +54,8 @@ fn redeemed_below_min_debt_becomes_dormant() {
 		let total = v.debt.principal + v.debt.interest;
 		assert!(total > 0 && total < 200, "got total = {}", total);
 		assert!(vault_status(DOT, 1).is_dormant());
-		let bs = BranchStates::<Test>::get(DOT).unwrap();
-		assert_eq!(bs.dormant_redemption_target, Some(1));
+		let state = BranchStates::<Test>::get(DOT).unwrap();
+		assert_eq!(state.dormant_redemption_target, Some(1));
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
 			&rate_list(DOT),
 			&1
@@ -180,16 +176,16 @@ fn dormant_pointer_clears_when_last_dormant_fully_redeemed() {
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
 		// Push acct 1 to Dormant via partial-below-MinDebt.
 		assert_ok!(redeem(DOT, 3, 350));
-		let bs = BranchStates::<Test>::get(DOT).unwrap();
-		assert_eq!(bs.dormant_redemption_target, Some(1));
+		let state = BranchStates::<Test>::get(DOT).unwrap();
+		assert_eq!(state.dormant_redemption_target, Some(1));
 		// Now redeem acct 1's full residual. next_redemption_target prefers
 		// dormant_redemption_target, so this hits acct 1 again.
 		let v = Vaults::<Test>::get(DOT, 1).unwrap();
 		let residual = v.debt.principal + v.debt.interest;
 		let target = redeem(DOT, 3, residual).expect("redeem residual ok");
 		assert_eq!(target, 1);
-		let bs = BranchStates::<Test>::get(DOT).unwrap();
-		assert_eq!(bs.dormant_redemption_target, None);
+		let state = BranchStates::<Test>::get(DOT).unwrap();
+		assert_eq!(state.dormant_redemption_target, None);
 	});
 }
 
@@ -205,8 +201,8 @@ fn dormant_owner_borrowing_above_min_debt_revives_to_active() {
 			&rate_list(DOT),
 			&1
 		));
-		let bs = BranchStates::<Test>::get(DOT).unwrap();
-		assert_eq!(bs.dormant_redemption_target, Some(1));
+		let state = BranchStates::<Test>::get(DOT).unwrap();
+		assert_eq!(state.dormant_redemption_target, Some(1));
 
 		// Owner borrows enough to push debt above MinimumDebt → revives.
 		// Vault debt jumps from ~150 to ~650, well above MinimumDebt 200.
@@ -221,8 +217,8 @@ fn dormant_owner_borrowing_above_min_debt_revives_to_active() {
 		assert!(vault_status(DOT, 1).is_active());
 		// Re-inserted into the rate index at the new (or unchanged) rate.
 		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(&rate_list(DOT), &1));
-		let bs = BranchStates::<Test>::get(DOT).unwrap();
-		assert_eq!(bs.dormant_redemption_target, None);
+		let state = BranchStates::<Test>::get(DOT).unwrap();
+		assert_eq!(state.dormant_redemption_target, None);
 	});
 }
 
@@ -245,13 +241,13 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 
 		advance_time(365 * ONE_DAY_MS);
 		// Touch alone never re-activates a Dormant, even past MinimumDebt.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, 1));
 		assert!(vault_status(DOT, 1).is_dormant(), "touch never re-activates a Dormant");
 
 		assert_ok!(crate::Pallet::<Test>::activate_dormant(
 			RuntimeOrigin::signed(9),
-			1,
 			DOT,
+			1,
 			Position::endpoints_only(),
 		));
 		assert!(vault_status(DOT, 1).is_active());
@@ -271,8 +267,8 @@ fn activate_dormant_rejects_below_minimum_debt() {
 		assert_noop!(
 			crate::Pallet::<Test>::activate_dormant(
 				RuntimeOrigin::signed(9),
-				1,
 				DOT,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::DebtBelowMinimum
@@ -289,8 +285,8 @@ fn activate_dormant_rejects_active_vault() {
 		assert_noop!(
 			crate::Pallet::<Test>::activate_dormant(
 				RuntimeOrigin::signed(9),
-				1,
 				DOT,
+				1,
 				Position::endpoints_only(),
 			),
 			crate::Error::<Test>::InvalidVaultStatus
@@ -308,7 +304,7 @@ fn dormant_vault_with_residual_accrues_interest() {
 		let v_pre = Vaults::<Test>::get(DOT, 1).unwrap();
 
 		advance_time(365 * ONE_DAY_MS); // 1 year
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, 1));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 		assert!(
 			v_post.debt.interest > v_pre.debt.interest,
@@ -317,9 +313,7 @@ fn dormant_vault_with_residual_accrues_interest() {
 	});
 }
 
-// A liquidation distributes its debt and collateral to the remaining stake
-// pool. Dormant vaults keep their stake (compute_stake at open) and so still
-// receive redistribution gains when `touch_vault` reconciles the interest-time lag.
+// Dormant vaults keep stake and receive redistribution gains on touch.
 #[test]
 fn dormant_vault_receives_redistribution_gains_on_touch() {
 	build_and_execute(|| {
@@ -334,13 +328,13 @@ fn dormant_vault_receives_redistribution_gains_on_touch() {
 
 		// Drop the price so acct 3's CR falls below MCR — the vault pallet
 		// refuses liquidation of a vault whose CR is at/above MCR. 1.0 puts
-		// vault 3 (200 coll, ~200 debt) under the 110% MCR while leaving vaults
+		// vault 3 (200 collateral, ~200 debt) under the 110% MCR while leaving vaults
 		// 1 and 2 above it.
 		let v_dormant_pre = Vaults::<Test>::get(DOT, 1).unwrap();
 		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
 		assert_ok!(liquidate(DOT, 3));
-		// Touch acct 1 so the interest-time lag closes and redist gains land on it.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), 1, DOT));
+		// Touch acct 1 so the interest-time lag closes and redistribution gains land on it.
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, 1));
 		let v_dormant_post = Vaults::<Test>::get(DOT, 1).unwrap();
 		// Gains may be very small for tiny liquidations; pin "did not lose".
 		assert!(
@@ -350,7 +344,7 @@ fn dormant_vault_receives_redistribution_gains_on_touch() {
 	});
 }
 
-// `borrow` requires `vault.debt.principal >= cfg.minimum_debt` after the
+// `borrow` requires `vault.debt.principal >= config.minimum_debt` after the
 // operation. Borrowing on a Dormant vault that doesn't reach the threshold
 // reverts.
 #[test]
@@ -390,7 +384,7 @@ fn deposit_to_dormant_without_revival_errors() {
 		assert_ok!(redeem(DOT, 3, 350));
 		assert!(vault_status(DOT, 1).is_dormant());
 		assert_noop!(
-			crate::Pallet::<Test>::deposit_collateral_for(RuntimeOrigin::signed(2), 1, DOT, 100),
+			crate::Pallet::<Test>::deposit_collateral_for(RuntimeOrigin::signed(2), DOT, 1, 100),
 			crate::Error::<Test>::DebtBelowMinimum
 		);
 	});

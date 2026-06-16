@@ -2,7 +2,6 @@
 //! re-insertion of vaults keyed by their annual borrow rate.
 
 use crate::{mock::*, tests::rate_pct};
-use frame::deps::frame_support::assert_ok;
 use pallet_linked_list::SortedListInterface;
 
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
@@ -64,15 +63,15 @@ fn close_vault_removes_from_rate_index() {
 		// Repay vault 3 fully (top up from acct 4) then close it.
 		let v = crate::pallet::Vaults::<Test>::get(DOT, 3).unwrap();
 		let total = v.debt.principal + v.debt.interest;
-		let _ = <Pusd as frame::deps::frame_support::traits::fungible::Mutate<u64>>::transfer(
+		let _ = <Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&4,
 			&3,
 			v.debt.interest,
-			frame::deps::frame_support::traits::tokens::Preservation::Expendable,
+			frame::traits::tokens::Preservation::Expendable,
 		);
 		// repay-to-zero auto-closes, which also removes the vault from the
 		// rate index.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), 3, DOT, total));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), DOT, 3, total));
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
 			&rate_list(DOT),
 			&3

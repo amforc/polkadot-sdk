@@ -6,49 +6,29 @@
 use crate::{
 	math,
 	pallet::{
-		BalanceOf, BranchConfigs, BranchStates, Config, Error, Event, HoldReason, MomentOf, Pallet,
+		BalanceOf, BranchConfigs, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet,
 		Vaults,
 	},
 	recovery,
 	types::{
 		BranchConfig, BranchDebt, BranchMode, BranchStakes, BranchState, DebtPayment, FrozenReason,
-		FrozenState, InterestClock, RedistSnapshot, Vault, VaultDebt, VaultListId, VaultStatus,
+		FrozenState, InterestClock, RedistributionSnapshot, Vault, VaultDebt, VaultListId,
+		VaultStatus,
 	},
 	weights::WeightInfo,
 };
 use frame::{
-	deps::{
-		frame_support::{
-			require_transactional,
-			storage::with_storage_layer,
-			traits::{
-				fungible::{Balanced as FungibleBalanced, Mutate as FungibleMutate},
-				fungibles::{
-					InspectHold as FungiblesInspectHold, MutateHold as FungiblesMutateHold,
-				},
-				tokens::{Fortitude, Imbalance, Precision, Preservation, Restriction},
-				OnUnbalanced, Time,
-			},
-			weights::Weight,
-		},
-		sp_runtime::{
-			traits::{CheckedDiv, Saturating, Zero},
-			DispatchError, FixedPointNumber, FixedU128, Permill,
-		},
-	},
+	deps::frame_support::storage::with_storage_layer,
 	prelude::*,
+	traits::{
+		fungible::{Balanced as FungibleBalanced, Mutate as FungibleMutate},
+		fungibles::{InspectHold as FungiblesInspectHold, MutateHold as FungiblesMutateHold},
+		tokens::{Imbalance, Restriction},
+		Time,
+	},
 };
 use pallet_linked_list::{ListError, Position, SortedListInterface};
 use pusd_primitives::{OnBranchRegistered, ProvidePrice};
-
-pub(crate) fn moment_to_millis<T: Config>(m: MomentOf<T>) -> u64 {
-	use frame::deps::sp_runtime::traits::SaturatedConversion;
-	m.saturated_into::<u64>()
-}
-
-pub(crate) fn millis_diff<T: Config>(now: MomentOf<T>, then: MomentOf<T>) -> u64 {
-	moment_to_millis::<T>(now.saturating_sub(then))
-}
 
 /// Translate a rate-index insert/re-insert failure. A stale user-supplied
 /// hint surfaces as [`Error::InvalidPositionHints`]; every other kind means
@@ -66,14 +46,14 @@ pub(crate) fn map_error<T: Config>(e: ListError) -> Error<T> {
 /// Read the branch state, returning `UnknownCollateral` when missing.
 pub(crate) fn branch_state_of<T: Config>(
 	collateral_id: &T::AssetId,
-) -> Result<BranchState<T::AccountId, BalanceOf<T>, MomentOf<T>>, DispatchError> {
+) -> Result<BranchState<T::AccountId, BalanceOf<T>>, DispatchError> {
 	BranchStates::<T>::get(collateral_id).ok_or_else(|| Error::<T>::UnknownCollateral.into())
 }
 
 /// Read the branch config, returning `UnknownCollateral` when missing.
-pub(crate) fn branch_cfg_of<T: Config>(
+pub(crate) fn branch_config_of<T: Config>(
 	collateral_id: &T::AssetId,
-) -> Result<BranchConfig<BalanceOf<T>, MomentOf<T>>, DispatchError> {
+) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
 	BranchConfigs::<T>::get(collateral_id).ok_or_else(|| Error::<T>::UnknownCollateral.into())
 }
 
@@ -84,11 +64,11 @@ pub(crate) fn ensure_above_icr<T: Config>(
 	collateral: BalanceOf<T>,
 	debt: BalanceOf<T>,
 	price: FixedU128,
-	cfg: &BranchConfig<BalanceOf<T>, MomentOf<T>>,
+	config: &BranchConfig<BalanceOf<T>>,
 ) -> Result<(), DispatchError> {
 	let cr = math::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
 		.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
-	ensure!(cr >= cfg.initial_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
+	ensure!(cr >= config.initial_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
 	Ok(())
 }
 
@@ -99,11 +79,11 @@ pub(crate) fn ensure_below_mcr<T: Config>(
 	collateral: BalanceOf<T>,
 	debt: BalanceOf<T>,
 	price: FixedU128,
-	cfg: &BranchConfig<BalanceOf<T>, MomentOf<T>>,
+	config: &BranchConfig<BalanceOf<T>>,
 ) -> Result<(), DispatchError> {
 	let cr = math::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
 		.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
-	ensure!(cr < cfg.minimum_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
+	ensure!(cr < config.minimum_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
 	Ok(())
 }
 
@@ -113,11 +93,11 @@ pub(crate) fn ensure_at_or_above_mcr<T: Config>(
 	collateral: BalanceOf<T>,
 	debt: BalanceOf<T>,
 	price: FixedU128,
-	cfg: &BranchConfig<BalanceOf<T>, MomentOf<T>>,
+	config: &BranchConfig<BalanceOf<T>>,
 ) -> Result<(), DispatchError> {
 	let cr = math::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
 		.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
-	ensure!(cr >= cfg.minimum_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
+	ensure!(cr >= config.minimum_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
 	Ok(())
 }
 
@@ -125,11 +105,11 @@ pub(crate) fn ensure_at_or_above_mcr<T: Config>(
 pub(crate) fn vault_of<T: Config>(
 	collateral_id: &T::AssetId,
 	owner: &T::AccountId,
-) -> Result<Vault<BalanceOf<T>, MomentOf<T>>, DispatchError> {
+) -> Result<Vault<BalanceOf<T>>, DispatchError> {
 	Vaults::<T>::get(collateral_id, owner).ok_or_else(|| Error::<T>::VaultNotFound.into())
 }
 
-impl<Balance, Moment> Vault<Balance, Moment> {
+impl<Balance> Vault<Balance> {
 	/// Derive this vault's lifecycle status from queue/index membership.
 	///
 	/// Status is not stored on the row, and the keys must be re-supplied
@@ -152,17 +132,17 @@ impl<Balance, Moment> Vault<Balance, Moment> {
 
 mod accounting;
 mod branch;
+mod context;
 mod ops;
 mod views;
 
-use accounting::{charge_upfront_fee, simulate_borrow, simulate_change_rate};
-pub(crate) use accounting::{
-	compute_tcr, open_upfront_fee, pending_touch_for, touch_vault, update_aggregate_interest,
-};
+pub(crate) use accounting::{compute_tcr, open_upfront_fee, pending_touch_for};
+use accounting::{simulate_borrow, simulate_change_rate};
 pub(crate) use branch::{
 	clear_governance_frozen_mode, current_mode, enable_frozen_mode, enforce_mode_rules,
-	ensure_not_frozen, refresh_branch, register_branch, update_branch_config, validate_rate,
+	refresh_branch, register_branch, update_branch_config, validate_rate,
 };
+pub(crate) use context::{OpContext, TouchedVault};
 pub(crate) use ops::{
 	activate_dormant, borrow, change_rate, close_vault, deposit_collateral_for,
 	enter_final_recovery, exit_final_recovery, on_idle_walk, open_vault, poke, repay_for,

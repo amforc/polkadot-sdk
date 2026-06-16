@@ -1,8 +1,4 @@
 use crate::{mock::*, tests::rate_pct};
-use frame::deps::{
-	frame_support::{assert_noop, assert_ok},
-	sp_runtime::FixedU128,
-};
 use pusd_primitives::{KeeperCompensation, LiquidationAllocation, OffsetAllocation};
 
 #[test]
@@ -48,7 +44,7 @@ fn execute_liquidation_rejects_final_recovery_vault() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, 1));
 		assert_noop!(liquidate(DOT, 1), crate::Error::<Test>::VaultInFinalRecovery);
 	});
 }
@@ -128,15 +124,15 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 		// Partial redemption drains vault 1 below MinimumDebt → Dormant, and
 		// parks it as the next redemption target.
 		assert_ok!(redeem(DOT, 3, 350));
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
-		assert_eq!(bs.dormant_redemption_target, Some(1));
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_eq!(state.dormant_redemption_target, Some(1));
 
 		// Crash the price so the dormant husk is liquidatable, then liquidate.
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
 		assert!(liquidate(DOT, 1).is_ok());
 
 		assert!(crate::pallet::Vaults::<Test>::get(DOT, 1).is_none());
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
-		assert_eq!(bs.dormant_redemption_target, None, "pointer cleared with the row");
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_eq!(state.dormant_redemption_target, None, "pointer cleared with the row");
 	});
 }

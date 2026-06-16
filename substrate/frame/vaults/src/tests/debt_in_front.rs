@@ -1,5 +1,4 @@
 use crate::{mock::*, tests::rate_pct};
-use frame::deps::frame_support::assert_ok;
 
 // `view_debt_in_front` returns the total debt at rates strictly below a given
 // rate. A debt-between-two-rates range is derivable from two calls:
@@ -52,8 +51,8 @@ fn debt_in_front_counts_principal_not_total_debt() {
 		assert_ok!(open(2, DOT, 5_000, 700, rate_pct(6, 1000))); // 0.6%
 														   // Accrue a year of interest and materialise it into stored debt.
 		advance_time(365 * 24 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), 1, DOT));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), 2, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, 1));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, 2));
 		let v1 = crate::pallet::Vaults::<Test>::get(DOT, 1).expect("v1");
 		assert!(v1.debt.interest > 0, "interest must have materialised on top of principal");
 		// Still just the principals: 500 + 700.

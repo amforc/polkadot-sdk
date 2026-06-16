@@ -3,22 +3,14 @@ use crate::{
 	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
-use frame::deps::{
-	frame_support::{
-		assert_noop, assert_ok,
-		traits::{
-			fungible::{Inspect as FungibleInspect, Mutate as FungibleMutate},
-			tokens::Preservation,
-		},
-	},
-	sp_runtime::FixedU128,
+use frame::traits::{
+	fungible::{Inspect as FungibleInspect, Mutate as FungibleMutate},
+	tokens::Preservation,
 };
 use pallet_linked_list::SortedListInterface;
 
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 
-// Branch interest time at wall-clock `now` — the value `touch_vault` stamps into
-// `last_interest_time`. Differs from raw `now` by the branch epoch base.
 fn interest_time_at(asset: AssetId, now: Moment) -> Moment {
 	crate::pallet::BranchStates::<Test>::get(asset).unwrap().interest_time(now)
 }
@@ -58,8 +50,6 @@ fn open_sets_last_interest_time_to_now() {
 			Vaults::<Test>::get(DOT, 1).unwrap().last_interest_time,
 			interest_time_at(DOT, t0)
 		);
-		// Advance time, open a second vault — last-update for that vault is
-		// the new `now`, while the first vault keeps its original stamp.
 		advance_time(1_000);
 		let t1 = pallet_timestamp::Pallet::<Test>::get();
 		assert_ok!(open(2, DOT, 1_000, 2_000, rate_pct(5, 100)));
@@ -84,7 +74,6 @@ fn change_rate_from_non_owner_returns_vault_not_found() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(37, 100)));
-		// Account 2 has no vault on DOT.
 		assert_noop!(
 			crate::Pallet::<Test>::change_rate(
 				RuntimeOrigin::signed(2),
@@ -161,13 +150,8 @@ fn change_rate_post_cooldown_full_state() {
 		));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 
-		// last_interest_time == now (touch ran inside change_rate).
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
-		// No fee charged post-cooldown, so principal is unchanged.
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
-		// Pending interest at the new last_interest_time is zero by
-		// construction (touch_vault moved any sim-pending into the accrued
-		// component). Accrued grew by the materialised pending.
 		assert!(v_post.debt.interest >= v_pre.debt.interest);
 	});
 }
@@ -182,7 +166,7 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 		advance_time(ONE_DAY_MS / 2);
 		// Settle pending interest into accrued first so the change_rate
 		// delta isolates the upfront-fee component.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, 1));
 		let v_pre = Vaults::<Test>::get(DOT, 1).unwrap();
 
 		let predicted =
@@ -213,11 +197,10 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 			&rate_list(DOT),
 			10,
 		);
-		// Various coll/debt adjusts — none of these touch the rate index.
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
-			1,
 			DOT,
+			1,
 			100,
 		));
 		assert_ok!(crate::Pallet::<Test>::borrow(
@@ -228,7 +211,7 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 			2,
 			Position::endpoints_only(),
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), 3, DOT, 50));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), DOT, 3, 50));
 		let order_after = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
 			&rate_list(DOT),
 			10,
@@ -251,7 +234,7 @@ fn borrow_full_state_changes() {
 		advance_time(ONE_DAY_MS);
 		// Settle pending into accrued so the borrow delta isolates the
 		// upfront fee.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, 1));
 
 		let v_pre = Vaults::<Test>::get(DOT, 1).unwrap();
 		let predicted_fee = crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, 1, 500, None);
@@ -267,12 +250,8 @@ fn borrow_full_state_changes() {
 		));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 
-		// last_interest_time advances to now.
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
-		// Recorded principal grew by exactly the borrowed amount.
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
-		// Accrued grew by exactly the upfront fee (no sim-pending to
-		// materialise — we pre-poked).
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted_fee);
 	});
 }
@@ -356,14 +335,14 @@ fn repay_full_state_changes() {
 		// Settle pending interest into a known-quantity accrued, then top up
 		// the borrower's pUSD so they have enough to repay both principal
 		// and accrued.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, 1));
 		let v_pre = Vaults::<Test>::get(DOT, 1).unwrap();
 		// Borrow more pUSD into a second account so we can shuttle some over.
 		assert_ok!(open(2, DOT, 5_000, 3_000, rate_pct(25, 100)));
 		top_up_pusd(1, 2, v_pre.debt.interest + 500);
 
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, 500));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 500));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
@@ -402,14 +381,11 @@ fn poke_full_state_changes() {
 
 		// Permissionless: any signed origin (here, account 2) can poke
 		// account 1's vault.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, 1));
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
-		// Recorded principal unchanged.
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
-		// Pending at the new last_interest_time is zero by construction; the
-		// accrued component grew by the materialised sim-pending.
 		assert!(v_post.debt.interest >= v_pre.debt.interest);
 	});
 }
@@ -425,14 +401,13 @@ fn poke_after_full_repayment_errors_vault_not_found() {
 		assert_ok!(open(2, DOT, 3_000, 2_000, rate_pct(25, 100)));
 		// Repay all of vault 1's debt — first poke to settle accrued, then
 		// transfer accrued from vault 2 to cover the residual.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, 1));
 		let v = Vaults::<Test>::get(DOT, 1).unwrap();
 		let total = v.debt.principal + v.debt.interest;
 		top_up_pusd(1, 2, v.debt.interest);
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, total));
-		// The repay-to-zero auto-closed the vault; poke surfaces that.
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, total));
 		assert_noop!(
-			crate::Pallet::<Test>::poke(RuntimeOrigin::signed(3), 1, DOT),
+			crate::Pallet::<Test>::poke(RuntimeOrigin::signed(3), DOT, 1),
 			crate::Error::<Test>::VaultNotFound
 		);
 	});
@@ -463,7 +438,6 @@ fn redemption_full_state_changes() {
 		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 
-		// Entire debt reduces by the redeemed amount.
 		let entire_pre = v_pre.debt.principal + v_pre.debt.interest;
 		let entire_post = v_post.debt.principal + v_post.debt.interest;
 		assert_eq!(entire_post, entire_pre - 200);
@@ -474,7 +448,6 @@ fn redemption_full_state_changes() {
 		let pay_principal = 200 - pay_accrued;
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal - pay_principal);
 
-		// Vault stays Active because remaining debt is well above MinimumDebt.
 		assert!(vault_status(DOT, 1).is_active());
 	});
 }
@@ -482,7 +455,7 @@ fn redemption_full_state_changes() {
 // In the test mock both `SpYieldSink` and `FeeHandler` are drop-style
 // implementations — they consume the `Credit` without resolving it, which
 // rescinds the corresponding mint. So `total_issuance` grows by only the
-// borrow amount; the fee is recorded on `bs.debt.minted_interest` and on
+// borrow amount; the fee is recorded on `state.debt.minted_interest` and on
 // `vault.debt.interest` instead. (In production wiring,
 // `pallet-stability-pool` would resolve the SP credit and keep the mint live.)
 #[test]
@@ -495,14 +468,12 @@ fn open_mints_borrow_amount_with_fee_recorded_in_branch_state() {
 		assert!(predicted_fee > 0);
 		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(10, 100)));
 		let total_post = <Pusd as FungibleInspect<AccountId>>::total_issuance();
-		// Fee is rescinded by the mock drops — only the user mint persists.
 		assert_eq!(total_post, total_pre + 2_000);
 		assert_eq!(<Pusd as FungibleInspect<AccountId>>::balance(&1), 2_000);
-		// But the fee was charged: it lives on the vault and the branch.
 		let v = Vaults::<Test>::get(DOT, 1).unwrap();
 		assert_eq!(v.debt.interest, predicted_fee);
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).unwrap();
-		assert_eq!(bs.debt.minted_interest, predicted_fee);
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).unwrap();
+		assert_eq!(state.debt.minted_interest, predicted_fee);
 	});
 }
 
@@ -515,24 +486,16 @@ fn open_mints_borrow_amount_with_fee_recorded_in_branch_state() {
 fn poke_after_liquidation_applies_redistribution_gains() {
 	build_and_execute(|| {
 		register_default_branch();
-		// Two vaults, A and C, both at 25%. C is more leveraged so a price
-		// drop puts it underwater first.
 		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(25, 100)));
 		assert_ok!(open(3, DOT, 1_000, 2_000, rate_pct(25, 100)));
-		// Drop the price so C is below MCR; A stays comfortably above.
 		set_price(DOT, FixedU128::from_rational(15u128, 10u128));
 
 		let v_a_pre = Vaults::<Test>::get(DOT, 1).unwrap();
 		let entire_a_pre = v_a_pre.debt.principal + v_a_pre.debt.interest;
 
-		// Liquidate C through the trait surface — branch-level redistribution
-		// accumulators get bumped, but A's vault row isn't touched until A is
-		// poked.
 		assert_ok!(liquidate(DOT, 3));
 
-		// Poke A — its accrued/principal should incorporate the redistribution
-		// gain.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, 1));
 		let v_a_post = Vaults::<Test>::get(DOT, 1).unwrap();
 		let entire_a_post = v_a_post.debt.principal + v_a_post.debt.interest;
 		assert!(
