@@ -7,7 +7,7 @@ use crate::{
 		BalanceOf, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet, StableCreditOf,
 	},
 	recovery,
-	types::{BranchState, VaultListId, VaultStatus},
+	types::{BranchState, VaultStatus},
 };
 use frame::{
 	deps::frame_support::transactional,
@@ -21,8 +21,8 @@ use frame::{
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
-	AllocationResult, LiquidationSnapshot, ProvidePrice, RedemptionAllocation,
-	VaultBadDebtInterface, VaultLiquidationInterface, VaultRedemptionInterface,
+	AllocationResult, LiquidationSnapshot, RedemptionAllocation, VaultBadDebtInterface,
+	VaultLiquidationInterface, VaultRedemptionInterface,
 };
 
 impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>> for Pallet<T> {
@@ -36,13 +36,13 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 	) -> DispatchResult {
 		let mut context = OpContext::<T>::load(collateral_id)?;
 		context.ensure_not_frozen()?;
-		let price = <T::Oracle as ProvidePrice>::provide_price(&context.collateral_id)?.price;
+		let price = context.price()?;
 		let TouchedVault { vault, status } = context.touch(&owner)?;
 		ensure!(!status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
 		let post_touch_debt = vault.debt.total();
 		let held = vault.redistribution_stake;
-		let config = helpers::branch_config_of::<T>(&context.collateral_id)?;
+		let config = context.config()?;
 		let cr = math::collateralization_ratio::<BalanceOf<T>>(held, post_touch_debt, price)
 			.ok_or(Error::<T>::VaultNotLiquidatable)?;
 		ensure!(cr < config.minimum_collateralization_ratio, Error::<T>::VaultNotLiquidatable);
@@ -81,7 +81,7 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 			)?;
 		}
 
-		match T::VaultLists::remove(&VaultListId::Rate(context.collateral_id.clone()), &owner) {
+		match T::VaultLists::remove(&context.rate_list(), &owner) {
 			Ok(()) | Err(ListError::ItemNotFound) => {},
 			Err(_) => return Err(Error::<T>::RateIndexInvariantBroken.into()),
 		}
@@ -256,7 +256,7 @@ impl<T: Config> VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>
 			)?;
 		}
 
-		let config = helpers::branch_config_of::<T>(&context.collateral_id)?;
+		let config = context.config()?;
 		let new_total = vault.debt.total();
 		let stake_changes = matches!(status, VaultStatus::Active | VaultStatus::Dormant) &&
 			!allocation.collateral_to_redeemer.is_zero();
@@ -316,7 +316,7 @@ fn settle_redemption_status<T: Config>(
 ) -> DispatchResult {
 	match status {
 		VaultStatus::Active if new_total < config.minimum_debt => {
-			T::VaultLists::remove(&VaultListId::Rate(context.collateral_id.clone()), owner)
+			T::VaultLists::remove(&context.rate_list(), owner)
 				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		},
 		VaultStatus::FinalRecovery if new_total.is_zero() => {

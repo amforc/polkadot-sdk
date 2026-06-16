@@ -124,13 +124,8 @@ pub fn predict_upfront_fee_borrow<T: Config>(
 	};
 	let new_rate = maybe_new_rate.unwrap_or(vault.annual_rate);
 	let now = T::TimeProvider::now();
-	let cooldown_elapsed =
-		now.saturating_sub(vault.last_rate_update) >= config.rate_adjustment_cooldown;
-	let rate_change_fee_base = if maybe_new_rate.is_some() && !cooldown_elapsed {
-		vault.debt.principal
-	} else {
-		BalanceOf::<T>::zero()
-	};
+	let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
+	let rate_change_fee_base = vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
 	simulate_borrow::<T>(&state, &config, &vault, debt_increase, new_rate, rate_change_fee_base).1
 }
 
@@ -143,8 +138,7 @@ pub fn predict_upfront_fee_rate_change<T: Config>(
 		return BalanceOf::<T>::zero();
 	};
 	let now = T::TimeProvider::now();
-	let cooldown_elapsed =
-		now.saturating_sub(vault.last_rate_update) >= config.rate_adjustment_cooldown;
+	let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
 	simulate_change_rate::<T>(&state, &config, &vault, new_rate, cooldown_elapsed).1
 }
 

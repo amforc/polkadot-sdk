@@ -158,6 +158,13 @@ pub fn open_upfront_fee<T: Config>(
 	math::simple_interest_ceil(new_debt, avg, config.upfront_fee_period)
 }
 
+fn avg_rate<T: Config>(state: &BranchState<T::AccountId, BalanceOf<T>>) -> FixedU128 {
+	math::average_branch_rate(
+		state.debt.weighted_principal_sum,
+		state.debt.principal.saturating_add(state.debt.pending_redistribution_principal),
+	)
+}
+
 /// Simulate `borrow` for the live path and fee prediction.
 ///
 /// `rate_change_fee_base` is the existing principal that the rate-change
@@ -190,18 +197,14 @@ pub(super) fn simulate_borrow<T: Config>(
 			.saturating_sub(stake_w_old)
 			.saturating_add(stake_w_new);
 	}
-	let avg = math::average_branch_rate(
-		branch_state_after.debt.weighted_principal_sum,
-		branch_state_after
-			.debt
-			.principal
-			.saturating_add(branch_state_after.debt.pending_redistribution_principal),
-	);
+	let avg = avg_rate::<T>(&branch_state_after);
 	let fee = math::simple_interest_ceil(
 		debt_increase.saturating_add(rate_change_fee_base),
 		avg,
 		config.upfront_fee_period,
 	);
+	branch_state_after.debt.minted_interest =
+		branch_state_after.debt.minted_interest.saturating_add(fee);
 	(branch_state_after, fee)
 }
 
@@ -223,14 +226,10 @@ pub(super) fn simulate_change_rate<T: Config>(
 	let fee = if cooldown_elapsed {
 		BalanceOf::<T>::zero()
 	} else {
-		let avg = math::average_branch_rate(
-			branch_state_after.debt.weighted_principal_sum,
-			branch_state_after
-				.debt
-				.principal
-				.saturating_add(branch_state_after.debt.pending_redistribution_principal),
-		);
+		let avg = avg_rate::<T>(&branch_state_after);
 		math::simple_interest_ceil(vault.debt.principal, avg, config.upfront_fee_period)
 	};
+	branch_state_after.debt.minted_interest =
+		branch_state_after.debt.minted_interest.saturating_add(fee);
 	(branch_state_after, fee)
 }

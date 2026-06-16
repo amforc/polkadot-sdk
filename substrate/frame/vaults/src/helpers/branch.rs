@@ -111,6 +111,7 @@ fn enter_frozen<T: Config>(
 	reason: FrozenReason,
 ) -> Result<(), DispatchError> {
 	let now = T::TimeProvider::now();
+	let old_mode = current_mode::<T>(collateral_id).unwrap_or(BranchMode::Normal);
 	BranchStates::<T>::try_mutate(collateral_id, |maybe| -> Result<_, DispatchError> {
 		let state = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
 		// Flush before freezing so the frozen window accrues nothing.
@@ -127,7 +128,7 @@ fn enter_frozen<T: Config>(
 	})?;
 	Pallet::<T>::deposit_event(Event::ModeChanged {
 		collateral_id: collateral_id.clone(),
-		old_mode: BranchMode::Normal,
+		old_mode,
 		new_mode: BranchMode::Frozen,
 	});
 	Ok(())
@@ -139,7 +140,7 @@ pub fn refresh_branch<T: Config>(collateral_id: &T::AssetId) -> Result<(), Dispa
 	let oracle_ok = T::Oracle::provide_price(collateral_id).is_ok();
 	match (state.frozen, oracle_ok) {
 		(Some(state), true) if matches!(state.reason, FrozenReason::OracleFailure) => {
-			clear_frozen::<T>(collateral_id, BranchMode::Frozen, BranchMode::Normal)
+			clear_frozen::<T>(collateral_id)
 		},
 		(None, false) => freeze_oracle::<T>(collateral_id),
 		_ => Ok(()),
@@ -150,11 +151,7 @@ fn freeze_oracle<T: Config>(collateral_id: &T::AssetId) -> Result<(), DispatchEr
 	enter_frozen::<T>(collateral_id, FrozenReason::OracleFailure)
 }
 
-fn clear_frozen<T: Config>(
-	collateral_id: &T::AssetId,
-	old_mode: BranchMode,
-	new_mode: BranchMode,
-) -> Result<(), DispatchError> {
+fn clear_frozen<T: Config>(collateral_id: &T::AssetId) -> Result<(), DispatchError> {
 	let now = T::TimeProvider::now();
 	BranchStates::<T>::try_mutate(collateral_id, |maybe| -> Result<_, DispatchError> {
 		let state = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
@@ -168,9 +165,12 @@ fn clear_frozen<T: Config>(
 		state.frozen = None;
 		Ok(())
 	})?;
+	// `Frozen` is the only persisted mode, so the branch always leaves it for the
+	// live TCR-derived mode.
+	let new_mode = current_mode::<T>(collateral_id).unwrap_or(BranchMode::Normal);
 	Pallet::<T>::deposit_event(Event::ModeChanged {
 		collateral_id: collateral_id.clone(),
-		old_mode,
+		old_mode: BranchMode::Frozen,
 		new_mode,
 	});
 	Ok(())
@@ -184,7 +184,7 @@ pub fn clear_governance_frozen_mode<T: Config>(
 	let state = branch_state_of::<T>(collateral_id)?;
 	match state.frozen {
 		Some(state) if matches!(state.reason, FrozenReason::Governance) => {
-			clear_frozen::<T>(collateral_id, BranchMode::Frozen, BranchMode::Normal)
+			clear_frozen::<T>(collateral_id)
 		},
 		_ => Ok(()),
 	}
