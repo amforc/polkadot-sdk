@@ -1,13 +1,10 @@
 //! `VaultBadDebtInterface` recording and healing.
 
 use crate::{mock::*, pallet::BranchStates};
-use frame::deps::frame_support::{
-	assert_err, assert_noop, assert_ok,
-	traits::{fungible::Balanced, tokens::Imbalance},
-};
+use frame::traits::{fungible::Balanced, tokens::Imbalance};
 use pusd_primitives::VaultBadDebtInterface;
 
-fn record(amount: Balance) -> frame::deps::sp_runtime::DispatchResult {
+fn record(amount: Balance) -> DispatchResult {
 	<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, Balance, _>>::record_bad_debt(
 		DOT, amount,
 	)
@@ -15,7 +12,7 @@ fn record(amount: Balance) -> frame::deps::sp_runtime::DispatchResult {
 
 /// Issue a fresh credit of `amount`, heal with it, and return the surplus
 /// handed back (the unconsumed part of the credit).
-fn heal(amount: Balance) -> Result<Balance, frame::deps::sp_runtime::DispatchError> {
+fn heal(amount: Balance) -> Result<Balance, DispatchError> {
 	let credit = <Pusd as Balanced<AccountId>>::issue(amount);
 	<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, Balance, _>>::heal(DOT, credit)
 		.map(|surplus| surplus.peek())

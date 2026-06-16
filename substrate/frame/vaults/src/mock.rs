@@ -5,28 +5,23 @@
 
 use crate as pallet_vaults;
 pub use crate::{
-	pallet::{BalanceOf, MomentOf, StableCreditOf},
+	pallet::{BalanceOf, StableCreditOf},
 	BranchConfig, BranchMode, Error, Event, HoldReason, Pallet, VaultsManagerLevel,
 };
+pub use frame::{
+	arithmetic::{FixedPointNumber, FixedU128, Saturating},
+	prelude::{DispatchError, DispatchResult},
+	testing_prelude::{assert_err, assert_noop, assert_ok},
+};
 use frame::{
-	deps::{
-		frame_support::{
-			derive_impl, parameter_types,
-			traits::{
-				fungible::{
-					self, Credit, Inspect as FungibleInspect, ItemOf, NativeFromLeft,
-					NativeOrWithId,
-				},
-				fungibles::InspectHold,
-				AsEnsureOriginWithArg, ConstU128, ConstU64, OnUnbalanced,
-			},
-			PalletId,
-		},
-		sp_runtime::{
-			traits::IdentityLookup, BuildStorage, DispatchError, DispatchResult, FixedU128, Permill,
-		},
-	},
 	testing_prelude::*,
+	traits::{
+		fungible::{
+			self, Credit, Inspect as FungibleInspect, ItemOf, NativeFromLeft, NativeOrWithId,
+		},
+		fungibles::InspectHold,
+		AsEnsureOriginWithArg, EnsureOrigin, IdentityLookup,
+	},
 };
 pub use pallet_linked_list::Position;
 use pusd_primitives::{
@@ -42,7 +37,7 @@ pub type Block = MockBlock<Test>;
 pub type VaultList = pallet_vaults::VaultListId<AssetId>;
 pub type Moment = u64;
 
-#[frame::deps::frame_support::runtime]
+#[frame_construct_runtime]
 mod runtime {
 	#[runtime::runtime]
 	#[runtime::derive(
@@ -154,7 +149,7 @@ impl pusd_primitives::ProvidePrice for MockOracle {
 
 	fn provide_price(
 		collateral_id: &AssetId,
-	) -> Result<pusd_primitives::PriceFeed<Moment>, frame::deps::sp_runtime::DispatchError> {
+	) -> Result<pusd_primitives::PriceFeed<Moment>, DispatchError> {
 		if !MockOracleAvailable::get() {
 			return Err(crate::pallet::Error::<Test>::OraclePriceNotAvailable.into());
 		}
@@ -181,10 +176,7 @@ pub fn set_oracle_available(v: bool) {
 /// Drops yield credits on the floor: tests don't need a Stability Pool.
 pub struct DropYieldSink;
 impl pusd_primitives::OnBranchYield<AssetId, Credit<AccountId, Pusd>> for DropYieldSink {
-	fn on_branch_yield(
-		_collateral_id: AssetId,
-		credit: Credit<AccountId, Pusd>,
-	) -> frame::deps::frame_support::pallet_prelude::DispatchResult {
+	fn on_branch_yield(_collateral_id: AssetId, credit: Credit<AccountId, Pusd>) -> DispatchResult {
 		drop(credit);
 		Ok(())
 	}
@@ -199,7 +191,7 @@ impl OnUnbalanced<Credit<AccountId, Pusd>> for DropFeeHandler {
 }
 
 pub struct VaultsManagerOrigin;
-impl frame::deps::frame_support::traits::EnsureOrigin<RuntimeOrigin> for VaultsManagerOrigin {
+impl EnsureOrigin<RuntimeOrigin> for VaultsManagerOrigin {
 	type Success = pallet_vaults::VaultsManagerLevel;
 	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
 		match Into::<Result<frame_system::RawOrigin<u64>, RuntimeOrigin>>::into(o.clone()) {
@@ -248,7 +240,7 @@ impl pallet_vaults::BenchmarkHelper<AssetId, AccountId, Balance> for MockBenchma
 	}
 
 	fn mint_collateral(asset_id: AssetId, who: &AccountId, amount: Balance) {
-		use frame::deps::frame_support::traits::{
+		use frame::traits::{
 			fungible::Mutate as FungibleMutate, fungibles::Mutate as FungiblesMutate,
 		};
 		// Native ED first: without it withdraw / borrow / change_rate fail for
@@ -317,7 +309,7 @@ pub fn new_test_ext() -> TestState {
 		// Mint Token X to test accounts. Native DOT was already minted via
 		// the balances genesis above.
 		for who in 1u64..=10 {
-			<Assets as frame::deps::frame_support::traits::fungibles::Mutate<u64>>::mint_into(
+			<Assets as frame::traits::fungibles::Mutate<u64>>::mint_into(
 				TOKEN_X_ID,
 				&who,
 				1_000_000_000_000,
@@ -342,7 +334,7 @@ pub fn build_and_execute(test: impl FnOnce()) {
 /// Default branch config: MCR=110%, ICR=120%, Safety=130%, ceiling 100M,
 /// MinDebt=200, MinColl=1, rate bounds 0.1%-100%, 7d upfront fee,
 /// 1d rate-cooldown, 5% redistribution penalty.
-pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance, Moment> {
+pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	pallet_vaults::BranchConfig {
 		minimum_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 		initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
@@ -386,22 +378,18 @@ pub fn register_branch_for(asset: AssetId) {
 /// production (per DESIGN.md §5.3 "ensures the redistribution account can hold
 /// `c`") but currently doesn't — covered by Phase 3 grooming.
 pub fn fund_redistribution_account_for(asset: AssetId) {
-	use frame::deps::{
-		frame_support::traits::fungible::Mutate as FungibleMutate,
-		sp_runtime::traits::AccountIdConversion,
-	};
+	use frame::traits::{fungible::Mutate as FungibleMutate, AccountIdConversion};
 	let pallet_account: AccountId = VaultsPalletId::get().into_account_truncating();
 	match asset {
 		AssetId::Native => {
 			let _ = <Balances as FungibleMutate<AccountId>>::mint_into(&pallet_account, 1);
 		},
 		AssetId::WithId(asset) => {
-			let _ =
-				<Assets as frame::deps::frame_support::traits::fungibles::Mutate<AccountId>>::mint_into(
-					asset,
-					&pallet_account,
-					1,
-				);
+			let _ = <Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
+				asset,
+				&pallet_account,
+				1,
+			);
 		},
 	}
 }
@@ -429,14 +417,14 @@ pub fn advance_blocks(n: u64, ms_per_block: Moment) {
 pub fn open(
 	who: AccountId,
 	asset: AssetId,
-	coll: Balance,
+	collateral: Balance,
 	debt: Balance,
 	rate: FixedU128,
 ) -> DispatchResult {
 	pallet_vaults::Pallet::<Test>::open_vault(
 		RuntimeOrigin::signed(who),
 		asset,
-		coll,
+		collateral,
 		debt,
 		rate,
 		Position::endpoints_only(),
@@ -489,13 +477,10 @@ pub fn redeem(
 	)?;
 	let debt_to_cancel = core::cmp::min(amount, post_touch);
 	let price = MockPrices::get().get(&asset).copied().expect("price set");
-	let coll_to_redeemer =
+	let collateral_to_redeemer =
 		(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
-	let alloc = RedemptionAllocation {
-		debt_to_cancel,
-		collateral_to_redeemer: coll_to_redeemer,
-		fee_collateral_retained: 0,
-	};
+	let alloc =
+		RedemptionAllocation { debt_to_cancel, collateral_to_redeemer, fee_collateral_retained: 0 };
 	<Pallet<Test> as VaultRedemptionInterface<AccountId, AssetId, Balance>>::apply_redemption(
 		asset, target, redeemer, alloc,
 	)?;
@@ -513,7 +498,7 @@ pub fn held(asset: AssetId, who: AccountId) -> Balance {
 
 /// Total balance of `(asset, who)` on the collateral surface (includes any hold).
 pub fn collateral_balance(asset: AssetId, who: AccountId) -> Balance {
-	use frame::deps::frame_support::traits::fungibles::Inspect as FungiblesInspect;
+	use frame::traits::fungibles::Inspect as FungiblesInspect;
 	<VaultCollateralAssets as FungiblesInspect<AccountId>>::balance(asset, &who)
 }
 
