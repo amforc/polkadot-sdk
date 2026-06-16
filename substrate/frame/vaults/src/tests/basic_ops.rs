@@ -3,10 +3,6 @@ use crate::{
 	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
-use frame::deps::{
-	frame_support::{assert_noop, assert_ok},
-	sp_runtime::DispatchResult,
-};
 use pallet_linked_list::SortedListInterface;
 
 // Opening a vault from an account whose free balance is below the requested
@@ -28,8 +24,8 @@ fn adjust_vault_via_deposit_then_borrow() {
 		// +200 collateral.
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
-			1,
 			DOT,
+			1,
 			200,
 		));
 		// +300 debt (no rate change).
@@ -102,7 +98,7 @@ fn repay_for_by_third_party_burns_payer_balance_and_updates_owner_vault() {
 		let payer_pre = pusd_balance(2);
 		let v_pre = Vaults::<Test>::get(DOT, 1).expect("vault stored");
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), 1, DOT, 100));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, 1, 100));
 
 		assert_eq!(pusd_balance(2), payer_pre - 100);
 		let v_post = Vaults::<Test>::get(DOT, 1).expect("vault stored");
@@ -142,19 +138,19 @@ fn repay_for_to_zero_closes_active_vault() {
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
 		let v = Vaults::<Test>::get(DOT, 1).expect("vault stored");
 		let total = v.debt.principal + v.debt.interest;
-		let _ = <Pusd as frame::deps::frame_support::traits::fungible::Mutate<u64>>::transfer(
+		let _ = <Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&2,
 			&1,
 			v.debt.interest,
-			frame::deps::frame_support::traits::tokens::Preservation::Expendable,
+			frame::traits::tokens::Preservation::Expendable,
 		);
-		let coll_before = collateral_balance(DOT, 1);
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, total));
+		let collateral_before = collateral_balance(DOT, 1);
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, total));
 		assert!(Vaults::<Test>::get(DOT, 1).is_none(), "vault row removed");
 		assert_eq!(held(DOT, 1), 0, "held collateral released");
 		assert_eq!(
 			collateral_balance(DOT, 1),
-			coll_before + 1_000,
+			collateral_before + 1_000,
 			"owner received the collateral"
 		);
 		assert!(
@@ -176,7 +172,7 @@ fn poke_missing_vault_errors() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_noop!(
-			crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), 99, DOT),
+			crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, 99),
 			crate::Error::<Test>::VaultNotFound
 		);
 	});
@@ -192,11 +188,11 @@ fn repay_overpay_burns_only_debt_and_closes() {
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
 		// Acct 2's minted pUSD funds the surplus over acct 1's own balance.
-		let _ = <Pusd as frame::deps::frame_support::traits::fungible::Mutate<u64>>::transfer(
+		let _ = <Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&2,
 			&1,
 			400,
-			frame::deps::frame_support::traits::tokens::Preservation::Expendable,
+			frame::traits::tokens::Preservation::Expendable,
 		);
 		let v = Vaults::<Test>::get(DOT, 1).expect("vault stored");
 		let total = v.debt.principal + v.debt.interest;
@@ -205,8 +201,8 @@ fn repay_overpay_burns_only_debt_and_closes() {
 
 		assert_ok!(crate::Pallet::<Test>::repay_for(
 			RuntimeOrigin::signed(1),
-			1,
 			DOT,
+			1,
 			balance_before
 		));
 
@@ -245,8 +241,8 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 		let balance_before = pusd_balance(1);
 		assert_ok!(crate::Pallet::<Test>::repay_for(
 			RuntimeOrigin::signed(1),
-			1,
 			DOT,
+			1,
 			balance_before
 		));
 
@@ -270,17 +266,17 @@ fn repay_for_to_zero_closes_dormant_vault() {
 		let v = Vaults::<Test>::get(DOT, 1).expect("dormant vault stored");
 		let total = v.debt.principal + v.debt.interest;
 		assert!(total > 0);
-		let _ = <Pusd as frame::deps::frame_support::traits::fungible::Mutate<u64>>::transfer(
+		let _ = <Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&2,
 			&1,
 			total.saturating_sub(pusd_balance(1)),
-			frame::deps::frame_support::traits::tokens::Preservation::Expendable,
+			frame::traits::tokens::Preservation::Expendable,
 		);
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, total));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, total));
 		assert!(Vaults::<Test>::get(DOT, 1).is_none());
 		assert_eq!(held(DOT, 1), 0);
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("bs");
-		assert_eq!(bs.dormant_redemption_target, None);
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("state");
+		assert_eq!(state.dormant_redemption_target, None);
 	});
 }
 
@@ -291,7 +287,7 @@ fn repay_for_to_zero_closes_dormant_vault() {
 // orphan into `bad_debt` (it is unbacked circulating pUSD) and settle.
 #[test]
 fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
-	use frame::deps::frame_support::traits::{
+	use frame::traits::{
 		fungible::{Balanced, Mutate},
 		tokens::Imbalance,
 	};
@@ -302,35 +298,35 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		// Distinct accrual timestamps make several ceiling mints land while
 		// the vaults only ever accrue floors.
 		advance_time(30 * 24 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), 1, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, 1));
 		advance_time(24 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), 2, DOT));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, 2));
 		// Top up both owners so overpay-repays can cover accrued interest.
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 100));
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&2, 100));
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), 2, DOT, 10_000));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, 2, 10_000));
 		assert!(Vaults::<Test>::get(DOT, 2).is_none(), "vault 2 closed");
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
-		assert_eq!(bs.debt.bad_debt, 0, "no sweep while a debt-bearing vault remains");
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_eq!(state.debt.bad_debt, 0, "no sweep while a debt-bearing vault remains");
 
 		// The last close: previously rejected with `WouldEnterSafetyMode`.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), 1, DOT, 10_000));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 10_000));
 		assert!(Vaults::<Test>::get(DOT, 1).is_none(), "vault 1 closed");
 
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
-		assert_eq!(bs.debt.principal, 0);
-		assert_eq!(bs.stakes.total, 0);
-		assert_eq!(bs.debt.minted_interest, 0, "drift swept out of minted_interest");
-		assert_eq!(bs.rounding.ownerless_pusd_debt, 0);
-		assert!(bs.debt.bad_debt > 0, "drift recorded as bad debt");
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_eq!(state.debt.principal, 0);
+		assert_eq!(state.stakes.total, 0);
+		assert_eq!(state.debt.minted_interest, 0, "drift swept out of minted_interest");
+		assert_eq!(state.rounding.ownerless_pusd_debt, 0);
+		assert!(state.debt.bad_debt > 0, "drift recorded as bad debt");
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtRecorded {
 			collateral_id: DOT,
-			amount: bs.debt.bad_debt,
+			amount: state.debt.bad_debt,
 		}));
 
 		// The insurance flow can now heal the branch clean.
-		let credit = <Pusd as Balanced<AccountId>>::issue(bs.debt.bad_debt);
+		let credit = <Pusd as Balanced<AccountId>>::issue(state.debt.bad_debt);
 		let surplus = <crate::Pallet<Test> as pusd_primitives::VaultBadDebtInterface<
 			AssetId,
 			Balance,
@@ -338,8 +334,8 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		>>::heal(DOT, credit)
 		.expect("heal succeeds");
 		assert_eq!(surplus.peek(), 0);
-		let bs = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
-		assert_eq!(bs.debt.bad_debt, 0, "branch fully settled");
+		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_eq!(state.debt.bad_debt, 0, "branch fully settled");
 	});
 }
 

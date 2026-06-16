@@ -22,8 +22,8 @@ pub mod yield_sink;
 pub use bad_debt::VaultBadDebtInterface;
 pub use branch::{BranchMode, BranchModeProvider, FrozenReason, FrozenState};
 pub use liquidation::{
-	KeeperCompensation, LiquidationAllocation, LiquidationSnapshot, OffsetAllocation,
-	VaultLiquidationInterface,
+	AllocationResult, KeeperCompensation, LiquidationAllocation, LiquidationSnapshot,
+	OffsetAllocation, VaultLiquidationInterface,
 };
 pub use oracle::{PriceFeed, ProvidePrice};
 pub use redemption::{RedemptionAllocation, VaultRedemptionInterface};
