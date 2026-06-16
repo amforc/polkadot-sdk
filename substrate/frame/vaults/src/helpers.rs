@@ -57,6 +57,15 @@ pub(crate) fn branch_config_of<T: Config>(
 	BranchConfigs::<T>::get(collateral_id).ok_or_else(|| Error::<T>::UnknownCollateral.into())
 }
 
+fn ratio<T: Config>(
+	collateral: BalanceOf<T>,
+	debt: BalanceOf<T>,
+	price: FixedU128,
+) -> Result<FixedU128, Error<T>> {
+	math::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+		.ok_or(Error::<T>::UnsafeCollateralizationRatio)
+}
+
 /// Ensure a vault's collateralization ratio is at or above the branch ICR.
 /// Used by the open/borrow/withdraw safety gates. A `None` ratio (zero debt)
 /// and a below-ICR ratio both surface as `UnsafeCollateralizationRatio`.
@@ -66,8 +75,7 @@ pub(crate) fn ensure_above_icr<T: Config>(
 	price: FixedU128,
 	config: &BranchConfig<BalanceOf<T>>,
 ) -> Result<(), DispatchError> {
-	let cr = math::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
-		.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
+	let cr = ratio::<T>(collateral, debt, price)?;
 	ensure!(cr >= config.initial_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
 	Ok(())
 }
@@ -81,8 +89,7 @@ pub(crate) fn ensure_below_mcr<T: Config>(
 	price: FixedU128,
 	config: &BranchConfig<BalanceOf<T>>,
 ) -> Result<(), DispatchError> {
-	let cr = math::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
-		.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
+	let cr = ratio::<T>(collateral, debt, price)?;
 	ensure!(cr < config.minimum_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
 	Ok(())
 }
@@ -95,8 +102,7 @@ pub(crate) fn ensure_at_or_above_mcr<T: Config>(
 	price: FixedU128,
 	config: &BranchConfig<BalanceOf<T>>,
 ) -> Result<(), DispatchError> {
-	let cr = math::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
-		.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
+	let cr = ratio::<T>(collateral, debt, price)?;
 	ensure!(cr >= config.minimum_collateralization_ratio, Error::<T>::UnsafeCollateralizationRatio);
 	Ok(())
 }
@@ -127,6 +133,32 @@ impl<Balance> Vault<Balance> {
 			return VaultStatus::FinalRecovery;
 		}
 		VaultStatus::Dormant
+	}
+
+	/// Whether the rate-adjustment cooldown has elapsed. A rate change is free of
+	/// the upfront fee once `rate_adjustment_cooldown` has passed since the last
+	/// one.
+	pub(crate) fn cooldown_elapsed(&self, config: &BranchConfig<Balance>, now: Millis) -> bool {
+		now.saturating_sub(self.last_rate_update) >= config.rate_adjustment_cooldown
+	}
+
+	/// Existing principal the rate-change part of the borrow upfront fee is
+	/// charged against: the current principal when `borrow` also moves the rate
+	/// within the cooldown window, zero otherwise (a pure debt increase, or the
+	/// cooldown has elapsed).
+	pub(crate) fn rate_change_base(
+		&self,
+		maybe_new_rate: Option<FixedU128>,
+		cooldown_elapsed: bool,
+	) -> Balance
+	where
+		Balance: Zero + Copy,
+	{
+		if maybe_new_rate.is_some() && !cooldown_elapsed {
+			self.debt.principal
+		} else {
+			Balance::zero()
+		}
 	}
 }
 
