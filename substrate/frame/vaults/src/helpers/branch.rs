@@ -49,6 +49,10 @@ pub fn register_branch<T: Config>(
 		BranchConfigs::<T>::count() < <T::MaxBranches as Get<u32>>::get(),
 		Error::<T>::TooManyBranches
 	);
+	let redistribution_account = Pallet::<T>::redistribution_account();
+	if frame_system::Pallet::<T>::providers(&redistribution_account) == 0 {
+		frame_system::Pallet::<T>::inc_providers(&redistribution_account);
+	}
 	BranchConfigs::<T>::insert(&collateral_id, config);
 	let now = T::TimeProvider::now();
 	BranchStates::<T>::insert(

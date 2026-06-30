@@ -3249,8 +3249,10 @@ parameter_types! {
 	pub const VaultsMaxBranches: u32 = 16;
 	pub const VaultsMaxOnIdleVaultRefresh: u32 = 8;
 	pub VaultsSpYieldShare: Permill = Permill::from_percent(75);
-	/// Oracle key used for the native-token price feed.
-	pub const VaultsNativePriceFeedId: u32 = 0;
+	/// Oracle key reserved for the native-token price feed.
+	pub const VaultsNativePriceFeedId: u32 = u32::MAX;
+	pub const VaultsOraclePriceMaxAge: Moment =
+		if cfg!(feature = "runtime-benchmarks") { Moment::MAX } else { 60 * 60 * 1_000 };
 }
 
 pub type VaultsCollateralId = NativeOrWithId<u32>;
@@ -3278,13 +3280,18 @@ impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
 	fn provide_price(
 		collateral_id: &VaultsCollateralId,
 	) -> Result<pusd_primitives::PriceFeed<Moment>, sp_runtime::DispatchError> {
-		match pallet_oracle::Pallet::<Runtime>::get(&vaults_oracle_key(collateral_id)) {
-			Some(v) => Ok(pusd_primitives::PriceFeed {
-				price: FixedU128::from_inner(v.value),
-				observed_at: v.timestamp,
-			}),
-			None => Err(pallet_vaults::Error::<Runtime>::OraclePriceNotAvailable.into()),
+		let v = pallet_oracle::Pallet::<Runtime>::get(&vaults_oracle_key(collateral_id))
+			.ok_or(pallet_vaults::Error::<Runtime>::OraclePriceNotAvailable)?;
+		// Reject observations older than the freshness window so the branch freezes on
+		// a stalled feed instead of pricing against stale data.
+		let now = pallet_timestamp::Pallet::<Runtime>::get();
+		if now.saturating_sub(v.timestamp) > VaultsOraclePriceMaxAge::get() {
+			return Err(pallet_vaults::Error::<Runtime>::OracleStale.into());
 		}
+		Ok(pusd_primitives::PriceFeed {
+			price: FixedU128::from_inner(v.value),
+			observed_at: v.timestamp,
+		})
 	}
 }
 
