@@ -83,6 +83,12 @@ fn check_branch_identities<T: Config>(
 			&HoldReason::VaultCollateral.into(),
 			&owner,
 		);
+		// One stablecoin per collateral today, so the row's collateral is the
+		// whole owner hold. The multi-market generalisation relaxes this to
+		// `Σ_stablecoins vault.collateral == held`.
+		if vault.collateral != held {
+			return Err("vault.collateral != held collateral".into());
+		}
 		sum_owner_held = sum_owner_held.saturating_add(held);
 		// Every row — FinalRecovery included — keeps its debt attached to the
 		// branch aggregates; only the stake is detached while in the FIFO.

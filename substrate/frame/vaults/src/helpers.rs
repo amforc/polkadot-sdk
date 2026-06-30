@@ -22,7 +22,7 @@ use frame::{
 	prelude::*,
 	traits::{
 		fungible::{Balanced as FungibleBalanced, Mutate as FungibleMutate},
-		fungibles::{InspectHold as FungiblesInspectHold, MutateHold as FungiblesMutateHold},
+		fungibles::MutateHold as FungiblesMutateHold,
 		tokens::{Imbalance, Restriction},
 		Time,
 	},
