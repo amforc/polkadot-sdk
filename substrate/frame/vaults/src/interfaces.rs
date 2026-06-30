@@ -163,16 +163,29 @@ fn apply_redistribution_accumulators<T: Config>(
 			.ok_or(Error::<T>::RedistributionWouldOverflow)?;
 	// Must match `pending_touch_for`'s interest-time origin.
 	let now_fp = FixedU128::saturating_from_integer(state.interest_time(now));
-	state.redistribution.debt_per_stake =
-		state.redistribution.debt_per_stake.saturating_add(debt_per_stake);
-	state.redistribution.collateral_per_stake =
-		state.redistribution.collateral_per_stake.saturating_add(collateral_per_stake);
+	let debt_time_increment = now_fp
+		.checked_mul(&debt_per_stake)
+		.ok_or(Error::<T>::RedistributionWouldOverflow)?;
+	state.redistribution.debt_per_stake = state
+		.redistribution
+		.debt_per_stake
+		.checked_add(&debt_per_stake)
+		.ok_or(Error::<T>::RedistributionWouldOverflow)?;
+	state.redistribution.collateral_per_stake = state
+		.redistribution
+		.collateral_per_stake
+		.checked_add(&collateral_per_stake)
+		.ok_or(Error::<T>::RedistributionWouldOverflow)?;
 	state.redistribution.debt_time_per_stake = state
 		.redistribution
 		.debt_time_per_stake
-		.saturating_add(now_fp.saturating_mul(debt_per_stake));
-	state.redistribution.weight_per_stake =
-		state.redistribution.weight_per_stake.saturating_add(weight_per_stake);
+		.checked_add(&debt_time_increment)
+		.ok_or(Error::<T>::RedistributionWouldOverflow)?;
+	state.redistribution.weight_per_stake = state
+		.redistribution
+		.weight_per_stake
+		.checked_add(&weight_per_stake)
+		.ok_or(Error::<T>::RedistributionWouldOverflow)?;
 	let distributed_debt = debt_per_stake.saturating_mul_int(state.stakes.total);
 	let debt_dust = redistributed_debt.saturating_sub(distributed_debt);
 	state.debt.pending_redistribution_principal =
@@ -220,8 +233,8 @@ impl<T: Config> VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>
 		allocation: RedemptionAllocation<BalanceOf<T>>,
 	) -> DispatchResult {
 		let mut context = OpContext::<T>::load(collateral_id)?;
-		let mut vault = helpers::vault_of::<T>(&context.collateral_id, &owner)?;
-		let status = vault.status::<T>(&context.collateral_id, &owner);
+		context.ensure_not_frozen()?;
+		let TouchedVault { mut vault, status } = context.touch(&owner)?;
 		let post_touch_debt = vault.debt.total();
 		let held = T::CollateralAssets::balance_on_hold(
 			context.collateral_id.clone(),

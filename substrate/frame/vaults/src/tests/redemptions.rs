@@ -99,6 +99,30 @@ fn touch_for_redemption_rejects_frozen_branch_and_missing_vault() {
 }
 
 #[test]
+fn apply_redemption_rejects_frozen_branch() {
+	build_and_execute(|| {
+		register_default_branch();
+		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
+		// A frozen branch must reject settlement, like every other price-dependent
+		// path; the gate fires before any vault is touched.
+		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
+		assert_noop!(
+			<crate::Pallet<Test> as VaultRedemptionInterface<AccountId, AssetId, Balance>>::apply_redemption(
+				DOT,
+				1,
+				3,
+				RedemptionAllocation {
+					debt_to_cancel: 100,
+					collateral_to_redeemer: 10,
+					fee_collateral_retained: 0,
+				},
+			),
+			crate::Error::<Test>::BranchFrozen
+		);
+	});
+}
+
+#[test]
 fn apply_redemption_rejects_invalid_allocations_without_state_change() {
 	build_and_execute(|| {
 		register_default_branch();
