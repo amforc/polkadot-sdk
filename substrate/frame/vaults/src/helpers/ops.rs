@@ -28,6 +28,7 @@ pub fn open_vault<T: Config>(
 	let upfront_fee = open_upfront_fee::<T>(&context.state, &config, initial_debt, annual_rate);
 
 	let vault = Vault {
+		collateral: initial_collateral,
 		debt: VaultDebt { principal: initial_debt, interest: upfront_fee },
 		annual_rate,
 		last_interest_time: context.state.interest_time(context.now),
@@ -100,6 +101,7 @@ pub fn deposit_collateral_for<T: Config>(
 	)?;
 
 	context.state.add_collateral(amount);
+	vault.collateral = vault.collateral.saturating_add(amount);
 	if status.is_active() {
 		let old_stake = vault.redistribution_stake;
 		let new_stake = old_stake.saturating_add(amount);
@@ -130,7 +132,7 @@ pub fn withdraw_collateral<T: Config>(
 	ensure!(!status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
 	let config = context.config()?;
-	let collateral = vault.redistribution_stake;
+	let collateral = vault.collateral;
 	ensure!(collateral >= amount, Error::<T>::InsufficientCollateral);
 
 	let total_debt = vault.debt.total();
@@ -160,6 +162,7 @@ pub fn withdraw_collateral<T: Config>(
 	)?;
 
 	vault.redistribution_stake = new_collateral;
+	vault.collateral = new_collateral;
 	Pallet::<T>::deposit_event(Event::CollateralWithdrawn {
 		collateral_id: context.collateral_id.clone(),
 		owner: owner.clone(),
@@ -419,12 +422,9 @@ fn close_inner<T: Config>(
 	request: CloseRequest<'_, T>,
 ) -> Result<(), DispatchError> {
 	let CloseRequest { owner, recipient, vault, config, status, price, maybe_payment } = request;
-	// FinalRecovery stake is zero, so use the live hold.
-	let collateral = T::CollateralAssets::balance_on_hold(
-		context.collateral_id.clone(),
-		&HoldReason::VaultCollateral.into(),
-		owner,
-	);
+	// The row tracks this market's collateral in every state, FinalRecovery
+	// included (where the stake is zero but the collateral persists).
+	let collateral = vault.collateral;
 	let mut branch_state_after = context.state.clone();
 	if let Some((payment, rate)) = maybe_payment {
 		branch_state_after.apply_debt_payment(payment, rate, vault.debt.principal);
@@ -544,11 +544,7 @@ pub fn exit_final_recovery<T: Config>(
 	ensure!(status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
 
 	let config = context.config()?;
-	let collateral = T::CollateralAssets::balance_on_hold(
-		context.collateral_id.clone(),
-		&HoldReason::VaultCollateral.into(),
-		&owner,
-	);
+	let collateral = vault.collateral;
 	let total_debt = vault.debt.total();
 	ensure_at_or_above_mcr::<T>(collateral, total_debt, price, &config)?;
 

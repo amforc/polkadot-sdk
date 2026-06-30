@@ -171,19 +171,27 @@ pub struct InterestClock {
 	pub frozen_elapsed: Millis,
 }
 
-/// Per-vault state. The vault's collateral lives on the `VaultCollateral`
-/// hold for `(owner, collateral_id)` and is intentionally NOT stored here.
+/// Per-vault state.
+///
+/// `collateral` is this market's collateral for the owner: the share of the
+/// owner's `VaultCollateral` hold attributable to this `(collateral, stable)`
+/// market. The owner's hold is shared across every stablecoin they back with
+/// the same collateral asset, so the hold alone cannot represent one market's
+/// collateral — the row carries it. It tracks the collateral in every
+/// lifecycle state, `FinalRecovery` included.
+///
 /// `redistribution_stake` mirrors the vault's *current* eligible collateral:
-/// it must equal the `VaultCollateral` hold while the vault is `Active` or
-/// `Dormant` and is set to zero while the vault is in `FinalRecovery`. The
-/// field is refreshed after every op that changes collateral or eligibility,
+/// it equals `collateral` while the vault is `Active` or `Dormant` and is zero
+/// while the vault is in `FinalRecovery` (where `collateral` itself persists).
+/// It is refreshed after every op that changes collateral or eligibility,
 /// always after pending redistribution has been applied, so
-/// `BranchStakes.total == Σ vault.redistribution_stake` over the live
-/// eligible set.
+/// `BranchStakes.total == Σ vault.redistribution_stake` over the live eligible
+/// set.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct Vault<Balance> {
+	pub collateral: Balance,
 	pub debt: VaultDebt<Balance>,
 	pub annual_rate: FixedU128,
 	pub last_interest_time: Millis,

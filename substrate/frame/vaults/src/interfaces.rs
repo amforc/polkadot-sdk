@@ -14,7 +14,7 @@ use frame::{
 	prelude::*,
 	traits::{
 		fungible::Balanced as FungibleBalanced,
-		fungibles::{InspectHold as FungiblesInspectHold, MutateHold as FungiblesMutateHold},
+		fungibles::MutateHold as FungiblesMutateHold,
 		tokens::{Imbalance, Restriction},
 		SameOrOther,
 	},
@@ -41,7 +41,7 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 		ensure!(!status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
 		let post_touch_debt = vault.debt.total();
-		let held = vault.redistribution_stake;
+		let held = vault.collateral;
 		let config = context.config()?;
 		let cr = math::collateralization_ratio::<BalanceOf<T>>(held, post_touch_debt, price)
 			.ok_or(Error::<T>::VaultNotLiquidatable)?;
@@ -125,17 +125,15 @@ impl<T: Config> VaultLiquidationInterface<T::AccountId, T::AssetId, BalanceOf<T>
 			)?;
 		}
 
-		let after_outflow = T::CollateralAssets::balance_on_hold(
-			context.collateral_id.clone(),
-			&HoldReason::VaultCollateral.into(),
-			&owner,
-		);
-		if !after_outflow.is_zero() {
+		// Release only this market's residual. The owner's hold may also back
+		// other markets' collateral on the same asset, which must stay locked.
+		let leftover = held.saturating_sub(total_paid_out);
+		if !leftover.is_zero() {
 			T::CollateralAssets::release(
 				context.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				&owner,
-				after_outflow,
+				leftover,
 				Precision::Exact,
 			)?;
 		}
@@ -236,11 +234,7 @@ impl<T: Config> VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>
 		context.ensure_not_frozen()?;
 		let TouchedVault { mut vault, status } = context.touch(&owner)?;
 		let post_touch_debt = vault.debt.total();
-		let held = T::CollateralAssets::balance_on_hold(
-			context.collateral_id.clone(),
-			&HoldReason::VaultCollateral.into(),
-			&owner,
-		);
+		let held = vault.collateral;
 		ensure!(
 			allocation.debt_to_cancel <= post_touch_debt,
 			Error::<T>::InvalidRedemptionAllocation
@@ -279,6 +273,7 @@ impl<T: Config> VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>
 			.state
 			.apply_debt_payment(payment, vault.annual_rate, vault.debt.principal);
 		context.state.remove_collateral(allocation.collateral_to_redeemer);
+		vault.collateral = vault.collateral.saturating_sub(allocation.collateral_to_redeemer);
 		if stake_changes {
 			context.state.refresh_vault_stake(vault.annual_rate, old_stake, new_stake);
 		}
@@ -334,16 +329,13 @@ fn settle_redemption_status<T: Config>(
 		},
 		VaultStatus::FinalRecovery if new_total.is_zero() => {
 			recovery::remove::<T>(&context.collateral_id, owner)?;
-			let held_now = T::CollateralAssets::balance_on_hold(
-				context.collateral_id.clone(),
-				&HoldReason::VaultCollateral.into(),
-				owner,
+			context.state.refresh_vault_stake(
+				vault.annual_rate,
+				BalanceOf::<T>::zero(),
+				vault.collateral,
 			);
-			context
-				.state
-				.refresh_vault_stake(vault.annual_rate, BalanceOf::<T>::zero(), held_now);
 			vault.redistribution_snapshot = context.state.redistribution;
-			vault.redistribution_stake = held_now;
+			vault.redistribution_stake = vault.collateral;
 		},
 		_ => {},
 	}
