@@ -14,14 +14,9 @@ pub fn view_vault_cr<T: Config>(
 	let vault = Vaults::<T>::get(collateral_id, owner)?;
 	let state = BranchStates::<T>::get(collateral_id)?;
 	let now = T::TimeProvider::now();
-	let collateral = T::CollateralAssets::balance_on_hold(
-		collateral_id.clone(),
-		&HoldReason::VaultCollateral.into(),
-		owner,
-	);
 	let price = T::Oracle::provide_price(collateral_id).ok()?.price;
 	let pending = pending_touch_for::<T>(&vault, &state, now);
-	let total_coll = collateral.saturating_add(pending.collateral);
+	let total_coll = vault.collateral.saturating_add(pending.collateral);
 	let total_debt = vault
 		.debt
 		.total()

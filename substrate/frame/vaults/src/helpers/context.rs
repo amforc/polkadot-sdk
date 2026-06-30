@@ -141,6 +141,7 @@ impl<T: Config> OpContext<T> {
 				Restriction::OnHold,
 				Fortitude::Polite,
 			)?;
+			vault.collateral = vault.collateral.saturating_add(pending.collateral);
 		}
 
 		if vault.redistribution_snapshot != self.state.redistribution {
@@ -148,18 +149,15 @@ impl<T: Config> OpContext<T> {
 		}
 		vault.last_interest_time = self.state.interest_time(self.now);
 
-		// FinalRecovery vaults are not stake-bearing.
-		if !status.is_final_recovery() {
-			let held = T::CollateralAssets::balance_on_hold(
-				self.collateral_id.clone(),
-				&HoldReason::VaultCollateral.into(),
-				owner,
+		// FinalRecovery vaults are not stake-bearing; their stake stays zero while
+		// `collateral` persists on the row.
+		if !status.is_final_recovery() && vault.redistribution_stake != vault.collateral {
+			self.state.refresh_vault_stake(
+				vault.annual_rate,
+				vault.redistribution_stake,
+				vault.collateral,
 			);
-			if vault.redistribution_stake != held {
-				self.state
-					.refresh_vault_stake(vault.annual_rate, vault.redistribution_stake, held);
-				vault.redistribution_stake = held;
-			}
+			vault.redistribution_stake = vault.collateral;
 		}
 
 		Ok(TouchedVault { vault, status })
