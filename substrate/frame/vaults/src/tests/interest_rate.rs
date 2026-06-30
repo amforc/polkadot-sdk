@@ -322,6 +322,47 @@ fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
 	});
 }
 
+// Borrowing while passing the vault's *current* rate is a pure debt increase:
+// it must not charge the full-principal rate-change fee nor reset the cooldown,
+// mirroring `change_rate`'s equal-rate no-op.
+#[test]
+fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
+	build_and_execute(|| {
+		register_default_branch();
+		assert_ok!(open(1, DOT, 5_000, 2_000, rate_pct(20, 100)));
+		let opened_at = Vaults::<Test>::get(DOT, 1).unwrap().last_rate_update;
+
+		// Advance only part-way into the rate-adjustment cooldown so a (buggy)
+		// rate-change fee would still apply if the rate were treated as changed.
+		advance_time(ONE_DAY_MS / 2);
+
+		let fee_pure = crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, 1, 500, None);
+		let fee_same_rate =
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, 1, 500, Some(rate_pct(20, 100)));
+		assert_eq!(fee_pure, fee_same_rate, "an unchanged rate must not add a rate-change fee");
+
+		assert_ok!(crate::Pallet::<Test>::borrow(
+			RuntimeOrigin::signed(1),
+			DOT,
+			500,
+			Some(rate_pct(20, 100)),
+			1,
+			Position::endpoints_only(),
+		));
+
+		let v_post = Vaults::<Test>::get(DOT, 1).unwrap();
+		assert_eq!(v_post.annual_rate, rate_pct(20, 100));
+		assert_eq!(v_post.last_rate_update, opened_at, "no-op rate must not reset the cooldown");
+		assert!(
+			!System::events().iter().any(|e| matches!(
+				e.event,
+				RuntimeEvent::Vaults(crate::Event::BorrowRateChanged { .. })
+			)),
+			"no BorrowRateChanged event for an unchanged rate"
+		);
+	});
+}
+
 // Repay refreshes last_interest_time, settles pending interest, reduces
 // entire debt by the repaid amount, and reduces recorded debt by the
 // principal portion.
