@@ -209,7 +209,7 @@ pub fn borrow<T: Config>(
 	let dormant_to_active = pre_status.is_dormant() && new_ib_debt >= config.minimum_debt;
 	vault.debt.principal = new_ib_debt;
 	vault.debt.interest = vault.debt.interest.saturating_add(upfront_fee);
-	if maybe_new_rate.is_some() {
+	if old_rate != new_rate {
 		vault.annual_rate = new_rate;
 		vault.last_rate_update = context.now;
 	}

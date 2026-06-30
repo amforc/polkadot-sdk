@@ -358,7 +358,6 @@ pub fn register_default_branch() {
 	)
 	.expect("register_branch ok");
 	set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-	fund_redistribution_account_for(DOT);
 }
 
 pub fn register_branch_for(asset: AssetId) {
@@ -369,29 +368,6 @@ pub fn register_branch_for(asset: AssetId) {
 	)
 	.expect("register_branch ok");
 	set_price(asset.clone(), FixedU128::from_rational(10u128, 1u128));
-	fund_redistribution_account_for(asset);
-}
-
-/// Mint a single existential deposit unit to the redistribution sub-account
-/// so it can receive on-hold transfers during a liquidation that redistributes
-/// collateral. The pallet's `register_branch` is expected to handle this in
-/// production (per DESIGN.md §5.3 "ensures the redistribution account can hold
-/// `c`") but currently doesn't — covered by Phase 3 grooming.
-pub fn fund_redistribution_account_for(asset: AssetId) {
-	use frame::traits::{fungible::Mutate as FungibleMutate, AccountIdConversion};
-	let pallet_account: AccountId = VaultsPalletId::get().into_account_truncating();
-	match asset {
-		AssetId::Native => {
-			let _ = <Balances as FungibleMutate<AccountId>>::mint_into(&pallet_account, 1);
-		},
-		AssetId::WithId(asset) => {
-			let _ = <Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
-				asset,
-				&pallet_account,
-				1,
-			);
-		},
-	}
 }
 
 /// Advance `pallet_timestamp` by `ms` milliseconds without touching block #.

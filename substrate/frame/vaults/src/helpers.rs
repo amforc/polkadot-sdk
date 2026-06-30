@@ -154,7 +154,7 @@ impl<Balance> Vault<Balance> {
 	where
 		Balance: Zero + Copy,
 	{
-		if maybe_new_rate.is_some() && !cooldown_elapsed {
+		if maybe_new_rate.is_some_and(|rate| rate != self.annual_rate) && !cooldown_elapsed {
 			self.debt.principal
 		} else {
 			Balance::zero()
