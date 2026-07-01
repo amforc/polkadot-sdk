@@ -15,36 +15,53 @@ use pusd_primitives::BranchModeProvider;
 fn register_branch_creates_state() {
 	build_and_execute(|| {
 		register_default_branch();
-		let state = BranchStates::<Test>::get(DOT).expect("branch registered");
+		let state = BranchStates::<Test>::get(DOT, PUSD).expect("branch registered");
 		assert_eq!(state.total_collateral, 0);
 		assert!(!state.is_frozen());
 	});
 }
 
 #[test]
-fn register_branch_requires_full_manager() {
+fn create_branch_requires_asset_owner_or_root() {
 	build_and_execute(|| {
-		// Defensive (acct 999) cannot register a new branch — needs Full.
+		// A non-owner of the stable asset cannot create a market for it.
 		assert_noop!(
-			crate::Pallet::<Test>::register_branch(
-				RuntimeOrigin::signed(999),
-				DOT,
-				default_branch_config(),
+			crate::Pallet::<Test>::create_branch(
+				RuntimeOrigin::signed(2),
+				TOKEN_X,
+				PUSD,
+				ADMIN,
+				EMERGENCY_ADMIN,
+				default_branch_config()
 			),
-			crate::Error::<Test>::InsufficientPrivilege
+			DispatchError::BadOrigin
 		);
+		// The stable asset's owner (acct 1 in genesis) can, locking a deposit.
+		set_price(TOKEN_X, FixedU128::from_rational(10u128, 1u128));
+		assert_ok!(crate::Pallet::<Test>::create_branch(
+			RuntimeOrigin::signed(1),
+			TOKEN_X,
+			PUSD,
+			ADMIN,
+			EMERGENCY_ADMIN,
+			default_branch_config()
+		));
 	});
 }
 
 #[test]
-fn register_branch_rejects_unknown_asset() {
+fn create_branch_rejects_unknown_asset() {
 	build_and_execute(|| {
 		let unknown = AssetId::WithId(999_999);
+		set_price(unknown.clone(), FixedU128::from_rational(10u128, 1u128));
 		assert_noop!(
-			crate::Pallet::<Test>::register_branch(
+			crate::Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				unknown,
-				default_branch_config(),
+				PUSD,
+				ADMIN,
+				EMERGENCY_ADMIN,
+				default_branch_config()
 			),
 			crate::Error::<Test>::UnknownCollateral
 		);
@@ -52,14 +69,17 @@ fn register_branch_rejects_unknown_asset() {
 }
 
 #[test]
-fn register_branch_rejects_duplicate_collateral() {
+fn create_branch_rejects_duplicate_collateral() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_noop!(
-			crate::Pallet::<Test>::register_branch(
+			crate::Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				DOT,
-				default_branch_config(),
+				PUSD,
+				ADMIN,
+				EMERGENCY_ADMIN,
+				default_branch_config()
 			),
 			crate::Error::<Test>::BranchAlreadyRegistered
 		);
@@ -71,7 +91,7 @@ fn branches_view_lists_registered_assets_in_registration_order() {
 	build_and_execute(|| {
 		register_default_branch();
 		register_branch_for(TOKEN_X);
-		assert_eq!(crate::Pallet::<Test>::branches(), alloc::vec![DOT, TOKEN_X]);
+		assert_eq!(crate::Pallet::<Test>::branches(), alloc::vec![(DOT, PUSD), (TOKEN_X, PUSD)]);
 	});
 }
 
@@ -81,7 +101,7 @@ fn open_vault_holds_collateral_and_mints_pusd() {
 		register_default_branch();
 		// 1000 DOT @ $10 = $10000 collateral; borrow 1000 pUSD with 5% rate.
 		assert_ok!(open(1, DOT, 1_000, 1_000, rate_pct(5, 100)));
-		let v = Vaults::<Test>::get(DOT, 1).expect("vault stored");
+		let v = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(v.debt.principal, 1_000);
 		assert!(vault_status(DOT, 1).is_active());
 		assert_eq!(pusd_balance(1), 1_000);
@@ -118,12 +138,15 @@ fn open_vault_below_min_debt_rejected() {
 fn open_vault_rate_out_of_bounds_rejected() {
 	build_and_execute(|| {
 		register_default_branch();
+		// Below the branch `minimum_borrow_rate` (0.1%).
 		assert_noop!(
 			open(1, DOT, 1_000, 500, rate_pct(0, 1)),
 			crate::Error::<Test>::RateOutOfBounds
 		);
+		// Above the branch `maximum_borrow_rate` (400%): the cap is the
+		// per-branch config bound, not a hard-coded 100%.
 		assert_noop!(
-			open(1, DOT, 1_000, 500, rate_pct(101, 100)),
+			open(1, DOT, 1_000, 500, rate_pct(401, 100)),
 			crate::Error::<Test>::RateOutOfBounds
 		);
 	});
@@ -158,32 +181,45 @@ fn defensive_manager_can_only_tighten_selected_risk_parameters() {
 		register_default_branch();
 
 		assert_ok!(crate::Pallet::<Test>::set_minimum_collateralization_ratio(
-			RuntimeOrigin::signed(999),
+			RuntimeOrigin::signed(EMERGENCY_ADMIN),
 			DOT,
-			rate_pct(120, 100),
+			PUSD,
+			rate_pct(120, 100)
 		));
 		assert_noop!(
 			crate::Pallet::<Test>::set_minimum_collateralization_ratio(
-				RuntimeOrigin::signed(999),
+				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
-				rate_pct(109, 100),
+				PUSD,
+				rate_pct(109, 100)
 			),
 			crate::Error::<Test>::DefensiveActionNotDefensive
 		);
 
 		assert_ok!(crate::Pallet::<Test>::set_debt_ceiling(
-			RuntimeOrigin::signed(999),
+			RuntimeOrigin::signed(EMERGENCY_ADMIN),
 			DOT,
-			50_000_000,
+			PUSD,
+			50_000_000
 		));
 		assert_noop!(
-			crate::Pallet::<Test>::set_debt_ceiling(RuntimeOrigin::signed(999), DOT, 200_000_000,),
+			crate::Pallet::<Test>::set_debt_ceiling(
+				RuntimeOrigin::signed(EMERGENCY_ADMIN),
+				DOT,
+				PUSD,
+				200_000_000
+			),
 			crate::Error::<Test>::DefensiveActionNotDefensive
 		);
 
 		assert_noop!(
-			crate::Pallet::<Test>::set_minimum_debt(RuntimeOrigin::signed(999), DOT, 300),
-			crate::Error::<Test>::InsufficientPrivilege
+			crate::Pallet::<Test>::set_minimum_debt(
+				RuntimeOrigin::signed(EMERGENCY_ADMIN),
+				DOT,
+				PUSD,
+				300
+			),
+			crate::Error::<Test>::NotBranchAdmin
 		);
 	});
 }
@@ -220,7 +256,11 @@ fn open_vault_on_multi_asset_branch() {
 fn frozen_branch_blocks_user_ops() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT,));
+		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD
+		));
 		assert_noop!(
 			open(1, DOT, 1_000, 500, rate_pct(5, 100)),
 			crate::Error::<Test>::BranchFrozen
@@ -234,8 +274,8 @@ fn refresh_branch_persists_frozen_on_oracle_failure() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_oracle_available(false);
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT));
-		let state = BranchStates::<Test>::get(DOT).expect("state");
+		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		let state = BranchStates::<Test>::get(DOT, PUSD).expect("state");
 		let frozen = state.frozen.expect("frozen persisted");
 		assert!(matches!(frozen.reason, crate::FrozenReason::OracleFailure));
 	});
@@ -249,12 +289,12 @@ fn mode_reports_frozen_while_oracle_unavailable() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		let mode = <crate::Pallet<Test> as BranchModeProvider<AssetId>>::mode;
-		assert_eq!(mode(&DOT), Some(BranchMode::Normal));
+		let mode = <crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode;
+		assert_eq!(mode(&DOT, &PUSD), Some(BranchMode::Normal));
 		set_oracle_available(false);
-		assert_eq!(mode(&DOT), Some(BranchMode::Frozen));
+		assert_eq!(mode(&DOT, &PUSD), Some(BranchMode::Frozen));
 		set_oracle_available(true);
-		assert_eq!(mode(&DOT), Some(BranchMode::Normal));
+		assert_eq!(mode(&DOT, &PUSD), Some(BranchMode::Normal));
 	});
 }
 
@@ -264,16 +304,16 @@ fn refresh_branch_clears_oracle_frozen() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_oracle_available(false);
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT));
-		assert!(BranchStates::<Test>::get(DOT).unwrap().is_frozen());
+		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
 		// Oracle still down → second refresh is a no-op (already frozen for
 		// the same reason).
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT));
-		assert!(BranchStates::<Test>::get(DOT).unwrap().is_frozen());
+		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
 		// Restore oracle and refresh → unfreezes.
 		set_oracle_available(true);
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT));
-		assert!(!BranchStates::<Test>::get(DOT).unwrap().is_frozen());
+		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert!(!BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -281,9 +321,13 @@ fn refresh_branch_clears_oracle_frozen() {
 fn refresh_branch_does_not_clear_governance_frozen() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT));
-		assert!(BranchStates::<Test>::get(DOT).unwrap().is_frozen());
+		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD
+		));
+		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -292,14 +336,26 @@ fn governance_clear_clears_governance_frozen() {
 	build_and_execute(|| {
 		register_default_branch();
 		// Defensive (acct 999) cannot clear governance Frozen — needs Full.
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
+		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD
+		));
 		assert_noop!(
-			crate::Pallet::<Test>::clear_governance_frozen_mode(RuntimeOrigin::signed(999), DOT),
-			crate::Error::<Test>::InsufficientPrivilege
+			crate::Pallet::<Test>::clear_governance_frozen_mode(
+				RuntimeOrigin::signed(EMERGENCY_ADMIN),
+				DOT,
+				PUSD
+			),
+			crate::Error::<Test>::NotBranchAdmin
 		);
 		// Full clears governance Frozen.
-		assert_ok!(crate::Pallet::<Test>::clear_governance_frozen_mode(RuntimeOrigin::root(), DOT));
-		assert!(!BranchStates::<Test>::get(DOT).unwrap().is_frozen());
+		assert_ok!(crate::Pallet::<Test>::clear_governance_frozen_mode(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD
+		));
+		assert!(!BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -309,26 +365,15 @@ fn governance_clear_is_noop_for_oracle_frozen() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_oracle_available(false);
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT));
-		assert!(BranchStates::<Test>::get(DOT).unwrap().is_frozen());
+		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
 		// Governance clear refuses oracle-Frozen state — branch stays frozen.
-		assert_ok!(crate::Pallet::<Test>::clear_governance_frozen_mode(RuntimeOrigin::root(), DOT));
-		assert!(BranchStates::<Test>::get(DOT).unwrap().is_frozen());
-	});
-}
-
-#[test]
-fn poke_during_frozen_is_noop() {
-	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
-		let branch_state_pre = BranchStates::<Test>::get(DOT).expect("state");
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, 1));
-		let branch_state_post = BranchStates::<Test>::get(DOT).expect("state");
-		// No interest minted while frozen.
-		assert_eq!(branch_state_pre.debt.minted_interest, branch_state_post.debt.minted_interest);
-		assert!(branch_state_post.is_frozen(), "poke does not clear Frozen");
+		assert_ok!(crate::Pallet::<Test>::clear_governance_frozen_mode(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD
+		));
+		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -337,18 +382,23 @@ fn frozen_poke_pins_interest_clock_without_minting() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
-		let before = BranchStates::<Test>::get(DOT).expect("branch state");
+		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD
+		));
+		let before = BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
 
 		let elapsed: Moment = 24 * 3_600 * 1_000;
 		advance_time(elapsed);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, 1));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
 
-		let after = BranchStates::<Test>::get(DOT).expect("branch state");
+		let after = BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
 		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
 		assert_eq!(
 			after.debt.last_interest_time, before.debt.last_interest_time,
 			"interest clock pinned across the frozen window"
 		);
+		assert!(after.is_frozen(), "poke does not clear Frozen");
 	});
 }

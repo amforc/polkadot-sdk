@@ -22,19 +22,24 @@ pub struct RedemptionAllocation<Balance> {
 /// against the post-touch debt and the held collateral, then applies it; each
 /// applied redemption re-shapes the priority queue, so the next read returns the
 /// new head.
-pub trait VaultRedemptionInterface<AccountId, AssetId, Balance> {
-	/// Highest-priority vault owner to redeem against on `collateral_id`, or
-	/// `None` when the branch has no redeemable vaults.
+pub trait VaultRedemptionInterface<AccountId, CollateralId, StableId, Balance> {
+	/// Highest-priority vault owner to redeem against on the
+	/// `(collateral_id, stable_id)` market, or `None` when the market has no
+	/// redeemable vaults.
 	///
 	/// The vault pallet's authoritative redemption order is: `FinalRecovery`
 	/// FIFO first, then `last_dormant_vault_owner`, then the rate index
 	/// tail-first. Redemption always targets the current head.
-	fn next_redemption_target(collateral_id: AssetId) -> Option<AccountId>;
+	fn next_redemption_target(
+		collateral_id: CollateralId,
+		stable_id: StableId,
+	) -> Option<AccountId>;
 
 	/// Touch the vault, apply pending interest and redistribution, and return
 	/// the post-touch debt the orchestrator must cap `debt_to_cancel` against.
 	fn touch_for_redemption(
-		collateral_id: AssetId,
+		collateral_id: CollateralId,
+		stable_id: StableId,
 		owner: AccountId,
 	) -> Result<Balance, DispatchError>;
 
@@ -43,7 +48,8 @@ pub trait VaultRedemptionInterface<AccountId, AssetId, Balance> {
 	/// to `Dormant` if the residual debt is below `MinimumDebt`, and updates
 	/// `last_dormant_vault_owner` accordingly.
 	fn apply_redemption(
-		collateral_id: AssetId,
+		collateral_id: CollateralId,
+		stable_id: StableId,
 		owner: AccountId,
 		redeemer: AccountId,
 		allocation: RedemptionAllocation<Balance>,

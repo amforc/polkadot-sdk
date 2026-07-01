@@ -9,7 +9,7 @@ fn close_last_vault_with_debt_reverts() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
-			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, None),
+			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None),
 			crate::Error::<Test>::DebtOutstanding
 		);
 	});
@@ -24,7 +24,7 @@ fn repay_into_dust_window_reverts() {
 		// borrow=1000, min_debt=200. Repay 850 would leave 150 < 200.
 		assert_ok!(open(1, DOT, 1_000, 1_000, rate_pct(5, 100)));
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 850),
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 850),
 			crate::Error::<Test>::DebtWouldBecomeDust
 		);
 	});
@@ -38,7 +38,13 @@ fn withdraw_more_than_held_reverts() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 2_000, 1,),
+			crate::Pallet::<Test>::withdraw_collateral(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				2_000,
+				None
+			),
 			crate::Error::<Test>::InsufficientCollateral
 		);
 	});
@@ -54,7 +60,13 @@ fn withdraw_breaking_cr_reverts() {
 		// 1000 DOT @ $10 backs 500 pUSD — withdrawing 950 leaves
 		// 50 DOT × $10 = $500, CR == 100% < ICR 120%.
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 950, 1),
+			crate::Pallet::<Test>::withdraw_collateral(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				950,
+				None
+			),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
 	});
@@ -68,51 +80,100 @@ fn withdraw_breaking_cr_reverts() {
 fn zero_amount_ops_are_no_ops() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		let pre = Vaults::<Test>::get(DOT, 1).expect("vault stored");
+		// Non-trivial principal/rate so a day of interest is observable:
+		// floor(5_000 * 0.5 * 1day / year) = 6.
+		assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(50, 100)));
+		let pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		advance_time(86_400_000); // one day
+		let now = pallet_timestamp::Pallet::<Test>::get();
 
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			1,
-			0,
+			0
 		));
-		assert_ok!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 0, 1,)
-		);
+		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			0,
+			None
+		));
 		assert_ok!(crate::Pallet::<Test>::borrow(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			0,
 			None,
-			1,
-			Position::endpoints_only(),
+			None,
+			Position::endpoints_only()
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 0));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 0));
 
-		let post = Vaults::<Test>::get(DOT, 1).expect("vault stored");
-		assert_eq!(pre.debt.principal, post.debt.principal);
-		assert_eq!(pre.debt.interest, post.debt.interest);
+		let post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		// Zero-amount ops still touch (helpers/ops.rs:147/191/249/344): they settle the
+		// pending day of interest and advance the clock — the row is NOT byte-identical.
+		assert_eq!(post.debt.principal, pre.debt.principal);
+		assert_eq!(post.debt.interest, pre.debt.interest + 6);
+		assert_eq!(
+			post.last_interest_time,
+			crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap().interest_time(now)
+		);
 		assert_eq!(held(DOT, 1), 1_000);
 	});
 }
 
-// `change_rate` to the current rate returns `Ok(())` early without touching
-// state. This pins the no-op semantics: the storage row before and after is
-// byte-identical.
+// `repay_for` is exempt from the Safety-mode TCR gate: repaying always improves
+// branch TCR, so it must succeed even while the branch sits in Safety mode
+// (this is why repay-to-zero leaves a husk rather than auto-closing — the close
+// would release collateral and could worsen TCR).
+#[test]
+fn repay_for_allowed_in_safety_mode() {
+	build_and_execute(|| {
+		register_default_branch();
+		assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(5, 100)));
+		// Drop price into Safety (TCR ≈ 126%, between ICR 120% and Safety 130%).
+		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
+		let tcr_before = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
+		assert!(tcr_before < rate_pct(130, 100), "setup must leave the branch in Safety mode");
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 2_000));
+		let tcr_after = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
+		assert!(tcr_after > tcr_before, "repay improves branch TCR even in Safety mode");
+	});
+}
+
+// `change_rate` to the current rate returns early without re-inserting in the rate
+// index or charging a fee — but it still touches first (helpers/ops.rs:433-438), so it
+// settles pending interest and advances the interest clock. It is a no-op on the
+// *rate*, not on the whole storage row.
 #[test]
 fn change_rate_to_same_rate_is_no_op() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 5_000, 10_000, rate_pct(5, 100)));
-		let pre = Vaults::<Test>::get(DOT, 1).expect("vault stored");
+		let pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		advance_time(86_400_000); // one day of pending interest
+		let now = pallet_timestamp::Pallet::<Test>::get();
 		assert_ok!(crate::Pallet::<Test>::change_rate(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			rate_pct(5, 100),
-			Position::endpoints_only(),
+			Position::endpoints_only()
 		));
-		let post = Vaults::<Test>::get(DOT, 1).expect("vault stored");
-		assert_eq!(pre, post);
+		let post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		// Rate, principal and cooldown clock are untouched (no real rate change).
+		assert_eq!(post.annual_rate, pre.annual_rate);
+		assert_eq!(post.debt.principal, pre.debt.principal);
+		assert_eq!(post.last_rate_update, pre.last_rate_update);
+		// But interest is settled: exactly floor(10_000 * 0.05 * 1day / year) = 1, and no
+		// upfront fee is added (which would have pushed debt.interest higher).
+		assert_eq!(post.debt.interest, pre.debt.interest + 1);
+		assert_eq!(
+			post.last_interest_time,
+			crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap().interest_time(now)
+		);
 	});
 }

@@ -7,20 +7,23 @@ mod critical_threshold;
 mod debt_in_front;
 mod events;
 mod final_recovery;
+mod governance;
 mod hint_helpers;
 mod interest_rate;
 mod last_vault;
 mod lifecycle;
+mod multi_market;
 mod rate_index;
 mod redemptions;
 mod redistribution_accounting;
+mod risk_controls;
 
-use crate::mock::{AccountId, AssetId, FixedU128, Test};
+use crate::mock::{AccountId, AssetId, FixedU128, Test, PUSD};
 
 pub(super) fn rate_pct(num: u128, denom: u128) -> FixedU128 {
 	FixedU128::from_rational(num, denom)
 }
 
 pub(super) fn vault_status(asset: AssetId, owner: AccountId) -> crate::types::VaultStatus {
-	crate::Pallet::<Test>::vault_status(asset, owner).expect("vault status")
+	crate::Pallet::<Test>::vault_status(asset, PUSD, owner).expect("vault status")
 }

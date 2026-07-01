@@ -6,7 +6,7 @@ use frame::traits::fungible::Mutate as FungibleMutate;
 use pallet_linked_list::SortedListInterface;
 
 fn fund_account(who: AccountId) {
-	let _ = <Balances as FungibleMutate<AccountId>>::mint_into(&who, 1_000_000_000_000);
+	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&who, 1_000_000_000_000));
 }
 
 fn seed_long_rate_index() {
@@ -41,7 +41,7 @@ fn find_rate_position_skips_dormant_vaults() {
 
 		// Now query a hint at a rate near acct 1's old rate. The result
 		// must not name acct 1 — it's no longer in the index.
-		let pos = crate::Pallet::<Test>::find_rate_position(DOT, rate_pct(15, 1000)); // 1.5%
+		let pos = crate::Pallet::<Test>::find_rate_position(DOT, PUSD, rate_pct(15, 1000)); // 1.5%
 		assert_ne!(pos.prev, Some(1));
 		assert_ne!(pos.next, Some(1));
 	});
@@ -58,10 +58,10 @@ fn repair_steps_needed_zero_for_valid_positive_for_stale() {
 		}
 		let budget = <LinkedList as SortedListInterface<VaultList, u64>>::repair_budget();
 		let rate = rate_pct(25, 100);
-		let good = crate::Pallet::<Test>::find_rate_position(DOT, rate);
-		assert_eq!(crate::Pallet::<Test>::repair_steps_needed(DOT, rate, good), 0);
+		let good = crate::Pallet::<Test>::find_rate_position(DOT, PUSD, rate);
+		assert_eq!(crate::Pallet::<Test>::repair_steps_needed(DOT, PUSD, rate, good), 0);
 		let stale =
-			crate::Pallet::<Test>::repair_steps_needed(DOT, rate, Position::endpoints_only());
+			crate::Pallet::<Test>::repair_steps_needed(DOT, PUSD, rate, Position::endpoints_only());
 		assert!(stale > 0 && stale <= budget, "stale hint must be repairable within budget");
 	});
 }
@@ -76,6 +76,7 @@ fn repair_steps_needed_exceeds_budget_for_extreme_hint_in_long_index() {
 		let budget = <LinkedList as SortedListInterface<VaultList, u64>>::repair_budget();
 		let steps = crate::Pallet::<Test>::repair_steps_needed(
 			DOT,
+			PUSD,
 			rate_pct(1, 100),
 			Position::endpoints_only(),
 		);
@@ -93,26 +94,35 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 		fund_account(21);
 		assert_ok!(open(21, DOT, 1_000, 500, rate_pct(1, 100)));
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, 21));
+		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
+			RuntimeOrigin::signed(99),
+			DOT,
+			PUSD,
+			21
+		));
 
 		// Restore the price and seed a long index so the tail re-insertion at 1%
 		// needs more than the repair budget.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		seed_long_rate_index();
 
-		let vault_pre = crate::pallet::Vaults::<Test>::get(DOT, 21).expect("vault stored");
+		let vault_pre = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).expect("vault stored");
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(
 				RuntimeOrigin::signed(99),
 				DOT,
+				PUSD,
 				21,
-				Position::endpoints_only(),
+				Position::endpoints_only()
 			),
 			crate::Error::<Test>::InvalidPositionHints
 		);
 		assert!(vault_status(DOT, 21).is_final_recovery());
-		assert_eq!(crate::pallet::Vaults::<Test>::get(DOT, 21).unwrap(), vault_pre);
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, 10), alloc::vec![21]);
+		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).unwrap(), vault_pre);
+		assert_eq!(
+			crate::Pallet::<Test>::final_recovery_queue_head(DOT, PUSD, 10),
+			alloc::vec![21]
+		);
 	});
 }
 
@@ -129,15 +139,16 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 			crate::Pallet::<Test>::open_vault(
 				RuntimeOrigin::signed(21),
 				DOT,
+				PUSD,
 				1_000,
 				500,
 				rate_pct(1, 100),
-				Position::endpoints_only(),
+				Position::endpoints_only()
 			),
 			crate::Error::<Test>::InvalidPositionHints
 		);
 
-		assert!(crate::pallet::Vaults::<Test>::get(DOT, 21).is_none());
+		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).is_none());
 		assert_eq!(held(DOT, 21), 0);
 		assert_eq!(collateral_balance(DOT, 21), collateral_pre);
 		assert_eq!(pusd_balance(21), pusd_pre);
@@ -149,8 +160,8 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 	build_and_execute(|| {
 		register_default_branch();
 		seed_long_rate_index();
-		let vault_pre = crate::pallet::Vaults::<Test>::get(DOT, 20).expect("vault stored");
-		let branch_pre = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		let vault_pre = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).expect("vault stored");
+		let branch_pre = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
 		let order_pre = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
 			&rate_list(DOT),
 			25,
@@ -160,14 +171,15 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 			crate::Pallet::<Test>::change_rate(
 				RuntimeOrigin::signed(20),
 				DOT,
+				PUSD,
 				rate_pct(1, 100),
-				Position::endpoints_only(),
+				Position::endpoints_only()
 			),
 			crate::Error::<Test>::InvalidPositionHints
 		);
 
-		assert_eq!(crate::pallet::Vaults::<Test>::get(DOT, 20).unwrap(), vault_pre);
-		assert_eq!(crate::pallet::BranchStates::<Test>::get(DOT).unwrap(), branch_pre);
+		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).unwrap(), vault_pre);
+		assert_eq!(crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap(), branch_pre);
 		let order_post = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
 			&rate_list(DOT),
 			25,

@@ -23,7 +23,7 @@ fn liquidate_succeeds_when_a_second_vault_exists() {
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		// Now the last-vault guard doesn't trip — vault 2 remains as a
 		// redistribution recipient.
-		assert!(liquidate(DOT, 1).is_ok());
+		assert_ok!(liquidate(DOT, 1));
 	});
 }
 
@@ -44,7 +44,12 @@ fn execute_liquidation_rejects_final_recovery_vault() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, 1));
+		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
+			RuntimeOrigin::signed(99),
+			DOT,
+			PUSD,
+			1
+		));
 		assert_noop!(liquidate(DOT, 1), crate::Error::<Test>::VaultInFinalRecovery);
 	});
 }
@@ -55,7 +60,11 @@ fn execute_liquidation_rejects_frozen_branch() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
+		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD
+		));
 		assert_noop!(liquidate(DOT, 1), crate::Error::<Test>::BranchFrozen);
 	});
 }
@@ -64,6 +73,12 @@ fn execute_liquidation_rejects_frozen_branch() {
 // single-transaction model rolls the rejection back atomically — the vault row
 // and branch aggregates are untouched — so a follow-up valid allocation still
 // succeeds.
+//
+// In production this can't be reached from a user: the `LiquidationAllocation`
+// is computed *inside* the pallet from the liquidation math, never externally
+// supplied. These two tests defensively guard the `VaultLiquidationInterface`
+// boundary (rejecting an inconsistent allocation and rolling back cleanly); the
+// allocation *calculation* itself is exercised where that math lives.
 #[test]
 fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 	build_and_execute(|| {
@@ -80,7 +95,7 @@ fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 			}),
 			crate::Error::<Test>::InvalidLiquidationAllocation
 		);
-		assert!(crate::pallet::Vaults::<Test>::contains_key(DOT, 1));
+		assert!(crate::pallet::Vaults::<Test>::contains_key((DOT, PUSD, 1)));
 
 		assert_ok!(liquidate_with(DOT, 1, |post_touch| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 10, debt: post_touch, collateral: 0 },
@@ -109,7 +124,7 @@ fn execute_liquidation_rejects_collateral_payout_above_held() {
 			}),
 			crate::Error::<Test>::InvalidLiquidationAllocation
 		);
-		assert!(crate::pallet::Vaults::<Test>::contains_key(DOT, 1));
+		assert!(crate::pallet::Vaults::<Test>::contains_key((DOT, PUSD, 1)));
 	});
 }
 
@@ -124,15 +139,15 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 		// Partial redemption drains vault 1 below MinimumDebt → Dormant, and
 		// parks it as the next redemption target.
 		assert_ok!(redeem(DOT, 3, 350));
-		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
 		assert_eq!(state.dormant_redemption_target, Some(1));
 
 		// Crash the price so the dormant husk is liquidatable, then liquidate.
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
-		assert!(liquidate(DOT, 1).is_ok());
+		assert_ok!(liquidate(DOT, 1));
 
-		assert!(crate::pallet::Vaults::<Test>::get(DOT, 1).is_none());
-		let state = crate::pallet::BranchStates::<Test>::get(DOT).expect("branch state");
+		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
 		assert_eq!(state.dormant_redemption_target, None, "pointer cleared with the row");
 	});
 }
