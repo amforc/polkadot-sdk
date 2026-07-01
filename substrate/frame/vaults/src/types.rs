@@ -2,7 +2,9 @@
 
 use crate::Millis;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, Permill, Saturating};
+use frame::arithmetic::{
+	FixedPointNumber, FixedPointOperand, FixedU128, Permill, Saturating, Zero,
+};
 use scale_info::TypeInfo;
 
 pub use pusd_primitives::{BranchMode, FrozenReason, FrozenState};
@@ -31,11 +33,12 @@ pub enum VaultStatus {
 	FinalRecovery,
 }
 
-/// Logical linked-list partitions owned by this pallet.
+/// Logical linked-list partitions owned by this pallet, one pair of lists per
+/// `(collateral_id, stable_id)` market.
 ///
-/// `Rate(asset)` is the active-vault rate index. `FinalRecovery(asset)` is
-/// the per-branch recovery FIFO, using a monotonically increasing insertion
-/// sequence as the stored priority.
+/// `Rate(collateral, stable)` is the active-vault rate index.
+/// `FinalRecovery(collateral, stable)` is the per-market recovery FIFO, using a
+/// monotonically increasing insertion sequence as the stored priority.
 #[derive(
 	Encode,
 	Decode,
@@ -49,14 +52,14 @@ pub enum VaultStatus {
 	Ord,
 	Debug,
 )]
-pub enum VaultListId<AssetId> {
-	Rate(AssetId),
-	FinalRecovery(AssetId),
+pub enum VaultListId<CollateralId, StableId> {
+	Rate(CollateralId, StableId),
+	FinalRecovery(CollateralId, StableId),
 }
 
-impl<AssetId: Default> Default for VaultListId<AssetId> {
+impl<CollateralId: Default, StableId: Default> Default for VaultListId<CollateralId, StableId> {
 	fn default() -> Self {
-		Self::Rate(AssetId::default())
+		Self::Rate(CollateralId::default(), StableId::default())
 	}
 }
 
@@ -216,6 +219,11 @@ pub struct BranchConfig<Balance> {
 	pub upfront_fee_period: Millis,
 	pub rate_adjustment_cooldown: Millis,
 	pub redistribution_penalty: Permill,
+	/// Autoline headroom above current debt. `0` disables the autoline, leaving
+	/// `debt_ceiling` as the static borrow cap.
+	pub ceiling_gap: Balance,
+	/// Minimum time between autoline ceiling increases (slow-up gate).
+	pub ceiling_ttl: Millis,
 }
 
 /// Debt and interest aggregates for one collateral branch.
@@ -229,6 +237,19 @@ pub struct BranchDebt<Balance> {
 	pub bad_debt: Balance,
 	pub weighted_principal_sum: Balance,
 	pub last_interest_time: Millis,
+}
+
+impl<Balance: FixedPointOperand + Saturating> BranchDebt<Balance> {
+	/// Total outstanding stable liability: principal, minted interest, pending
+	/// redistribution principal, and socialized bad debt. The canonical measure
+	/// of a branch's stable exposure, used by the global debt ceiling and the
+	/// market-emptiness check.
+	pub fn outstanding(&self) -> Balance {
+		self.principal
+			.saturating_add(self.minted_interest)
+			.saturating_add(self.pending_redistribution_principal)
+			.saturating_add(self.bad_debt)
+	}
 }
 
 /// Current-collateral redistribution stake totals for one collateral branch.
@@ -283,6 +304,11 @@ pub struct BranchState<AccountId, Balance> {
 	pub dormant_redemption_target: Option<AccountId>,
 	pub idle_cursor: Option<AccountId>,
 	pub frozen: Option<FrozenState>,
+	/// Autoline current line — the self-adjusting borrow cap, maintained while
+	/// `ceiling_gap > 0` and bounded above by `debt_ceiling` (the line max).
+	pub effective_ceiling: Balance,
+	/// When `effective_ceiling` last increased; gates the slow-up.
+	pub ceiling_last_inc: Millis,
 }
 
 impl<AccountId, Balance> BranchState<AccountId, Balance> {
@@ -409,11 +435,25 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 			.saturating_add(rate.saturating_mul_int(new_stake));
 	}
 
-	/// True when no debt-bearing or stake-bearing row remains attached.
+	/// True when no debt-bearing or stake-bearing vault row remains attached
+	/// (branch principal, stake, and pending redistribution all zero). Interest
+	/// drift and bad debt may still remain to be swept, and collateral may still
+	/// sit in the redistribution account; this marks the last-vault *settlement*
+	/// point. For the *removal* precondition use [`Self::is_removable`].
 	pub fn is_empty_of_liability(&self) -> bool {
 		self.debt.principal.is_zero() &&
 			self.stakes.total.is_zero() &&
 			self.debt.pending_redistribution_principal.is_zero()
+	}
+
+	/// True when the market carries no residual liability at all: no debt
+	/// (principal, minted interest, pending redistribution, or socialized bad
+	/// debt), no stake, and no collateral still locked in the redistribution
+	/// account. The precondition for removing the market.
+	pub fn is_removable(&self) -> bool {
+		self.debt.outstanding().is_zero() &&
+			self.stakes.total.is_zero() &&
+			self.total_collateral.is_zero()
 	}
 
 	/// Sweep the orphan debt counters into `bad_debt`, returning the swept
@@ -469,9 +509,11 @@ pub enum BranchConfigUpdate<Balance> {
 	UpfrontFeePeriod(Millis),
 	RateAdjustmentCooldown(Millis),
 	RedistributionPenalty(Permill),
+	CeilingGap(Balance),
+	CeilingTtl(Millis),
 }
 
-impl<Balance> BranchConfigUpdate<Balance> {
+impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 	pub fn apply_to(self, config: &mut BranchConfig<Balance>) {
 		match self {
 			Self::MinimumCollateralizationRatio(v) => config.minimum_collateralization_ratio = v,
@@ -487,15 +529,99 @@ impl<Balance> BranchConfigUpdate<Balance> {
 			Self::UpfrontFeePeriod(v) => config.upfront_fee_period = v,
 			Self::RateAdjustmentCooldown(v) => config.rate_adjustment_cooldown = v,
 			Self::RedistributionPenalty(v) => config.redistribution_penalty = v,
+			Self::CeilingGap(v) => config.ceiling_gap = v,
+			Self::CeilingTtl(v) => config.ceiling_ttl = v,
+		}
+	}
+
+	/// Admin tier required to apply this update. The risk parameters an
+	/// `Emergency` admin may tighten are `Emergency`-gated; the rest are
+	/// `Full`-only.
+	pub fn required_level(&self) -> AdminLevel {
+		match self {
+			Self::MinimumCollateralizationRatio(_) |
+			Self::InitialCollateralizationRatio(_) |
+			Self::SafetyCollateralizationRatio(_) |
+			Self::DebtCeiling(_) |
+			Self::BorrowRateBounds { .. } => AdminLevel::Emergency,
+			Self::MinimumDebt(_) |
+			Self::MinimumCollateral(_) |
+			Self::UpfrontFeePeriod(_) |
+			Self::RateAdjustmentCooldown(_) |
+			Self::RedistributionPenalty(_) |
+			Self::CeilingGap(_) |
+			Self::CeilingTtl(_) => AdminLevel::Full,
+		}
+	}
+
+	/// Whether applying this update to `config` is risk-reducing: raising a
+	/// collateralization floor, lowering the debt ceiling, or narrowing the rate
+	/// band. Only consulted for `Emergency`-tier callers; `Full`-only variants
+	/// (never reached by an `Emergency` admin) report `true`.
+	pub fn is_defensive(&self, config: &BranchConfig<Balance>) -> bool {
+		match self {
+			Self::MinimumCollateralizationRatio(v) => *v >= config.minimum_collateralization_ratio,
+			Self::InitialCollateralizationRatio(v) => *v >= config.initial_collateralization_ratio,
+			Self::SafetyCollateralizationRatio(v) => *v >= config.safety_collateralization_ratio,
+			Self::DebtCeiling(v) => *v <= config.debt_ceiling,
+			Self::BorrowRateBounds { min, max } => {
+				*max <= config.maximum_borrow_rate && *min >= config.minimum_borrow_rate
+			},
+			_ => true,
 		}
 	}
 }
 
-/// Manager-origin authorization tier.
+/// Governance envelope a permissionless market's config must sit inside.
 ///
-/// `Full` may register branches and update any parameter. `Defensive` may only
-/// take risk-reducing actions: lower debt ceiling, raise collateralization
-/// thresholds, force `Frozen` mode, or reduce max borrow rate.
+/// Markets sharing a collateral share its risk, so a creator's `Full` autonomy
+/// is bounded by these floors and ceilings — validated at `create_branch` and
+/// on every loosening `set_*`. The per-collateral `GlobalDebtCeiling[C] > 0`
+/// gate (governance's collateral allow-list) is enforced separately on the
+/// borrow path.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
+)]
+pub struct BranchConfigGuard<Balance> {
+	pub min_minimum_collateralization_ratio: FixedU128,
+	pub min_initial_collateralization_ratio: FixedU128,
+	pub min_safety_collateralization_ratio: FixedU128,
+	pub min_minimum_debt: Balance,
+	pub min_minimum_collateral: Balance,
+	pub max_borrow_rate: FixedU128,
+	/// Cap on a market's static `debt_ceiling` (the autoline `line_max`).
+	pub max_branch_line: Balance,
+	/// Cap on the autoline headroom a market may keep above its current debt.
+	/// Bounds how large a single ceiling step can be.
+	pub max_ceiling_gap: Balance,
+	/// Floor on the minimum time between autoline ceiling increases. Bounds how
+	/// fast a market may ratchet its ceiling up.
+	pub min_ceiling_ttl: Millis,
+}
+
+impl<Balance: PartialOrd + Copy + Zero> BranchConfigGuard<Balance> {
+	/// Whether `config` sits within the envelope (ratios at or above the floors,
+	/// rate and line at or below the ceilings). The autoline slow-up floor
+	/// (`min_ceiling_ttl`) only binds when the autoline is enabled (`ceiling_gap > 0`).
+	pub fn permits(&self, config: &BranchConfig<Balance>) -> bool {
+		config.minimum_collateralization_ratio >= self.min_minimum_collateralization_ratio &&
+			config.initial_collateralization_ratio >= self.min_initial_collateralization_ratio &&
+			config.safety_collateralization_ratio >= self.min_safety_collateralization_ratio &&
+			config.minimum_debt >= self.min_minimum_debt &&
+			config.minimum_collateral >= self.min_minimum_collateral &&
+			config.maximum_borrow_rate <= self.max_borrow_rate &&
+			config.debt_ceiling <= self.max_branch_line &&
+			config.ceiling_gap <= self.max_ceiling_gap &&
+			(config.ceiling_gap.is_zero() || config.ceiling_ttl >= self.min_ceiling_ttl)
+	}
+}
+
+/// Per-market admin authorization tier.
+///
+/// `Full` may move any parameter within the [`BranchConfigGuard`] envelope and
+/// remove an empty market. `Emergency` may only take risk-reducing actions:
+/// freeze, raise collateralization thresholds, lower the debt ceiling, or reduce
+/// the max borrow rate.
 #[derive(
 	Encode,
 	Decode,
@@ -508,9 +634,31 @@ impl<Balance> BranchConfigUpdate<Balance> {
 	Eq,
 	Debug,
 )]
-pub enum VaultsManagerLevel {
+pub enum AdminLevel {
 	Full,
-	Defensive,
+	Emergency,
+}
+
+/// The two admin accounts for a market, bundled so the same-typed `full_admin`
+/// and `emergency_admin` cannot be silently swapped at a call site.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
+)]
+pub struct BranchAdmins<AccountId> {
+	/// May move any param within the envelope and remove an empty market.
+	pub full_admin: AccountId,
+	/// May only take risk-reducing actions (freeze, tighten).
+	pub emergency_admin: AccountId,
+}
+
+/// Per-market admin accounts and the refundable creation deposit, stored
+/// together and torn down together by `remove_branch`. `full_admin` may move any
+/// param within the envelope; `emergency_admin` may only freeze or tighten.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
+pub struct BranchAdminInfo<AccountId, Consideration> {
+	pub full_admin: AccountId,
+	pub emergency_admin: AccountId,
+	pub deposit: Option<(AccountId, Consideration)>,
 }
 
 #[cfg(test)]
@@ -536,6 +684,8 @@ mod tests {
 			dormant_redemption_target: None,
 			idle_cursor: None,
 			frozen: None,
+			effective_ceiling: 0,
+			ceiling_last_inc: 0,
 		}
 	}
 

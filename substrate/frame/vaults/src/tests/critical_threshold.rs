@@ -3,6 +3,7 @@ use crate::{
 	pallet::{BranchStates, Vaults},
 	tests::{rate_pct, vault_status},
 };
+use pusd_primitives::BranchModeProvider;
 
 /// Open one vault, then drop the oracle price so the branch enters Safety
 /// mode (TCR ≈ 125.87% — between ICR=120% and Safety=130%).
@@ -15,7 +16,14 @@ fn enter_safety_mode_single_vault() {
 	assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(5, 100)));
 	set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 	// Sanity: `state.frozen` must remain `None`; mode is *derived* from TCR.
-	assert!(!BranchStates::<Test>::get(DOT).expect("branch state").is_frozen());
+	assert!(!BranchStates::<Test>::get(DOT, PUSD).expect("branch state").is_frozen());
+	// Verify the branch really entered Safety mode rather than trusting the
+	// hand-picked price — the mode is derived from live TCR.
+	assert_eq!(
+		<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
+		Some(BranchMode::Safety),
+		"price drop must put the branch in Safety mode"
+	);
 }
 
 // The vault pallet's
@@ -58,10 +66,11 @@ fn safety_mode_blocks_borrow_alone() {
 			crate::Pallet::<Test>::borrow(
 				RuntimeOrigin::signed(1),
 				DOT,
+				PUSD,
 				200,
 				None,
-				1,
-				Position::endpoints_only(),
+				None,
+				Position::endpoints_only()
 			),
 			crate::Error::<Test>::SafetyModeTcrWorsening
 		);
@@ -70,7 +79,10 @@ fn safety_mode_blocks_borrow_alone() {
 
 // In Safety mode, adding *enough* collateral first lifts TCR back above the
 // safety threshold, after which a moderate borrow is allowed because both
-// pre- and post-states sit in Normal mode.
+// pre- and post-states sit in Normal mode. This is exactly the deposit+borrow
+// pairing a user would submit as a single `utility.batch`: applied in order,
+// the deposit lands first and the borrow is then checked against the lifted
+// TCR. (`safety_mode_blocks_borrow_alone` shows the borrow leg fails on its own.)
 #[test]
 fn safety_mode_allows_borrow_after_large_deposit() {
 	build_and_execute(|| {
@@ -78,18 +90,20 @@ fn safety_mode_allows_borrow_after_large_deposit() {
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			1,
-			200,
+			200
 		));
 		// post-deposit TCR ≈ 1200*6.3/5005 ≈ 151%. Now borrow a moderate amount
 		// while staying in Normal mode and well above Safety.
 		assert_ok!(crate::Pallet::<Test>::borrow(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			200,
 			None,
-			1,
-			Position::endpoints_only(),
+			None,
+			Position::endpoints_only()
 		));
 	});
 }
@@ -102,7 +116,13 @@ fn safety_mode_blocks_withdraw_alone() {
 	build_and_execute(|| {
 		enter_safety_mode_single_vault();
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(1), DOT, 1, 1,),
+			crate::Pallet::<Test>::withdraw_collateral(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				1,
+				None
+			),
 			crate::Error::<Test>::SafetyModeTcrWorsening
 		);
 	});
@@ -110,23 +130,26 @@ fn safety_mode_blocks_withdraw_alone() {
 
 // In Safety mode, a withdraw paired with a matching repay is done by repaying
 // first (always allowed — `repay_for` does not enforce mode rules) and then
-// withdrawing. After enough debt is repaid, the branch may exit Safety
-// mode entirely; the subsequent withdraw still passes the per-call TCR check
-// because post_TCR ≥ Safety in Normal mode.
+// withdrawing. This is the `utility.batch([repay, withdraw])` a user submits:
+// applied in order, the repay lifts TCR and the withdraw is then checked against
+// it. After enough debt is repaid the branch may exit Safety mode entirely; the
+// subsequent withdraw still passes the per-call TCR check because post_TCR ≥
+// Safety in Normal mode.
 #[test]
 fn safety_mode_allows_repay_then_withdraw() {
 	build_and_execute(|| {
 		enter_safety_mode_single_vault();
 		// Repay 3000 pUSD: total debt drops from 5005 to ~2005, TCR rises to
 		// 1000*6.3/2005 ≈ 314%. Branch exits Safety mode.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 3_000));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 3_000));
 		// Now withdraw 100 DOT — TCR drops to 900*6.3/2005 ≈ 282%, still in
 		// Normal mode and well above Safety threshold.
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			100,
-			1,
+			None
 		));
 	});
 }
@@ -151,8 +174,9 @@ fn normal_mode_blocks_premature_rate_change_pulling_into_safety() {
 			crate::Pallet::<Test>::change_rate(
 				RuntimeOrigin::signed(1),
 				DOT,
+				PUSD,
 				rate_pct(50, 100),
-				Position::endpoints_only(),
+				Position::endpoints_only()
 			),
 			crate::Error::<Test>::WouldEnterSafetyMode
 		);
@@ -173,8 +197,9 @@ fn safety_mode_blocks_premature_rate_change() {
 			crate::Pallet::<Test>::change_rate(
 				RuntimeOrigin::signed(1),
 				DOT,
+				PUSD,
 				rate_pct(7, 100),
-				Position::endpoints_only(),
+				Position::endpoints_only()
 			),
 			crate::Error::<Test>::SafetyModeTcrWorsening
 		);
@@ -191,12 +216,17 @@ fn safety_mode_allows_post_cooldown_rate_change() {
 		assert_ok!(crate::Pallet::<Test>::change_rate(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			rate_pct(7, 100),
-			Position::endpoints_only(),
+			Position::endpoints_only()
 		));
 	});
 }
 
+// Repaying to zero is always allowed (it improves TCR) and just leaves a husk;
+// the TCR gate is on the *collateral-releasing* `close_vault`. Closing a husk
+// that still holds collateral removes backing and, here, drops the branch into
+// Safety mode → the close reverts with `WouldEnterSafetyMode`.
 #[test]
 fn safety_mode_blocks_close_with_collateral() {
 	build_and_execute(|| {
@@ -204,19 +234,29 @@ fn safety_mode_blocks_close_with_collateral() {
 		assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
 		// Top up acct 2's pUSD so the repay can cover principal + upfront fee.
-		let v = Vaults::<Test>::get(DOT, 2).expect("vault stored");
+		let v = Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault stored");
 		let total = v.debt.principal + v.debt.interest;
-		let _ = <Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
+		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&1,
 			&2,
 			v.debt.interest,
 			frame::traits::tokens::Preservation::Expendable,
-		);
-		// Drop the price; the post-close TCR will be below the safety
-		// threshold, so the auto-close inside repay_for must revert.
+		));
+		// Repay to zero at $10 (Normal mode) — allowed, leaves a Dormant husk
+		// still holding its 1000 DOT.
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, PUSD, 2, total));
+		assert!(vault_status(DOT, 2).is_dormant(), "husk survives the repay");
+		// Now drop the price: releasing the husk's collateral on close would push
+		// post-close TCR below the safety threshold, so the close must revert.
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
+		// The branch is still in Normal mode here (TCR ≈ 252%); it is *releasing* the
+		// husk's collateral on close that would drop TCR into Safety — hence the block.
+		assert_eq!(
+			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
+			Some(BranchMode::Normal),
+		);
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, 2, total),
+			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None),
 			crate::Error::<Test>::WouldEnterSafetyMode
 		);
 	});
@@ -237,23 +277,35 @@ fn safety_mode_allows_close_zero_collateral() {
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
 			RuntimeOrigin::signed(2),
 			DOT,
+			PUSD,
 			residual,
-			2,
+			None
 		));
 		assert_eq!(held(DOT, 2), 0);
-		// Drop into Safety. Closing the empty vault does not change branch
-		// collateral → post_TCR == pre_TCR → allowed.
+		// The vault now holds nothing (zero debt, zero collateral). Emptying it
+		// via `withdraw` leaves a husk — only repay-to-zero auto-closes a
+		// collateral-less vault — so the owner reclaims the row with an explicit
+		// close. Dropping into Safety does not block it: with no collateral to
+		// release, post_TCR == pre_TCR.
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, None));
-		assert!(Vaults::<Test>::get(DOT, 2).is_none());
+		// The branch is now in Safety mode (TCR ≈ 126%, below the 130% threshold); the
+		// close is still allowed because it releases no collateral (post_TCR == pre_TCR).
+		assert_eq!(
+			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
+			Some(BranchMode::Safety),
+		);
+		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
+		assert!(Vaults::<Test>::get((DOT, PUSD, 2)).is_none());
 	});
 }
 
-// In Safety mode, a vault whose CR has fallen below ICR (e.g., due to a
-// price drop) cannot borrow until enough collateral is deposited to bring
-// the CR back above ICR. A zero-amount borrow still triggers the ICR guard,
-// so we use `borrow(+0)` as a CR-gate-only probe that validates CR without
-// changing debt.
+// A vault whose CR has fallen below ICR (e.g., due to a price drop) cannot
+// borrow until enough collateral is deposited to bring the CR back above ICR.
+// The ICR gate is per-vault and mode-independent — borrowing is only ever
+// allowed down to ICR (see `normal_mode_blocks_borrow_when_cr_below_icr` for the
+// Normal-mode case). A zero-amount borrow still triggers the ICR guard, so we
+// use `borrow(+0)` as a CR-gate-only probe that validates CR without changing
+// debt.
 #[test]
 fn safety_mode_blocks_borrow_when_cr_below_icr() {
 	build_and_execute(|| {
@@ -265,6 +317,11 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 		// Drop price to $2.10: acct 2's CR ≈ 100*2.10/205 ≈ 102.4% — below
 		// MCR 110%, above 100%. Branch TCR also enters Safety mode.
 		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
+		// The price drop puts the branch in Safety mode (TCR ≈ 44%, below 130%).
+		assert_eq!(
+			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
+			Some(BranchMode::Safety),
+		);
 
 		// borrow(+0) revalidates CR without touching debt, so we use it as a
 		// gate-only probe. CR is below ICR → reverts.
@@ -272,10 +329,11 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 			crate::Pallet::<Test>::borrow(
 				RuntimeOrigin::signed(2),
 				DOT,
+				PUSD,
 				0,
 				None,
-				2,
-				Position::endpoints_only(),
+				None,
+				Position::endpoints_only()
 			),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
@@ -285,8 +343,9 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
 			DOT,
+			PUSD,
 			2,
-			100,
+			100
 		));
 		// borrow(+0) now passes the CR gate. The TCR check passes too because
 		// post_TCR == pre_TCR for a zero-amount borrow (Safety-branch allows
@@ -294,18 +353,55 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 		assert_ok!(crate::Pallet::<Test>::borrow(
 			RuntimeOrigin::signed(2),
 			DOT,
+			PUSD,
 			0,
 			None,
-			2,
-			Position::endpoints_only(),
+			None,
+			Position::endpoints_only()
 		));
+	});
+}
+
+// The ICR gate is not a Safety-mode rule: borrowing is only ever allowed down to
+// ICR, in Normal mode too. Here a healthy whale keeps the branch TCR well in
+// Normal mode while acct 2's CR sits below ICR — the `borrow(+0)` CR probe still
+// reverts.
+#[test]
+fn normal_mode_blocks_borrow_when_cr_below_icr() {
+	build_and_execute(|| {
+		register_default_branch();
+		// A large healthy whale dominates branch TCR, keeping it in Normal mode.
+		assert_ok!(open(1, DOT, 100_000, 5_000, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, 100, 200, rate_pct(5, 100)));
+		// Drop price to $2.10: acct 2's CR ≈ 102% (below ICR 120%), but branch
+		// TCR ≈ 100_100*2.10/5205 ≈ 4038% stays firmly in Normal mode.
+		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
+		assert_eq!(
+			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
+			Some(BranchMode::Normal),
+			"whale keeps the branch in Normal mode"
+		);
+		assert_noop!(
+			crate::Pallet::<Test>::borrow(
+				RuntimeOrigin::signed(2),
+				DOT,
+				PUSD,
+				0,
+				None,
+				None,
+				Position::endpoints_only()
+			),
+			crate::Error::<Test>::UnsafeCollateralizationRatio
+		);
 	});
 }
 
 // The withdraw-side analogue of the borrow guard above: a vault below ICR
 // cannot make itself worse via `withdraw_collateral` (the per-call ICR guard
-// fires). Depositing enough collateral to lift branch TCR back above the
-// safety threshold lets a subsequent withdraw pass the Normal-mode gate.
+// fires). Like the borrow gate, this is mode-independent — the Normal-mode case
+// is `borrower_operations::withdraw_breaking_cr_reverts`. Depositing enough
+// collateral to lift branch TCR back above the safety threshold lets a
+// subsequent withdraw pass the Normal-mode gate.
 #[test]
 fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 	build_and_execute(|| {
@@ -313,11 +409,22 @@ fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 		assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, 100, 200, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
+		// The price drop puts the branch in Safety mode (TCR ≈ 44%, below 130%).
+		assert_eq!(
+			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
+			Some(BranchMode::Safety),
+		);
 
 		// Withdrawing any collateral fails because post-CR < ICR (and so does
 		// pre-CR; the per-call gate uses the post-state).
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(2), DOT, 1, 2,),
+			crate::Pallet::<Test>::withdraw_collateral(
+				RuntimeOrigin::signed(2),
+				DOT,
+				PUSD,
+				1,
+				None
+			),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
 
@@ -328,32 +435,42 @@ fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
 			DOT,
+			PUSD,
 			2,
-			3_000,
+			3_000
 		));
 		// Withdraw 1 DOT now — vault 2 CR is huge, branch is in Normal mode
 		// well above Safety, so the per-call gate passes from both directions.
-		assert_ok!(
-			crate::Pallet::<Test>::withdraw_collateral(RuntimeOrigin::signed(2), DOT, 1, 2,)
-		);
+		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
+			RuntimeOrigin::signed(2),
+			DOT,
+			PUSD,
+			1,
+			None
+		));
 	});
 }
 
-// Redemptions are the protocol's settlement mechanism: unlike borrow / withdraw
-// / close / change_rate (gated above), `apply_redemption` is deliberately not
-// subject to the Safety-mode TCR rules, so a redemption settles even while the
-// branch sits in Safety mode.
+// Redemptions are allowed in Safety mode because they always improve branch TCR
+// (they burn pUSD debt and release collateral at par), not because they are
+// "protocol settlement operations". The gated ops (borrow / withdraw / close /
+// change_rate) can worsen TCR; a redemption of a vault with CR > 100% cannot, so
+// it needs no mode gate. The one exception is a FinalRecovery vault with CR <
+// 100%, where a redemption may worsen CR yet is still allowed via pro-rata
+// accounting including the IF's funds (see `final_recovery.rs`).
 #[test]
-fn redemption_proceeds_in_safety_mode() {
+fn redemption_improves_tcr_and_proceeds_in_safety_mode() {
 	build_and_execute(|| {
 		enter_safety_mode_single_vault();
-		let tcr = crate::Pallet::<Test>::branch_tcr(DOT).expect("tcr");
-		assert!(tcr < rate_pct(130, 100), "setup must leave the branch in Safety mode");
+		let tcr_before = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
+		assert!(tcr_before < rate_pct(130, 100), "setup must leave the branch in Safety mode");
 
 		let target = redeem(DOT, 3, 1_000).expect("redemption settles in Safety mode");
 		assert_eq!(target, 1);
-		// The vault kept enough debt to remain Active; the redemption simply went
-		// through despite Safety mode.
+		// The vault kept enough debt to remain Active; the redemption went through
+		// despite Safety mode and strictly improved branch TCR.
 		assert_eq!(vault_status(DOT, 1), crate::types::VaultStatus::Active);
+		let tcr_after = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
+		assert!(tcr_after > tcr_before, "redemption strictly improves branch TCR");
 	});
 }

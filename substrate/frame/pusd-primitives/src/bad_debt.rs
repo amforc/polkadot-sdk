@@ -10,11 +10,21 @@ use frame::deps::{frame_support::pallet_prelude::DispatchResult, sp_runtime::Dis
 /// Insurance Fund as a `fungible::Credit` and hands it here; the
 /// implementation rescinds the underlying pUSD and decrements the branch's
 /// recorded bad debt by the same amount.
-pub trait VaultBadDebtInterface<AssetId, Balance, Credit> {
-	/// Record `amount` of unbacked debt against `collateral_id`.
-	fn record_bad_debt(collateral_id: AssetId, amount: Balance) -> DispatchResult;
+pub trait VaultBadDebtInterface<CollateralId, StableId, Balance, Credit> {
+	/// Record `amount` of unbacked debt against the `(collateral_id, stable_id)`
+	/// market.
+	fn record_bad_debt(
+		collateral_id: CollateralId,
+		stable_id: StableId,
+		amount: Balance,
+	) -> DispatchResult;
 
-	/// Burn up to the recorded bad debt of `collateral_id` from `credit` and
-	/// return the unconsumed surplus (zero when the credit was fully used).
-	fn heal(collateral_id: AssetId, credit: Credit) -> Result<Credit, DispatchError>;
+	/// Burn up to the recorded bad debt of the `(collateral_id, stable_id)`
+	/// market from `credit` and return the unconsumed surplus (zero when the
+	/// credit was fully used). The coin to rescind comes from `credit.asset()`.
+	fn heal(
+		collateral_id: CollateralId,
+		stable_id: StableId,
+		credit: Credit,
+	) -> Result<Credit, DispatchError>;
 }

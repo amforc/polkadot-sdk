@@ -27,7 +27,7 @@ pub use liquidation::{
 };
 pub use oracle::{PriceFeed, ProvidePrice};
 pub use redemption::{RedemptionAllocation, VaultRedemptionInterface};
-pub use registration::OnBranchRegistered;
+pub use registration::OnBranchLifecycle;
 pub use yield_sink::OnBranchYield;
 
 pub const MILLIS_PER_YEAR: u64 = 31_557_600_000;

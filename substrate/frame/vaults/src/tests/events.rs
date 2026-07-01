@@ -14,28 +14,31 @@ fn open_vault_emits_canonical_events() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(10, 100)));
-		assert_event(crate::Event::VaultOpened { collateral_id: DOT, owner: 1 });
+		assert_event(crate::Event::VaultOpened { collateral_id: DOT, stable_id: PUSD, owner: 1 });
 		assert_event(crate::Event::CollateralDeposited {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			from: 1,
 			amount: 1_000,
 		});
 		assert_event(crate::Event::Borrowed {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			recipient: 1,
 			amount: 2_000,
 		});
 		// Upfront fee is non-trivial for these inputs.
 		let predicted_fee =
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, 2_000, rate_pct(10, 100));
+			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100));
 		assert!(predicted_fee > 0);
 		// The charged fee equals the vault's recorded interest; assert the
 		// event carries that amount.
-		let v = crate::pallet::Vaults::<Test>::get(DOT, 1).unwrap();
+		let v = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		assert_event(crate::Event::UpfrontFeeCharged {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			amount: v.debt.interest,
 		});
@@ -52,12 +55,14 @@ fn deposit_collateral_emits_collateral_deposited() {
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
 			DOT,
+			PUSD,
 			1,
-			100,
+			100
 		));
 		// `from` is the caller (acct 2), `owner` is the vault owner (acct 1).
 		assert_event(crate::Event::CollateralDeposited {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			from: 2,
 			amount: 100,
@@ -70,16 +75,19 @@ fn borrow_emits_borrowed() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(5, 100)));
+		// `None` recipient defaults to the owner; the emitted event confirms it.
 		assert_ok!(crate::Pallet::<Test>::borrow(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			500,
 			None,
-			1,
-			Position::endpoints_only(),
+			None,
+			Position::endpoints_only()
 		));
 		assert_event(crate::Event::Borrowed {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			recipient: 1,
 			amount: 500,
@@ -92,14 +100,17 @@ fn withdraw_collateral_emits_collateral_withdrawn() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 3_000, 500, rate_pct(5, 100)));
+		// `None` recipient defaults to the owner; the emitted event confirms it.
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			100,
-			1,
+			None
 		));
 		assert_event(crate::Event::CollateralWithdrawn {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			recipient: 1,
 			amount: 100,
@@ -112,8 +123,14 @@ fn repay_emits_repaid() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 1_000, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, 1, 200));
-		assert_event(crate::Event::Repaid { collateral_id: DOT, owner: 1, from: 1, amount: 200 });
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 200));
+		assert_event(crate::Event::Repaid {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			from: 1,
+			amount: 200,
+		});
 	});
 }
 
@@ -128,11 +145,13 @@ fn change_rate_emits_borrow_rate_changed() {
 		assert_ok!(crate::Pallet::<Test>::change_rate(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			rate_pct(7, 100),
-			Position::endpoints_only(),
+			Position::endpoints_only()
 		));
 		assert_event(crate::Event::BorrowRateChanged {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			old_rate: rate_pct(5, 100),
 			new_rate: rate_pct(7, 100),
@@ -147,23 +166,26 @@ fn premature_change_rate_emits_upfront_fee_charged() {
 		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(5, 100)));
 		// Within the cooldown window — fee charged.
 		advance_time(12 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, 1));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
 		let predicted =
-			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, 1, rate_pct(7, 100));
+			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(7, 100));
 		assert!(predicted > 0);
 		assert_ok!(crate::Pallet::<Test>::change_rate(
 			RuntimeOrigin::signed(1),
 			DOT,
+			PUSD,
 			rate_pct(7, 100),
-			Position::endpoints_only(),
+			Position::endpoints_only()
 		));
 		assert_event(crate::Event::UpfrontFeeCharged {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			amount: predicted,
 		});
 		assert_event(crate::Event::BorrowRateChanged {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			old_rate: rate_pct(5, 100),
 			new_rate: rate_pct(7, 100),
@@ -178,18 +200,15 @@ fn poke_emits_interest_accrued() {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(50, 100)));
 		advance_time(7 * 24 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, 1));
-		// We don't pin the magnitude (it depends on the upfront fee period
-		// and rate), but we assert that *some* InterestAccrued event for
-		// this vault landed in the log.
-		let saw = System::events().into_iter().any(|e| {
-			matches!(
-				e.event,
-				RuntimeEvent::Vaults(crate::Event::InterestAccrued { collateral_id, owner, .. })
-					if collateral_id == DOT && owner == 1
-			)
-		});
-		assert!(saw, "expected an InterestAccrued event on poke");
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
+		// Exact magnitude: 7 days at 50% on 2_000 principal accrues
+		// floor(2_000 * 0.5 * 7days / year) = 19 (interest is on principal, not the fee).
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::InterestAccrued {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			amount: 19,
+		}));
 	});
 }
 
@@ -224,7 +243,7 @@ fn redemption_emits_vault_redeemed() {
 fn register_branch_emits_branch_registered() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_event(crate::Event::BranchRegistered { collateral_id: DOT });
+		assert_event(crate::Event::BranchRegistered { collateral_id: DOT, stable_id: PUSD });
 	});
 }
 
@@ -233,7 +252,11 @@ fn register_branch_emits_branch_registered() {
 fn enable_frozen_mode_emits_mode_changed() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT));
+		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD
+		));
 		// Branch starts in Normal mode (no debt yet, TCR is treated as
 		// infinity); after enable_frozen_mode it transitions to Frozen.
 		let saw = System::events().into_iter().any(|e| {
@@ -254,12 +277,14 @@ fn set_parameter_emits_parameter_updated() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(crate::Pallet::<Test>::set_minimum_collateralization_ratio(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			FixedU128::from_rational(115u128, 100u128),
+			PUSD,
+			FixedU128::from_rational(115u128, 100u128)
 		));
 		assert_event(crate::Event::ParameterUpdated {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			update: crate::types::BranchConfigUpdate::MinimumCollateralizationRatio(
 				FixedU128::from_rational(115u128, 100u128),
 			),
@@ -273,15 +298,21 @@ fn set_parameter_emits_parameter_updated() {
 fn set_debt_ceiling_emits_parameter_updated() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(
-			crate::Pallet::<Test>::set_debt_ceiling(RuntimeOrigin::root(), DOT, 50_000_000,)
-		);
+		assert_ok!(crate::Pallet::<Test>::set_debt_ceiling(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			50_000_000
+		));
 		assert_event(crate::Event::ParameterUpdated {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			update: crate::types::BranchConfigUpdate::DebtCeiling(50_000_000),
 		});
 		assert_eq!(
-			crate::pallet::BranchConfigs::<Test>::get(DOT).expect("config").debt_ceiling,
+			crate::pallet::BranchConfigs::<Test>::get((DOT, PUSD))
+				.expect("config")
+				.debt_ceiling,
 			50_000_000
 		);
 	});
@@ -295,10 +326,20 @@ fn enter_final_recovery_emits_status_change_and_fifo_entry() {
 		// Single vault that we'll push into FinalRecovery via a price drop.
 		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(2u128, 100u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(2), DOT, 1,));
-		assert_event(crate::Event::FinalRecoveryEntered { collateral_id: DOT, owner: 1 });
+		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
+			RuntimeOrigin::signed(2),
+			DOT,
+			PUSD,
+			1
+		));
+		assert_event(crate::Event::FinalRecoveryEntered {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+		});
 		assert_event(crate::Event::VaultStatusChanged {
 			collateral_id: DOT,
+			stable_id: PUSD,
 			owner: 1,
 			old_status: crate::types::VaultStatus::Active,
 			new_status: crate::types::VaultStatus::FinalRecovery,

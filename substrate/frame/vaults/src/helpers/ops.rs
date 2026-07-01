@@ -1,17 +1,67 @@
 use super::*;
 
+/// Enforce the per-collateral global debt ceiling. Every market on the collateral
+/// contributes its full outstanding stable liability — principal, minted interest,
+/// pending redistribution principal, and socialized bad debt — except that the
+/// borrowing market's `principal` is taken at its post-borrow value `principal_after`.
+/// The total, valued in the collateral's unit at `price`, must not exceed
+/// `GlobalDebtCeiling[collateral]` — the systemic backstop a single market's
+/// per-branch ceiling cannot see.
+fn ensure_global_ceiling<T: Config>(
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
+	principal_after: BalanceOf<T>,
+	price: FixedU128,
+) -> Result<(), DispatchError> {
+	let mut total = BalanceOf::<T>::zero();
+	for (s, state) in BranchStates::<T>::iter_prefix(collateral_id) {
+		total = total.saturating_add(state.debt.outstanding());
+		if &s == stable_id {
+			// The stored principal is pre-borrow; replace it with the post-borrow value.
+			total = total.saturating_sub(state.debt.principal).saturating_add(principal_after);
+		}
+	}
+	let collateral_debt = math::value_in_collateral::<BalanceOf<T>>(total, price)
+		.ok_or(Error::<T>::ArithmeticOverflow)?;
+	ensure!(
+		collateral_debt <= GlobalDebtCeiling::<T>::get(collateral_id),
+		Error::<T>::GlobalDebtCeilingExceeded
+	);
+	Ok(())
+}
+
+/// Enforce every borrow-admissibility ceiling for a market whose principal would
+/// become `principal_after`: the static per-market `debt_ceiling`, the autoline
+/// `effective_ceiling` (only when the autoline is enabled), and the
+/// per-collateral global ceiling. Shared by `open_vault` and `borrow`.
+fn ensure_within_ceilings<T: Config>(
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
+	state: &BranchState<T::AccountId, BalanceOf<T>>,
+	config: &BranchConfig<BalanceOf<T>>,
+	principal_after: BalanceOf<T>,
+	price: FixedU128,
+) -> Result<(), DispatchError> {
+	ensure!(principal_after <= config.debt_ceiling, Error::<T>::DebtCeilingExceeded);
+	if !config.ceiling_gap.is_zero() {
+		ensure!(principal_after <= state.effective_ceiling, Error::<T>::DebtCeilingExceeded);
+	}
+	ensure_global_ceiling::<T>(collateral_id, stable_id, principal_after, price)
+}
+
 pub fn open_vault<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	initial_collateral: BalanceOf<T>,
 	initial_debt: BalanceOf<T>,
 	annual_rate: FixedU128,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	ensure!(
-		!Vaults::<T>::contains_key(&context.collateral_id, &owner),
+		!Vaults::<T>::contains_key((&context.collateral_id, &context.stable_id, &owner)),
 		Error::<T>::VaultAlreadyExists
 	);
 	let config = context.config()?;
@@ -20,10 +70,14 @@ pub fn open_vault<T: Config>(
 	validate_rate::<T>(&config, annual_rate)?;
 	let price = context.price()?;
 
-	ensure!(
-		context.state.debt.principal.saturating_add(initial_debt) <= config.debt_ceiling,
-		Error::<T>::DebtCeilingExceeded
-	);
+	ensure_within_ceilings::<T>(
+		&context.collateral_id,
+		&context.stable_id,
+		&context.state,
+		&config,
+		context.state.debt.principal.saturating_add(initial_debt),
+		price,
+	)?;
 
 	let upfront_fee = open_upfront_fee::<T>(&context.state, &config, initial_debt, annual_rate);
 
@@ -51,7 +105,7 @@ pub fn open_vault<T: Config>(
 		&owner,
 		initial_collateral,
 	)?;
-	T::StableAsset::mint_into(&owner, initial_debt)?;
+	T::StableAssets::mint_into(context.stable_id.clone(), &owner, initial_debt)?;
 	context.charge_upfront_fee(&owner, upfront_fee);
 
 	T::VaultLists::insert(context.rate_list(), owner.clone(), annual_rate, hint)
@@ -59,18 +113,21 @@ pub fn open_vault<T: Config>(
 
 	Pallet::<T>::deposit_event(Event::Borrowed {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		recipient: owner.clone(),
 		amount: initial_debt,
 	});
 	Pallet::<T>::deposit_event(Event::CollateralDeposited {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		from: owner.clone(),
 		amount: initial_collateral,
 	});
 	Pallet::<T>::deposit_event(Event::VaultOpened {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 	});
 	context.commit_with_vault(&owner, &vault);
@@ -81,10 +138,11 @@ pub fn open_vault<T: Config>(
 pub fn deposit_collateral_for<T: Config>(
 	from: T::AccountId,
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	amount: BalanceOf<T>,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let TouchedVault { mut vault, status } = context.touch(&owner)?;
 	ensure!(!status.is_dormant(), Error::<T>::DebtBelowMinimum);
@@ -111,6 +169,7 @@ pub fn deposit_collateral_for<T: Config>(
 
 	Pallet::<T>::deposit_event(Event::CollateralDeposited {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		from,
 		amount,
@@ -121,11 +180,12 @@ pub fn deposit_collateral_for<T: Config>(
 
 pub fn withdraw_collateral<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	amount: BalanceOf<T>,
 	recipient: T::AccountId,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let price = context.price()?;
 	let TouchedVault { mut vault, status } = context.touch(&owner)?;
@@ -165,6 +225,7 @@ pub fn withdraw_collateral<T: Config>(
 	vault.collateral = new_collateral;
 	Pallet::<T>::deposit_event(Event::CollateralWithdrawn {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		recipient,
 		amount,
@@ -175,13 +236,14 @@ pub fn withdraw_collateral<T: Config>(
 
 pub fn borrow<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	amount: BalanceOf<T>,
 	maybe_new_rate: Option<FixedU128>,
 	recipient: T::AccountId,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let price = context.price()?;
 	let TouchedVault { mut vault, status: pre_status } = context.touch(&owner)?;
@@ -193,10 +255,14 @@ pub fn borrow<T: Config>(
 	validate_rate::<T>(&config, new_rate)?;
 
 	let new_ib_debt = vault.debt.principal.saturating_add(amount);
-	ensure!(
-		context.state.debt.principal.saturating_add(amount) <= config.debt_ceiling,
-		Error::<T>::DebtCeilingExceeded
-	);
+	ensure_within_ceilings::<T>(
+		&context.collateral_id,
+		&context.stable_id,
+		&context.state,
+		&config,
+		context.state.debt.principal.saturating_add(amount),
+		price,
+	)?;
 
 	let cooldown_elapsed = vault.cooldown_elapsed(&config, context.now);
 	let rate_change_fee_base = vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
@@ -228,7 +294,7 @@ pub fn borrow<T: Config>(
 		context.state.release_dormant_target(&owner);
 	}
 
-	T::StableAsset::mint_into(&recipient, amount)?;
+	T::StableAssets::mint_into(context.stable_id.clone(), &recipient, amount)?;
 	context.charge_upfront_fee(&owner, upfront_fee);
 
 	if dormant_to_active {
@@ -236,6 +302,7 @@ pub fn borrow<T: Config>(
 			.map_err(map_error::<T>)?;
 		Pallet::<T>::deposit_event(Event::VaultStatusChanged {
 			collateral_id: context.collateral_id.clone(),
+			stable_id: context.stable_id.clone(),
 			owner: owner.clone(),
 			old_status: VaultStatus::Dormant,
 			new_status: VaultStatus::Active,
@@ -248,6 +315,7 @@ pub fn borrow<T: Config>(
 	if old_rate != new_rate {
 		Pallet::<T>::deposit_event(Event::BorrowRateChanged {
 			collateral_id: context.collateral_id.clone(),
+			stable_id: context.stable_id.clone(),
 			owner: owner.clone(),
 			old_rate,
 			new_rate,
@@ -255,6 +323,7 @@ pub fn borrow<T: Config>(
 	}
 	Pallet::<T>::deposit_event(Event::Borrowed {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		recipient,
 		amount,
@@ -266,10 +335,11 @@ pub fn borrow<T: Config>(
 pub fn repay_for<T: Config>(
 	from: T::AccountId,
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	amount: BalanceOf<T>,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let TouchedVault { mut vault, status: pre_status } = context.touch(&owner)?;
 	ensure!(!pre_status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
@@ -278,7 +348,8 @@ pub fn repay_for<T: Config>(
 
 	// Cap overpayment at the touched debt.
 	let repay = amount.min(vault.debt.total());
-	T::StableAsset::burn_from(
+	T::StableAssets::burn_from(
+		context.stable_id.clone(),
 		&from,
 		repay,
 		Preservation::Expendable,
@@ -295,25 +366,44 @@ pub fn repay_for<T: Config>(
 	}
 
 	if new_total.is_zero() {
-		let price = context.price()?;
 		Pallet::<T>::deposit_event(Event::Repaid {
 			collateral_id: context.collateral_id.clone(),
+			stable_id: context.stable_id.clone(),
 			owner: owner.clone(),
 			from,
 			amount: repay,
 		});
-		close_inner::<T>(
-			context,
-			CloseRequest {
-				owner: &owner,
-				recipient: &owner,
-				vault: &vault,
-				config: &config,
-				status: pre_status,
-				price,
-				maybe_payment: Some((payment, vault.annual_rate)),
-			},
-		)?;
+		// A vault with no collateral left to reclaim (a fully-redeemed husk) is
+		// closed outright — there is nothing to keep it open for.
+		if vault.collateral.is_zero() {
+			let price = context.price()?;
+			close_inner::<T>(
+				context,
+				CloseRequest {
+					owner: &owner,
+					recipient: &owner,
+					vault: &vault,
+					config: &config,
+					status: pre_status,
+					price,
+					maybe_payment: Some((payment, vault.annual_rate)),
+				},
+			)?;
+			return Ok(());
+		}
+		// Repaying to zero does not close the vault: the collateral stays held and
+		// the row survives as a zero-debt Dormant husk (mirroring a redeem-to-zero).
+		// The owner reclaims collateral with an explicit `close_vault`. Keeping the
+		// vault open lets debt be repaid in Safety mode purely to improve branch TCR.
+		context
+			.state
+			.apply_debt_payment(payment, vault.annual_rate, vault.debt.principal);
+		context.state.release_dormant_target(&owner);
+		if pre_status.is_active() {
+			T::VaultLists::remove(&context.rate_list(), &owner)
+				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
+		}
+		context.commit_with_vault(&owner, &vault);
 		return Ok(());
 	}
 
@@ -322,6 +412,7 @@ pub fn repay_for<T: Config>(
 		.apply_debt_payment(payment, vault.annual_rate, vault.debt.principal);
 	Pallet::<T>::deposit_event(Event::Repaid {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		from,
 		amount: repay,
@@ -332,11 +423,12 @@ pub fn repay_for<T: Config>(
 
 pub fn change_rate<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	new_rate: FixedU128,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let TouchedVault { mut vault, status } = context.touch(&owner)?;
 	ensure!(status.is_active(), Error::<T>::InvalidVaultStatus);
@@ -366,6 +458,7 @@ pub fn change_rate<T: Config>(
 		.map_err(map_error::<T>)?;
 	Pallet::<T>::deposit_event(Event::BorrowRateChanged {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		old_rate,
 		new_rate,
@@ -376,11 +469,12 @@ pub fn change_rate<T: Config>(
 
 pub fn close_vault<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	recipient: Option<T::AccountId>,
 ) -> Result<(), DispatchError> {
 	let recipient = recipient.unwrap_or(owner.clone());
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let price = context.price()?;
 	let TouchedVault { vault, status } = context.touch(&owner)?;
@@ -411,8 +505,8 @@ struct CloseRequest<'a, T: Config> {
 	config: &'a BranchConfig<BalanceOf<T>>,
 	status: VaultStatus,
 	price: FixedU128,
-	/// `Some` when an overpaying repay closes the vault: the payment to fold
-	/// into the branch aggregates and the rate it was charged at.
+	/// `Some` when a repay-to-zero closes an empty (no-collateral) vault: the
+	/// payment to fold into the branch aggregates and the rate it was charged at.
 	maybe_payment: Option<(DebtPayment<BalanceOf<T>>, FixedU128)>,
 }
 
@@ -464,7 +558,7 @@ fn close_inner<T: Config>(
 				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		},
 		VaultStatus::FinalRecovery => {
-			recovery::remove::<T>(&context.collateral_id, owner)?;
+			recovery::remove::<T>(&context.collateral_id, &context.stable_id, owner)?;
 		},
 		VaultStatus::Dormant => {},
 	}
@@ -472,11 +566,13 @@ fn close_inner<T: Config>(
 	if !orphan_debt.is_zero() {
 		Pallet::<T>::deposit_event(Event::BadDebtRecorded {
 			collateral_id: context.collateral_id.clone(),
+			stable_id: context.stable_id.clone(),
 			amount: orphan_debt,
 		});
 	}
 	Pallet::<T>::deposit_event(Event::VaultClosed {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		recipient: recipient.clone(),
 	});
@@ -486,16 +582,18 @@ fn close_inner<T: Config>(
 
 pub fn poke<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 ) -> Result<(), DispatchError> {
-	OpContext::<T>::refresh(collateral_id, &owner)
+	OpContext::<T>::refresh(collateral_id, stable_id, &owner)
 }
 
 pub fn enter_final_recovery<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let price = context.price()?;
 	let TouchedVault { mut vault, status } = context.touch(&owner)?;
@@ -519,10 +617,16 @@ pub fn enter_final_recovery<T: Config>(
 		BalanceOf::<T>::zero(),
 	);
 	vault.redistribution_stake = BalanceOf::<T>::zero();
-	recovery::append::<T>(&mut context.state, &context.collateral_id, owner.clone())?;
+	recovery::append::<T>(
+		&mut context.state,
+		&context.collateral_id,
+		&context.stable_id,
+		owner.clone(),
+	)?;
 
 	Pallet::<T>::deposit_event(Event::VaultStatusChanged {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		old_status: VaultStatus::Active,
 		new_status: VaultStatus::FinalRecovery,
@@ -534,10 +638,11 @@ pub fn enter_final_recovery<T: Config>(
 /// Explicit `FinalRecovery` exit. Rejoins the rate index only above `MinimumDebt`.
 pub fn exit_final_recovery<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let price = context.price()?;
 	let TouchedVault { mut vault, status } = context.touch(&owner)?;
@@ -551,7 +656,7 @@ pub fn exit_final_recovery<T: Config>(
 	let rejoin_active = total_debt >= config.minimum_debt;
 	let new_status = if rejoin_active { VaultStatus::Active } else { VaultStatus::Dormant };
 
-	recovery::remove::<T>(&context.collateral_id, &owner)?;
+	recovery::remove::<T>(&context.collateral_id, &context.stable_id, &owner)?;
 	vault.redistribution_stake = collateral;
 	vault.redistribution_snapshot = context.state.redistribution;
 	context
@@ -569,6 +674,7 @@ pub fn exit_final_recovery<T: Config>(
 	}
 	Pallet::<T>::deposit_event(Event::VaultStatusChanged {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		old_status: VaultStatus::FinalRecovery,
 		new_status,
@@ -580,10 +686,11 @@ pub fn exit_final_recovery<T: Config>(
 /// Permissionless Dormant to Active revival.
 pub fn activate_dormant<T: Config>(
 	owner: T::AccountId,
-	collateral_id: T::AssetId,
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
 	hint: Position<T::AccountId>,
 ) -> Result<(), DispatchError> {
-	let mut context = OpContext::<T>::load(collateral_id)?;
+	let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 	context.ensure_not_frozen()?;
 	let TouchedVault { vault, status } = context.touch(&owner)?;
 	ensure!(status.is_dormant(), Error::<T>::InvalidVaultStatus);
@@ -596,6 +703,7 @@ pub fn activate_dormant<T: Config>(
 
 	Pallet::<T>::deposit_event(Event::VaultStatusChanged {
 		collateral_id: context.collateral_id.clone(),
+		stable_id: context.stable_id.clone(),
 		owner: owner.clone(),
 		old_status: VaultStatus::Dormant,
 		new_status: VaultStatus::Active,
@@ -612,31 +720,37 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 	}
 	let mut consumed = Weight::zero();
 	let mut budget = T::MaxOnIdleVaultRefresh::get();
-	let touch_one = |collateral_id: &T::AssetId, owner: &T::AccountId| -> bool {
-		if !Vaults::<T>::contains_key(collateral_id, owner) {
+	let touch_one = |collateral_id: &T::CollateralAssetId,
+	                 stable_id: &T::StableAssetId,
+	                 owner: &T::AccountId|
+	 -> bool {
+		if !Vaults::<T>::contains_key((collateral_id, stable_id, owner)) {
 			return true;
 		}
 		let _ = with_storage_layer::<(), DispatchError, _>(|| {
-			OpContext::<T>::refresh(collateral_id.clone(), owner)
+			OpContext::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
 		});
 		true
 	};
-	for collateral_id in BranchConfigs::<T>::iter_keys() {
+	for (collateral_id, stable_id) in BranchConfigs::<T>::iter_keys() {
 		let collateral_id = &collateral_id;
+		let stable_id = &stable_id;
 		if budget == 0 || (remaining.saturating_sub(consumed)).any_lt(per_call) {
 			break;
 		}
-		let _ = with_storage_layer::<(), DispatchError, _>(|| refresh_branch::<T>(collateral_id));
-		let Some(branch) = BranchStates::<T>::get(collateral_id) else { continue };
-		let rate_list = VaultListId::Rate(collateral_id.clone());
+		let _ = with_storage_layer::<(), DispatchError, _>(|| {
+			refresh_branch::<T>(collateral_id, stable_id)
+		});
+		let Some(branch) = BranchStates::<T>::get(collateral_id, stable_id) else { continue };
+		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 		let initial_cursor = branch.idle_cursor.or_else(|| T::VaultLists::head(&rate_list));
 		let mut cursor = initial_cursor.clone();
-		let final_recovery_head = recovery::next_target::<T>(collateral_id);
+		let final_recovery_head = recovery::next_target::<T>(collateral_id, stable_id);
 		let dormant_target = branch.dormant_redemption_target;
 
 		while budget > 0 {
 			let Some(owner) = cursor.clone() else { break };
-			if !touch_one(collateral_id, &owner) {
+			if !touch_one(collateral_id, stable_id, &owner) {
 				break;
 			}
 			cursor = T::VaultLists::neighbors(&rate_list, &owner).and_then(|p| p.next);
@@ -651,7 +765,7 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 			if *budget == 0 || (remaining.saturating_sub(*consumed)).any_lt(per_call) {
 				return;
 			}
-			if touch_one(collateral_id, &owner) {
+			if touch_one(collateral_id, stable_id, &owner) {
 				*budget = budget.saturating_sub(1);
 				*consumed = consumed.saturating_add(per_call);
 			}
@@ -664,7 +778,7 @@ pub fn on_idle_walk<T: Config>(remaining: Weight) -> Weight {
 		}
 
 		if cursor != initial_cursor {
-			BranchStates::<T>::mutate(collateral_id, |maybe| {
+			BranchStates::<T>::mutate(collateral_id, stable_id, |maybe| {
 				if let Some(state) = maybe {
 					state.idle_cursor = cursor.take();
 				}

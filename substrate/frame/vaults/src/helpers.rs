@@ -6,14 +6,14 @@
 use crate::{
 	math,
 	pallet::{
-		BalanceOf, BranchConfigs, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet,
-		Vaults,
+		BalanceOf, BranchAdmin, BranchConfigs, BranchStates, Config, Error, Event,
+		GlobalDebtCeiling, HoldReason, Millis, Pallet, Vaults,
 	},
 	recovery,
 	types::{
-		BranchConfig, BranchDebt, BranchMode, BranchStakes, BranchState, DebtPayment, FrozenReason,
-		FrozenState, InterestClock, RedistributionSnapshot, Vault, VaultDebt, VaultListId,
-		VaultStatus,
+		AdminLevel, BranchAdminInfo, BranchAdmins, BranchConfig, BranchDebt, BranchMode,
+		BranchStakes, BranchState, DebtPayment, FrozenReason, FrozenState, InterestClock,
+		RedistributionSnapshot, Vault, VaultDebt, VaultListId, VaultStatus,
 	},
 	weights::WeightInfo,
 };
@@ -21,14 +21,16 @@ use frame::{
 	deps::frame_support::storage::with_storage_layer,
 	prelude::*,
 	traits::{
-		fungible::{Balanced as FungibleBalanced, Mutate as FungibleMutate},
-		fungibles::MutateHold as FungiblesMutateHold,
-		tokens::{Imbalance, Restriction},
-		Time,
+		fungibles::{
+			Balanced as FungiblesBalanced, Mutate as FungiblesMutate,
+			MutateHold as FungiblesMutateHold,
+		},
+		tokens::Restriction,
+		Consideration, Footprint, Time,
 	},
 };
 use pallet_linked_list::{ListError, Position, SortedListInterface};
-use pusd_primitives::{OnBranchRegistered, ProvidePrice};
+use pusd_primitives::{OnBranchLifecycle, ProvidePrice};
 
 /// Translate a rate-index insert/re-insert failure. A stale user-supplied
 /// hint surfaces as [`Error::InvalidPositionHints`]; every other kind means
@@ -45,16 +47,20 @@ pub(crate) fn map_error<T: Config>(e: ListError) -> Error<T> {
 
 /// Read the branch state, returning `UnknownCollateral` when missing.
 pub(crate) fn branch_state_of<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 ) -> Result<BranchState<T::AccountId, BalanceOf<T>>, DispatchError> {
-	BranchStates::<T>::get(collateral_id).ok_or_else(|| Error::<T>::UnknownCollateral.into())
+	BranchStates::<T>::get(collateral_id, stable_id)
+		.ok_or_else(|| Error::<T>::UnknownCollateral.into())
 }
 
 /// Read the branch config, returning `UnknownCollateral` when missing.
 pub(crate) fn branch_config_of<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 ) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
-	BranchConfigs::<T>::get(collateral_id).ok_or_else(|| Error::<T>::UnknownCollateral.into())
+	BranchConfigs::<T>::get((collateral_id, stable_id))
+		.ok_or_else(|| Error::<T>::UnknownCollateral.into())
 }
 
 fn ratio<T: Config>(
@@ -109,10 +115,12 @@ pub(crate) fn ensure_at_or_above_mcr<T: Config>(
 
 /// Read a vault row, returning `VaultNotFound` when missing.
 pub(crate) fn vault_of<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 ) -> Result<Vault<BalanceOf<T>>, DispatchError> {
-	Vaults::<T>::get(collateral_id, owner).ok_or_else(|| Error::<T>::VaultNotFound.into())
+	Vaults::<T>::get((collateral_id, stable_id, owner))
+		.ok_or_else(|| Error::<T>::VaultNotFound.into())
 }
 
 impl<Balance> Vault<Balance> {
@@ -123,13 +131,20 @@ impl<Balance> Vault<Balance> {
 	/// of existence.
 	pub(crate) fn status<T: Config>(
 		&self,
-		collateral_id: &T::AssetId,
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
 		owner: &T::AccountId,
 	) -> VaultStatus {
-		if T::VaultLists::contains(&VaultListId::Rate(collateral_id.clone()), owner) {
+		if T::VaultLists::contains(
+			&VaultListId::Rate(collateral_id.clone(), stable_id.clone()),
+			owner,
+		) {
 			return VaultStatus::Active;
 		}
-		if T::VaultLists::contains(&VaultListId::FinalRecovery(collateral_id.clone()), owner) {
+		if T::VaultLists::contains(
+			&VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone()),
+			owner,
+		) {
 			return VaultStatus::FinalRecovery;
 		}
 		VaultStatus::Dormant
@@ -171,8 +186,9 @@ mod views;
 pub(crate) use accounting::{compute_tcr, open_upfront_fee, pending_touch_for};
 use accounting::{simulate_borrow, simulate_change_rate};
 pub(crate) use branch::{
-	clear_governance_frozen_mode, current_mode, enable_frozen_mode, enforce_mode_rules,
-	refresh_branch, register_branch, update_branch_config, validate_rate,
+	clear_governance_frozen_mode, create_branch, current_mode, enable_frozen_mode,
+	enforce_mode_rules, ensure_branch_admin, poke_ceiling, refresh_branch, remove_branch,
+	set_param, validate_rate,
 };
 pub(crate) use context::{OpContext, TouchedVault};
 pub(crate) use ops::{

@@ -59,12 +59,13 @@ pub struct FrozenState {
 	pub entered_at: u64,
 }
 
-/// Read-only hook letting other pUSD pallets observe a branch's mode without
-/// depending on `pallet-vaults` directly. Returns `None` for unknown branches.
-pub trait BranchModeProvider<AssetId> {
-	fn mode(collateral_id: &AssetId) -> Option<BranchMode>;
+/// Read-only hook letting other pUSD pallets observe a market's mode without
+/// depending on `pallet-vaults` directly. A market is one stablecoin against one
+/// collateral. Returns `None` for unknown markets.
+pub trait BranchModeProvider<CollateralId, StableId> {
+	fn mode(collateral_id: &CollateralId, stable_id: &StableId) -> Option<BranchMode>;
 
-	fn is_registered(collateral_id: &AssetId) -> bool {
-		Self::mode(collateral_id).is_some()
+	fn is_registered(collateral_id: &CollateralId, stable_id: &StableId) -> bool {
+		Self::mode(collateral_id, stable_id).is_some()
 	}
 }

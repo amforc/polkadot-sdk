@@ -60,16 +60,18 @@ pub(super) enum YieldSource {
 /// Issue `amount` pUSD and route per `SpYieldShare`: a portion goes to
 /// `T::SpYieldSink`, the residual goes to `T::FeeHandler`.
 pub(super) fn mint_and_route_yield<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	amount: BalanceOf<T>,
 	source: YieldSource,
 ) {
-	let credit = T::StableAsset::issue(amount);
+	let credit = T::StableAssets::issue(stable_id.clone(), amount);
 	let share: Permill = T::SpYieldShare::get();
 	let sp_amount = share * credit.peek();
 	let (sp_credit, residual) = credit.split(sp_amount);
-	if let Err(e) = <T::SpYieldSink as pusd_primitives::OnBranchYield<_, _>>::on_branch_yield(
+	if let Err(e) = <T::SpYieldSink as pusd_primitives::OnBranchYield<_, _, _>>::on_branch_yield(
 		collateral_id.clone(),
+		stable_id.clone(),
 		sp_credit,
 	) {
 		crate::log!(error, "SpYieldSink rejected {:?}: {:?}", source, e);
