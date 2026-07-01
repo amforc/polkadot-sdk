@@ -70,9 +70,7 @@ fn assert_accounting_identity_holds() {
 // After a redistribute-everything liquidation, the branch's
 // `debt.weighted_principal_sum` must reflect the economic debt at the recipient's
 // actual rate — total economic debt × recipient rate — not the redistributed
-// principal carried at rate=1.0. The `≈` in the assertion is pure ceil/floor
-// rounding: per-stake accounting floors, so `weighted_sum` lands within a few
-// base units of the ideal, which the tight `<= 3` bound pins.
+// principal carried at rate=1.0.
 #[test]
 fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 	build_and_execute(|| {
@@ -285,8 +283,7 @@ fn final_recovery_exit_requires_explicit_hint() {
 }
 
 // `OffsetAllocation` carries a `recipient` AccountId, and `finalize_liquidation`
-// moves `offset.collateral` to that recipient rather than leaking it back to the
-// liquidatee.
+// moves `offset.collateral` to that recipient.
 #[test]
 fn finalize_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 	build_and_execute(|| {
