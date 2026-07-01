@@ -15,8 +15,8 @@ use frame::{
 	benchmarking::prelude::*,
 	deps::{
 		frame_support::traits::{
-			fungible::Mutate as FungibleMutate, fungibles::MutateHold as FungiblesMutateHold,
-			EnsureOrigin,
+			fungibles::{Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold},
+			EnsureOrigin, EnsureOriginWithArg,
 		},
 		sp_runtime::{
 			traits::{SaturatedConversion, Zero},
@@ -29,6 +29,8 @@ use pallet_linked_list::{Position, SortedListInterface};
 use pusd_primitives::{RedemptionAllocation, VaultRedemptionInterface};
 
 const ORACLE_PRICE: u128 = 10;
+/// High per-collateral global ceiling so the systemic cap never binds in benches.
+const GLOBAL_CEILING: u128 = 1_000_000_000_000_000;
 const ACCOUNT_FUNDING: u128 = 10_000_000;
 const SEED_COLL: u128 = 1_000_000;
 /// Must exceed `default_branch_config::minimum_debt` (200).
@@ -45,6 +47,10 @@ const REDIST_PER_STAKE_DEN: u128 = 100;
 const REDIST_WEIGHT_PER_STAKE_NUM: u128 = 1;
 const REDIST_WEIGHT_PER_STAKE_DEN: u128 = 10_000;
 const REDIST_PRESTAGE_COLL: u128 = 10_000_000;
+
+fn stable<T: Config>() -> T::StableAssetId {
+	T::BenchmarkHelper::stable_asset_id()
+}
 
 fn balance<T: Config>(value: u128) -> BalanceOf<T> {
 	value.saturated_into()
@@ -68,29 +74,59 @@ fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
 		upfront_fee_period: 7 * DAY_MS,
 		rate_adjustment_cooldown: DAY_MS,
 		redistribution_penalty: Permill::from_percent(5),
+		ceiling_gap: balance::<T>(0),
+		ceiling_ttl: 0,
 	}
 }
 
-fn manager_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {
-	T::ManagerOrigin::try_successful_origin()
-		.map_err(|_| BenchmarkError::Stop("manager origin unavailable"))
+/// The full and emergency admins every benchmarked market is created with.
+fn branch_admins<T: Config>() -> (T::AccountId, T::AccountId) {
+	(account("full_admin", 0, 0), account("emergency_admin", 0, 0))
 }
 
-fn register_default_branch<T: Config>() -> Result<T::AssetId, BenchmarkError> {
+/// A successful `CreateOrigin` for the default stablecoin — Root (deposit-free)
+/// in both the mock and the node runtime.
+fn create_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {
+	T::CreateOrigin::try_successful_origin(&stable::<T>())
+		.map_err(|_| BenchmarkError::Stop("create origin unavailable"))
+}
+
+/// Signed origin of a benchmarked market's full admin.
+fn full_admin_origin<T: Config>() -> T::RuntimeOrigin {
+	RawOrigin::Signed(branch_admins::<T>().0).into()
+}
+
+fn global_manager_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {
+	T::GlobalManagerOrigin::try_successful_origin()
+		.map_err(|_| BenchmarkError::Stop("global manager origin unavailable"))
+}
+
+fn register_default_branch<T: Config>() -> Result<T::CollateralAssetId, BenchmarkError> {
 	let asset = T::BenchmarkHelper::collateral_asset_id();
-	Pallet::<T>::register_branch(
-		manager_origin::<T>()?,
-		asset.clone(),
-		default_branch_config::<T>(),
-	)?;
+	// `create_branch` validates the oracle price, so set it first.
 	T::BenchmarkHelper::set_oracle_price(
 		asset.clone(),
+		stable::<T>(),
 		FixedU128::saturating_from_integer(ORACLE_PRICE),
 	);
+	let (full_admin, emergency_admin) = branch_admins::<T>();
+	Pallet::<T>::create_branch(
+		create_origin::<T>()?,
+		asset.clone(),
+		stable::<T>(),
+		full_admin,
+		emergency_admin,
+		default_branch_config::<T>(),
+	)?;
+	Pallet::<T>::set_global_debt_ceiling(
+		global_manager_origin::<T>()?,
+		asset.clone(),
+		balance::<T>(GLOBAL_CEILING),
+	)?;
 	Ok(asset)
 }
 
-fn funded_account<T: Config>(seed: &'static str, asset: &T::AssetId) -> T::AccountId {
+fn funded_account<T: Config>(seed: &'static str, asset: &T::CollateralAssetId) -> T::AccountId {
 	let who: T::AccountId = account(seed, 0, 0);
 	T::BenchmarkHelper::mint_collateral(asset.clone(), &who, balance::<T>(ACCOUNT_FUNDING));
 	who
@@ -111,8 +147,8 @@ struct RateBounds {
 	middle: FixedU128,
 }
 
-fn rate_bounds<T: Config>(asset: &T::AssetId) -> Result<RateBounds, BenchmarkError> {
-	let config = helpers::branch_config_of::<T>(asset)
+fn rate_bounds<T: Config>(asset: &T::CollateralAssetId) -> Result<RateBounds, BenchmarkError> {
+	let config = helpers::branch_config_of::<T>(asset, &stable::<T>())
 		.map_err(|_| BenchmarkError::Stop("missing branch config"))?;
 	let count = T::VaultLists::repair_budget().saturating_add(2);
 	let safety_floor = config
@@ -147,7 +183,7 @@ fn rate_bounds<T: Config>(asset: &T::AssetId) -> Result<RateBounds, BenchmarkErr
 /// `find_position` to keep seeding O(count) — independent of the
 /// hint-repair budget. Returns owners in head→tail order.
 fn seed_worst_case_chain<T: Config>(
-	asset: &T::AssetId,
+	asset: &T::CollateralAssetId,
 ) -> Result<Vec<T::AccountId>, BenchmarkError> {
 	let count = T::VaultLists::repair_budget().saturating_add(2);
 	let mut owners = Vec::with_capacity(count as usize);
@@ -157,10 +193,12 @@ fn seed_worst_case_chain<T: Config>(
 		let r = bounds.base.saturating_sub(offset);
 		let who: T::AccountId = account("seed", i, 0);
 		T::BenchmarkHelper::mint_collateral(asset.clone(), &who, balance::<T>(ACCOUNT_FUNDING));
-		let hint = T::VaultLists::find_position(&VaultListId::Rate(asset.clone()), r);
+		let hint =
+			T::VaultLists::find_position(&VaultListId::Rate(asset.clone(), stable::<T>()), r);
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(who.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT),
 			r,
@@ -188,11 +226,13 @@ fn worst_case_head_hint<T: Config>(
 /// Plant a non-trivial branch redistribution snapshot so every vault touch
 /// enters the `snap != redistribution` branch with non-zero `redistribution_collateral` and
 /// `redistribution_debt_principal`.
-fn seed_pending_redistribution<T: Config>(asset: &T::AssetId) -> Result<(), BenchmarkError> {
+fn seed_pending_redistribution<T: Config>(
+	asset: &T::CollateralAssetId,
+) -> Result<(), BenchmarkError> {
 	let per_stake = rate(REDIST_PER_STAKE_NUM, REDIST_PER_STAKE_DEN);
 	let weight_per_stake = rate(REDIST_WEIGHT_PER_STAKE_NUM, REDIST_WEIGHT_PER_STAKE_DEN);
 
-	let redistribution_account_id = Pallet::<T>::redistribution_account();
+	let redistribution_account_id = Pallet::<T>::redistribution_account(asset, &stable::<T>());
 	let pre_stage = balance::<T>(REDIST_PRESTAGE_COLL);
 	T::BenchmarkHelper::mint_collateral(asset.clone(), &redistribution_account_id, pre_stage);
 	T::CollateralAssets::hold(
@@ -203,7 +243,7 @@ fn seed_pending_redistribution<T: Config>(asset: &T::AssetId) -> Result<(), Benc
 	)
 	.map_err(|_| BenchmarkError::Stop("hold on redistribution account failed"))?;
 
-	BranchStates::<T>::try_mutate(asset, |maybe| -> Result<(), BenchmarkError> {
+	BranchStates::<T>::try_mutate(asset, &stable::<T>(), |maybe| -> Result<(), BenchmarkError> {
 		let state = maybe.as_mut().ok_or(BenchmarkError::Stop("branch missing"))?;
 		state.redistribution.debt_per_stake = per_stake;
 		state.redistribution.collateral_per_stake = per_stake;
@@ -220,13 +260,14 @@ fn seed_pending_redistribution<T: Config>(asset: &T::AssetId) -> Result<(), Benc
 /// then restore the oracle.
 fn recovery_cycle<T: Config>(
 	seed_index: u32,
-	asset: &T::AssetId,
+	asset: &T::CollateralAssetId,
 ) -> Result<T::AccountId, BenchmarkError> {
 	let owner: T::AccountId = account("rec", seed_index, 0);
 	T::BenchmarkHelper::mint_collateral(asset.clone(), &owner, balance::<T>(ACCOUNT_FUNDING));
 	Pallet::<T>::open_vault(
 		RawOrigin::Signed(owner.clone()).into(),
 		asset.clone(),
+		stable::<T>(),
 		balance::<T>(RECOVERY_VAULT_COLL),
 		balance::<T>(SEED_DEBT),
 		rate(5, 100),
@@ -234,16 +275,19 @@ fn recovery_cycle<T: Config>(
 	)?;
 	T::BenchmarkHelper::set_oracle_price(
 		asset.clone(),
+		stable::<T>(),
 		FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
 	);
 	let keeper: T::AccountId = whitelisted_caller();
 	Pallet::<T>::enter_final_recovery(
 		RawOrigin::Signed(keeper).into(),
 		asset.clone(),
+		stable::<T>(),
 		owner.clone(),
 	)?;
 	T::BenchmarkHelper::set_oracle_price(
 		asset.clone(),
+		stable::<T>(),
 		FixedU128::saturating_from_integer(ORACLE_PRICE),
 	);
 	Ok(owner)
@@ -253,8 +297,8 @@ fn prefill_branches<T: Config>(count: u32) {
 	// The registry is the `BranchConfigs` key set, and its counted variant tracks
 	// the capacity gate, so seeding configs is enough to fill the registry.
 	for seed in 0..count {
-		let asset = T::BenchmarkHelper::synth_asset_id(seed);
-		BranchConfigs::<T>::insert(asset, default_branch_config::<T>());
+		let (collateral, stable) = T::BenchmarkHelper::synth_market(seed);
+		BranchConfigs::<T>::insert((collateral, stable), default_branch_config::<T>());
 	}
 }
 
@@ -274,9 +318,17 @@ mod benchmarks {
 		let new_rate = rate_bounds::<T>(&asset)?.above;
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller.clone()), asset.clone(), collateral, debt, new_rate, hint);
+		_(
+			RawOrigin::Signed(caller.clone()),
+			asset.clone(),
+			stable::<T>(),
+			collateral,
+			debt,
+			new_rate,
+			hint,
+		);
 
-		assert!(Vaults::<T>::contains_key(&asset, &caller));
+		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &caller)));
 		Ok(())
 	}
 
@@ -287,6 +339,7 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(owner.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT),
 			rate(5, 100),
@@ -298,9 +351,9 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), owner.clone(), deposit);
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), deposit);
 
-		assert!(Vaults::<T>::contains_key(&asset, &owner));
+		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)));
 		Ok(())
 	}
 
@@ -312,6 +365,7 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(caller.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			initial_coll,
 			balance::<T>(SEED_DEBT),
 			rate(5, 100),
@@ -322,9 +376,15 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller.clone()), asset.clone(), withdraw, caller.clone());
+		_(
+			RawOrigin::Signed(caller.clone()),
+			asset.clone(),
+			stable::<T>(),
+			withdraw,
+			Some(caller.clone()),
+		);
 
-		assert!(Vaults::<T>::contains_key(&asset, &caller));
+		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &caller)));
 		Ok(())
 	}
 
@@ -335,11 +395,14 @@ mod benchmarks {
 		let bounds = rate_bounds::<T>(&asset)?;
 		let caller = funded_account::<T>("caller", &asset);
 		let caller_rate = bounds.middle;
-		let caller_hint =
-			T::VaultLists::find_position(&VaultListId::Rate(asset.clone()), caller_rate);
+		let caller_hint = T::VaultLists::find_position(
+			&VaultListId::Rate(asset.clone(), stable::<T>()),
+			caller_rate,
+		);
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(caller.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL * 10),
 			balance::<T>(SEED_DEBT),
 			caller_rate,
@@ -355,13 +418,14 @@ mod benchmarks {
 		_(
 			RawOrigin::Signed(caller.clone()),
 			asset.clone(),
+			stable::<T>(),
 			extra_debt,
 			new_rate,
-			caller.clone(),
+			Some(caller.clone()),
 			hint,
 		);
 
-		assert!(Vaults::<T>::contains_key(&asset, &caller));
+		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &caller)));
 		Ok(())
 	}
 
@@ -372,22 +436,23 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(owner.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT * 10),
 			rate(5, 100),
 			Position::endpoints_only(),
 		)?;
 		let caller: T::AccountId = whitelisted_caller();
-		T::StableAsset::mint_into(&caller, balance::<T>(SEED_DEBT * 100))
+		T::StableAssets::mint_into(stable::<T>(), &caller, balance::<T>(SEED_DEBT * 100))
 			.expect("mint pUSD to repay caller");
 		let amount = balance::<T>(SEED_DEBT);
 		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), owner.clone(), amount);
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), amount);
 
-		assert!(Vaults::<T>::contains_key(&asset, &owner));
+		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)));
 		Ok(())
 	}
 
@@ -398,11 +463,14 @@ mod benchmarks {
 		let bounds = rate_bounds::<T>(&asset)?;
 		let caller = funded_account::<T>("caller", &asset);
 		let caller_rate = bounds.middle;
-		let caller_hint =
-			T::VaultLists::find_position(&VaultListId::Rate(asset.clone()), caller_rate);
+		let caller_hint = T::VaultLists::find_position(
+			&VaultListId::Rate(asset.clone(), stable::<T>()),
+			caller_rate,
+		);
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(caller.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL * 10),
 			balance::<T>(SEED_DEBT),
 			caller_rate,
@@ -414,9 +482,9 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller.clone()), asset.clone(), new_rate, hint);
+		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), new_rate, hint);
 
-		assert!(Vaults::<T>::contains_key(&asset, &caller));
+		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &caller)));
 		Ok(())
 	}
 
@@ -430,6 +498,7 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(background.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT),
 			rate(5, 100),
@@ -439,24 +508,32 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(caller.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT),
 			rate(5, 100),
 			Position::endpoints_only(),
 		)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
-		// `close_vault` requires zero debt and a full repayment auto-closes in
-		// `repay_for`, so the only state this extrinsic can act on is the
-		// Dormant husk a full redemption leaves behind: zero debt, row intact,
-		// collateral still held, out of the rate index.
+		// `close_vault` requires zero debt. Clearing debt (via a full repayment or,
+		// as here, a full redemption) leaves a Dormant husk — zero debt, row
+		// intact, collateral still held, out of the rate index — which is the
+		// state this extrinsic acts on.
 		let total_debt = <Pallet<T> as VaultRedemptionInterface<
 			T::AccountId,
-			T::AssetId,
+			T::CollateralAssetId,
+			T::StableAssetId,
 			BalanceOf<T>,
-		>>::touch_for_redemption(asset.clone(), caller.clone())?;
+		>>::touch_for_redemption(asset.clone(), stable::<T>(), caller.clone())?;
 		let redeemer: T::AccountId = whitelisted_caller();
-		<Pallet<T> as VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>>::apply_redemption(
+		<Pallet<T> as VaultRedemptionInterface<
+			T::AccountId,
+			T::CollateralAssetId,
+			T::StableAssetId,
+			BalanceOf<T>,
+		>>::apply_redemption(
 			asset.clone(),
+			stable::<T>(),
 			caller.clone(),
 			redeemer,
 			RedemptionAllocation {
@@ -467,9 +544,9 @@ mod benchmarks {
 		)?;
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller.clone()), asset.clone(), None);
+		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), None);
 
-		assert!(!Vaults::<T>::contains_key(&asset, &caller));
+		assert!(!Vaults::<T>::contains_key((&asset, &stable::<T>(), &caller)));
 		Ok(())
 	}
 
@@ -480,6 +557,7 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(owner.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT),
 			rate(5, 100),
@@ -490,9 +568,9 @@ mod benchmarks {
 		let caller: T::AccountId = whitelisted_caller();
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), owner.clone());
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone());
 
-		assert!(Vaults::<T>::contains_key(&asset, &owner));
+		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)));
 		Ok(())
 	}
 
@@ -504,6 +582,7 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(owner.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(RECOVERY_VAULT_COLL),
 			balance::<T>(SEED_DEBT),
 			rate(5, 100),
@@ -513,14 +592,18 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 		T::BenchmarkHelper::set_oracle_price(
 			asset.clone(),
+			stable::<T>(),
 			FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
 		);
 		let caller: T::AccountId = whitelisted_caller();
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), owner.clone());
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone());
 
-		assert_eq!(Pallet::<T>::vault_status(asset, owner), Some(VaultStatus::FinalRecovery));
+		assert_eq!(
+			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
+			Some(VaultStatus::FinalRecovery)
+		);
 		Ok(())
 	}
 
@@ -537,9 +620,12 @@ mod benchmarks {
 		let hint = worst_case_head_hint::<T>(&seeds)?;
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), owner.clone(), hint);
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), hint);
 
-		assert_eq!(Pallet::<T>::vault_status(asset, owner), Some(VaultStatus::Active));
+		assert_eq!(
+			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
+			Some(VaultStatus::Active)
+		);
 		Ok(())
 	}
 
@@ -551,6 +637,7 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(background).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT),
 			rate(5, 100),
@@ -561,6 +648,7 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(owner.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT),
 			owner_rate,
@@ -570,13 +658,20 @@ mod benchmarks {
 		// Dormant vault outside the rate index.
 		let total_debt = <Pallet<T> as VaultRedemptionInterface<
 			T::AccountId,
-			T::AssetId,
+			T::CollateralAssetId,
+			T::StableAssetId,
 			BalanceOf<T>,
-		>>::touch_for_redemption(asset.clone(), owner.clone())?;
+		>>::touch_for_redemption(asset.clone(), stable::<T>(), owner.clone())?;
 		let remaining = balance::<T>(199);
 		let redeemer: T::AccountId = whitelisted_caller();
-		<Pallet<T> as VaultRedemptionInterface<T::AccountId, T::AssetId, BalanceOf<T>>>::apply_redemption(
+		<Pallet<T> as VaultRedemptionInterface<
+			T::AccountId,
+			T::CollateralAssetId,
+			T::StableAssetId,
+			BalanceOf<T>,
+		>>::apply_redemption(
 			asset.clone(),
+			stable::<T>(),
 			owner.clone(),
 			redeemer,
 			RedemptionAllocation {
@@ -586,19 +681,25 @@ mod benchmarks {
 			},
 		)?;
 		assert_eq!(
-			Pallet::<T>::vault_status(asset.clone(), owner.clone()),
+			Pallet::<T>::vault_status(asset.clone(), stable::<T>(), owner.clone()),
 			Some(VaultStatus::Dormant)
 		);
 		// Accrue interest until the fully-accrued debt is back at/above
 		// `minimum_debt`, so the vault is activation-eligible.
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS.saturating_mul(24 * 365 * 2));
-		let hint = T::VaultLists::find_position(&VaultListId::Rate(asset.clone()), owner_rate);
+		let hint = T::VaultLists::find_position(
+			&VaultListId::Rate(asset.clone(), stable::<T>()),
+			owner_rate,
+		);
 		let caller: T::AccountId = whitelisted_caller();
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), owner.clone(), hint);
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), hint);
 
-		assert_eq!(Pallet::<T>::vault_status(asset, owner), Some(VaultStatus::Active));
+		assert_eq!(
+			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
+			Some(VaultStatus::Active)
+		);
 		Ok(())
 	}
 
@@ -608,23 +709,29 @@ mod benchmarks {
 		prefill_branches::<T>(prefill);
 		let asset = T::BenchmarkHelper::collateral_asset_id();
 		let config = default_branch_config::<T>();
-		let origin = manager_origin::<T>()?;
+		let (full_admin, emergency_admin) = branch_admins::<T>();
+		T::BenchmarkHelper::set_oracle_price(
+			asset.clone(),
+			stable::<T>(),
+			FixedU128::saturating_from_integer(ORACLE_PRICE),
+		);
+		let origin = create_origin::<T>()?;
 
 		#[extrinsic_call]
-		_(origin, asset.clone(), config);
+		create_branch(origin, asset.clone(), stable::<T>(), full_admin, emergency_admin, config);
 
-		assert!(BranchStates::<T>::contains_key(&asset));
+		assert!(BranchStates::<T>::contains_key(&asset, &stable::<T>()));
 		Ok(())
 	}
 
 	#[benchmark]
 	fn set_param() -> Result<(), BenchmarkError> {
 		let asset = register_default_branch::<T>()?;
-		let origin = manager_origin::<T>()?;
+		let origin = full_admin_origin::<T>();
 		let new_value = rate(150, 100);
 
 		#[extrinsic_call]
-		set_minimum_collateralization_ratio(origin, asset, new_value);
+		set_minimum_collateralization_ratio(origin, asset, stable::<T>(), new_value);
 
 		Ok(())
 	}
@@ -632,12 +739,13 @@ mod benchmarks {
 	#[benchmark]
 	fn enable_frozen_mode() -> Result<(), BenchmarkError> {
 		let asset = register_default_branch::<T>()?;
-		let origin = manager_origin::<T>()?;
+		let origin = full_admin_origin::<T>();
 
 		#[extrinsic_call]
-		_(origin, asset.clone());
+		_(origin, asset.clone(), stable::<T>());
 
-		let state = BranchStates::<T>::get(&asset).expect("branch state present after register");
+		let state = BranchStates::<T>::get(&asset, &stable::<T>())
+			.expect("branch state present after register");
 		assert!(state.frozen.is_some());
 		Ok(())
 	}
@@ -649,6 +757,7 @@ mod benchmarks {
 		Pallet::<T>::open_vault(
 			RawOrigin::Signed(owner.clone()).into(),
 			asset.clone(),
+			stable::<T>(),
 			balance::<T>(SEED_COLL),
 			balance::<T>(SEED_DEBT),
 			rate(5, 100),
@@ -659,13 +768,17 @@ mod benchmarks {
 
 		#[block]
 		{
-			if Vaults::<T>::contains_key(&asset, &owner) {
-				let _ = crate::helpers::OpContext::<T>::refresh(asset.clone(), &owner);
-				let _ = T::VaultLists::neighbors(&VaultListId::Rate(asset.clone()), &owner);
+			if Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)) {
+				let _ =
+					crate::helpers::OpContext::<T>::refresh(asset.clone(), stable::<T>(), &owner);
+				let _ = T::VaultLists::neighbors(
+					&VaultListId::Rate(asset.clone(), stable::<T>()),
+					&owner,
+				);
 			}
 		}
 
-		assert!(Vaults::<T>::contains_key(&asset, &owner));
+		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)));
 		Ok(())
 	}
 

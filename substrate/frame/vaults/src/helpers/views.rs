@@ -1,18 +1,20 @@
 use super::*;
 
 pub fn view_vault_status<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 ) -> Option<VaultStatus> {
-	let vault = Vaults::<T>::get(collateral_id, owner)?;
-	Some(vault.status::<T>(collateral_id, owner))
+	let vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
+	Some(vault.status::<T>(collateral_id, stable_id, owner))
 }
 pub fn view_vault_cr<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 ) -> Option<FixedU128> {
-	let vault = Vaults::<T>::get(collateral_id, owner)?;
-	let state = BranchStates::<T>::get(collateral_id)?;
+	let vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
+	let state = BranchStates::<T>::get(collateral_id, stable_id)?;
 	let now = T::TimeProvider::now();
 	let price = T::Oracle::provide_price(collateral_id).ok()?.price;
 	let pending = pending_touch_for::<T>(&vault, &state, now);
@@ -25,8 +27,11 @@ pub fn view_vault_cr<T: Config>(
 	math::collateralization_ratio::<BalanceOf<T>>(total_coll, total_debt, price)
 }
 
-pub fn view_branch_tcr<T: Config>(collateral_id: &T::AssetId) -> Option<FixedU128> {
-	let state = BranchStates::<T>::get(collateral_id)?;
+pub fn view_branch_tcr<T: Config>(
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
+) -> Option<FixedU128> {
+	let state = BranchStates::<T>::get(collateral_id, stable_id)?;
 	let price = T::Oracle::provide_price(collateral_id).ok()?.price;
 	let now = T::TimeProvider::now();
 	compute_tcr::<T>(&state, price, now).ok()
@@ -36,7 +41,9 @@ pub fn view_branch_tcr<T: Config>(collateral_id: &T::AssetId) -> Option<FixedU12
 /// order as [`SortedListInterface::iter_from_tail`], but every storage read is
 /// deferred until the iterator advances, so a caller taking only the head pays
 /// for only the tail read.
-fn list_from_tail<T: Config>(list: VaultListId<T::AssetId>) -> impl Iterator<Item = T::AccountId> {
+fn list_from_tail<T: Config>(
+	list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
+) -> impl Iterator<Item = T::AccountId> {
 	let mut started = false;
 	let mut cursor: Option<T::AccountId> = None;
 	core::iter::from_fn(move || {
@@ -56,15 +63,17 @@ fn list_from_tail<T: Config>(list: VaultListId<T::AssetId>) -> impl Iterator<Ite
 /// index tail-first. Lazy and allocation-free: `.next()` gives the next target
 /// and `take(n)` the queue view, reading only the tiers they reach.
 pub(crate) fn redemption_targets<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 ) -> impl Iterator<Item = T::AccountId> {
-	let priority = recovery::next_target::<T>(collateral_id).or_else(|| {
-		BranchStates::<T>::get(collateral_id).and_then(|state| state.dormant_redemption_target)
+	let priority = recovery::next_target::<T>(collateral_id, stable_id).or_else(|| {
+		BranchStates::<T>::get(collateral_id, stable_id)
+			.and_then(|state| state.dormant_redemption_target)
 	});
 	// The rate index is walked only when no FinalRecovery/Dormant target gates it.
 	let rate = priority
 		.is_none()
-		.then(|| list_from_tail::<T>(VaultListId::Rate(collateral_id.clone())))
+		.then(|| list_from_tail::<T>(VaultListId::Rate(collateral_id.clone(), stable_id.clone())))
 		.into_iter()
 		.flatten();
 	priority.into_iter().chain(rate)
@@ -74,12 +83,13 @@ pub(crate) fn redemption_targets<T: Config>(
 /// stored priority is strictly below `rate`, visiting at most `max_steps`
 /// vaults. Returns the partial sum when the cap stops the walk early.
 pub fn view_debt_in_front<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	rate: FixedU128,
 	max_steps: u32,
 ) -> BalanceOf<T> {
 	let mut total = BalanceOf::<T>::zero();
-	let rate_list = VaultListId::Rate(collateral_id.clone());
+	let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 	let mut cursor = T::VaultLists::tail(&rate_list);
 	for _ in 0..max_steps {
 		let Some(o) = cursor else { break };
@@ -87,7 +97,7 @@ pub fn view_debt_in_front<T: Config>(
 		if priority >= rate {
 			break;
 		}
-		if let Some(v) = Vaults::<T>::get(collateral_id, &o) {
+		if let Some(v) = Vaults::<T>::get((collateral_id, stable_id, &o)) {
 			total = total.saturating_add(v.debt.principal);
 		}
 		cursor = neighbors.prev;
@@ -96,11 +106,15 @@ pub fn view_debt_in_front<T: Config>(
 }
 
 pub fn predict_upfront_fee_open<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	initial_debt: BalanceOf<T>,
 	annual_rate: FixedU128,
 ) -> BalanceOf<T> {
-	match (BranchConfigs::<T>::get(collateral_id), BranchStates::<T>::get(collateral_id)) {
+	match (
+		BranchConfigs::<T>::get((collateral_id, stable_id)),
+		BranchStates::<T>::get(collateral_id, stable_id),
+	) {
 		(Some(config), Some(state)) => {
 			open_upfront_fee::<T>(&state, &config, initial_debt, annual_rate)
 		},
@@ -109,12 +123,13 @@ pub fn predict_upfront_fee_open<T: Config>(
 }
 
 pub fn predict_upfront_fee_borrow<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 	debt_increase: BalanceOf<T>,
 	maybe_new_rate: Option<FixedU128>,
 ) -> BalanceOf<T> {
-	let Some((config, state, vault)) = predict_inputs::<T>(collateral_id, owner) else {
+	let Some((config, state, vault)) = predict_inputs::<T>(collateral_id, stable_id, owner) else {
 		return BalanceOf::<T>::zero();
 	};
 	let new_rate = maybe_new_rate.unwrap_or(vault.annual_rate);
@@ -125,11 +140,12 @@ pub fn predict_upfront_fee_borrow<T: Config>(
 }
 
 pub fn predict_upfront_fee_rate_change<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 	new_rate: FixedU128,
 ) -> BalanceOf<T> {
-	let Some((config, state, vault)) = predict_inputs::<T>(collateral_id, owner) else {
+	let Some((config, state, vault)) = predict_inputs::<T>(collateral_id, stable_id, owner) else {
 		return BalanceOf::<T>::zero();
 	};
 	let now = T::TimeProvider::now();
@@ -141,7 +157,8 @@ pub fn predict_upfront_fee_rate_change<T: Config>(
 /// Returns `None` if any row is missing — the predict APIs treat that as
 /// "no fee" rather than an error.
 fn predict_inputs<T: Config>(
-	collateral_id: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 ) -> Option<(
 	BranchConfig<BalanceOf<T>>,
@@ -149,8 +166,8 @@ fn predict_inputs<T: Config>(
 	Vault<BalanceOf<T>>,
 )> {
 	Some((
-		BranchConfigs::<T>::get(collateral_id)?,
-		BranchStates::<T>::get(collateral_id)?,
-		Vaults::<T>::get(collateral_id, owner)?,
+		BranchConfigs::<T>::get((collateral_id, stable_id))?,
+		BranchStates::<T>::get(collateral_id, stable_id)?,
+		Vaults::<T>::get((collateral_id, stable_id, owner))?,
 	))
 }

@@ -7,6 +7,7 @@ use crate::{
 	pallet::{BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, Vaults},
 	types::VaultListId,
 };
+use alloc::collections::BTreeMap;
 use frame::{
 	deps::{
 		frame_support::traits::{fungibles::InspectHold, Time},
@@ -20,31 +21,64 @@ use frame::{
 use pallet_linked_list::SortedListInterface;
 
 pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
+	// Owner-hold invariant accumulator: filled per branch inside
+	// `check_branch_identities`' single vault pass, then checked once below.
+	let mut owner_collateral: BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>> =
+		BTreeMap::new();
 	// The `BranchConfigs` key set is the canonical registry (SPEC §4.4).
-	for c in BranchConfigs::<T>::iter_keys() {
-		let c = &c;
-		let rate_list = VaultListId::Rate(c.clone());
-		let recovery_list = VaultListId::FinalRecovery(c.clone());
-		check_branch_identities::<T>(c, &rate_list, &recovery_list)?;
-		if let Some(state) = BranchStates::<T>::get(c) {
+	for (collateral_id, stable_id) in BranchConfigs::<T>::iter_keys() {
+		let (collateral_id, stable_id) = (&collateral_id, &stable_id);
+		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
+		let recovery_list = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
+		check_branch_identities::<T>(
+			collateral_id,
+			stable_id,
+			&rate_list,
+			&recovery_list,
+			&mut owner_collateral,
+		)?;
+		if let Some(state) = BranchStates::<T>::get(collateral_id, stable_id) {
 			let tau = state.interest_time(T::TimeProvider::now());
 			if state.debt.last_interest_time > tau {
 				return Err("branch last_interest_time ahead of interest_time(now)".into());
 			}
-			for (_owner, vault) in Vaults::<T>::iter_prefix(c) {
+			for (_owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
 				if vault.last_interest_time > tau {
 					return Err("vault last_interest_time ahead of interest_time(now)".into());
 				}
 			}
 			// `dormant_redemption_target`, when set, must point at a Dormant vault.
 			if let Some(owner) = state.dormant_redemption_target.clone() {
-				let Some(vault) = Vaults::<T>::get(c, &owner) else {
+				let Some(vault) = Vaults::<T>::get((collateral_id, stable_id, &owner)) else {
 					return Err("dormant_redemption_target points at missing vault".into());
 				};
-				if !vault.status::<T>(c, &owner).is_dormant() {
+				if !vault.status::<T>(collateral_id, stable_id, &owner).is_dormant() {
 					return Err("dormant_redemption_target points at non-Dormant".into());
 				}
 			}
+		}
+	}
+
+	check_owner_holds::<T>(owner_collateral)?;
+	Ok(())
+}
+
+/// Owner-hold invariant: per `(owner, collateral C)`, the owner's
+/// `VaultCollateral` hold on `C` equals the sum of `vault.collateral` across
+/// every stablecoin market on `C`. The sum is accumulated in `check_branch_identities`'
+/// single vault pass; here we only compare it against the on-chain hold. With one
+/// stablecoin per collateral this collapses to a single term.
+fn check_owner_holds<T: Config>(
+	owner_collateral: BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>>,
+) -> Result<(), TryRuntimeError> {
+	for ((collateral_id, owner), sum) in owner_collateral {
+		let held = T::CollateralAssets::balance_on_hold(
+			collateral_id,
+			&HoldReason::VaultCollateral.into(),
+			&owner,
+		);
+		if sum != held {
+			return Err("Σ vault.collateral over a collateral's markets != owner hold".into());
 		}
 	}
 	Ok(())
@@ -53,18 +87,20 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 /// Single pass over `Vaults::<T>::iter_prefix(c)`: per-vault membership
 /// invariants and redistribution accounting sums.
 fn check_branch_identities<T: Config>(
-	c: &T::AssetId,
-	rate_list: &VaultListId<T::AssetId>,
-	recovery_list: &VaultListId<T::AssetId>,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
+	rate_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
+	recovery_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
+	owner_collateral: &mut BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>>,
 ) -> Result<(), TryRuntimeError> {
-	let Some(state) = BranchStates::<T>::get(c) else {
+	let Some(state) = BranchStates::<T>::get(collateral_id, stable_id) else {
 		return Err("registered branch missing BranchState".into());
 	};
 	let cumul_debt_ps = state.redistribution.debt_per_stake;
 	let cumul_collat_ps = state.redistribution.collateral_per_stake;
 
 	let mut sum_stake = BalanceOf::<T>::zero();
-	let mut sum_owner_held = BalanceOf::<T>::zero();
+	let mut sum_market_collateral = BalanceOf::<T>::zero();
 	let mut sum_pending_debt_share = BalanceOf::<T>::zero();
 	let mut sum_pending_collat_share = BalanceOf::<T>::zero();
 	let mut sum_principal = BalanceOf::<T>::zero();
@@ -72,24 +108,19 @@ fn check_branch_identities<T: Config>(
 	let mut sum_weighted_stake = BalanceOf::<T>::zero();
 	let mut n_live_vaults: u128 = 0;
 
-	for (owner, vault) in Vaults::<T>::iter_prefix(c) {
+	for (owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
 		let in_rate_index = T::VaultLists::contains(rate_list, &owner);
 		let in_recovery = T::VaultLists::contains(recovery_list, &owner);
 		if in_rate_index && in_recovery {
 			return Err("vault in both rate index and recovery FIFO".into());
 		}
-		let held = T::CollateralAssets::balance_on_hold(
-			c.clone(),
-			&HoldReason::VaultCollateral.into(),
-			&owner,
-		);
-		// One stablecoin per collateral today, so the row's collateral is the
-		// whole owner hold. The multi-market generalisation relaxes this to
-		// `Σ_stablecoins vault.collateral == held`.
-		if vault.collateral != held {
-			return Err("vault.collateral != held collateral".into());
-		}
-		sum_owner_held = sum_owner_held.saturating_add(held);
+		// The row carries this market's share of the owner's hold; the cross-market
+		// owner-hold invariant (`Σ_stablecoins vault.collateral == hold`) is
+		// accumulated here and checked once, globally, in `do_try_state`.
+		let owner_entry =
+			owner_collateral.entry((collateral_id.clone(), owner.clone())).or_default();
+		*owner_entry = owner_entry.saturating_add(vault.collateral);
+		sum_market_collateral = sum_market_collateral.saturating_add(vault.collateral);
 		// Every row — FinalRecovery included — keeps its debt attached to the
 		// branch aggregates; only the stake is detached while in the FIFO.
 		sum_principal = sum_principal.saturating_add(vault.debt.principal);
@@ -103,8 +134,8 @@ fn check_branch_identities<T: Config>(
 			}
 			continue;
 		}
-		if vault.redistribution_stake != held {
-			return Err("vault.redistribution_stake != held collateral".into());
+		if vault.redistribution_stake != vault.collateral {
+			return Err("vault.redistribution_stake != vault.collateral".into());
 		}
 		sum_stake = sum_stake.saturating_add(vault.redistribution_stake);
 		let snap = vault.redistribution_snapshot;
@@ -132,7 +163,8 @@ fn check_branch_identities<T: Config>(
 		return Err("stakes.weighted_sum != Σ floor(rate · stake)".into());
 	}
 	check_weighted_principal_sum::<T>(
-		c,
+		collateral_id,
+		stable_id,
 		state.debt.weighted_principal_sum,
 		state
 			.debt
@@ -157,11 +189,11 @@ fn check_branch_identities<T: Config>(
 	}
 
 	let held_redistribution = T::CollateralAssets::balance_on_hold(
-		c.clone(),
+		collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
-		&Pallet::<T>::redistribution_account(),
+		&Pallet::<T>::redistribution_account(collateral_id, stable_id),
 	);
-	let physical = sum_owner_held.saturating_add(held_redistribution);
+	let physical = sum_market_collateral.saturating_add(held_redistribution);
 	if state.total_collateral != physical {
 		return Err("total_collateral != Σ owner-held + redistribution-account hold".into());
 	}
@@ -184,7 +216,8 @@ fn check_branch_identities<T: Config>(
 }
 
 fn check_weighted_principal_sum<T: Config>(
-	c: &T::AssetId,
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
 	weighted_principal_sum: BalanceOf<T>,
 	pending_pool: BalanceOf<T>,
 	sum_weighted_principal: BalanceOf<T>,
@@ -193,7 +226,7 @@ fn check_weighted_principal_sum<T: Config>(
 	if weighted_principal_sum < sum_weighted_principal {
 		return Err("weighted_principal_sum below Σ floor(rate · principal)".into());
 	}
-	let Some(config) = BranchConfigs::<T>::get(c) else {
+	let Some(config) = BranchConfigs::<T>::get((collateral_id, stable_id)) else {
 		return Err("registered branch without config".into());
 	};
 	let rate_bound = config.maximum_borrow_rate.max(FixedU128::one());
