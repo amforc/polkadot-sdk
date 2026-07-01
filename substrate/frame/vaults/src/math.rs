@@ -84,6 +84,26 @@ pub fn collateralization_ratio<Balance: FixedPointOperand>(
 	FixedU128::checked_from_rational(value, debt)
 }
 
+/// Value a stable-denominated `debt` in its collateral's unit: `ceil(debt /
+/// price)`, where `price` is the collateral price in stable units
+/// (stable-per-collateral). Rounds up so the systemic ceiling never undercounts.
+/// Returns `None` on a zero price (undefined) or on overflow.
+pub fn value_in_collateral<Balance: FixedPointOperand>(
+	debt: Balance,
+	price: FixedU128,
+) -> Option<Balance> {
+	if debt.is_zero() {
+		return Some(Balance::zero());
+	}
+	if price.is_zero() {
+		return None;
+	}
+	let d: u128 = debt.unique_saturated_into();
+	// debt / price == debt * DIV / price.into_inner().
+	multiply_by_rational_with_rounding(d, FixedU128::DIV, price.into_inner(), Rounding::Up)
+		.and_then(|raw| Balance::try_from(raw).ok())
+}
+
 /// `ceil(weighted_sum / total_ib_debt)` reinterpreted as a `FixedU128`
 /// fraction. Returns `One` if `total_ib_debt` is zero, which keeps the
 /// upfront-fee formula safe in branches with no pre-existing debt (the new

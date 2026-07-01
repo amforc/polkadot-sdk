@@ -388,7 +388,7 @@ parameter_types! {
 
 impl pallet_linked_list::Config for Runtime {
 	type WeightInfo = ();
-	type ListId = pallet_vaults::VaultListId<VaultsCollateralId>;
+	type ListId = pallet_vaults::VaultListId<VaultsCollateralId, VaultsStableId>;
 	type ItemId = AccountId;
 	type Priority = FixedU128;
 	type MaxHintRepairSteps = LinkedListMaxHintRepairSteps;
@@ -3223,6 +3223,24 @@ parameter_types! {
 	pub const VaultsNativePriceFeedId: u32 = u32::MAX;
 	pub const VaultsOraclePriceMaxAge: Moment =
 		if cfg!(feature = "runtime-benchmarks") { Moment::MAX } else { 60 * 60 * 1_000 };
+	pub const VaultsMarketCreationHoldReason: RuntimeHoldReason =
+		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::MarketCreationDeposit);
+	pub const VaultsMarketCreationDeposit: Balance = 100 * DOLLARS;
+	/// Governance envelope every permissionlessly-created market config must sit
+	/// inside: floors on the collateralization ratios and minimums, caps on the
+	/// borrow rate and the static debt line.
+	pub VaultsBranchConfigGuard: pallet_vaults::types::BranchConfigGuard<Balance> =
+		pallet_vaults::types::BranchConfigGuard {
+			min_minimum_collateralization_ratio: FixedU128::from_rational(105, 100),
+			min_initial_collateralization_ratio: FixedU128::from_rational(110, 100),
+			min_safety_collateralization_ratio: FixedU128::from_rational(120, 100),
+			min_minimum_debt: 10 * DOLLARS,
+			min_minimum_collateral: 1,
+			max_borrow_rate: FixedU128::from_rational(400, 100),
+			max_branch_line: 1_000_000_000 * DOLLARS,
+			max_ceiling_gap: 100_000_000 * DOLLARS,
+			min_ceiling_ttl: 24 * 60 * 60 * 1_000,
+		};
 }
 
 pub type VaultsCollateralId = NativeOrWithId<u32>;
@@ -3237,7 +3255,7 @@ fn vaults_oracle_key(collateral_id: &VaultsCollateralId) -> u32 {
 pub type VaultsCollateral =
 	UnionOf<Balances, AssetsHolder, NativeFromLeft, VaultsCollateralId, AccountId>;
 
-pub type VaultsStableAsset = ItemOf<Assets, PsmStablecoinAssetId, AccountId>;
+pub type VaultsStableId = u32;
 
 /// Bridges `pallet-oracle` (u32 → u128) to the vault pallet's `ProvidePrice`
 /// surface. The oracle value is interpreted as a `FixedU128` inner
@@ -3265,38 +3283,62 @@ impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
 	}
 }
 
-/// Root-only manager origin for the vaults pallet — Root resolves to the
-/// `Full` privilege tier; every other origin is rejected.
-pub struct EnsureVaultsManager;
-impl frame_support::traits::EnsureOrigin<RuntimeOrigin> for EnsureVaultsManager {
-	type Success = pallet_vaults::VaultsManagerLevel;
+/// `CreateOrigin` for permissionless market creation. Root creates deposit-free
+/// (`None`); the stablecoin asset's owner creates with a refundable deposit
+/// (`Some(who)`); every other origin is rejected.
+pub struct VaultsCreateOrigin;
+impl EnsureOriginWithArg<RuntimeOrigin, VaultsStableId> for VaultsCreateOrigin {
+	type Success = Option<AccountId>;
 
-	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
+	fn try_origin(
+		o: RuntimeOrigin,
+		stable_id: &VaultsStableId,
+	) -> Result<Self::Success, RuntimeOrigin> {
+		use frame_support::traits::fungibles::roles::Inspect as RolesInspect;
 		use frame_system::RawOrigin;
 		match o.clone().into() {
-			Ok(RawOrigin::Root) => Ok(pallet_vaults::VaultsManagerLevel::Full),
+			Ok(RawOrigin::Root) => Ok(None),
+			Ok(RawOrigin::Signed(who)) => {
+				if <Assets as RolesInspect<AccountId>>::owner(*stable_id) == Some(who.clone()) {
+					Ok(Some(who))
+				} else {
+					Err(o)
+				}
+			},
 			_ => Err(o),
 		}
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]
-	fn try_successful_origin() -> Result<RuntimeOrigin, ()> {
+	fn try_successful_origin(_stable_id: &VaultsStableId) -> Result<RuntimeOrigin, ()> {
 		Ok(RuntimeOrigin::root())
 	}
 }
 
 impl pallet_vaults::Config for Runtime {
 	type RuntimeHoldReason = RuntimeHoldReason;
-	type AssetId = VaultsCollateralId;
+	type CollateralAssetId = VaultsCollateralId;
+	type StableAssetId = VaultsStableId;
+	fn is_same_asset(collateral_id: &VaultsCollateralId, stable_id: &VaultsStableId) -> bool {
+		matches!(collateral_id, NativeOrWithId::WithId(id) if id == stable_id)
+	}
 	type CollateralAssets = VaultsCollateral;
-	type StableAsset = VaultsStableAsset;
+	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
 	type SpYieldSink = ();
 	type SpYieldShare = VaultsSpYieldShare;
 	type FeeHandler = ();
-	type OnBranchRegistered = ();
+	type OnBranchLifecycle = ();
 	type TimeProvider = Timestamp;
-	type ManagerOrigin = EnsureVaultsManager;
+	type CreateOrigin = VaultsCreateOrigin;
+	type Consideration = HoldConsideration<
+		AccountId,
+		Balances,
+		VaultsMarketCreationHoldReason,
+		ConstantStoragePrice<VaultsMarketCreationDeposit, Balance>,
+	>;
+	type BranchConfigGuard = VaultsBranchConfigGuard;
+	type GlobalManagerOrigin = EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type MaxBranches = VaultsMaxBranches;
 	type MaxOnIdleVaultRefresh = VaultsMaxOnIdleVaultRefresh;
@@ -3310,11 +3352,21 @@ impl pallet_vaults::Config for Runtime {
 pub struct VaultsBenchmarkHelper;
 
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, AccountId, Balance>
+impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountId, Balance>
 	for VaultsBenchmarkHelper
 {
 	fn collateral_asset_id() -> VaultsCollateralId {
 		VaultsCollateralId::Native
+	}
+
+	fn stable_asset_id() -> VaultsStableId {
+		PsmStablecoinAssetId::get()
+	}
+
+	fn mint_stable(stable_id: VaultsStableId, who: &AccountId, amount: Balance) {
+		use frame_support::traits::fungibles::Mutate as FungiblesMutate;
+		<Assets as FungiblesMutate<AccountId>>::mint_into(stable_id, who, amount)
+			.expect("mint stable for benchmark account");
 	}
 
 	fn mint_collateral(asset_id: VaultsCollateralId, who: &AccountId, amount: Balance) {
@@ -3333,7 +3385,11 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, AccountId, Balance>
 		};
 	}
 
-	fn set_oracle_price(asset_id: VaultsCollateralId, price: FixedU128) {
+	fn set_oracle_price(
+		asset_id: VaultsCollateralId,
+		_stable_id: VaultsStableId,
+		price: FixedU128,
+	) {
 		let timestamp = <pallet_timestamp::Pallet<Runtime>>::get();
 		pallet_oracle::Values::<Runtime>::insert(
 			vaults_oracle_key(&asset_id),
@@ -3346,8 +3402,8 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, AccountId, Balance>
 		<pallet_timestamp::Pallet<Runtime>>::set_timestamp(now + ms);
 	}
 
-	fn synth_asset_id(seed: u32) -> VaultsCollateralId {
-		VaultsCollateralId::WithId(1_000 + seed)
+	fn synth_market(seed: u32) -> (VaultsCollateralId, VaultsStableId) {
+		(VaultsCollateralId::WithId(1_000 + seed), 20_000 + seed)
 	}
 }
 
