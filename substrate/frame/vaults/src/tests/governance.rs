@@ -1,7 +1,3 @@
-//! Step 6 governance surface: permissionless market creation with a refundable
-//! deposit, per-market admins (full vs emergency), the governance envelope on
-//! config, market removal, and the governance kill switch.
-
 use crate::{
 	mock::*,
 	pallet::{BranchAdmin, BranchConfigs, BranchStates, Vaults},

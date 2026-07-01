@@ -1,7 +1,5 @@
 use crate::{mock::*, tests::rate_pct};
 
-/// Convenience: assert the system event log contains exactly this
-/// `pallet_vaults::Event<Test>` value (wrapped in the runtime event).
 fn assert_event(event: crate::Event<Test>) {
 	System::assert_has_event(RuntimeEvent::Vaults(event));
 }
