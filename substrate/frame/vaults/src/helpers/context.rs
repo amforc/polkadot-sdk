@@ -12,7 +12,8 @@ pub(crate) struct TouchedVault<Balance> {
 
 /// Threads one branch-state read through an operation and commits it once.
 pub(crate) struct OpContext<T: Config> {
-	pub collateral_id: T::AssetId,
+	pub collateral_id: T::CollateralAssetId,
+	pub stable_id: T::StableAssetId,
 	pub now: Millis,
 	pub state: BranchState<T::AccountId, BalanceOf<T>>,
 	pending_interest_mint: BalanceOf<T>,
@@ -24,9 +25,12 @@ pub(crate) struct OpContext<T: Config> {
 
 impl<T: Config> OpContext<T> {
 	/// Read the branch state and accrue aggregate interest in memory.
-	pub fn load(collateral_id: T::AssetId) -> Result<Self, DispatchError> {
+	pub fn load(
+		collateral_id: T::CollateralAssetId,
+		stable_id: T::StableAssetId,
+	) -> Result<Self, DispatchError> {
 		let now = T::TimeProvider::now();
-		let mut state = branch_state_of::<T>(&collateral_id)?;
+		let mut state = branch_state_of::<T>(&collateral_id, &stable_id)?;
 		#[cfg(debug_assertions)]
 		let loaded = state.clone();
 
@@ -34,6 +38,7 @@ impl<T: Config> OpContext<T> {
 
 		Ok(Self {
 			collateral_id,
+			stable_id,
 			now,
 			state,
 			pending_interest_mint,
@@ -45,8 +50,12 @@ impl<T: Config> OpContext<T> {
 	}
 
 	/// Refresh one vault. This is intentionally allowed while frozen.
-	pub fn refresh(collateral_id: T::AssetId, owner: &T::AccountId) -> Result<(), DispatchError> {
-		let mut context = Self::load(collateral_id)?;
+	pub fn refresh(
+		collateral_id: T::CollateralAssetId,
+		stable_id: T::StableAssetId,
+		owner: &T::AccountId,
+	) -> Result<(), DispatchError> {
+		let mut context = Self::load(collateral_id, stable_id)?;
 		let touched = context.touch(owner)?;
 		context.commit_with_vault(owner, &touched.vault);
 		Ok(())
@@ -58,8 +67,8 @@ impl<T: Config> OpContext<T> {
 	}
 
 	/// The branch's rate-index list id.
-	pub fn rate_list(&self) -> VaultListId<T::AssetId> {
-		VaultListId::Rate(self.collateral_id.clone())
+	pub fn rate_list(&self) -> VaultListId<T::CollateralAssetId, T::StableAssetId> {
+		VaultListId::Rate(self.collateral_id.clone(), self.stable_id.clone())
 	}
 
 	/// Oracle price for this context's collateral.
@@ -69,7 +78,7 @@ impl<T: Config> OpContext<T> {
 
 	/// Branch config for this context's collateral.
 	pub fn config(&self) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
-		branch_config_of::<T>(&self.collateral_id)
+		branch_config_of::<T>(&self.collateral_id, &self.stable_id)
 	}
 
 	/// Adopt `next` as the branch state, but only if the TCR mode rules permit
@@ -94,8 +103,8 @@ impl<T: Config> OpContext<T> {
 		&mut self,
 		owner: &T::AccountId,
 	) -> Result<TouchedVault<BalanceOf<T>>, DispatchError> {
-		let mut vault = vault_of::<T>(&self.collateral_id, owner)?;
-		let status = vault.status::<T>(&self.collateral_id, owner);
+		let mut vault = vault_of::<T>(&self.collateral_id, &self.stable_id, owner)?;
+		let status = vault.status::<T>(&self.collateral_id, &self.stable_id, owner);
 		let pending = pending_touch_for::<T>(&vault, &self.state, self.now);
 
 		if !pending.interest.is_zero() {
@@ -134,7 +143,7 @@ impl<T: Config> OpContext<T> {
 			T::CollateralAssets::transfer_on_hold(
 				self.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
-				&Pallet::<T>::redistribution_account(),
+				&Pallet::<T>::redistribution_account(&self.collateral_id, &self.stable_id),
 				owner,
 				pending.collateral,
 				Precision::Exact,
@@ -173,15 +182,15 @@ impl<T: Config> OpContext<T> {
 
 	pub fn commit_with_vault(self, owner: &T::AccountId, vault: &Vault<BalanceOf<T>>) {
 		self.assert_unclobbered();
-		Vaults::<T>::insert(&self.collateral_id, owner, vault);
-		BranchStates::<T>::insert(&self.collateral_id, &self.state);
+		Vaults::<T>::insert((&self.collateral_id, &self.stable_id, owner), vault);
+		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
 		self.finish();
 	}
 
 	pub fn commit_removing_vault(self, owner: &T::AccountId) {
 		self.assert_unclobbered();
-		Vaults::<T>::remove(&self.collateral_id, owner);
-		BranchStates::<T>::insert(&self.collateral_id, &self.state);
+		Vaults::<T>::remove((&self.collateral_id, &self.stable_id, owner));
+		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
 		self.finish();
 	}
 
@@ -190,6 +199,7 @@ impl<T: Config> OpContext<T> {
 		if !self.pending_interest_mint.is_zero() {
 			mint_and_route_yield::<T>(
 				&self.collateral_id,
+				&self.stable_id,
 				self.pending_interest_mint,
 				YieldSource::BranchInterest,
 			);
@@ -197,14 +207,21 @@ impl<T: Config> OpContext<T> {
 		if let Some((owner, amount)) = self.pending_interest_accrued {
 			Pallet::<T>::deposit_event(Event::InterestAccrued {
 				collateral_id: self.collateral_id.clone(),
+				stable_id: self.stable_id.clone(),
 				owner,
 				amount,
 			});
 		}
 		if let Some((fee_owner, fee)) = self.pending_fee {
-			mint_and_route_yield::<T>(&self.collateral_id, fee, YieldSource::UpfrontFee);
+			mint_and_route_yield::<T>(
+				&self.collateral_id,
+				&self.stable_id,
+				fee,
+				YieldSource::UpfrontFee,
+			);
 			Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
 				collateral_id: self.collateral_id.clone(),
+				stable_id: self.stable_id.clone(),
 				owner: fee_owner,
 				amount: fee,
 			});
@@ -214,7 +231,7 @@ impl<T: Config> OpContext<T> {
 	fn assert_unclobbered(&self) {
 		#[cfg(debug_assertions)]
 		debug_assert_eq!(
-			BranchStates::<T>::get(&self.collateral_id).as_ref(),
+			BranchStates::<T>::get(&self.collateral_id, &self.stable_id).as_ref(),
 			Some(&self.loaded),
 			"BranchStates mutated behind OpContext"
 		);

@@ -62,9 +62,10 @@ pub type AllocationResult<AccountId, Balance> =
 /// Returning `Err` from `build_allocation`, or producing an invalid allocation,
 /// rolls the whole call back, so a rejected liquidation never leaves partial
 /// state behind.
-pub trait VaultLiquidationInterface<AccountId, AssetId, Balance> {
+pub trait VaultLiquidationInterface<AccountId, CollateralId, StableId, Balance> {
 	fn execute_liquidation(
-		collateral_id: AssetId,
+		collateral_id: CollateralId,
+		stable_id: StableId,
 		owner: AccountId,
 		build_allocation: impl FnOnce(
 			LiquidationSnapshot<Balance>,
