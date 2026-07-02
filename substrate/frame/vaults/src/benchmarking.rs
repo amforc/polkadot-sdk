@@ -519,31 +519,20 @@ mod benchmarks {
 		// as here, a full redemption) leaves a Dormant husk — zero debt, row
 		// intact, collateral still held, out of the rate index — which is the
 		// state this extrinsic acts on.
-		let total_debt =
-			<Pallet<T> as VaultRedemptionInterface<
-				T::AccountId,
-				T::CollateralAssetId,
-				T::StableAssetId,
-				BalanceOf<T>,
-			>>::prepare_redemption_step(asset.clone(), stable::<T>(), caller.clone())?
-			.debt;
 		let redeemer: T::AccountId = whitelisted_caller();
 		<Pallet<T> as VaultRedemptionInterface<
-			T::AccountId,
 			T::CollateralAssetId,
 			T::StableAssetId,
+			T::AccountId,
 			BalanceOf<T>,
-		>>::apply_redemption(
-			asset.clone(),
-			stable::<T>(),
-			caller.clone(),
-			redeemer,
-			RedemptionAllocation {
-				debt_to_cancel: total_debt,
+		>>::redeem_step(&asset, &stable::<T>(), &caller, |snapshot| {
+			Ok(Some(RedemptionAllocation {
+				redeemer,
+				debt_to_cancel: snapshot.debt,
 				collateral_to_redeemer: BalanceOf::<T>::zero(),
 				fee_collateral_retained: BalanceOf::<T>::zero(),
-			},
-		)?;
+			}))
+		})?;
 
 		#[extrinsic_call]
 		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), None);
@@ -658,31 +647,21 @@ mod benchmarks {
 		)?;
 		// Redeem the target to just below `minimum_debt`, leaving a debt-bearing
 		// Dormant vault outside the rate index.
-		let total_debt = <Pallet<T> as VaultRedemptionInterface<
-			T::AccountId,
-			T::CollateralAssetId,
-			T::StableAssetId,
-			BalanceOf<T>,
-		>>::prepare_redemption_step(asset.clone(), stable::<T>(), owner.clone())?
-		.debt;
 		let remaining = balance::<T>(199);
 		let redeemer: T::AccountId = whitelisted_caller();
 		<Pallet<T> as VaultRedemptionInterface<
-			T::AccountId,
 			T::CollateralAssetId,
 			T::StableAssetId,
+			T::AccountId,
 			BalanceOf<T>,
-		>>::apply_redemption(
-			asset.clone(),
-			stable::<T>(),
-			owner.clone(),
-			redeemer,
-			RedemptionAllocation {
-				debt_to_cancel: total_debt.saturating_sub(remaining),
+		>>::redeem_step(&asset, &stable::<T>(), &owner, |snapshot| {
+			Ok(Some(RedemptionAllocation {
+				redeemer,
+				debt_to_cancel: snapshot.debt.saturating_sub(remaining),
 				collateral_to_redeemer: BalanceOf::<T>::zero(),
 				fee_collateral_retained: BalanceOf::<T>::zero(),
-			},
-		)?;
+			}))
+		})?;
 		assert_eq!(
 			Pallet::<T>::vault_status(asset.clone(), stable::<T>(), owner.clone()),
 			Some(VaultStatus::Dormant)

@@ -170,14 +170,14 @@ fn heal_rejects_a_wrong_coin_credit() {
 		register_market(DOT, PUSD);
 		assert_ok!(
 			<Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::record_bad_debt(
-				DOT, PUSD, 1_000,
+				&DOT, &PUSD, 1_000,
 			)
 		);
 
 		// A credit in another coin (EUSD) cannot heal the PUSD market.
 		let wrong = <VaultStableAssets as Balanced<AccountId>>::issue(EUSD, 1_000);
 		let surplus = <Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::heal(
-			DOT, PUSD, wrong,
+			&DOT, &PUSD, wrong,
 		)
 		.unwrap();
 		assert_eq!(surplus.peek(), 1_000, "the whole wrong-coin credit is handed back");
@@ -192,7 +192,7 @@ fn heal_rejects_a_wrong_coin_credit() {
 		// The market's own coin heals it.
 		let right = <VaultStableAssets as Balanced<AccountId>>::issue(PUSD, 1_000);
 		let surplus = <Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::heal(
-			DOT, PUSD, right,
+			&DOT, &PUSD, right,
 		)
 		.unwrap();
 		assert_eq!(surplus.peek(), 0);

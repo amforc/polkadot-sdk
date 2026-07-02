@@ -108,7 +108,7 @@ pub fn open_vault<T: Config>(
 	T::StableAssets::mint_into(context.stable_id.clone(), &owner, initial_debt)?;
 	context.charge_upfront_fee(&owner, upfront_fee);
 
-	T::VaultLists::insert(context.rate_list(), owner.clone(), annual_rate, hint)
+	T::VaultLists::insert(context.rate_list().clone(), owner.clone(), annual_rate, hint)
 		.map_err(map_error::<T>)?;
 
 	Pallet::<T>::deposit_event(Event::Borrowed {
@@ -298,7 +298,7 @@ pub fn borrow<T: Config>(
 	context.charge_upfront_fee(&owner, upfront_fee);
 
 	if dormant_to_active {
-		T::VaultLists::insert(context.rate_list(), owner.clone(), new_rate, hint)
+		T::VaultLists::insert(context.rate_list().clone(), owner.clone(), new_rate, hint)
 			.map_err(map_error::<T>)?;
 		Pallet::<T>::deposit_event(Event::VaultStatusChanged {
 			collateral_id: context.collateral_id.clone(),
@@ -308,7 +308,7 @@ pub fn borrow<T: Config>(
 			new_status: VaultStatus::Active,
 		});
 	} else if old_rate != new_rate {
-		T::VaultLists::re_insert(context.rate_list(), owner.clone(), new_rate, hint)
+		T::VaultLists::re_insert(context.rate_list().clone(), owner.clone(), new_rate, hint)
 			.map_err(map_error::<T>)?;
 	}
 
@@ -400,7 +400,7 @@ pub fn repay_for<T: Config>(
 			.apply_debt_payment(payment, vault.annual_rate, vault.debt.principal);
 		context.state.release_dormant_target(&owner);
 		if pre_status.is_active() {
-			T::VaultLists::remove(&context.rate_list(), &owner)
+			T::VaultLists::remove(context.rate_list(), &owner)
 				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		}
 		context.commit_with_vault(&owner, &vault);
@@ -454,7 +454,7 @@ pub fn change_rate<T: Config>(
 	vault.last_rate_update = context.now;
 	vault.debt.interest = vault.debt.interest.saturating_add(upfront_fee);
 
-	T::VaultLists::re_insert(context.rate_list(), owner.clone(), new_rate, hint)
+	T::VaultLists::re_insert(context.rate_list().clone(), owner.clone(), new_rate, hint)
 		.map_err(map_error::<T>)?;
 	Pallet::<T>::deposit_event(Event::BorrowRateChanged {
 		collateral_id: context.collateral_id.clone(),
@@ -554,7 +554,7 @@ fn close_inner<T: Config>(
 	match status {
 		VaultStatus::Active => {
 			// Active vaults must be in the rate index.
-			T::VaultLists::remove(&context.rate_list(), owner)
+			T::VaultLists::remove(context.rate_list(), owner)
 				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		},
 		VaultStatus::FinalRecovery => {
@@ -609,7 +609,7 @@ pub fn enter_final_recovery<T: Config>(
 		Error::<T>::NotLastEligibleVault
 	);
 
-	T::VaultLists::remove(&context.rate_list(), &owner)
+	T::VaultLists::remove(context.rate_list(), &owner)
 		.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 	context.state.refresh_vault_stake(
 		vault.annual_rate,
@@ -669,7 +669,7 @@ pub fn exit_final_recovery<T: Config>(
 		return Err(Error::<T>::DormantTargetOccupied.into());
 	}
 	if rejoin_active {
-		T::VaultLists::insert(context.rate_list(), owner.clone(), vault.annual_rate, hint)
+		T::VaultLists::insert(context.rate_list().clone(), owner.clone(), vault.annual_rate, hint)
 			.map_err(map_error::<T>)?;
 	}
 	Pallet::<T>::deposit_event(Event::VaultStatusChanged {
@@ -697,7 +697,7 @@ pub fn activate_dormant<T: Config>(
 	let config = context.config()?;
 	ensure!(vault.debt.total() >= config.minimum_debt, Error::<T>::DebtBelowMinimum);
 
-	T::VaultLists::insert(context.rate_list(), owner.clone(), vault.annual_rate, hint)
+	T::VaultLists::insert(context.rate_list().clone(), owner.clone(), vault.annual_rate, hint)
 		.map_err(map_error::<T>)?;
 	context.state.release_dormant_target(&owner);
 

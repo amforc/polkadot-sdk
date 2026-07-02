@@ -103,14 +103,20 @@ pub(crate) fn redemption_targets<T: Config>(
 /// The next ordinary redemption target after `owner` in the rate index: its
 /// head-ward (`prev`) neighbor. Lets the orchestrator skip an underwater
 /// ordinary head tail-first without mutating the index. `None` when `owner` is
-/// the head (highest-rate) vault or is not a rate-index member.
+/// the head (highest-rate) vault or is not a rate-index member — the latter is
+/// an orchestrator contract violation, silent in release so a broken cursor
+/// reads as an exhausted queue rather than corrupting the walk.
 pub(crate) fn ordinary_target_after<T: Config>(
 	collateral_id: &T::CollateralAssetId,
 	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 ) -> Option<T::AccountId> {
-	T::VaultLists::neighbors(&VaultListId::Rate(collateral_id.clone(), stable_id.clone()), owner)
-		.and_then(|p| p.prev)
+	let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
+	debug_assert!(
+		T::VaultLists::contains(&rate_list, owner),
+		"redemption after-cursor must be a current rate-index member"
+	);
+	T::VaultLists::neighbors(&rate_list, owner).and_then(|p| p.prev)
 }
 
 /// Walk the rate index tail-first, summing active-vault principal while the
