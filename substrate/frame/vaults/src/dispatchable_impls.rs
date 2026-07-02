@@ -815,19 +815,8 @@ impl<T: Config> Pallet<T> {
 			&stable_id,
 			BranchState {
 				total_collateral: BalanceOf::<T>::zero(),
-				debt: BranchDebt {
-					principal: BalanceOf::<T>::zero(),
-					minted_interest: BalanceOf::<T>::zero(),
-					pending_redistribution_principal: BalanceOf::<T>::zero(),
-					bad_debt: BalanceOf::<T>::zero(),
-					weighted_principal_sum: BalanceOf::<T>::zero(),
-					// Interest time is 0 at the epoch base (`now`); see `interest_time`.
-					last_interest_time: Zero::zero(),
-				},
-				stakes: BranchStakes {
-					total: BalanceOf::<T>::zero(),
-					weighted_sum: BalanceOf::<T>::zero(),
-				},
+				debt: BranchDebt::default(),
+				stakes: BranchStakes::default(),
 				rounding: BranchRounding::default(),
 				redistribution: RedistributionSnapshot::default(),
 				interest_clock: InterestClock { epoch_base: now, frozen_elapsed: Zero::zero() },
