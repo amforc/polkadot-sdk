@@ -3,7 +3,6 @@ use crate::{
 	pallet::{BranchStates, Vaults},
 	tests::{rate_pct, vault_status},
 };
-use pusd_primitives::BranchModeProvider;
 
 /// Open one vault, then drop the oracle price so the branch enters Safety
 /// mode (TCR ≈ 125.87% — between ICR=120% and Safety=130%).
@@ -20,7 +19,7 @@ fn enter_safety_mode_single_vault() {
 	// Verify the branch really entered Safety mode rather than trusting the
 	// hand-picked price — the mode is derived from live TCR.
 	assert_eq!(
-		<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
+		branch_mode(&DOT, &PUSD),
 		Some(BranchMode::Safety),
 		"price drop must put the branch in Safety mode"
 	);
@@ -251,10 +250,7 @@ fn safety_mode_blocks_close_with_collateral() {
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		// The branch is still in Normal mode here (TCR ≈ 252%); it is *releasing* the
 		// husk's collateral on close that would drop TCR into Safety — hence the block.
-		assert_eq!(
-			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
-			Some(BranchMode::Normal),
-		);
+		assert_eq!(branch_mode(&DOT, &PUSD), Some(BranchMode::Normal),);
 		assert_noop!(
 			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None),
 			crate::Error::<Test>::WouldEnterSafetyMode
@@ -290,10 +286,7 @@ fn safety_mode_allows_close_zero_collateral() {
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		// The branch is now in Safety mode (TCR ≈ 126%, below the 130% threshold); the
 		// close is still allowed because it releases no collateral (post_TCR == pre_TCR).
-		assert_eq!(
-			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
-			Some(BranchMode::Safety),
-		);
+		assert_eq!(branch_mode(&DOT, &PUSD), Some(BranchMode::Safety),);
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
 		assert!(Vaults::<Test>::get((DOT, PUSD, 2)).is_none());
 	});
@@ -318,10 +311,7 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 		// MCR 110%, above 100%. Branch TCR also enters Safety mode.
 		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
 		// The price drop puts the branch in Safety mode (TCR ≈ 44%, below 130%).
-		assert_eq!(
-			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
-			Some(BranchMode::Safety),
-		);
+		assert_eq!(branch_mode(&DOT, &PUSD), Some(BranchMode::Safety),);
 
 		// borrow(+0) revalidates CR without touching debt, so we use it as a
 		// gate-only probe. CR is below ICR → reverts.
@@ -377,7 +367,7 @@ fn normal_mode_blocks_borrow_when_cr_below_icr() {
 		// TCR ≈ 100_100*2.10/5205 ≈ 4038% stays firmly in Normal mode.
 		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
 		assert_eq!(
-			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
+			branch_mode(&DOT, &PUSD),
 			Some(BranchMode::Normal),
 			"whale keeps the branch in Normal mode"
 		);
@@ -410,10 +400,7 @@ fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 		assert_ok!(open(2, DOT, 100, 200, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
 		// The price drop puts the branch in Safety mode (TCR ≈ 44%, below 130%).
-		assert_eq!(
-			<crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(&DOT, &PUSD),
-			Some(BranchMode::Safety),
-		);
+		assert_eq!(branch_mode(&DOT, &PUSD), Some(BranchMode::Safety),);
 
 		// Withdrawing any collateral fails because post-CR < ICR (and so does
 		// pre-CR; the per-call gate uses the post-state).

@@ -6,7 +6,9 @@
 
 use crate::{
 	helpers,
-	pallet::{BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, Vaults},
+	pallet::{
+		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, PalletsOriginOf, Vaults,
+	},
 	types::{BranchConfig, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
 };
@@ -79,9 +81,15 @@ fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
 	}
 }
 
-/// The full and emergency admins every benchmarked market is created with.
-fn branch_admins<T: Config>() -> (T::AccountId, T::AccountId) {
+/// The accounts acting as full and emergency admin of every benchmarked market.
+fn branch_admin_accounts<T: Config>() -> (T::AccountId, T::AccountId) {
 	(account("full_admin", 0, 0), account("emergency_admin", 0, 0))
+}
+
+/// The admin origin-callers every benchmarked market is created with.
+fn branch_admins<T: Config>() -> (PalletsOriginOf<T>, PalletsOriginOf<T>) {
+	let (full_admin, emergency_admin) = branch_admin_accounts::<T>();
+	(RawOrigin::Signed(full_admin).into(), RawOrigin::Signed(emergency_admin).into())
 }
 
 /// A successful `CreateOrigin` for the default stablecoin — Root (deposit-free)
@@ -93,7 +101,7 @@ fn create_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {
 
 /// Signed origin of a benchmarked market's full admin.
 fn full_admin_origin<T: Config>() -> T::RuntimeOrigin {
-	RawOrigin::Signed(branch_admins::<T>().0).into()
+	RawOrigin::Signed(branch_admin_accounts::<T>().0).into()
 }
 
 fn global_manager_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {

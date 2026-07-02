@@ -580,13 +580,13 @@ fn redemption_full_state_changes() {
 	});
 }
 
-// Fee routing, end to end. The upfront fee is minted and split by
-// `SpYieldShare`: the 75% share goes to the drop-style `SpYieldSink` (which
-// rescinds its mint), and the residual is routed by `FeeHandler` to `FEE_DEST`.
-// So `total_issuance` grows by the borrow amount plus that routed residual (the
-// dropped SP share nets to zero), and we can pin the exact fee that reaches the
-// handler in pUSD. The fee is also recorded as debt on `state.debt.minted_interest`
-// and `vault.debt.interest`.
+// Fee routing, end to end. The upfront fee is minted and handed whole to the
+// mock's `DealWithFees`, which splits per `SpFeeShare`: the SP share is
+// dropped (rescinding its mint) and the residual resolves to `FEE_DEST`. So
+// `total_issuance` grows by the borrow amount plus that routed residual (the
+// dropped SP share nets to zero), and we can pin the exact fee that reaches
+// the destination in pUSD. The fee is also recorded as debt on
+// `state.debt.minted_interest` and `vault.debt.interest`.
 #[test]
 fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 	build_and_execute(|| {
@@ -598,8 +598,8 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 
 		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(10, 100)));
 
-		// The `FeeHandler` receives the fee minus the `SpYieldShare` (dropped) part.
-		let sp_share = SpYieldShare::get() * predicted_fee;
+		// `DealWithFees` takes the `SpFeeShare` cut; the residual reaches FEE_DEST.
+		let sp_share = SpFeeShare::get() * predicted_fee;
 		let fee_residual = predicted_fee - sp_share;
 		assert_eq!(fee_dest_balance(), fee_residual, "residual fee routed to FEE_DEST in pUSD");
 
