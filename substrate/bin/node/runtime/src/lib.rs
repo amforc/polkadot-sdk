@@ -3248,7 +3248,6 @@ parameter_types! {
 	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
 	pub const VaultsMaxBranches: u32 = 16;
 	pub const VaultsMaxOnIdleVaultRefresh: u32 = 8;
-	pub VaultsSpYieldShare: Permill = Permill::from_percent(75);
 	/// Oracle key reserved for the native-token price feed.
 	pub const VaultsNativePriceFeedId: u32 = u32::MAX;
 	pub const VaultsOraclePriceMaxAge: Moment =
@@ -3293,11 +3292,10 @@ pub type VaultsStableId = u32;
 pub struct VaultsOracleAdapter;
 impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
 	type AssetId = VaultsCollateralId;
-	type Moment = Moment;
 
 	fn provide_price(
 		collateral_id: &VaultsCollateralId,
-	) -> Result<pusd_primitives::PriceFeed<Moment>, sp_runtime::DispatchError> {
+	) -> Result<FixedU128, sp_runtime::DispatchError> {
 		let v = pallet_oracle::Pallet::<Runtime>::get(&vaults_oracle_key(collateral_id))
 			.ok_or(pallet_vaults::Error::<Runtime>::OraclePriceNotAvailable)?;
 		// Reject observations older than the freshness window so the branch freezes on
@@ -3306,10 +3304,7 @@ impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
 		if now.saturating_sub(v.timestamp) > VaultsOraclePriceMaxAge::get() {
 			return Err(pallet_vaults::Error::<Runtime>::OracleStale.into());
 		}
-		Ok(pusd_primitives::PriceFeed {
-			price: FixedU128::from_inner(v.value),
-			observed_at: v.timestamp,
-		})
+		Ok(FixedU128::from_inner(v.value))
 	}
 }
 
@@ -3349,14 +3344,10 @@ impl pallet_vaults::Config for Runtime {
 	type RuntimeHoldReason = RuntimeHoldReason;
 	type CollateralAssetId = VaultsCollateralId;
 	type StableAssetId = VaultsStableId;
-	fn is_same_asset(collateral_id: &VaultsCollateralId, stable_id: &VaultsStableId) -> bool {
-		matches!(collateral_id, NativeOrWithId::WithId(id) if id == stable_id)
-	}
+	type SameAsset = pallet_vaults::SameAssetViaInto;
 	type CollateralAssets = VaultsCollateral;
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
-	type SpYieldSink = ();
-	type SpYieldShare = VaultsSpYieldShare;
 	type FeeHandler = ();
 	type OnBranchLifecycle = ();
 	type TimeProvider = Timestamp;

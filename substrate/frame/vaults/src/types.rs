@@ -639,25 +639,25 @@ pub enum AdminLevel {
 	Emergency,
 }
 
-/// The two admin accounts for a market, bundled so the same-typed `full_admin`
-/// and `emergency_admin` cannot be silently swapped at a call site.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
-pub struct BranchAdmins<AccountId> {
+/// The two admins of a market, bundled so the same-typed `full_admin` and
+/// `emergency_admin` cannot be silently swapped at a call site.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BranchAdmins<PalletsOrigin> {
 	/// May move any param within the envelope and remove an empty market.
-	pub full_admin: AccountId,
+	pub full_admin: PalletsOrigin,
 	/// May only take risk-reducing actions (freeze, tighten).
-	pub emergency_admin: AccountId,
+	pub emergency_admin: PalletsOrigin,
 }
 
-/// Per-market admin accounts and the refundable creation deposit, stored
+/// Per-market admin origins and the refundable creation deposit, stored
 /// together and torn down together by `remove_branch`. `full_admin` may move any
-/// param within the envelope; `emergency_admin` may only freeze or tighten.
+/// param within the envelope; `emergency_admin` may only freeze or tighten. The
+/// deposit stays keyed by the depositor *account* regardless of who admins the
+/// market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
-pub struct BranchAdminInfo<AccountId, Consideration> {
-	pub full_admin: AccountId,
-	pub emergency_admin: AccountId,
+pub struct BranchAdminInfo<PalletsOrigin, AccountId, Consideration> {
+	pub full_admin: PalletsOrigin,
+	pub emergency_admin: PalletsOrigin,
 	pub deposit: Option<(AccountId, Consideration)>,
 }
 

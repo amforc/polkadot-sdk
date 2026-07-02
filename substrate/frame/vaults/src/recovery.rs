@@ -13,7 +13,7 @@ use frame::prelude::*;
 use pallet_linked_list::{Position, SortedListInterface};
 
 /// The per-branch FIFO list id.
-fn list_id<T: Config>(
+pub(crate) fn list_id<T: Config>(
 	collateral_id: &T::CollateralAssetId,
 	stable_id: &T::StableAssetId,
 ) -> VaultListId<T::CollateralAssetId, T::StableAssetId> {
