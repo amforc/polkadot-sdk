@@ -519,12 +519,14 @@ mod benchmarks {
 		// as here, a full redemption) leaves a Dormant husk — zero debt, row
 		// intact, collateral still held, out of the rate index — which is the
 		// state this extrinsic acts on.
-		let total_debt = <Pallet<T> as VaultRedemptionInterface<
-			T::AccountId,
-			T::CollateralAssetId,
-			T::StableAssetId,
-			BalanceOf<T>,
-		>>::touch_for_redemption(asset.clone(), stable::<T>(), caller.clone())?;
+		let total_debt =
+			<Pallet<T> as VaultRedemptionInterface<
+				T::AccountId,
+				T::CollateralAssetId,
+				T::StableAssetId,
+				BalanceOf<T>,
+			>>::prepare_redemption_step(asset.clone(), stable::<T>(), caller.clone())?
+			.debt;
 		let redeemer: T::AccountId = whitelisted_caller();
 		<Pallet<T> as VaultRedemptionInterface<
 			T::AccountId,
@@ -661,7 +663,8 @@ mod benchmarks {
 			T::CollateralAssetId,
 			T::StableAssetId,
 			BalanceOf<T>,
-		>>::touch_for_redemption(asset.clone(), stable::<T>(), owner.clone())?;
+		>>::prepare_redemption_step(asset.clone(), stable::<T>(), owner.clone())?
+		.debt;
 		let remaining = balance::<T>(199);
 		let redeemer: T::AccountId = whitelisted_caller();
 		<Pallet<T> as VaultRedemptionInterface<

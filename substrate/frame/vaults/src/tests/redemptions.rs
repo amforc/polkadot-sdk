@@ -92,7 +92,7 @@ fn redeemed_above_min_debt_stays_active() {
 }
 
 #[test]
-fn touch_for_redemption_rejects_frozen_branch_and_missing_vault() {
+fn prepare_redemption_step_rejects_frozen_branch_and_missing_vault() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_noop!(
@@ -101,7 +101,7 @@ fn touch_for_redemption_rejects_frozen_branch_and_missing_vault() {
 				AssetId,
 				StableId,
 				Balance,
-			>>::touch_for_redemption(DOT, PUSD, 99),
+			>>::prepare_redemption_step(DOT, PUSD, 99),
 			crate::Error::<Test>::VaultNotFound
 		);
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
@@ -116,7 +116,7 @@ fn touch_for_redemption_rejects_frozen_branch_and_missing_vault() {
 				AssetId,
 				StableId,
 				Balance,
-			>>::touch_for_redemption(DOT, PUSD, 1),
+			>>::prepare_redemption_step(DOT, PUSD, 1),
 			crate::Error::<Test>::BranchFrozen
 		);
 	});

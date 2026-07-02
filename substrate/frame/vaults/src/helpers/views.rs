@@ -1,4 +1,20 @@
 use super::*;
+use pusd_primitives::RedemptionTargetKind;
+
+/// Fully-accrued total branch debt (principal + minted interest + pending
+/// aggregate interest + pending redistribution + bad debt + ownerless debt).
+/// Mirrors the numerator-side of [`compute_tcr`]; used to size the redemption
+/// fee's redeemed fraction. Zero for an unregistered branch.
+pub fn view_branch_debt<T: Config>(
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
+	now: Millis,
+) -> BalanceOf<T> {
+	let Some(bs) = BranchStates::<T>::get(collateral_id, stable_id) else {
+		return BalanceOf::<T>::zero();
+	};
+	accrued_branch_debt::<T>(&bs, now)
+}
 
 pub fn view_vault_status<T: Config>(
 	collateral_id: &T::CollateralAssetId,
@@ -24,7 +40,7 @@ pub fn view_vault_cr<T: Config>(
 		.total()
 		.saturating_add(pending.principal)
 		.saturating_add(pending.interest);
-	math::collateralization_ratio::<BalanceOf<T>>(total_coll, total_debt, price)
+	pusd_primitives::collateralization_ratio::<BalanceOf<T>>(total_coll, total_debt, price)
 }
 
 pub fn view_branch_tcr<T: Config>(
@@ -57,26 +73,44 @@ fn list_from_tail<T: Config>(
 	})
 }
 
-/// A branch's redemption targets, in priority order with the SPEC §6.1 cutoff:
-/// if the `FinalRecovery` FIFO is non-empty, yield only its head; else if
-/// `dormant_redemption_target` is set, yield only that; otherwise yield the rate
-/// index tail-first. Lazy and allocation-free: `.next()` gives the next target
-/// and `take(n)` the queue view, reading only the tiers they reach.
+/// A branch's redemption targets, each tagged with its pricing regime, in
+/// priority order: if the `FinalRecovery` FIFO is
+/// non-empty, yield only its head; else if `dormant_redemption_target` is set,
+/// yield only that; otherwise yield the rate index tail-first (all `Ordinary`).
+/// Lazy and allocation-free: `.next()` gives the next target and `take(n)` the
+/// queue view, reading only the tiers they reach.
 pub(crate) fn redemption_targets<T: Config>(
 	collateral_id: &T::CollateralAssetId,
 	stable_id: &T::StableAssetId,
-) -> impl Iterator<Item = T::AccountId> {
-	let priority = recovery::next_target::<T>(collateral_id, stable_id).or_else(|| {
-		BranchStates::<T>::get(collateral_id, stable_id)
-			.and_then(|state| state.dormant_redemption_target)
-	});
+) -> impl Iterator<Item = (T::AccountId, RedemptionTargetKind)> {
+	let priority = recovery::next_target::<T>(collateral_id, stable_id)
+		.map(|owner| (owner, RedemptionTargetKind::FinalRecovery))
+		.or_else(|| {
+			BranchStates::<T>::get(collateral_id, stable_id)
+				.and_then(|bs| bs.dormant_redemption_target)
+				.map(|owner| (owner, RedemptionTargetKind::Dormant))
+		});
 	// The rate index is walked only when no FinalRecovery/Dormant target gates it.
 	let rate = priority
 		.is_none()
 		.then(|| list_from_tail::<T>(VaultListId::Rate(collateral_id.clone(), stable_id.clone())))
 		.into_iter()
-		.flatten();
+		.flatten()
+		.map(|owner| (owner, RedemptionTargetKind::Ordinary));
 	priority.into_iter().chain(rate)
+}
+
+/// The next ordinary redemption target after `owner` in the rate index: its
+/// head-ward (`prev`) neighbor. Lets the orchestrator skip an underwater
+/// ordinary head tail-first without mutating the index. `None` when `owner` is
+/// the head (highest-rate) vault or is not a rate-index member.
+pub(crate) fn ordinary_target_after<T: Config>(
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
+	owner: &T::AccountId,
+) -> Option<T::AccountId> {
+	T::VaultLists::neighbors(&VaultListId::Rate(collateral_id.clone(), stable_id.clone()), owner)
+		.and_then(|p| p.prev)
 }
 
 /// Walk the rate index tail-first, summing active-vault principal while the

@@ -32,8 +32,8 @@ pub fn simple_interest_floor<Balance: FixedPointOperand>(
 
 /// `ceil(principal * rate * delta_millis / MILLIS_PER_YEAR)`.
 ///
-/// Used to mint protocol-favored aggregate interest (§7.3) and upfront fees
-/// (§7.5). See [`simple_interest_with_rounding`] for the math.
+/// Used to mint protocol-favored aggregate interest and upfront fees.
+/// See [`simple_interest_with_rounding`] for the math.
 pub fn simple_interest_ceil<Balance: FixedPointOperand>(
 	principal: Balance,
 	rate: FixedU128,
@@ -64,24 +64,6 @@ fn simple_interest_with_rounding<Balance: FixedPointOperand>(
 	multiply_by_rational_with_rounding(p, rate_times_delta, denom, rounding)
 		.and_then(|raw| Balance::try_from(raw).ok())
 		.defensive_unwrap_or_else(Balance::max_value)
-}
-
-/// Compute a vault's collateralization ratio (`collateral * price / debt`).
-///
-/// Returns `None` if `debt` is zero (the protocol treats CR as undefined and
-/// callers must apply specific debt-floor rules) or if either step overflows
-/// — better to surface than to silently saturate a safety-critical ratio.
-///
-/// `checked_mul_int` truncates the fractional part of `price * collateral` at
-/// the `Balance` atom; for realistic protocol balances this is below dust and
-/// orders of magnitude under CR threshold granularity.
-pub fn collateralization_ratio<Balance: FixedPointOperand>(
-	collateral: Balance,
-	debt: Balance,
-	price: FixedU128,
-) -> Option<FixedU128> {
-	let value = price.checked_mul_int(collateral)?;
-	FixedU128::checked_from_rational(value, debt)
 }
 
 /// Value a stable-denominated `debt` in its collateral's unit: `ceil(debt /
@@ -189,28 +171,6 @@ mod tests {
 		// principal=3, rate=1, delta=1ms — fractional, ceils to 1
 		let got = simple_interest_ceil::<u128>(3, FixedU128::one(), 1);
 		assert_eq!(got, 1);
-	}
-
-	#[test]
-	fn collateralization_ratio_basic() {
-		// collateral=200, debt=100, price=1.0 → CR = 2.0
-		let cr = collateralization_ratio::<u128>(200, 100, FixedU128::one());
-		assert_eq!(cr, Some(FixedU128::saturating_from_integer(2u128)));
-	}
-
-	#[test]
-	fn collateralization_ratio_zero_debt_is_none() {
-		// CR is undefined when there is no debt.
-		let cr = collateralization_ratio::<u128>(100, 0, FixedU128::one());
-		assert_eq!(cr, None);
-	}
-
-	#[test]
-	fn collateralization_ratio_price_scales() {
-		// collateral=100, debt=50, price=2.0 → CR = 4.0
-		let price = FixedU128::saturating_from_integer(2u128);
-		let cr = collateralization_ratio::<u128>(100, 50, price);
-		assert_eq!(cr, Some(FixedU128::saturating_from_integer(4u128)));
 	}
 
 	#[test]
