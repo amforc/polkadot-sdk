@@ -422,7 +422,7 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 			StableId,
 			Balance,
 			_,
-		>>::heal(DOT, PUSD, credit)
+		>>::heal(&DOT, &PUSD, credit)
 		.expect("heal succeeds");
 		assert_eq!(surplus.peek(), 0);
 		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
@@ -432,22 +432,17 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 
 #[test]
 fn redemption_slot_rejects_second_owner() {
-	use pusd_primitives::{RedemptionAllocation, VaultRedemptionInterface};
+	use pusd_primitives::RedemptionAllocation;
 	fn park(owner: AccountId) -> DispatchResult {
-		let post_touch = <crate::Pallet<Test> as VaultRedemptionInterface<
-			AccountId,
-			AssetId,
-			StableId,
-			Balance,
-		>>::prepare_redemption_step(DOT, PUSD, owner)
-		.expect("touch")
-		.debt;
-		let allocation = RedemptionAllocation {
-			debt_to_cancel: post_touch - 150,
-			collateral_to_redeemer: (post_touch - 150) / 10,
-			fee_collateral_retained: 0,
-		};
-		<crate::Pallet<Test> as VaultRedemptionInterface<AccountId, AssetId, StableId, Balance>>::apply_redemption(DOT, PUSD, owner, 7, allocation)
+		redeem_step(&DOT, &PUSD, &owner, |snapshot| {
+			Ok(Some(RedemptionAllocation {
+				redeemer: 7,
+				debt_to_cancel: snapshot.debt - 150,
+				collateral_to_redeemer: (snapshot.debt - 150) / 10,
+				fee_collateral_retained: 0,
+			}))
+		})
+		.map(|_| ())
 	}
 	fn parked() -> Option<AccountId> {
 		crate::pallet::BranchStates::<Test>::get(DOT, PUSD)
@@ -465,6 +460,6 @@ fn redemption_slot_rejects_second_owner() {
 		assert_eq!(park(2).unwrap_err(), crate::Error::<Test>::DormantTargetOccupied.into());
 		assert_eq!(parked(), Some(1), "slot still points at the first owner");
 		assert!(vault_status(DOT, 1).is_dormant(), "first dormant intact");
-		assert!(vault_status(DOT, 2).is_active(), "second vault stays Active (apply rolled back)");
+		assert!(vault_status(DOT, 2).is_active(), "second vault stays Active (step rolled back)");
 	});
 }

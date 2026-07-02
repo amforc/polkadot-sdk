@@ -123,6 +123,21 @@ pub(crate) fn vault_of<T: Config>(
 		.ok_or_else(|| Error::<T>::VaultNotFound.into())
 }
 
+/// Derive a vault's lifecycle status from queue/index membership.
+pub(crate) fn vault_status_in<T: Config>(
+	rate_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
+	recovery_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
+	owner: &T::AccountId,
+) -> VaultStatus {
+	if T::VaultLists::contains(rate_list, owner) {
+		return VaultStatus::Active;
+	}
+	if T::VaultLists::contains(recovery_list, owner) {
+		return VaultStatus::FinalRecovery;
+	}
+	VaultStatus::Dormant
+}
+
 impl<Balance> Vault<Balance> {
 	/// Derive this vault's lifecycle status from queue/index membership.
 	///
@@ -135,19 +150,11 @@ impl<Balance> Vault<Balance> {
 		stable_id: &T::StableAssetId,
 		owner: &T::AccountId,
 	) -> VaultStatus {
-		if T::VaultLists::contains(
+		vault_status_in::<T>(
 			&VaultListId::Rate(collateral_id.clone(), stable_id.clone()),
-			owner,
-		) {
-			return VaultStatus::Active;
-		}
-		if T::VaultLists::contains(
 			&VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone()),
 			owner,
-		) {
-			return VaultStatus::FinalRecovery;
-		}
-		VaultStatus::Dormant
+		)
 	}
 
 	/// Whether the rate-adjustment cooldown has elapsed. A rate change is free of
