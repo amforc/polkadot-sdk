@@ -15,8 +15,8 @@ pub trait OnBranchYield<CollateralId, StableId, Credit> {
 	/// or otherwise settling it. Implementations must drop or net the credit before
 	/// returning to satisfy `OnDropCredit` accounting.
 	fn on_branch_yield(
-		collateral_id: CollateralId,
-		stable_id: StableId,
+		collateral_id: &CollateralId,
+		stable_id: &StableId,
 		credit: Credit,
 	) -> DispatchResult;
 }
@@ -25,8 +25,8 @@ pub trait OnBranchYield<CollateralId, StableId, Credit> {
 /// runtimes that route 100% of yield via `FeeHandler` instead.
 impl<CollateralId, StableId, Credit> OnBranchYield<CollateralId, StableId, Credit> for () {
 	fn on_branch_yield(
-		_collateral_id: CollateralId,
-		_stable_id: StableId,
+		_collateral_id: &CollateralId,
+		_stable_id: &StableId,
 		_credit: Credit,
 	) -> DispatchResult {
 		Ok(())
