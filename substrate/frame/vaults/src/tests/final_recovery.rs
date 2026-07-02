@@ -23,30 +23,18 @@ fn enter_recovery(who: AccountId, rate: FixedU128) {
 }
 
 fn direct_redeem(owner: AccountId, redeemer: AccountId, amount: Balance) {
-	let post_touch = <crate::Pallet<Test> as VaultRedemptionInterface<
-		AccountId,
-		AssetId,
-		StableId,
-		Balance,
-	>>::prepare_redemption_step(DOT, PUSD, owner)
-	.expect("touch target")
-	.debt;
-	let debt_to_cancel = core::cmp::min(amount, post_touch);
 	let price = MockPrices::get().get(&DOT).copied().expect("price set");
-	let collateral_to_redeemer =
-		(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
-	assert_ok!(<crate::Pallet<Test> as VaultRedemptionInterface<
-		AccountId,
-		AssetId,
-		StableId,
-		Balance,
-	>>::apply_redemption(
-		DOT,
-		PUSD,
-		owner,
-		redeemer,
-		RedemptionAllocation { debt_to_cancel, collateral_to_redeemer, fee_collateral_retained: 0 }
-	));
+	assert_ok!(redeem_step(&DOT, &PUSD, &owner, |snapshot| {
+		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
+		let collateral_to_redeemer =
+			(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
+		Ok(Some(RedemptionAllocation {
+			redeemer,
+			debt_to_cancel,
+			collateral_to_redeemer,
+			fee_collateral_retained: 0,
+		}))
+	}));
 }
 
 #[test]
@@ -64,9 +52,9 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 		);
 		assert_eq!(
 			<crate::Pallet<Test> as VaultRedemptionInterface<
-				AccountId,
 				AssetId,
 				StableId,
+				AccountId,
 				Balance,
 			>>::next_redemption_target(&DOT, &PUSD, None)
 			.map(|t| t.owner),

@@ -2,7 +2,7 @@
 //!
 //! Settlement pricing is intentionally not
 //! implemented here — the redemption orchestrator pallet owns recovery-pricing
-//! math and passes the resulting `RedemptionAllocation` to `apply_redemption`.
+//! math and passes the resulting `RedemptionAllocation` to `redeem_step`.
 
 use crate::{
 	pallet::{BalanceOf, Config, Error, Event, Pallet},
@@ -12,6 +12,14 @@ use alloc::vec::Vec;
 use frame::prelude::*;
 use pallet_linked_list::{Position, SortedListInterface};
 
+/// The per-branch FIFO list id.
+fn list_id<T: Config>(
+	collateral_id: &T::CollateralAssetId,
+	stable_id: &T::StableAssetId,
+) -> VaultListId<T::CollateralAssetId, T::StableAssetId> {
+	VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone())
+}
+
 /// Append `owner` to the per-branch FIFO.
 pub fn append<T: Config>(
 	state: &mut BranchState<T::AccountId, BalanceOf<T>>,
@@ -19,7 +27,7 @@ pub fn append<T: Config>(
 	stable_id: &T::StableAssetId,
 	owner: T::AccountId,
 ) -> Result<(), DispatchError> {
-	let list_id = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
+	let list_id = list_id::<T>(collateral_id, stable_id);
 	ensure!(!T::VaultLists::contains(&list_id, &owner), Error::<T>::FinalRecoveryInvariantBroken,);
 
 	let nonce = state.next_final_recovery_nonce;
@@ -45,8 +53,8 @@ pub fn remove<T: Config>(
 	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 ) -> Result<(), DispatchError> {
-	let list_id = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
-	T::VaultLists::remove(&list_id, owner).map_err(|_| Error::<T>::FinalRecoveryInvariantBroken)?;
+	T::VaultLists::remove(&list_id::<T>(collateral_id, stable_id), owner)
+		.map_err(|_| Error::<T>::FinalRecoveryInvariantBroken)?;
 	Pallet::<T>::deposit_event(Event::FinalRecoveryExited {
 		collateral_id: collateral_id.clone(),
 		stable_id: stable_id.clone(),
@@ -60,7 +68,7 @@ pub fn next_target<T: Config>(
 	collateral_id: &T::CollateralAssetId,
 	stable_id: &T::StableAssetId,
 ) -> Option<T::AccountId> {
-	T::VaultLists::tail(&VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone()))
+	T::VaultLists::tail(&list_id::<T>(collateral_id, stable_id))
 }
 
 /// First `n` FIFO owners, oldest first.
@@ -69,8 +77,5 @@ pub fn queue_head<T: Config>(
 	stable_id: &T::StableAssetId,
 	n: u32,
 ) -> Vec<T::AccountId> {
-	T::VaultLists::iter_from_tail(
-		&VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone()),
-		n,
-	)
+	T::VaultLists::iter_from_tail(&list_id::<T>(collateral_id, stable_id), n)
 }
