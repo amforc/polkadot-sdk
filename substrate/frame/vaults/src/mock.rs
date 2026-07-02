@@ -668,24 +668,25 @@ pub fn redeem_market(
 		AssetId,
 		StableId,
 		Balance,
-	>>::next_redemption_target(collateral.clone(), stable)
+	>>::next_redemption_target(&collateral, &stable, None)
 	.ok_or(DispatchError::Other("no redemption target"))?;
-	let post_touch = <Pallet<Test> as VaultRedemptionInterface<
+	let owner = target.owner;
+	let snapshot = <Pallet<Test> as VaultRedemptionInterface<
 		AccountId,
 		AssetId,
 		StableId,
 		Balance,
-	>>::touch_for_redemption(collateral.clone(), stable, target)?;
-	let debt_to_cancel = core::cmp::min(amount, post_touch);
+	>>::prepare_redemption_step(collateral.clone(), stable, owner)?;
+	let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
 	let price = MockPrices::get().get(&collateral).copied().expect("price set");
 	let collateral_to_redeemer =
 		(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
 	let alloc =
 		RedemptionAllocation { debt_to_cancel, collateral_to_redeemer, fee_collateral_retained: 0 };
 	<Pallet<Test> as VaultRedemptionInterface<AccountId, AssetId, StableId, Balance>>::apply_redemption(
-		collateral, stable, target, redeemer, alloc,
+		collateral, stable, owner, redeemer, alloc,
 	)?;
-	Ok(target)
+	Ok(owner)
 }
 
 /// Held collateral on `(collateral, who)` for the `VaultCollateral` reason.

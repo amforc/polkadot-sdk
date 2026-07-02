@@ -1,22 +1,33 @@
 use super::*;
 
-/// Compute TCR including aggregate interest accrued since the last update.
-pub fn compute_tcr<T: Config>(
+/// Fully-accrued total branch debt (the TCR numerator): principal + minted
+/// interest + pending aggregate interest + pending redistribution principal +
+/// bad debt + ownerless debt. Single definition shared by [`compute_tcr`] and
+/// the `branch_debt` redemption-fee accessor so the two cannot diverge.
+pub fn accrued_branch_debt<T: Config>(
 	state: &BranchState<T::AccountId, BalanceOf<T>>,
-	price: FixedU128,
 	now: Millis,
-) -> Result<FixedU128, DispatchError> {
+) -> BalanceOf<T> {
 	let elapsed = state.interest_time(now).saturating_sub(state.debt.last_interest_time);
 	let pending_aggregate =
 		math::simple_interest_ceil(state.debt.weighted_principal_sum, FixedU128::one(), elapsed);
-	let total_debt = state
+	state
 		.debt
 		.principal
 		.saturating_add(state.debt.minted_interest)
 		.saturating_add(pending_aggregate)
 		.saturating_add(state.debt.pending_redistribution_principal)
 		.saturating_add(state.debt.bad_debt)
-		.saturating_add(state.rounding.ownerless_pusd_debt);
+		.saturating_add(state.rounding.ownerless_pusd_debt)
+}
+
+/// Compute TCR including aggregate interest accrued since the last update.
+pub fn compute_tcr<T: Config>(
+	state: &BranchState<T::AccountId, BalanceOf<T>>,
+	price: FixedU128,
+	now: Millis,
+) -> Result<FixedU128, DispatchError> {
+	let total_debt = accrued_branch_debt::<T>(state, now);
 	if total_debt.is_zero() {
 		// Branch with no debt is treated as "infinitely well-collateralized".
 		return Ok(FixedU128::max_value());

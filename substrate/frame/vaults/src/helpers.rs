@@ -68,7 +68,7 @@ fn ratio<T: Config>(
 	debt: BalanceOf<T>,
 	price: FixedU128,
 ) -> Result<FixedU128, Error<T>> {
-	math::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+	pusd_primitives::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
 		.ok_or(Error::<T>::UnsafeCollateralizationRatio)
 }
 
@@ -183,7 +183,9 @@ mod context;
 mod ops;
 mod views;
 
-pub(crate) use accounting::{compute_tcr, open_upfront_fee, pending_touch_for};
+pub(crate) use accounting::{
+	accrued_branch_debt, compute_tcr, open_upfront_fee, pending_touch_for,
+};
 use accounting::{simulate_borrow, simulate_change_rate};
 pub(crate) use branch::{
 	clear_governance_frozen_mode, create_branch, current_mode, enable_frozen_mode,
@@ -197,6 +199,7 @@ pub(crate) use ops::{
 	withdraw_collateral,
 };
 pub(crate) use views::{
-	predict_upfront_fee_borrow, predict_upfront_fee_open, predict_upfront_fee_rate_change,
-	redemption_targets, view_branch_tcr, view_debt_in_front, view_vault_cr, view_vault_status,
+	ordinary_target_after, predict_upfront_fee_borrow, predict_upfront_fee_open,
+	predict_upfront_fee_rate_change, redemption_targets, view_branch_debt, view_branch_tcr,
+	view_debt_in_front, view_vault_cr, view_vault_status,
 };

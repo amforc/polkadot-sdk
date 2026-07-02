@@ -624,6 +624,7 @@ pub mod pallet {
 			n: u32,
 		) -> alloc::vec::Vec<T::AccountId> {
 			helpers::redemption_targets::<T>(&collateral_id, &stable_id)
+				.map(|(owner, _kind)| owner)
 				.take(n as usize)
 				.collect()
 		}

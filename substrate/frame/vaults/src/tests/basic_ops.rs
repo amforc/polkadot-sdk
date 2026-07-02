@@ -439,8 +439,9 @@ fn redemption_slot_rejects_second_owner() {
 			AssetId,
 			StableId,
 			Balance,
-		>>::touch_for_redemption(DOT, PUSD, owner)
-		.expect("touch");
+		>>::prepare_redemption_step(DOT, PUSD, owner)
+		.expect("touch")
+		.debt;
 		let allocation = RedemptionAllocation {
 			debt_to_cancel: post_touch - 150,
 			collateral_to_redeemer: (post_touch - 150) / 10,

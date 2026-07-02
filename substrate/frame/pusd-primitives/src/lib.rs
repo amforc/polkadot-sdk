@@ -9,12 +9,13 @@
 
 extern crate alloc;
 
-use frame::deps::sp_runtime::FixedU128;
+use frame::deps::sp_runtime::{FixedPointNumber, FixedPointOperand, FixedU128};
 
 pub mod bad_debt;
 pub mod branch;
 pub mod liquidation;
 pub mod oracle;
+pub mod recovery_pricing;
 pub mod redemption;
 pub mod registration;
 pub mod yield_sink;
@@ -26,7 +27,11 @@ pub use liquidation::{
 	OffsetAllocation, VaultLiquidationInterface,
 };
 pub use oracle::{PriceFeed, ProvidePrice};
-pub use redemption::{RedemptionAllocation, VaultRedemptionInterface};
+pub use recovery_pricing::InsuranceAdjusted;
+pub use redemption::{
+	RedemptionAllocation, RedemptionStepSnapshot, RedemptionTarget, RedemptionTargetKind,
+	VaultRedemptionInterface,
+};
 pub use registration::OnBranchLifecycle;
 pub use yield_sink::OnBranchYield;
 
@@ -36,3 +41,14 @@ pub const MILLIS_PER_YEAR: u64 = 31_557_600_000;
 /// index. `FixedU128` matches the `pallet-linked-list` `Score` type configured
 /// by `pallet-vaults`.
 pub type AnnualRate = FixedU128;
+
+/// `floor(price * collateral / debt)` as a collateralization ratio. `None` when
+/// `debt == 0` (CR undefined) or either step overflows.
+pub fn collateralization_ratio<Balance: FixedPointOperand>(
+	collateral: Balance,
+	debt: Balance,
+	price: FixedU128,
+) -> Option<FixedU128> {
+	let value = price.checked_mul_int(collateral)?;
+	FixedU128::checked_from_rational(value, debt)
+}
