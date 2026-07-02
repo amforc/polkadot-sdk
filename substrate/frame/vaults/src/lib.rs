@@ -9,11 +9,13 @@
 
 extern crate alloc;
 
-mod helpers;
+mod context;
+mod dispatchable_impls;
 mod interfaces;
 mod math;
 mod recovery;
 pub mod types;
+mod utility_impls;
 pub mod weights;
 
 #[cfg(feature = "runtime-benchmarks")]
@@ -78,7 +80,7 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 pub mod pallet {
 	use super::*;
 	use crate::{
-		helpers, recovery,
+		recovery,
 		types::{AdminLevel, BranchAdminInfo, BranchAdmins, BranchConfigGuard},
 	};
 	use frame::{
@@ -553,7 +555,7 @@ pub mod pallet {
 		}
 
 		fn on_idle(_block: BlockNumberFor<T>, remaining: Weight) -> Weight {
-			helpers::on_idle_walk::<T>(remaining)
+			Self::on_idle_walk(remaining)
 		}
 
 		#[cfg(feature = "try-runtime")]
@@ -571,7 +573,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			owner: T::AccountId,
 		) -> Option<FixedU128> {
-			helpers::view_vault_cr::<T>(&collateral_id, &stable_id, &owner)
+			Self::view_vault_cr(&collateral_id, &stable_id, &owner)
 		}
 
 		/// Derived lifecycle status of the vault.
@@ -580,7 +582,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			owner: T::AccountId,
 		) -> Option<VaultStatus> {
-			helpers::view_vault_status::<T>(&collateral_id, &stable_id, &owner)
+			Self::view_vault_status(&collateral_id, &stable_id, &owner)
 		}
 
 		/// Market TCR, including aggregate interest accrued since the last
@@ -590,7 +592,7 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		) -> Option<FixedU128> {
-			helpers::view_branch_tcr::<T>(&collateral_id, &stable_id)
+			Self::view_branch_tcr(&collateral_id, &stable_id)
 		}
 
 		/// Registered `(collateral, stable)` markets.
@@ -606,7 +608,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			n: u32,
 		) -> alloc::vec::Vec<T::AccountId> {
-			helpers::redemption_targets::<T>(&collateral_id, &stable_id)
+			Self::redemption_targets(&collateral_id, &stable_id)
 				.map(|(owner, _kind)| owner)
 				.take(n as usize)
 				.collect()
@@ -679,7 +681,7 @@ pub mod pallet {
 			rate: FixedU128,
 			max_steps: u32,
 		) -> BalanceOf<T> {
-			helpers::view_debt_in_front::<T>(&collateral_id, &stable_id, rate, max_steps)
+			Self::view_debt_in_front(&collateral_id, &stable_id, rate, max_steps)
 		}
 
 		/// Predict the upfront fee `open_vault` would charge for
@@ -690,12 +692,7 @@ pub mod pallet {
 			initial_debt: BalanceOf<T>,
 			annual_rate: FixedU128,
 		) -> BalanceOf<T> {
-			helpers::predict_upfront_fee_open::<T>(
-				&collateral_id,
-				&stable_id,
-				initial_debt,
-				annual_rate,
-			)
+			Self::predict_upfront_fee_open(&collateral_id, &stable_id, initial_debt, annual_rate)
 		}
 
 		/// Predict the upfront fee `borrow` would charge.
@@ -706,7 +703,7 @@ pub mod pallet {
 			debt_increase: BalanceOf<T>,
 			maybe_new_rate: Option<FixedU128>,
 		) -> BalanceOf<T> {
-			helpers::predict_upfront_fee_borrow::<T>(
+			Self::predict_upfront_fee_borrow(
 				&collateral_id,
 				&stable_id,
 				&owner,
@@ -723,12 +720,7 @@ pub mod pallet {
 			owner: T::AccountId,
 			new_rate: FixedU128,
 		) -> BalanceOf<T> {
-			helpers::predict_upfront_fee_rate_change::<T>(
-				&collateral_id,
-				&stable_id,
-				&owner,
-				new_rate,
-			)
+			Self::predict_upfront_fee_rate_change(&collateral_id, &stable_id, &owner, new_rate)
 		}
 	}
 
@@ -747,7 +739,7 @@ pub mod pallet {
 			hint: Position<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			helpers::open_vault::<T>(
+			Self::do_open_vault(
 				who,
 				collateral_id,
 				stable_id,
@@ -770,7 +762,7 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let from = ensure_signed(origin)?;
-			helpers::deposit_collateral_for::<T>(from, owner, collateral_id, stable_id, amount)
+			Self::do_deposit_collateral_for(from, owner, collateral_id, stable_id, amount)
 		}
 
 		/// Withdraw collateral from caller's vault on `collateral_id`.
@@ -786,7 +778,7 @@ pub mod pallet {
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
-			helpers::withdraw_collateral::<T>(who, collateral_id, stable_id, amount, recipient)
+			Self::do_withdraw_collateral(who, collateral_id, stable_id, amount, recipient)
 		}
 
 		/// Borrow more pUSD from caller's vault, optionally adjusting the
@@ -805,15 +797,7 @@ pub mod pallet {
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
-			helpers::borrow::<T>(
-				who,
-				collateral_id,
-				stable_id,
-				amount,
-				maybe_new_rate,
-				recipient,
-				hint,
-			)
+			Self::do_borrow(who, collateral_id, stable_id, amount, maybe_new_rate, recipient, hint)
 		}
 
 		/// Permissionless repay-into-vault. `amount` is capped at the
@@ -830,7 +814,7 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let from = ensure_signed(origin)?;
-			helpers::repay_for::<T>(from, owner, collateral_id, stable_id, amount)
+			Self::do_repay_for(from, owner, collateral_id, stable_id, amount)
 		}
 
 		/// Change the borrow rate of caller's vault.
@@ -844,7 +828,7 @@ pub mod pallet {
 			hint: Position<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			helpers::change_rate::<T>(who, collateral_id, stable_id, new_rate, hint)
+			Self::do_change_rate(who, collateral_id, stable_id, new_rate, hint)
 		}
 
 		/// Close caller's vault and reclaim its collateral. The vault must have
@@ -858,7 +842,7 @@ pub mod pallet {
 			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			helpers::close_vault::<T>(who, collateral_id, stable_id, recipient)
+			Self::do_close_vault(who, collateral_id, stable_id, recipient)
 		}
 
 		/// Permissionless: refresh aggregate/vault interest and apply pending
@@ -872,7 +856,7 @@ pub mod pallet {
 			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			helpers::poke::<T>(owner, collateral_id, stable_id)
+			Self::do_poke(owner, collateral_id, stable_id)
 		}
 
 		/// Permissionless: move an unsafe last-eligible vault into
@@ -886,7 +870,7 @@ pub mod pallet {
 			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			helpers::enter_final_recovery::<T>(owner, collateral_id, stable_id)
+			Self::do_enter_final_recovery(owner, collateral_id, stable_id)
 		}
 
 		/// Permissionless: exit `FinalRecovery` once the fully-accrued vault CR
@@ -902,7 +886,7 @@ pub mod pallet {
 			hint: Position<T::AccountId>,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			helpers::exit_final_recovery::<T>(owner, collateral_id, stable_id, hint)
+			Self::do_exit_final_recovery(owner, collateral_id, stable_id, hint)
 		}
 
 		/// Permissionless market creation. The stable asset's owner (or Root,
@@ -920,7 +904,7 @@ pub mod pallet {
 			config: BranchConfig<BalanceOf<T>>,
 		) -> DispatchResult {
 			let depositor = T::CreateOrigin::ensure_origin(origin, &stable_id)?;
-			helpers::create_branch::<T>(
+			Self::do_create_branch(
 				collateral_id,
 				stable_id,
 				BranchAdmins { full_admin, emergency_admin },
@@ -937,7 +921,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			ratio: FixedU128,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -953,7 +937,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			ratio: FixedU128,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -969,7 +953,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			ratio: FixedU128,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -985,7 +969,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			ceiling: BalanceOf<T>,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -1001,7 +985,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			minimum_debt: BalanceOf<T>,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -1017,7 +1001,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			minimum_collateral: BalanceOf<T>,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -1034,7 +1018,7 @@ pub mod pallet {
 			min_rate: FixedU128,
 			max_rate: FixedU128,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -1050,7 +1034,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			period: Millis,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -1066,7 +1050,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			cooldown: Millis,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -1082,7 +1066,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			penalty: Permill,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -1099,13 +1083,8 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
-			helpers::ensure_branch_admin::<T>(
-				origin,
-				&collateral_id,
-				&stable_id,
-				AdminLevel::Emergency,
-			)?;
-			helpers::enable_frozen_mode::<T>(&collateral_id, &stable_id)
+			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Emergency)?;
+			Self::do_enable_frozen_mode(&collateral_id, &stable_id)
 		}
 
 		/// Permissionless: clear an oracle-induced `Frozen` state once the
@@ -1119,7 +1098,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			helpers::refresh_branch::<T>(&collateral_id, &stable_id)
+			Self::do_refresh_branch(&collateral_id, &stable_id)
 		}
 
 		/// Full-admin: clear a governance-induced `Frozen` state. No-op when the
@@ -1132,13 +1111,8 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
-			helpers::ensure_branch_admin::<T>(
-				origin,
-				&collateral_id,
-				&stable_id,
-				AdminLevel::Full,
-			)?;
-			helpers::clear_governance_frozen_mode::<T>(&collateral_id, &stable_id)
+			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
+			Self::do_clear_governance_frozen_mode(&collateral_id, &stable_id)
 		}
 
 		/// Full-admin: remove an empty market, refunding the creation deposit and
@@ -1150,13 +1124,8 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
-			helpers::ensure_branch_admin::<T>(
-				origin,
-				&collateral_id,
-				&stable_id,
-				AdminLevel::Full,
-			)?;
-			helpers::remove_branch::<T>(collateral_id, stable_id)
+			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
+			Self::do_remove_branch(collateral_id, stable_id)
 		}
 
 		/// Full-admin: reassign the market's admins.
@@ -1169,12 +1138,7 @@ pub mod pallet {
 			full_admin: PalletsOriginOf<T>,
 			emergency_admin: PalletsOriginOf<T>,
 		) -> DispatchResult {
-			helpers::ensure_branch_admin::<T>(
-				origin,
-				&collateral_id,
-				&stable_id,
-				AdminLevel::Full,
-			)?;
+			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
 			BranchAdmin::<T>::try_mutate(
 				(&collateral_id, &stable_id),
 				|maybe| -> Result<_, DispatchError> {
@@ -1202,7 +1166,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
 			T::GlobalManagerOrigin::ensure_origin(origin)?;
-			helpers::enable_frozen_mode::<T>(&collateral_id, &stable_id)
+			Self::do_enable_frozen_mode(&collateral_id, &stable_id)
 		}
 
 		/// Governance kill switch: remove any empty market, bypassing its admins.
@@ -1214,7 +1178,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
 			T::GlobalManagerOrigin::ensure_origin(origin)?;
-			helpers::remove_branch::<T>(collateral_id, stable_id)
+			Self::do_remove_branch(collateral_id, stable_id)
 		}
 
 		/// Permissionless: revive a `Dormant` vault whose fully-accrued debt is
@@ -1230,7 +1194,7 @@ pub mod pallet {
 			hint: Position<T::AccountId>,
 		) -> DispatchResultWithPostInfo {
 			let _ = ensure_signed(origin)?;
-			helpers::activate_dormant::<T>(owner, collateral_id, stable_id, hint)?;
+			Self::do_activate_dormant(owner, collateral_id, stable_id, hint)?;
 			Ok(Pays::No.into())
 		}
 
@@ -1261,7 +1225,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			helpers::poke_ceiling::<T>(collateral_id, stable_id)
+			Self::do_poke_ceiling(collateral_id, stable_id)
 		}
 
 		/// Full-admin: set the market's autoline headroom (`ceiling_gap`). `0`
@@ -1274,7 +1238,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			ceiling_gap: BalanceOf<T>,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,
@@ -1292,7 +1256,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			ceiling_ttl: Millis,
 		) -> DispatchResult {
-			helpers::set_param::<T>(
+			Self::do_set_param(
 				origin,
 				collateral_id,
 				stable_id,

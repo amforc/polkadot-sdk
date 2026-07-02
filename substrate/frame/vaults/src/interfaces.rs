@@ -1,7 +1,7 @@
 //! pUSD primitive trait implementations.
 
 use crate::{
-	helpers::{self, OpContext, TouchedVault},
+	context::{OpContext, TouchedVault},
 	math,
 	pallet::{
 		BalanceOf, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet, StableCreditOf,
@@ -223,13 +223,13 @@ impl<T: Config>
 		// barrier that preempts any carried ordinary cursor: the previous step
 		// may have created one. Re-check it regardless of `after`; the cursor
 		// only resolves the ordinary-tail position when no barrier gates.
-		match helpers::redemption_targets::<T>(collateral_id, stable_id).next() {
+		match Self::redemption_targets(collateral_id, stable_id).next() {
 			Some((owner, kind)) if !matches!(kind, RedemptionTargetKind::Ordinary) => {
 				Some(RedemptionTarget { owner, kind })
 			},
 			head => match after {
 				None => head.map(|(owner, kind)| RedemptionTarget { owner, kind }),
-				Some(owner) => helpers::ordinary_target_after::<T>(collateral_id, stable_id, owner)
+				Some(owner) => Self::ordinary_target_after(collateral_id, stable_id, owner)
 					.map(|owner| RedemptionTarget { owner, kind: RedemptionTargetKind::Ordinary }),
 			},
 		}
@@ -403,7 +403,7 @@ impl<T: Config>
 		stable_id: &T::StableAssetId,
 	) -> BalanceOf<T> {
 		let now = T::TimeProvider::now();
-		helpers::view_branch_debt::<T>(collateral_id, stable_id, now)
+		Self::view_branch_debt(collateral_id, stable_id, now)
 	}
 }
 
@@ -452,7 +452,7 @@ impl<T: Config> VaultBadDebtInterface<T::CollateralAssetId, T::StableAssetId, St
 		if credit.asset() != *stable_id {
 			return Ok(credit);
 		}
-		let state = helpers::branch_state_of::<T>(collateral_id, stable_id)?;
+		let state = Self::branch_state_of(collateral_id, stable_id)?;
 		let healable = credit.peek().min(state.debt.bad_debt);
 		if healable.is_zero() {
 			// Nothing recorded (or an empty credit) — hand everything back.
