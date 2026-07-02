@@ -25,7 +25,6 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	// `check_branch_identities`' single vault pass, then checked once below.
 	let mut owner_collateral: BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>> =
 		BTreeMap::new();
-	// The `BranchConfigs` key set is the canonical registry (SPEC §4.4).
 	for (collateral_id, stable_id) in BranchConfigs::<T>::iter_keys() {
 		let (collateral_id, stable_id) = (&collateral_id, &stable_id);
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());

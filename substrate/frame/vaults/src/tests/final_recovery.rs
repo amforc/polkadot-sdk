@@ -28,8 +28,9 @@ fn direct_redeem(owner: AccountId, redeemer: AccountId, amount: Balance) {
 		AssetId,
 		StableId,
 		Balance,
-	>>::touch_for_redemption(DOT, PUSD, owner)
-	.expect("touch target");
+	>>::prepare_redemption_step(DOT, PUSD, owner)
+	.expect("touch target")
+	.debt;
 	let debt_to_cancel = core::cmp::min(amount, post_touch);
 	let price = MockPrices::get().get(&DOT).copied().expect("price set");
 	let collateral_to_redeemer =
@@ -67,7 +68,8 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 				AssetId,
 				StableId,
 				Balance,
-			>>::next_redemption_target(DOT, PUSD),
+			>>::next_redemption_target(&DOT, &PUSD, None)
+			.map(|t| t.owner),
 			Some(1)
 		);
 	});
