@@ -5,7 +5,6 @@
 #![cfg(feature = "runtime-benchmarks")]
 
 use crate::{
-	helpers,
 	pallet::{
 		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, PalletsOriginOf, Vaults,
 	},
@@ -156,7 +155,7 @@ struct RateBounds {
 }
 
 fn rate_bounds<T: Config>(asset: &T::CollateralAssetId) -> Result<RateBounds, BenchmarkError> {
-	let config = helpers::branch_config_of::<T>(asset, &stable::<T>())
+	let config = Pallet::<T>::branch_config_of(asset, &stable::<T>())
 		.map_err(|_| BenchmarkError::Stop("missing branch config"))?;
 	let count = T::VaultLists::repair_budget().saturating_add(2);
 	let safety_floor = config
@@ -760,7 +759,7 @@ mod benchmarks {
 		{
 			if Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)) {
 				let _ =
-					crate::helpers::OpContext::<T>::refresh(asset.clone(), stable::<T>(), &owner);
+					crate::context::OpContext::<T>::refresh(asset.clone(), stable::<T>(), &owner);
 				let _ = T::VaultLists::neighbors(
 					&VaultListId::Rate(asset.clone(), stable::<T>()),
 					&owner,

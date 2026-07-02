@@ -1,9 +1,15 @@
 //! Per-dispatch branch state context with deferred yield routing.
 
-use super::{
-	accounting::{accrue_aggregate_interest, mint_and_route_yield, pending_touch_for},
-	*,
+use crate::{
+	pallet::{BalanceOf, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet, Vaults},
+	recovery,
+	types::{BranchConfig, BranchState, Vault, VaultListId, VaultStatus},
 };
+use frame::{
+	prelude::*,
+	traits::{fungibles::MutateHold as FungiblesMutateHold, tokens::Restriction, Time},
+};
+use pusd_primitives::ProvidePrice;
 
 pub(crate) struct TouchedVault<Balance> {
 	pub vault: Vault<Balance>,
@@ -31,11 +37,11 @@ impl<T: Config> OpContext<T> {
 		stable_id: T::StableAssetId,
 	) -> Result<Self, DispatchError> {
 		let now = T::TimeProvider::now();
-		let mut state = branch_state_of::<T>(&collateral_id, &stable_id)?;
+		let mut state = Pallet::<T>::branch_state_of(&collateral_id, &stable_id)?;
 		#[cfg(debug_assertions)]
 		let loaded = state.clone();
 
-		let pending_interest_mint = accrue_aggregate_interest::<T>(&mut state, now);
+		let pending_interest_mint = Pallet::<T>::accrue_aggregate_interest(&mut state, now);
 
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 		Ok(Self {
@@ -83,12 +89,12 @@ impl<T: Config> OpContext<T> {
 
 	/// Branch config for this context's collateral.
 	pub fn config(&self) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
-		branch_config_of::<T>(&self.collateral_id, &self.stable_id)
+		Pallet::<T>::branch_config_of(&self.collateral_id, &self.stable_id)
 	}
 
 	/// Adopt `next` as the branch state, but only if the TCR mode rules permit
 	/// the pre→post transition. `is_settlement` relaxes the worsening checks on
-	/// the liquidation/close settlement paths (see [`enforce_mode_rules`]).
+	/// the liquidation/close settlement paths (see [`Pallet::enforce_mode_rules`]).
 	pub fn transition(
 		&mut self,
 		next: BranchState<T::AccountId, BalanceOf<T>>,
@@ -96,9 +102,9 @@ impl<T: Config> OpContext<T> {
 		price: FixedU128,
 		is_settlement: bool,
 	) -> Result<(), DispatchError> {
-		let pre_tcr = compute_tcr::<T>(&self.state, price, self.now)?;
-		let post_tcr = compute_tcr::<T>(&next, price, self.now)?;
-		enforce_mode_rules::<T>(config, &self.state, pre_tcr, post_tcr, is_settlement)?;
+		let pre_tcr = Pallet::<T>::compute_tcr(&self.state, price, self.now)?;
+		let post_tcr = Pallet::<T>::compute_tcr(&next, price, self.now)?;
+		Pallet::<T>::enforce_mode_rules(config, &self.state, pre_tcr, post_tcr, is_settlement)?;
 		self.state = next;
 		Ok(())
 	}
@@ -108,13 +114,13 @@ impl<T: Config> OpContext<T> {
 		&mut self,
 		owner: &T::AccountId,
 	) -> Result<TouchedVault<BalanceOf<T>>, DispatchError> {
-		let mut vault = vault_of::<T>(&self.collateral_id, &self.stable_id, owner)?;
-		let status = vault_status_in::<T>(
+		let mut vault = Pallet::<T>::vault_of(&self.collateral_id, &self.stable_id, owner)?;
+		let status = Pallet::<T>::vault_status_in(
 			&self.rate_list,
 			&recovery::list_id::<T>(&self.collateral_id, &self.stable_id),
 			owner,
 		);
-		let pending = pending_touch_for::<T>(&vault, &self.state, self.now);
+		let pending = Pallet::<T>::pending_touch_for(&vault, &self.state, self.now);
 
 		if !pending.interest.is_zero() {
 			vault.debt.interest = vault.debt.interest.saturating_add(pending.interest);
@@ -214,7 +220,7 @@ impl<T: Config> OpContext<T> {
 			..
 		} = self;
 		if !pending_interest_mint.is_zero() {
-			mint_and_route_yield::<T>(&stable_id, pending_interest_mint);
+			Pallet::<T>::mint_and_route_yield(&stable_id, pending_interest_mint);
 		}
 		if let Some((owner, amount)) = pending_interest_accrued {
 			Pallet::<T>::deposit_event(Event::InterestAccrued {
@@ -225,7 +231,7 @@ impl<T: Config> OpContext<T> {
 			});
 		}
 		if let Some((owner, amount)) = pending_fee {
-			mint_and_route_yield::<T>(&stable_id, amount);
+			Pallet::<T>::mint_and_route_yield(&stable_id, amount);
 			Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
 				collateral_id,
 				stable_id,
