@@ -27,7 +27,7 @@ fn find_rate_position_skips_dormant_vaults() {
 			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
 		}
 
-		// Redeem acct 1's full debt. apply_redemption transitions vault to
+		// Redeem acct 1's full debt. redeem_step transitions the vault to
 		// Dormant when residual debt is zero (see interfaces.rs).
 		let target = redeem(DOT, 5, 600).expect("redeem ok"); // 600 > vault 1's debt to fully clear it
 		assert_eq!(target, 1);

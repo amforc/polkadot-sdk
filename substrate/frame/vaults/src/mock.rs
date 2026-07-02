@@ -27,8 +27,9 @@ use frame::{
 			roles::Inspect as FungiblesRolesInspect, Credit, Inspect as FungiblesInspect,
 			InspectHold,
 		},
-		tokens::fungible,
+		tokens::{fungible, imbalance::ResolveAssetTo},
 		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
+		OnUnbalanced,
 	},
 };
 pub use pallet_linked_list::Position;
@@ -127,7 +128,6 @@ parameter_types! {
 	pub const MaxBranches: u32 = 8;
 	pub const MaxOnIdleVaultRefresh: u32 = 4;
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
-	pub SpYieldShare: Permill = Permill::from_percent(75);
 }
 
 impl pallet_linked_list::Config for Test {
@@ -164,21 +164,15 @@ parameter_types! {
 }
 impl pusd_primitives::ProvidePrice for MockOracle {
 	type AssetId = AssetId;
-	type Moment = Moment;
 
-	fn provide_price(
-		collateral: &AssetId,
-	) -> Result<pusd_primitives::PriceFeed<Moment>, DispatchError> {
+	fn provide_price(collateral: &AssetId) -> Result<FixedU128, DispatchError> {
 		if !MockOracleAvailable::get() {
 			return Err(crate::pallet::Error::<Test>::OraclePriceNotAvailable.into());
 		}
-		match MockPrices::get().get(collateral).copied() {
-			Some(p) => Ok(pusd_primitives::PriceFeed {
-				price: p,
-				observed_at: pallet_timestamp::Pallet::<Test>::get(),
-			}),
-			None => Err(crate::pallet::Error::<Test>::OraclePriceNotAvailable.into()),
-		}
+		MockPrices::get()
+			.get(collateral)
+			.copied()
+			.ok_or_else(|| crate::pallet::Error::<Test>::OraclePriceNotAvailable.into())
 	}
 }
 
@@ -188,42 +182,39 @@ pub fn set_price(collateral: AssetId, price: FixedU128) {
 	});
 }
 
+/// Derived branch mode (`None` when the market is unknown or the mode cannot
+/// be computed), for tests observing Normal/Safety/Frozen transitions.
+pub fn branch_mode(collateral: &AssetId, stable: &StableId) -> Option<BranchMode> {
+	crate::helpers::current_mode::<Test>(collateral, stable).ok()
+}
+
 pub fn set_oracle_available(v: bool) {
 	MockOracleAvailable::set(v);
 }
 
-/// Drops yield credits on the floor: tests don't need a Stability Pool.
-pub struct DropYieldSink;
-impl pusd_primitives::OnBranchYield<AssetId, StableId, Credit<AccountId, VaultStableAssets>>
-	for DropYieldSink
-{
-	fn on_branch_yield(
-		_collateral_id: &AssetId,
-		stable_id: &StableId,
-		credit: Credit<AccountId, VaultStableAssets>,
-	) -> DispatchResult {
-		// Every yield credit a market routes must be denominated in that market's
-		// own coin; a wrong-id mint would surface here across the whole suite.
-		assert_eq!(credit.asset(), *stable_id, "yield minted in the wrong asset");
-		drop(credit);
-		Ok(())
-	}
-}
-
-/// Account the [`RecordingFeeHandler`] resolves protocol fee credits into, so
-/// tests can assert the exact pUSD routed as fees.
+/// Account the protocol's fee residual resolves into, so tests can assert the
+/// exact pUSD routed as fees.
 pub const FEE_DEST: AccountId = 200;
 
-/// `OnUnbalanced` impl that resolves residual fee credits into [`FEE_DEST`]
-/// instead of dropping them, so fee routing (and the exact fee amount) is
-/// assertable. A resolve failure (never expected: the coin is `is_sufficient`)
-/// falls back to dropping the credit.
-pub struct RecordingFeeHandler;
-impl OnUnbalanced<Credit<AccountId, VaultStableAssets>> for RecordingFeeHandler {
-	fn on_nonzero_unbalanced(amount: Credit<AccountId, VaultStableAssets>) {
-		let _ = <VaultStableAssets as frame::traits::fungibles::Balanced<AccountId>>::resolve(
-			&FEE_DEST, amount,
-		);
+parameter_types! {
+	pub const FeeDestAccount: AccountId = FEE_DEST;
+	/// Fraction of each minted fee credit routed to the Stability-Pool share by
+	/// [`DealWithFees`]; the residual resolves to [`FEE_DEST`]. A settable
+	/// static, so a test can exercise any split.
+	pub static SpFeeShare: Permill = Permill::from_percent(75);
+}
+
+/// Runtime-side fee policy, built from the stock `OnUnbalanced` alone: split
+/// each minted fee credit per [`SpFeeShare`] into the Stability-Pool share
+/// (TODO: burned until the SP pallet lands) and the protocol residual resolved to
+/// [`FEE_DEST`].
+pub struct DealWithFees;
+impl OnUnbalanced<Credit<AccountId, VaultStableAssets>> for DealWithFees {
+	fn on_nonzero_unbalanced(credit: Credit<AccountId, VaultStableAssets>) {
+		let sp_share = SpFeeShare::get() * credit.peek();
+		let (sp_credit, residual) = credit.split(sp_share);
+		drop(sp_credit);
+		ResolveAssetTo::<FeeDestAccount, VaultStableAssets>::on_unbalanced(residual);
 	}
 }
 
@@ -255,6 +246,12 @@ parameter_types! {
 pub const ADMIN: AccountId = 100;
 /// Emergency (tighten-only) admin of every market a test helper registers.
 pub const EMERGENCY_ADMIN: AccountId = 101;
+
+/// The origin caller under which `who` administers markets — admins are stored
+/// as origin callers, not accounts.
+pub fn admin_caller(who: AccountId) -> OriginCaller {
+	frame_system::RawOrigin::Signed(who).into()
+}
 
 /// `CreateOrigin`: Root creates deposit-free (`None`); the stable asset's owner
 /// creates with a deposit (`Some(who)`); anyone else is rejected.
@@ -309,15 +306,11 @@ impl pallet_vaults::Config for Test {
 	type RuntimeHoldReason = RuntimeHoldReason;
 	type CollateralAssetId = AssetId;
 	type StableAssetId = StableId;
-	fn is_same_asset(collateral_id: &AssetId, stable_id: &StableId) -> bool {
-		matches!(collateral_id, NativeOrWithId::WithId(id) if id == stable_id)
-	}
+	type SameAsset = pallet_vaults::SameAssetViaInto;
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = VaultStableAssets;
 	type Oracle = MockOracle;
-	type SpYieldSink = DropYieldSink;
-	type SpYieldShare = SpYieldShare;
-	type FeeHandler = RecordingFeeHandler;
+	type FeeHandler = DealWithFees;
 	type OnBranchLifecycle = RecordingLifecycle;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
@@ -532,8 +525,8 @@ pub fn register_autoline_market(
 		RuntimeOrigin::root(),
 		collateral.clone(),
 		stable,
-		ADMIN,
-		EMERGENCY_ADMIN,
+		admin_caller(ADMIN),
+		admin_caller(EMERGENCY_ADMIN),
 		config,
 	)
 	.expect("create_branch ok");
@@ -552,8 +545,8 @@ pub fn register_market(collateral: AssetId, stable: StableId) {
 		RuntimeOrigin::root(),
 		collateral.clone(),
 		stable,
-		ADMIN,
-		EMERGENCY_ADMIN,
+		admin_caller(ADMIN),
+		admin_caller(EMERGENCY_ADMIN),
 		default_branch_config(),
 	)
 	.expect("create_branch ok");
@@ -726,8 +719,8 @@ pub fn pusd_balance(who: AccountId) -> Balance {
 	stable_balance(PUSD, who)
 }
 
-/// pUSD routed to [`FEE_DEST`] by [`RecordingFeeHandler`] — the cumulative
-/// protocol fee (upfront-fee and branch-interest residual) in the default coin.
+/// pUSD routed to [`FEE_DEST`] by the `FeeHandler` — the cumulative protocol
+/// fee (upfront-fee and branch-interest residual) in the default coin.
 pub fn fee_dest_balance() -> Balance {
 	stable_balance(PUSD, FEE_DEST)
 }

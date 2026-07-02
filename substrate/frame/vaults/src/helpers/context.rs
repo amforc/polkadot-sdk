@@ -1,7 +1,7 @@
 //! Per-dispatch branch state context with deferred yield routing.
 
 use super::{
-	accounting::{accrue_aggregate_interest, mint_and_route_yield, pending_touch_for, YieldSource},
+	accounting::{accrue_aggregate_interest, mint_and_route_yield, pending_touch_for},
 	*,
 };
 
@@ -17,7 +17,6 @@ pub(crate) struct OpContext<T: Config> {
 	pub now: Millis,
 	pub state: BranchState<T::AccountId, BalanceOf<T>>,
 	rate_list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
-	recovery_list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
 	pending_interest_mint: BalanceOf<T>,
 	pending_fee: Option<(T::AccountId, BalanceOf<T>)>,
 	pending_interest_accrued: Option<(T::AccountId, BalanceOf<T>)>,
@@ -39,14 +38,12 @@ impl<T: Config> OpContext<T> {
 		let pending_interest_mint = accrue_aggregate_interest::<T>(&mut state, now);
 
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
-		let recovery_list = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
 		Ok(Self {
 			collateral_id,
 			stable_id,
 			now,
 			state,
 			rate_list,
-			recovery_list,
 			pending_interest_mint,
 			pending_fee: None,
 			pending_interest_accrued: None,
@@ -72,15 +69,16 @@ impl<T: Config> OpContext<T> {
 		Ok(())
 	}
 
-	/// The branch's rate-index list id.
-	// TODO: Do we need this wrapper?
+	/// The branch's rate-index list id, built once at [`Self::load`]. A
+	/// read-only accessor (rather than a public field) so it can never drift
+	/// from `collateral_id`/`stable_id`.
 	pub fn rate_list(&self) -> &VaultListId<T::CollateralAssetId, T::StableAssetId> {
 		&self.rate_list
 	}
 
 	/// Oracle price for this context's collateral.
 	pub fn price(&self) -> Result<FixedU128, DispatchError> {
-		Ok(T::Oracle::provide_price(&self.collateral_id)?.price)
+		T::Oracle::provide_price(&self.collateral_id)
 	}
 
 	/// Branch config for this context's collateral.
@@ -111,7 +109,11 @@ impl<T: Config> OpContext<T> {
 		owner: &T::AccountId,
 	) -> Result<TouchedVault<BalanceOf<T>>, DispatchError> {
 		let mut vault = vault_of::<T>(&self.collateral_id, &self.stable_id, owner)?;
-		let status = vault_status_in::<T>(&self.rate_list, &self.recovery_list, owner);
+		let status = vault_status_in::<T>(
+			&self.rate_list,
+			&recovery::list_id::<T>(&self.collateral_id, &self.stable_id),
+			owner,
+		);
 		let pending = pending_touch_for::<T>(&vault, &self.state, self.now);
 
 		if !pending.interest.is_zero() {
@@ -212,12 +214,7 @@ impl<T: Config> OpContext<T> {
 			..
 		} = self;
 		if !pending_interest_mint.is_zero() {
-			mint_and_route_yield::<T>(
-				&collateral_id,
-				&stable_id,
-				pending_interest_mint,
-				YieldSource::BranchInterest,
-			);
+			mint_and_route_yield::<T>(&stable_id, pending_interest_mint);
 		}
 		if let Some((owner, amount)) = pending_interest_accrued {
 			Pallet::<T>::deposit_event(Event::InterestAccrued {
@@ -228,7 +225,7 @@ impl<T: Config> OpContext<T> {
 			});
 		}
 		if let Some((owner, amount)) = pending_fee {
-			mint_and_route_yield::<T>(&collateral_id, &stable_id, amount, YieldSource::UpfrontFee);
+			mint_and_route_yield::<T>(&stable_id, amount);
 			Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
 				collateral_id,
 				stable_id,

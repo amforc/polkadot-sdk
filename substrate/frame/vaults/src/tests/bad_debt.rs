@@ -1,57 +1,27 @@
-//! `VaultBadDebtInterface` recording and healing.
+//! `VaultBadDebtInterface` healing.
 
 use crate::{mock::*, pallet::BranchStates};
 use pusd_primitives::VaultBadDebtInterface;
 
-fn record(amount: Balance) -> DispatchResult {
-	<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::record_bad_debt(
-		&DOT, &PUSD, amount,
-	)
+/// Seed recorded bad debt directly: recording only ever happens inside the
+/// vault pallet (recovery settlement / orphan-debt sweeps).
+fn record(amount: Balance) {
+	BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
+		let state = maybe.as_mut().expect("branch registered");
+		state.debt.bad_debt = state.debt.bad_debt.saturating_add(amount);
+	});
 }
 
 /// Issue a fresh credit of `amount`, heal with it, and return the surplus
 /// handed back (the unconsumed part of the credit).
 fn heal(amount: Balance) -> Result<Balance, DispatchError> {
 	let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, amount);
-	<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::heal(
-		&DOT, &PUSD, credit,
-	)
-	.map(|surplus| surplus.peek())
+	<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, _>>::heal(&DOT, &PUSD, credit)
+		.map(|surplus| surplus.peek())
 }
 
 fn bad_debt() -> Balance {
 	BranchStates::<Test>::get(DOT, PUSD).expect("branch state").debt.bad_debt
-}
-
-#[test]
-fn record_bad_debt_increments_and_emits() {
-	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(record(1_000));
-		assert_eq!(bad_debt(), 1_000);
-		assert_ok!(record(500));
-		assert_eq!(bad_debt(), 1_500);
-		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtRecorded {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			amount: 500,
-		}));
-	});
-}
-
-#[test]
-fn record_bad_debt_rejects_unknown_branch_and_skips_zero() {
-	build_and_execute(|| {
-		register_default_branch();
-		assert_noop!(
-			<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::record_bad_debt(&TOKEN_X, &PUSD, 100),
-			crate::Error::<Test>::UnknownCollateral
-		);
-		let events_before = System::events().len();
-		assert_ok!(record(0));
-		assert_eq!(bad_debt(), 0);
-		assert_eq!(System::events().len(), events_before, "zero record emits nothing");
-	});
 }
 
 // A partial heal followed by an exact one. In production the insurance flow
@@ -63,7 +33,7 @@ fn record_bad_debt_rejects_unknown_branch_and_skips_zero() {
 fn heal_partial_then_exact_clears_bad_debt() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(record(1_000));
+		record(1_000);
 
 		assert_eq!(heal(400), Ok(0), "fully consumed, no surplus");
 		assert_eq!(bad_debt(), 600);
@@ -81,7 +51,7 @@ fn heal_partial_then_exact_clears_bad_debt() {
 fn heal_caps_at_recorded_and_returns_surplus() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(record(500));
+		record(500);
 
 		// Over-supplying heals what is recorded and hands the rest back; the
 		// caller decides whether a surplus is an error.
@@ -116,7 +86,7 @@ fn heal_unknown_branch_errors() {
 		register_default_branch();
 		let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, 10);
 		assert_err!(
-			<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::heal(
+			<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, _>>::heal(
 				&TOKEN_X, &PUSD, credit
 			)
 			.map(|surplus| surplus.peek()),

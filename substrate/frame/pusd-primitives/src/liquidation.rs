@@ -1,8 +1,6 @@
-//! Liquidation handoff types and trait
+//! Liquidation handoff types and trait.
 
-use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::deps::frame_support::pallet_prelude::{DispatchError, DispatchResult};
-use scale_info::TypeInfo;
 
 /// Debt cancelled by external pUSD (Stability Pool + JIT combined) and the
 /// matching collateral credited to the offset path. The orchestrator may
@@ -11,9 +9,7 @@ use scale_info::TypeInfo;
 /// `recipient` is the account that receives `collateral` — the vault pallet
 /// moves it inline during `finalize_liquidation`, so the orchestrator never
 /// needs to take possession of liquidated collateral itself.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OffsetAllocation<AccountId, Balance> {
 	pub recipient: AccountId,
 	pub debt: Balance,
@@ -21,9 +17,7 @@ pub struct OffsetAllocation<AccountId, Balance> {
 }
 
 /// Compensation paid to the liquidation keeper.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct KeeperCompensation<AccountId, Balance> {
 	pub recipient: AccountId,
 	pub collateral: Balance,
@@ -35,9 +29,7 @@ pub struct KeeperCompensation<AccountId, Balance> {
 /// Redistributed debt is derived inside `execute_liquidation` as
 /// `snapshot.debt - offset.debt`, so the orchestrator only needs to specify
 /// the collateral split.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LiquidationAllocation<AccountId, Balance> {
 	pub offset: OffsetAllocation<AccountId, Balance>,
 	pub redistribution_collateral: Balance,

@@ -46,9 +46,10 @@ fn adjust_vault_via_deposit_then_borrow() {
 		// recorded as debt: debt.interest = 2, total debt = 802.
 		assert_eq!(v.debt.interest, 2);
 		assert_eq!(v.debt.total(), 802);
-		// The FeeHandler residual is 0: SpYieldShare=75% rounds each 1-unit fee entirely
-		// into the (dropped) yield sink, leaving nothing for FEE_DEST.
-		assert_eq!(fee_dest_balance(), 0);
+		// Each 1-unit fee is split per `SpFeeShare` before the residual reaches
+		// FEE_DEST (Permill multiplication rounds 75% of 1 up to 1, leaving 0).
+		let residual_per_fee = 1u128 - SpFeeShare::get() * 1u128;
+		assert_eq!(fee_dest_balance(), 2 * residual_per_fee);
 		// Branch aggregate mirrors the vault principal.
 		assert_eq!(
 			crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.principal,
@@ -420,7 +421,6 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		let surplus = <crate::Pallet<Test> as pusd_primitives::VaultBadDebtInterface<
 			AssetId,
 			StableId,
-			Balance,
 			_,
 		>>::heal(&DOT, &PUSD, credit)
 		.expect("heal succeeds");

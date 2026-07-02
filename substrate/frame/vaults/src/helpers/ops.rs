@@ -7,6 +7,16 @@ use super::*;
 /// The total, valued in the collateral's unit at `price`, must not exceed
 /// `GlobalDebtCeiling[collateral]` — the systemic backstop a single market's
 /// per-branch ceiling cannot see.
+///
+/// TODO: Two known limitations, deferred deliberately.
+/// (1) The fold sums `outstanding()` in raw units across *different* stable assets before one
+///     price conversion, which is only correct while every stable shares the same unit value
+///     ($1 par, same scale). Fix once the oracle is keyed by `(collateral, stable)`: convert
+///     each market's outstanding at its own pair price, then sum in collateral units.
+/// (2) The fold is O(markets on the collateral) inside every borrow while the extrinsic weight
+///     is flat, and market creation is permissionless — spamming markets on a popular
+///     collateral inflates every borrower's execution cost. Bound markets-per-collateral,
+///     scale the borrow weight by the fold length, or maintain a per-collateral aggregate.
 fn ensure_global_ceiling<T: Config>(
 	collateral_id: &T::CollateralAssetId,
 	stable_id: &T::StableAssetId,
@@ -70,6 +80,9 @@ pub fn open_vault<T: Config>(
 	validate_rate::<T>(&config, annual_rate)?;
 	let price = context.price()?;
 
+	// Advance the autoline in-band (still ttl-gated), so a borrower with valid
+	// headroom does not need a separate `poke_ceiling` transaction first.
+	ratchet_ceiling::<T>(&mut context.state, &config, context.now);
 	ensure_within_ceilings::<T>(
 		&context.collateral_id,
 		&context.stable_id,
@@ -255,6 +268,8 @@ pub fn borrow<T: Config>(
 	validate_rate::<T>(&config, new_rate)?;
 
 	let new_ib_debt = vault.debt.principal.saturating_add(amount);
+	// Advance the autoline in-band (still ttl-gated); see `open_vault`.
+	ratchet_ceiling::<T>(&mut context.state, &config, context.now);
 	ensure_within_ceilings::<T>(
 		&context.collateral_id,
 		&context.stable_id,
