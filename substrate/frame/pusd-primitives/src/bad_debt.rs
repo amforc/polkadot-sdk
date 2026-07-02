@@ -14,8 +14,8 @@ pub trait VaultBadDebtInterface<CollateralId, StableId, Balance, Credit> {
 	/// Record `amount` of unbacked debt against the `(collateral_id, stable_id)`
 	/// market.
 	fn record_bad_debt(
-		collateral_id: CollateralId,
-		stable_id: StableId,
+		collateral_id: &CollateralId,
+		stable_id: &StableId,
 		amount: Balance,
 	) -> DispatchResult;
 
@@ -23,8 +23,8 @@ pub trait VaultBadDebtInterface<CollateralId, StableId, Balance, Credit> {
 	/// market from `credit` and return the unconsumed surplus (zero when the
 	/// credit was fully used). The coin to rescind comes from `credit.asset()`.
 	fn heal(
-		collateral_id: CollateralId,
-		stable_id: StableId,
+		collateral_id: &CollateralId,
+		stable_id: &StableId,
 		credit: Credit,
 	) -> Result<Credit, DispatchError>;
 }
