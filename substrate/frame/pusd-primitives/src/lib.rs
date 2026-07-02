@@ -18,22 +18,22 @@ pub mod oracle;
 pub mod recovery_pricing;
 pub mod redemption;
 pub mod registration;
-pub mod yield_sink;
+pub mod supply_ledger;
 
 pub use bad_debt::VaultBadDebtInterface;
-pub use branch::{BranchMode, BranchModeProvider, FrozenReason, FrozenState};
+pub use branch::{BranchMode, FrozenReason, FrozenState};
 pub use liquidation::{
 	AllocationResult, KeeperCompensation, LiquidationAllocation, LiquidationSnapshot,
 	OffsetAllocation, VaultLiquidationInterface,
 };
-pub use oracle::{PriceFeed, ProvidePrice};
+pub use oracle::ProvidePrice;
 pub use recovery_pricing::InsuranceAdjusted;
 pub use redemption::{
 	RedemptionAllocation, RedemptionRegime, RedemptionStepSnapshot, RedemptionTarget,
 	RedemptionTargetKind, VaultRedemptionInterface,
 };
 pub use registration::OnBranchLifecycle;
-pub use yield_sink::OnBranchYield;
+pub use supply_ledger::SupplyLedger;
 
 /// TODO: Check if this is the best way to handle the "time"
 pub type Millis = u64;

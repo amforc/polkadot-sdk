@@ -168,18 +168,16 @@ fn closing_one_market_leaves_shared_collateral_held() {
 fn heal_rejects_a_wrong_coin_credit() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(
-			<Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::record_bad_debt(
-				&DOT, &PUSD, 1_000,
-			)
-		);
+		// Bad debt is only ever recorded inside the vault pallet; seed it directly.
+		BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
+			maybe.as_mut().expect("branch registered").debt.bad_debt = 1_000;
+		});
 
 		// A credit in another coin (EUSD) cannot heal the PUSD market.
 		let wrong = <VaultStableAssets as Balanced<AccountId>>::issue(EUSD, 1_000);
-		let surplus = <Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::heal(
-			&DOT, &PUSD, wrong,
-		)
-		.unwrap();
+		let surplus =
+			<Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, _>>::heal(&DOT, &PUSD, wrong)
+				.unwrap();
 		assert_eq!(surplus.peek(), 1_000, "the whole wrong-coin credit is handed back");
 		assert_eq!(surplus.asset(), EUSD);
 		assert_eq!(
@@ -191,10 +189,9 @@ fn heal_rejects_a_wrong_coin_credit() {
 
 		// The market's own coin heals it.
 		let right = <VaultStableAssets as Balanced<AccountId>>::issue(PUSD, 1_000);
-		let surplus = <Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::heal(
-			&DOT, &PUSD, right,
-		)
-		.unwrap();
+		let surplus =
+			<Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, _>>::heal(&DOT, &PUSD, right)
+				.unwrap();
 		assert_eq!(surplus.peek(), 0);
 		assert_eq!(BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.bad_debt, 0);
 	});
@@ -220,9 +217,10 @@ fn yield_accrues_in_the_markets_own_coin() {
 		// A full year at 50% on 5_000 principal accrues exactly 2_500 EUSD of vault
 		// interest (interest is on principal, not the open fee).
 		assert_eq!(interest_after - interest_before, 2_500);
-		// The branch minted that interest and routed the non-SpYieldShare residual to
-		// FEE_DEST in the market's own coin: 2_500 − round(0.75 * 2_500) = 625 EUSD.
-		assert_eq!(stable_balance(EUSD, FEE_DEST) - eusd_fee_before, 625);
+		// The branch minted that interest and `DealWithFees` routed the non-SP
+		// residual to FEE_DEST in the market's own coin (2_500 − 75% = 625).
+		let residual = 2_500u128 - SpFeeShare::get() * 2_500u128;
+		assert_eq!(stable_balance(EUSD, FEE_DEST) - eusd_fee_before, residual);
 		// The PUSD market was never involved, so its supply is unchanged.
 		assert_eq!(total_stable(PUSD), pusd_before);
 	});

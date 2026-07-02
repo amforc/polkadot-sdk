@@ -32,7 +32,7 @@ pub fn view_vault_cr<T: Config>(
 	let vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
 	let state = BranchStates::<T>::get(collateral_id, stable_id)?;
 	let now = T::TimeProvider::now();
-	let price = T::Oracle::provide_price(collateral_id).ok()?.price;
+	let price = T::Oracle::provide_price(collateral_id).ok()?;
 	let pending = pending_touch_for::<T>(&vault, &state, now);
 	let total_coll = vault.collateral.saturating_add(pending.collateral);
 	let total_debt = vault
@@ -48,7 +48,7 @@ pub fn view_branch_tcr<T: Config>(
 	stable_id: &T::StableAssetId,
 ) -> Option<FixedU128> {
 	let state = BranchStates::<T>::get(collateral_id, stable_id)?;
-	let price = T::Oracle::provide_price(collateral_id).ok()?.price;
+	let price = T::Oracle::provide_price(collateral_id).ok()?;
 	let now = T::TimeProvider::now();
 	compute_tcr::<T>(&state, price, now).ok()
 }
@@ -104,15 +104,15 @@ pub(crate) fn redemption_targets<T: Config>(
 /// head-ward (`prev`) neighbor. Lets the orchestrator skip an underwater
 /// ordinary head tail-first without mutating the index. `None` when `owner` is
 /// the head (highest-rate) vault or is not a rate-index member — the latter is
-/// an orchestrator contract violation, silent in release so a broken cursor
-/// reads as an exhausted queue rather than corrupting the walk.
+/// an orchestrator contract violation, logged-but-tolerated in release so a
+/// broken cursor reads as an exhausted queue rather than corrupting the walk.
 pub(crate) fn ordinary_target_after<T: Config>(
 	collateral_id: &T::CollateralAssetId,
 	stable_id: &T::StableAssetId,
 	owner: &T::AccountId,
 ) -> Option<T::AccountId> {
 	let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
-	debug_assert!(
+	defensive_assert!(
 		T::VaultLists::contains(&rate_list, owner),
 		"redemption after-cursor must be a current rate-index member"
 	);

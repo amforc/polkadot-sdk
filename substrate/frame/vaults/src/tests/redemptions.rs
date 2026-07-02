@@ -159,7 +159,7 @@ fn redeem_step_skip_persists_touch_without_redeeming() {
 
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		let held_pre = held(DOT, 1);
-		assert_eq!(redeem_step(&DOT, &PUSD, &1, |_| Ok(None)), Ok(None));
+		assert_ok!(redeem_step(&DOT, &PUSD, &1, |_| Ok(None)));
 
 		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		// No debt cancelled, no collateral moved — but the year of pending

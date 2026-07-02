@@ -252,13 +252,11 @@ impl<T: Config>
 		let TouchedVault { mut vault, status } = context.touch(owner)?;
 		// Only FinalRecovery pricing consumes the redistribution penalty, so defer
 		// the branch-config read on the common ordinary/dormant skip path.
-		let (regime, maybe_config) = match status {
-			VaultStatus::Active => (RedemptionRegime::Ordinary, None),
-			VaultStatus::Dormant => (RedemptionRegime::Dormant, None),
-			VaultStatus::FinalRecovery => {
-				let config = context.config()?;
-				let redistribution_penalty = config.redistribution_penalty;
-				(RedemptionRegime::FinalRecovery { redistribution_penalty }, Some(config))
+		let regime = match status {
+			VaultStatus::Active => RedemptionRegime::Ordinary,
+			VaultStatus::Dormant => RedemptionRegime::Dormant,
+			VaultStatus::FinalRecovery => RedemptionRegime::FinalRecovery {
+				redistribution_penalty: context.config()?.redistribution_penalty,
 			},
 		};
 		let post_touch_debt = vault.debt.total();
@@ -301,10 +299,7 @@ impl<T: Config>
 			)?;
 		}
 
-		let config = match maybe_config {
-			Some(config) => config,
-			None => context.config()?,
-		};
+		let config = context.config()?;
 		let new_total = vault.debt.total();
 		let stake_changes = matches!(status, VaultStatus::Active | VaultStatus::Dormant) &&
 			!allocation.collateral_to_redeemer.is_zero();
@@ -441,36 +436,9 @@ fn settle_redemption_status<T: Config>(
 	Ok(())
 }
 
-impl<T: Config>
-	VaultBadDebtInterface<T::CollateralAssetId, T::StableAssetId, BalanceOf<T>, StableCreditOf<T>>
+impl<T: Config> VaultBadDebtInterface<T::CollateralAssetId, T::StableAssetId, StableCreditOf<T>>
 	for Pallet<T>
 {
-	#[transactional]
-	fn record_bad_debt(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		amount: BalanceOf<T>,
-	) -> DispatchResult {
-		if amount.is_zero() {
-			return Ok(());
-		}
-		BranchStates::<T>::try_mutate(
-			collateral_id,
-			stable_id,
-			|maybe| -> Result<_, DispatchError> {
-				let state = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-				state.debt.bad_debt = state.debt.bad_debt.saturating_add(amount);
-				Ok(())
-			},
-		)?;
-		Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-			collateral_id: collateral_id.clone(),
-			stable_id: stable_id.clone(),
-			amount,
-		});
-		Ok(())
-	}
-
 	#[transactional]
 	fn heal(
 		collateral_id: &T::CollateralAssetId,

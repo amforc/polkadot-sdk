@@ -9,7 +9,6 @@ use crate::{
 	tests::{rate_pct, vault_status},
 };
 use pallet_linked_list::SortedListInterface;
-use pusd_primitives::BranchModeProvider;
 
 #[test]
 fn register_branch_creates_state() {
@@ -30,8 +29,8 @@ fn create_branch_requires_asset_owner_or_root() {
 				RuntimeOrigin::signed(2),
 				TOKEN_X,
 				PUSD,
-				ADMIN,
-				EMERGENCY_ADMIN,
+				admin_caller(ADMIN),
+				admin_caller(EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			DispatchError::BadOrigin
@@ -42,8 +41,8 @@ fn create_branch_requires_asset_owner_or_root() {
 			RuntimeOrigin::signed(1),
 			TOKEN_X,
 			PUSD,
-			ADMIN,
-			EMERGENCY_ADMIN,
+			admin_caller(ADMIN),
+			admin_caller(EMERGENCY_ADMIN),
 			default_branch_config()
 		));
 	});
@@ -59,8 +58,8 @@ fn create_branch_rejects_unknown_asset() {
 				RuntimeOrigin::root(),
 				unknown,
 				PUSD,
-				ADMIN,
-				EMERGENCY_ADMIN,
+				admin_caller(ADMIN),
+				admin_caller(EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			crate::Error::<Test>::UnknownCollateral
@@ -77,8 +76,8 @@ fn create_branch_rejects_duplicate_collateral() {
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				ADMIN,
-				EMERGENCY_ADMIN,
+				admin_caller(ADMIN),
+				admin_caller(EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			crate::Error::<Test>::BranchAlreadyRegistered
@@ -289,7 +288,7 @@ fn mode_reports_frozen_while_oracle_unavailable() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		let mode = <crate::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode;
+		let mode = branch_mode;
 		assert_eq!(mode(&DOT, &PUSD), Some(BranchMode::Normal));
 		set_oracle_available(false);
 		assert_eq!(mode(&DOT, &PUSD), Some(BranchMode::Frozen));

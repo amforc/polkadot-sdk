@@ -28,6 +28,8 @@ pub mod mock;
 #[cfg(test)]
 mod tests;
 
+use frame::traits::ContainsPair;
+
 pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
@@ -36,6 +38,16 @@ pub use types::{
 	VaultStatus,
 };
 pub use weights::WeightInfo;
+
+/// [`ContainsPair`] adapter for [`Config::SameAsset`] covering the usual
+/// runtime layout where the stable-id namespace embeds into the collateral-id
+/// namespace via `Into`.
+pub struct SameAssetViaInto;
+impl<C: PartialEq, S: Clone + Into<C>> ContainsPair<C, S> for SameAssetViaInto {
+	fn contains(collateral_id: &C, stable_id: &S) -> bool {
+		*collateral_id == stable_id.clone().into()
+	}
+}
 
 /// Runtime-supplied benchmark hooks. The pallet's `Config` only exposes
 /// oracle reads (`ProvidePrice`), clock reads (`Time`), and hold-only
@@ -62,22 +74,6 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 	fn synth_market(seed: u32) -> (CollateralId, StableId);
 }
 
-pub(crate) const LOG_TARGET: &str = "runtime::vaults";
-
-/// Convenience macro mirroring `pallet-linked-list`'s log helper.
-#[macro_export]
-macro_rules! log {
-	($level:tt, $pattern:expr $(, $values:expr)* $(,)?) => {
-		frame::log::$level!(
-			target: $crate::LOG_TARGET,
-			concat!("[{:?}] [{}] ", $pattern),
-			<frame_system::Pallet<T>>::block_number(),
-			<$crate::Pallet::<T> as frame::traits::PalletInfoAccess>::name()
-			$(, $values)*
-		)
-	};
-}
-
 #[frame::pallet]
 pub mod pallet {
 	use super::*;
@@ -92,11 +88,11 @@ pub mod pallet {
 				Balanced as FungiblesBalanced, Inspect as FungiblesInspect,
 				Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold,
 			},
-			Consideration, EnsureOriginWithArg, Footprint, Time,
+			Consideration, ContainsPair, EnsureOriginWithArg, Footprint, OriginTrait, Time,
 		},
 	};
 	use pallet_linked_list::{Position, PriorityProvider, SortedListInterface};
-	use pusd_primitives::{BranchModeProvider, OnBranchLifecycle, OnBranchYield, ProvidePrice};
+	use pusd_primitives::{OnBranchLifecycle, ProvidePrice};
 
 	pub type BalanceOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
 		<T as frame_system::Config>::AccountId,
@@ -109,6 +105,11 @@ pub mod pallet {
 
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
+
+	/// The runtime's origin-caller type. Market admins are stored as origin callers, so a
+	/// governance track or collective can administer a market.
+	pub type PalletsOriginOf<T> =
+		<<T as frame_system::Config>::RuntimeOrigin as OriginTrait>::PalletsOrigin;
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(1);
 
@@ -128,15 +129,9 @@ pub mod pallet {
 		/// Identifier for stable assets.
 		type StableAssetId: Parameter + Member + Ord + MaxEncodedLen;
 
-		/// Whether the collateral asset and the stablecoin asset denote the same
-		/// underlying asset. The pallet mints stablecoins permissionlessly, so a
-		/// coin trusted as some market's collateral would let its owner mint
-		/// unbacked collateral; `register_branch` rejects any such collision. The
-		/// two id types are distinct, so only the runtime can relate them.
-		fn is_same_asset(
-			collateral_id: &Self::CollateralAssetId,
-			stable_id: &Self::StableAssetId,
-		) -> bool;
+		/// Whether a collateral id and a stable id denote the same underlying
+		/// asset.
+		type SameAsset: ContainsPair<Self::CollateralAssetId, Self::StableAssetId>;
 
 		/// Multi-asset collateral implementation. Balance must be a
 		/// [`FixedPointOperand`] so the pallet's `FixedU128`-based math can
@@ -160,25 +155,13 @@ pub mod pallet {
 		/// numéraire (USD). Issued coins are treated as $1-pegged at par, so the
 		/// price is keyed by collateral alone, not by the `(collateral, stable)`
 		/// market: every coin backed by a given collateral reads the same feed.
-		type Oracle: ProvidePrice<AssetId = Self::CollateralAssetId, Moment = Millis>;
+		type Oracle: ProvidePrice<AssetId = Self::CollateralAssetId>;
 
-		/// Market-aware sink for the SP share of minted yield. Implemented by
-		/// `pallet-stability-pool` in production. Must consume the credit and
-		/// either resolve it (`Balanced::resolve`) or pair it against a
-		/// rescind so the imbalance nets to zero. The coin is carried by the
-		/// credit (`Credit::asset()`).
-		type SpYieldSink: OnBranchYield<
-			Self::CollateralAssetId,
-			Self::StableAssetId,
-			StableCreditOf<Self>,
-		>;
-
-		/// Fraction of newly minted pUSD fees routed to `SpYieldSink`. The
-		/// remainder is forwarded to `FeeHandler`.
-		type SpYieldShare: Get<Permill>;
-
-		/// Runtime-configured destination for the residual (non-SP) share of
-		/// minted pUSD fees.
+		/// Destination for minted pUSD fees (branch interest and upfront fees).
+		/// The credit carries the coin (`Credit::asset()`), so a runtime can
+		/// route revenue per stablecoin. The Stability-Pool yield share arrives
+		/// with `pallet-stability-pool`; until then the whole minted amount
+		/// routes here.
 		type FeeHandler: OnUnbalanced<StableCreditOf<Self>>;
 
 		/// Market lifecycle hook: `register_branch` calls `on_registered` so
@@ -320,7 +303,7 @@ pub mod pallet {
 		_,
 		Twox64Concat,
 		(T::CollateralAssetId, T::StableAssetId),
-		BranchAdminInfo<T::AccountId, T::Consideration>,
+		BranchAdminInfo<PalletsOriginOf<T>, T::AccountId, T::Consideration>,
 	>;
 
 	#[pallet::event]
@@ -448,8 +431,8 @@ pub mod pallet {
 		BranchAdminChanged {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			full_admin: T::AccountId,
-			emergency_admin: T::AccountId,
+			full_admin: PalletsOriginOf<T>,
+			emergency_admin: PalletsOriginOf<T>,
 		},
 		/// A redemption cancelled vault debt in exchange for collateral.
 		VaultRedeemed {
@@ -924,15 +907,16 @@ pub mod pallet {
 
 		/// Permissionless market creation. The stable asset's owner (or Root,
 		/// deposit-free) opens a `(collateral, stable)` market with `full_admin`
-		/// and `emergency_admin`, and a config inside the governance envelope.
+		/// and `emergency_admin` and a config inside the
+		/// governance envelope.
 		#[pallet::call_index(10)]
 		#[pallet::weight(T::WeightInfo::register_branch())]
 		pub fn create_branch(
 			origin: OriginFor<T>,
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			full_admin: T::AccountId,
-			emergency_admin: T::AccountId,
+			full_admin: PalletsOriginOf<T>,
+			emergency_admin: PalletsOriginOf<T>,
 			config: BranchConfig<BalanceOf<T>>,
 		) -> DispatchResult {
 			let depositor = T::CreateOrigin::ensure_origin(origin, &stable_id)?;
@@ -1182,8 +1166,8 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			full_admin: T::AccountId,
-			emergency_admin: T::AccountId,
+			full_admin: PalletsOriginOf<T>,
+			emergency_admin: PalletsOriginOf<T>,
 		) -> DispatchResult {
 			helpers::ensure_branch_admin::<T>(
 				origin,
@@ -1314,27 +1298,6 @@ pub mod pallet {
 				stable_id,
 				BranchConfigUpdate::CeilingTtl(ceiling_ttl),
 			)
-		}
-	}
-
-	/// `BranchModeProvider` implementation so other pallets can query the
-	/// derived/persisted mode without depending on us at the trait surface.
-	impl<T: Config> BranchModeProvider<T::CollateralAssetId, T::StableAssetId> for Pallet<T> {
-		fn mode(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
-		) -> Option<BranchMode> {
-			helpers::current_mode::<T>(collateral_id, stable_id).ok()
-		}
-
-		/// Answer from the registry, not the default's `mode().is_some()`: a
-		/// transient mode-computation failure (e.g. TCR overflow) must not make
-		/// a registered market read as unregistered.
-		fn is_registered(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
-		) -> bool {
-			BranchConfigs::<T>::contains_key((collateral_id, stable_id))
 		}
 	}
 

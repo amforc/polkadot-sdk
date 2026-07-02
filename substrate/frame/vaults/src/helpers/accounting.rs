@@ -59,35 +59,13 @@ pub(super) fn accrue_aggregate_interest<T: Config>(
 	new_interest
 }
 
-/// Origin of a pUSD yield credit routed by [`mint_and_route_yield`].
-#[derive(Debug, Clone, Copy)]
-pub(super) enum YieldSource {
-	/// Aggregate branch interest accrued at `OpContext::load`.
-	BranchInterest,
-	/// Upfront fee charged on borrow / change-rate.
-	UpfrontFee,
-}
-
-/// Issue `amount` pUSD and route per `SpYieldShare`: a portion goes to
-/// `T::SpYieldSink`, the residual goes to `T::FeeHandler`.
-pub(super) fn mint_and_route_yield<T: Config>(
-	collateral_id: &T::CollateralAssetId,
-	stable_id: &T::StableAssetId,
-	amount: BalanceOf<T>,
-	source: YieldSource,
-) {
+/// Issue `amount` of the market's coin (branch interest or an upfront fee) and
+/// hand it to `T::FeeHandler`. The Stability-Pool yield-share split returns
+/// with `pallet-stability-pool`; until then the whole minted amount routes to
+/// the fee destination.
+pub(super) fn mint_and_route_yield<T: Config>(stable_id: &T::StableAssetId, amount: BalanceOf<T>) {
 	let credit = T::StableAssets::issue(stable_id.clone(), amount);
-	let share: Permill = T::SpYieldShare::get();
-	let sp_amount = share * credit.peek();
-	let (sp_credit, residual) = credit.split(sp_amount);
-	if let Err(e) = <T::SpYieldSink as pusd_primitives::OnBranchYield<_, _, _>>::on_branch_yield(
-		collateral_id,
-		stable_id,
-		sp_credit,
-	) {
-		crate::log!(error, "SpYieldSink rejected {:?}: {:?}", source, e);
-	}
-	T::FeeHandler::on_unbalanced(residual);
+	T::FeeHandler::on_unbalanced(credit);
 }
 
 /// Deltas the next vault touch would apply.

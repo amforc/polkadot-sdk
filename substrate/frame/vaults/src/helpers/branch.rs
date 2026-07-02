@@ -1,5 +1,5 @@
 use super::*;
-use frame::traits::fungibles::Inspect as _;
+use frame::traits::{fungibles::Inspect as _, ContainsPair};
 
 /// Mode is `Frozen` if persisted, otherwise derived from live TCR.
 pub fn current_mode<T: Config>(
@@ -15,7 +15,7 @@ pub fn current_mode<T: Config>(
 	// that poke lands, rather than defaulting to the most permissive mode
 	// while prices are unknowable.
 	let price = match T::Oracle::provide_price(collateral_id) {
-		Ok(feed) => feed.price,
+		Ok(price) => price,
 		Err(_) => return Ok(BranchMode::Frozen),
 	};
 	let config = branch_config_of::<T>(collateral_id, stable_id)?;
@@ -56,14 +56,17 @@ pub fn register_branch<T: Config>(
 	// The pallet mints a market's stablecoin permissionlessly, so that asset must
 	// never be trusted as collateral — in this market or any sibling — else its
 	// owner could mint unbacked collateral.
-	ensure!(!T::is_same_asset(&collateral_id, &stable_id), Error::<T>::StableCollateralCollision);
+	ensure!(
+		!T::SameAsset::contains(&collateral_id, &stable_id),
+		Error::<T>::StableCollateralCollision
+	);
 	for (existing_collateral, existing_stable) in BranchConfigs::<T>::iter_keys() {
 		ensure!(
-			!T::is_same_asset(&existing_collateral, &stable_id),
+			!T::SameAsset::contains(&existing_collateral, &stable_id),
 			Error::<T>::StableCollateralCollision
 		);
 		ensure!(
-			!T::is_same_asset(&collateral_id, &existing_stable),
+			!T::SameAsset::contains(&collateral_id, &existing_stable),
 			Error::<T>::StableCollateralCollision
 		);
 	}
@@ -171,12 +174,7 @@ fn enter_frozen<T: Config>(
 		// Flush before freezing so the frozen window accrues nothing.
 		let minted = accounting::accrue_aggregate_interest::<T>(state, now);
 		if !minted.is_zero() {
-			accounting::mint_and_route_yield::<T>(
-				collateral_id,
-				stable_id,
-				minted,
-				accounting::YieldSource::BranchInterest,
-			);
+			accounting::mint_and_route_yield::<T>(stable_id, minted);
 		}
 		state.frozen = Some(FrozenState { reason, entered_at: now });
 		Ok(())
@@ -336,13 +334,13 @@ pub fn ensure_branch_admin<T: Config>(
 	stable_id: &T::StableAssetId,
 	required: AdminLevel,
 ) -> Result<AdminLevel, DispatchError> {
-	let who = ensure_signed(origin)?;
 	let info =
 		BranchAdmin::<T>::get((collateral_id, stable_id)).ok_or(Error::<T>::UnknownCollateral)?;
-	if who == info.full_admin {
+	let caller = origin.into_caller();
+	if caller == info.full_admin {
 		return Ok(AdminLevel::Full);
 	}
-	if matches!(required, AdminLevel::Emergency) && who == info.emergency_admin {
+	if matches!(required, AdminLevel::Emergency) && caller == info.emergency_admin {
 		return Ok(AdminLevel::Emergency);
 	}
 	Err(Error::<T>::NotBranchAdmin.into())
@@ -354,7 +352,7 @@ pub fn ensure_branch_admin<T: Config>(
 pub fn create_branch<T: Config>(
 	collateral_id: T::CollateralAssetId,
 	stable_id: T::StableAssetId,
-	admins: BranchAdmins<T::AccountId>,
+	admins: BranchAdmins<PalletsOriginOf<T>>,
 	config: BranchConfig<BalanceOf<T>>,
 	depositor: Option<T::AccountId>,
 ) -> Result<(), DispatchError> {
@@ -363,8 +361,9 @@ pub fn create_branch<T: Config>(
 	T::Oracle::provide_price(&collateral_id).map_err(|_| Error::<T>::OraclePriceNotAvailable)?;
 	let deposit = match depositor {
 		Some(who) => {
-			let footprint =
-				Footprint::from_mel::<BranchAdminInfo<T::AccountId, T::Consideration>>();
+			let footprint = Footprint::from_mel::<
+				BranchAdminInfo<PalletsOriginOf<T>, T::AccountId, T::Consideration>,
+			>();
 			let ticket = T::Consideration::new(&who, footprint)?;
 			Some((who, ticket))
 		},

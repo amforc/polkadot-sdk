@@ -7,7 +7,7 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, BranchAdmin, BranchConfigs, BranchStates, Config, Error, Event,
-		GlobalDebtCeiling, HoldReason, Millis, Pallet, Vaults,
+		GlobalDebtCeiling, HoldReason, Millis, Pallet, PalletsOriginOf, Vaults,
 	},
 	recovery,
 	types::{
@@ -18,7 +18,7 @@ use crate::{
 	weights::WeightInfo,
 };
 use frame::{
-	deps::frame_support::storage::with_storage_layer,
+	deps::frame_support::{defensive_assert, storage::with_storage_layer},
 	prelude::*,
 	traits::{
 		fungibles::{
@@ -26,7 +26,7 @@ use frame::{
 			MutateHold as FungiblesMutateHold,
 		},
 		tokens::Restriction,
-		Consideration, Footprint, Time,
+		Consideration, Footprint, OriginTrait, Time,
 	},
 };
 use pallet_linked_list::{ListError, Position, SortedListInterface};
@@ -129,6 +129,8 @@ pub(crate) fn vault_status_in<T: Config>(
 	recovery_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
 	owner: &T::AccountId,
 ) -> VaultStatus {
+	debug_assert!(matches!(rate_list, VaultListId::Rate(..)));
+	debug_assert!(matches!(recovery_list, VaultListId::FinalRecovery(..)));
 	if T::VaultLists::contains(rate_list, owner) {
 		return VaultStatus::Active;
 	}
@@ -152,7 +154,7 @@ impl<Balance> Vault<Balance> {
 	) -> VaultStatus {
 		vault_status_in::<T>(
 			&VaultListId::Rate(collateral_id.clone(), stable_id.clone()),
-			&VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone()),
+			&recovery::list_id::<T>(collateral_id, stable_id),
 			owner,
 		)
 	}
@@ -195,10 +197,13 @@ pub(crate) use accounting::{
 };
 use accounting::{simulate_borrow, simulate_change_rate};
 pub(crate) use branch::{
-	clear_governance_frozen_mode, create_branch, current_mode, enable_frozen_mode,
-	enforce_mode_rules, ensure_branch_admin, poke_ceiling, refresh_branch, remove_branch,
-	set_param, validate_rate,
+	clear_governance_frozen_mode, create_branch, enable_frozen_mode, enforce_mode_rules,
+	ensure_branch_admin, poke_ceiling, ratchet_ceiling, refresh_branch, remove_branch, set_param,
+	validate_rate,
 };
+// Only the test mock reads the derived mode from outside this module.
+#[cfg(test)]
+pub(crate) use branch::current_mode;
 pub(crate) use context::{OpContext, TouchedVault};
 pub(crate) use ops::{
 	activate_dormant, borrow, change_rate, close_vault, deposit_collateral_for,
