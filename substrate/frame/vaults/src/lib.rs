@@ -102,10 +102,10 @@ pub mod pallet {
 		<T as frame_system::Config>::AccountId,
 	>>::Balance;
 
-	/// Pallet-local time unit: UNIX milliseconds. All vault accounting is done
-	/// in concrete `u64` milliseconds rather than a generic `Moment`; the time
+	/// Protocol time unit: UNIX milliseconds. All vault accounting is done in
+	/// concrete `u64` milliseconds rather than a generic `Moment`; the time
 	/// provider's `Moment` is pinned to `Millis` via [`Config::TimeProvider`].
-	pub type Millis = u64;
+	pub use pusd_primitives::Millis;
 
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
@@ -1325,6 +1325,16 @@ pub mod pallet {
 			stable_id: &T::StableAssetId,
 		) -> Option<BranchMode> {
 			helpers::current_mode::<T>(collateral_id, stable_id).ok()
+		}
+
+		/// Answer from the registry, not the default's `mode().is_some()`: a
+		/// transient mode-computation failure (e.g. TCR overflow) must not make
+		/// a registered market read as unregistered.
+		fn is_registered(
+			collateral_id: &T::CollateralAssetId,
+			stable_id: &T::StableAssetId,
+		) -> bool {
+			BranchConfigs::<T>::contains_key((collateral_id, stable_id))
 		}
 	}
 

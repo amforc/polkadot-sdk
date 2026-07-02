@@ -198,13 +198,13 @@ impl pusd_primitives::OnBranchYield<AssetId, StableId, Credit<AccountId, VaultSt
 	for DropYieldSink
 {
 	fn on_branch_yield(
-		_collateral_id: AssetId,
-		stable_id: StableId,
+		_collateral_id: &AssetId,
+		stable_id: &StableId,
 		credit: Credit<AccountId, VaultStableAssets>,
 	) -> DispatchResult {
 		// Every yield credit a market routes must be denominated in that market's
 		// own coin; a wrong-id mint would surface here across the whole suite.
-		assert_eq!(credit.asset(), stable_id, "yield minted in the wrong coin");
+		assert_eq!(credit.asset(), *stable_id, "yield minted in the wrong asset");
 		drop(credit);
 		Ok(())
 	}
@@ -638,10 +638,10 @@ pub fn liquidate_market_with(
 	owner: AccountId,
 	build: impl FnOnce(Balance) -> LiquidationAllocation<AccountId, Balance>,
 ) -> DispatchResult {
-	<Pallet<Test> as VaultLiquidationInterface<AccountId, AssetId, StableId, Balance>>::execute_liquidation(
-		collateral,
-		stable,
-		owner,
+	<Pallet<Test> as VaultLiquidationInterface<AssetId, StableId, AccountId, Balance>>::execute_liquidation(
+		&collateral,
+		&stable,
+		&owner,
 		|snapshot| Ok(build(snapshot.debt)),
 	)
 }
@@ -664,29 +664,46 @@ pub fn redeem_market(
 	amount: Balance,
 ) -> Result<AccountId, DispatchError> {
 	let target = <Pallet<Test> as VaultRedemptionInterface<
-		AccountId,
 		AssetId,
 		StableId,
+		AccountId,
 		Balance,
 	>>::next_redemption_target(&collateral, &stable, None)
 	.ok_or(DispatchError::Other("no redemption target"))?;
 	let owner = target.owner;
-	let snapshot = <Pallet<Test> as VaultRedemptionInterface<
-		AccountId,
-		AssetId,
-		StableId,
-		Balance,
-	>>::prepare_redemption_step(collateral.clone(), stable, owner)?;
-	let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
 	let price = MockPrices::get().get(&collateral).copied().expect("price set");
-	let collateral_to_redeemer =
-		(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
-	let alloc =
-		RedemptionAllocation { debt_to_cancel, collateral_to_redeemer, fee_collateral_retained: 0 };
-	<Pallet<Test> as VaultRedemptionInterface<AccountId, AssetId, StableId, Balance>>::apply_redemption(
-		collateral, stable, owner, redeemer, alloc,
-	)?;
+	redeem_step(&collateral, &stable, &owner, |snapshot| {
+		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
+		let collateral_to_redeemer =
+			(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
+		Ok(Some(RedemptionAllocation {
+			redeemer,
+			debt_to_cancel,
+			collateral_to_redeemer,
+			fee_collateral_retained: 0,
+		}))
+	})?;
 	Ok(owner)
+}
+
+/// One redemption step against an explicit vault, through the trait surface.
+pub fn redeem_step(
+	collateral: &AssetId,
+	stable: &StableId,
+	owner: &AccountId,
+	build_allocation: impl FnOnce(
+		pusd_primitives::RedemptionStepSnapshot<Balance>,
+	) -> Result<
+		Option<RedemptionAllocation<AccountId, Balance>>,
+		DispatchError,
+	>,
+) -> Result<Option<RedemptionAllocation<AccountId, Balance>>, DispatchError> {
+	<Pallet<Test> as VaultRedemptionInterface<AssetId, StableId, AccountId, Balance>>::redeem_step(
+		collateral,
+		stable,
+		owner,
+		build_allocation,
+	)
 }
 
 /// Held collateral on `(collateral, who)` for the `VaultCollateral` reason.

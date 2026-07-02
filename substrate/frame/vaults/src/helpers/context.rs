@@ -16,6 +16,8 @@ pub(crate) struct OpContext<T: Config> {
 	pub stable_id: T::StableAssetId,
 	pub now: Millis,
 	pub state: BranchState<T::AccountId, BalanceOf<T>>,
+	rate_list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
+	recovery_list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
 	pending_interest_mint: BalanceOf<T>,
 	pending_fee: Option<(T::AccountId, BalanceOf<T>)>,
 	pending_interest_accrued: Option<(T::AccountId, BalanceOf<T>)>,
@@ -36,11 +38,15 @@ impl<T: Config> OpContext<T> {
 
 		let pending_interest_mint = accrue_aggregate_interest::<T>(&mut state, now);
 
+		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
+		let recovery_list = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
 		Ok(Self {
 			collateral_id,
 			stable_id,
 			now,
 			state,
+			rate_list,
+			recovery_list,
 			pending_interest_mint,
 			pending_fee: None,
 			pending_interest_accrued: None,
@@ -67,8 +73,9 @@ impl<T: Config> OpContext<T> {
 	}
 
 	/// The branch's rate-index list id.
-	pub fn rate_list(&self) -> VaultListId<T::CollateralAssetId, T::StableAssetId> {
-		VaultListId::Rate(self.collateral_id.clone(), self.stable_id.clone())
+	// TODO: Do we need this wrapper?
+	pub fn rate_list(&self) -> &VaultListId<T::CollateralAssetId, T::StableAssetId> {
+		&self.rate_list
 	}
 
 	/// Oracle price for this context's collateral.
@@ -104,7 +111,7 @@ impl<T: Config> OpContext<T> {
 		owner: &T::AccountId,
 	) -> Result<TouchedVault<BalanceOf<T>>, DispatchError> {
 		let mut vault = vault_of::<T>(&self.collateral_id, &self.stable_id, owner)?;
-		let status = vault.status::<T>(&self.collateral_id, &self.stable_id, owner);
+		let status = vault_status_in::<T>(&self.rate_list, &self.recovery_list, owner);
 		let pending = pending_touch_for::<T>(&vault, &self.state, self.now);
 
 		if !pending.interest.is_zero() {
@@ -196,34 +203,37 @@ impl<T: Config> OpContext<T> {
 
 	/// Runs external hooks after the storage commit.
 	fn finish(self) {
-		if !self.pending_interest_mint.is_zero() {
+		let Self {
+			collateral_id,
+			stable_id,
+			pending_interest_mint,
+			pending_fee,
+			pending_interest_accrued,
+			..
+		} = self;
+		if !pending_interest_mint.is_zero() {
 			mint_and_route_yield::<T>(
-				&self.collateral_id,
-				&self.stable_id,
-				self.pending_interest_mint,
+				&collateral_id,
+				&stable_id,
+				pending_interest_mint,
 				YieldSource::BranchInterest,
 			);
 		}
-		if let Some((owner, amount)) = self.pending_interest_accrued {
+		if let Some((owner, amount)) = pending_interest_accrued {
 			Pallet::<T>::deposit_event(Event::InterestAccrued {
-				collateral_id: self.collateral_id.clone(),
-				stable_id: self.stable_id.clone(),
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
 				owner,
 				amount,
 			});
 		}
-		if let Some((fee_owner, fee)) = self.pending_fee {
-			mint_and_route_yield::<T>(
-				&self.collateral_id,
-				&self.stable_id,
-				fee,
-				YieldSource::UpfrontFee,
-			);
+		if let Some((owner, amount)) = pending_fee {
+			mint_and_route_yield::<T>(&collateral_id, &stable_id, amount, YieldSource::UpfrontFee);
 			Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
-				collateral_id: self.collateral_id.clone(),
-				stable_id: self.stable_id.clone(),
-				owner: fee_owner,
-				amount: fee,
+				collateral_id,
+				stable_id,
+				owner,
+				amount,
 			});
 		}
 	}

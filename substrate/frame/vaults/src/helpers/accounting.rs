@@ -81,8 +81,8 @@ pub(super) fn mint_and_route_yield<T: Config>(
 	let sp_amount = share * credit.peek();
 	let (sp_credit, residual) = credit.split(sp_amount);
 	if let Err(e) = <T::SpYieldSink as pusd_primitives::OnBranchYield<_, _, _>>::on_branch_yield(
-		collateral_id.clone(),
-		stable_id.clone(),
+		collateral_id,
+		stable_id,
 		sp_credit,
 	) {
 		crate::log!(error, "SpYieldSink rejected {:?}: {:?}", source, e);

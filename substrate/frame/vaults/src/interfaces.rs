@@ -5,14 +5,12 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet, StableCreditOf,
-		Vaults,
 	},
 	recovery,
 	types::{BranchState, VaultStatus},
 };
 use frame::{
-	arithmetic::Permill,
-	deps::frame_support::transactional,
+	deps::frame_support::{defensive, transactional},
 	prelude::*,
 	traits::{
 		fungibles::{Balanced as FungiblesBalanced, MutateHold as FungiblesMutateHold},
@@ -22,28 +20,28 @@ use frame::{
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
-	AllocationResult, LiquidationSnapshot, RedemptionAllocation, RedemptionStepSnapshot,
-	RedemptionTarget, RedemptionTargetKind, VaultBadDebtInterface, VaultLiquidationInterface,
-	VaultRedemptionInterface,
+	AllocationResult, LiquidationSnapshot, RedemptionAllocation, RedemptionRegime,
+	RedemptionStepSnapshot, RedemptionTarget, RedemptionTargetKind, VaultBadDebtInterface,
+	VaultLiquidationInterface, VaultRedemptionInterface,
 };
 
 impl<T: Config>
-	VaultLiquidationInterface<T::AccountId, T::CollateralAssetId, T::StableAssetId, BalanceOf<T>>
+	VaultLiquidationInterface<T::CollateralAssetId, T::StableAssetId, T::AccountId, BalanceOf<T>>
 	for Pallet<T>
 {
 	#[transactional]
 	fn execute_liquidation(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
-		owner: T::AccountId,
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
+		owner: &T::AccountId,
 		build_allocation: impl FnOnce(
 			LiquidationSnapshot<BalanceOf<T>>,
 		) -> AllocationResult<T::AccountId, BalanceOf<T>>,
 	) -> DispatchResult {
-		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
+		let mut context = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
 		context.ensure_not_frozen()?;
 		let price = context.price()?;
-		let TouchedVault { vault, status } = context.touch(&owner)?;
+		let TouchedVault { vault, status } = context.touch(owner)?;
 		ensure!(!status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
 		let post_touch_debt = vault.debt.total();
@@ -74,7 +72,7 @@ impl<T: Config>
 
 		let redistributed_debt = post_touch_debt.saturating_sub(allocation.offset.debt);
 		context.state.detach_vault(&vault);
-		context.state.release_dormant_target(&owner);
+		context.state.release_dormant_target(owner);
 		// Redistributed collateral stays branch-owned until recipient touch.
 		let non_redistribution_out = held.saturating_sub(allocation.redistribution_collateral);
 		context.state.total_collateral =
@@ -88,7 +86,7 @@ impl<T: Config>
 			)?;
 		}
 
-		match T::VaultLists::remove(&context.rate_list(), &owner) {
+		match T::VaultLists::remove(context.rate_list(), owner) {
 			Ok(()) | Err(ListError::ItemNotFound) => {},
 			Err(_) => return Err(Error::<T>::RateIndexInvariantBroken.into()),
 		}
@@ -97,7 +95,7 @@ impl<T: Config>
 			T::CollateralAssets::transfer_on_hold(
 				context.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
-				&owner,
+				owner,
 				&Pallet::<T>::redistribution_account(&context.collateral_id, &context.stable_id),
 				allocation.redistribution_collateral,
 				Precision::Exact,
@@ -110,7 +108,7 @@ impl<T: Config>
 			T::CollateralAssets::transfer_on_hold(
 				context.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
-				&owner,
+				owner,
 				&allocation.offset.recipient,
 				allocation.offset.collateral,
 				Precision::Exact,
@@ -123,7 +121,7 @@ impl<T: Config>
 			T::CollateralAssets::transfer_on_hold(
 				context.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
-				&owner,
+				owner,
 				&allocation.keeper.recipient,
 				allocation.keeper.collateral,
 				Precision::Exact,
@@ -139,13 +137,13 @@ impl<T: Config>
 			T::CollateralAssets::release(
 				context.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
-				&owner,
+				owner,
 				leftover,
 				Precision::Exact,
 			)?;
 		}
 
-		context.commit_removing_vault(&owner);
+		context.commit_removing_vault(owner);
 		Ok(())
 	}
 }
@@ -211,7 +209,7 @@ fn apply_redistribution_accumulators<T: Config>(
 }
 
 impl<T: Config>
-	VaultRedemptionInterface<T::AccountId, T::CollateralAssetId, T::StableAssetId, BalanceOf<T>>
+	VaultRedemptionInterface<T::CollateralAssetId, T::StableAssetId, T::AccountId, BalanceOf<T>>
 	for Pallet<T>
 {
 	/// Priority order: `FinalRecovery` FIFO head, then `dormant_redemption_target`,
@@ -238,48 +236,43 @@ impl<T: Config>
 	}
 
 	#[transactional]
-	fn prepare_redemption_step(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
-		owner: T::AccountId,
-	) -> Result<RedemptionStepSnapshot<T::AccountId, BalanceOf<T>>, DispatchError> {
-		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
+	fn redeem_step(
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
+		owner: &T::AccountId,
+		build_allocation: impl FnOnce(
+			RedemptionStepSnapshot<BalanceOf<T>>,
+		) -> Result<
+			Option<RedemptionAllocation<T::AccountId, BalanceOf<T>>>,
+			DispatchError,
+		>,
+	) -> Result<Option<RedemptionAllocation<T::AccountId, BalanceOf<T>>>, DispatchError> {
+		let mut context = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
 		context.ensure_not_frozen()?;
-		let TouchedVault { vault, status } = context.touch(&owner)?;
-		let kind = match status {
-			VaultStatus::Active => RedemptionTargetKind::Ordinary,
-			VaultStatus::Dormant => RedemptionTargetKind::Dormant,
-			VaultStatus::FinalRecovery => RedemptionTargetKind::FinalRecovery,
+		let TouchedVault { mut vault, status } = context.touch(owner)?;
+		// Only FinalRecovery pricing consumes the redistribution penalty, so defer
+		// the branch-config read on the common ordinary/dormant skip path.
+		let (regime, maybe_config) = match status {
+			VaultStatus::Active => (RedemptionRegime::Ordinary, None),
+			VaultStatus::Dormant => (RedemptionRegime::Dormant, None),
+			VaultStatus::FinalRecovery => {
+				let config = context.config()?;
+				let redistribution_penalty = config.redistribution_penalty;
+				(RedemptionRegime::FinalRecovery { redistribution_penalty }, Some(config))
+			},
 		};
-		// Collateral now lives on the vault row (a shared on-hold balance may back
-		// several markets on the same collateral asset), so read it directly.
-		let collateral = vault.collateral;
-		// Only FinalRecovery pricing consumes the redistribution penalty, so skip the
-		// branch-config read on the common ordinary/dormant multi-step path.
-		let redistribution_penalty = if matches!(kind, RedemptionTargetKind::FinalRecovery) {
-			helpers::branch_config_of::<T>(&context.collateral_id, &context.stable_id)?
-				.redistribution_penalty
-		} else {
-			Permill::zero()
-		};
-		let debt = vault.debt.total();
-		context.commit_with_vault(&owner, &vault);
-		Ok(RedemptionStepSnapshot { owner, kind, debt, collateral, redistribution_penalty })
-	}
-
-	#[transactional]
-	fn apply_redemption(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
-		owner: T::AccountId,
-		redeemer: T::AccountId,
-		allocation: RedemptionAllocation<BalanceOf<T>>,
-	) -> DispatchResult {
-		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
-		context.ensure_not_frozen()?;
-		let TouchedVault { mut vault, status } = context.touch(&owner)?;
 		let post_touch_debt = vault.debt.total();
+		// Collateral lives on the vault row (a shared on-hold balance may back
+		// several markets on the same collateral asset), so read it directly.
 		let held = vault.collateral;
+		let snapshot = RedemptionStepSnapshot { regime, debt: post_touch_debt, collateral: held };
+
+		let Some(allocation) = build_allocation(snapshot)? else {
+			// Skipped target: persist the touch so the accrual it caused is paid for.
+			context.commit_with_vault(owner, &vault);
+			return Ok(None);
+		};
+
 		ensure!(
 			allocation.debt_to_cancel <= post_touch_debt,
 			Error::<T>::InvalidRedemptionAllocation
@@ -299,8 +292,8 @@ impl<T: Config>
 			T::CollateralAssets::transfer_on_hold(
 				context.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
-				&owner,
-				&redeemer,
+				owner,
+				&allocation.redeemer,
 				allocation.collateral_to_redeemer,
 				Precision::Exact,
 				Restriction::Free,
@@ -308,7 +301,10 @@ impl<T: Config>
 			)?;
 		}
 
-		let config = context.config()?;
+		let config = match maybe_config {
+			Some(config) => config,
+			None => context.config()?,
+		};
 		let new_total = vault.debt.total();
 		let stake_changes = matches!(status, VaultStatus::Active | VaultStatus::Dormant) &&
 			!allocation.collateral_to_redeemer.is_zero();
@@ -324,7 +320,7 @@ impl<T: Config>
 		}
 		if matches!(status, VaultStatus::Active | VaultStatus::Dormant) {
 			if new_total.is_zero() {
-				context.state.release_dormant_target(&owner);
+				context.state.release_dormant_target(owner);
 			} else if new_total < config.minimum_debt &&
 				!context.state.try_park_dormant_target(owner.clone())
 			{
@@ -335,89 +331,75 @@ impl<T: Config>
 			vault.redistribution_stake = new_stake;
 		}
 
-		settle_redemption_status::<T>(
-			&mut context,
-			&owner,
-			&mut vault,
-			status,
-			new_total,
-			&config,
-		)?;
+		settle_redemption_status::<T>(&mut context, owner, &mut vault, status, new_total, &config)?;
 
 		Pallet::<T>::deposit_event(Event::VaultRedeemed {
 			collateral_id: context.collateral_id.clone(),
 			stable_id: context.stable_id.clone(),
 			owner: owner.clone(),
-			redeemer,
+			redeemer: allocation.redeemer.clone(),
 			debt_cancelled: allocation.debt_to_cancel,
 			collateral_to_redeemer: allocation.collateral_to_redeemer,
 			fee_collateral_retained: allocation.fee_collateral_retained,
 			vault_annual_rate: vault.annual_rate,
 		});
-		context.commit_with_vault(&owner, &vault);
-		Ok(())
+		context.commit_with_vault(owner, &vault);
+		Ok(Some(allocation))
 	}
 
 	#[transactional]
 	fn settle_recovery_residual(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
-		owner: T::AccountId,
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
+		owner: &T::AccountId,
 	) -> Result<BalanceOf<T>, DispatchError> {
-		let vault = helpers::vault_of::<T>(&collateral_id, &stable_id, &owner)?;
-		ensure!(
-			vault.status::<T>(&collateral_id, &stable_id, &owner).is_final_recovery(),
-			Error::<T>::InvalidVaultStatus
-		);
-		// Move the residual debt off the vault and onto the branch bad-debt
-		// ledger; the orchestrator burns it from the Insurance Fund via `heal`.
+		let mut context = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
+		context.ensure_not_frozen()?;
+		let TouchedVault { vault, status } = context.touch(owner)?;
+		ensure!(status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
+		// Move the fully-accrued residual debt off the vault and onto the branch
+		// bad-debt ledger; the orchestrator burns it from the Insurance Fund via
+		// `heal`.
 		let residual = vault.debt.total();
 		// Collateral lives on the vault row; the leftover here is sub-atom dust.
 		let dust = vault.collateral;
-		let mut swept = BalanceOf::<T>::zero();
-		BranchStates::<T>::try_mutate(
-			&collateral_id,
-			&stable_id,
-			|maybe| -> Result<_, DispatchError> {
-				let bs = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-				bs.detach_vault(&vault);
-				bs.debt.bad_debt = bs.debt.bad_debt.saturating_add(residual);
-				bs.remove_collateral(dust);
-				if bs.is_empty_of_liability() {
-					swept = bs.sweep_orphan_debt();
-				}
-				Ok(())
-			},
-		)?;
-		recovery::remove::<T>(&collateral_id, &stable_id, &owner)?;
+		context.state.detach_vault(&vault);
+		context.state.debt.bad_debt = context.state.debt.bad_debt.saturating_add(residual);
+		context.state.remove_collateral(dust);
+		let swept = if context.state.is_empty_of_liability() {
+			context.state.sweep_orphan_debt()
+		} else {
+			BalanceOf::<T>::zero()
+		};
+		recovery::remove::<T>(&context.collateral_id, &context.stable_id, owner)?;
 
 		// Release only this market's residual dust from the shared hold before the
 		// vault row vanishes; the owner's hold may still back other markets.
 		if !dust.is_zero() {
 			T::CollateralAssets::release(
-				collateral_id.clone(),
+				context.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
-				&owner,
+				owner,
 				dust,
 				Precision::Exact,
 			)?;
 		}
 
-		Vaults::<T>::remove((&collateral_id, &stable_id, &owner));
 		if !swept.is_zero() {
 			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id: collateral_id.clone(),
-				stable_id: stable_id.clone(),
+				collateral_id: context.collateral_id.clone(),
+				stable_id: context.stable_id.clone(),
 				amount: swept,
 			});
 		}
 		if !residual.is_zero() {
 			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id,
-				stable_id,
+				collateral_id: context.collateral_id.clone(),
+				stable_id: context.stable_id.clone(),
 				amount: residual,
 			});
 		}
+		context.commit_removing_vault(owner);
 		Ok(residual)
 	}
 
@@ -441,7 +423,7 @@ fn settle_redemption_status<T: Config>(
 ) -> DispatchResult {
 	match status {
 		VaultStatus::Active if new_total < config.minimum_debt => {
-			T::VaultLists::remove(&context.rate_list(), owner)
+			T::VaultLists::remove(context.rate_list(), owner)
 				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		},
 		VaultStatus::FinalRecovery if new_total.is_zero() => {
@@ -465,40 +447,44 @@ impl<T: Config>
 {
 	#[transactional]
 	fn record_bad_debt(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		if amount.is_zero() {
 			return Ok(());
 		}
 		BranchStates::<T>::try_mutate(
-			&collateral_id,
-			&stable_id,
+			collateral_id,
+			stable_id,
 			|maybe| -> Result<_, DispatchError> {
 				let state = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
 				state.debt.bad_debt = state.debt.bad_debt.saturating_add(amount);
 				Ok(())
 			},
 		)?;
-		Pallet::<T>::deposit_event(Event::BadDebtRecorded { collateral_id, stable_id, amount });
+		Pallet::<T>::deposit_event(Event::BadDebtRecorded {
+			collateral_id: collateral_id.clone(),
+			stable_id: stable_id.clone(),
+			amount,
+		});
 		Ok(())
 	}
 
 	#[transactional]
 	fn heal(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
 		credit: StableCreditOf<T>,
 	) -> Result<StableCreditOf<T>, DispatchError> {
 		// A credit denominated in another coin cannot heal this market's bad
 		// debt — hand it straight back. The `offset` below would reject it
 		// anyway (mismatched asset), but checking up front keeps the imbalance
 		// intact for the caller.
-		if credit.asset() != stable_id {
+		if credit.asset() != *stable_id {
 			return Ok(credit);
 		}
-		let state = helpers::branch_state_of::<T>(&collateral_id, &stable_id)?;
+		let state = helpers::branch_state_of::<T>(collateral_id, stable_id)?;
 		let healable = credit.peek().min(state.debt.bad_debt);
 		if healable.is_zero() {
 			// Nothing recorded (or an empty credit) — hand everything back.
@@ -506,28 +492,17 @@ impl<T: Config>
 		}
 		let (to_burn, surplus) = credit.split(healable);
 		// Rescind the market's own coin to net the burn to zero. The credit's
-		// asset equals `stable_id` (checked above), so `offset` always matches.
+		// asset equals `stable_id` (checked above) and its size equals
+		// `healable`, so `offset` always nets fully; anything else is
+		// corruption, and rolling back keeps the ledgers coherent.
 		let debt = T::StableAssets::rescind(stable_id.clone(), healable);
-		match to_burn.offset(debt) {
-			Ok(SameOrOther::None) => {},
-			Ok(SameOrOther::Same(remaining_credit)) => {
-				// Defensive: `peek == healable` rescind should fully net.
-				drop(remaining_credit);
-				return Err(Error::<T>::ArithmeticOverflow.into());
-			},
-			Ok(SameOrOther::Other(remaining_debt)) => {
-				drop(remaining_debt);
-				return Err(Error::<T>::ArithmeticOverflow.into());
-			},
-			Err((leftover_credit, leftover_debt)) => {
-				// Unreachable: assets were equalised above.
-				drop((leftover_credit, leftover_debt));
-				return Err(Error::<T>::ArithmeticOverflow.into());
-			},
+		if !matches!(to_burn.offset(debt), Ok(SameOrOther::None)) {
+			defensive!("healed credit must net to zero against its own rescind");
+			return Err(Error::<T>::ArithmeticOverflow.into());
 		}
 		BranchStates::<T>::try_mutate(
-			&collateral_id,
-			&stable_id,
+			collateral_id,
+			stable_id,
 			|maybe| -> Result<_, DispatchError> {
 				let state = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
 				state.debt.bad_debt = state.debt.bad_debt.saturating_sub(healable);
@@ -535,8 +510,8 @@ impl<T: Config>
 			},
 		)?;
 		Pallet::<T>::deposit_event(Event::BadDebtHealed {
-			collateral_id,
-			stable_id,
+			collateral_id: collateral_id.clone(),
+			stable_id: stable_id.clone(),
 			amount: healable,
 		});
 		Ok(surplus)

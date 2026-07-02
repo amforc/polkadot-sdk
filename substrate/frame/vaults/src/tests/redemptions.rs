@@ -6,7 +6,6 @@ use crate::{
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{
 	KeeperCompensation, LiquidationAllocation, OffsetAllocation, RedemptionAllocation,
-	VaultRedemptionInterface,
 };
 
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
@@ -92,72 +91,30 @@ fn redeemed_above_min_debt_stays_active() {
 }
 
 #[test]
-fn prepare_redemption_step_rejects_frozen_branch_and_missing_vault() {
+fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_noop!(
-			<crate::Pallet<Test> as VaultRedemptionInterface<
-				AccountId,
-				AssetId,
-				StableId,
-				Balance,
-			>>::prepare_redemption_step(DOT, PUSD, 99),
+			redeem_step(&DOT, &PUSD, &99, |_| panic!("closure must not run")),
 			crate::Error::<Test>::VaultNotFound
 		);
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD
-		));
-		assert_noop!(
-			<crate::Pallet<Test> as VaultRedemptionInterface<
-				AccountId,
-				AssetId,
-				StableId,
-				Balance,
-			>>::prepare_redemption_step(DOT, PUSD, 1),
-			crate::Error::<Test>::BranchFrozen
-		);
-	});
-}
-
-#[test]
-fn apply_redemption_rejects_frozen_branch() {
-	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
 		// A frozen branch must reject settlement, like every other price-dependent
-		// path; the gate fires before any vault is touched.
+		// path; the gate fires before any vault is touched or priced.
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD
 		));
 		assert_noop!(
-			<crate::Pallet<Test> as VaultRedemptionInterface<
-				AccountId,
-				AssetId,
-				StableId,
-				Balance,
-			>>::apply_redemption(
-				DOT,
-				PUSD,
-				1,
-				3,
-				RedemptionAllocation {
-					debt_to_cancel: 100,
-					collateral_to_redeemer: 10,
-					fee_collateral_retained: 0,
-				}
-			),
+			redeem_step(&DOT, &PUSD, &1, |_| panic!("closure must not run")),
 			crate::Error::<Test>::BranchFrozen
 		);
 	});
 }
 
 #[test]
-fn apply_redemption_rejects_invalid_allocations_without_state_change() {
+fn redeem_step_rejects_invalid_allocations_without_state_change() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
@@ -166,46 +123,56 @@ fn apply_redemption_rejects_invalid_allocations_without_state_change() {
 		let held_pre = held(DOT, 1);
 
 		assert_noop!(
-			<crate::Pallet<Test> as VaultRedemptionInterface<
-				AccountId,
-				AssetId,
-				StableId,
-				Balance,
-			>>::apply_redemption(
-				DOT,
-				PUSD,
-				1,
-				3,
-				RedemptionAllocation {
-					debt_to_cancel: vault_pre.debt.total() + 1,
-					collateral_to_redeemer: 0,
-					fee_collateral_retained: 0,
-				}
-			),
+			redeem_step(&DOT, &PUSD, &1, |snapshot| Ok(Some(RedemptionAllocation {
+				redeemer: 3,
+				debt_to_cancel: snapshot.debt + 1,
+				collateral_to_redeemer: 0,
+				fee_collateral_retained: 0,
+			}))),
 			crate::Error::<Test>::InvalidRedemptionAllocation
 		);
 		assert_noop!(
-			<crate::Pallet<Test> as VaultRedemptionInterface<
-				AccountId,
-				AssetId,
-				StableId,
-				Balance,
-			>>::apply_redemption(
-				DOT,
-				PUSD,
-				1,
-				3,
-				RedemptionAllocation {
-					debt_to_cancel: 0,
-					collateral_to_redeemer: held_pre + 1,
-					fee_collateral_retained: 0,
-				}
-			),
+			redeem_step(&DOT, &PUSD, &1, |snapshot| Ok(Some(RedemptionAllocation {
+				redeemer: 3,
+				debt_to_cancel: 0,
+				collateral_to_redeemer: snapshot.collateral + 1,
+				fee_collateral_retained: 0,
+			}))),
 			crate::Error::<Test>::InvalidRedemptionAllocation
 		);
 
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap(), vault_pre);
 		assert_eq!(held(DOT, 1), held_pre);
+	});
+}
+
+// `Ok(None)` from the pricing closure is the skip signal: the step applies
+// nothing, but the touch it caused is committed rather than rolled back.
+#[test]
+fn redeem_step_skip_persists_touch_without_redeeming() {
+	build_and_execute(|| {
+		register_default_branch();
+		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(50, 100)));
+		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(60, 100)));
+		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		let now = pallet_timestamp::Pallet::<Test>::get();
+
+		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let held_pre = held(DOT, 1);
+		assert_eq!(redeem_step(&DOT, &PUSD, &1, |_| Ok(None)), Ok(None));
+
+		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		// No debt cancelled, no collateral moved — but the year of pending
+		// interest was folded into the row and the interest clock advanced.
+		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
+		// Exactly one year at 50% on 500 principal.
+		assert_eq!(v_post.debt.interest, v_pre.debt.interest + 250);
+		assert_eq!(held(DOT, 1), held_pre);
+		assert_eq!(
+			v_post.last_interest_time,
+			BranchStates::<Test>::get(DOT, PUSD).unwrap().interest_time(now)
+		);
+		assert!(vault_status(DOT, 1).is_active());
 	});
 }
 
@@ -225,22 +192,12 @@ fn redemption_with_retained_fee_leaves_fee_collateral_on_vault() {
 		let coll_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().collateral;
 		let redeemer_pre = collateral_balance(DOT, 3);
 
-		assert_ok!(<crate::Pallet<Test> as VaultRedemptionInterface<
-			AccountId,
-			AssetId,
-			StableId,
-			Balance,
-		>>::apply_redemption(
-			DOT,
-			PUSD,
-			1,
-			3,
-			RedemptionAllocation {
-				debt_to_cancel: 100,
-				collateral_to_redeemer: 10,
-				fee_collateral_retained: 5,
-			}
-		));
+		assert_ok!(redeem_step(&DOT, &PUSD, &1, |_| Ok(Some(RedemptionAllocation {
+			redeemer: 3,
+			debt_to_cancel: 100,
+			collateral_to_redeemer: 10,
+			fee_collateral_retained: 5,
+		}))));
 
 		// Only the redeemer's 10 leaves the hold; the 5-unit fee stays locked on
 		// the vault (it does not move to the redeemer or through `FeeHandler`).
