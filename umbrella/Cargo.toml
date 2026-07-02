@@ -138,6 +138,7 @@ std = [
 	"pallet-psm?/std",
 	"pallet-ranked-collective?/std",
 	"pallet-recovery?/std",
+	"pallet-redemptions?/std",
 	"pallet-referenda?/std",
 	"pallet-remark?/std",
 	"pallet-revive-types?/std",
@@ -342,6 +343,7 @@ runtime-benchmarks = [
 	"pallet-psm?/runtime-benchmarks",
 	"pallet-ranked-collective?/runtime-benchmarks",
 	"pallet-recovery?/runtime-benchmarks",
+	"pallet-redemptions?/runtime-benchmarks",
 	"pallet-referenda?/runtime-benchmarks",
 	"pallet-remark?/runtime-benchmarks",
 	"pallet-revive?/runtime-benchmarks",
@@ -496,6 +498,7 @@ try-runtime = [
 	"pallet-psm?/try-runtime",
 	"pallet-ranked-collective?/try-runtime",
 	"pallet-recovery?/try-runtime",
+	"pallet-redemptions?/try-runtime",
 	"pallet-referenda?/try-runtime",
 	"pallet-remark?/try-runtime",
 	"pallet-revive?/try-runtime",
@@ -724,6 +727,7 @@ runtime-full = [
 	"pallet-psm",
 	"pallet-ranked-collective",
 	"pallet-recovery",
+	"pallet-redemptions",
 	"pallet-referenda",
 	"pallet-remark",
 	"pallet-revive",
@@ -1731,6 +1735,11 @@ path = "../substrate/frame/ranked-collective"
 default-features = false
 optional = true
 path = "../substrate/frame/recovery"
+
+[dependencies.pallet-redemptions]
+default-features = false
+optional = true
+path = "../substrate/frame/redemptions"
 
 [dependencies.pallet-referenda]
 default-features = false

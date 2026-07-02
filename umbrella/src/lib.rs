@@ -661,6 +661,10 @@ pub use pallet_ranked_collective;
 #[cfg(feature = "pallet-recovery")]
 pub use pallet_recovery;
 
+/// FRAME pallet for the pUSD redemptions engine.
+#[cfg(feature = "pallet-redemptions")]
+pub use pallet_redemptions;
+
 /// FRAME pallet for inclusive on-chain decisions.
 #[cfg(feature = "pallet-referenda")]
 pub use pallet_referenda;
