@@ -11,11 +11,6 @@ use frame::{
 };
 use pusd_primitives::ProvidePrice;
 
-pub(crate) struct TouchedVault<Balance> {
-	pub vault: Vault<Balance>,
-	pub status: VaultStatus,
-}
-
 /// Threads one branch-state read through an operation and commits it once.
 pub(crate) struct OpContext<T: Config> {
 	pub collateral_id: T::CollateralAssetId,
@@ -28,6 +23,8 @@ pub(crate) struct OpContext<T: Config> {
 	pending_interest_accrued: Option<(T::AccountId, BalanceOf<T>)>,
 	#[cfg(debug_assertions)]
 	loaded: BranchState<T::AccountId, BalanceOf<T>>,
+	#[cfg(debug_assertions)]
+	touched_owner: Option<T::AccountId>,
 }
 
 impl<T: Config> OpContext<T> {
@@ -55,6 +52,8 @@ impl<T: Config> OpContext<T> {
 			pending_interest_accrued: None,
 			#[cfg(debug_assertions)]
 			loaded,
+			#[cfg(debug_assertions)]
+			touched_owner: None,
 		})
 	}
 
@@ -65,8 +64,8 @@ impl<T: Config> OpContext<T> {
 		owner: &T::AccountId,
 	) -> Result<(), DispatchError> {
 		let mut context = Self::load(collateral_id, stable_id)?;
-		let touched = context.touch(owner)?;
-		context.commit_with_vault(owner, &touched.vault);
+		let (vault, _) = context.touch(owner)?;
+		context.commit_with_vault(owner, &vault);
 		Ok(())
 	}
 
@@ -113,7 +112,12 @@ impl<T: Config> OpContext<T> {
 	pub fn touch(
 		&mut self,
 		owner: &T::AccountId,
-	) -> Result<TouchedVault<BalanceOf<T>>, DispatchError> {
+	) -> Result<(Vault<BalanceOf<T>>, VaultStatus), DispatchError> {
+		#[cfg(debug_assertions)]
+		{
+			debug_assert!(self.touched_owner.is_none(), "one touch per context");
+			self.touched_owner = Some(owner.clone());
+		}
 		let mut vault = Pallet::<T>::vault_of(&self.collateral_id, &self.stable_id, owner)?;
 		let status = Pallet::<T>::vault_status_in(
 			&self.rate_list,
@@ -124,34 +128,10 @@ impl<T: Config> OpContext<T> {
 
 		if !pending.interest.is_zero() {
 			vault.debt.interest = vault.debt.interest.saturating_add(pending.interest);
-			debug_assert!(self.pending_interest_accrued.is_none(), "one touch per context");
 			self.pending_interest_accrued = Some((owner.clone(), pending.interest));
 		}
 		if !pending.principal.is_zero() {
-			self.state.debt.pending_redistribution_principal = self
-				.state
-				.debt
-				.pending_redistribution_principal
-				.saturating_sub(pending.principal);
-			self.state.debt.principal = self.state.debt.principal.saturating_add(pending.principal);
-			// Replace the avg-rate redistribution contribution with this
-			// vault's own-rate contribution.
-			let delta_weight_per_stake = self
-				.state
-				.redistribution
-				.weight_per_stake
-				.saturating_sub(vault.redistribution_snapshot.weight_per_stake);
-			let weight_to_remove =
-				delta_weight_per_stake.saturating_mul_int(vault.redistribution_stake);
-			let principal_before = vault.debt.principal;
-			vault.debt.principal = vault.debt.principal.saturating_add(pending.principal);
-			self.state.debt.weighted_principal_sum = self
-				.state
-				.debt
-				.weighted_principal_sum
-				.saturating_sub(weight_to_remove)
-				.saturating_sub(vault.annual_rate.saturating_mul_int(principal_before))
-				.saturating_add(vault.annual_rate.saturating_mul_int(vault.debt.principal));
+			self.state.absorb_redistributed_debt(&mut vault, pending.principal);
 		}
 		if !pending.collateral.is_zero() {
 			// Already counted in `state.total_collateral`; only the hold moves.
@@ -184,7 +164,7 @@ impl<T: Config> OpContext<T> {
 			vault.redistribution_stake = vault.collateral;
 		}
 
-		Ok(TouchedVault { vault, status })
+		Ok((vault, status))
 	}
 
 	pub fn charge_upfront_fee(&mut self, owner: &T::AccountId, amount: BalanceOf<T>) {
@@ -197,6 +177,7 @@ impl<T: Config> OpContext<T> {
 
 	pub fn commit_with_vault(self, owner: &T::AccountId, vault: &Vault<BalanceOf<T>>) {
 		self.assert_unclobbered();
+		self.assert_commits_touched_owner(owner);
 		Vaults::<T>::insert((&self.collateral_id, &self.stable_id, owner), vault);
 		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
 		self.finish();
@@ -204,6 +185,7 @@ impl<T: Config> OpContext<T> {
 
 	pub fn commit_removing_vault(self, owner: &T::AccountId) {
 		self.assert_unclobbered();
+		self.assert_commits_touched_owner(owner);
 		Vaults::<T>::remove((&self.collateral_id, &self.stable_id, owner));
 		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
 		self.finish();
@@ -248,5 +230,18 @@ impl<T: Config> OpContext<T> {
 			Some(&self.loaded),
 			"BranchStates mutated behind OpContext"
 		);
+	}
+
+	/// A commit must target the row [`Self::touch`] returned, or the touch's
+	/// interest/redistribution settlement would be written to the wrong key.
+	/// Untouched commits (fresh rows from `open_vault`) are exempt.
+	fn assert_commits_touched_owner(&self, owner: &T::AccountId) {
+		#[cfg(debug_assertions)]
+		debug_assert!(
+			self.touched_owner.as_ref().is_none_or(|touched| touched == owner),
+			"committed vault must be the touched vault"
+		);
+		#[cfg(not(debug_assertions))]
+		let _ = owner;
 	}
 }

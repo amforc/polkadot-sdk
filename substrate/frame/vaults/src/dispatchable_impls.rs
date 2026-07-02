@@ -1,9 +1,5 @@
-//! The `do_*` backends of the pallet's dispatchables, one per extrinsic,
-//! following the FRAME `Pallet::do_call` convention. Each dispatchable in
-//! `lib.rs` is a thin origin-checking wrapper over its `do_*` counterpart here.
-
 use crate::{
-	context::{OpContext, TouchedVault},
+	context::OpContext,
 	math,
 	pallet::{
 		BalanceOf, BranchAdmin, BranchConfigs, BranchStates, Config, Error, Event,
@@ -207,7 +203,7 @@ impl<T: Config> Pallet<T> {
 	) -> Result<(), DispatchError> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
-		let TouchedVault { mut vault, status } = context.touch(&owner)?;
+		let (mut vault, status) = context.touch(&owner)?;
 		ensure!(!status.is_dormant(), Error::<T>::DebtBelowMinimum);
 
 		T::CollateralAssets::transfer_and_hold(
@@ -251,7 +247,7 @@ impl<T: Config> Pallet<T> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
 		let price = context.price()?;
-		let TouchedVault { mut vault, status } = context.touch(&owner)?;
+		let (mut vault, status) = context.touch(&owner)?;
 		ensure!(!status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
 		let config = context.config()?;
@@ -309,7 +305,7 @@ impl<T: Config> Pallet<T> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
 		let price = context.price()?;
-		let TouchedVault { mut vault, status: pre_status } = context.touch(&owner)?;
+		let (mut vault, pre_status) = context.touch(&owner)?;
 		ensure!(!pre_status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
 		let config = context.config()?;
@@ -406,7 +402,7 @@ impl<T: Config> Pallet<T> {
 	) -> Result<(), DispatchError> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
-		let TouchedVault { mut vault, status: pre_status } = context.touch(&owner)?;
+		let (mut vault, pre_status) = context.touch(&owner)?;
 		ensure!(!pre_status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
 		let config = context.config()?;
@@ -495,7 +491,7 @@ impl<T: Config> Pallet<T> {
 	) -> Result<(), DispatchError> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
-		let TouchedVault { mut vault, status } = context.touch(&owner)?;
+		let (mut vault, status) = context.touch(&owner)?;
 		ensure!(status.is_active(), Error::<T>::InvalidVaultStatus);
 		let old_rate = vault.annual_rate;
 		if old_rate == new_rate {
@@ -542,7 +538,7 @@ impl<T: Config> Pallet<T> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
 		let price = context.price()?;
-		let TouchedVault { vault, status } = context.touch(&owner)?;
+		let (vault, status) = context.touch(&owner)?;
 		ensure!(vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 
 		let config = context.config()?;
@@ -647,7 +643,7 @@ impl<T: Config> Pallet<T> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
 		let price = context.price()?;
-		let TouchedVault { mut vault, status } = context.touch(&owner)?;
+		let (mut vault, status) = context.touch(&owner)?;
 		ensure!(status.is_active(), Error::<T>::InvalidVaultStatus);
 
 		let config = context.config()?;
@@ -696,7 +692,7 @@ impl<T: Config> Pallet<T> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
 		let price = context.price()?;
-		let TouchedVault { mut vault, status } = context.touch(&owner)?;
+		let (mut vault, status) = context.touch(&owner)?;
 		ensure!(status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
 
 		let config = context.config()?;
@@ -748,7 +744,7 @@ impl<T: Config> Pallet<T> {
 	) -> Result<(), DispatchError> {
 		let mut context = OpContext::<T>::load(collateral_id, stable_id)?;
 		context.ensure_not_frozen()?;
-		let TouchedVault { vault, status } = context.touch(&owner)?;
+		let (vault, status) = context.touch(&owner)?;
 		ensure!(status.is_dormant(), Error::<T>::InvalidVaultStatus);
 		let config = context.config()?;
 		ensure!(vault.debt.total() >= config.minimum_debt, Error::<T>::DebtBelowMinimum);

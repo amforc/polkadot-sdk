@@ -445,25 +445,17 @@ impl<T: Config> Pallet<T> {
 		new_rate: FixedU128,
 		rate_change_fee_base: BalanceOf<T>,
 	) -> (BranchState<T::AccountId, BalanceOf<T>>, BalanceOf<T>) {
+		// Swap the vault's full aggregate contribution: detach the pre-borrow row
+		// and attach the post-borrow one, so `attach_vault`/`detach_vault` stay
+		// the only writers of the weighted sums. The fee is not stamped on
+		// `vault_after` — attach would then double-count it against the explicit
+		// `minted_interest` add below (the caller stamps the vault row).
+		let mut vault_after = vault.clone();
+		vault_after.debt.principal = vault.debt.principal.saturating_add(debt_increase);
+		vault_after.annual_rate = new_rate;
 		let mut branch_state_after = state.clone();
-		branch_state_after.debt.principal = state.debt.principal.saturating_add(debt_increase);
-		let weighted_old = vault.annual_rate.saturating_mul_int(vault.debt.principal);
-		let weighted_new =
-			new_rate.saturating_mul_int(vault.debt.principal.saturating_add(debt_increase));
-		branch_state_after.debt.weighted_principal_sum = state
-			.debt
-			.weighted_principal_sum
-			.saturating_sub(weighted_old)
-			.saturating_add(weighted_new);
-		if new_rate != vault.annual_rate {
-			let stake_w_old = vault.annual_rate.saturating_mul_int(vault.redistribution_stake);
-			let stake_w_new = new_rate.saturating_mul_int(vault.redistribution_stake);
-			branch_state_after.stakes.weighted_sum = state
-				.stakes
-				.weighted_sum
-				.saturating_sub(stake_w_old)
-				.saturating_add(stake_w_new);
-		}
+		branch_state_after.detach_vault(vault);
+		branch_state_after.attach_vault(&vault_after);
 		let avg = Self::avg_rate(&branch_state_after);
 		let fee = math::simple_interest_ceil(
 			debt_increase.saturating_add(rate_change_fee_base),

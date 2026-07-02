@@ -1,9 +1,10 @@
 //! Storage and value types for `pallet-vaults`.
 
-use crate::Millis;
+use crate::{math, Millis};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::arithmetic::{
-	FixedPointNumber, FixedPointOperand, FixedU128, Permill, Saturating, Zero,
+	CheckedAdd, CheckedMul, FixedPointNumber, FixedPointOperand, FixedU128, Permill, Saturating,
+	Zero,
 };
 use scale_info::TypeInfo;
 
@@ -463,6 +464,34 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 			.saturating_add(rate.saturating_mul_int(new_stake));
 	}
 
+	/// Fold `principal` of pending redistributed debt into `vault` at its own
+	/// rate, mutating the vault row and the branch aggregates together.
+	///
+	/// Redistribution recorded the debt at the branch-average rate (see
+	/// [`Self::record_redistribution`]); on touch, the receiving vault re-prices
+	/// its share at its own `annual_rate`, so the average-rate weighting
+	/// accumulated since the vault's snapshot (`weight_per_stake` delta) is
+	/// swapped out for the vault's own-rate contribution.
+	pub fn absorb_redistributed_debt(&mut self, vault: &mut Vault<Balance>, principal: Balance) {
+		self.debt.pending_redistribution_principal =
+			self.debt.pending_redistribution_principal.saturating_sub(principal);
+		self.debt.principal = self.debt.principal.saturating_add(principal);
+		let delta_weight_per_stake = self
+			.redistribution
+			.weight_per_stake
+			.saturating_sub(vault.redistribution_snapshot.weight_per_stake);
+		let weight_to_remove =
+			delta_weight_per_stake.saturating_mul_int(vault.redistribution_stake);
+		let principal_before = vault.debt.principal;
+		vault.debt.principal = vault.debt.principal.saturating_add(principal);
+		self.debt.weighted_principal_sum = self
+			.debt
+			.weighted_principal_sum
+			.saturating_sub(weight_to_remove)
+			.saturating_sub(vault.annual_rate.saturating_mul_int(principal_before))
+			.saturating_add(vault.annual_rate.saturating_mul_int(vault.debt.principal));
+	}
+
 	/// True when no debt-bearing or stake-bearing vault row remains attached
 	/// (branch principal, stake, and pending redistribution all zero). Interest
 	/// drift and bad debt may still remain to be swept, and collateral may still
@@ -492,6 +521,67 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 		self.rounding.ownerless_pusd_debt = Balance::zero();
 		self.debt.bad_debt = self.debt.bad_debt.saturating_add(orphan);
 		orphan
+	}
+}
+
+impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance> {
+	/// Fold one liquidation's redistribution into the branch accumulators.
+	///
+	/// The redistributed debt is recorded at the branch-average rate (its
+	/// weighting is corrected to each recipient's own rate when the recipient
+	/// absorbs its share, see [`Self::absorb_redistributed_debt`]). Per-stake
+	/// flooring residue lands in the ownerless rounding buckets. Returns `None`
+	/// when a per-stake increment overflows; the accumulators are only written
+	/// once every increment has been validated.
+	pub fn record_redistribution(
+		&mut self,
+		redistributed_debt: Balance,
+		redistributed_collateral: Balance,
+		now: Millis,
+	) -> Option<()> {
+		let avg_rate = math::average_branch_rate(self.stakes.weighted_sum, self.stakes.total);
+		let debt_per_stake = math::redistribution_per_stake(redistributed_debt, self.stakes.total)?;
+		let collateral_per_stake =
+			math::redistribution_per_stake(redistributed_collateral, self.stakes.total)?;
+		let weight_per_stake =
+			math::redistribution_weight_per_stake(redistributed_debt, avg_rate, self.stakes.total)?;
+		// Must match `pending_touch_for`'s interest-time origin.
+		let now_fp = FixedU128::saturating_from_integer(self.interest_time(now));
+		let debt_time_increment = now_fp.checked_mul(&debt_per_stake)?;
+
+		self.redistribution = RedistributionSnapshot {
+			debt_per_stake: self.redistribution.debt_per_stake.checked_add(&debt_per_stake)?,
+			collateral_per_stake: self
+				.redistribution
+				.collateral_per_stake
+				.checked_add(&collateral_per_stake)?,
+			debt_time_per_stake: self
+				.redistribution
+				.debt_time_per_stake
+				.checked_add(&debt_time_increment)?,
+			weight_per_stake: self
+				.redistribution
+				.weight_per_stake
+				.checked_add(&weight_per_stake)?,
+		};
+
+		let distributed_debt = debt_per_stake.saturating_mul_int(self.stakes.total);
+		self.debt.pending_redistribution_principal =
+			self.debt.pending_redistribution_principal.saturating_add(distributed_debt);
+		self.debt.weighted_principal_sum = self
+			.debt
+			.weighted_principal_sum
+			.saturating_add(avg_rate.saturating_mul_int(redistributed_debt));
+		let debt_dust = redistributed_debt.saturating_sub(distributed_debt);
+		if !debt_dust.is_zero() {
+			self.add_ownerless_pusd_debt(debt_dust);
+		}
+		let distributed_collateral = collateral_per_stake.saturating_mul_int(self.stakes.total);
+		let collateral_dust = redistributed_collateral.saturating_sub(distributed_collateral);
+		if !collateral_dust.is_zero() {
+			self.add_ownerless_collateral_surplus(collateral_dust);
+		}
+		Some(())
 	}
 }
 
@@ -736,5 +826,34 @@ mod tests {
 		state.apply_debt_payment(DebtPayment { interest: 0, principal: 10 }, rate, 0);
 		assert_eq!(state.debt.principal, 0);
 		assert_eq!(state.debt.weighted_principal_sum, 0);
+	}
+
+	#[test]
+	fn absorb_redistributed_debt_swaps_avg_rate_weighting_for_own_rate() {
+		// Vault: principal 10 at rate 0.5 → own contribution floor(0.5 · 10) = 5.
+		// Avg-rate weighting accumulated since the snapshot:
+		// (0.3 − 0.1) · stake 10 = 2. Absorbing 3 re-prices the share:
+		// 20 − 2 − 5 + floor(0.5 · 13) = 20 − 2 − 5 + 6 = 19.
+		let rate = FixedU128::from_rational(5u128, 10u128);
+		let mut state = make_branch_state(30, 20);
+		state.debt.pending_redistribution_principal = 6;
+		state.redistribution.weight_per_stake = FixedU128::from_rational(3u128, 10u128);
+		let mut vault = Vault {
+			collateral: 10,
+			debt: VaultDebt { principal: 10, interest: 0 },
+			annual_rate: rate,
+			last_interest_time: 0,
+			last_rate_update: 0,
+			redistribution_stake: 10,
+			redistribution_snapshot: RedistributionSnapshot {
+				weight_per_stake: FixedU128::from_rational(1u128, 10u128),
+				..RedistributionSnapshot::default()
+			},
+		};
+		state.absorb_redistributed_debt(&mut vault, 3);
+		assert_eq!(vault.debt.principal, 13);
+		assert_eq!(state.debt.principal, 33);
+		assert_eq!(state.debt.pending_redistribution_principal, 3);
+		assert_eq!(state.debt.weighted_principal_sum, 19);
 	}
 }
