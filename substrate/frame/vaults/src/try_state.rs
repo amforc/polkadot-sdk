@@ -51,7 +51,9 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				let Some(vault) = Vaults::<T>::get((collateral_id, stable_id, &owner)) else {
 					return Err("dormant_redemption_target points at missing vault".into());
 				};
-				if !vault.status::<T>(collateral_id, stable_id, &owner).is_dormant() {
+				if !Pallet::<T>::vault_status_of(&vault, collateral_id, stable_id, &owner)
+					.is_dormant()
+				{
 					return Err("dormant_redemption_target points at non-Dormant".into());
 				}
 			}

@@ -185,7 +185,7 @@ pub fn set_price(collateral: AssetId, price: FixedU128) {
 /// Derived branch mode (`None` when the market is unknown or the mode cannot
 /// be computed), for tests observing Normal/Safety/Frozen transitions.
 pub fn branch_mode(collateral: &AssetId, stable: &StableId) -> Option<BranchMode> {
-	crate::helpers::current_mode::<Test>(collateral, stable).ok()
+	crate::Pallet::<Test>::current_mode(collateral, stable).ok()
 }
 
 pub fn set_oracle_available(v: bool) {

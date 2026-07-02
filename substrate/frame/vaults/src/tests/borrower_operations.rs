@@ -113,8 +113,6 @@ fn zero_amount_ops_are_no_ops() {
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 0));
 
 		let post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
-		// Zero-amount ops still touch (helpers/ops.rs:147/191/249/344): they settle the
-		// pending day of interest and advance the clock — the row is NOT byte-identical.
 		assert_eq!(post.debt.principal, pre.debt.principal);
 		assert_eq!(post.debt.interest, pre.debt.interest + 6);
 		assert_eq!(
@@ -145,7 +143,7 @@ fn repay_for_allowed_in_safety_mode() {
 }
 
 // `change_rate` to the current rate returns early without re-inserting in the rate
-// index or charging a fee — but it still touches first (helpers/ops.rs:433-438), so it
+// index or charging a fee — but it still touches first (`do_change_rate`), so it
 // settles pending interest and advances the interest clock. It is a no-op on the
 // *rate*, not on the whole storage row.
 #[test]
