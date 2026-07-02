@@ -3005,6 +3005,9 @@ mod runtime {
 
 	#[runtime::pallet_index(97)]
 	pub type Vaults = pallet_vaults::Pallet<Runtime>;
+
+	#[runtime::pallet_index(98)]
+	pub type Redemptions = pallet_redemptions::Pallet<Runtime>;
 }
 
 /// The address format for describing accounts.
@@ -3381,7 +3384,7 @@ impl pallet_vaults::Config for Runtime {
 	type Oracle = VaultsOracleAdapter;
 	type FeeAccount = VaultsFeeAccount;
 	type YieldHook = ();
-	type OnBranchLifecycle = ();
+	type OnBranchLifecycle = Redemptions;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
 	type BranchConsideration = HoldConsideration<
@@ -3440,6 +3443,143 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 	fn advance_time(ms: u64) {
 		let now = <pallet_timestamp::Pallet<Runtime>>::get();
 		<pallet_timestamp::Pallet<Runtime>>::set_timestamp(now + ms);
+	}
+}
+
+parameter_types! {
+	/// Redemption parameters seeded on every branch registration.
+	pub RedemptionsDefaultConfig: pallet_redemptions::RedemptionConfig<Balance, Moment> =
+		pallet_redemptions::RedemptionConfig {
+			minimum_redemption_amount: 100_000_000, // 100 pUSD (6 decimals)
+			base_rate_decay_period: 6 * 60 * 60 * 1_000, // 6 hours in ms
+			base_rate_floor: FixedU128::from_rational(0u128, 1u128),
+			base_rate_ceiling: FixedU128::from_rational(1u128, 1u128),
+			redemption_fee_floor: FixedU128::from_rational(5u128, 1_000u128), // 0.5%
+			redemption_fee_ceiling: FixedU128::from_rational(1u128, 1u128),
+			base_rate_increase_divisor: FixedU128::from_rational(2u128, 1u128),
+			final_recovery_bonus_buffer: FixedU128::from_rational(1u128, 100u128), // 1%
+		};
+	pub const RedemptionsMaxSteps: u32 = 16;
+}
+
+impl pallet_redemptions::Config for Runtime {
+	type CollateralAssetId = VaultsCollateralId;
+	type StableAssetId = VaultsStableId;
+	type StableAssets = Assets;
+	type Oracle = VaultsOracleAdapter;
+	type Vaults = Vaults;
+	type BranchMode = Vaults;
+	type InsuranceFundAccount = PsmInsuranceFundAccount;
+	type FeeHandler = ();
+	type TimeProvider = Timestamp;
+	type ManagerOrigin = EnsureRoot<AccountId>;
+	type DefaultRedemptionConfig = RedemptionsDefaultConfig;
+	type MaxRedemptionSteps = RedemptionsMaxSteps;
+	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = RedemptionsBenchmarkHelper;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub struct RedemptionsBenchmarkHelper;
+
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountId, Balance>
+	for RedemptionsBenchmarkHelper
+{
+	fn setup_redeemable_branch(
+		vaults: u32,
+	) -> (VaultsCollateralId, VaultsStableId, AccountId, Balance) {
+		use frame_support::traits::fungibles::Mutate as FungiblesMutate;
+		use frame_system::RawOrigin;
+		use pallet_vaults::BenchmarkHelper as _;
+
+		let collateral_id = VaultsCollateralId::Native;
+		let stable_id: VaultsStableId = PsmStablecoinAssetId::get();
+
+		// The benchmark genesis does not create the pUSD asset, so opening vaults
+		// (which mints pUSD debt) and funding the redeemer would fail without it.
+		{
+			use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
+			if !<Assets as FungiblesInspect<AccountId>>::asset_exists(stable_id) {
+				let asset_owner: AccountId = frame_benchmarking::account("pusd_owner", 0, 0);
+				<Assets as Create<AccountId>>::create(stable_id, asset_owner, true, 1)
+					.expect("create pUSD asset for benchmark");
+			}
+		}
+
+		// `create_branch` validates the oracle price, so set it first.
+		VaultsBenchmarkHelper::set_oracle_price(
+			collateral_id.clone(),
+			stable_id,
+			FixedU128::from_rational(10u128, 1u128),
+		);
+		let branch_config = pallet_vaults::BranchConfig {
+			minimum_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
+			initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
+			safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
+			debt_ceiling: 1_000_000 * DOLLARS,
+			minimum_debt: 10 * DOLLARS,
+			minimum_collateral: 1,
+			minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
+			maximum_borrow_rate: FixedU128::from_rational(1u128, 1u128),
+			upfront_fee_period: 7 * 24 * 60 * 60 * 1_000,
+			rate_adjustment_cooldown: 24 * 60 * 60 * 1_000,
+			redistribution_penalty: Permill::from_percent(5),
+			ceiling_gap: 0,
+			ceiling_ttl: 0,
+		};
+		let full_admin: AccountId = frame_benchmarking::account("vaults_admin", 0, 0);
+		let emergency_admin: AccountId = frame_benchmarking::account("vaults_emergency", 0, 0);
+		pallet_vaults::Pallet::<Runtime>::create_branch(
+			RawOrigin::Root.into(),
+			collateral_id.clone(),
+			stable_id,
+			full_admin,
+			emergency_admin,
+			branch_config,
+		)
+		.expect("create branch for benchmark");
+		pallet_vaults::Pallet::<Runtime>::set_global_debt_ceiling(
+			RawOrigin::Root.into(),
+			collateral_id.clone(),
+			1_000_000_000 * DOLLARS,
+		)
+		.expect("set global debt ceiling for benchmark");
+
+		// Native collateral must clear the runtime existential deposit (1 DOLLAR),
+		// with headroom so the vault's collateral hold leaves free balance above it.
+		let collateral: Balance = 1_000 * DOLLARS;
+		let funding: Balance = collateral.saturating_mul(10);
+		let debt: Balance = 20 * DOLLARS; // above the 10-DOLLAR minimum_debt
+		for i in 0..vaults {
+			let owner: AccountId = frame_benchmarking::account("redemption_vault", i, 0);
+			VaultsBenchmarkHelper::mint_collateral(collateral_id.clone(), &owner, funding);
+			let rate = FixedU128::from_rational(u128::from(i) + 1, 1_000u128);
+			pallet_vaults::Pallet::<Runtime>::open_vault(
+				RawOrigin::Signed(owner).into(),
+				collateral_id.clone(),
+				stable_id,
+				collateral,
+				debt,
+				rate,
+				pallet_linked_list::Position::endpoints_only(),
+			)
+			.expect("open benchmark vault");
+		}
+
+		let redeemer: AccountId = frame_benchmarking::account("redeemer", 0, 0);
+		// The redeemer receives collateral onto its free balance, so it must exist
+		// above the existential deposit before the redemption pays out.
+		VaultsBenchmarkHelper::mint_collateral(collateral_id.clone(), &redeemer, funding);
+		let budget = debt.saturating_mul(u128::from(vaults).saturating_add(2)).saturating_mul(2);
+		<Assets as FungiblesMutate<AccountId>>::mint_into(
+			stable_id,
+			&redeemer,
+			budget.saturating_mul(2),
+		)
+		.expect("mint pusd for redeemer");
+		(collateral_id, stable_id, redeemer, budget)
 	}
 }
 
@@ -3593,6 +3733,7 @@ mod benches {
 		[pallet_psm, Psm]
 		[pallet_linked_list, LinkedList]
 		[pallet_vaults, Vaults]
+		[pallet_redemptions, Redemptions]
 	);
 }
 
