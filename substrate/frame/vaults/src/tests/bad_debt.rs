@@ -5,7 +5,7 @@ use pusd_primitives::VaultBadDebtInterface;
 
 fn record(amount: Balance) -> DispatchResult {
 	<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::record_bad_debt(
-		DOT, PUSD, amount,
+		&DOT, &PUSD, amount,
 	)
 }
 
@@ -14,7 +14,7 @@ fn record(amount: Balance) -> DispatchResult {
 fn heal(amount: Balance) -> Result<Balance, DispatchError> {
 	let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, amount);
 	<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::heal(
-		DOT, PUSD, credit,
+		&DOT, &PUSD, credit,
 	)
 	.map(|surplus| surplus.peek())
 }
@@ -44,7 +44,7 @@ fn record_bad_debt_rejects_unknown_branch_and_skips_zero() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_noop!(
-			<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::record_bad_debt(TOKEN_X, PUSD, 100),
+			<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::record_bad_debt(&TOKEN_X, &PUSD, 100),
 			crate::Error::<Test>::UnknownCollateral
 		);
 		let events_before = System::events().len();
@@ -117,7 +117,7 @@ fn heal_unknown_branch_errors() {
 		let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, 10);
 		assert_err!(
 			<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, Balance, _>>::heal(
-				TOKEN_X, PUSD, credit
+				&TOKEN_X, &PUSD, credit
 			)
 			.map(|surplus| surplus.peek()),
 			crate::Error::<Test>::UnknownCollateral
