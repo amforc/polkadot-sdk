@@ -181,7 +181,7 @@ fn change_rate_post_cooldown_full_state() {
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest);
 		assert_eq!(v_post.annual_rate, rate_pct(75, 100));
 		// The defining side effect of a rate change: the cooldown clock is stamped
-		// to the wall-clock moment of the call (helpers/ops.rs:454).
+		// to the wall-clock moment of the call (`do_change_rate` in `dispatchable_impls.rs`).
 		assert_eq!(v_post.last_rate_update, now_before_call);
 	});
 }
