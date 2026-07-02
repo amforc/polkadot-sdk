@@ -257,7 +257,16 @@ pub struct BranchConfig<Balance> {
 
 /// Debt and interest aggregates for one collateral branch.
 #[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	PartialEq,
+	Eq,
+	Debug,
+	Default,
 )]
 pub struct BranchDebt<Balance> {
 	pub principal: Balance,
@@ -283,7 +292,16 @@ impl<Balance: FixedPointOperand + Saturating> BranchDebt<Balance> {
 
 /// Current-collateral redistribution stake totals for one collateral branch.
 #[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	PartialEq,
+	Eq,
+	Debug,
+	Default,
 )]
 pub struct BranchStakes<Balance> {
 	pub total: Balance,
