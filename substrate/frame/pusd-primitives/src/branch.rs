@@ -1,5 +1,6 @@
 //! Branch-mode types and a read-only mode hook.
 
+use crate::Millis;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
 
@@ -56,7 +57,7 @@ pub enum FrozenReason {
 )]
 pub struct FrozenState {
 	pub reason: FrozenReason,
-	pub entered_at: u64,
+	pub entered_at: Millis,
 }
 
 /// Read-only hook letting other pUSD pallets observe a market's mode without
