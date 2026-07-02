@@ -3457,7 +3457,6 @@ impl pallet_redemptions::Config for Runtime {
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
 	type Vaults = Vaults;
-	type BranchMode = Vaults;
 	type InsuranceFundAccount = PsmInsuranceFundAccount;
 	type FeeHandler = ();
 	type TimeProvider = Timestamp;

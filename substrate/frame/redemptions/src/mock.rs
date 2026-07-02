@@ -7,11 +7,12 @@ use frame::{
 			traits::{
 				fungible::{self, HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
 				fungibles::{
-					roles::Inspect as FungiblesRolesInspect, Credit, Inspect as FungiblesInspect,
+					roles::Inspect as FungiblesRolesInspect, Inspect as FungiblesInspect,
 					InspectHold, Mutate as FungiblesMutate,
 				},
+				tokens::imbalance::ResolveAssetTo,
 				AsEnsureOriginWithArg, ConstU128, ConstU32, ConstU64, EnsureOriginWithArg,
-				LinearStoragePrice, OnUnbalanced,
+				LinearStoragePrice,
 			},
 			PalletId,
 		},
@@ -118,7 +119,6 @@ parameter_types! {
 	pub const MaxOnIdleVaultRefresh: u32 = 4;
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
 	pub const PusdAssetId: AssetIdForAssets = 1_000;
-	pub SpYieldShare: Permill = Permill::from_percent(75);
 }
 
 impl pallet_linked_list::Config for Test {
@@ -150,21 +150,15 @@ parameter_types! {
 }
 impl ProvidePrice for MockOracle {
 	type AssetId = AssetId;
-	type Moment = Moment;
 
-	fn provide_price(
-		collateral_id: &AssetId,
-	) -> Result<pusd_primitives::PriceFeed<Moment>, DispatchError> {
+	fn provide_price(collateral_id: &AssetId) -> Result<FixedU128, DispatchError> {
 		if !MockOracleAvailable::get() {
 			return Err(DispatchError::Other("oracle unavailable"));
 		}
-		match MockPrices::get().get(collateral_id).copied() {
-			Some(price) => Ok(pusd_primitives::PriceFeed {
-				price,
-				observed_at: pallet_timestamp::Pallet::<Test>::get(),
-			}),
-			None => Err(DispatchError::Other("no price")),
-		}
+		MockPrices::get()
+			.get(collateral_id)
+			.copied()
+			.ok_or(DispatchError::Other("no price"))
 	}
 }
 
@@ -172,28 +166,6 @@ pub fn set_price(asset: AssetId, price: FixedU128) {
 	MockPrices::mutate(|m| {
 		m.insert(asset, price);
 	});
-}
-
-/// Drops yield credits: no Stability Pool in these tests.
-pub struct DropYieldSink;
-impl pusd_primitives::OnBranchYield<AssetId, StableId, Credit<AccountId, VaultStableAssets>>
-	for DropYieldSink
-{
-	fn on_branch_yield(
-		_collateral_id: AssetId,
-		_stable_id: StableId,
-		credit: Credit<AccountId, VaultStableAssets>,
-	) -> DispatchResult {
-		drop(credit);
-		Ok(())
-	}
-}
-
-pub struct DropFeeHandler;
-impl OnUnbalanced<Credit<AccountId, VaultStableAssets>> for DropFeeHandler {
-	fn on_nonzero_unbalanced(amount: Credit<AccountId, VaultStableAssets>) {
-		drop(amount);
-	}
 }
 
 parameter_types! {
@@ -206,6 +178,11 @@ parameter_types! {
 pub const ADMIN: AccountId = 100;
 /// Emergency (tighten-only) admin of every market a test helper registers.
 pub const EMERGENCY_ADMIN: AccountId = 101;
+
+/// The origin caller under which `who` administers markets.
+pub fn admin_caller(who: AccountId) -> OriginCaller {
+	frame_system::RawOrigin::Signed(who).into()
+}
 
 /// `CreateOrigin`: Root creates deposit-free (`None`); the stable asset's owner
 /// creates with a deposit (`Some(who)`); anyone else is rejected.
@@ -260,15 +237,11 @@ impl pallet_vaults::Config for Test {
 	type RuntimeHoldReason = RuntimeHoldReason;
 	type CollateralAssetId = AssetId;
 	type StableAssetId = StableId;
-	fn is_same_asset(collateral_id: &AssetId, stable_id: &StableId) -> bool {
-		matches!(collateral_id, NativeOrWithId::WithId(id) if id == stable_id)
-	}
+	type SameAsset = pallet_vaults::SameAssetViaInto;
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = VaultStableAssets;
 	type Oracle = MockOracle;
-	type SpYieldSink = DropYieldSink;
-	type SpYieldShare = SpYieldShare;
-	type FeeHandler = DropFeeHandler;
+	type FeeHandler = ();
 	// Registering a market seeds this pallet's redemption config via `on_registered`.
 	type OnBranchLifecycle = Redemptions;
 	type TimeProvider = Timestamp;
@@ -335,14 +308,8 @@ parameter_types! {
 	pub const InsuranceFundAccount: AccountId = INSURANCE_FUND;
 }
 
-pub struct FeeToAccount;
-impl OnUnbalanced<Credit<AccountId, VaultStableAssets>> for FeeToAccount {
-	fn on_nonzero_unbalanced(credit: Credit<AccountId, VaultStableAssets>) {
-		let _ = <VaultStableAssets as frame::traits::fungibles::Balanced<AccountId>>::resolve(
-			&FEE_ACCOUNT,
-			credit,
-		);
-	}
+parameter_types! {
+	pub const FeeDestAccount: AccountId = FEE_ACCOUNT;
 }
 
 pub struct RedemptionsManagerOrigin;
@@ -380,9 +347,8 @@ impl pallet_redemptions::Config for Test {
 	type StableAssets = VaultStableAssets;
 	type Oracle = MockOracle;
 	type Vaults = Vaults;
-	type BranchMode = Vaults;
 	type InsuranceFundAccount = InsuranceFundAccount;
-	type FeeHandler = FeeToAccount;
+	type FeeHandler = ResolveAssetTo<FeeDestAccount, VaultStableAssets>;
 	type TimeProvider = Timestamp;
 	type ManagerOrigin = RedemptionsManagerOrigin;
 	type DefaultRedemptionConfig = DefaultRedemptionConfig;
@@ -488,8 +454,8 @@ pub fn register_default_branch() {
 		RuntimeOrigin::root(),
 		DOT,
 		PUSD,
-		ADMIN,
-		EMERGENCY_ADMIN,
+		admin_caller(ADMIN),
+		admin_caller(EMERGENCY_ADMIN),
 		default_branch_config(),
 	)
 	.expect("create_branch ok");
@@ -622,9 +588,9 @@ pub fn branch_tcr() -> FixedU128 {
 /// Fully accrued branch debt: the denominator the base-rate accelerator uses.
 pub fn branch_debt() -> Balance {
 	<pallet_vaults::Pallet<Test> as VaultRedemptionInterface<
-		AccountId,
 		AssetId,
 		StableId,
+		AccountId,
 		Balance,
 	>>::branch_debt(&DOT, &PUSD)
 }

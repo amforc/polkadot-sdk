@@ -7,7 +7,7 @@ use frame::deps::{
 		FixedPointNumber, FixedU128, Permill,
 	},
 };
-use pusd_primitives::{recovery_pricing, BranchMode, BranchModeProvider, RedemptionTargetKind};
+use pusd_primitives::{recovery_pricing, RedemptionTargetKind};
 
 const HOUR_MS: Moment = 3_600 * 1_000;
 const ONE_YEAR_MS: Moment = 31_557_600_000;
@@ -57,8 +57,8 @@ fn branch_registration_rejects_invalid_default_redemption_config() {
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				ADMIN,
-				EMERGENCY_ADMIN,
+				admin_caller(ADMIN),
+				admin_caller(EMERGENCY_ADMIN),
 				default_branch_config(),
 			),
 			Error::<Test>::InvalidRedemptionConfig
@@ -97,7 +97,9 @@ fn redeem_frozen_branch_reverts() {
 			DOT,
 			PUSD
 		));
-		assert_noop!(redeem(3, 200, 0, 4), Error::<Test>::BranchFrozen);
+		// Frozen-mode enforcement lives vault-side: the first `redeem_step`
+		// rejects the frozen branch and the whole redemption rolls back.
+		assert_noop!(redeem(3, 200, 0, 4), pallet_vaults::Error::<Test>::BranchFrozen);
 	});
 }
 
@@ -939,13 +941,12 @@ fn ordinary_redemption_succeeds_in_safety_mode() {
 		register_default_branch();
 		assert_ok!(open(1, 1_000, 500, rate_pct(5, 100)));
 		// Drop the price so branch TCR falls below the 130% safety threshold while
-		// the vault stays above 100% and remains redeemable.
+		// the vault stays above 100% and remains redeemable — i.e. the branch is
+		// in Safety mode (mode is derived from live TCR).
 		set_price(DOT, FixedU128::from_rational(6u128, 10u128));
-		assert_eq!(
-			<pallet_vaults::Pallet<Test> as BranchModeProvider<AssetId, StableId>>::mode(
-				&DOT, &PUSD
-			),
-			Some(BranchMode::Safety)
+		assert!(
+			branch_tcr() < FixedU128::from_rational(130u128, 100u128),
+			"fixture must put the branch below the safety threshold"
 		);
 
 		let debt_before = vault_debt(1);
@@ -969,14 +970,15 @@ fn ordinary_redemption_succeeds_in_safety_mode() {
 }
 
 #[test]
-fn redeem_with_oracle_down_is_blocked_as_frozen() {
+fn redeem_with_oracle_down_reverts() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, 1_000, 500, rate_pct(5, 100)));
 		mint_pusd(3, 1_000);
-		// A failing oracle surfaces as Frozen mode, so redemptions are refused.
+		// The preamble reads the oracle itself, so a failing feed is refused
+		// before any vault is touched.
 		MockOracleAvailable::set(false);
-		assert_noop!(redeem(3, 201, 0, 4), Error::<Test>::BranchFrozen);
+		assert_noop!(redeem(3, 201, 0, 4), Error::<Test>::OracleUnavailable);
 	});
 }
 
