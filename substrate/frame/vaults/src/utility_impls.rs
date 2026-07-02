@@ -154,10 +154,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Derive the lifecycle status of an existing vault row from queue/index
 	/// membership. Status is not stored on the row, and the keys must be
-	/// re-supplied because the row does not carry them. The `vault` reference
-	/// is a proof of existence: a missing row would also read as `Dormant`.
+	/// re-supplied because the row does not carry them.
 	pub(crate) fn vault_status_of(
-		_vault: &Vault<BalanceOf<T>>,
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		owner: &T::AccountId,
@@ -506,15 +504,6 @@ impl<T: Config> Pallet<T> {
 			return BalanceOf::<T>::zero();
 		};
 		Self::accrued_branch_debt(&bs, now)
-	}
-
-	pub(crate) fn view_vault_status(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		owner: &T::AccountId,
-	) -> Option<VaultStatus> {
-		let vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
-		Some(Self::vault_status_of(&vault, collateral_id, stable_id, owner))
 	}
 
 	pub(crate) fn view_vault_cr(
