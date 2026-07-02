@@ -29,13 +29,16 @@ pub use liquidation::{
 pub use oracle::{PriceFeed, ProvidePrice};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use redemption::{
-	RedemptionAllocation, RedemptionStepSnapshot, RedemptionTarget, RedemptionTargetKind,
-	VaultRedemptionInterface,
+	RedemptionAllocation, RedemptionRegime, RedemptionStepSnapshot, RedemptionTarget,
+	RedemptionTargetKind, VaultRedemptionInterface,
 };
 pub use registration::OnBranchLifecycle;
 pub use yield_sink::OnBranchYield;
 
-pub const MILLIS_PER_YEAR: u64 = 31_557_600_000;
+/// TODO: Check if this is the best way to handle the "time"
+pub type Millis = u64;
+
+pub const MILLIS_PER_YEAR: Millis = 31_557_600_000;
 
 /// Convenience alias for the rate type used by the rate-ordered redemption
 /// index. `FixedU128` matches the `pallet-linked-list` `Score` type configured
