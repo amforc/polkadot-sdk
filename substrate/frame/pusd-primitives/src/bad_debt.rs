@@ -1,24 +1,15 @@
-//! Bad-debt recording and healing trait.
+//! Bad-debt healing trait.
 
-use frame::deps::{frame_support::pallet_prelude::DispatchResult, sp_runtime::DispatchError};
+use frame::deps::sp_runtime::DispatchError;
 
-/// Branch-level bad-debt accounting surface.
+/// Branch-level bad-debt healing surface.
 ///
-/// `record_bad_debt` is the increment side, called by the orchestrator when a
-/// liquidation cannot cover a vault's debt. `heal` is the inverse: the
-/// orchestrator withdraws from the
-/// Insurance Fund as a `fungible::Credit` and hands it here; the
-/// implementation rescinds the underlying pUSD and decrements the branch's
-/// recorded bad debt by the same amount.
-pub trait VaultBadDebtInterface<CollateralId, StableId, Balance, Credit> {
-	/// Record `amount` of unbacked debt against the `(collateral_id, stable_id)`
-	/// market.
-	fn record_bad_debt(
-		collateral_id: &CollateralId,
-		stable_id: &StableId,
-		amount: Balance,
-	) -> DispatchResult;
-
+/// Bad debt is only ever *recorded* inside the vault pallet (recovery settlement and
+/// orphan-debt sweeps), so this trait carries just the inverse side: the orchestrator withdraws
+/// cover from the Insurance Fund as a `fungible::Credit` and hands it here; the implementation
+/// rescinds the underlying pUSD and decrements the branch's recorded bad debt by the same
+/// amount.
+pub trait VaultBadDebtInterface<CollateralId, StableId, Credit> {
 	/// Burn up to the recorded bad debt of the `(collateral_id, stable_id)`
 	/// market from `credit` and return the unconsumed surplus (zero when the
 	/// credit was fully used). The coin to rescind comes from `credit.asset()`.

@@ -9,9 +9,7 @@ use scale_info::TypeInfo;
 ///
 /// `redeemer` receives `collateral_to_redeemer`; `fee_collateral_retained`
 /// stays in the vault as a branch-local fee.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RedemptionAllocation<AccountId, Balance> {
 	pub redeemer: AccountId,
 	pub debt_to_cancel: Balance,
@@ -21,7 +19,18 @@ pub struct RedemptionAllocation<AccountId, Balance> {
 
 /// Pricing regime of a redemption target. Returned alongside the target so the
 /// orchestrator selects the regime without a second classifying call.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
 pub enum RedemptionTargetKind {
 	/// Active rate-index vault, redeemed at face value (ordinary redemption).
 	Ordinary,
@@ -64,14 +73,23 @@ pub enum RedemptionRegime {
 }
 
 impl RedemptionRegime {
+	/// The selection tag this regime prices, so the two enums cannot drift.
+	pub fn kind(&self) -> RedemptionTargetKind {
+		match self {
+			Self::Ordinary => RedemptionTargetKind::Ordinary,
+			Self::Dormant => RedemptionTargetKind::Dormant,
+			Self::FinalRecovery { .. } => RedemptionTargetKind::FinalRecovery,
+		}
+	}
+
 	/// True for the `FinalRecovery` regime.
 	pub fn is_final_recovery(&self) -> bool {
-		matches!(self, Self::FinalRecovery { .. })
+		self.kind().is_final_recovery()
 	}
 
 	/// True for the dormant redemption target.
 	pub fn is_dormant(&self) -> bool {
-		matches!(self, Self::Dormant)
+		self.kind().is_dormant()
 	}
 }
 
@@ -91,7 +109,7 @@ pub struct RedemptionStepSnapshot<Balance> {
 /// `(collateral_id, stable_id)` market. Reads are authoritative current state;
 /// writes re-shape the priority queue.
 pub trait VaultRedemptionInterface<CollateralId, StableId, AccountId, Balance> {
-/// TODO: Doc
+	/// TODO: Doc
 	fn next_redemption_target(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
