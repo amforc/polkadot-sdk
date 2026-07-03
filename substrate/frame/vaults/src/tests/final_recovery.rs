@@ -4,6 +4,7 @@ use crate::{
 	mock::*,
 	tests::{rate_pct, vault_status},
 };
+use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{RedemptionAllocation, VaultRedemptionInterface};
 
 fn low_recovery_price() -> FixedU128 {
@@ -447,13 +448,14 @@ fn redemption_queue_head_gates_on_final_recovery() {
 }
 
 #[test]
-fn final_recovery_nonce_persists_across_cycles() {
+fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 	build_and_execute(|| {
 		register_default_branch();
 		enter_recovery(1, rate_pct(1, 100));
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
-		assert_eq!(state.next_final_recovery_nonce, 1);
+		enter_recovery(2, rate_pct(2, 100));
 
+		// Exit 1 while priced back up, then push it under again: it re-enters
+		// behind 2 — the queue is FIFO by entry time, not by first entry.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
 			RuntimeOrigin::signed(42),
@@ -469,9 +471,19 @@ fn final_recovery_nonce_persists_across_cycles() {
 			PUSD,
 			1
 		));
+		assert_eq!(
+			crate::Pallet::<Test>::final_recovery_queue_head(DOT, PUSD, 10),
+			alloc::vec![2, 1]
+		);
 
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
-		assert_eq!(state.next_final_recovery_nonce, 2);
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, PUSD, 10), alloc::vec![1]);
+		// The stored priorities stay strictly distinct (newest greatest), so
+		// the linked list's permissionless re-anchoring can never legally
+		// relocate a member.
+		let list = VaultList::FinalRecovery(DOT, PUSD);
+		let p1 = <LinkedList as SortedListInterface<VaultList, AccountId>>::priority(&list, &1)
+			.expect("member");
+		let p2 = <LinkedList as SortedListInterface<VaultList, AccountId>>::priority(&list, &2)
+			.expect("member");
+		assert!(p1 > p2, "re-entered vault must carry a strictly greater priority");
 	});
 }

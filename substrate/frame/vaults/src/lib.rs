@@ -332,18 +332,6 @@ pub mod pallet {
 			old_status: VaultStatus,
 			new_status: VaultStatus,
 		},
-		/// The owner was appended to the market's `FinalRecovery` FIFO.
-		FinalRecoveryEntered {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			owner: T::AccountId,
-		},
-		/// The owner left the market's `FinalRecovery` FIFO.
-		FinalRecoveryExited {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			owner: T::AccountId,
-		},
 		/// Unbacked circulating debt was recorded against the market ledger.
 		BadDebtRecorded {
 			collateral_id: T::CollateralAssetId,
@@ -521,8 +509,6 @@ pub mod pallet {
 		/// The `FinalRecovery` FIFO and the vault rows disagree — storage
 		/// corruption, not a user error.
 		FinalRecoveryInvariantBroken,
-		/// The `FinalRecovery` insertion sequence overflowed `u128`.
-		FinalRecoverySequenceOverflow,
 		/// `enter_final_recovery` requires the candidate to be the branch's
 		/// only remaining stake-bearer.
 		NotLastEligibleVault,
