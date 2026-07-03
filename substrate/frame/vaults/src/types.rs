@@ -650,7 +650,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 ///
 /// Markets sharing a collateral share its risk, so a creator's `Full` autonomy
 /// is bounded by these floors and ceilings — validated at `create_branch` and
-/// on every loosening `set_*`. The per-collateral `GlobalDebtCeiling[C] > 0`
+/// on every `set_param` update. The per-collateral `GlobalDebtCeiling[C] > 0`
 /// gate (governance's collateral allow-list) is enforced separately on the
 /// borrow path.
 #[derive(

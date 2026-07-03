@@ -404,7 +404,7 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 }
 
 #[test]
-fn redistribution_residue_lands_in_ownerless_pusd_debt() {
+fn redistribution_residue_lands_in_ownerless_debt() {
 	build_and_execute(|| {
 		register_default_branch();
 		// Two recipients with stakes that do not evenly divide an
