@@ -12,16 +12,13 @@ extern crate alloc;
 use frame::deps::sp_runtime::{FixedPointNumber, FixedPointOperand, FixedU128};
 
 pub mod bad_debt;
-pub mod branch;
 pub mod liquidation;
 pub mod oracle;
 pub mod recovery_pricing;
 pub mod redemption;
 pub mod registration;
-pub mod supply_ledger;
 
 pub use bad_debt::VaultBadDebtInterface;
-pub use branch::{BranchMode, FrozenReason, FrozenState};
 pub use liquidation::{
 	AllocationResult, KeeperCompensation, LiquidationAllocation, LiquidationSnapshot,
 	OffsetAllocation, VaultLiquidationInterface,
@@ -33,17 +30,11 @@ pub use redemption::{
 	RedemptionTargetKind, VaultRedemptionInterface,
 };
 pub use registration::OnBranchLifecycle;
-pub use supply_ledger::SupplyLedger;
 
 /// TODO: Check if this is the best way to handle the "time"
 pub type Millis = u64;
 
 pub const MILLIS_PER_YEAR: Millis = 31_557_600_000;
-
-/// Convenience alias for the rate type used by the rate-ordered redemption
-/// index. `FixedU128` matches the `pallet-linked-list` `Score` type configured
-/// by `pallet-vaults`.
-pub type AnnualRate = FixedU128;
 
 /// `floor(price * collateral / debt)` as a collateralization ratio. `None` when
 /// `debt == 0` (CR undefined) or either step overflows.
