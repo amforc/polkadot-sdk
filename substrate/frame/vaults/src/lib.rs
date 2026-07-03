@@ -226,8 +226,8 @@ pub mod pallet {
 		#[pallet::constant]
 		type MaxBranches: Get<u32>;
 
-		/// Maximum vaults the `on_idle` cursor refreshes per block. Bounds
-		/// idle-block weight regardless of branch count.
+		/// Maximum vaults the `on_idle` cursor refreshes per block; the cap on
+		/// the idle walk's touch budget.
 		#[pallet::constant]
 		type MaxOnIdleVaultRefresh: Get<u32>;
 
