@@ -165,10 +165,7 @@ fn check_branch_identities<T: Config>(
 		collateral_id,
 		stable_id,
 		state.debt.weighted_principal_sum,
-		state
-			.debt
-			.pending_redistribution_principal
-			.saturating_add(state.rounding.ownerless_pusd_debt),
+		state.debt.pending_redistribution_principal.saturating_add(state.ownerless_debt),
 		sum_weighted_principal,
 		n_live_vaults,
 	)?;
@@ -201,8 +198,7 @@ fn check_branch_identities<T: Config>(
 	// will pick up on next touch + ownerless collateral surplus. Per-vault
 	// flooring may leave shares slightly below the held amount; treat the gap
 	// as tolerance plus the explicit ownerless bucket.
-	let claimed_plus_surplus =
-		sum_pending_collat_share.saturating_add(state.rounding.ownerless_collateral_surplus);
+	let claimed_plus_surplus = sum_pending_collat_share.saturating_add(state.ownerless_collateral);
 	let collateral_drift = if held_redistribution >= claimed_plus_surplus {
 		held_redistribution.saturating_sub(claimed_plus_surplus)
 	} else {

@@ -403,7 +403,7 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		assert_eq!(state.debt.principal, 0);
 		assert_eq!(state.stakes.total, 0);
 		assert_eq!(state.debt.minted_interest, 0, "drift swept out of minted_interest");
-		assert_eq!(state.rounding.ownerless_pusd_debt, 0);
+		assert_eq!(state.ownerless_debt, 0);
 		// The drift is exactly this small — a few base units of rounding.
 		const DRIFT: Balance = 2;
 		assert_eq!(state.debt.bad_debt, DRIFT, "drift recorded as bad debt");

@@ -339,34 +339,6 @@ pub struct BranchStakes<Balance> {
 	pub weighted_sum: Balance,
 }
 
-/// Per-branch ownerless rounding residue.
-///
-/// `ownerless_pusd_debt` is debt that exists at the branch level but cannot
-/// be attributed to any specific vault (typically per-stake flooring residue
-/// from a redistribution). `ownerless_pusd_surplus` is the mirror image:
-/// pUSD that arrived without an owner. `add_ownerless_pusd_*` netting keeps
-/// `surplus * debt == 0` so the surplus offsets debt as soon as it appears.
-/// `ownerless_collateral_surplus` is collateral that sits on the
-/// redistribution account but cannot be attributed; it is bookkeeping only,
-/// since the physical balance is already held there.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
-pub struct BranchRounding<Balance> {
-	pub ownerless_pusd_debt: Balance,
-	pub ownerless_pusd_surplus: Balance,
-	pub ownerless_collateral_surplus: Balance,
-}
-
 /// Per-branch accounting state.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
@@ -375,7 +347,14 @@ pub struct BranchState<AccountId, Balance> {
 	pub total_collateral: Balance,
 	pub debt: BranchDebt<Balance>,
 	pub stakes: BranchStakes<Balance>,
-	pub rounding: BranchRounding<Balance>,
+	/// Debt that exists at the branch level but cannot be attributed to any
+	/// specific vault (per-stake flooring residue from a redistribution).
+	/// Swept into `bad_debt` when the branch empties of liability.
+	pub ownerless_debt: Balance,
+	/// Collateral that sits on the redistribution account but cannot be
+	/// attributed; bookkeeping only, since the physical balance is already
+	/// held there.
+	pub ownerless_collateral: Balance,
 	pub redistribution: RedistributionSnapshot,
 	/// Wall-clock origin of the branch's interest timebase, shifted forward by
 	/// every completed frozen window. Interest accrues in `interest_time(now)`
@@ -582,9 +561,9 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 	/// Sweep the orphan debt counters into `bad_debt`, returning the swept
 	/// amount.
 	pub fn sweep_orphan_debt(&mut self) -> Balance {
-		let orphan = self.debt.minted_interest.saturating_add(self.rounding.ownerless_pusd_debt);
+		let orphan = self.debt.minted_interest.saturating_add(self.ownerless_debt);
 		self.debt.minted_interest = Balance::zero();
-		self.rounding.ownerless_pusd_debt = Balance::zero();
+		self.ownerless_debt = Balance::zero();
 		self.debt.bad_debt = self.debt.bad_debt.saturating_add(orphan);
 		orphan
 	}
@@ -596,7 +575,7 @@ impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance
 	/// The redistributed debt is recorded at the branch-average rate (its
 	/// weighting is corrected to each recipient's own rate when the recipient
 	/// absorbs its share, see [`Self::absorb_redistributed_debt`]). Per-stake
-	/// flooring residue lands in the ownerless rounding buckets. Returns `None`
+	/// flooring residue lands in the ownerless buckets. Returns `None`
 	/// when a per-stake increment overflows; the accumulators are only written
 	/// once every increment has been validated.
 	pub fn record_redistribution(
@@ -639,44 +618,11 @@ impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance
 			.weighted_principal_sum
 			.saturating_add(avg_rate.saturating_mul_int(redistributed_debt));
 		let debt_dust = redistributed_debt.saturating_sub(distributed_debt);
-		if !debt_dust.is_zero() {
-			self.add_ownerless_pusd_debt(debt_dust);
-		}
+		self.ownerless_debt = self.ownerless_debt.saturating_add(debt_dust);
 		let distributed_collateral = collateral_per_stake.saturating_mul_int(self.stakes.total);
 		let collateral_dust = redistributed_collateral.saturating_sub(distributed_collateral);
-		if !collateral_dust.is_zero() {
-			self.add_ownerless_collateral_surplus(collateral_dust);
-		}
+		self.ownerless_collateral = self.ownerless_collateral.saturating_add(collateral_dust);
 		Some(())
-	}
-}
-
-impl<AccountId, Balance: Ord + Saturating + Copy> BranchState<AccountId, Balance> {
-	/// Deposit ownerless pUSD debt, netting against any existing ownerless
-	/// surplus first. Preserves the invariant `surplus * debt == 0`.
-	pub fn add_ownerless_pusd_debt(&mut self, amount: Balance) {
-		let offset = core::cmp::min(amount, self.rounding.ownerless_pusd_surplus);
-		self.rounding.ownerless_pusd_surplus =
-			self.rounding.ownerless_pusd_surplus.saturating_sub(offset);
-		self.rounding.ownerless_pusd_debt =
-			self.rounding.ownerless_pusd_debt.saturating_add(amount.saturating_sub(offset));
-	}
-
-	/// Deposit ownerless pUSD surplus, netting against any existing ownerless
-	/// debt first. Preserves the invariant `surplus * debt == 0`.
-	pub fn add_ownerless_pusd_surplus(&mut self, amount: Balance) {
-		let offset = core::cmp::min(amount, self.rounding.ownerless_pusd_debt);
-		self.rounding.ownerless_pusd_debt =
-			self.rounding.ownerless_pusd_debt.saturating_sub(offset);
-		self.rounding.ownerless_pusd_surplus = self
-			.rounding
-			.ownerless_pusd_surplus
-			.saturating_add(amount.saturating_sub(offset));
-	}
-
-	pub fn add_ownerless_collateral_surplus(&mut self, amount: Balance) {
-		self.rounding.ownerless_collateral_surplus =
-			self.rounding.ownerless_collateral_surplus.saturating_add(amount);
 	}
 }
 
@@ -861,7 +807,8 @@ mod tests {
 				last_interest_time: 0,
 			},
 			stakes: BranchStakes { total: 0, weighted_sum: 0 },
-			rounding: BranchRounding::default(),
+			ownerless_debt: 0,
+			ownerless_collateral: 0,
 			redistribution: RedistributionSnapshot::default(),
 			interest_epoch: 0,
 			next_final_recovery_nonce: 0,
