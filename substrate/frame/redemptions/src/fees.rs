@@ -11,9 +11,9 @@ use frame::deps::{
 /// a higher decayed rate. The fractional half-life is the secant upper bound of
 /// `2^(-f)` on `[0, 1)`, so the result is at or slightly above the exact decay
 /// (favoring the system) and is continuous across period boundaries.
-pub fn decay_base_rate(base_rate: FixedU128, elapsed_ms: u64, period_ms: u64) -> FixedU128 {
-	if base_rate.is_zero() || elapsed_ms == 0 {
-		return base_rate;
+pub fn decay_dynamic_fee(dynamic_fee: FixedU128, elapsed_ms: u64, period_ms: u64) -> FixedU128 {
+	if dynamic_fee.is_zero() || elapsed_ms == 0 {
+		return dynamic_fee;
 	}
 	if period_ms == 0 {
 		return FixedU128::zero();
@@ -22,7 +22,7 @@ pub fn decay_base_rate(base_rate: FixedU128, elapsed_ms: u64, period_ms: u64) ->
 	if whole >= 128 {
 		return FixedU128::zero();
 	}
-	let halved = FixedU128::from_inner(base_rate.into_inner() >> whole);
+	let halved = FixedU128::from_inner(dynamic_fee.into_inner() >> whole);
 	let remainder = elapsed_ms % period_ms;
 	if remainder == 0 {
 		return halved;
@@ -33,7 +33,7 @@ pub fn decay_base_rate(base_rate: FixedU128, elapsed_ms: u64, period_ms: u64) ->
 	halved.saturating_mul(factor)
 }
 
-pub fn increased_base_rate(
+pub fn increased_dynamic_fee(
 	decayed: FixedU128,
 	redeemed_fraction: FixedU128,
 	divisor: FixedU128,
@@ -44,8 +44,8 @@ pub fn increased_base_rate(
 	decayed.saturating_add(increase).max(floor).min(ceiling)
 }
 
-pub fn fee_rate(base_rate: FixedU128, fee_floor: FixedU128, fee_ceiling: FixedU128) -> FixedU128 {
-	base_rate.saturating_add(fee_floor).min(fee_ceiling)
+pub fn fee_rate(dynamic_fee: FixedU128, base_fee: FixedU128, fee_ceiling: FixedU128) -> FixedU128 {
+	dynamic_fee.saturating_add(base_fee).min(fee_ceiling)
 }
 
 pub fn fee_pusd<Balance: FixedPointOperand>(
@@ -109,16 +109,16 @@ mod tests {
 	#[test]
 	fn decay_halves_over_one_half_life() {
 		let base = FixedU128::from_rational(1, 2); // 50%
-		assert_eq!(decay_base_rate(base, 6 * HOUR, 6 * HOUR), FixedU128::from_rational(1, 4));
-		assert_eq!(decay_base_rate(base, 12 * HOUR, 6 * HOUR), FixedU128::from_rational(1, 8));
+		assert_eq!(decay_dynamic_fee(base, 6 * HOUR, 6 * HOUR), FixedU128::from_rational(1, 4));
+		assert_eq!(decay_dynamic_fee(base, 12 * HOUR, 6 * HOUR), FixedU128::from_rational(1, 8));
 	}
 
 	#[test]
 	fn decay_is_monotonic_non_increasing() {
 		let base = FixedU128::from_rational(80, 100);
-		let mut prev = decay_base_rate(base, 0, 6 * HOUR);
+		let mut prev = decay_dynamic_fee(base, 0, 6 * HOUR);
 		for h in 1..=48u64 {
-			let now = decay_base_rate(base, h * HOUR, 6 * HOUR);
+			let now = decay_dynamic_fee(base, h * HOUR, 6 * HOUR);
 			assert!(now <= prev, "decay rose at hour {h}: {now:?} > {prev:?}");
 			prev = now;
 		}
@@ -127,15 +127,15 @@ mod tests {
 	#[test]
 	fn decay_zero_inputs() {
 		let base = FixedU128::from_rational(1, 2);
-		assert_eq!(decay_base_rate(base, 0, HOUR), base);
-		assert_eq!(decay_base_rate(FixedU128::zero(), HOUR, HOUR), FixedU128::zero());
-		assert_eq!(decay_base_rate(base, 200 * HOUR, HOUR), FixedU128::zero());
+		assert_eq!(decay_dynamic_fee(base, 0, HOUR), base);
+		assert_eq!(decay_dynamic_fee(FixedU128::zero(), HOUR, HOUR), FixedU128::zero());
+		assert_eq!(decay_dynamic_fee(base, 200 * HOUR, HOUR), FixedU128::zero());
 	}
 
 	#[test]
 	fn increase_caps_at_ceiling() {
 		let ceiling = FixedU128::one();
-		let got = increased_base_rate(
+		let got = increased_dynamic_fee(
 			FixedU128::from_rational(90, 100),
 			FixedU128::from_rational(1, 2),
 			FixedU128::from_rational(2, 1),
@@ -147,7 +147,7 @@ mod tests {
 
 	#[test]
 	fn increase_adds_half_of_fraction() {
-		let got = increased_base_rate(
+		let got = increased_dynamic_fee(
 			FixedU128::from_rational(10, 100),
 			FixedU128::from_rational(40, 100),
 			FixedU128::from_rational(2, 1),
