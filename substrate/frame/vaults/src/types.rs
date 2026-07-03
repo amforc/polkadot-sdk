@@ -206,29 +206,6 @@ pub struct RedistributionSnapshot {
 	pub weight_per_stake: FixedU128,
 }
 
-/// Branch-local interest timebase. Interest accrues in `interest_time(now)`
-/// units rather than raw wall-clock time so that freezing a branch suspends
-/// accrual without ever rewinding the clock. See [`BranchState::interest_time`].
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
-pub struct InterestClock {
-	/// Wall-clock epoch used to keep interest time relative and bounded.
-	pub epoch_base: Millis,
-	/// Completed frozen-window duration since `epoch_base`.
-	pub frozen_elapsed: Millis,
-}
-
 /// Per-vault state.
 ///
 /// `collateral` is this market's collateral for the owner: the share of the
@@ -400,7 +377,11 @@ pub struct BranchState<AccountId, Balance> {
 	pub stakes: BranchStakes<Balance>,
 	pub rounding: BranchRounding<Balance>,
 	pub redistribution: RedistributionSnapshot,
-	pub interest_clock: InterestClock,
+	/// Wall-clock origin of the branch's interest timebase, shifted forward by
+	/// every completed frozen window. Interest accrues in `interest_time(now)`
+	/// units rather than raw wall-clock time so that freezing a branch suspends
+	/// accrual without ever rewinding the clock. See [`Self::interest_time`].
+	pub interest_epoch: Millis,
 	pub next_final_recovery_nonce: u128,
 	pub dormant_redemption_target: Option<AccountId>,
 	pub idle_cursor: Option<AccountId>,
@@ -420,9 +401,7 @@ impl<AccountId, Balance> BranchState<AccountId, Balance> {
 	pub fn interest_time(&self, now: Millis) -> Millis {
 		let current_frozen =
 			self.frozen.as_ref().map_or(0, |state| now.saturating_sub(state.entered_at));
-		now.saturating_sub(self.interest_clock.epoch_base)
-			.saturating_sub(self.interest_clock.frozen_elapsed)
-			.saturating_sub(current_frozen)
+		now.saturating_sub(self.interest_epoch).saturating_sub(current_frozen)
 	}
 }
 
@@ -884,7 +863,7 @@ mod tests {
 			stakes: BranchStakes { total: 0, weighted_sum: 0 },
 			rounding: BranchRounding::default(),
 			redistribution: RedistributionSnapshot::default(),
-			interest_clock: InterestClock { epoch_base: 0, frozen_elapsed: 0 },
+			interest_epoch: 0,
 			next_final_recovery_nonce: 0,
 			dormant_redemption_target: None,
 			idle_cursor: None,
