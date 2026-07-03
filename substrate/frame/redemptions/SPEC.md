@@ -19,7 +19,7 @@ The design borrows these Liquity V2 mechanics:
 - redemptions against borrower-selected rate ordering;
 - lowest-rate vaults redeemed first;
 - same-rate LIFO behavior;
-- redemption fees based on a dynamic base rate;
+- redemption fees based on a base fee plus a decaying dynamic fee;
 - redemption path priority over borrower preference during stress.
 
 Intentional differences:
@@ -41,8 +41,8 @@ Intentional differences:
 - **Rate Index:** Per-branch vault ordering maintained by `pallet-vaults`; ordinary redemptions walk the lowest-rate end first.
 - **Dormant Vault:** A vault outside the ordinary rate index. Redemptions may create a debt-bearing Dormant below `MinimumDebt`, or a zero-debt Dormant with residual collateral. Dormants remain in branch accounting and redistribution; only the branch's Dormant redemption target is part of ordinary redemption ordering.
 - **`FinalRecovery` Vault:** A vault that is below MCR and cannot be liquidated because it is the last eligible redistribution recipient in the branch.
-- **Redemption Fee:** pUSD-denominated protocol fee charged on ordinary redemptions according to a dynamic base-rate model and routed through `FeeHandler`.
-- **Base Rate:** Dynamic redemption-fee state that increases with redemption activity and decays over time.
+- **Redemption Fee:** pUSD-denominated protocol fee charged on ordinary redemptions according to a base-fee-plus-dynamic-fee model and routed through `FeeHandler`.
+- **Dynamic Fee:** Decaying redemption-fee component that rises with redemption activity and decays over time.
 - **Maximum Input:** The maximum pUSD amount the caller is willing to burn.
 - **Minimum Collateral Out:** Slippage bound for the minimum collateral the caller must receive.
 - **Iteration Limit:** Maximum number of vaults the redemption may touch in one transaction.
@@ -68,7 +68,7 @@ Intentional differences:
 2. ordinary redemption loops;
 3. `FinalRecovery` redemption loops;
 4. redemption preview functions;
-5. redemption fee and base-rate accounting;
+5. redemption fee and dynamic-fee accounting;
 6. slippage, partial-fill, and on-chain step-bound enforcement;
 7. settlement pricing for `FinalRecovery` redemptions;
 8. shared pricing helpers used by Stability Pool recovery offsets;
@@ -137,20 +137,20 @@ where each route item specifies a collateral branch and maximum branch share.
 struct RedemptionConfig<Balance, Moment> {
     minimum_redemption_amount: Balance,
 
-    base_rate_decay_period: Moment,
-    base_rate_floor: FixedU128,
-    base_rate_ceiling: FixedU128,
-    redemption_fee_floor: FixedU128,
-    redemption_fee_ceiling: FixedU128,
-    base_rate_increase_divisor: FixedU128,
+    dynamic_fee_decay_period: Moment,
+    dynamic_fee_floor: FixedU128,
+    dynamic_fee_ceiling: FixedU128,
+    base_fee: FixedU128,
+    fee_ceiling: FixedU128,
+    dynamic_fee_increase_divisor: FixedU128,
 
     final_recovery_bonus_buffer: FixedU128,
 }
 ```
 
 Valid configs must have a non-zero `minimum_redemption_amount`, non-zero
-`base_rate_decay_period`, ordered base-rate and fee ranges, and a non-zero
-`base_rate_increase_divisor`.
+`dynamic_fee_decay_period`, ordered dynamic-fee and fee ranges, and a non-zero
+`dynamic_fee_increase_divisor`.
 
 `final_recovery_bonus_buffer` is used when a `FinalRecovery` vault has `CR >= 100%`. It ensures the recovery bonus does not prevent the vault from improving as settlement proceeds.
 
@@ -158,12 +158,12 @@ Valid configs must have a non-zero `minimum_redemption_amount`, non-zero
 
 ```rust
 struct RedemptionState<Moment> {
-    base_rate: FixedU128,
+    dynamic_fee: FixedU128,
     last_fee_operation: Moment,
 }
 ```
 
-The base rate is branch-specific. It decays over time and increases when ordinary redemptions are executed. Recovery redemptions do not increase the ordinary redemption base rate.
+The dynamic fee is branch-specific. It decays over time and increases when ordinary redemptions are executed. Recovery redemptions do not increase the ordinary redemption dynamic fee.
 
 ### 5.3 Storage Items
 
@@ -213,44 +213,58 @@ Because the preview does not mutate, it cannot drain a Dormant target and cross 
 ### 6.2 Vault Interface Required by Redemptions
 
 ```rust
-trait VaultRedemptionInterface<AccountId, AssetId, Balance> {
+// The redemption-facing subset of `VaultInterface` (pusd-primitives), keyed by
+// the `(collateral_id, stable_id)` market.
+trait VaultInterface {
     fn next_redemption_target(
-        collateral_id: AssetId,
-        after: Option<AccountId>,
-    ) -> Option<RedemptionTarget<AccountId>>;
+        collateral_id: &CollateralId,
+        stable_id: &StableId,
+        after: Option<&AccountId>,
+    ) -> Option<(AccountId, VaultStatus)>;
 
-    fn prepare_redemption_step(
-        collateral_id: AssetId,
-        owner: AccountId,
-    ) -> Result<RedemptionStepSnapshot<AccountId, Balance>, DispatchError>;
-
-    fn apply_redemption(
-        collateral_id: AssetId,
-        owner: AccountId,
-        redeemer: AccountId,
-        allocation: RedemptionAllocation<Balance>,
-    ) -> DispatchResult;
+    // One atomic step: touch the vault, hand the post-touch snapshot to the
+    // orchestrator's closure, and apply the allocation it returns. `Ok(None)`
+    // persists the touch without redeeming; `Err` rolls the whole step back.
+    fn redeem_step(
+        collateral_id: &CollateralId,
+        stable_id: &StableId,
+        owner: &AccountId,
+        build_allocation: impl FnOnce(
+            RedemptionStepSnapshot<Balance>,
+        ) -> Result<Option<RedemptionAllocation<AccountId, Balance>>, DispatchError>,
+    ) -> Result<Option<RedemptionAllocation<AccountId, Balance>>, DispatchError>;
 
     // Terminal FinalRecovery settlement once the market-cancellable debt is
     // exhausted: moves the residual to branch bad debt and removes the vault,
     // returning the residual the orchestrator burns from the Insurance Fund.
     fn settle_recovery_residual(
-        collateral_id: AssetId,
-        owner: AccountId,
+        collateral_id: &CollateralId,
+        stable_id: &StableId,
+        owner: &AccountId,
     ) -> Result<Balance, DispatchError>;
 
-    // Fully-accrued branch debt, for the base-rate redeemed-fraction.
-    fn branch_debt(collateral_id: AssetId) -> Balance;
+    // Fully-accrued branch debt, for the dynamic-fee redeemed-fraction.
+    fn branch_debt(collateral_id: &CollateralId, stable_id: &StableId) -> Balance;
+
+    // Burns up to the market's recorded bad debt from `credit`, returning the
+    // unconsumed surplus. Carries the Insurance-Fund residual burn.
+    fn heal(
+        collateral_id: &CollateralId,
+        stable_id: &StableId,
+        credit: Credit,
+    ) -> Result<Credit, DispatchError>;
 }
 ```
 
-`RedemptionTarget` carries the target `owner` and its `RedemptionTargetKind`
-(`Ordinary`, `Dormant`, or `FinalRecovery`) so the orchestrator selects a pricing regime
-without a second classifying call. `RedemptionStepSnapshot` carries the post-touch `debt`,
-held `collateral`, and the branch `redistribution_penalty` (the recovery-bonus bound).
+`next_redemption_target` returns the target `owner` and its `VaultStatus`
+(`Active`, `Dormant`, or `FinalRecovery`). `RedemptionStepSnapshot` carries the same
+`status` plus the post-touch `debt`, held `collateral`, and the branch
+`redistribution_penalty` (the recovery-bonus bound; only consulted by `FinalRecovery`
+pricing), so the orchestrator selects a pricing regime without a second classifying call.
 
-`prepare_redemption_step` fully accrues aggregate interest, touches the target vault,
-validates its current status, and returns a snapshot that is safe to execute against.
+`redeem_step` fully accrues aggregate interest, touches the target vault, validates its
+current status, and prices and applies the step against that post-touch snapshot inside
+one atomic call.
 
 `next_redemption_target` is the authoritative current-target interface. Both forms re-apply the
 `FinalRecovery`/Dormant barrier first, so slot clearance, creation, liquidation, activation, or
@@ -306,40 +320,40 @@ Ordinary redemptions charge a dynamic pUSD fee. The fee has two purposes:
 
 The redeemed debt is burned through the linear credit passed into Vaults. The redemption fee is not burned; Redemptions splits it from the total withdrawn credit and routes it through `FeeHandler`.
 
-### 8.1 Base-Rate Decay
+### 8.1 Dynamic-Fee Decay
 
-Before applying a new ordinary redemption, the branch base rate is decayed from `last_fee_operation` to the current time.
+Before applying a new ordinary redemption, the branch dynamic fee is decayed from `last_fee_operation` to the current time.
 
 ```text
-elapsed_half_lives = time_elapsed / base_rate_decay_period
+elapsed_half_lives = time_elapsed / dynamic_fee_decay_period
 decay_factor = 2^(-elapsed_half_lives)
-decayed_base_rate = floor(base_rate * decay_factor)
+decayed_dynamic_fee = floor(dynamic_fee * decay_factor)
 ```
 
-`base_rate_decay_period` is the redemption-fee half-life. The suggested initial value is 6 hours. The implementation may approximate `2^(-elapsed_half_lives)` with a fixed-point helper, but it must be deterministic and monotonic: more elapsed time must never produce a higher decayed base rate.
+`dynamic_fee_decay_period` is the redemption-fee half-life. The suggested initial value is 6 hours. The implementation may approximate `2^(-elapsed_half_lives)` with a fixed-point helper, but it must be deterministic and monotonic: more elapsed time must never produce a higher decayed dynamic fee.
 
-### 8.2 Base-Rate Increase
+### 8.2 Dynamic-Fee Increase
 
-After an ordinary redemption, the base rate increases according to the redeemed fraction of branch debt.
+After an ordinary redemption, the dynamic fee increases according to the redeemed fraction of branch debt.
 
 ```text
 redeemed_fraction = redeemed_debt / branch_debt_before_redemption
-base_rate = clamp(
-    decayed_base_rate + redeemed_fraction / base_rate_increase_divisor,
-    base_rate_floor,
-    base_rate_ceiling,
+dynamic_fee = clamp(
+    decayed_dynamic_fee + redeemed_fraction / dynamic_fee_increase_divisor,
+    dynamic_fee_floor,
+    dynamic_fee_ceiling,
 )
 ```
 
-`base_rate_increase_divisor` and `base_rate_ceiling` are configurable per branch.
+`dynamic_fee_increase_divisor` and `dynamic_fee_ceiling` are configurable per branch.
 
 ### 8.3 Fee Calculation
 
 ```text
 redemption_fee_rate = clamp(
-    base_rate + redemption_fee_floor,
-    redemption_fee_floor,
-    redemption_fee_ceiling,
+    dynamic_fee + base_fee,
+    base_fee,
+    fee_ceiling,
 )
 ```
 
@@ -380,6 +394,8 @@ The bonus must not make the recovery vault's CR worse than its pre-redemption CR
 ### 9.2 Insurance-Adjusted Settlement when `CR < 100%`
 
 When the recovery vault is below 100% CR, redemptions use insurance-adjusted recovery pricing.
+
+Each stablecoin has its own Insurance Fund account (the runtime maps `stable_id` to an account), so cover held for one stablecoin never settles another stablecoin's bad debt.
 
 Let:
 
@@ -430,8 +446,10 @@ The Stability Pool document owns `P`, `S`, `G`, epoch, scale, depositor realizat
 | Ordinary redemption         | Yes            | Yes            | No             |
 | Recovery redemption         | Yes            | Yes            | No             |
 | Redemption preview          | Yes            | Yes            | No             |
-| Base-rate update            | Yes            | Yes            | No             |
-| Governance parameter update | Manager origin | Manager origin | Manager origin |
+| Dynamic-fee update            | Yes            | Yes            | No             |
+| Config parameter update     | Branch admin   | Branch admin   | Branch admin   |
+
+Config parameter updates are authorized per market by the runtime's `UpdateOrigin`, keyed by the `(collateral, stable)` pair. Runtimes point it at the market's full admin (the authority that created the branch) and compose a governance override with `EitherOf`.
 
 Safety Mode permits redemptions because they burn pUSD and improve branch TCR. Recovery redemptions are explicit settlement operations.
 
@@ -460,10 +478,10 @@ event RecoveryRedemptionExecuted {
     regime,
 }
 
-event RedemptionBaseRateUpdated {
+event RedemptionDynamicFeeUpdated {
     collateral_id,
-    old_base_rate,
-    new_base_rate,
+    old_dynamic_fee,
+    new_dynamic_fee,
 }
 
 event RedemptionConfigUpdated {
@@ -507,10 +525,10 @@ InvalidRedemptionConfig
 | ----------------------------- | ----------------------: | -------------------------------------------------------- |
 | `minimum_redemption_amount`   |                100 pUSD | Should prevent dust redemptions.                         |
 | `MaxRedemptionSteps`          |                     TBD | Runtime-constant ceiling for caller-supplied `max_steps` |
-| `base_rate_decay_period`      |                 6 hours | Impacts expected redemption demand.                      |
-| `base_rate_floor`             |                       0 | Dynamic base rate may decay to zero.                     |
-| `base_rate_ceiling`           |                    100% | Caps the dynamic base-rate state.                        |
-| `redemption_fee_floor`        |                    0.5% | Minimum ordinary redemption fee.                         |
-| `redemption_fee_ceiling`      |                    100% | Maximum ordinary redemption fee.                         |
-| `base_rate_increase_divisor`  |                       2 | Divides redeemed branch-debt fraction before rate bump.  |
+| `dynamic_fee_decay_period`      |                 6 hours | Impacts expected redemption demand.                      |
+| `dynamic_fee_floor`             |                       0 | The dynamic fee may decay to zero.                     |
+| `dynamic_fee_ceiling`           |                    100% | Caps the dynamic-fee state.                        |
+| `base_fee`        |                    0.5% | Minimum ordinary redemption fee.                         |
+| `fee_ceiling`      |                    100% | Maximum ordinary redemption fee.                         |
+| `dynamic_fee_increase_divisor`  |                       2 | Divides redeemed branch-debt fraction before rate bump.  |
 | `final_recovery_bonus_buffer` |                      1% | Should be reviewed with the recovery-bonus formula.      |
