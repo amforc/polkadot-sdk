@@ -1,4 +1,4 @@
-//! Per-dispatch operation contexts with deferred yield routing.
+//! Per-dispatch operation contexts with deferred yield minting.
 //!
 //! Two phases: [`OpContext::load`] opens the branch-level context, and
 //! [`OpContext::touch`] consumes it into a [`VaultOp`] that owns the touched
@@ -62,7 +62,6 @@ pub(crate) struct VaultOp<T: Config> {
 	pub owner: T::AccountId,
 	pub vault: Vault<BalanceOf<T>>,
 	pub status: VaultStatus,
-	pending_interest_accrued: Option<BalanceOf<T>>,
 }
 
 impl<T: Config> OpContext<T> {
@@ -129,14 +128,21 @@ impl<T: Config> OpContext<T> {
 		Pallet::<T>::branch_config_of(&self.collateral_id, &self.stable_id)
 	}
 
-	/// Defer the upfront fee (charged to the committed vault's owner) until
-	/// commit.
-	pub fn charge_upfront_fee(&mut self, amount: BalanceOf<T>) {
+	/// Charge `owner` the upfront fee: the event is deposited now (reverted
+	/// with the dispatch on error), the mint is deferred until commit so pUSD
+	/// is only issued when the branch state is actually written.
+	pub fn charge_upfront_fee(&mut self, owner: &T::AccountId, amount: BalanceOf<T>) {
 		if amount.is_zero() {
 			return;
 		}
 		debug_assert!(self.pending_fee.is_none(), "one upfront fee per dispatch");
 		self.pending_fee = Some(amount);
+		Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
+			collateral_id: self.collateral_id.clone(),
+			stable_id: self.stable_id.clone(),
+			owner: owner.clone(),
+			amount,
+		});
 	}
 
 	/// Apply pending interest/redistribution to `owner`'s vault row in memory,
@@ -147,10 +153,14 @@ impl<T: Config> OpContext<T> {
 		let status = Pallet::<T>::vault_status_of(&self.collateral_id, &self.stable_id, owner);
 		let pending = Pallet::<T>::pending_touch_for(&vault, &self.state, self.now);
 
-		let mut pending_interest_accrued = None;
 		if !pending.interest.is_zero() {
 			vault.debt.interest = vault.debt.interest.saturating_add(pending.interest);
-			pending_interest_accrued = Some(pending.interest);
+			Pallet::<T>::deposit_event(Event::InterestAccrued {
+				collateral_id: self.collateral_id.clone(),
+				stable_id: self.stable_id.clone(),
+				owner: owner.clone(),
+				amount: pending.interest,
+			});
 		}
 		if !pending.principal.is_zero() {
 			self.state.absorb_redistributed_debt(&mut vault, pending.principal);
@@ -185,7 +195,7 @@ impl<T: Config> OpContext<T> {
 		// A touch preserves the TCR inputs — principal + pending redistribution
 		// move as a sum, collateral only changes hands, and the aggregate accrual
 		// already ran at load — so the load baseline is the post-touch baseline.
-		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, status, pending_interest_accrued })
+		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, status })
 	}
 
 	/// Attach a freshly-built vault row for `owner` — the only path on which a
@@ -193,13 +203,7 @@ impl<T: Config> OpContext<T> {
 	/// fee may already be charged (an open computes its fee before the row
 	/// exists).
 	pub fn attach_new(self, owner: &T::AccountId, vault: Vault<BalanceOf<T>>) -> VaultOp<T> {
-		VaultOp {
-			ctx: self,
-			owner: owner.clone(),
-			vault,
-			status: VaultStatus::Active,
-			pending_interest_accrued: None,
-		}
+		VaultOp { ctx: self, owner: owner.clone(), vault, status: VaultStatus::Active }
 	}
 
 	fn assert_unclobbered(&self) {
@@ -241,16 +245,14 @@ impl<T: Config> VaultOp<T> {
 		}
 		BranchStates::<T>::insert(&self.ctx.collateral_id, &self.ctx.stable_id, &self.ctx.state);
 
-		let Self { ctx, owner, pending_interest_accrued, .. } = self;
-		let interest_accrued = pending_interest_accrued.map(|amount| (owner.clone(), amount));
-		let fee = ctx.pending_fee.map(|amount| (owner, amount));
-		flush_deferred::<T>(
-			ctx.collateral_id,
-			ctx.stable_id,
-			ctx.pending_interest_mint,
-			interest_accrued,
-			fee,
-		);
+		// Mint only after the state is written; the two amounts stay separate
+		// credits so the fee handler's per-credit rounding is unchanged.
+		if !self.ctx.pending_interest_mint.is_zero() {
+			Pallet::<T>::mint_and_route_yield(&self.ctx.stable_id, self.ctx.pending_interest_mint);
+		}
+		if let Some(fee) = self.ctx.pending_fee {
+			Pallet::<T>::mint_and_route_yield(&self.ctx.stable_id, fee);
+		}
 		Ok(())
 	}
 }
@@ -266,35 +268,4 @@ fn enforce_tcr_gate<T: Config>(
 	let pre_tcr = Pallet::<T>::tcr_from_inputs(baseline, price)?;
 	let post_tcr = Pallet::<T>::compute_tcr(state, price, now)?;
 	Pallet::<T>::enforce_mode_rules(config, state, pre_tcr, post_tcr, settlement)
-}
-
-/// Deferred effects, run after the storage commit: aggregate interest minting,
-/// the touched vault's `InterestAccrued`, and the op's upfront fee.
-fn flush_deferred<T: Config>(
-	collateral_id: T::CollateralAssetId,
-	stable_id: T::StableAssetId,
-	interest_mint: BalanceOf<T>,
-	interest_accrued: Option<(T::AccountId, BalanceOf<T>)>,
-	fee: Option<(T::AccountId, BalanceOf<T>)>,
-) {
-	if !interest_mint.is_zero() {
-		Pallet::<T>::mint_and_route_yield(&stable_id, interest_mint);
-	}
-	if let Some((owner, amount)) = interest_accrued {
-		Pallet::<T>::deposit_event(Event::InterestAccrued {
-			collateral_id: collateral_id.clone(),
-			stable_id: stable_id.clone(),
-			owner,
-			amount,
-		});
-	}
-	if let Some((owner, amount)) = fee {
-		Pallet::<T>::mint_and_route_yield(&stable_id, amount);
-		Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
-			collateral_id,
-			stable_id,
-			owner,
-			amount,
-		});
-	}
 }
