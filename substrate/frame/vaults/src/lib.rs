@@ -308,6 +308,13 @@ pub mod pallet {
 		BranchAdminInfo<PalletsOriginOf<T>, T::AccountId, T::Consideration>,
 	>;
 
+	/// Cursor of the `on_idle` refresh walk over [`Vaults`]: the key of the
+	/// last row touched, resumed after on the next idle block. `None` restarts
+	/// from the front of the map.
+	#[pallet::storage]
+	pub type IdleCursor<T: Config> =
+		StorageValue<_, (T::CollateralAssetId, T::StableAssetId, T::AccountId), OptionQuery>;
+
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {

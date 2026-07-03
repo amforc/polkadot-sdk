@@ -6,7 +6,8 @@ use crate::{
 	context::OpContext,
 	math,
 	pallet::{
-		BalanceOf, BranchAdmin, BranchConfigs, BranchStates, Config, Error, Millis, Pallet, Vaults,
+		BalanceOf, BranchAdmin, BranchConfigs, BranchStates, Config, Error, IdleCursor, Millis,
+		Pallet, Vaults,
 	},
 	recovery,
 	types::{
@@ -763,74 +764,52 @@ impl<T: Config> Pallet<T> {
 		))
 	}
 
-	/// Refresh the next handful of vaults across each branch using the cursor.
+	/// Refresh vaults with the block's leftover weight: reconcile every
+	/// branch's oracle-frozen state (bounded by `MaxBranches`, as before),
+	/// then resume the flat [`IdleCursor`] walk over the [`Vaults`] map,
+	/// touching up to the budget. Map order visits every row eventually —
+	/// dormant husks and mid-FIFO `FinalRecovery` vaults included, which the
+	/// old per-branch rate-index cursor never reached.
 	pub(crate) fn on_idle_walk(remaining: Weight) -> Weight {
 		let per_call = T::WeightInfo::on_idle_one_vault();
-		if remaining.any_lt(per_call) {
+		// `checked_div_per_component` is `None` only when every `per_call`
+		// component is zero — weight then does not constrain the walk (the
+		// placeholder `()` weights do exactly this) and only the count cap binds.
+		let by_weight = remaining.checked_div_per_component(&per_call).unwrap_or(u64::MAX);
+		let budget = u64::from(T::MaxOnIdleVaultRefresh::get()).min(by_weight);
+		if budget == 0 {
 			return Weight::zero();
 		}
-		let mut consumed = Weight::zero();
-		let mut budget = T::MaxOnIdleVaultRefresh::get();
-		let touch_one = |collateral_id: &T::CollateralAssetId,
-		                 stable_id: &T::StableAssetId,
-		                 owner: &T::AccountId| {
-			if !Vaults::<T>::contains_key((collateral_id, stable_id, owner)) {
-				return;
-			}
-			let _ = with_storage_layer::<(), DispatchError, _>(|| {
-				OpContext::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
-			});
-		};
+
 		for (collateral_id, stable_id) in BranchConfigs::<T>::iter_keys() {
-			let collateral_id = &collateral_id;
-			let stable_id = &stable_id;
-			if budget == 0 || (remaining.saturating_sub(consumed)).any_lt(per_call) {
-				break;
-			}
 			let _ = with_storage_layer::<(), DispatchError, _>(|| {
-				Self::do_refresh_branch(collateral_id, stable_id)
+				Self::do_refresh_branch(&collateral_id, &stable_id)
 			});
-			let Some(branch) = BranchStates::<T>::get(collateral_id, stable_id) else { continue };
-			let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
-			let initial_cursor = branch.idle_cursor.or_else(|| T::VaultLists::head(&rate_list));
-			let mut cursor = initial_cursor.clone();
-			let final_recovery_head = recovery::next_target::<T>(collateral_id, stable_id);
-			let dormant_target = branch.dormant_redemption_target;
-
-			while budget > 0 {
-				let Some(owner) = cursor.clone() else { break };
-				touch_one(collateral_id, stable_id, &owner);
-				cursor = T::VaultLists::neighbors(&rate_list, &owner).and_then(|p| p.next);
-				budget = budget.saturating_sub(1);
-				consumed = consumed.saturating_add(per_call);
-				if (remaining.saturating_sub(consumed)).any_lt(per_call) {
-					break;
-				}
-			}
-
-			let try_extra = |owner: T::AccountId, budget: &mut u32, consumed: &mut Weight| {
-				if *budget == 0 || (remaining.saturating_sub(*consumed)).any_lt(per_call) {
-					return;
-				}
-				touch_one(collateral_id, stable_id, &owner);
-				*budget = budget.saturating_sub(1);
-				*consumed = consumed.saturating_add(per_call);
-			};
-			if let Some(owner) = final_recovery_head {
-				try_extra(owner, &mut budget, &mut consumed);
-			}
-			if let Some(owner) = dormant_target {
-				try_extra(owner, &mut budget, &mut consumed);
-			}
-
-			if cursor != initial_cursor {
-				BranchStates::<T>::mutate(collateral_id, stable_id, |maybe| {
-					if let Some(state) = maybe {
-						state.idle_cursor = cursor.take();
-					}
-				});
-			}
 		}
-		consumed
+
+		let mut iter = match IdleCursor::<T>::get() {
+			Some((collateral_id, stable_id, owner)) => Vaults::<T>::iter_from(
+				Vaults::<T>::hashed_key_for((collateral_id, stable_id, owner)),
+			),
+			None => Vaults::<T>::iter(),
+		};
+		// Bounded by `budget >= 1`: every iteration increments `touched` and
+		// the loop breaks at the budget, or earlier when the map drains.
+		let mut touched: u64 = 0;
+		let cursor = loop {
+			// Iterator drained: clear the cursor so the next idle block wraps
+			// around to the front of the map.
+			let Some((key, _vault)) = iter.next() else { break None };
+			let (collateral_id, stable_id, owner) = key;
+			let _ = with_storage_layer::<(), DispatchError, _>(|| {
+				OpContext::<T>::refresh(collateral_id.clone(), stable_id.clone(), &owner)
+			});
+			touched = touched.saturating_add(1);
+			if touched >= budget {
+				break Some((collateral_id, stable_id, owner));
+			}
+		};
+		IdleCursor::<T>::set(cursor);
+		per_call.saturating_mul(touched)
 	}
 }
