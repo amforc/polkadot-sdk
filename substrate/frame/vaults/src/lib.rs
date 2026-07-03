@@ -36,8 +36,7 @@ pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
 	BranchConfig, BranchConfigUpdate, BranchDebt, BranchMode, BranchStakes, BranchState,
-	DebtPayment, FrozenReason, FrozenState, RedistributionSnapshot, Vault, VaultDebt, VaultListId,
-	VaultStatus,
+	FrozenReason, FrozenState, RedistributionSnapshot, Vault, VaultDebt, VaultListId, VaultStatus,
 };
 pub use weights::WeightInfo;
 
