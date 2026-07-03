@@ -48,9 +48,9 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			}
 			// `dormant_redemption_target`, when set, must point at a Dormant vault.
 			if let Some(owner) = state.dormant_redemption_target.clone() {
-				let Some(vault) = Vaults::<T>::get((collateral_id, stable_id, &owner)) else {
+				if !Vaults::<T>::contains_key((collateral_id, stable_id, &owner)) {
 					return Err("dormant_redemption_target points at missing vault".into());
-				};
+				}
 				if !Pallet::<T>::vault_status_of(collateral_id, stable_id, &owner).is_dormant() {
 					return Err("dormant_redemption_target points at non-Dormant".into());
 				}

@@ -1,4 +1,12 @@
-//! Per-dispatch branch state context with deferred yield routing.
+//! Per-dispatch operation contexts with deferred yield routing.
+//!
+//! Two phases: [`OpContext::load`] opens the branch-level context, and
+//! [`OpContext::touch`] consumes it into a [`VaultOp`] that owns the touched
+//! vault row, its owner key, and its derived status. A commit consumes the
+//! phase value, writes the row it owns, and applies the [`TcrGate`] the
+//! operation declares. The protocol is structural: an operation cannot touch
+//! twice, commit a row other than the one it touched, or commit without
+//! naming its TCR stance.
 
 use crate::{
 	pallet::{BalanceOf, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet, Vaults},
@@ -11,7 +19,25 @@ use frame::{
 };
 use pusd_primitives::ProvidePrice;
 
-/// Threads one branch-state read through an operation and commits it once.
+/// TCR admissibility rule a commit declares, applied to the operation's
+/// baseline → committed state change. Every commit names one, so each
+/// operation's mode-rule stance is explicit (and greppable) at its commit
+/// site.
+pub(crate) enum TcrGate<'a, Balance> {
+	/// The Normal/Safety mode rules apply: the op may not drop the branch TCR
+	/// below the safety threshold, nor worsen it while already below.
+	Enforce { price: FixedU128, config: &'a BranchConfig<Balance> },
+	/// Settlement path (a branch-emptying close): TCRs are still computed —
+	/// surfacing arithmetic overflow — but worsening is allowed.
+	Settle { price: FixedU128, config: &'a BranchConfig<Balance> },
+	/// No TCR computation: the op is structurally TCR-improving (repay,
+	/// deposit, redemption) or gated elsewhere (MCR on the liquidation and
+	/// recovery paths).
+	Exempt,
+}
+
+/// Branch-level operation context: one branch-state read threaded through an
+/// operation and committed once.
 pub(crate) struct OpContext<T: Config> {
 	pub collateral_id: T::CollateralAssetId,
 	pub stable_id: T::StableAssetId,
@@ -19,12 +45,35 @@ pub(crate) struct OpContext<T: Config> {
 	pub state: BranchState<T::AccountId, BalanceOf<T>>,
 	rate_list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
 	pending_interest_mint: BalanceOf<T>,
-	pending_fee: Option<(T::AccountId, BalanceOf<T>)>,
-	pending_interest_accrued: Option<(T::AccountId, BalanceOf<T>)>,
+	pending_fee: Option<BalanceOf<T>>,
+	/// Post-accrual state at load: the "pre" side of the commit's TCR gate.
+	/// A touch preserves the TCR inputs (the debt sum and collateral are
+	/// invariant under a touch), so this doubles as the [`VaultOp`] baseline.
+	tcr_baseline: BranchState<T::AccountId, BalanceOf<T>>,
 	#[cfg(debug_assertions)]
 	loaded: BranchState<T::AccountId, BalanceOf<T>>,
+}
+
+/// Vault-level operation: a [`OpContext::touch`]ed context that owns the vault
+/// row it settled. Commits write `vault` under `owner`, so the touched row and
+/// the committed row cannot diverge.
+pub(crate) struct VaultOp<T: Config> {
+	pub collateral_id: T::CollateralAssetId,
+	pub stable_id: T::StableAssetId,
+	pub now: Millis,
+	pub state: BranchState<T::AccountId, BalanceOf<T>>,
+	pub owner: T::AccountId,
+	pub vault: Vault<BalanceOf<T>>,
+	pub status: VaultStatus,
+	rate_list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
+	pending_interest_mint: BalanceOf<T>,
+	pending_fee: Option<BalanceOf<T>>,
+	pending_interest_accrued: Option<BalanceOf<T>>,
+	/// The [`OpContext`] baseline, carried through the touch: the "pre" side
+	/// of the commit's TCR gate.
+	tcr_baseline: BranchState<T::AccountId, BalanceOf<T>>,
 	#[cfg(debug_assertions)]
-	touched_owner: Option<T::AccountId>,
+	loaded: BranchState<T::AccountId, BalanceOf<T>>,
 }
 
 impl<T: Config> OpContext<T> {
@@ -45,15 +94,13 @@ impl<T: Config> OpContext<T> {
 			collateral_id,
 			stable_id,
 			now,
+			tcr_baseline: state.clone(),
 			state,
 			rate_list,
 			pending_interest_mint,
 			pending_fee: None,
-			pending_interest_accrued: None,
 			#[cfg(debug_assertions)]
 			loaded,
-			#[cfg(debug_assertions)]
-			touched_owner: None,
 		})
 	}
 
@@ -63,10 +110,9 @@ impl<T: Config> OpContext<T> {
 		stable_id: T::StableAssetId,
 		owner: &T::AccountId,
 	) -> Result<(), DispatchError> {
-		let mut context = Self::load(collateral_id, stable_id)?;
-		let (vault, _) = context.touch(owner)?;
-		context.commit_with_vault(owner, &vault);
-		Ok(())
+		let op = Self::load(collateral_id, stable_id)?;
+		let op = op.touch(owner)?;
+		op.commit(TcrGate::Exempt)
 	}
 
 	pub fn ensure_not_frozen(&self) -> Result<(), DispatchError> {
@@ -91,33 +137,20 @@ impl<T: Config> OpContext<T> {
 		Pallet::<T>::branch_config_of(&self.collateral_id, &self.stable_id)
 	}
 
-	/// Adopt `next` as the branch state, but only if the TCR mode rules permit
-	/// the pre→post transition. `is_settlement` relaxes the worsening checks on
-	/// the liquidation/close settlement paths (see [`Pallet::enforce_mode_rules`]).
-	pub fn transition(
-		&mut self,
-		next: BranchState<T::AccountId, BalanceOf<T>>,
-		config: &BranchConfig<BalanceOf<T>>,
-		price: FixedU128,
-		is_settlement: bool,
-	) -> Result<(), DispatchError> {
-		let pre_tcr = Pallet::<T>::compute_tcr(&self.state, price, self.now)?;
-		let post_tcr = Pallet::<T>::compute_tcr(&next, price, self.now)?;
-		Pallet::<T>::enforce_mode_rules(config, &self.state, pre_tcr, post_tcr, is_settlement)?;
-		self.state = next;
-		Ok(())
+	/// Defer the upfront fee (charged to the committed vault's owner) until
+	/// commit.
+	pub fn charge_upfront_fee(&mut self, amount: BalanceOf<T>) {
+		if amount.is_zero() {
+			return;
+		}
+		debug_assert!(self.pending_fee.is_none(), "one upfront fee per dispatch");
+		self.pending_fee = Some(amount);
 	}
 
-	/// Apply pending interest/redistribution to a vault row in memory.
-	pub fn touch(
-		&mut self,
-		owner: &T::AccountId,
-	) -> Result<(Vault<BalanceOf<T>>, VaultStatus), DispatchError> {
-		#[cfg(debug_assertions)]
-		{
-			debug_assert!(self.touched_owner.is_none(), "one touch per context");
-			self.touched_owner = Some(owner.clone());
-		}
+	/// Apply pending interest/redistribution to `owner`'s vault row in memory,
+	/// consuming the branch context into a [`VaultOp`] that owns the row.
+	pub fn touch(mut self, owner: &T::AccountId) -> Result<VaultOp<T>, DispatchError> {
+		debug_assert!(self.pending_fee.is_none(), "fee charged before touch");
 		let mut vault = Pallet::<T>::vault_of(&self.collateral_id, &self.stable_id, owner)?;
 		let status = Pallet::<T>::vault_status_in(
 			&self.rate_list,
@@ -126,9 +159,10 @@ impl<T: Config> OpContext<T> {
 		);
 		let pending = Pallet::<T>::pending_touch_for(&vault, &self.state, self.now);
 
+		let mut pending_interest_accrued = None;
 		if !pending.interest.is_zero() {
 			vault.debt.interest = vault.debt.interest.saturating_add(pending.interest);
-			self.pending_interest_accrued = Some((owner.clone(), pending.interest));
+			pending_interest_accrued = Some(pending.interest);
 		}
 		if !pending.principal.is_zero() {
 			self.state.absorb_redistributed_debt(&mut vault, pending.principal);
@@ -156,71 +190,53 @@ impl<T: Config> OpContext<T> {
 		// FinalRecovery vaults are not stake-bearing; their stake stays zero while
 		// `collateral` persists on the row.
 		if !status.is_final_recovery() && vault.redistribution_stake != vault.collateral {
-			self.state.refresh_vault_stake(
-				vault.annual_rate,
-				vault.redistribution_stake,
-				vault.collateral,
-			);
-			vault.redistribution_stake = vault.collateral;
+			let new_stake = vault.collateral;
+			self.state.set_vault_stake(&mut vault, new_stake);
 		}
 
-		Ok((vault, status))
+		Ok(VaultOp {
+			// A touch preserves the TCR inputs — principal + pending
+			// redistribution move as a sum, collateral only changes hands, and
+			// the aggregate accrual already ran at load — so the load baseline
+			// is the post-touch baseline.
+			tcr_baseline: self.tcr_baseline,
+			collateral_id: self.collateral_id,
+			stable_id: self.stable_id,
+			now: self.now,
+			state: self.state,
+			owner: owner.clone(),
+			vault,
+			status,
+			rate_list: self.rate_list,
+			pending_interest_mint: self.pending_interest_mint,
+			pending_fee: self.pending_fee,
+			pending_interest_accrued,
+			#[cfg(debug_assertions)]
+			loaded: self.loaded,
+		})
 	}
 
-	pub fn charge_upfront_fee(&mut self, owner: &T::AccountId, amount: BalanceOf<T>) {
-		if amount.is_zero() {
-			return;
-		}
-		debug_assert!(self.pending_fee.is_none(), "one upfront fee per dispatch");
-		self.pending_fee = Some((owner.clone(), amount));
-	}
-
-	pub fn commit_with_vault(self, owner: &T::AccountId, vault: &Vault<BalanceOf<T>>) {
+	/// Commit a freshly-opened vault row for `owner` — the only path on which a
+	/// row enters storage without a touch — together with the branch state.
+	pub fn commit_new_vault(
+		self,
+		owner: &T::AccountId,
+		vault: &Vault<BalanceOf<T>>,
+		gate: TcrGate<'_, BalanceOf<T>>,
+	) -> Result<(), DispatchError> {
+		enforce_tcr_gate::<T>(&self.tcr_baseline, &self.state, self.now, gate)?;
 		self.assert_unclobbered();
-		self.assert_commits_touched_owner(owner);
 		Vaults::<T>::insert((&self.collateral_id, &self.stable_id, owner), vault);
 		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
-		self.finish();
-	}
-
-	pub fn commit_removing_vault(self, owner: &T::AccountId) {
-		self.assert_unclobbered();
-		self.assert_commits_touched_owner(owner);
-		Vaults::<T>::remove((&self.collateral_id, &self.stable_id, owner));
-		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
-		self.finish();
-	}
-
-	/// Runs external hooks after the storage commit.
-	fn finish(self) {
-		let Self {
-			collateral_id,
-			stable_id,
-			pending_interest_mint,
-			pending_fee,
-			pending_interest_accrued,
-			..
-		} = self;
-		if !pending_interest_mint.is_zero() {
-			Pallet::<T>::mint_and_route_yield(&stable_id, pending_interest_mint);
-		}
-		if let Some((owner, amount)) = pending_interest_accrued {
-			Pallet::<T>::deposit_event(Event::InterestAccrued {
-				collateral_id: collateral_id.clone(),
-				stable_id: stable_id.clone(),
-				owner,
-				amount,
-			});
-		}
-		if let Some((owner, amount)) = pending_fee {
-			Pallet::<T>::mint_and_route_yield(&stable_id, amount);
-			Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
-				collateral_id,
-				stable_id,
-				owner,
-				amount,
-			});
-		}
+		let fee = self.pending_fee.map(|amount| (owner.clone(), amount));
+		flush_deferred::<T>(
+			self.collateral_id,
+			self.stable_id,
+			self.pending_interest_mint,
+			None,
+			fee,
+		);
+		Ok(())
 	}
 
 	fn assert_unclobbered(&self) {
@@ -231,17 +247,132 @@ impl<T: Config> OpContext<T> {
 			"BranchStates mutated behind OpContext"
 		);
 	}
+}
 
-	/// A commit must target the row [`Self::touch`] returned, or the touch's
-	/// interest/redistribution settlement would be written to the wrong key.
-	/// Untouched commits (fresh rows from `open_vault`) are exempt.
-	fn assert_commits_touched_owner(&self, owner: &T::AccountId) {
+impl<T: Config> VaultOp<T> {
+	/// The branch's rate-index list id; see [`OpContext::rate_list`].
+	pub fn rate_list(&self) -> &VaultListId<T::CollateralAssetId, T::StableAssetId> {
+		&self.rate_list
+	}
+
+	/// Oracle price for this operation's collateral.
+	pub fn price(&self) -> Result<FixedU128, DispatchError> {
+		T::Oracle::provide_price(&self.collateral_id)
+	}
+
+	/// Branch config for this operation's collateral.
+	pub fn config(&self) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
+		Pallet::<T>::branch_config_of(&self.collateral_id, &self.stable_id)
+	}
+
+	/// Defer the upfront fee charged to the vault owner until commit.
+	pub fn charge_upfront_fee(&mut self, amount: BalanceOf<T>) {
+		if amount.is_zero() {
+			return;
+		}
+		debug_assert!(self.pending_fee.is_none(), "one upfront fee per dispatch");
+		self.pending_fee = Some(amount);
+	}
+
+	/// Write the owned vault row and the branch state, gated by `gate`.
+	pub fn commit(self, gate: TcrGate<'_, BalanceOf<T>>) -> Result<(), DispatchError> {
+		self.commit_inner(gate, true)
+	}
+
+	/// Remove the owned vault row and write the branch state, gated by `gate`.
+	pub fn commit_removing_vault(
+		self,
+		gate: TcrGate<'_, BalanceOf<T>>,
+	) -> Result<(), DispatchError> {
+		self.commit_inner(gate, false)
+	}
+
+	fn commit_inner(
+		self,
+		gate: TcrGate<'_, BalanceOf<T>>,
+		keep_row: bool,
+	) -> Result<(), DispatchError> {
+		enforce_tcr_gate::<T>(&self.tcr_baseline, &self.state, self.now, gate)?;
+		self.assert_unclobbered();
+		if keep_row {
+			Vaults::<T>::insert((&self.collateral_id, &self.stable_id, &self.owner), &self.vault);
+		} else {
+			Vaults::<T>::remove((&self.collateral_id, &self.stable_id, &self.owner));
+		}
+		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
+		self.flush();
+		Ok(())
+	}
+
+	fn flush(self) {
+		let Self {
+			collateral_id,
+			stable_id,
+			owner,
+			pending_interest_mint,
+			pending_fee,
+			pending_interest_accrued,
+			..
+		} = self;
+		let interest_accrued = pending_interest_accrued.map(|amount| (owner.clone(), amount));
+		let fee = pending_fee.map(|amount| (owner, amount));
+		flush_deferred::<T>(collateral_id, stable_id, pending_interest_mint, interest_accrued, fee);
+	}
+
+	fn assert_unclobbered(&self) {
 		#[cfg(debug_assertions)]
-		debug_assert!(
-			self.touched_owner.as_ref().is_none_or(|touched| touched == owner),
-			"committed vault must be the touched vault"
+		debug_assert_eq!(
+			BranchStates::<T>::get(&self.collateral_id, &self.stable_id).as_ref(),
+			Some(&self.loaded),
+			"BranchStates mutated behind VaultOp"
 		);
-		#[cfg(not(debug_assertions))]
-		let _ = owner;
+	}
+}
+
+/// Apply `gate` to one operation's `baseline` → `state` change.
+fn enforce_tcr_gate<T: Config>(
+	baseline: &BranchState<T::AccountId, BalanceOf<T>>,
+	state: &BranchState<T::AccountId, BalanceOf<T>>,
+	now: Millis,
+	gate: TcrGate<'_, BalanceOf<T>>,
+) -> Result<(), DispatchError> {
+	let (price, config, is_settlement) = match gate {
+		TcrGate::Enforce { price, config } => (price, config, false),
+		TcrGate::Settle { price, config } => (price, config, true),
+		TcrGate::Exempt => return Ok(()),
+	};
+	let pre_tcr = Pallet::<T>::compute_tcr(baseline, price, now)?;
+	let post_tcr = Pallet::<T>::compute_tcr(state, price, now)?;
+	Pallet::<T>::enforce_mode_rules(config, state, pre_tcr, post_tcr, is_settlement)
+}
+
+/// Deferred effects, run after the storage commit: aggregate interest minting,
+/// the touched vault's `InterestAccrued`, and the op's upfront fee.
+fn flush_deferred<T: Config>(
+	collateral_id: T::CollateralAssetId,
+	stable_id: T::StableAssetId,
+	interest_mint: BalanceOf<T>,
+	interest_accrued: Option<(T::AccountId, BalanceOf<T>)>,
+	fee: Option<(T::AccountId, BalanceOf<T>)>,
+) {
+	if !interest_mint.is_zero() {
+		Pallet::<T>::mint_and_route_yield(&stable_id, interest_mint);
+	}
+	if let Some((owner, amount)) = interest_accrued {
+		Pallet::<T>::deposit_event(Event::InterestAccrued {
+			collateral_id: collateral_id.clone(),
+			stable_id: stable_id.clone(),
+			owner,
+			amount,
+		});
+	}
+	if let Some((owner, amount)) = fee {
+		Pallet::<T>::mint_and_route_yield(&stable_id, amount);
+		Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
+			collateral_id,
+			stable_id,
+			owner,
+			amount,
+		});
 	}
 }
