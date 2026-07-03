@@ -870,13 +870,22 @@ impl<T: Config> Pallet<T> {
 		if Self::branch_state_of(collateral_id, stable_id)?.is_frozen() {
 			return Ok(());
 		}
-		Self::enter_frozen(collateral_id, stable_id, FrozenReason::Governance)
+		Self::transition_frozen(collateral_id, stable_id, Some(FrozenReason::Governance))
 	}
 
-	fn enter_frozen(
+	/// Move the market's persisted frozen flag to `target`, emitting one
+	/// `ModeChanged` derived symmetrically: mode before the write, mode after
+	/// (`current_mode` short-circuits on the persisted flag, so entering
+	/// reports `Frozen` as `new_mode` and leaving reports it as `old_mode`).
+	///
+	/// Entering flushes pending aggregate interest first so the frozen window
+	/// accrues nothing; leaving folds the completed window into
+	/// `interest_epoch` so `interest_time(now)` stays continuous. Callers gate
+	/// on the current frozen state, so the same-state arms are unreachable.
+	fn transition_frozen(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-		reason: FrozenReason,
+		target: Option<FrozenReason>,
 	) -> Result<(), DispatchError> {
 		let now = T::TimeProvider::now();
 		let old_mode = Self::current_mode(collateral_id, stable_id).unwrap_or(BranchMode::Normal);
@@ -885,20 +894,33 @@ impl<T: Config> Pallet<T> {
 			stable_id,
 			|maybe| -> Result<_, DispatchError> {
 				let state = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-				// Flush before freezing so the frozen window accrues nothing.
-				let minted = Self::accrue_aggregate_interest(state, now);
-				if !minted.is_zero() {
-					Self::mint_and_route_yield(stable_id, minted);
+				match (state.frozen, target) {
+					(None, Some(_)) => {
+						// Flush before freezing so the frozen window accrues nothing.
+						let minted = Self::accrue_aggregate_interest(state, now);
+						if !minted.is_zero() {
+							Self::mint_and_route_yield(stable_id, minted);
+						}
+					},
+					(Some(frozen), None) => {
+						// Keep `interest_time(now)` continuous across the frozen window.
+						let frozen_window = now.saturating_sub(frozen.entered_at);
+						state.interest_epoch = state.interest_epoch.saturating_add(frozen_window);
+					},
+					(None, None) | (Some(_), Some(_)) => {
+						debug_assert!(false, "callers gate on the current frozen state");
+					},
 				}
-				state.frozen = Some(FrozenState { reason, entered_at: now });
+				state.frozen = target.map(|reason| FrozenState { reason, entered_at: now });
 				Ok(())
 			},
 		)?;
+		let new_mode = Self::current_mode(collateral_id, stable_id).unwrap_or(BranchMode::Normal);
 		Self::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
 			old_mode,
-			new_mode: BranchMode::Frozen,
+			new_mode,
 		});
 		Ok(())
 	}
@@ -912,45 +934,13 @@ impl<T: Config> Pallet<T> {
 		let oracle_ok = T::Oracle::provide_price(collateral_id).is_ok();
 		match (state.frozen, oracle_ok) {
 			(Some(state), true) if matches!(state.reason, FrozenReason::OracleFailure) => {
-				Self::clear_frozen(collateral_id, stable_id)
+				Self::transition_frozen(collateral_id, stable_id, None)
 			},
 			(None, false) => {
-				Self::enter_frozen(collateral_id, stable_id, FrozenReason::OracleFailure)
+				Self::transition_frozen(collateral_id, stable_id, Some(FrozenReason::OracleFailure))
 			},
 			_ => Ok(()),
 		}
-	}
-
-	fn clear_frozen(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-	) -> Result<(), DispatchError> {
-		let now = T::TimeProvider::now();
-		BranchStates::<T>::try_mutate(
-			collateral_id,
-			stable_id,
-			|maybe| -> Result<_, DispatchError> {
-				let state = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-				// Keep `interest_time(now)` continuous across the frozen window.
-				let entered_at = state.frozen.as_ref().map(|state| state.entered_at);
-				if let Some(entered_at) = entered_at {
-					let frozen_window = now.saturating_sub(entered_at);
-					state.interest_epoch = state.interest_epoch.saturating_add(frozen_window);
-				}
-				state.frozen = None;
-				Ok(())
-			},
-		)?;
-		// `Frozen` is the only persisted mode, so the branch always leaves it for the
-		// live TCR-derived mode.
-		let new_mode = Self::current_mode(collateral_id, stable_id).unwrap_or(BranchMode::Normal);
-		Self::deposit_event(Event::ModeChanged {
-			collateral_id: collateral_id.clone(),
-			stable_id: stable_id.clone(),
-			old_mode: BranchMode::Frozen,
-			new_mode,
-		});
-		Ok(())
 	}
 
 	/// Clear a governance-induced Frozen state. No-op when not frozen, or when
@@ -962,7 +952,7 @@ impl<T: Config> Pallet<T> {
 		let state = Self::branch_state_of(collateral_id, stable_id)?;
 		match state.frozen {
 			Some(state) if matches!(state.reason, FrozenReason::Governance) => {
-				Self::clear_frozen(collateral_id, stable_id)
+				Self::transition_frozen(collateral_id, stable_id, None)
 			},
 			_ => Ok(()),
 		}
