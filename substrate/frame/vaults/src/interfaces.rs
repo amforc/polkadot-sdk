@@ -339,8 +339,12 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 	) -> BalanceOf<T> {
-		let now = T::TimeProvider::now();
-		Self::view_branch_debt(collateral_id, stable_id, now)
+		// Zero for an unregistered branch: this sizes the dynamic redemption
+		// fee, it is not an error surface.
+		let Some(state) = BranchStates::<T>::get(collateral_id, stable_id) else {
+			return BalanceOf::<T>::zero();
+		};
+		Self::accrued_branch_debt(&state, T::TimeProvider::now())
 	}
 
 	#[transactional]
