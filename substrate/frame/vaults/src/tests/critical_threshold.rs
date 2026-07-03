@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	pallet::{BranchStates, Vaults},
+	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
 
@@ -15,7 +15,7 @@ fn enter_safety_mode_single_vault() {
 	assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(5, 100)));
 	set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 	// Sanity: `state.frozen` must remain `None`; mode is *derived* from TCR.
-	assert!(!BranchStates::<Test>::get(DOT, PUSD).expect("branch state").is_frozen());
+	assert!(!branch_state(DOT, PUSD).expect("branch state").is_frozen());
 	// Verify the branch really entered Safety mode rather than trusting the
 	// hand-picked price — the mode is derived from live TCR.
 	assert_eq!(

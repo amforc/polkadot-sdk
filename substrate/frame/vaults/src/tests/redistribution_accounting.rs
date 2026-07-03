@@ -10,7 +10,7 @@
 
 use crate::{
 	mock::*,
-	pallet::{BranchStates, Vaults},
+	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
 use pusd_primitives::{KeeperCompensation, LiquidationAllocation, OffsetAllocation};
@@ -27,7 +27,7 @@ fn weighted(x: Balance, rate: FixedU128) -> Balance {
 /// pending-redistribution principal matches the sum of per-vault shares to within
 /// per-stake flooring dust.
 fn assert_accounting_identity_holds() {
-	let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+	let state = branch_state(DOT, PUSD).unwrap();
 	let cumul = state.redistribution.debt_per_stake;
 	let mut sum_shares: Balance = 0;
 	let mut sum_held: Balance = 0;
@@ -97,7 +97,7 @@ fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 		assert_eq!(held(DOT, 1), 0, "liquidatee collateral released");
 		assert_eq!(held(DOT, 2), 1_000, "recipient collateral untouched");
 
-		let state = BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let state = branch_state(DOT, PUSD).expect("branch state");
 		let total_econ =
 			state.debt.principal.saturating_add(state.debt.pending_redistribution_principal);
 		// weighted_sum ≈ total_econ * 0.20 (vault 2's rate, the only recipient).
@@ -135,8 +135,8 @@ fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
 		}));
 
-		let pre_minted = BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.minted_interest;
-		let branch_state_pre = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let pre_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
+		let branch_state_pre = branch_state(DOT, PUSD).unwrap();
 		let total_econ_pre = branch_state_pre
 			.debt
 			.principal
@@ -145,7 +145,7 @@ fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 		advance_time(ONE_YEAR_MS);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
 
-		let post_minted = BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.minted_interest;
+		let post_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
 		let delta = post_minted.saturating_sub(pre_minted);
 
 		let target = weighted(total_econ_pre, rate_pct(20, 100));
@@ -185,7 +185,7 @@ fn mixed_rate_recipients_reconcile_on_touch() {
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
 
-		let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
 		let v_a = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		let v_b = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
 		let expected = weighted(v_a.debt.principal, rate_pct(5, 100))
@@ -232,7 +232,7 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 		));
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
 
-		let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
 		let v_a = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		let v_b = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
 		let expected = weighted(v_a.debt.principal, rate_pct(5, 100))
@@ -394,7 +394,7 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 			crate::Pallet::<Test>::vault_status(DOT, PUSD, 2).unwrap().is_dormant(),
 			"poke must NOT auto-revive a Dormant vault; re-entry requires an explicit hint",
 		);
-		let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(
 			state.dormant_redemption_target,
 			Some(2),
@@ -413,7 +413,7 @@ fn redistribution_residue_lands_in_ownerless_debt() {
 		assert_ok!(open(2, DOT, 999, 500, rate_pct(5, 100)));
 		assert_ok!(open(3, DOT, 5_000, 500, rate_pct(5, 100))); // liquidatee
 
-		let pre_owner = BranchStates::<Test>::get(DOT, PUSD).unwrap().ownerless_debt;
+		let pre_owner = branch_state(DOT, PUSD).unwrap().ownerless_debt;
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		// Force a full redistribution path: no offset, all debt redistributed.
 		// `redistribution_collateral: 0` on purpose — this test isolates the
@@ -425,7 +425,7 @@ fn redistribution_residue_lands_in_ownerless_debt() {
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
 
-		let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
 		// Redistributed debt 501 over stakes 1_000 + 999 = 1_999: the double floor
 		// (per-stake, then × stake) distributes 500 and strands exactly 1 unit — a tight
 		// bound, not an open `> 0` that would also pass if hundreds were mis-routed.

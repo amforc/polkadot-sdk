@@ -309,12 +309,7 @@ fn debt_ceiling_update_emits_parameter_updated() {
 			stable_id: PUSD,
 			update: crate::types::BranchConfigUpdate::DebtCeiling(50_000_000),
 		});
-		assert_eq!(
-			crate::pallet::BranchConfigs::<Test>::get((DOT, PUSD))
-				.expect("config")
-				.debt_ceiling,
-			50_000_000
-		);
+		assert_eq!(branch_config(DOT, PUSD).expect("config").debt_ceiling, 50_000_000);
 	});
 }
 
