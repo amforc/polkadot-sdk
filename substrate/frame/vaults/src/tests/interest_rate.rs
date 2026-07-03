@@ -678,3 +678,34 @@ fn accrued_interest_is_path_independent_across_pokes() {
 		assert!(once - many <= DAYS as u128, "floor dust bounded by one unit per poke");
 	});
 }
+
+// The open fee is priced by the same `apply_borrow` path every borrow uses.
+// Pin it against the closed form it must equal: the post-open debt-weighted
+// average rate applied to the new debt over the upfront-fee period.
+#[test]
+fn open_fee_matches_post_open_average_rate_closed_form() {
+	build_and_execute(|| {
+		register_default_branch();
+		// Pre-existing debt at 5% so the average is a genuine blend.
+		assert_ok!(open(1, DOT, 10_000, 500, rate_pct(5, 100)));
+
+		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let config = crate::pallet::BranchConfigs::<Test>::get((DOT, PUSD)).unwrap();
+		let new_debt: Balance = 1_000;
+		let new_rate = rate_pct(10, 100);
+		let total_ib =
+			state.debt.principal + state.debt.pending_redistribution_principal + new_debt;
+		let weighted = state.debt.weighted_principal_sum + new_rate.saturating_mul_int(new_debt);
+		let avg = crate::math::average_branch_rate(weighted, total_ib);
+		let expected = crate::math::simple_interest_ceil(new_debt, avg, config.upfront_fee_period);
+		assert!(expected > 0);
+
+		assert_eq!(
+			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, new_debt, new_rate),
+			expected
+		);
+		assert_ok!(open(2, DOT, 20_000, new_debt, new_rate));
+		let vault = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
+		assert_eq!(vault.debt.interest, expected, "charged fee matches the quote");
+	});
+}

@@ -9,7 +9,10 @@ use crate::{
 		BalanceOf, BranchAdmin, BranchConfigs, BranchStates, Config, Error, Millis, Pallet, Vaults,
 	},
 	recovery,
-	types::{AdminLevel, BranchConfig, BranchMode, BranchState, Vault, VaultListId, VaultStatus},
+	types::{
+		AdminLevel, BranchConfig, BranchMode, BranchState, Vault, VaultDebt, VaultListId,
+		VaultStatus,
+	},
 	weights::WeightInfo,
 };
 use frame::{
@@ -444,24 +447,27 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Upfront fee for opening a vault at the post-open average branch rate.
-	pub(crate) fn open_upfront_fee(
+	/// A zero-debt, zero-stake vault row: the pre-borrow shape an open feeds
+	/// to [`Self::apply_borrow`], so the open fee is priced by the same code
+	/// path as every borrow. The stake MUST be zero here — `apply_borrow`
+	/// swaps the row's full aggregate contribution, and the open's stake
+	/// enters the aggregates via `set_vault_stake` after the borrow is
+	/// applied. The caller stamps the returned fee onto the row's debt.
+	pub(crate) fn open_scratch_row(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
-		config: &BranchConfig<BalanceOf<T>>,
-		new_debt: BalanceOf<T>,
-		new_rate: FixedU128,
-	) -> BalanceOf<T> {
-		let total_ib = state
-			.debt
-			.principal
-			.saturating_add(state.debt.pending_redistribution_principal)
-			.saturating_add(new_debt);
-		let weighted = state
-			.debt
-			.weighted_principal_sum
-			.saturating_add(new_rate.saturating_mul_int(new_debt));
-		let avg = math::average_branch_rate(weighted, total_ib);
-		math::simple_interest_ceil(new_debt, avg, config.upfront_fee_period)
+		annual_rate: FixedU128,
+		collateral: BalanceOf<T>,
+		now: Millis,
+	) -> Vault<BalanceOf<T>> {
+		Vault {
+			collateral,
+			debt: VaultDebt { principal: Zero::zero(), interest: Zero::zero() },
+			annual_rate,
+			last_interest_time: state.interest_time(now),
+			last_rate_update: now,
+			redistribution_stake: Zero::zero(),
+			redistribution_snapshot: state.redistribution,
+		}
 	}
 
 	fn avg_rate(state: &BranchState<T::AccountId, BalanceOf<T>>) -> FixedU128 {
@@ -680,8 +686,17 @@ impl<T: Config> Pallet<T> {
 			BranchConfigs::<T>::get((collateral_id, stable_id)),
 			BranchStates::<T>::get(collateral_id, stable_id),
 		) {
-			(Some(config), Some(state)) => {
-				Self::open_upfront_fee(&state, &config, initial_debt, annual_rate)
+			(Some(config), Some(mut state)) => {
+				let now = T::TimeProvider::now();
+				let scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
+				Self::apply_borrow(
+					&mut state,
+					&config,
+					&scratch,
+					initial_debt,
+					annual_rate,
+					Zero::zero(),
+				)
 			},
 			_ => BalanceOf::<T>::zero(),
 		}
