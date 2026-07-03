@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	pallet::{BranchStates, Vaults},
+	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
 use pallet_linked_list::SortedListInterface;
@@ -37,11 +37,8 @@ fn fully_redeemed_vault_becomes_dormant_and_leaves_rate_index() {
 		assert!(vault_status(DOT, 1).is_dormant());
 		assert_eq!(v.debt.principal + v.debt.interest, 0);
 		// The redemption poked the target: its interest clock advanced to now.
-		assert_eq!(
-			v.last_interest_time,
-			BranchStates::<Test>::get(DOT, PUSD).unwrap().interest_time(now)
-		);
-		let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		assert_eq!(v.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
+		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.dormant_redemption_target, None);
 		// Rate index no longer contains acct 1.
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
@@ -67,7 +64,7 @@ fn redeemed_below_min_debt_becomes_dormant() {
 		// 349 principal, leaving exactly 151, below MinimumDebt 200.
 		assert_eq!(total, 151);
 		assert!(vault_status(DOT, 1).is_dormant());
-		let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.dormant_redemption_target, Some(1));
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
 			&rate_list(DOT),
@@ -168,10 +165,7 @@ fn redeem_step_skip_persists_touch_without_redeeming() {
 		// Exactly one year at 50% on 500 principal.
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest + 250);
 		assert_eq!(held(DOT, 1), held_pre);
-		assert_eq!(
-			v_post.last_interest_time,
-			BranchStates::<Test>::get(DOT, PUSD).unwrap().interest_time(now)
-		);
+		assert_eq!(v_post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
 		assert!(vault_status(DOT, 1).is_active());
 	});
 }
@@ -216,7 +210,7 @@ fn dormant_pointer_clears_when_last_dormant_fully_redeemed() {
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
 		// Push acct 1 to Dormant via partial-below-MinDebt.
 		assert_ok!(redeem(DOT, 3, 350));
-		let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.dormant_redemption_target, Some(1));
 		// Now redeem acct 1's full residual. next_redemption_target prefers
 		// dormant_redemption_target, so this hits acct 1 again.
@@ -224,7 +218,7 @@ fn dormant_pointer_clears_when_last_dormant_fully_redeemed() {
 		let residual = v.debt.principal + v.debt.interest;
 		let target = redeem(DOT, 3, residual).expect("redeem residual ok");
 		assert_eq!(target, 1);
-		let state = BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.dormant_redemption_target, None);
 	});
 }
@@ -244,10 +238,7 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(60, 100)));
 		assert_ok!(redeem(DOT, 3, 350));
 		assert!(vault_status(DOT, 1).is_dormant());
-		assert_eq!(
-			BranchStates::<Test>::get(DOT, PUSD).unwrap().dormant_redemption_target,
-			Some(1)
-		);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 
 		advance_time(365 * ONE_DAY_MS);
 		// Touch alone never re-activates a Dormant, even past MinimumDebt.
@@ -263,7 +254,7 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 		));
 		assert!(vault_status(DOT, 1).is_active());
 		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(&rate_list(DOT), &1));
-		assert_eq!(BranchStates::<Test>::get(DOT, PUSD).unwrap().dormant_redemption_target, None);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
 	});
 }
 
@@ -322,10 +313,7 @@ fn dormant_vault_with_residual_accrues_interest() {
 		// Vault 1 (open fee 5 → total 505) is redeemed by 350: interest-first cancels 5,
 		// then 345 principal, leaving a 155 residual below MinimumDebt 200 → Dormant.
 		assert!(vault_status(DOT, 1).is_dormant());
-		assert_eq!(
-			BranchStates::<Test>::get(DOT, PUSD).unwrap().dormant_redemption_target,
-			Some(1)
-		);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		assert_eq!(v_pre.debt.principal, 155);
 		assert_eq!(v_pre.debt.interest, 0);
@@ -368,10 +356,7 @@ fn dormant_vault_receives_redistribution_gains_on_touch() {
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
 		// Touch acct 1 so the interest-time lag closes and redistribution gains land on it.
-		let pending_pre = BranchStates::<Test>::get(DOT, PUSD)
-			.unwrap()
-			.debt
-			.pending_redistribution_principal;
+		let pending_pre = branch_state(DOT, PUSD).unwrap().debt.pending_redistribution_principal;
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
 		let v_dormant_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		// The Dormant vault receives its exact stake-weighted share of the redistributed
@@ -379,10 +364,7 @@ fn dormant_vault_receives_redistribution_gains_on_touch() {
 		let gained = v_dormant_post.debt.principal - v_dormant_pre.debt.principal;
 		assert_eq!(gained, 97);
 		// The branch's pending redistribution pool is drawn down by exactly that share.
-		let pending_post = BranchStates::<Test>::get(DOT, PUSD)
-			.unwrap()
-			.debt
-			.pending_redistribution_principal;
+		let pending_post = branch_state(DOT, PUSD).unwrap().debt.pending_redistribution_principal;
 		assert_eq!(pending_pre - pending_post, gained);
 	});
 }
@@ -436,10 +418,7 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 			&rate_list(DOT),
 			&1
 		));
-		assert_eq!(
-			BranchStates::<Test>::get(DOT, PUSD).unwrap().dormant_redemption_target,
-			Some(1)
-		);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 
 		// A deposit alone cannot revive a Dormant vault → rejected (so it must not
 		// lead a batch).
@@ -467,7 +446,7 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 		assert!(vault_status(DOT, 1).is_active());
 		// ...re-inserted into the rate index and the dormant slot cleared.
 		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(&rate_list(DOT), &1));
-		assert_eq!(BranchStates::<Test>::get(DOT, PUSD).unwrap().dormant_redemption_target, None);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
 
 		// ...after which the deposit leg of the batch is accepted.
 		let held_before = held(DOT, 1);

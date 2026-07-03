@@ -115,10 +115,7 @@ fn zero_amount_ops_are_no_ops() {
 		let post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(post.debt.principal, pre.debt.principal);
 		assert_eq!(post.debt.interest, pre.debt.interest + 6);
-		assert_eq!(
-			post.last_interest_time,
-			crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap().interest_time(now)
-		);
+		assert_eq!(post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
 		assert_eq!(held(DOT, 1), 1_000);
 	});
 }
@@ -169,9 +166,6 @@ fn change_rate_to_same_rate_is_no_op() {
 		// But interest is settled: exactly floor(10_000 * 0.05 * 1day / year) = 1, and no
 		// upfront fee is added (which would have pushed debt.interest higher).
 		assert_eq!(post.debt.interest, pre.debt.interest + 1);
-		assert_eq!(
-			post.last_interest_time,
-			crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap().interest_time(now)
-		);
+		assert_eq!(post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
 	});
 }

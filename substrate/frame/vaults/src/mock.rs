@@ -183,6 +183,33 @@ pub fn set_price(collateral: AssetId, price: FixedU128) {
 	});
 }
 
+/// The market's hot accounting state (`None` when unregistered).
+pub fn branch_state(
+	collateral: AssetId,
+	stable: StableId,
+) -> Option<pallet_vaults::BranchState<AccountId, Balance>> {
+	crate::pallet::Branches::<Test>::get((collateral, stable)).map(|branch| branch.state)
+}
+
+/// The market's config (`None` when unregistered).
+pub fn branch_config(
+	collateral: AssetId,
+	stable: StableId,
+) -> Option<pallet_vaults::BranchConfig<Balance>> {
+	crate::pallet::Branches::<Test>::get((collateral, stable)).map(|branch| branch.config)
+}
+
+/// Mutate the market's hot state in place; panics when unregistered.
+pub fn mutate_branch_state(
+	collateral: AssetId,
+	stable: StableId,
+	mutate: impl FnOnce(&mut pallet_vaults::BranchState<AccountId, Balance>),
+) {
+	crate::pallet::Branches::<Test>::mutate((collateral, stable), |maybe| {
+		mutate(&mut maybe.as_mut().expect("branch registered").state)
+	});
+}
+
 /// Derived branch mode (`None` when the market is unknown or the mode cannot
 /// be computed), for tests observing Normal/Safety/Frozen transitions.
 pub fn branch_mode(collateral: &AssetId, stable: &StableId) -> Option<BranchMode> {

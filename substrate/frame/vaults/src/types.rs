@@ -308,6 +308,32 @@ pub struct BranchState<AccountId, Balance> {
 	pub ceiling_last_inc: Millis,
 }
 
+impl<AccountId, Balance: Default + Zero + Ord + Copy> BranchState<AccountId, Balance> {
+	/// A fresh market's state at registration time. The autoline starts at its
+	/// headroom (capped by the line max) when enabled, else at the static
+	/// ceiling.
+	pub fn fresh(config: &BranchConfig<Balance>, now: Millis) -> Self {
+		let effective_ceiling = if config.ceiling_gap.is_zero() {
+			config.debt_ceiling
+		} else {
+			config.ceiling_gap.min(config.debt_ceiling)
+		};
+		Self {
+			total_collateral: Balance::zero(),
+			debt: BranchDebt::default(),
+			stakes: BranchStakes::default(),
+			ownerless_debt: Balance::zero(),
+			ownerless_collateral: Balance::zero(),
+			redistribution: RedistributionSnapshot::default(),
+			interest_epoch: now,
+			dormant_redemption_target: None,
+			frozen: None,
+			effective_ceiling,
+			ceiling_last_inc: now,
+		}
+	}
+}
+
 impl<AccountId, Balance> BranchState<AccountId, Balance> {
 	pub fn is_frozen(&self) -> bool {
 		self.frozen.is_some()
@@ -724,11 +750,17 @@ pub struct BranchAdmins<PalletsOrigin> {
 	pub emergency_admin: PalletsOrigin,
 }
 
-/// Per-market admin origins and the refundable creation deposit, stored
-/// together and torn down together by `remove_branch`. The deposit stays keyed
-/// by the depositor *account* regardless of who admins the market.
+/// Everything a registered `(collateral, stable)` market carries, in one
+/// record: created whole by `create_branch`, torn down whole by
+/// `remove_branch`, so a partially registered market is unrepresentable. The
+/// deposit stays keyed by the depositor *account* regardless of who admins
+/// the market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
-pub struct BranchAdminInfo<PalletsOrigin, AccountId, Consideration> {
+pub struct Branch<PalletsOrigin, AccountId, Balance, Consideration> {
+	/// Governance/risk parameters, moved only through `set_param`.
+	pub config: BranchConfig<Balance>,
+	/// Hot accounting state, rewritten by every vault operation.
+	pub state: BranchState<AccountId, Balance>,
 	pub admins: BranchAdmins<PalletsOrigin>,
 	pub deposit: Option<(AccountId, Consideration)>,
 }

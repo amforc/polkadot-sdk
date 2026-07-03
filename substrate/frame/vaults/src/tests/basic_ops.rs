@@ -51,10 +51,7 @@ fn adjust_vault_via_deposit_then_borrow() {
 		let residual_per_fee = 1u128 - SpFeeShare::get() * 1u128;
 		assert_eq!(fee_dest_balance(), 2 * residual_per_fee);
 		// Branch aggregate mirrors the vault principal.
-		assert_eq!(
-			crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.principal,
-			800
-		);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.principal, 800);
 		// pUSD net to user: initial 500 + 300 borrowed. The upfront fee is recorded as
 		// debt, not deducted from the minted pUSD the user receives.
 		assert_eq!(pusd_balance(1), 800);
@@ -313,9 +310,7 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 		assert_ok!(redeem(DOT, 3, 350));
 		assert!(vault_status(DOT, 1).is_dormant());
 		assert_eq!(
-			crate::pallet::BranchStates::<Test>::get(DOT, PUSD)
-				.unwrap()
-				.dormant_redemption_target,
+			branch_state(DOT, PUSD).unwrap().dormant_redemption_target,
 			Some(1),
 			"sub-minimum redemption parked acct 1 in the dormant slot"
 		);
@@ -335,7 +330,7 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 		assert_eq!(husk.debt.total(), 0);
 		assert_eq!(held(DOT, 1), held_before, "collateral untouched by repay");
 		assert!(vault_status(DOT, 1).is_dormant());
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("state");
+		let state = branch_state(DOT, PUSD).expect("state");
 		assert_eq!(state.dormant_redemption_target, None, "slot released on repay-to-zero");
 	});
 }
@@ -386,12 +381,12 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		));
 		assert!(vault_status(DOT, 2).is_dormant(), "vault 2 is a husk");
 		assert!(vault_status(DOT, 1).is_dormant(), "vault 1 is a husk");
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.debt.bad_debt, 0, "no sweep while husks still hold stake");
 
 		// Closing the first husk still leaves the branch non-empty: no sweep.
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.debt.bad_debt, 0, "no sweep while a husk remains");
 
 		// Closing the last husk empties the branch and sweeps the drift. This
@@ -399,7 +394,7 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
 		assert!(Vaults::<Test>::get((DOT, PUSD, 1)).is_none(), "last husk closed");
 
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.debt.principal, 0);
 		assert_eq!(state.stakes.total, 0);
 		assert_eq!(state.debt.minted_interest, 0, "drift swept out of minted_interest");
@@ -422,7 +417,7 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 			<crate::Pallet<Test> as pusd_primitives::VaultInterface>::heal(&DOT, &PUSD, credit)
 				.expect("heal succeeds");
 		assert_eq!(surplus.peek(), 0);
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.debt.bad_debt, 0, "branch fully settled");
 	});
 }
@@ -442,9 +437,7 @@ fn redemption_slot_rejects_second_owner() {
 		.map(|_| ())
 	}
 	fn parked() -> Option<AccountId> {
-		crate::pallet::BranchStates::<Test>::get(DOT, PUSD)
-			.expect("branch state")
-			.dormant_redemption_target
+		branch_state(DOT, PUSD).expect("branch state").dormant_redemption_target
 	}
 	build_and_execute(|| {
 		register_default_branch();

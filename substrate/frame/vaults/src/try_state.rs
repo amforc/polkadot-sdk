@@ -4,7 +4,7 @@
 //! `next_block` and end-to-end by the runtime's pre-upgrade hook.
 
 use crate::{
-	pallet::{BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, Vaults},
+	pallet::{BalanceOf, BranchOf, Branches, Config, HoldReason, Pallet, Vaults},
 	types::VaultListId,
 };
 use alloc::collections::BTreeMap;
@@ -25,35 +25,35 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	// `check_branch_identities`' single vault pass, then checked once below.
 	let mut owner_collateral: BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>> =
 		BTreeMap::new();
-	for (collateral_id, stable_id) in BranchConfigs::<T>::iter_keys() {
+	for ((collateral_id, stable_id), branch) in Branches::<T>::iter() {
 		let (collateral_id, stable_id) = (&collateral_id, &stable_id);
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 		let recovery_list = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
 		check_branch_identities::<T>(
 			collateral_id,
 			stable_id,
+			&branch,
 			&rate_list,
 			&recovery_list,
 			&mut owner_collateral,
 		)?;
-		if let Some(state) = BranchStates::<T>::get(collateral_id, stable_id) {
-			let tau = state.interest_time(T::TimeProvider::now());
-			if state.debt.last_interest_time > tau {
-				return Err("branch last_interest_time ahead of interest_time(now)".into());
+		let state = &branch.state;
+		let tau = state.interest_time(T::TimeProvider::now());
+		if state.debt.last_interest_time > tau {
+			return Err("branch last_interest_time ahead of interest_time(now)".into());
+		}
+		for (_owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
+			if vault.last_interest_time > tau {
+				return Err("vault last_interest_time ahead of interest_time(now)".into());
 			}
-			for (_owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
-				if vault.last_interest_time > tau {
-					return Err("vault last_interest_time ahead of interest_time(now)".into());
-				}
+		}
+		// `dormant_redemption_target`, when set, must point at a Dormant vault.
+		if let Some(owner) = state.dormant_redemption_target.clone() {
+			if !Vaults::<T>::contains_key((collateral_id, stable_id, &owner)) {
+				return Err("dormant_redemption_target points at missing vault".into());
 			}
-			// `dormant_redemption_target`, when set, must point at a Dormant vault.
-			if let Some(owner) = state.dormant_redemption_target.clone() {
-				if !Vaults::<T>::contains_key((collateral_id, stable_id, &owner)) {
-					return Err("dormant_redemption_target points at missing vault".into());
-				}
-				if !Pallet::<T>::vault_status_of(collateral_id, stable_id, &owner).is_dormant() {
-					return Err("dormant_redemption_target points at non-Dormant".into());
-				}
+			if !Pallet::<T>::vault_status_of(collateral_id, stable_id, &owner).is_dormant() {
+				return Err("dormant_redemption_target points at non-Dormant".into());
 			}
 		}
 	}
@@ -88,13 +88,12 @@ fn check_owner_holds<T: Config>(
 fn check_branch_identities<T: Config>(
 	collateral_id: &T::CollateralAssetId,
 	stable_id: &T::StableAssetId,
+	branch: &BranchOf<T>,
 	rate_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
 	recovery_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
 	owner_collateral: &mut BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>>,
 ) -> Result<(), TryRuntimeError> {
-	let Some(state) = BranchStates::<T>::get(collateral_id, stable_id) else {
-		return Err("registered branch missing BranchState".into());
-	};
+	let state = &branch.state;
 	let cumul_debt_ps = state.redistribution.debt_per_stake;
 	let cumul_collat_ps = state.redistribution.collateral_per_stake;
 
@@ -162,8 +161,7 @@ fn check_branch_identities<T: Config>(
 		return Err("stakes.weighted_sum != Σ floor(rate · stake)".into());
 	}
 	check_weighted_principal_sum::<T>(
-		collateral_id,
-		stable_id,
+		&branch.config,
 		state.debt.weighted_principal_sum,
 		state.debt.pending_redistribution_principal.saturating_add(state.ownerless_debt),
 		sum_weighted_principal,
@@ -211,8 +209,7 @@ fn check_branch_identities<T: Config>(
 }
 
 fn check_weighted_principal_sum<T: Config>(
-	collateral_id: &T::CollateralAssetId,
-	stable_id: &T::StableAssetId,
+	config: &crate::types::BranchConfig<BalanceOf<T>>,
 	weighted_principal_sum: BalanceOf<T>,
 	pending_pool: BalanceOf<T>,
 	sum_weighted_principal: BalanceOf<T>,
@@ -221,9 +218,6 @@ fn check_weighted_principal_sum<T: Config>(
 	if weighted_principal_sum < sum_weighted_principal {
 		return Err("weighted_principal_sum below Σ floor(rate · principal)".into());
 	}
-	let Some(config) = BranchConfigs::<T>::get((collateral_id, stable_id)) else {
-		return Err("registered branch without config".into());
-	};
 	let rate_bound = config.maximum_borrow_rate.max(FixedU128::one());
 	let w_pending = rate_bound.saturating_mul_int(pending_pool);
 	let slack: BalanceOf<T> = n_live_vaults.saturating_add(1).unique_saturated_into();

@@ -9,8 +9,10 @@
 //! naming its TCR stance.
 
 use crate::{
-	pallet::{BalanceOf, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet, Vaults},
-	types::{BranchConfig, BranchState, Vault, VaultListId, VaultStatus},
+	pallet::{
+		BalanceOf, BranchOf, Branches, Config, Error, Event, HoldReason, Millis, Pallet, Vaults,
+	},
+	types::{BranchConfig, Vault, VaultListId, VaultStatus},
 	utility_impls::TcrInputs,
 };
 use frame::{
@@ -23,12 +25,13 @@ use pusd_primitives::ProvidePrice;
 /// baseline → committed state change. Every commit names one, so each
 /// operation's mode-rule stance is explicit (and greppable) at its commit
 /// site.
-pub(crate) enum TcrGate<'a, Balance> {
-	/// Pre- and post-TCR are computed — surfacing arithmetic overflow. Unless
-	/// `settlement` (a branch-emptying close, where worsening is allowed), the
-	/// Normal/Safety mode rules apply: the op may not drop the branch TCR
-	/// below the safety threshold, nor worsen it while already below.
-	Check { price: FixedU128, config: &'a BranchConfig<Balance>, settlement: bool },
+pub(crate) enum TcrGate {
+	/// Pre- and post-TCR are computed — surfacing arithmetic overflow — against
+	/// the operation's own loaded branch config. Unless `settlement` (a
+	/// branch-emptying close, where worsening is allowed), the Normal/Safety
+	/// mode rules apply: the op may not drop the branch TCR below the safety
+	/// threshold, nor worsen it while already below.
+	Check { price: FixedU128, settlement: bool },
 	/// No TCR computation: the op is structurally TCR-improving (repay,
 	/// deposit, redemption) or gated elsewhere (MCR on the liquidation and
 	/// recovery paths).
@@ -41,7 +44,7 @@ pub(crate) struct OpContext<T: Config> {
 	pub collateral_id: T::CollateralAssetId,
 	pub stable_id: T::StableAssetId,
 	pub now: Millis,
-	pub state: BranchState<T::AccountId, BalanceOf<T>>,
+	pub branch: BranchOf<T>,
 	pending_interest_mint: BalanceOf<T>,
 	pending_fee: Option<BalanceOf<T>>,
 	/// The post-accrual TCR inputs at load: the "pre" side of the commit's
@@ -50,7 +53,7 @@ pub(crate) struct OpContext<T: Config> {
 	/// immutable, so it doubles as the [`VaultOp`] baseline.
 	tcr_baseline: TcrInputs<BalanceOf<T>>,
 	#[cfg(debug_assertions)]
-	loaded: BranchState<T::AccountId, BalanceOf<T>>,
+	loaded: BranchOf<T>,
 }
 
 /// Vault-level operation: a [`OpContext::touch`]ed context that owns the vault
@@ -71,24 +74,24 @@ impl<T: Config> OpContext<T> {
 		stable_id: T::StableAssetId,
 	) -> Result<Self, DispatchError> {
 		let now = T::TimeProvider::now();
-		let mut state = Pallet::<T>::branch_state_of(&collateral_id, &stable_id)?;
+		let mut branch = Pallet::<T>::branch_of(&collateral_id, &stable_id)?;
 		#[cfg(debug_assertions)]
-		let loaded = state.clone();
+		let loaded = branch.clone();
 
-		let pending_interest_mint = Pallet::<T>::accrue_aggregate_interest(&mut state, now);
+		let pending_interest_mint = Pallet::<T>::accrue_aggregate_interest(&mut branch.state, now);
 
 		// The accrual above folded pending aggregate interest into the state,
 		// so the baseline debt is exactly the sum `compute_tcr` would see.
 		let tcr_baseline = TcrInputs {
-			collateral: state.total_collateral,
-			debt: Pallet::<T>::accrued_branch_debt(&state, now),
+			collateral: branch.state.total_collateral,
+			debt: Pallet::<T>::accrued_branch_debt(&branch.state, now),
 		};
 		Ok(Self {
 			collateral_id,
 			stable_id,
 			now,
 			tcr_baseline,
-			state,
+			branch,
 			pending_interest_mint,
 			pending_fee: None,
 			#[cfg(debug_assertions)]
@@ -108,7 +111,7 @@ impl<T: Config> OpContext<T> {
 	}
 
 	pub fn ensure_not_frozen(&self) -> Result<(), DispatchError> {
-		ensure!(!self.state.is_frozen(), Error::<T>::BranchFrozen);
+		ensure!(!self.branch.state.is_frozen(), Error::<T>::BranchFrozen);
 		Ok(())
 	}
 
@@ -123,9 +126,10 @@ impl<T: Config> OpContext<T> {
 		T::Oracle::provide_price(&self.collateral_id)
 	}
 
-	/// Branch config for this context's collateral.
-	pub fn config(&self) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
-		Pallet::<T>::branch_config_of(&self.collateral_id, &self.stable_id)
+	/// This operation's branch config — a copy of the loaded record's, so no
+	/// second storage read and no borrow of the op itself.
+	pub fn config(&self) -> BranchConfig<BalanceOf<T>> {
+		self.branch.config.clone()
 	}
 
 	/// Charge `owner` the upfront fee: the event is deposited now (reverted
@@ -151,7 +155,7 @@ impl<T: Config> OpContext<T> {
 		debug_assert!(self.pending_fee.is_none(), "fee charged before touch");
 		let mut vault = Pallet::<T>::vault_of(&self.collateral_id, &self.stable_id, owner)?;
 		let status = Pallet::<T>::vault_status_of(&self.collateral_id, &self.stable_id, owner);
-		let pending = Pallet::<T>::pending_touch_for(&vault, &self.state, self.now);
+		let pending = Pallet::<T>::pending_touch_for(&vault, &self.branch.state, self.now);
 
 		if !pending.interest.is_zero() {
 			vault.debt.interest = vault.debt.interest.saturating_add(pending.interest);
@@ -163,7 +167,7 @@ impl<T: Config> OpContext<T> {
 			});
 		}
 		if !pending.principal.is_zero() {
-			self.state.absorb_redistributed_debt(&mut vault, pending.principal);
+			self.branch.state.absorb_redistributed_debt(&mut vault, pending.principal);
 		}
 		if !pending.collateral.is_zero() {
 			// Already counted in `state.total_collateral`; only the hold moves.
@@ -180,16 +184,16 @@ impl<T: Config> OpContext<T> {
 			vault.collateral = vault.collateral.saturating_add(pending.collateral);
 		}
 
-		if vault.redistribution_snapshot != self.state.redistribution {
-			vault.redistribution_snapshot = self.state.redistribution;
+		if vault.redistribution_snapshot != self.branch.state.redistribution {
+			vault.redistribution_snapshot = self.branch.state.redistribution;
 		}
-		vault.last_interest_time = self.state.interest_time(self.now);
+		vault.last_interest_time = self.branch.state.interest_time(self.now);
 
 		// FinalRecovery vaults are not stake-bearing; their stake stays zero while
 		// `collateral` persists on the row.
 		if !status.is_final_recovery() && vault.redistribution_stake != vault.collateral {
 			let new_stake = vault.collateral;
-			self.state.set_vault_stake(&mut vault, new_stake);
+			self.branch.state.set_vault_stake(&mut vault, new_stake);
 		}
 
 		// A touch preserves the TCR inputs — principal + pending redistribution
@@ -209,33 +213,26 @@ impl<T: Config> OpContext<T> {
 	fn assert_unclobbered(&self) {
 		#[cfg(debug_assertions)]
 		debug_assert_eq!(
-			BranchStates::<T>::get(&self.collateral_id, &self.stable_id).as_ref(),
+			Branches::<T>::get((&self.collateral_id, &self.stable_id)).as_ref(),
 			Some(&self.loaded),
-			"BranchStates mutated behind OpContext"
+			"Branches mutated behind OpContext"
 		);
 	}
 }
 
 impl<T: Config> VaultOp<T> {
-	/// Write the owned vault row and the branch state, gated by `gate`.
-	pub fn commit(self, gate: TcrGate<'_, BalanceOf<T>>) -> Result<(), DispatchError> {
+	/// Write the owned vault row and the branch record, gated by `gate`.
+	pub fn commit(self, gate: TcrGate) -> Result<(), DispatchError> {
 		self.commit_inner(gate, true)
 	}
 
-	/// Remove the owned vault row and write the branch state, gated by `gate`.
-	pub fn commit_removing_vault(
-		self,
-		gate: TcrGate<'_, BalanceOf<T>>,
-	) -> Result<(), DispatchError> {
+	/// Remove the owned vault row and write the branch record, gated by `gate`.
+	pub fn commit_removing_vault(self, gate: TcrGate) -> Result<(), DispatchError> {
 		self.commit_inner(gate, false)
 	}
 
-	fn commit_inner(
-		self,
-		gate: TcrGate<'_, BalanceOf<T>>,
-		keep_row: bool,
-	) -> Result<(), DispatchError> {
-		enforce_tcr_gate::<T>(&self.ctx.tcr_baseline, &self.ctx.state, self.ctx.now, gate)?;
+	fn commit_inner(self, gate: TcrGate, keep_row: bool) -> Result<(), DispatchError> {
+		enforce_tcr_gate::<T>(&self.ctx.tcr_baseline, &self.ctx.branch, self.ctx.now, gate)?;
 		self.ctx.assert_unclobbered();
 		let key = (&self.ctx.collateral_id, &self.ctx.stable_id, &self.owner);
 		if keep_row {
@@ -243,7 +240,7 @@ impl<T: Config> VaultOp<T> {
 		} else {
 			Vaults::<T>::remove(key);
 		}
-		BranchStates::<T>::insert(&self.ctx.collateral_id, &self.ctx.stable_id, &self.ctx.state);
+		Branches::<T>::insert((&self.ctx.collateral_id, &self.ctx.stable_id), &self.ctx.branch);
 
 		// Mint only after the state is written; the two amounts stay separate
 		// credits so the fee handler's per-credit rounding is unchanged.
@@ -257,15 +254,17 @@ impl<T: Config> VaultOp<T> {
 	}
 }
 
-/// Apply `gate` to one operation's `baseline` → `state` change.
+/// Apply `gate` to one operation's `baseline` → committed-branch change. The
+/// config the mode rules run against is the operation's own loaded record, so
+/// the gate can never check a different config than the op used.
 fn enforce_tcr_gate<T: Config>(
 	baseline: &TcrInputs<BalanceOf<T>>,
-	state: &BranchState<T::AccountId, BalanceOf<T>>,
+	branch: &BranchOf<T>,
 	now: Millis,
-	gate: TcrGate<'_, BalanceOf<T>>,
+	gate: TcrGate,
 ) -> Result<(), DispatchError> {
-	let TcrGate::Check { price, config, settlement } = gate else { return Ok(()) };
+	let TcrGate::Check { price, settlement } = gate else { return Ok(()) };
 	let pre_tcr = Pallet::<T>::tcr_from_inputs(baseline, price)?;
-	let post_tcr = Pallet::<T>::compute_tcr(state, price, now)?;
-	Pallet::<T>::enforce_mode_rules(config, state, pre_tcr, post_tcr, settlement)
+	let post_tcr = Pallet::<T>::compute_tcr(&branch.state, price, now)?;
+	Pallet::<T>::enforce_mode_rules(&branch.config, &branch.state, pre_tcr, post_tcr, settlement)
 }

@@ -81,7 +81,7 @@ pub mod pallet {
 	use crate::{
 		context::OpContext,
 		recovery,
-		types::{AdminLevel, BranchAdminInfo, BranchAdmins, BranchConfigGuard},
+		types::{AdminLevel, BranchAdmins, BranchConfigGuard},
 	};
 	use frame::{
 		prelude::*,
@@ -107,6 +107,14 @@ pub mod pallet {
 
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
+
+	/// The [`Branches`] record, instantiated for the runtime.
+	pub type BranchOf<T> = crate::types::Branch<
+		PalletsOriginOf<T>,
+		<T as frame_system::Config>::AccountId,
+		BalanceOf<T>,
+		<T as Config>::Consideration,
+	>;
 
 	/// The runtime's origin-caller type. Market admins are stored as origin callers, so a
 	/// governance track or collective can administer a market.
@@ -216,7 +224,7 @@ pub mod pallet {
 
 		/// Maximum registered collateral branches.
 		#[pallet::constant]
-		type MaxBranches: Get<u32> + Get<Option<u32>>;
+		type MaxBranches: Get<u32>;
 
 		/// Maximum vaults the `on_idle` cursor refreshes per block. Bounds
 		/// idle-block weight regardless of branch count.
@@ -260,33 +268,17 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Per-market governance/risk parameters. The count gates `MaxBranches`;
-	/// the collateral-major key lets the per-collateral risk fold prefix-iterate
-	/// one collateral's markets.
+	/// The registered `(collateral, stable)` markets: config, hot state,
+	/// admins, and creation deposit in one record, so the pieces can never
+	/// partially exist. The collateral-major key lets the per-collateral risk
+	/// fold prefix-iterate one collateral's markets, and its leading columns
+	/// match [`Vaults`]' first two keys.
 	#[pallet::storage]
-	pub type BranchConfigs<T: Config> = CountedStorageNMap<
+	pub type Branches<T: Config> = StorageNMap<
 		_,
 		(NMapKey<Twox64Concat, T::CollateralAssetId>, NMapKey<Twox64Concat, T::StableAssetId>),
-		BranchConfig<BalanceOf<T>>,
+		BranchOf<T>,
 		OptionQuery,
-		GetDefault,
-		T::MaxBranches,
-	>;
-
-	/// Per-market hot accounting state. A `DoubleMap` (collateral-major) rather
-	/// than an `NMap`: two keys, and the collateral-major outer key still lets a
-	/// per-collateral risk fold prefix-iterate one collateral's markets.
-	#[pallet::storage]
-	pub type BranchStates<T: Config> = StorageDoubleMap<
-		_,
-		Twox64Concat,
-		T::CollateralAssetId,
-		Twox64Concat,
-		T::StableAssetId,
-		BranchState<T::AccountId, BalanceOf<T>>,
-		OptionQuery,
-		GetDefault,
-		T::MaxBranches,
 	>;
 
 	/// Governance-set hard cap on total debt per collateral asset, in the
@@ -298,16 +290,6 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type GlobalDebtCeiling<T: Config> =
 		StorageMap<_, Twox64Concat, T::CollateralAssetId, BalanceOf<T>, ValueQuery>;
-
-	/// Per-market admins and the creation deposit. Present iff the market is
-	/// registered; removed (and the deposit refunded) by `remove_branch`.
-	#[pallet::storage]
-	pub type BranchAdmin<T: Config> = StorageMap<
-		_,
-		Twox64Concat,
-		(T::CollateralAssetId, T::StableAssetId),
-		BranchAdminInfo<PalletsOriginOf<T>, T::AccountId, T::Consideration>,
-	>;
 
 	/// Cursor of the `on_idle` refresh walk over [`Vaults`]: the key of the
 	/// last row touched, resumed after on the next idle block. `None` restarts
@@ -545,7 +527,7 @@ pub mod pallet {
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn integrity_test() {
-			assert!(<T::MaxBranches as Get<u32>>::get() > 0, "`MaxBranches` must be > 0");
+			assert!(T::MaxBranches::get() > 0, "`MaxBranches` must be > 0");
 		}
 
 		fn on_idle(_block: BlockNumberFor<T>, remaining: Weight) -> Weight {
@@ -568,7 +550,7 @@ pub mod pallet {
 			owner: T::AccountId,
 		) -> Option<FixedU128> {
 			let vault = Vaults::<T>::get((&collateral_id, &stable_id, &owner))?;
-			let state = BranchStates::<T>::get(&collateral_id, &stable_id)?;
+			let state = Branches::<T>::get((&collateral_id, &stable_id))?.state;
 			let now = T::TimeProvider::now();
 			let price = T::Oracle::provide_price(&collateral_id).ok()?;
 			let pending = Self::pending_touch_for(&vault, &state, now);
@@ -598,7 +580,7 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		) -> Option<FixedU128> {
-			let state = BranchStates::<T>::get(&collateral_id, &stable_id)?;
+			let state = Branches::<T>::get((&collateral_id, &stable_id))?.state;
 			let price = T::Oracle::provide_price(&collateral_id).ok()?;
 			let now = T::TimeProvider::now();
 			Self::compute_tcr(&state, price, now).ok()
@@ -606,7 +588,7 @@ pub mod pallet {
 
 		/// Registered `(collateral, stable)` markets.
 		pub fn branches() -> alloc::vec::Vec<(T::CollateralAssetId, T::StableAssetId)> {
-			BranchConfigs::<T>::iter_keys().collect()
+			Branches::<T>::iter_keys().collect()
 		}
 
 		/// First `n` vault owners in actual redemption order: `FinalRecovery`
@@ -717,24 +699,20 @@ pub mod pallet {
 			initial_debt: BalanceOf<T>,
 			annual_rate: FixedU128,
 		) -> BalanceOf<T> {
-			match (
-				BranchConfigs::<T>::get((&collateral_id, &stable_id)),
-				BranchStates::<T>::get(&collateral_id, &stable_id),
-			) {
-				(Some(config), Some(mut state)) => {
-					let now = T::TimeProvider::now();
-					let scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
-					Self::apply_borrow(
-						&mut state,
-						&config,
-						&scratch,
-						initial_debt,
-						annual_rate,
-						Zero::zero(),
-					)
-				},
-				_ => BalanceOf::<T>::zero(),
-			}
+			let Some(branch) = Branches::<T>::get((&collateral_id, &stable_id)) else {
+				return BalanceOf::<T>::zero();
+			};
+			let (config, mut state) = (branch.config, branch.state);
+			let now = T::TimeProvider::now();
+			let scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
+			Self::apply_borrow(
+				&mut state,
+				&config,
+				&scratch,
+				initial_debt,
+				annual_rate,
+				Zero::zero(),
+			)
 		}
 
 		/// Predict the upfront fee `borrow` would charge.
@@ -1055,11 +1033,11 @@ pub mod pallet {
 			admins: BranchAdmins<PalletsOriginOf<T>>,
 		) -> DispatchResult {
 			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
-			BranchAdmin::<T>::try_mutate(
+			Branches::<T>::try_mutate(
 				(&collateral_id, &stable_id),
 				|maybe| -> Result<_, DispatchError> {
-					let info = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-					info.admins = admins.clone();
+					let branch = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
+					branch.admins = admins.clone();
 					Ok(())
 				},
 			)?;

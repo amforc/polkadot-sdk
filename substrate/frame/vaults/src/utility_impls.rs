@@ -4,10 +4,7 @@
 use crate::{
 	context::OpContext,
 	math,
-	pallet::{
-		BalanceOf, BranchAdmin, BranchConfigs, BranchStates, Config, Error, IdleCursor, Millis,
-		Pallet, Vaults,
-	},
+	pallet::{BalanceOf, BranchOf, Branches, Config, Error, IdleCursor, Millis, Pallet, Vaults},
 	recovery,
 	types::{
 		AdminLevel, BranchConfig, BranchMode, BranchState, Vault, VaultDebt, VaultListId,
@@ -59,21 +56,13 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Read the branch state, returning `UnknownCollateral` when missing.
-	pub(crate) fn branch_state_of(
+	/// Read the whole market record, returning `UnknownCollateral` when
+	/// missing.
+	pub(crate) fn branch_of(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-	) -> Result<BranchState<T::AccountId, BalanceOf<T>>, DispatchError> {
-		BranchStates::<T>::get(collateral_id, stable_id)
-			.ok_or_else(|| Error::<T>::UnknownCollateral.into())
-	}
-
-	/// Read the branch config, returning `UnknownCollateral` when missing.
-	pub(crate) fn branch_config_of(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-	) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
-		BranchConfigs::<T>::get((collateral_id, stable_id))
+	) -> Result<BranchOf<T>, DispatchError> {
+		Branches::<T>::get((collateral_id, stable_id))
 			.ok_or_else(|| Error::<T>::UnknownCollateral.into())
 	}
 
@@ -183,8 +172,8 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 	) -> Result<BranchMode, DispatchError> {
-		let state = Self::branch_state_of(collateral_id, stable_id)?;
-		if state.is_frozen() {
+		let branch = Self::branch_of(collateral_id, stable_id)?;
+		if branch.state.is_frozen() {
 			return Ok(BranchMode::Frozen);
 		}
 		// A failing oracle is what `do_refresh_branch` would persist as
@@ -195,10 +184,9 @@ impl<T: Config> Pallet<T> {
 			Ok(price) => price,
 			Err(_) => return Ok(BranchMode::Frozen),
 		};
-		let config = Self::branch_config_of(collateral_id, stable_id)?;
 		let now = T::TimeProvider::now();
-		let tcr = Self::compute_tcr(&state, price, now)?;
-		if tcr < config.safety_collateralization_ratio {
+		let tcr = Self::compute_tcr(&branch.state, price, now)?;
+		if tcr < branch.config.safety_collateralization_ratio {
 			Ok(BranchMode::Safety)
 		} else {
 			Ok(BranchMode::Normal)
@@ -299,13 +287,12 @@ impl<T: Config> Pallet<T> {
 		stable_id: &T::StableAssetId,
 		required: AdminLevel,
 	) -> Result<AdminLevel, DispatchError> {
-		let info = BranchAdmin::<T>::get((collateral_id, stable_id))
-			.ok_or(Error::<T>::UnknownCollateral)?;
+		let admins = Self::branch_of(collateral_id, stable_id)?.admins;
 		let caller = origin.into_caller();
-		if caller == info.admins.full_admin {
+		if caller == admins.full_admin {
 			return Ok(AdminLevel::Full);
 		}
-		if matches!(required, AdminLevel::Emergency) && caller == info.admins.emergency_admin {
+		if matches!(required, AdminLevel::Emergency) && caller == admins.emergency_admin {
 			return Ok(AdminLevel::Emergency);
 		}
 		Err(Error::<T>::NotBranchAdmin.into())
@@ -571,8 +558,8 @@ impl<T: Config> Pallet<T> {
 		let priority = recovery::next_target::<T>(collateral_id, stable_id)
 			.map(|owner| (owner, VaultStatus::FinalRecovery))
 			.or_else(|| {
-				BranchStates::<T>::get(collateral_id, stable_id)
-					.and_then(|bs| bs.dormant_redemption_target)
+				Branches::<T>::get((collateral_id, stable_id))
+					.and_then(|branch| branch.state.dormant_redemption_target)
 					.map(|owner| (owner, VaultStatus::Dormant))
 			});
 		// The rate index is walked only when no FinalRecovery/Dormant target gates it.
@@ -618,11 +605,9 @@ impl<T: Config> Pallet<T> {
 		BranchState<T::AccountId, BalanceOf<T>>,
 		Vault<BalanceOf<T>>,
 	)> {
-		Some((
-			BranchConfigs::<T>::get((collateral_id, stable_id))?,
-			BranchStates::<T>::get(collateral_id, stable_id)?,
-			Vaults::<T>::get((collateral_id, stable_id, owner))?,
-		))
+		let branch = Branches::<T>::get((collateral_id, stable_id))?;
+		let vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
+		Some((branch.config, branch.state, vault))
 	}
 
 	/// Refresh vaults with the block's leftover weight: reconcile every
@@ -642,7 +627,7 @@ impl<T: Config> Pallet<T> {
 			return Weight::zero();
 		}
 
-		for (collateral_id, stable_id) in BranchConfigs::<T>::iter_keys() {
+		for (collateral_id, stable_id) in Branches::<T>::iter_keys() {
 			let _ = with_storage_layer::<(), DispatchError, _>(|| {
 				Self::do_refresh_branch(&collateral_id, &stable_id)
 			});
