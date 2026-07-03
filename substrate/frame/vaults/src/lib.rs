@@ -582,10 +582,8 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			owner: T::AccountId,
 		) -> Option<VaultStatus> {
-			if Vaults::<T>::get((&collateral_id, &stable_id, &owner)).is_none() {
-				return None;
-			};
-			Some(Self::vault_status_of(&collateral_id, &stable_id, &owner))
+			Vaults::<T>::contains_key((&collateral_id, &stable_id, &owner))
+				.then(|| Self::vault_status_of(&collateral_id, &stable_id, &owner))
 		}
 
 		/// Market TCR, including aggregate interest accrued since the last

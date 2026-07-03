@@ -205,25 +205,29 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Apply Normal/Safety mode TCR rules.
+	/// Apply Normal/Safety mode TCR rules. `state` is the operation's post
+	/// state; the frozen flag is operation-invariant, so it stands in for the
+	/// pre state too.
 	pub(crate) fn enforce_mode_rules(
 		config: &BranchConfig<BalanceOf<T>>,
-		branch_state_pre: &BranchState<T::AccountId, BalanceOf<T>>,
+		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		pre_tcr: FixedU128,
 		post_tcr: FixedU128,
 		is_settlement: bool,
 	) -> Result<(), DispatchError> {
-		if branch_state_pre.is_frozen() {
+		if state.is_frozen() {
 			return Err(Error::<T>::BranchFrozen.into());
 		}
+		if is_settlement {
+			return Ok(());
+		}
 		if pre_tcr < config.safety_collateralization_ratio {
-			if !is_settlement && post_tcr < pre_tcr {
-				return Err(Error::<T>::SafetyModeTcrWorsening.into());
-			}
+			ensure!(post_tcr >= pre_tcr, Error::<T>::SafetyModeTcrWorsening);
 		} else {
-			if !is_settlement && post_tcr < config.safety_collateralization_ratio {
-				return Err(Error::<T>::WouldEnterSafetyMode.into());
-			}
+			ensure!(
+				post_tcr >= config.safety_collateralization_ratio,
+				Error::<T>::WouldEnterSafetyMode
+			);
 		}
 		Ok(())
 	}
@@ -430,19 +434,22 @@ impl<T: Config> Pallet<T> {
 		)
 	}
 
-	/// Simulate `borrow` for the live path and fee prediction.
+	/// Apply a borrow's branch-side accounting to `state` and return the
+	/// upfront fee. `vault` is the pre-borrow row; the caller stamps it (the
+	/// live path) or discards it (the `predict_*` views, which apply to a
+	/// scratch copy of the state).
 	///
 	/// `rate_change_fee_base` is the existing principal that the rate-change
 	/// component of the upfront fee is charged against (zero when the call is a
 	/// pure debt increase or the cooldown has elapsed).
-	pub(crate) fn simulate_borrow(
-		state: &BranchState<T::AccountId, BalanceOf<T>>,
+	pub(crate) fn apply_borrow(
+		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		config: &BranchConfig<BalanceOf<T>>,
 		vault: &Vault<BalanceOf<T>>,
 		debt_increase: BalanceOf<T>,
 		new_rate: FixedU128,
 		rate_change_fee_base: BalanceOf<T>,
-	) -> (BranchState<T::AccountId, BalanceOf<T>>, BalanceOf<T>) {
+	) -> BalanceOf<T> {
 		// Swap the vault's full aggregate contribution: detach the pre-borrow row
 		// and attach the post-borrow one, so `attach_vault`/`detach_vault` stay
 		// the only writers of the weighted sums. The fee is not stamped on
@@ -451,30 +458,28 @@ impl<T: Config> Pallet<T> {
 		let mut vault_after = vault.clone();
 		vault_after.debt.principal = vault.debt.principal.saturating_add(debt_increase);
 		vault_after.annual_rate = new_rate;
-		let mut branch_state_after = state.clone();
-		branch_state_after.detach_vault(vault);
-		branch_state_after.attach_vault(&vault_after);
-		let avg = Self::avg_rate(&branch_state_after);
+		state.detach_vault(vault);
+		state.attach_vault(&vault_after);
+		let avg = Self::avg_rate(state);
 		let fee = math::simple_interest_ceil(
 			debt_increase.saturating_add(rate_change_fee_base),
 			avg,
 			config.upfront_fee_period,
 		);
-		branch_state_after.debt.minted_interest =
-			branch_state_after.debt.minted_interest.saturating_add(fee);
-		(branch_state_after, fee)
+		state.debt.minted_interest = state.debt.minted_interest.saturating_add(fee);
+		fee
 	}
 
-	/// Simulate `change_rate` for the live path and fee prediction.
-	pub(crate) fn simulate_change_rate(
-		state: &BranchState<T::AccountId, BalanceOf<T>>,
+	/// Apply a rate change's branch-side accounting to `state` and return the
+	/// upfront fee; see [`Self::apply_borrow`] for the caller contract.
+	pub(crate) fn apply_rate_change(
+		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		config: &BranchConfig<BalanceOf<T>>,
 		vault: &Vault<BalanceOf<T>>,
 		new_rate: FixedU128,
 		cooldown_elapsed: bool,
-	) -> (BranchState<T::AccountId, BalanceOf<T>>, BalanceOf<T>) {
-		let mut branch_state_after = state.clone();
-		branch_state_after.change_vault_rate(
+	) -> BalanceOf<T> {
+		state.change_vault_rate(
 			vault.annual_rate,
 			new_rate,
 			vault.debt.principal,
@@ -483,12 +488,11 @@ impl<T: Config> Pallet<T> {
 		let fee = if cooldown_elapsed {
 			BalanceOf::<T>::zero()
 		} else {
-			let avg = Self::avg_rate(&branch_state_after);
+			let avg = Self::avg_rate(state);
 			math::simple_interest_ceil(vault.debt.principal, avg, config.upfront_fee_period)
 		};
-		branch_state_after.debt.minted_interest =
-			branch_state_after.debt.minted_interest.saturating_add(fee);
-		(branch_state_after, fee)
+		state.debt.minted_interest = state.debt.minted_interest.saturating_add(fee);
+		fee
 	}
 
 	/// Fully-accrued total branch debt (principal + minted interest + pending
@@ -653,7 +657,8 @@ impl<T: Config> Pallet<T> {
 		debt_increase: BalanceOf<T>,
 		maybe_new_rate: Option<FixedU128>,
 	) -> BalanceOf<T> {
-		let Some((config, state, vault)) = Self::predict_inputs(collateral_id, stable_id, owner)
+		let Some((config, mut state, vault)) =
+			Self::predict_inputs(collateral_id, stable_id, owner)
 		else {
 			return BalanceOf::<T>::zero();
 		};
@@ -661,15 +666,14 @@ impl<T: Config> Pallet<T> {
 		let now = T::TimeProvider::now();
 		let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
 		let rate_change_fee_base = vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
-		Self::simulate_borrow(
-			&state,
+		Self::apply_borrow(
+			&mut state,
 			&config,
 			&vault,
 			debt_increase,
 			new_rate,
 			rate_change_fee_base,
 		)
-		.1
 	}
 
 	pub(crate) fn predict_upfront_fee_rate_change(
@@ -678,13 +682,14 @@ impl<T: Config> Pallet<T> {
 		owner: &T::AccountId,
 		new_rate: FixedU128,
 	) -> BalanceOf<T> {
-		let Some((config, state, vault)) = Self::predict_inputs(collateral_id, stable_id, owner)
+		let Some((config, mut state, vault)) =
+			Self::predict_inputs(collateral_id, stable_id, owner)
 		else {
 			return BalanceOf::<T>::zero();
 		};
 		let now = T::TimeProvider::now();
 		let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
-		Self::simulate_change_rate(&state, &config, &vault, new_rate, cooldown_elapsed).1
+		Self::apply_rate_change(&mut state, &config, &vault, new_rate, cooldown_elapsed)
 	}
 
 	/// Read the `(config, branch state, vault)` triple for a `predict_*` view.
@@ -716,15 +721,13 @@ impl<T: Config> Pallet<T> {
 		let mut budget = T::MaxOnIdleVaultRefresh::get();
 		let touch_one = |collateral_id: &T::CollateralAssetId,
 		                 stable_id: &T::StableAssetId,
-		                 owner: &T::AccountId|
-		 -> bool {
+		                 owner: &T::AccountId| {
 			if !Vaults::<T>::contains_key((collateral_id, stable_id, owner)) {
-				return true;
+				return;
 			}
 			let _ = with_storage_layer::<(), DispatchError, _>(|| {
 				OpContext::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
 			});
-			true
 		};
 		for (collateral_id, stable_id) in BranchConfigs::<T>::iter_keys() {
 			let collateral_id = &collateral_id;
@@ -744,9 +747,7 @@ impl<T: Config> Pallet<T> {
 
 			while budget > 0 {
 				let Some(owner) = cursor.clone() else { break };
-				if !touch_one(collateral_id, stable_id, &owner) {
-					break;
-				}
+				touch_one(collateral_id, stable_id, &owner);
 				cursor = T::VaultLists::neighbors(&rate_list, &owner).and_then(|p| p.next);
 				budget = budget.saturating_sub(1);
 				consumed = consumed.saturating_add(per_call);
@@ -759,10 +760,9 @@ impl<T: Config> Pallet<T> {
 				if *budget == 0 || (remaining.saturating_sub(*consumed)).any_lt(per_call) {
 					return;
 				}
-				if touch_one(collateral_id, stable_id, &owner) {
-					*budget = budget.saturating_sub(1);
-					*consumed = consumed.saturating_add(per_call);
-				}
+				touch_one(collateral_id, stable_id, &owner);
+				*budget = budget.saturating_sub(1);
+				*consumed = consumed.saturating_add(per_call);
 			};
 			if let Some(owner) = final_recovery_head {
 				try_extra(owner, &mut budget, &mut consumed);
