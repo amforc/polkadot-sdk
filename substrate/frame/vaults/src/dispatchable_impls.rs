@@ -9,7 +9,7 @@ use crate::{
 	types::{
 		AdminLevel, BranchAdminInfo, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchDebt,
 		BranchMode, BranchRounding, BranchStakes, BranchState, DebtPayment, FrozenReason,
-		FrozenState, InterestClock, RedistributionSnapshot, Vault, VaultDebt, VaultStatus,
+		FrozenState, RedistributionSnapshot, Vault, VaultDebt, VaultStatus,
 	},
 };
 use frame::{
@@ -749,7 +749,7 @@ impl<T: Config> Pallet<T> {
 				stakes: BranchStakes::default(),
 				rounding: BranchRounding::default(),
 				redistribution: RedistributionSnapshot::default(),
-				interest_clock: InterestClock { epoch_base: now, frozen_elapsed: Zero::zero() },
+				interest_epoch: now,
 				next_final_recovery_nonce: 0,
 				dormant_redemption_target: None,
 				idle_cursor: None,
@@ -934,8 +934,7 @@ impl<T: Config> Pallet<T> {
 				let entered_at = state.frozen.as_ref().map(|state| state.entered_at);
 				if let Some(entered_at) = entered_at {
 					let frozen_window = now.saturating_sub(entered_at);
-					state.interest_clock.frozen_elapsed =
-						state.interest_clock.frozen_elapsed.saturating_add(frozen_window);
+					state.interest_epoch = state.interest_epoch.saturating_add(frozen_window);
 				}
 				state.frozen = None;
 				Ok(())
