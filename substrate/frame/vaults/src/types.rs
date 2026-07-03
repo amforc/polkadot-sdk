@@ -301,7 +301,6 @@ pub struct BranchState<AccountId, Balance> {
 	pub interest_epoch: Millis,
 	pub next_final_recovery_nonce: u128,
 	pub dormant_redemption_target: Option<AccountId>,
-	pub idle_cursor: Option<AccountId>,
 	pub frozen: Option<FrozenState>,
 	/// Autoline current line — the self-adjusting borrow cap, maintained while
 	/// `ceiling_gap > 0` and bounded above by `debt_ceiling` (the line max).
@@ -757,7 +756,6 @@ mod tests {
 			interest_epoch: 0,
 			next_final_recovery_nonce: 0,
 			dormant_redemption_target: None,
-			idle_cursor: None,
 			frozen: None,
 			effective_ceiling: 0,
 			ceiling_last_inc: 0,
