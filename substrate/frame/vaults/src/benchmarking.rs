@@ -28,7 +28,7 @@ use frame::{
 };
 use frame_system::RawOrigin;
 use pallet_linked_list::{Position, SortedListInterface};
-use pusd_primitives::{RedemptionAllocation, VaultRedemptionInterface};
+use pusd_primitives::{RedemptionAllocation, VaultInterface};
 
 const ORACLE_PRICE: u128 = 10;
 /// High per-collateral global ceiling so the systemic cap never binds in benches.
@@ -529,12 +529,7 @@ mod benchmarks {
 		// intact, collateral still held, out of the rate index — which is the
 		// state this extrinsic acts on.
 		let redeemer: T::AccountId = whitelisted_caller();
-		<Pallet<T> as VaultRedemptionInterface<
-			T::CollateralAssetId,
-			T::StableAssetId,
-			T::AccountId,
-			BalanceOf<T>,
-		>>::redeem_step(&asset, &stable::<T>(), &caller, |snapshot| {
+		<Pallet<T> as VaultInterface>::redeem_step(&asset, &stable::<T>(), &caller, |snapshot| {
 			Ok(Some(RedemptionAllocation {
 				redeemer,
 				debt_to_cancel: snapshot.debt,
@@ -658,12 +653,7 @@ mod benchmarks {
 		// Dormant vault outside the rate index.
 		let remaining = balance::<T>(199);
 		let redeemer: T::AccountId = whitelisted_caller();
-		<Pallet<T> as VaultRedemptionInterface<
-			T::CollateralAssetId,
-			T::StableAssetId,
-			T::AccountId,
-			BalanceOf<T>,
-		>>::redeem_step(&asset, &stable::<T>(), &owner, |snapshot| {
+		<Pallet<T> as VaultInterface>::redeem_step(&asset, &stable::<T>(), &owner, |snapshot| {
 			Ok(Some(RedemptionAllocation {
 				redeemer,
 				debt_to_cancel: snapshot.debt.saturating_sub(remaining),
