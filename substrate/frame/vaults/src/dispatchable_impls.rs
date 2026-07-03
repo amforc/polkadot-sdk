@@ -133,22 +133,21 @@ impl<T: Config> Pallet<T> {
 			price,
 		)?;
 
-		let upfront_fee = Self::open_upfront_fee(&op.state, &config, initial_debt, annual_rate);
-
-		let vault = Vault {
-			collateral: initial_collateral,
-			debt: VaultDebt { principal: initial_debt, interest: upfront_fee },
+		let mut vault = Self::open_scratch_row(&op.state, annual_rate, initial_collateral, op.now);
+		let upfront_fee = Self::apply_borrow(
+			&mut op.state,
+			&config,
+			&vault,
+			initial_debt,
 			annual_rate,
-			last_interest_time: op.state.interest_time(op.now),
-			last_rate_update: op.now,
-			redistribution_stake: initial_collateral,
-			redistribution_snapshot: op.state.redistribution,
-		};
+			Zero::zero(),
+		);
+		vault.debt = VaultDebt { principal: initial_debt, interest: upfront_fee };
 
 		let total_debt = initial_debt.saturating_add(upfront_fee);
 		Self::ensure_above_icr(initial_collateral, total_debt, price, &config)?;
 
-		op.state.attach_vault(&vault);
+		op.state.set_vault_stake(&mut vault, initial_collateral);
 		op.state.add_collateral(initial_collateral);
 
 		T::CollateralAssets::hold(
