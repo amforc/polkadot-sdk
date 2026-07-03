@@ -265,39 +265,50 @@ fn emergency_admin_can_freeze() {
 	});
 }
 
-// The governance kill switch freezes any market, bypassing its admins; a branch
-// admin who is not the global manager cannot wield it.
+// The global manager origin freezes any market through the same extrinsic the
+// admins use, bypassing them.
 #[test]
-fn force_freeze_is_governance_only() {
+fn governance_can_freeze_bypassing_admins() {
 	build_and_execute(|| {
 		register_default_branch();
-		// A branch admin is not the global manager origin.
-		assert_noop!(
-			Pallet::<Test>::force_freeze(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
-			DispatchError::BadOrigin
-		);
-		assert_ok!(Pallet::<Test>::force_freeze(RuntimeOrigin::root(), DOT, PUSD));
+		// Root is not a branch admin, yet the kill switch passes.
+		assert_ok!(Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT, PUSD));
 		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
-// `force_remove` is governance-only and still requires the market to be empty.
+// A signer who is neither a branch admin nor the global manager can neither
+// freeze nor remove.
 #[test]
-fn force_remove_is_governance_only_and_requires_empty() {
+fn freeze_and_remove_reject_unauthorized_signers() {
 	build_and_execute(|| {
 		register_default_branch();
+		const NOBODY: AccountId = 999;
 		assert_noop!(
-			Pallet::<Test>::force_remove(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
-			DispatchError::BadOrigin
+			Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::signed(NOBODY), DOT, PUSD),
+			Error::<Test>::NotBranchAdmin
 		);
+		assert_noop!(
+			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(NOBODY), DOT, PUSD),
+			Error::<Test>::NotBranchAdmin
+		);
+	});
+}
+
+// Governance removal goes through `remove_branch` and still requires the
+// market to be empty.
+#[test]
+fn governance_remove_bypasses_admins_and_requires_empty() {
+	build_and_execute(|| {
+		register_default_branch();
 		assert_ok!(open(PUSD_OWNER, DOT, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
-			Pallet::<Test>::force_remove(RuntimeOrigin::root(), DOT, PUSD),
+			Pallet::<Test>::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
 			Error::<Test>::MarketNotEmpty
 		);
 
 		repay_to_close(PUSD_OWNER);
-		assert_ok!(Pallet::<Test>::force_remove(RuntimeOrigin::root(), DOT, PUSD));
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 		assert!(!market_exists(DOT, PUSD));
 	});
 }

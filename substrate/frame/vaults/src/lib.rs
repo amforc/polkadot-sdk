@@ -192,9 +192,10 @@ pub mod pallet {
 		type BranchConfigGuard: Get<BranchConfigGuard<BalanceOf<Self>>>;
 
 		/// Governance origin owning the systemic per-collateral limits
-		/// ([`GlobalDebtCeiling`]) and the `force_freeze`/`force_remove` kill
-		/// switch — the hard backstop beneath the permissionless per-market
-		/// ceilings, distinct from any per-market admin.
+		/// ([`GlobalDebtCeiling`]) and able to freeze or remove any market via
+		/// `enable_frozen_mode`/`remove_branch`, bypassing its admins — the
+		/// hard backstop beneath the permissionless per-market ceilings,
+		/// distinct from any per-market admin.
 		type GlobalManagerOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
 		/// Sorted-DLL backing the per-market rate index and FinalRecovery FIFO.
@@ -929,7 +930,8 @@ pub mod pallet {
 		}
 
 		/// Freeze the market. Either admin tier may issue this — a defensive
-		/// override.
+		/// override — and so may [`Config::GlobalManagerOrigin`], as the
+		/// governance kill switch that bypasses the market's admins.
 		#[pallet::call_index(21)]
 		#[pallet::weight(T::WeightInfo::enable_frozen_mode())]
 		pub fn enable_frozen_mode(
@@ -937,7 +939,12 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
-			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Emergency)?;
+			Self::ensure_branch_admin_or_manager(
+				origin,
+				&collateral_id,
+				&stable_id,
+				AdminLevel::Emergency,
+			)?;
 			Self::do_enable_frozen_mode(&collateral_id, &stable_id)
 		}
 
@@ -969,7 +976,8 @@ pub mod pallet {
 			Self::do_clear_governance_frozen_mode(&collateral_id, &stable_id)
 		}
 
-		/// Full-admin: remove an empty market, refunding the creation deposit and
+		/// Full-admin (or [`Config::GlobalManagerOrigin`], bypassing the market's
+		/// admins): remove an empty market, refunding the creation deposit and
 		/// freeing the `MaxBranches` slot.
 		#[pallet::call_index(24)]
 		#[pallet::weight(T::WeightInfo::register_branch())]
@@ -978,7 +986,12 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
-			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
+			Self::ensure_branch_admin_or_manager(
+				origin,
+				&collateral_id,
+				&stable_id,
+				AdminLevel::Full,
+			)?;
 			Self::do_remove_branch(collateral_id, stable_id)
 		}
 
@@ -1009,30 +1022,6 @@ pub mod pallet {
 				emergency_admin,
 			});
 			Ok(())
-		}
-
-		/// Governance kill switch: freeze any market, bypassing its admins.
-		#[pallet::call_index(26)]
-		#[pallet::weight(T::WeightInfo::enable_frozen_mode())]
-		pub fn force_freeze(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-		) -> DispatchResult {
-			T::GlobalManagerOrigin::ensure_origin(origin)?;
-			Self::do_enable_frozen_mode(&collateral_id, &stable_id)
-		}
-
-		/// Governance kill switch: remove any empty market, bypassing its admins.
-		#[pallet::call_index(27)]
-		#[pallet::weight(T::WeightInfo::register_branch())]
-		pub fn force_remove(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-		) -> DispatchResult {
-			T::GlobalManagerOrigin::ensure_origin(origin)?;
-			Self::do_remove_branch(collateral_id, stable_id)
 		}
 
 		/// Permissionless: revive a `Dormant` vault whose fully-accrued debt is
