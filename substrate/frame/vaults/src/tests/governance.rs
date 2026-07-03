@@ -1,9 +1,4 @@
-use crate::{
-	mock::*,
-	pallet::{BranchAdmin, BranchConfigs, BranchStates, Vaults},
-	tests::rate_pct,
-	types::BranchConfigUpdate,
-};
+use crate::{mock::*, pallet::Vaults, tests::rate_pct, types::BranchConfigUpdate};
 use frame::traits::fungibles::Mutate as FungiblesMutate;
 
 /// PUSD's genesis owner — the signer permitted to open a PUSD market with a
@@ -16,7 +11,7 @@ const NEW_EMERGENCY_ADMIN: AccountId = 201;
 const DAY_MS: Moment = 24 * 3_600 * 1_000;
 
 fn market_exists(collateral: AssetId, stable: StableId) -> bool {
-	BranchStates::<Test>::get(collateral, stable).is_some()
+	branch_state(collateral, stable).is_some()
 }
 
 /// Repay `owner`'s full `(DOT, PUSD)` debt and close the vault, emptying the
@@ -167,7 +162,7 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 			BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(106, 100))
 		));
 		assert_eq!(
-			BranchConfigs::<Test>::get((DOT, PUSD)).unwrap().minimum_collateralization_ratio,
+			branch_config(DOT, PUSD).unwrap().minimum_collateralization_ratio,
 			rate_pct(106, 100)
 		);
 		// 104% is below the envelope floor — even the full admin cannot go there.
@@ -225,7 +220,7 @@ fn set_branch_admins_reassigns_authority() {
 			PUSD,
 			branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
 		));
-		let info = BranchAdmin::<Test>::get((DOT, PUSD)).expect("admins stored");
+		let info = crate::pallet::Branches::<Test>::get((DOT, PUSD)).expect("admins stored");
 		assert_eq!(info.admins.full_admin, admin_caller(NEW_FULL_ADMIN));
 		assert_eq!(info.admins.emergency_admin, admin_caller(NEW_EMERGENCY_ADMIN));
 
@@ -239,7 +234,7 @@ fn set_branch_admins_reassigns_authority() {
 			DOT,
 			PUSD
 		));
-		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -253,7 +248,7 @@ fn emergency_admin_can_freeze() {
 			DOT,
 			PUSD
 		));
-		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -265,7 +260,7 @@ fn governance_can_freeze_bypassing_admins() {
 		register_default_branch();
 		// Root is not a branch admin, yet the kill switch passes.
 		assert_ok!(Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT, PUSD));
-		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -323,7 +318,10 @@ fn remove_branch_frees_max_branches_slot() {
 				));
 			}
 		}
-		assert_eq!(BranchConfigs::<Test>::count(), MaxBranches::get());
+		assert_eq!(
+			u32::try_from(crate::pallet::Branches::<Test>::iter_keys().count()).unwrap(),
+			MaxBranches::get()
+		);
 
 		// The registry is full: a market on the spare collateral is rejected.
 		set_price(COLL_D, FixedU128::from_rational(10u128, 1u128));
@@ -340,7 +338,10 @@ fn remove_branch_frees_max_branches_slot() {
 
 		// Removing one market frees a slot; the previously-rejected create lands.
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert_eq!(BranchConfigs::<Test>::count(), MaxBranches::get() - 1);
+		assert_eq!(
+			u32::try_from(crate::pallet::Branches::<Test>::iter_keys().count()).unwrap(),
+			MaxBranches::get() - 1
+		);
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			COLL_D,
@@ -348,7 +349,10 @@ fn remove_branch_frees_max_branches_slot() {
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
-		assert_eq!(BranchConfigs::<Test>::count(), MaxBranches::get());
+		assert_eq!(
+			u32::try_from(crate::pallet::Branches::<Test>::iter_keys().count()).unwrap(),
+			MaxBranches::get()
+		);
 	});
 }
 
@@ -465,7 +469,7 @@ fn set_ceiling_knobs_apply_within_envelope() {
 			PUSD,
 			BranchConfigUpdate::CeilingGap(1_000)
 		));
-		let config = BranchConfigs::<Test>::get((DOT, PUSD)).expect("config");
+		let config = branch_config(DOT, PUSD).expect("config");
 		assert_eq!(config.ceiling_gap, 1_000);
 		assert_eq!(config.ceiling_ttl, DAY_MS);
 		// A ttl below the floor (autoline now enabled) is rejected.
@@ -497,16 +501,16 @@ fn set_ceiling_knobs_apply_within_envelope() {
 fn remove_branch_rejected_while_bad_debt_remains() {
 	build_and_execute(|| {
 		register_default_branch();
-		BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
-			maybe.as_mut().expect("branch state").debt.bad_debt = 1;
+		mutate_branch_state(DOT, PUSD, |state| {
+			state.debt.bad_debt = 1;
 		});
 		assert_noop!(
 			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
 			Error::<Test>::MarketNotEmpty
 		);
 		// Once the bad debt is cleared, the empty market is removable.
-		BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
-			maybe.as_mut().expect("branch state").debt.bad_debt = 0;
+		mutate_branch_state(DOT, PUSD, |state| {
+			state.debt.bad_debt = 0;
 		});
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert!(!market_exists(DOT, PUSD));
@@ -519,15 +523,15 @@ fn remove_branch_rejected_while_bad_debt_remains() {
 fn remove_branch_rejected_while_collateral_remains() {
 	build_and_execute(|| {
 		register_default_branch();
-		BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
-			maybe.as_mut().expect("branch state").total_collateral = 1;
+		mutate_branch_state(DOT, PUSD, |state| {
+			state.total_collateral = 1;
 		});
 		assert_noop!(
 			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
 			Error::<Test>::MarketNotEmpty
 		);
-		BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
-			maybe.as_mut().expect("branch state").total_collateral = 0;
+		mutate_branch_state(DOT, PUSD, |state| {
+			state.total_collateral = 0;
 		});
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert!(!market_exists(DOT, PUSD));

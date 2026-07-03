@@ -139,7 +139,7 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 		// Partial redemption drains vault 1 below MinimumDebt → Dormant, and
 		// parks it as the next redemption target.
 		assert_ok!(redeem(DOT, 3, 350));
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.dormant_redemption_target, Some(1));
 
 		// Crash the price so the dormant husk is liquidatable, then liquidate.
@@ -147,7 +147,7 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 		assert_ok!(liquidate(DOT, 1));
 
 		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.dormant_redemption_target, None, "pointer cleared with the row");
 	});
 }

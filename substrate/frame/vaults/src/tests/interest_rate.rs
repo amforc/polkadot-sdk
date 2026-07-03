@@ -12,9 +12,7 @@ use pallet_linked_list::SortedListInterface;
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 
 fn interest_time_at(asset: AssetId, now: Moment) -> Moment {
-	crate::pallet::BranchStates::<Test>::get(asset, PUSD)
-		.unwrap()
-		.interest_time(now)
+	branch_state(asset, PUSD).unwrap().interest_time(now)
 }
 
 // Helper: top up `who`'s pUSD balance by `delta` so that subsequent
@@ -541,8 +539,7 @@ fn redemption_full_state_changes() {
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 		// Collateral-leg baselines before the redemption.
 		let redeemer_collateral_pre = collateral_balance(DOT, 5);
-		let branch_collateral_pre =
-			crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap().total_collateral;
+		let branch_collateral_pre = branch_state(DOT, PUSD).unwrap().total_collateral;
 		// Redeem 200 pUSD from acct 5 (the redeemer) — the helper uses the
 		// rate-index tail, which is acct 1 (lowest rate).
 		let target = redeem(DOT, 5, 200).expect("redeem ok");
@@ -572,7 +569,7 @@ fn redemption_full_state_changes() {
 		assert_eq!(held(DOT, 1), v_pre.collateral - collateral_released);
 		assert_eq!(collateral_balance(DOT, 5), redeemer_collateral_pre + collateral_released);
 		assert_eq!(
-			crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap().total_collateral,
+			branch_state(DOT, PUSD).unwrap().total_collateral,
 			branch_collateral_pre - collateral_released,
 		);
 
@@ -608,7 +605,7 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 		assert_eq!(<Pusd as FungibleInspect<AccountId>>::balance(&1), 2_000);
 		let v = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		assert_eq!(v.debt.interest, predicted_fee);
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.debt.minted_interest, predicted_fee);
 	});
 }
@@ -689,8 +686,8 @@ fn open_fee_matches_post_open_average_rate_closed_form() {
 		// Pre-existing debt at 5% so the average is a genuine blend.
 		assert_ok!(open(1, DOT, 10_000, 500, rate_pct(5, 100)));
 
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap();
-		let config = crate::pallet::BranchConfigs::<Test>::get((DOT, PUSD)).unwrap();
+		let state = branch_state(DOT, PUSD).unwrap();
+		let config = branch_config(DOT, PUSD).unwrap();
 		let new_debt: Balance = 1_000;
 		let new_rate = rate_pct(10, 100);
 		let total_ib =
