@@ -1,13 +1,13 @@
 //! Shared-collateral risk controls: the per-collateral global debt ceiling and
 //! the per-market autoline.
 
-use crate::{mock::*, pallet::BranchStates, tests::rate_pct};
+use crate::{mock::*, tests::rate_pct};
 use frame::traits::fungibles::Mutate;
 
 const DAY_MS: Moment = 24 * 3_600 * 1_000;
 
 fn effective_ceiling(collateral: AssetId, stable: StableId) -> Balance {
-	BranchStates::<Test>::get(collateral, stable).unwrap().effective_ceiling
+	branch_state(collateral, stable).unwrap().effective_ceiling
 }
 
 // A collateral whose global ceiling is the default `0` cannot be borrowed
@@ -80,8 +80,7 @@ fn global_ceiling_counts_all_outstanding_debt() {
 		// Ceiling 200 DOT; 1_500 PUSD (150 DOT) of principal fits with headroom.
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::root(), DOT, 200));
 		// Seed 600 PUSD (== 60 DOT) of non-principal debt on the branch.
-		BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
-			let state = maybe.as_mut().expect("branch state");
+		mutate_branch_state(DOT, PUSD, |state| {
 			state.debt.minted_interest = 200;
 			state.debt.pending_redistribution_principal = 200;
 			state.debt.bad_debt = 200;
@@ -92,8 +91,7 @@ fn global_ceiling_counts_all_outstanding_debt() {
 			Error::<Test>::GlobalDebtCeilingExceeded
 		);
 		// Clearing the non-principal debt frees the headroom; the same borrow lands.
-		BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
-			let state = maybe.as_mut().expect("branch state");
+		mutate_branch_state(DOT, PUSD, |state| {
 			state.debt.minted_interest = 0;
 			state.debt.pending_redistribution_principal = 0;
 			state.debt.bad_debt = 0;

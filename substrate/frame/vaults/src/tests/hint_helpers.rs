@@ -161,7 +161,7 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 		register_default_branch();
 		seed_long_rate_index();
 		let vault_pre = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).expect("vault stored");
-		let branch_pre = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let branch_pre = branch_state(DOT, PUSD).expect("branch state");
 		let order_pre = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
 			&rate_list(DOT),
 			25,
@@ -179,7 +179,7 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 		);
 
 		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).unwrap(), vault_pre);
-		assert_eq!(crate::pallet::BranchStates::<Test>::get(DOT, PUSD).unwrap(), branch_pre);
+		assert_eq!(branch_state(DOT, PUSD).unwrap(), branch_pre);
 		let order_post = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
 			&rate_list(DOT),
 			25,

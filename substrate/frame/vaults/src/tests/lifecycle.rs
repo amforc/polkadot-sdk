@@ -5,7 +5,7 @@
 
 use crate::{
 	mock::*,
-	pallet::{BranchStates, Vaults},
+	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 	types::BranchConfigUpdate,
 };
@@ -15,7 +15,7 @@ use pallet_linked_list::SortedListInterface;
 fn register_branch_creates_state() {
 	build_and_execute(|| {
 		register_default_branch();
-		let state = BranchStates::<Test>::get(DOT, PUSD).expect("branch registered");
+		let state = branch_state(DOT, PUSD).expect("branch registered");
 		assert_eq!(state.total_collateral, 0);
 		assert!(!state.is_frozen());
 	});
@@ -271,7 +271,7 @@ fn refresh_branch_persists_frozen_on_oracle_failure() {
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_oracle_available(false);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
-		let state = BranchStates::<Test>::get(DOT, PUSD).expect("state");
+		let state = branch_state(DOT, PUSD).expect("state");
 		let frozen = state.frozen.expect("frozen persisted");
 		assert!(matches!(frozen.reason, crate::FrozenReason::OracleFailure));
 	});
@@ -301,15 +301,15 @@ fn refresh_branch_clears_oracle_frozen() {
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_oracle_available(false);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
-		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Oracle still down → second refresh is a no-op (already frozen for
 		// the same reason).
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
-		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Restore oracle and refresh → unfreezes.
 		set_oracle_available(true);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
-		assert!(!BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -323,7 +323,7 @@ fn refresh_branch_does_not_clear_governance_frozen() {
 			PUSD
 		));
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
-		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -351,7 +351,7 @@ fn governance_clear_clears_governance_frozen() {
 			DOT,
 			PUSD
 		));
-		assert!(!BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -362,14 +362,14 @@ fn governance_clear_is_noop_for_oracle_frozen() {
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
 		set_oracle_available(false);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
-		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Governance clear refuses oracle-Frozen state — branch stays frozen.
 		assert_ok!(crate::Pallet::<Test>::clear_governance_frozen_mode(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD
 		));
-		assert!(BranchStates::<Test>::get(DOT, PUSD).unwrap().is_frozen());
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
@@ -383,13 +383,13 @@ fn frozen_poke_pins_interest_time_without_minting() {
 			DOT,
 			PUSD
 		));
-		let before = BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let before = branch_state(DOT, PUSD).expect("branch state");
 
 		let elapsed: Moment = 24 * 3_600 * 1_000;
 		advance_time(elapsed);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
 
-		let after = BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let after = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
 		assert_eq!(
 			after.debt.last_interest_time, before.debt.last_interest_time,

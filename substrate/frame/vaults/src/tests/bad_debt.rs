@@ -1,13 +1,12 @@
 //! Bad-debt healing through `VaultInterface::heal`.
 
-use crate::{mock::*, pallet::BranchStates};
+use crate::mock::*;
 use pusd_primitives::VaultInterface;
 
 /// Seed recorded bad debt directly: recording only ever happens inside the
 /// vault pallet (recovery settlement / orphan-debt sweeps).
 fn record(amount: Balance) {
-	BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
-		let state = maybe.as_mut().expect("branch registered");
+	mutate_branch_state(DOT, PUSD, |state| {
 		state.debt.bad_debt = state.debt.bad_debt.saturating_add(amount);
 	});
 }
@@ -20,7 +19,7 @@ fn heal(amount: Balance) -> Result<Balance, DispatchError> {
 }
 
 fn bad_debt() -> Balance {
-	BranchStates::<Test>::get(DOT, PUSD).expect("branch state").debt.bad_debt
+	branch_state(DOT, PUSD).expect("branch state").debt.bad_debt
 }
 
 // A partial heal followed by an exact one. In production the insurance flow

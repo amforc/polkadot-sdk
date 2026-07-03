@@ -5,11 +5,7 @@
 //! one owner running several markets, markets sharing a collateral, and
 //! in-market isolation of redemption, liquidation, redistribution, and yield.
 
-use crate::{
-	mock::*,
-	pallet::{BranchStates, Vaults},
-	tests::rate_pct,
-};
+use crate::{mock::*, pallet::Vaults, tests::rate_pct};
 use frame::traits::fungibles::{Balanced, Inspect, Mutate};
 use pusd_primitives::{
 	KeeperCompensation, LiquidationAllocation, OffsetAllocation, VaultInterface,
@@ -64,8 +60,8 @@ fn same_stable_two_collaterals_are_independent() {
 		assert_eq!(stable_balance(PUSD, 1), 5_000);
 
 		// Independent per-market debt ledgers.
-		assert_eq!(BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.principal, 2_000);
-		assert_eq!(BranchStates::<Test>::get(ETH, PUSD).unwrap().debt.principal, 3_000);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.principal, 2_000);
+		assert_eq!(branch_state(ETH, PUSD).unwrap().debt.principal, 3_000);
 
 		// Independent rate lists (distinct list ids).
 		assert_ne!(rate_list_for(DOT, PUSD), rate_list_for(ETH, PUSD));
@@ -118,7 +114,7 @@ fn liquidation_stays_inside_its_market() {
 		assert_ok!(open_market(3, ETH, EUSD, 1_000, 500, rate_pct(5, 100)));
 
 		let other_vault = Vaults::<Test>::get((ETH, EUSD, 3)).unwrap();
-		let other_state = BranchStates::<Test>::get(ETH, EUSD).unwrap();
+		let other_state = branch_state(ETH, EUSD).unwrap();
 		let other_hold = held(ETH, 3);
 
 		// Drop DOT so owner 1 falls below MCR, then liquidate it.
@@ -127,7 +123,7 @@ fn liquidation_stays_inside_its_market() {
 
 		// The ETH/EUSD market is byte-for-byte untouched.
 		assert_eq!(Vaults::<Test>::get((ETH, EUSD, 3)).unwrap(), other_vault);
-		assert_eq!(BranchStates::<Test>::get(ETH, EUSD).unwrap(), other_state);
+		assert_eq!(branch_state(ETH, EUSD).unwrap(), other_state);
 		assert_eq!(held(ETH, 3), other_hold);
 	});
 }
@@ -169,8 +165,8 @@ fn heal_rejects_a_wrong_coin_credit() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Bad debt is only ever recorded inside the vault pallet; seed it directly.
-		BranchStates::<Test>::mutate(DOT, PUSD, |maybe| {
-			maybe.as_mut().expect("branch registered").debt.bad_debt = 1_000;
+		mutate_branch_state(DOT, PUSD, |state| {
+			state.debt.bad_debt = 1_000;
 		});
 
 		// A credit in another coin (EUSD) cannot heal the PUSD market.
@@ -178,18 +174,14 @@ fn heal_rejects_a_wrong_coin_credit() {
 		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, &PUSD, wrong).unwrap();
 		assert_eq!(surplus.peek(), 1_000, "the whole wrong-coin credit is handed back");
 		assert_eq!(surplus.asset(), EUSD);
-		assert_eq!(
-			BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.bad_debt,
-			1_000,
-			"bad debt is unchanged",
-		);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.bad_debt, 1_000, "bad debt is unchanged",);
 		drop(surplus);
 
 		// The market's own coin heals it.
 		let right = <VaultStableAssets as Balanced<AccountId>>::issue(PUSD, 1_000);
 		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, &PUSD, right).unwrap();
 		assert_eq!(surplus.peek(), 0);
-		assert_eq!(BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.bad_debt, 0);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.bad_debt, 0);
 	});
 }
 
@@ -241,7 +233,7 @@ fn redistribution_stays_inside_its_market() {
 		assert_ok!(open_market(3, ETH, EUSD, 1_000, 500, rate_pct(5, 100)));
 
 		let other_vault = Vaults::<Test>::get((ETH, EUSD, 3)).unwrap();
-		let other_state = BranchStates::<Test>::get(ETH, EUSD).unwrap();
+		let other_state = branch_state(ETH, EUSD).unwrap();
 		let other_hold = held(ETH, 3);
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
@@ -253,7 +245,7 @@ fn redistribution_stays_inside_its_market() {
 
 		// The ETH/EUSD market is untouched: no ETH was parked, no state moved.
 		assert_eq!(Vaults::<Test>::get((ETH, EUSD, 3)).unwrap(), other_vault);
-		assert_eq!(BranchStates::<Test>::get(ETH, EUSD).unwrap(), other_state);
+		assert_eq!(branch_state(ETH, EUSD).unwrap(), other_state);
 		assert_eq!(held(ETH, 3), other_hold);
 	});
 }

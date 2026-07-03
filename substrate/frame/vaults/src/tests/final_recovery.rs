@@ -222,7 +222,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(vault.debt.total(), 0);
 		assert_eq!(vault.redistribution_stake, held(DOT, 1));
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("state");
+		let state = branch_state(DOT, PUSD).expect("state");
 		assert_eq!(state.stakes.total, held(DOT, 1));
 	});
 }
@@ -298,7 +298,7 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 		// Vault is no longer in FR FIFO and not in the rate index — it's Dormant.
 		assert!(vault_status(DOT, 1).is_dormant());
 		assert_eq!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, PUSD, 10), alloc::vec![2]);
-		let state = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("state");
+		let state = branch_state(DOT, PUSD).expect("state");
 		assert_eq!(state.dormant_redemption_target, Some(1));
 	});
 }
@@ -326,12 +326,7 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 			Position::endpoints_only()
 		));
 		assert!(vault_status(DOT, 1).is_dormant());
-		assert_eq!(
-			crate::pallet::BranchStates::<Test>::get(DOT, PUSD)
-				.unwrap()
-				.dormant_redemption_target,
-			Some(1)
-		);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 
 		// Vault 2 also needs the slot, but it is held by a different debt-bearing
 		// vault → the exit is rejected and vault 2 stays in FinalRecovery.
@@ -346,12 +341,7 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 			crate::Error::<Test>::DormantTargetOccupied
 		);
 		assert!(vault_status(DOT, 2).is_final_recovery());
-		assert_eq!(
-			crate::pallet::BranchStates::<Test>::get(DOT, PUSD)
-				.unwrap()
-				.dormant_redemption_target,
-			Some(1)
-		);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 	});
 }
 
@@ -361,7 +351,7 @@ fn deposit_into_final_recovery_keeps_stake_zero() {
 		register_default_branch();
 		enter_recovery(1, rate_pct(5, 100));
 
-		let before = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let before = branch_state(DOT, PUSD).expect("branch state");
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
 			DOT,
@@ -374,7 +364,7 @@ fn deposit_into_final_recovery_keeps_stake_zero() {
 		// vault stays excluded from stake accounting while in the FIFO.
 		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(vault.redistribution_stake, 0);
-		let after = crate::pallet::BranchStates::<Test>::get(DOT, PUSD).expect("branch state");
+		let after = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(after.stakes.total, before.stakes.total);
 		assert_eq!(after.total_collateral, before.total_collateral + 10_000);
 		assert_eq!(held(DOT, 1), 1_000 + 10_000);

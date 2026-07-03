@@ -6,8 +6,7 @@
 
 use crate::{
 	pallet::{
-		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, IdleCursor, Pallet,
-		PalletsOriginOf, Vaults,
+		BalanceOf, Branches, Config, HoldReason, IdleCursor, Pallet, PalletsOriginOf, Vaults,
 	},
 	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
@@ -157,8 +156,9 @@ struct RateBounds {
 }
 
 fn rate_bounds<T: Config>(asset: &T::CollateralAssetId) -> Result<RateBounds, BenchmarkError> {
-	let config = Pallet::<T>::branch_config_of(asset, &stable::<T>())
-		.map_err(|_| BenchmarkError::Stop("missing branch config"))?;
+	let config = Pallet::<T>::branch_of(asset, &stable::<T>())
+		.map_err(|_| BenchmarkError::Stop("missing branch config"))?
+		.config;
 	let count = T::VaultLists::repair_budget().saturating_add(2);
 	let safety_floor = config
 		.minimum_borrow_rate
@@ -252,8 +252,8 @@ fn seed_pending_redistribution<T: Config>(
 	)
 	.map_err(|_| BenchmarkError::Stop("hold on redistribution account failed"))?;
 
-	BranchStates::<T>::try_mutate(asset, &stable::<T>(), |maybe| -> Result<(), BenchmarkError> {
-		let state = maybe.as_mut().ok_or(BenchmarkError::Stop("branch missing"))?;
+	Branches::<T>::try_mutate((asset, &stable::<T>()), |maybe| -> Result<(), BenchmarkError> {
+		let state = &mut maybe.as_mut().ok_or(BenchmarkError::Stop("branch missing"))?.state;
 		state.redistribution.debt_per_stake = per_stake;
 		state.redistribution.collateral_per_stake = per_stake;
 		state.redistribution.weight_per_stake = weight_per_stake;
@@ -303,11 +303,21 @@ fn recovery_cycle<T: Config>(
 }
 
 fn prefill_branches<T: Config>(count: u32) {
-	// The registry is the `BranchConfigs` key set, and its counted variant tracks
-	// the capacity gate, so seeding configs is enough to fill the registry.
+	// The registry is the `Branches` key set, so each synthetic market seeds a
+	// complete (empty) record.
+	let now = frame::deps::sp_runtime::traits::Zero::zero();
 	for seed in 0..count {
 		let (collateral, stable) = T::BenchmarkHelper::synth_market(seed);
-		BranchConfigs::<T>::insert((collateral, stable), default_branch_config::<T>());
+		let config = default_branch_config::<T>();
+		Branches::<T>::insert(
+			(collateral, stable),
+			crate::types::Branch {
+				state: crate::types::BranchState::fresh(&config, now),
+				config,
+				admins: branch_admins::<T>(),
+				deposit: None,
+			},
+		);
 	}
 }
 
@@ -701,7 +711,7 @@ mod benchmarks {
 		#[extrinsic_call]
 		create_branch(origin, asset.clone(), stable::<T>(), admins, config);
 
-		assert!(BranchStates::<T>::contains_key(&asset, &stable::<T>()));
+		assert!(Branches::<T>::contains_key((&asset, &stable::<T>())));
 		Ok(())
 	}
 
@@ -730,9 +740,9 @@ mod benchmarks {
 		#[extrinsic_call]
 		_(origin, asset.clone(), stable::<T>());
 
-		let state = BranchStates::<T>::get(&asset, &stable::<T>())
-			.expect("branch state present after register");
-		assert!(state.frozen.is_some());
+		let branch =
+			Branches::<T>::get((&asset, &stable::<T>())).expect("branch present after register");
+		assert!(branch.state.frozen.is_some());
 		Ok(())
 	}
 
