@@ -573,11 +573,17 @@ pub enum BranchConfigUpdate<Balance> {
 	DebtCeiling(Balance),
 	MinimumDebt(Balance),
 	MinimumCollateral(Balance),
-	BorrowRateBounds { min: FixedU128, max: FixedU128 },
+	BorrowRateBounds {
+		min: FixedU128,
+		max: FixedU128,
+	},
 	UpfrontFeePeriod(Millis),
 	RateAdjustmentCooldown(Millis),
 	RedistributionPenalty(Permill),
+	/// Autoline headroom above current debt. `0` disables the autoline,
+	/// pinning the borrow cap to the static `debt_ceiling`.
 	CeilingGap(Balance),
+	/// Minimum time between autoline ceiling increases (the slow-up gate).
 	CeilingTtl(Millis),
 }
 
