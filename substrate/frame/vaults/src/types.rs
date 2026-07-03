@@ -135,32 +135,8 @@ impl VaultStatus {
 	}
 }
 
-/// Debt cancelled from a vault, split by bucket.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
-pub struct DebtPayment<Balance> {
-	pub interest: Balance,
-	pub principal: Balance,
-}
-
-impl<Balance: Saturating + Copy> DebtPayment<Balance> {
-	pub fn total(&self) -> Balance {
-		self.interest.saturating_add(self.principal)
-	}
-}
-
-/// Debt tracked on a vault row.
+/// Debt split by bucket: the state tracked on a vault row, and equally the
+/// shape of a cancelled portion of it (a payment is itself a debt breakdown).
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
@@ -174,13 +150,14 @@ impl<Balance: Ord + Saturating + Copy> VaultDebt<Balance> {
 		self.principal.saturating_add(self.interest)
 	}
 
-	pub fn cancel(&mut self, amount: Balance) -> DebtPayment<Balance> {
+	/// Cancel up to `amount`, interest first, returning the cancelled split.
+	pub fn cancel(&mut self, amount: Balance) -> Self {
 		let interest = core::cmp::min(amount, self.interest);
 		self.interest = self.interest.saturating_sub(interest);
 		let remaining = amount.saturating_sub(interest);
 		let principal = core::cmp::min(remaining, self.principal);
 		self.principal = self.principal.saturating_sub(principal);
-		DebtPayment { interest, principal }
+		Self { interest, principal }
 	}
 }
 
@@ -449,7 +426,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 	/// paying vault's principal *after* `VaultDebt::cancel` ran.
 	pub fn apply_debt_payment(
 		&mut self,
-		payment: DebtPayment<Balance>,
+		payment: VaultDebt<Balance>,
 		rate: FixedU128,
 		principal_after: Balance,
 	) {
@@ -827,7 +804,7 @@ mod tests {
 		// strand the weighted sum at 3.
 		let rate = FixedU128::from_rational(3u128, 10u128);
 		let mut state = make_branch_state(10, 3);
-		state.apply_debt_payment(DebtPayment { interest: 0, principal: 1 }, rate, 9);
+		state.apply_debt_payment(VaultDebt { interest: 0, principal: 1 }, rate, 9);
 		assert_eq!(state.debt.principal, 9);
 		assert_eq!(state.debt.weighted_principal_sum, 2);
 	}
@@ -836,7 +813,7 @@ mod tests {
 	fn apply_debt_payment_full_payoff_clears_contribution() {
 		let rate = FixedU128::from_rational(3u128, 10u128);
 		let mut state = make_branch_state(10, 3);
-		state.apply_debt_payment(DebtPayment { interest: 0, principal: 10 }, rate, 0);
+		state.apply_debt_payment(VaultDebt { interest: 0, principal: 10 }, rate, 0);
 		assert_eq!(state.debt.principal, 0);
 		assert_eq!(state.debt.weighted_principal_sum, 0);
 	}
