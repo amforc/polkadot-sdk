@@ -834,10 +834,10 @@ impl<T: Config> Pallet<T> {
 	/// defensive" rule, and the governance-envelope check are all derived from the
 	/// `update` itself ([`BranchConfigUpdate::required_level`] /
 	/// [`BranchConfigUpdate::is_defensive`] and
-	/// [`crate::types::BranchConfigGuard::permits`]), so each `set_*` dispatchable
-	/// is a thin wrapper over this one path. The whole post-update config is
-	/// re-validated through the same `permits` gate `create_branch` applies,
-	/// keeping envelope enforcement in a single place.
+	/// [`crate::types::BranchConfigGuard::permits`]), so the `set_param`
+	/// dispatchable is a thin wrapper over this one path. The whole post-update
+	/// config is re-validated through the same `permits` gate `create_branch`
+	/// applies, keeping envelope enforcement in a single place.
 	pub(crate) fn do_set_param(
 		origin: OriginFor<T>,
 		collateral_id: T::CollateralAssetId,
