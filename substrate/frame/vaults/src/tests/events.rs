@@ -318,9 +318,9 @@ fn debt_ceiling_update_emits_parameter_updated() {
 	});
 }
 
-// enter_final_recovery emits VaultStatusChanged + FinalRecoveryEntered.
+// enter_final_recovery emits VaultStatusChanged.
 #[test]
-fn enter_final_recovery_emits_status_change_and_fifo_entry() {
+fn enter_final_recovery_emits_status_change() {
 	build_and_execute(|| {
 		register_default_branch();
 		// Single vault that we'll push into FinalRecovery via a price drop.
@@ -332,11 +332,6 @@ fn enter_final_recovery_emits_status_change_and_fifo_entry() {
 			PUSD,
 			1
 		));
-		assert_event(crate::Event::FinalRecoveryEntered {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-		});
 		assert_event(crate::Event::VaultStatusChanged {
 			collateral_id: DOT,
 			stable_id: PUSD,

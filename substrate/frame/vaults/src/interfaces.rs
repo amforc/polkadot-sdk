@@ -322,6 +322,14 @@ impl<T: Config>
 				amount: residual,
 			});
 		}
+		// The owner-naming record of this settlement: the row is removed, so
+		// no status-change event can carry it. The dust went to the owner.
+		Pallet::<T>::deposit_event(Event::VaultClosed {
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
+			owner: owner.clone(),
+			recipient: owner.clone(),
+		});
 		op.commit_removing_vault(TcrGate::Exempt)?;
 		Ok(residual)
 	}
@@ -351,6 +359,13 @@ fn settle_redemption_status<T: Config>(
 			let new_stake = op.vault.collateral;
 			op.ctx.state.set_vault_stake(&mut op.vault, new_stake);
 			op.vault.redistribution_snapshot = op.ctx.state.redistribution;
+			Pallet::<T>::deposit_event(Event::VaultStatusChanged {
+				collateral_id: op.ctx.collateral_id.clone(),
+				stable_id: op.ctx.stable_id.clone(),
+				owner: op.owner.clone(),
+				old_status: VaultStatus::FinalRecovery,
+				new_status: VaultStatus::Dormant,
+			});
 		},
 		_ => {},
 	}
