@@ -18,7 +18,7 @@ use frame::{
 	traits::{fungibles::Balanced as FungiblesBalanced, OriginTrait, Time},
 };
 use pallet_linked_list::{ListError, SortedListInterface};
-use pusd_primitives::{ProvidePrice, RedemptionTargetKind};
+use pusd_primitives::ProvidePrice;
 
 /// Deltas the next vault touch would apply.
 pub(crate) struct PendingTouch<Balance> {
@@ -559,22 +559,22 @@ impl<T: Config> Pallet<T> {
 		})
 	}
 
-	/// A branch's redemption targets, each tagged with its pricing regime, in
+	/// A branch's redemption targets, each tagged with its lifecycle status, in
 	/// priority order: if the `FinalRecovery` FIFO is
 	/// non-empty, yield only its head; else if `dormant_redemption_target` is set,
-	/// yield only that; otherwise yield the rate index tail-first (all `Ordinary`).
+	/// yield only that; otherwise yield the rate index tail-first (all `Active`).
 	/// Lazy and allocation-free: `.next()` gives the next target and `take(n)` the
 	/// queue view, reading only the tiers they reach.
 	pub(crate) fn redemption_targets(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-	) -> impl Iterator<Item = (T::AccountId, RedemptionTargetKind)> {
+	) -> impl Iterator<Item = (T::AccountId, VaultStatus)> {
 		let priority = recovery::next_target::<T>(collateral_id, stable_id)
-			.map(|owner| (owner, RedemptionTargetKind::FinalRecovery))
+			.map(|owner| (owner, VaultStatus::FinalRecovery))
 			.or_else(|| {
 				BranchStates::<T>::get(collateral_id, stable_id)
 					.and_then(|bs| bs.dormant_redemption_target)
-					.map(|owner| (owner, RedemptionTargetKind::Dormant))
+					.map(|owner| (owner, VaultStatus::Dormant))
 			});
 		// The rate index is walked only when no FinalRecovery/Dormant target gates it.
 		let rate = priority
@@ -584,7 +584,7 @@ impl<T: Config> Pallet<T> {
 			})
 			.into_iter()
 			.flatten()
-			.map(|owner| (owner, RedemptionTargetKind::Ordinary));
+			.map(|owner| (owner, VaultStatus::Active));
 		priority.into_iter().chain(rate)
 	}
 

@@ -57,7 +57,7 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 				AccountId,
 				Balance,
 			>>::next_redemption_target(&DOT, &PUSD, None)
-			.map(|t| t.owner),
+			.map(|(owner, _status)| owner),
 			Some(1)
 		);
 	});
