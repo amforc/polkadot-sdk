@@ -8,6 +8,8 @@ use frame::arithmetic::{
 };
 use scale_info::TypeInfo;
 
+pub use pusd_primitives::VaultStatus;
+
 /// Branch operating mode. `Normal` and `Safety` are derived from live TCR;
 /// `Frozen` is the only persisted mode.
 #[derive(
@@ -64,30 +66,6 @@ pub struct FrozenState {
 	pub entered_at: Millis,
 }
 
-/// Lifecycle status of a vault.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
-pub enum VaultStatus {
-	/// Debt-bearing vault with `Debt >= MinimumDebt`. In the rate index.
-	Active,
-	/// Below `MinimumDebt` (possibly zero) after redemption. Out of the rate
-	/// index, may be revived to `Active`.
-	Dormant,
-	/// Below MCR last-eligible vault parked in the FIFO and resolved by
-	/// recovery redemptions / offsets.
-	FinalRecovery,
-}
-
 /// Logical linked-list partitions owned by this pallet, one pair of lists per
 /// `(collateral_id, stable_id)` market.
 ///
@@ -115,23 +93,6 @@ pub enum VaultListId<CollateralId, StableId> {
 impl<CollateralId: Default, StableId: Default> Default for VaultListId<CollateralId, StableId> {
 	fn default() -> Self {
 		Self::Rate(CollateralId::default(), StableId::default())
-	}
-}
-
-impl VaultStatus {
-	/// Debt-bearing vault, present in the rate index.
-	pub fn is_active(&self) -> bool {
-		matches!(self, Self::Active)
-	}
-
-	/// Drained below `minimum_debt`, out of the rate index.
-	pub fn is_dormant(&self) -> bool {
-		matches!(self, Self::Dormant)
-	}
-
-	/// Parked in the FIFO awaiting recovery settlement.
-	pub fn is_final_recovery(&self) -> bool {
-		matches!(self, Self::FinalRecovery)
 	}
 }
 

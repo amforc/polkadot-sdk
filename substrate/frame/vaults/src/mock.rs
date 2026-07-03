@@ -656,14 +656,13 @@ pub fn redeem_market(
 	redeemer: AccountId,
 	amount: Balance,
 ) -> Result<AccountId, DispatchError> {
-	let target = <Pallet<Test> as VaultRedemptionInterface<
+	let (owner, _status) = <Pallet<Test> as VaultRedemptionInterface<
 		AssetId,
 		StableId,
 		AccountId,
 		Balance,
 	>>::next_redemption_target(&collateral, &stable, None)
 	.ok_or(DispatchError::Other("no redemption target"))?;
-	let owner = target.owner;
 	let price = MockPrices::get().get(&collateral).copied().expect("price set");
 	redeem_step(&collateral, &stable, &owner, |snapshot| {
 		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);

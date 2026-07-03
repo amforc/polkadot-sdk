@@ -1,8 +1,7 @@
 //! Redemption handoff types and trait.
 
-use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
+use crate::VaultStatus;
 use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill};
-use scale_info::TypeInfo;
 
 /// Per-vault allocation produced by the redemption orchestrator and applied by
 /// [`VaultRedemptionInterface::redeem_step`].
@@ -17,104 +16,35 @@ pub struct RedemptionAllocation<AccountId, Balance> {
 	pub fee_collateral_retained: Balance,
 }
 
-/// Pricing regime of a redemption target. Returned alongside the target so the
-/// orchestrator selects the regime without a second classifying call.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
-pub enum RedemptionTargetKind {
-	/// Active rate-index vault, redeemed at face value (ordinary redemption).
-	Ordinary,
-	/// The branch's single dormant redemption-target slot occupant. Priced like
-	/// an ordinary redemption, but it gates the rate-index tail behind it.
-	Dormant,
-	/// `FinalRecovery` FIFO head, priced by recovery-settlement rules.
-	FinalRecovery,
-}
-
-impl RedemptionTargetKind {
-	/// True for the `FinalRecovery` regime.
-	pub fn is_final_recovery(&self) -> bool {
-		matches!(self, Self::FinalRecovery)
-	}
-
-	/// True for the dormant redemption target (a hard ordering barrier).
-	pub fn is_dormant(&self) -> bool {
-		matches!(self, Self::Dormant)
-	}
-}
-
-/// The current highest-priority redemption target on a market.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct RedemptionTarget<AccountId> {
-	pub owner: AccountId,
-	pub kind: RedemptionTargetKind,
-}
-
-/// Post-touch pricing regime of a redemption step.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RedemptionRegime {
-	/// Active rate-index vault, redeemed at face value.
-	Ordinary,
-	/// Dormant redemption-target slot occupant, redeemed at face value.
-	Dormant,
-	/// `FinalRecovery` FIFO head, priced by recovery-settlement rules. The
-	/// branch redistribution penalty bounds the recovery bonus.
-	FinalRecovery { redistribution_penalty: Permill },
-}
-
-impl RedemptionRegime {
-	/// The selection tag this regime prices, so the two enums cannot drift.
-	pub fn kind(&self) -> RedemptionTargetKind {
-		match self {
-			Self::Ordinary => RedemptionTargetKind::Ordinary,
-			Self::Dormant => RedemptionTargetKind::Dormant,
-			Self::FinalRecovery { .. } => RedemptionTargetKind::FinalRecovery,
-		}
-	}
-
-	/// True for the `FinalRecovery` regime.
-	pub fn is_final_recovery(&self) -> bool {
-		self.kind().is_final_recovery()
-	}
-
-	/// True for the dormant redemption target.
-	pub fn is_dormant(&self) -> bool {
-		self.kind().is_dormant()
-	}
-}
-
 /// Fully-accrued, post-touch snapshot of a redemption target. These are the
-/// numbers the orchestrator sizes and prices the step against; `regime`
-/// selects the pricing rules.
+/// numbers the orchestrator sizes and prices the step against; `status`
+/// selects the pricing rules: `Active` and `Dormant` redeem at face value,
+/// `FinalRecovery` by recovery-settlement rules.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RedemptionStepSnapshot<Balance> {
-	pub regime: RedemptionRegime,
+	pub status: VaultStatus,
 	/// Post-touch total debt; the cap on `debt_to_cancel`.
 	pub debt: Balance,
 	/// Collateral currently held against the vault.
 	pub collateral: Balance,
+	/// Branch redistribution penalty, bounding the recovery bonus. Only
+	/// consulted by `FinalRecovery` pricing.
+	pub redistribution_penalty: Permill,
 }
 
 /// Vault-side surface the redemption orchestrator drives, keyed by the
 /// `(collateral_id, stable_id)` market. Reads are authoritative current state;
 /// writes re-shape the priority queue.
 pub trait VaultRedemptionInterface<CollateralId, StableId, AccountId, Balance> {
-	/// TODO: Doc
+	/// The highest-priority redemption target and its lifecycle status:
+	/// `FinalRecovery` FIFO head first, then the dormant redemption target,
+	/// then the rate-index tail (`Active`). `after` resumes the rate-index
+	/// walk behind a carried cursor; a priority target preempts any cursor.
 	fn next_redemption_target(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
 		after: Option<&AccountId>,
-	) -> Option<RedemptionTarget<AccountId>>;
+	) -> Option<(AccountId, VaultStatus)>;
 
 	/// TODO: Doc
 	fn redeem_step(
