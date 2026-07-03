@@ -53,7 +53,7 @@ fn assert_accounting_identity_holds() {
 	);
 	let _ = sum_held;
 	// pending_redistribution_principal now holds only the recipient-attributable share;
-	// per-stake flooring dust lives in rounding.ownerless_pusd_debt separately.
+	// per-stake flooring dust lives in ownerless_debt separately.
 	let tolerance: Balance = n;
 	let drift = state.debt.pending_redistribution_principal.abs_diff(sum_shares);
 	assert!(
@@ -61,7 +61,7 @@ fn assert_accounting_identity_holds() {
 		"pending redistribution principal drift: pending={}, sum_shares={}, ownerless={}, drift={}, tol={}",
 		state.debt.pending_redistribution_principal,
 		sum_shares,
-		state.rounding.ownerless_pusd_debt,
+		state.ownerless_debt,
 		drift,
 		tolerance,
 	);
@@ -413,7 +413,7 @@ fn redistribution_residue_lands_in_ownerless_pusd_debt() {
 		assert_ok!(open(2, DOT, 999, 500, rate_pct(5, 100)));
 		assert_ok!(open(3, DOT, 5_000, 500, rate_pct(5, 100))); // liquidatee
 
-		let pre_owner = BranchStates::<Test>::get(DOT, PUSD).unwrap().rounding.ownerless_pusd_debt;
+		let pre_owner = BranchStates::<Test>::get(DOT, PUSD).unwrap().ownerless_debt;
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		// Force a full redistribution path: no offset, all debt redistributed.
 		// `redistribution_collateral: 0` on purpose — this test isolates the
@@ -429,7 +429,7 @@ fn redistribution_residue_lands_in_ownerless_pusd_debt() {
 		// Redistributed debt 501 over stakes 1_000 + 999 = 1_999: the double floor
 		// (per-stake, then × stake) distributes 500 and strands exactly 1 unit — a tight
 		// bound, not an open `> 0` that would also pass if hundreds were mis-routed.
-		assert_eq!(state.rounding.ownerless_pusd_debt, pre_owner + 1);
+		assert_eq!(state.ownerless_debt, pre_owner + 1);
 	});
 }
 
