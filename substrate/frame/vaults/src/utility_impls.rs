@@ -610,9 +610,9 @@ impl<T: Config> Pallet<T> {
 		Some((branch.config, branch.state, vault))
 	}
 
-	/// Refresh vaults with the block's leftover weight: reconcile every
-	/// branch's oracle-frozen state (bounded by `MaxBranches`, as before),
-	/// then resume the flat [`IdleCursor`] walk over the [`Vaults`] map,
+	/// Refresh vaults with the block's leftover weight: reconcile the
+	/// branches' oracle-frozen state, then resume the flat [`IdleCursor`]
+	/// walk over the [`Vaults`] map,
 	/// touching up to the budget. Map order visits every row eventually —
 	/// dormant husks and mid-FIFO `FinalRecovery` vaults included, which the
 	/// old per-branch rate-index cursor never reached.
@@ -627,7 +627,11 @@ impl<T: Config> Pallet<T> {
 			return Weight::zero();
 		}
 
-		for (collateral_id, stable_id) in Branches::<T>::iter_keys() {
+		// Bounded by `MaxBranches` and, under real weights, by the same
+		// remaining-weight quotient as the vault walk. Like the old per-branch
+		// walk, the reconciliation itself is not charged to the returned weight.
+		let refresh_bound = usize::try_from(by_weight).unwrap_or(usize::MAX);
+		for (collateral_id, stable_id) in Branches::<T>::iter_keys().take(refresh_bound) {
 			let _ = with_storage_layer::<(), DispatchError, _>(|| {
 				Self::do_refresh_branch(&collateral_id, &stable_id)
 			});
@@ -652,7 +656,10 @@ impl<T: Config> Pallet<T> {
 			});
 			touched = touched.saturating_add(1);
 			if touched >= budget {
-				break Some((collateral_id, stable_id, owner));
+				// Clear instead of park when the budget ran out exactly at the
+				// map's end, so the next pass starts at the front rather than
+				// burning a block discovering the drain.
+				break iter.next().is_some().then_some((collateral_id, stable_id, owner));
 			}
 		};
 		IdleCursor::<T>::set(cursor);

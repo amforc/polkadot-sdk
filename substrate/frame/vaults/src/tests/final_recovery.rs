@@ -217,6 +217,13 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 		// to Dormant with its stake re-synced to the still-held collateral.
 		direct_redeem(1, 7, full);
 
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultStatusChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			old_status: crate::types::VaultStatus::FinalRecovery,
+			new_status: crate::types::VaultStatus::Dormant,
+		}));
 		assert!(vault_status(DOT, 1).is_dormant());
 		assert!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, PUSD, 10).is_empty());
 		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
@@ -470,5 +477,35 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 		let p2 = <LinkedList as SortedListInterface<VaultList, AccountId>>::priority(&list, &2)
 			.expect("member");
 		assert!(p1 > p2, "re-entered vault must carry a strictly greater priority");
+	});
+}
+
+// `settle_recovery_residual` removes the row, so `VaultClosed` is its
+// owner-naming record; the residual lands on the bad-debt ledger.
+#[test]
+fn settle_recovery_residual_records_bad_debt_and_emits_vault_closed() {
+	build_and_execute(|| {
+		register_default_branch();
+		enter_recovery(1, rate_pct(5, 100));
+
+		let residual =
+			<crate::Pallet<Test> as VaultInterface>::settle_recovery_residual(&DOT, &PUSD, &1)
+				.expect("settles");
+		assert!(residual > 0);
+		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert!(branch_state(DOT, PUSD).unwrap().debt.bad_debt >= residual);
+
+		// Settlement must name the owner (VaultClosed) and record the residual.
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultClosed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 1,
+		}));
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtRecorded {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			amount: residual,
+		}));
 	});
 }

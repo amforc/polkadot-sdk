@@ -282,10 +282,10 @@ fn final_recovery_exit_requires_explicit_hint() {
 	});
 }
 
-// `OffsetAllocation` carries a `recipient` AccountId, and `finalize_liquidation`
+// `OffsetAllocation` carries a `recipient` AccountId, and `execute_liquidation`
 // moves `offset.collateral` to that recipient.
 #[test]
-fn finalize_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
+fn execute_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
