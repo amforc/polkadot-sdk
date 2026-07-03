@@ -8,7 +8,7 @@ use crate::{
 	pallet::{
 		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, PalletsOriginOf, Vaults,
 	},
-	types::{BranchConfig, VaultListId, VaultStatus},
+	types::{BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
 };
 use alloc::vec::Vec;
@@ -720,7 +720,12 @@ mod benchmarks {
 		let new_value = rate(150, 100);
 
 		#[extrinsic_call]
-		set_minimum_collateralization_ratio(origin, asset, stable::<T>(), new_value);
+		set_param(
+			origin,
+			asset,
+			stable::<T>(),
+			BranchConfigUpdate::MinimumCollateralizationRatio(new_value),
+		);
 
 		Ok(())
 	}

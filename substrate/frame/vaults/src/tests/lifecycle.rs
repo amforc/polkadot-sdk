@@ -7,6 +7,7 @@ use crate::{
 	mock::*,
 	pallet::{BranchStates, Vaults},
 	tests::{rate_pct, vault_status},
+	types::BranchConfigUpdate,
 };
 use pallet_linked_list::SortedListInterface;
 
@@ -179,44 +180,44 @@ fn defensive_manager_can_only_tighten_selected_risk_parameters() {
 	build_and_execute(|| {
 		register_default_branch();
 
-		assert_ok!(crate::Pallet::<Test>::set_minimum_collateralization_ratio(
+		assert_ok!(crate::Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(EMERGENCY_ADMIN),
 			DOT,
 			PUSD,
-			rate_pct(120, 100)
+			BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(120, 100))
 		));
 		assert_noop!(
-			crate::Pallet::<Test>::set_minimum_collateralization_ratio(
+			crate::Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
 				PUSD,
-				rate_pct(109, 100)
+				BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(109, 100))
 			),
 			crate::Error::<Test>::DefensiveActionNotDefensive
 		);
 
-		assert_ok!(crate::Pallet::<Test>::set_debt_ceiling(
+		assert_ok!(crate::Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(EMERGENCY_ADMIN),
 			DOT,
 			PUSD,
-			50_000_000
+			BranchConfigUpdate::DebtCeiling(50_000_000)
 		));
 		assert_noop!(
-			crate::Pallet::<Test>::set_debt_ceiling(
+			crate::Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
 				PUSD,
-				200_000_000
+				BranchConfigUpdate::DebtCeiling(200_000_000)
 			),
 			crate::Error::<Test>::DefensiveActionNotDefensive
 		);
 
 		assert_noop!(
-			crate::Pallet::<Test>::set_minimum_debt(
+			crate::Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
 				PUSD,
-				300
+				BranchConfigUpdate::MinimumDebt(300)
 			),
 			crate::Error::<Test>::NotBranchAdmin
 		);

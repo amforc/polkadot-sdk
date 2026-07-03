@@ -913,165 +913,19 @@ pub mod pallet {
 			)
 		}
 
+		/// Admin: update one branch-config parameter. The required admin tier,
+		/// the `Emergency`-only defensive-direction rule, and the governance
+		/// envelope check are all derived from the `update` itself; see
+		/// [`BranchConfigUpdate`].
 		#[pallet::call_index(11)]
 		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_minimum_collateralization_ratio(
+		pub fn set_param(
 			origin: OriginFor<T>,
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			ratio: FixedU128,
+			update: BranchConfigUpdate<BalanceOf<T>>,
 		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::MinimumCollateralizationRatio(ratio),
-			)
-		}
-
-		#[pallet::call_index(12)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_initial_collateralization_ratio(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			ratio: FixedU128,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::InitialCollateralizationRatio(ratio),
-			)
-		}
-
-		#[pallet::call_index(13)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_safety_collateralization_ratio(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			ratio: FixedU128,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::SafetyCollateralizationRatio(ratio),
-			)
-		}
-
-		#[pallet::call_index(14)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_debt_ceiling(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			ceiling: BalanceOf<T>,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::DebtCeiling(ceiling),
-			)
-		}
-
-		#[pallet::call_index(15)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_minimum_debt(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			minimum_debt: BalanceOf<T>,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::MinimumDebt(minimum_debt),
-			)
-		}
-
-		#[pallet::call_index(16)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_minimum_collateral(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			minimum_collateral: BalanceOf<T>,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::MinimumCollateral(minimum_collateral),
-			)
-		}
-
-		#[pallet::call_index(17)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_borrow_rate_bounds(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			min_rate: FixedU128,
-			max_rate: FixedU128,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::BorrowRateBounds { min: min_rate, max: max_rate },
-			)
-		}
-
-		#[pallet::call_index(18)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_upfront_fee_period(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			period: Millis,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::UpfrontFeePeriod(period),
-			)
-		}
-
-		#[pallet::call_index(19)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_rate_adjustment_cooldown(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			cooldown: Millis,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::RateAdjustmentCooldown(cooldown),
-			)
-		}
-
-		#[pallet::call_index(20)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_redistribution_penalty(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			penalty: Permill,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::RedistributionPenalty(penalty),
-			)
+			Self::do_set_param(origin, collateral_id, stable_id, update)
 		}
 
 		/// Freeze the market. Either admin tier may issue this — a defensive
@@ -1226,42 +1080,6 @@ pub mod pallet {
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
 			Self::do_poke_ceiling(collateral_id, stable_id)
-		}
-
-		/// Full-admin: set the market's autoline headroom (`ceiling_gap`). `0`
-		/// disables the autoline, pinning the borrow cap to the static `debt_ceiling`.
-		#[pallet::call_index(31)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_ceiling_gap(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			ceiling_gap: BalanceOf<T>,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::CeilingGap(ceiling_gap),
-			)
-		}
-
-		/// Full-admin: set the minimum time between autoline ceiling increases
-		/// (`ceiling_ttl`), the slow-up gate.
-		#[pallet::call_index(32)]
-		#[pallet::weight(T::WeightInfo::set_param())]
-		pub fn set_ceiling_ttl(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			ceiling_ttl: Millis,
-		) -> DispatchResult {
-			Self::do_set_param(
-				origin,
-				collateral_id,
-				stable_id,
-				BranchConfigUpdate::CeilingTtl(ceiling_ttl),
-			)
 		}
 	}
 
