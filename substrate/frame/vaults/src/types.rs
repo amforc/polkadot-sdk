@@ -714,8 +714,11 @@ pub enum AdminLevel {
 }
 
 /// The two admins of a market, bundled so the same-typed `full_admin` and
-/// `emergency_admin` cannot be silently swapped at a call site.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `emergency_admin` cannot be silently swapped at a call site — end to end,
+/// from the `create_branch`/`set_branch_admins` call arguments into storage.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
+)]
 pub struct BranchAdmins<PalletsOrigin> {
 	/// May move any param within the envelope and remove an empty market.
 	pub full_admin: PalletsOrigin,
@@ -724,14 +727,11 @@ pub struct BranchAdmins<PalletsOrigin> {
 }
 
 /// Per-market admin origins and the refundable creation deposit, stored
-/// together and torn down together by `remove_branch`. `full_admin` may move any
-/// param within the envelope; `emergency_admin` may only freeze or tighten. The
-/// deposit stays keyed by the depositor *account* regardless of who admins the
-/// market.
+/// together and torn down together by `remove_branch`. The deposit stays keyed
+/// by the depositor *account* regardless of who admins the market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct BranchAdminInfo<PalletsOrigin, AccountId, Consideration> {
-	pub full_admin: PalletsOrigin,
-	pub emergency_admin: PalletsOrigin,
+	pub admins: BranchAdmins<PalletsOrigin>,
 	pub deposit: Option<(AccountId, Consideration)>,
 }
 

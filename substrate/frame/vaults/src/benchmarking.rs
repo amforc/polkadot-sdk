@@ -8,7 +8,7 @@ use crate::{
 	pallet::{
 		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, PalletsOriginOf, Vaults,
 	},
-	types::{BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
+	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
 };
 use alloc::vec::Vec;
@@ -85,10 +85,13 @@ fn branch_admin_accounts<T: Config>() -> (T::AccountId, T::AccountId) {
 	(account("full_admin", 0, 0), account("emergency_admin", 0, 0))
 }
 
-/// The admin origin-callers every benchmarked market is created with.
-fn branch_admins<T: Config>() -> (PalletsOriginOf<T>, PalletsOriginOf<T>) {
+/// The admin bundle every benchmarked market is created with.
+fn branch_admins<T: Config>() -> BranchAdmins<PalletsOriginOf<T>> {
 	let (full_admin, emergency_admin) = branch_admin_accounts::<T>();
-	(RawOrigin::Signed(full_admin).into(), RawOrigin::Signed(emergency_admin).into())
+	BranchAdmins {
+		full_admin: RawOrigin::Signed(full_admin).into(),
+		emergency_admin: RawOrigin::Signed(emergency_admin).into(),
+	}
 }
 
 /// A successful `CreateOrigin` for the default stablecoin — Root (deposit-free)
@@ -116,13 +119,11 @@ fn register_default_branch<T: Config>() -> Result<T::CollateralAssetId, Benchmar
 		stable::<T>(),
 		FixedU128::saturating_from_integer(ORACLE_PRICE),
 	);
-	let (full_admin, emergency_admin) = branch_admins::<T>();
 	Pallet::<T>::create_branch(
 		create_origin::<T>()?,
 		asset.clone(),
 		stable::<T>(),
-		full_admin,
-		emergency_admin,
+		branch_admins::<T>(),
 		default_branch_config::<T>(),
 	)?;
 	Pallet::<T>::set_global_debt_ceiling(
@@ -698,7 +699,7 @@ mod benchmarks {
 		prefill_branches::<T>(prefill);
 		let asset = T::BenchmarkHelper::collateral_asset_id();
 		let config = default_branch_config::<T>();
-		let (full_admin, emergency_admin) = branch_admins::<T>();
+		let admins = branch_admins::<T>();
 		T::BenchmarkHelper::set_oracle_price(
 			asset.clone(),
 			stable::<T>(),
@@ -707,7 +708,7 @@ mod benchmarks {
 		let origin = create_origin::<T>()?;
 
 		#[extrinsic_call]
-		create_branch(origin, asset.clone(), stable::<T>(), full_admin, emergency_admin, config);
+		create_branch(origin, asset.clone(), stable::<T>(), admins, config);
 
 		assert!(BranchStates::<T>::contains_key(&asset, &stable::<T>()));
 		Ok(())

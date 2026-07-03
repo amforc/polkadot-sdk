@@ -12,6 +12,7 @@
 use crate as pallet_vaults;
 pub use crate::{
 	pallet::{BalanceOf, StableCreditOf},
+	types::BranchAdmins,
 	BranchConfig, BranchMode, Error, Event, HoldReason, Pallet,
 };
 pub use frame::{
@@ -251,6 +252,11 @@ pub const EMERGENCY_ADMIN: AccountId = 101;
 /// as origin callers, not accounts.
 pub fn admin_caller(who: AccountId) -> OriginCaller {
 	frame_system::RawOrigin::Signed(who).into()
+}
+
+/// The admin bundle `create_branch`/`set_branch_admins` take.
+pub fn branch_admins(full: AccountId, emergency: AccountId) -> BranchAdmins<OriginCaller> {
+	BranchAdmins { full_admin: admin_caller(full), emergency_admin: admin_caller(emergency) }
 }
 
 /// `CreateOrigin`: Root creates deposit-free (`None`); the stable asset's owner
@@ -525,8 +531,7 @@ pub fn register_autoline_market(
 		RuntimeOrigin::root(),
 		collateral.clone(),
 		stable,
-		admin_caller(ADMIN),
-		admin_caller(EMERGENCY_ADMIN),
+		branch_admins(ADMIN, EMERGENCY_ADMIN),
 		config,
 	)
 	.expect("create_branch ok");
@@ -545,8 +550,7 @@ pub fn register_market(collateral: AssetId, stable: StableId) {
 		RuntimeOrigin::root(),
 		collateral.clone(),
 		stable,
-		admin_caller(ADMIN),
-		admin_caller(EMERGENCY_ADMIN),
+		branch_admins(ADMIN, EMERGENCY_ADMIN),
 		default_branch_config(),
 	)
 	.expect("create_branch ok");
