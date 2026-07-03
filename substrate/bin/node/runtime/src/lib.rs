@@ -60,7 +60,7 @@ use frame_support::{
 			GetSalary, PayFromAccount, PayWithFungibles,
 		},
 		AsEnsureOriginWithArg, ConstBool, ConstU128, ConstU16, ConstU32, ConstU64,
-		ConstantStoragePrice, Contains, Currency, EitherOfDiverse, EnsureOriginWithArg,
+		ConstantStoragePrice, Contains, Currency, EitherOf, EitherOfDiverse, EnsureOriginWithArg,
 		EqualPrivilegeOnly, InsideBoth, InstanceFilter, KeyOwnerProofSystem, LinearStoragePrice,
 		LockIdentifier, Nothing, OnUnbalanced, VariantCountOf, WithdrawReasons,
 	},
@@ -3197,6 +3197,39 @@ parameter_types! {
 	/// Per-byte deposit slope; PSM footprints are fixed-size, so this is zero.
 	pub const PsmDepositSlope: Balance = 0;
 	pub PsmHoldReason: RuntimeHoldReason = RuntimeHoldReason::Psm(pallet_psm::HoldReason::CreationDeposit);
+	/// PSM fee revenue funds the internal stablecoin's insurance cover: the
+	/// same per-stable account redemptions settlement draws from.
+	pub PsmInsuranceFundAccount: AccountId =
+		<StableInsuranceAccount as traits::Convert<VaultsStableId, AccountId>>::convert(
+			PsmStablecoinAssetId::get(),
+		);
+}
+
+type PsmInternalAsset = ItemOf<Assets, PsmStablecoinAssetId, AccountId>;
+
+parameter_types! {
+	/// No debt ceiling: maximum possible issuance.
+	pub const NoVaultsCeiling: Balance = Balance::MAX;
+}
+
+/// EnsureOrigin implementation for PSM management that supports privilege levels.
+pub struct EnsurePsmManager;
+impl frame_support::traits::EnsureOrigin<RuntimeOrigin> for EnsurePsmManager {
+	type Success = pallet_psm::PsmManagerLevel;
+
+	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
+		use frame_system::RawOrigin;
+
+		match o.clone().into() {
+			Ok(RawOrigin::Root) => Ok(pallet_psm::PsmManagerLevel::Full),
+			_ => Err(o),
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn try_successful_origin() -> Result<RuntimeOrigin, ()> {
+		Ok(RuntimeOrigin::root())
+	}
 }
 
 #[cfg(feature = "runtime-benchmarks")]
@@ -3447,16 +3480,29 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 }
 
 parameter_types! {
+	pub const InsurancePalletId: PalletId = PalletId(*b"py/insur");
+}
+
+/// One insurance-fund account per stablecoin, derived as a sub-account so one
+/// coin's cover can never settle another coin's bad debt.
+pub struct StableInsuranceAccount;
+impl traits::Convert<VaultsStableId, AccountId> for StableInsuranceAccount {
+	fn convert(stable_id: VaultsStableId) -> AccountId {
+		InsurancePalletId::get().into_sub_account_truncating(stable_id)
+	}
+}
+
+parameter_types! {
 	/// Redemption parameters seeded on every branch registration.
 	pub RedemptionsDefaultConfig: pallet_redemptions::RedemptionConfig<Balance, Moment> =
 		pallet_redemptions::RedemptionConfig {
 			minimum_redemption_amount: 100_000_000, // 100 pUSD (6 decimals)
-			base_rate_decay_period: 6 * 60 * 60 * 1_000, // 6 hours in ms
-			base_rate_floor: FixedU128::from_rational(0u128, 1u128),
-			base_rate_ceiling: FixedU128::from_rational(1u128, 1u128),
-			redemption_fee_floor: FixedU128::from_rational(5u128, 1_000u128), // 0.5%
-			redemption_fee_ceiling: FixedU128::from_rational(1u128, 1u128),
-			base_rate_increase_divisor: FixedU128::from_rational(2u128, 1u128),
+			dynamic_fee_decay_period: 6 * 60 * 60 * 1_000, // 6 hours in ms
+			dynamic_fee_floor: FixedU128::from_rational(0u128, 1u128),
+			dynamic_fee_ceiling: FixedU128::from_rational(1u128, 1u128),
+			base_fee: FixedU128::from_rational(5u128, 1_000u128), // 0.5%
+			fee_ceiling: FixedU128::from_rational(1u128, 1u128),
+			dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
 			final_recovery_bonus_buffer: FixedU128::from_rational(1u128, 100u128), // 1%
 		};
 	pub const RedemptionsMaxSteps: u32 = 16;
@@ -3468,10 +3514,13 @@ impl pallet_redemptions::Config for Runtime {
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
 	type Vaults = Vaults;
-	type InsuranceFundAccount = PsmInsuranceFundAccount;
+	type InsuranceFundAccount = StableInsuranceAccount;
 	type FeeHandler = ();
 	type TimeProvider = Timestamp;
-	type ManagerOrigin = EnsureRoot<AccountId>;
+	type UpdateOrigin = EitherOf<
+		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
+		pallet_vaults::EnsureBranchFullAdmin<Runtime>,
+	>;
 	type DefaultRedemptionConfig = RedemptionsDefaultConfig;
 	type MaxRedemptionSteps = RedemptionsMaxSteps;
 	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
@@ -3530,12 +3579,15 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		};
 		let full_admin: AccountId = frame_benchmarking::account("vaults_admin", 0, 0);
 		let emergency_admin: AccountId = frame_benchmarking::account("vaults_emergency", 0, 0);
+		let admins = pallet_vaults::types::BranchAdmins {
+			full_admin: OriginCaller::from(RawOrigin::Signed(full_admin)),
+			emergency_admin: OriginCaller::from(RawOrigin::Signed(emergency_admin)),
+		};
 		pallet_vaults::Pallet::<Runtime>::create_branch(
 			RawOrigin::Root.into(),
 			collateral_id.clone(),
 			stable_id,
-			full_admin,
-			emergency_admin,
+			admins,
 			branch_config,
 		)
 		.expect("create branch for benchmark");
