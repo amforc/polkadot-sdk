@@ -262,6 +262,23 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
+	/// Authorize a call [`Config::GlobalManagerOrigin`] may force and a market
+	/// admin of `required` tier may issue: governance can always do what a
+	/// market admin can do here. Governance is checked first; `try_origin`
+	/// hands the origin back on failure, so the admin fallback is lossless.
+	pub(crate) fn ensure_branch_admin_or_manager(
+		origin: OriginFor<T>,
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
+		required: AdminLevel,
+	) -> Result<(), DispatchError> {
+		let origin = match T::GlobalManagerOrigin::try_origin(origin) {
+			Ok(_) => return Ok(()),
+			Err(origin) => origin,
+		};
+		Self::ensure_branch_admin(origin, collateral_id, stable_id, required).map(|_| ())
+	}
+
 	/// Authorize a per-market admin call, returning the caller's [`AdminLevel`].
 	/// `full_admin` satisfies any `required`; `emergency_admin` satisfies only
 	/// `Emergency`.
