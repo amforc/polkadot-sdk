@@ -10,7 +10,6 @@
 
 use crate::{
 	pallet::{BalanceOf, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet, Vaults},
-	recovery,
 	types::{BranchConfig, BranchState, Vault, VaultListId, VaultStatus},
 };
 use frame::{
@@ -43,7 +42,6 @@ pub(crate) struct OpContext<T: Config> {
 	pub stable_id: T::StableAssetId,
 	pub now: Millis,
 	pub state: BranchState<T::AccountId, BalanceOf<T>>,
-	rate_list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
 	pending_interest_mint: BalanceOf<T>,
 	pending_fee: Option<BalanceOf<T>>,
 	/// Post-accrual state at load: the "pre" side of the commit's TCR gate.
@@ -56,24 +54,14 @@ pub(crate) struct OpContext<T: Config> {
 
 /// Vault-level operation: a [`OpContext::touch`]ed context that owns the vault
 /// row it settled. Commits write `vault` under `owner`, so the touched row and
-/// the committed row cannot diverge.
+/// the committed row cannot diverge. Branch-level fields and helpers stay on
+/// the composed [`OpContext`], reached as `op.ctx`.
 pub(crate) struct VaultOp<T: Config> {
-	pub collateral_id: T::CollateralAssetId,
-	pub stable_id: T::StableAssetId,
-	pub now: Millis,
-	pub state: BranchState<T::AccountId, BalanceOf<T>>,
+	pub ctx: OpContext<T>,
 	pub owner: T::AccountId,
 	pub vault: Vault<BalanceOf<T>>,
 	pub status: VaultStatus,
-	rate_list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
-	pending_interest_mint: BalanceOf<T>,
-	pending_fee: Option<BalanceOf<T>>,
 	pending_interest_accrued: Option<BalanceOf<T>>,
-	/// The [`OpContext`] baseline, carried through the touch: the "pre" side
-	/// of the commit's TCR gate.
-	tcr_baseline: BranchState<T::AccountId, BalanceOf<T>>,
-	#[cfg(debug_assertions)]
-	loaded: BranchState<T::AccountId, BalanceOf<T>>,
 }
 
 impl<T: Config> OpContext<T> {
@@ -89,14 +77,12 @@ impl<T: Config> OpContext<T> {
 
 		let pending_interest_mint = Pallet::<T>::accrue_aggregate_interest(&mut state, now);
 
-		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 		Ok(Self {
 			collateral_id,
 			stable_id,
 			now,
 			tcr_baseline: state.clone(),
 			state,
-			rate_list,
 			pending_interest_mint,
 			pending_fee: None,
 			#[cfg(debug_assertions)]
@@ -120,11 +106,10 @@ impl<T: Config> OpContext<T> {
 		Ok(())
 	}
 
-	/// The branch's rate-index list id, built once at [`Self::load`]. A
-	/// read-only accessor (rather than a public field) so it can never drift
-	/// from `collateral_id`/`stable_id`.
-	pub fn rate_list(&self) -> &VaultListId<T::CollateralAssetId, T::StableAssetId> {
-		&self.rate_list
+	/// The branch's rate-index list id, derived from the context's own keys so
+	/// it can never drift from `collateral_id`/`stable_id`.
+	pub fn rate_list(&self) -> VaultListId<T::CollateralAssetId, T::StableAssetId> {
+		VaultListId::Rate(self.collateral_id.clone(), self.stable_id.clone())
 	}
 
 	/// Oracle price for this context's collateral.
@@ -152,11 +137,7 @@ impl<T: Config> OpContext<T> {
 	pub fn touch(mut self, owner: &T::AccountId) -> Result<VaultOp<T>, DispatchError> {
 		debug_assert!(self.pending_fee.is_none(), "fee charged before touch");
 		let mut vault = Pallet::<T>::vault_of(&self.collateral_id, &self.stable_id, owner)?;
-		let status = Pallet::<T>::vault_status_in(
-			&self.rate_list,
-			&recovery::list_id::<T>(&self.collateral_id, &self.stable_id),
-			owner,
-		);
+		let status = Pallet::<T>::vault_status_of(&self.collateral_id, &self.stable_id, owner);
 		let pending = Pallet::<T>::pending_touch_for(&vault, &self.state, self.now);
 
 		let mut pending_interest_accrued = None;
@@ -194,49 +175,24 @@ impl<T: Config> OpContext<T> {
 			self.state.set_vault_stake(&mut vault, new_stake);
 		}
 
-		Ok(VaultOp {
-			// A touch preserves the TCR inputs — principal + pending
-			// redistribution move as a sum, collateral only changes hands, and
-			// the aggregate accrual already ran at load — so the load baseline
-			// is the post-touch baseline.
-			tcr_baseline: self.tcr_baseline,
-			collateral_id: self.collateral_id,
-			stable_id: self.stable_id,
-			now: self.now,
-			state: self.state,
-			owner: owner.clone(),
-			vault,
-			status,
-			rate_list: self.rate_list,
-			pending_interest_mint: self.pending_interest_mint,
-			pending_fee: self.pending_fee,
-			pending_interest_accrued,
-			#[cfg(debug_assertions)]
-			loaded: self.loaded,
-		})
+		// A touch preserves the TCR inputs — principal + pending redistribution
+		// move as a sum, collateral only changes hands, and the aggregate accrual
+		// already ran at load — so the load baseline is the post-touch baseline.
+		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, status, pending_interest_accrued })
 	}
 
-	/// Commit a freshly-opened vault row for `owner` — the only path on which a
-	/// row enters storage without a touch — together with the branch state.
-	pub fn commit_new_vault(
-		self,
-		owner: &T::AccountId,
-		vault: &Vault<BalanceOf<T>>,
-		gate: TcrGate<'_, BalanceOf<T>>,
-	) -> Result<(), DispatchError> {
-		enforce_tcr_gate::<T>(&self.tcr_baseline, &self.state, self.now, gate)?;
-		self.assert_unclobbered();
-		Vaults::<T>::insert((&self.collateral_id, &self.stable_id, owner), vault);
-		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
-		let fee = self.pending_fee.map(|amount| (owner.clone(), amount));
-		flush_deferred::<T>(
-			self.collateral_id,
-			self.stable_id,
-			self.pending_interest_mint,
-			None,
-			fee,
-		);
-		Ok(())
+	/// Attach a freshly-built vault row for `owner` — the only path on which a
+	/// row enters storage without a touch. Unlike [`Self::touch`], the upfront
+	/// fee may already be charged (an open computes its fee before the row
+	/// exists).
+	pub fn attach_new(self, owner: &T::AccountId, vault: Vault<BalanceOf<T>>) -> VaultOp<T> {
+		VaultOp {
+			ctx: self,
+			owner: owner.clone(),
+			vault,
+			status: VaultStatus::Active,
+			pending_interest_accrued: None,
+		}
 	}
 
 	fn assert_unclobbered(&self) {
@@ -250,30 +206,6 @@ impl<T: Config> OpContext<T> {
 }
 
 impl<T: Config> VaultOp<T> {
-	/// The branch's rate-index list id; see [`OpContext::rate_list`].
-	pub fn rate_list(&self) -> &VaultListId<T::CollateralAssetId, T::StableAssetId> {
-		&self.rate_list
-	}
-
-	/// Oracle price for this operation's collateral.
-	pub fn price(&self) -> Result<FixedU128, DispatchError> {
-		T::Oracle::provide_price(&self.collateral_id)
-	}
-
-	/// Branch config for this operation's collateral.
-	pub fn config(&self) -> Result<BranchConfig<BalanceOf<T>>, DispatchError> {
-		Pallet::<T>::branch_config_of(&self.collateral_id, &self.stable_id)
-	}
-
-	/// Defer the upfront fee charged to the vault owner until commit.
-	pub fn charge_upfront_fee(&mut self, amount: BalanceOf<T>) {
-		if amount.is_zero() {
-			return;
-		}
-		debug_assert!(self.pending_fee.is_none(), "one upfront fee per dispatch");
-		self.pending_fee = Some(amount);
-	}
-
 	/// Write the owned vault row and the branch state, gated by `gate`.
 	pub fn commit(self, gate: TcrGate<'_, BalanceOf<T>>) -> Result<(), DispatchError> {
 		self.commit_inner(gate, true)
@@ -292,40 +224,27 @@ impl<T: Config> VaultOp<T> {
 		gate: TcrGate<'_, BalanceOf<T>>,
 		keep_row: bool,
 	) -> Result<(), DispatchError> {
-		enforce_tcr_gate::<T>(&self.tcr_baseline, &self.state, self.now, gate)?;
-		self.assert_unclobbered();
+		enforce_tcr_gate::<T>(&self.ctx.tcr_baseline, &self.ctx.state, self.ctx.now, gate)?;
+		self.ctx.assert_unclobbered();
+		let key = (&self.ctx.collateral_id, &self.ctx.stable_id, &self.owner);
 		if keep_row {
-			Vaults::<T>::insert((&self.collateral_id, &self.stable_id, &self.owner), &self.vault);
+			Vaults::<T>::insert(key, &self.vault);
 		} else {
-			Vaults::<T>::remove((&self.collateral_id, &self.stable_id, &self.owner));
+			Vaults::<T>::remove(key);
 		}
-		BranchStates::<T>::insert(&self.collateral_id, &self.stable_id, &self.state);
-		self.flush();
-		Ok(())
-	}
+		BranchStates::<T>::insert(&self.ctx.collateral_id, &self.ctx.stable_id, &self.ctx.state);
 
-	fn flush(self) {
-		let Self {
-			collateral_id,
-			stable_id,
-			owner,
-			pending_interest_mint,
-			pending_fee,
-			pending_interest_accrued,
-			..
-		} = self;
+		let Self { ctx, owner, pending_interest_accrued, .. } = self;
 		let interest_accrued = pending_interest_accrued.map(|amount| (owner.clone(), amount));
-		let fee = pending_fee.map(|amount| (owner, amount));
-		flush_deferred::<T>(collateral_id, stable_id, pending_interest_mint, interest_accrued, fee);
-	}
-
-	fn assert_unclobbered(&self) {
-		#[cfg(debug_assertions)]
-		debug_assert_eq!(
-			BranchStates::<T>::get(&self.collateral_id, &self.stable_id).as_ref(),
-			Some(&self.loaded),
-			"BranchStates mutated behind VaultOp"
+		let fee = ctx.pending_fee.map(|amount| (owner, amount));
+		flush_deferred::<T>(
+			ctx.collateral_id,
+			ctx.stable_id,
+			ctx.pending_interest_mint,
+			interest_accrued,
+			fee,
 		);
+		Ok(())
 	}
 }
 
