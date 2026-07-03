@@ -44,8 +44,7 @@ fn signed_create_takes_deposit_and_remove_refunds() {
 			RuntimeOrigin::signed(PUSD_OWNER),
 			DOT,
 			PUSD,
-			admin_caller(ADMIN),
-			admin_caller(EMERGENCY_ADMIN),
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), MarketDepositBase::get());
@@ -65,8 +64,7 @@ fn root_create_takes_no_deposit() {
 			RuntimeOrigin::root(),
 			DOT,
 			PUSD,
-			admin_caller(ADMIN),
-			admin_caller(EMERGENCY_ADMIN),
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
@@ -84,8 +82,7 @@ fn lifecycle_hooks_fire_on_create_and_remove() {
 			RuntimeOrigin::signed(PUSD_OWNER),
 			DOT,
 			PUSD,
-			admin_caller(ADMIN),
-			admin_caller(EMERGENCY_ADMIN),
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
 		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true)]);
@@ -110,8 +107,7 @@ fn create_branch_rejects_config_outside_envelope() {
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				config
 			),
 			Error::<Test>::ConfigOutsideEnvelope
@@ -131,8 +127,7 @@ fn create_branch_rejects_line_above_envelope() {
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				config
 			),
 			Error::<Test>::ConfigOutsideEnvelope
@@ -150,8 +145,7 @@ fn create_branch_rejects_unpriced_collateral() {
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			Error::<Test>::OraclePriceNotAvailable
@@ -220,8 +214,7 @@ fn set_branch_admins_reassigns_authority() {
 				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
 				PUSD,
-				admin_caller(NEW_FULL_ADMIN),
-				admin_caller(NEW_EMERGENCY_ADMIN)
+				branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
 			),
 			Error::<Test>::NotBranchAdmin
 		);
@@ -230,12 +223,11 @@ fn set_branch_admins_reassigns_authority() {
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD,
-			admin_caller(NEW_FULL_ADMIN),
-			admin_caller(NEW_EMERGENCY_ADMIN)
+			branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
 		));
 		let info = BranchAdmin::<Test>::get((DOT, PUSD)).expect("admins stored");
-		assert_eq!(info.full_admin, admin_caller(NEW_FULL_ADMIN));
-		assert_eq!(info.emergency_admin, admin_caller(NEW_EMERGENCY_ADMIN));
+		assert_eq!(info.admins.full_admin, admin_caller(NEW_FULL_ADMIN));
+		assert_eq!(info.admins.emergency_admin, admin_caller(NEW_EMERGENCY_ADMIN));
 
 		// The old full admin can no longer act; the new one can.
 		assert_noop!(
@@ -326,8 +318,7 @@ fn remove_branch_frees_max_branches_slot() {
 					RuntimeOrigin::root(),
 					collateral.clone(),
 					stable,
-					admin_caller(ADMIN),
-					admin_caller(EMERGENCY_ADMIN),
+					branch_admins(ADMIN, EMERGENCY_ADMIN),
 					default_branch_config()
 				));
 			}
@@ -341,8 +332,7 @@ fn remove_branch_frees_max_branches_slot() {
 				RuntimeOrigin::root(),
 				COLL_D,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			Error::<Test>::TooManyBranches
@@ -355,8 +345,7 @@ fn remove_branch_frees_max_branches_slot() {
 			RuntimeOrigin::root(),
 			COLL_D,
 			PUSD,
-			admin_caller(ADMIN),
-			admin_caller(EMERGENCY_ADMIN),
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
 		assert_eq!(BranchConfigs::<Test>::count(), MaxBranches::get());
@@ -374,8 +363,7 @@ fn create_branch_rejects_unknown_stable() {
 				RuntimeOrigin::root(),
 				DOT,
 				9_999,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			Error::<Test>::UnknownStable
@@ -396,8 +384,7 @@ fn create_branch_rejects_stable_collateral_collision() {
 				RuntimeOrigin::root(),
 				AssetId::WithId(PUSD),
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			Error::<Test>::StableCollateralCollision
@@ -412,8 +399,7 @@ fn create_branch_rejects_stable_collateral_collision() {
 				RuntimeOrigin::root(),
 				AssetId::WithId(EUSD),
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			Error::<Test>::StableCollateralCollision
@@ -439,8 +425,7 @@ fn create_branch_rejects_autoline_knobs_outside_envelope() {
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				wide_gap
 			),
 			Error::<Test>::ConfigOutsideEnvelope
@@ -453,8 +438,7 @@ fn create_branch_rejects_autoline_knobs_outside_envelope() {
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				fast_ttl
 			),
 			Error::<Test>::ConfigOutsideEnvelope

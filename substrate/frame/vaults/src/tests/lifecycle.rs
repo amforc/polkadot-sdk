@@ -30,8 +30,7 @@ fn create_branch_requires_asset_owner_or_root() {
 				RuntimeOrigin::signed(2),
 				TOKEN_X,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			DispatchError::BadOrigin
@@ -42,8 +41,7 @@ fn create_branch_requires_asset_owner_or_root() {
 			RuntimeOrigin::signed(1),
 			TOKEN_X,
 			PUSD,
-			admin_caller(ADMIN),
-			admin_caller(EMERGENCY_ADMIN),
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
 	});
@@ -59,8 +57,7 @@ fn create_branch_rejects_unknown_asset() {
 				RuntimeOrigin::root(),
 				unknown,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			crate::Error::<Test>::UnknownCollateral
@@ -77,8 +74,7 @@ fn create_branch_rejects_duplicate_collateral() {
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				admin_caller(ADMIN),
-				admin_caller(EMERGENCY_ADMIN),
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()
 			),
 			crate::Error::<Test>::BranchAlreadyRegistered
