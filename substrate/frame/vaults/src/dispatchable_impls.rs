@@ -158,7 +158,7 @@ impl<T: Config> Pallet<T> {
 			initial_collateral,
 		)?;
 		T::StableAssets::mint_into(op.stable_id.clone(), &owner, initial_debt)?;
-		op.charge_upfront_fee(upfront_fee);
+		op.charge_upfront_fee(&owner, upfront_fee);
 
 		T::VaultLists::insert(op.rate_list(), owner.clone(), annual_rate, hint)
 			.map_err(Self::map_error)?;
@@ -339,7 +339,7 @@ impl<T: Config> Pallet<T> {
 		}
 
 		T::StableAssets::mint_into(op.ctx.stable_id.clone(), &recipient, amount)?;
-		op.ctx.charge_upfront_fee(upfront_fee);
+		op.ctx.charge_upfront_fee(&owner, upfront_fee);
 
 		if dormant_to_active {
 			T::VaultLists::insert(op.ctx.rate_list(), owner.clone(), new_rate, hint)
@@ -478,7 +478,7 @@ impl<T: Config> Pallet<T> {
 		);
 
 		let price = op.ctx.price()?;
-		op.ctx.charge_upfront_fee(upfront_fee);
+		op.ctx.charge_upfront_fee(&owner, upfront_fee);
 
 		op.vault.annual_rate = new_rate;
 		op.vault.last_rate_update = op.ctx.now;
