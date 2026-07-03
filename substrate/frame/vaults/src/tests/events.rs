@@ -274,11 +274,13 @@ fn enable_frozen_mode_emits_mode_changed() {
 fn set_parameter_emits_parameter_updated() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(crate::Pallet::<Test>::set_minimum_collateralization_ratio(
+		assert_ok!(crate::Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD,
-			FixedU128::from_rational(115u128, 100u128)
+			crate::types::BranchConfigUpdate::MinimumCollateralizationRatio(
+				FixedU128::from_rational(115u128, 100u128)
+			)
 		));
 		assert_event(crate::Event::ParameterUpdated {
 			collateral_id: DOT,
@@ -296,11 +298,11 @@ fn set_parameter_emits_parameter_updated() {
 fn set_debt_ceiling_emits_parameter_updated() {
 	build_and_execute(|| {
 		register_default_branch();
-		assert_ok!(crate::Pallet::<Test>::set_debt_ceiling(
+		assert_ok!(crate::Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD,
-			50_000_000
+			crate::types::BranchConfigUpdate::DebtCeiling(50_000_000)
 		));
 		assert_event(crate::Event::ParameterUpdated {
 			collateral_id: DOT,
