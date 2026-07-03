@@ -470,16 +470,20 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 			.saturating_add(new_rate.saturating_mul_int(stake));
 	}
 
-	/// Swap a vault's stake contribution after collateral or eligibility has
-	/// changed. The vault rate is unchanged here; rate moves go through
-	/// [`Self::change_vault_rate`].
-	pub fn refresh_vault_stake(&mut self, rate: FixedU128, old_stake: Balance, new_stake: Balance) {
+	/// Set a vault's redistribution stake after collateral or eligibility has
+	/// changed, swapping its contribution in the branch stake aggregates.
+	/// Mutates the row and the aggregates together so
+	/// `stakes.total == Σ vault.redistribution_stake` cannot drift. The vault
+	/// rate is unchanged here; rate moves go through [`Self::change_vault_rate`].
+	pub fn set_vault_stake(&mut self, vault: &mut Vault<Balance>, new_stake: Balance) {
+		let old_stake = vault.redistribution_stake;
 		self.stakes.total = self.stakes.total.saturating_sub(old_stake).saturating_add(new_stake);
 		self.stakes.weighted_sum = self
 			.stakes
 			.weighted_sum
-			.saturating_sub(rate.saturating_mul_int(old_stake))
-			.saturating_add(rate.saturating_mul_int(new_stake));
+			.saturating_sub(vault.annual_rate.saturating_mul_int(old_stake))
+			.saturating_add(vault.annual_rate.saturating_mul_int(new_stake));
+		vault.redistribution_stake = new_stake;
 	}
 
 	/// Fold `principal` of pending redistributed debt into `vault` at its own
@@ -529,6 +533,17 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 		self.debt.outstanding().is_zero() &&
 			self.stakes.total.is_zero() &&
 			self.total_collateral.is_zero()
+	}
+
+	/// Record unbacked circulating debt against the branch ledger.
+	pub fn record_bad_debt(&mut self, amount: Balance) {
+		self.debt.bad_debt = self.debt.bad_debt.saturating_add(amount);
+	}
+
+	/// Burn recorded bad debt (saturating; callers cap `amount` at
+	/// `debt.bad_debt` where exactness matters).
+	pub fn heal_bad_debt(&mut self, amount: Balance) {
+		self.debt.bad_debt = self.debt.bad_debt.saturating_sub(amount);
 	}
 
 	/// Sweep the orphan debt counters into `bad_debt`, returning the swept
