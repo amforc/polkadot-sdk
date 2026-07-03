@@ -182,7 +182,11 @@ impl<T: Config> Pallet<T> {
 			stable_id: op.stable_id.clone(),
 			owner: owner.clone(),
 		});
-		op.attach_new(&owner, vault).commit(TcrGate::Enforce { price, config: &config })
+		op.attach_new(&owner, vault).commit(TcrGate::Check {
+			price,
+			config: &config,
+			settlement: false,
+		})
 	}
 
 	/// Permissionless deposit. Dormant vaults must be revived by borrowing.
@@ -271,7 +275,7 @@ impl<T: Config> Pallet<T> {
 			recipient,
 			amount,
 		});
-		op.commit(TcrGate::Enforce { price, config: &config })
+		op.commit(TcrGate::Check { price, config: &config, settlement: false })
 	}
 
 	pub(crate) fn do_borrow(
@@ -368,7 +372,7 @@ impl<T: Config> Pallet<T> {
 			recipient,
 			amount,
 		});
-		op.commit(TcrGate::Enforce { price, config: &config })
+		op.commit(TcrGate::Check { price, config: &config, settlement: false })
 	}
 
 	pub(crate) fn do_repay_for(
@@ -489,7 +493,7 @@ impl<T: Config> Pallet<T> {
 			old_rate,
 			new_rate,
 		});
-		op.commit(TcrGate::Enforce { price, config: &config })
+		op.commit(TcrGate::Check { price, config: &config, settlement: false })
 	}
 
 	pub(crate) fn do_close_vault(
@@ -572,12 +576,7 @@ impl<T: Config> Pallet<T> {
 			recipient: recipient.clone(),
 		});
 		// A branch-emptying close is a settlement: it may worsen TCR.
-		let gate = if branch_empties {
-			TcrGate::Settle { price, config }
-		} else {
-			TcrGate::Enforce { price, config }
-		};
-		op.commit_removing_vault(gate)
+		op.commit_removing_vault(TcrGate::Check { price, config, settlement: branch_empties })
 	}
 
 	pub(crate) fn do_poke(
