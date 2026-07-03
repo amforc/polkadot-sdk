@@ -2,6 +2,7 @@ use crate::{
 	mock::*,
 	pallet::{BranchAdmin, BranchConfigs, BranchStates, Vaults},
 	tests::rate_pct,
+	types::BranchConfigUpdate,
 };
 use frame::traits::fungibles::Mutate as FungiblesMutate;
 
@@ -165,11 +166,11 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 	build_and_execute(|| {
 		register_default_branch();
 		// 110% -> 106% is a loosening the full admin may apply (floor is 105%).
-		assert_ok!(Pallet::<Test>::set_minimum_collateralization_ratio(
+		assert_ok!(Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD,
-			rate_pct(106, 100)
+			BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(106, 100))
 		));
 		assert_eq!(
 			BranchConfigs::<Test>::get((DOT, PUSD)).unwrap().minimum_collateralization_ratio,
@@ -177,11 +178,11 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 		);
 		// 104% is below the envelope floor — even the full admin cannot go there.
 		assert_noop!(
-			Pallet::<Test>::set_minimum_collateralization_ratio(
+			Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(ADMIN),
 				DOT,
 				PUSD,
-				rate_pct(104, 100)
+				BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(104, 100))
 			),
 			Error::<Test>::ConfigOutsideEnvelope
 		);
@@ -457,24 +458,39 @@ fn set_ceiling_knobs_apply_within_envelope() {
 	build_and_execute(|| {
 		register_default_branch(); // autoline off: gap == 0, ttl == 0
 							 // Raise the ttl first (valid while the autoline is still disabled), then the gap.
-		assert_ok!(Pallet::<Test>::set_ceiling_ttl(
+		assert_ok!(Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD,
-			DAY_MS
+			BranchConfigUpdate::CeilingTtl(DAY_MS)
 		));
-		assert_ok!(Pallet::<Test>::set_ceiling_gap(RuntimeOrigin::signed(ADMIN), DOT, PUSD, 1_000));
+		assert_ok!(Pallet::<Test>::set_param(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			BranchConfigUpdate::CeilingGap(1_000)
+		));
 		let config = BranchConfigs::<Test>::get((DOT, PUSD)).expect("config");
 		assert_eq!(config.ceiling_gap, 1_000);
 		assert_eq!(config.ceiling_ttl, DAY_MS);
 		// A ttl below the floor (autoline now enabled) is rejected.
 		assert_noop!(
-			Pallet::<Test>::set_ceiling_ttl(RuntimeOrigin::signed(ADMIN), DOT, PUSD, DAY_MS - 1),
+			Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(ADMIN),
+				DOT,
+				PUSD,
+				BranchConfigUpdate::CeilingTtl(DAY_MS - 1)
+			),
 			Error::<Test>::ConfigOutsideEnvelope
 		);
 		// A gap above the cap is rejected.
 		assert_noop!(
-			Pallet::<Test>::set_ceiling_gap(RuntimeOrigin::signed(ADMIN), DOT, PUSD, 2_000_000_000),
+			Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(ADMIN),
+				DOT,
+				PUSD,
+				BranchConfigUpdate::CeilingGap(2_000_000_000)
+			),
 			Error::<Test>::ConfigOutsideEnvelope
 		);
 	});
