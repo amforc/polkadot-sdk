@@ -8,8 +8,8 @@ use crate::{
 	recovery,
 	types::{
 		AdminLevel, BranchAdminInfo, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchDebt,
-		BranchMode, BranchStakes, BranchState, DebtPayment, FrozenReason, FrozenState,
-		RedistributionSnapshot, Vault, VaultDebt, VaultStatus,
+		BranchMode, BranchStakes, BranchState, FrozenReason, FrozenState, RedistributionSnapshot,
+		Vault, VaultDebt, VaultStatus,
 	},
 };
 use frame::{
@@ -34,7 +34,7 @@ struct CloseRequest<'a, T: Config> {
 	price: FixedU128,
 	/// `Some` when a repay-to-zero closes an empty (no-collateral) vault: the
 	/// payment to fold into the branch aggregates, at the vault's own rate.
-	maybe_payment: Option<DebtPayment<BalanceOf<T>>>,
+	maybe_payment: Option<VaultDebt<BalanceOf<T>>>,
 }
 
 impl<T: Config> Pallet<T> {
