@@ -17,14 +17,17 @@ use frame::{
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
-	AllocationResult, LiquidationSnapshot, RedemptionAllocation, RedemptionStepSnapshot,
-	VaultBadDebtInterface, VaultLiquidationInterface, VaultRedemptionInterface,
+	LiquidationAllocation, LiquidationSnapshot, RedemptionAllocation, RedemptionStepSnapshot,
+	VaultInterface,
 };
 
-impl<T: Config>
-	VaultLiquidationInterface<T::CollateralAssetId, T::StableAssetId, T::AccountId, BalanceOf<T>>
-	for Pallet<T>
-{
+impl<T: Config> VaultInterface for Pallet<T> {
+	type CollateralId = T::CollateralAssetId;
+	type StableId = T::StableAssetId;
+	type AccountId = T::AccountId;
+	type Balance = BalanceOf<T>;
+	type Credit = StableCreditOf<T>;
+
 	#[transactional]
 	fn execute_liquidation(
 		collateral_id: &T::CollateralAssetId,
@@ -32,7 +35,10 @@ impl<T: Config>
 		owner: &T::AccountId,
 		build_allocation: impl FnOnce(
 			LiquidationSnapshot<BalanceOf<T>>,
-		) -> AllocationResult<T::AccountId, BalanceOf<T>>,
+		) -> Result<
+			LiquidationAllocation<T::AccountId, BalanceOf<T>>,
+			DispatchError,
+		>,
 	) -> DispatchResult {
 		let op = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
 		op.ensure_not_frozen()?;
@@ -143,12 +149,7 @@ impl<T: Config>
 		// Liquidation eligibility is MCR-gated above; the mode rules do not apply.
 		op.commit_removing_vault(TcrGate::Exempt)
 	}
-}
 
-impl<T: Config>
-	VaultRedemptionInterface<T::CollateralAssetId, T::StableAssetId, T::AccountId, BalanceOf<T>>
-	for Pallet<T>
-{
 	/// Priority order: `FinalRecovery` FIFO head, then `dormant_redemption_target`,
 	/// then the rate-index tail.
 	fn next_redemption_target(
@@ -341,40 +342,7 @@ impl<T: Config>
 		let now = T::TimeProvider::now();
 		Self::view_branch_debt(collateral_id, stable_id, now)
 	}
-}
 
-/// Update rate/FIFO membership after redemption.
-fn settle_redemption_status<T: Config>(
-	op: &mut VaultOp<T>,
-	config: &crate::types::BranchConfig<BalanceOf<T>>,
-) -> DispatchResult {
-	let new_total = op.vault.debt.total();
-	match op.status {
-		VaultStatus::Active if new_total < config.minimum_debt => {
-			T::VaultLists::remove(&op.ctx.rate_list(), &op.owner)
-				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
-		},
-		VaultStatus::FinalRecovery if new_total.is_zero() => {
-			recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, &op.owner)?;
-			let new_stake = op.vault.collateral;
-			op.ctx.state.set_vault_stake(&mut op.vault, new_stake);
-			op.vault.redistribution_snapshot = op.ctx.state.redistribution;
-			Pallet::<T>::deposit_event(Event::VaultStatusChanged {
-				collateral_id: op.ctx.collateral_id.clone(),
-				stable_id: op.ctx.stable_id.clone(),
-				owner: op.owner.clone(),
-				old_status: VaultStatus::FinalRecovery,
-				new_status: VaultStatus::Dormant,
-			});
-		},
-		_ => {},
-	}
-	Ok(())
-}
-
-impl<T: Config> VaultBadDebtInterface<T::CollateralAssetId, T::StableAssetId, StableCreditOf<T>>
-	for Pallet<T>
-{
 	#[transactional]
 	fn heal(
 		collateral_id: &T::CollateralAssetId,
@@ -420,4 +388,33 @@ impl<T: Config> VaultBadDebtInterface<T::CollateralAssetId, T::StableAssetId, St
 		});
 		Ok(surplus)
 	}
+}
+
+/// Update rate/FIFO membership after redemption.
+fn settle_redemption_status<T: Config>(
+	op: &mut VaultOp<T>,
+	config: &crate::types::BranchConfig<BalanceOf<T>>,
+) -> DispatchResult {
+	let new_total = op.vault.debt.total();
+	match op.status {
+		VaultStatus::Active if new_total < config.minimum_debt => {
+			T::VaultLists::remove(&op.ctx.rate_list(), &op.owner)
+				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
+		},
+		VaultStatus::FinalRecovery if new_total.is_zero() => {
+			recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, &op.owner)?;
+			let new_stake = op.vault.collateral;
+			op.ctx.state.set_vault_stake(&mut op.vault, new_stake);
+			op.vault.redistribution_snapshot = op.ctx.state.redistribution;
+			Pallet::<T>::deposit_event(Event::VaultStatusChanged {
+				collateral_id: op.ctx.collateral_id.clone(),
+				stable_id: op.ctx.stable_id.clone(),
+				owner: op.owner.clone(),
+				old_status: VaultStatus::FinalRecovery,
+				new_status: VaultStatus::Dormant,
+			});
+		},
+		_ => {},
+	}
+	Ok(())
 }

@@ -12,7 +12,7 @@ use crate::{
 };
 use frame::traits::fungibles::{Balanced, Inspect, Mutate};
 use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, VaultBadDebtInterface,
+	KeeperCompensation, LiquidationAllocation, OffsetAllocation, VaultInterface,
 };
 
 /// One Julian year in milliseconds (matches `pusd_primitives::MILLIS_PER_YEAR`).
@@ -175,9 +175,7 @@ fn heal_rejects_a_wrong_coin_credit() {
 
 		// A credit in another coin (EUSD) cannot heal the PUSD market.
 		let wrong = <VaultStableAssets as Balanced<AccountId>>::issue(EUSD, 1_000);
-		let surplus =
-			<Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, _>>::heal(&DOT, &PUSD, wrong)
-				.unwrap();
+		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, &PUSD, wrong).unwrap();
 		assert_eq!(surplus.peek(), 1_000, "the whole wrong-coin credit is handed back");
 		assert_eq!(surplus.asset(), EUSD);
 		assert_eq!(
@@ -189,9 +187,7 @@ fn heal_rejects_a_wrong_coin_credit() {
 
 		// The market's own coin heals it.
 		let right = <VaultStableAssets as Balanced<AccountId>>::issue(PUSD, 1_000);
-		let surplus =
-			<Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, _>>::heal(&DOT, &PUSD, right)
-				.unwrap();
+		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, &PUSD, right).unwrap();
 		assert_eq!(surplus.peek(), 0);
 		assert_eq!(BranchStates::<Test>::get(DOT, PUSD).unwrap().debt.bad_debt, 0);
 	});

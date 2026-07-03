@@ -5,7 +5,7 @@ use crate::{
 	tests::{rate_pct, vault_status},
 };
 use pallet_linked_list::SortedListInterface;
-use pusd_primitives::{RedemptionAllocation, VaultRedemptionInterface};
+use pusd_primitives::{RedemptionAllocation, VaultInterface};
 
 fn low_recovery_price() -> FixedU128 {
 	FixedU128::from_rational(1u128, 10u128)
@@ -52,13 +52,8 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 			alloc::vec![1, 2, 3]
 		);
 		assert_eq!(
-			<crate::Pallet<Test> as VaultRedemptionInterface<
-				AssetId,
-				StableId,
-				AccountId,
-				Balance,
-			>>::next_redemption_target(&DOT, &PUSD, None)
-			.map(|(owner, _status)| owner),
+			<crate::Pallet<Test> as VaultInterface>::next_redemption_target(&DOT, &PUSD, None)
+				.map(|(owner, _status)| owner),
 			Some(1)
 		);
 	});

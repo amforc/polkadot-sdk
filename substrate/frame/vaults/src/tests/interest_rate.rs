@@ -516,7 +516,7 @@ fn poke_after_full_repayment_pokes_dormant_husk() {
 
 // Redemption refreshes last_interest_time on the redeemed vault, applies
 // pending interest, reduces entire debt by the redeemed amount, and reduces
-// recorded debt accordingly. Tested through the `VaultRedemptionInterface`
+// recorded debt accordingly. Tested through the `VaultInterface`
 // trait (no `redeem` extrinsic exists yet).
 #[test]
 fn redemption_full_state_changes() {
