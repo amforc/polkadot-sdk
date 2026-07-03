@@ -3,19 +3,27 @@ use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::deps::sp_runtime::{traits::Zero, FixedU128};
 use scale_info::TypeInfo;
 
-pub use pusd_primitives::RedemptionTargetKind;
+pub use pusd_primitives::VaultStatus;
 
+/// The ordinary-redemption fee rate is
+/// `min(base_fee + decayed dynamic fee, fee_ceiling)`: a constant base every
+/// redemption pays plus a decaying component that redemption volume raises.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct RedemptionConfig<Balance, Moment> {
 	pub minimum_redemption_amount: Balance,
-	pub base_rate_decay_period: Moment,
-	pub base_rate_floor: FixedU128,
-	pub base_rate_ceiling: FixedU128,
-	pub redemption_fee_floor: FixedU128,
-	pub redemption_fee_ceiling: FixedU128,
-	pub base_rate_increase_divisor: FixedU128,
+	/// Half-life of the decaying dynamic fee.
+	pub dynamic_fee_decay_period: Moment,
+	pub dynamic_fee_floor: FixedU128,
+	pub dynamic_fee_ceiling: FixedU128,
+	/// Constant fee component every ordinary redemption pays (e.g. 0.5%).
+	pub base_fee: FixedU128,
+	/// Cap on the total fee rate, base and dynamic components combined.
+	pub fee_ceiling: FixedU128,
+	/// Divides the redeemed branch-debt fraction before it raises the
+	/// dynamic fee after an ordinary redemption.
+	pub dynamic_fee_increase_divisor: FixedU128,
 	/// Prevents the recovery bonus from worsening a `CR >= 100%` recovery vault.
 	pub final_recovery_bonus_buffer: FixedU128,
 }
@@ -26,16 +34,16 @@ impl<Balance: Zero, Moment: Zero> RedemptionConfig<Balance, Moment> {
 		if self.minimum_redemption_amount.is_zero() {
 			return false;
 		}
-		if self.base_rate_decay_period.is_zero() {
+		if self.dynamic_fee_decay_period.is_zero() {
 			return false;
 		}
-		if self.base_rate_floor > self.base_rate_ceiling {
+		if self.dynamic_fee_floor > self.dynamic_fee_ceiling {
 			return false;
 		}
-		if self.redemption_fee_floor > self.redemption_fee_ceiling {
+		if self.base_fee > self.fee_ceiling {
 			return false;
 		}
-		!self.base_rate_increase_divisor.is_zero()
+		!self.dynamic_fee_increase_divisor.is_zero()
 	}
 }
 
@@ -53,7 +61,7 @@ impl<Balance: Zero, Moment: Zero> RedemptionConfig<Balance, Moment> {
 	Default,
 )]
 pub struct RedemptionState<Moment> {
-	pub base_rate: FixedU128,
+	pub dynamic_fee: FixedU128,
 	pub last_fee_operation: Moment,
 }
 
@@ -79,7 +87,7 @@ pub enum RecoveryRegime {
 )]
 pub struct RedemptionPreviewStep<AccountId, Balance> {
 	pub target: AccountId,
-	pub kind: RedemptionTargetKind,
+	pub status: VaultStatus,
 	pub debt_cancellable: Balance,
 	pub collateral_out: Balance,
 	pub fee_pusd: Balance,

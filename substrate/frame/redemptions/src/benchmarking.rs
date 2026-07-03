@@ -8,7 +8,7 @@ use crate::{
 };
 use frame::{
 	benchmarking::prelude::*,
-	deps::{frame_support::traits::EnsureOrigin, sp_runtime::traits::Zero},
+	deps::{frame_support::traits::EnsureOriginWithArg, sp_runtime::traits::Zero},
 };
 use frame_system::RawOrigin;
 
@@ -41,7 +41,8 @@ mod benchmarks {
 		let (collateral_id, stable_id, _, _) = T::BenchmarkHelper::setup_redeemable_branch(1);
 		let config = T::DefaultRedemptionConfig::get();
 		let origin =
-			T::ManagerOrigin::try_successful_origin().map_err(|_| BenchmarkError::Weightless)?;
+			T::UpdateOrigin::try_successful_origin(&(collateral_id.clone(), stable_id.clone()))
+				.map_err(|_| BenchmarkError::Weightless)?;
 
 		#[extrinsic_call]
 		_(origin as T::RuntimeOrigin, collateral_id, stable_id, config);

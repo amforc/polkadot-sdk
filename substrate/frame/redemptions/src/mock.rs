@@ -11,19 +11,20 @@ use frame::{
 					InspectHold, Mutate as FungiblesMutate,
 				},
 				tokens::imbalance::ResolveAssetTo,
-				AsEnsureOriginWithArg, ConstU128, ConstU32, ConstU64, EnsureOriginWithArg,
-				LinearStoragePrice,
+				AsEnsureOriginWithArg, ConstU128, ConstU32, ConstU64, EitherOf,
+				EnsureOriginWithArg, LinearStoragePrice,
 			},
 			PalletId,
 		},
 		sp_runtime::{
-			traits::IdentityLookup, BuildStorage, DispatchError, DispatchResult, FixedU128, Permill,
+			traits::{Convert, IdentityLookup},
+			BuildStorage, DispatchError, DispatchResult, FixedU128, Permill,
 		},
 	},
 	testing_prelude::*,
 };
 pub use pallet_linked_list::Position;
-use pusd_primitives::{ProvidePrice, VaultRedemptionInterface};
+use pusd_primitives::{ProvidePrice, VaultInterface};
 
 pub type AccountId = u64;
 pub type Balance = u128;
@@ -184,6 +185,17 @@ pub fn admin_caller(who: AccountId) -> OriginCaller {
 	frame_system::RawOrigin::Signed(who).into()
 }
 
+/// The `create_branch` admin bundle: `full` administers, `emergency` tightens.
+pub fn branch_admins(
+	full: AccountId,
+	emergency: AccountId,
+) -> pallet_vaults::types::BranchAdmins<OriginCaller> {
+	pallet_vaults::types::BranchAdmins {
+		full_admin: admin_caller(full),
+		emergency_admin: admin_caller(emergency),
+	}
+}
+
 /// `CreateOrigin`: Root creates deposit-free (`None`); the stable asset's owner
 /// creates with a deposit (`Some(who)`); anyone else is rejected.
 pub struct EnsureAssetOwner;
@@ -301,42 +313,47 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId, Balance> for V
 	}
 }
 
-pub const INSURANCE_FUND: AccountId = 777;
+/// Base offset for per-stable insurance accounts: `insurance_account(stable)`
+/// is `INSURANCE_FUND_BASE + stable`.
+pub const INSURANCE_FUND_BASE: AccountId = 700_000;
+/// `insurance_account(PUSD)`, the default stablecoin's fund; `new_test_ext`
+/// pair-asserts the two stay in sync.
+pub const INSURANCE_FUND: AccountId = 701_000;
 pub const FEE_ACCOUNT: AccountId = 888;
 
-parameter_types! {
-	pub const InsuranceFundAccount: AccountId = INSURANCE_FUND;
+/// Each stablecoin's cover lives at its own account, mirroring a runtime that
+/// derives per-stable sub-accounts.
+pub fn insurance_account(stable_id: StableId) -> AccountId {
+	INSURANCE_FUND_BASE + AccountId::from(stable_id)
+}
+
+pub struct InsuranceFundAccounts;
+impl Convert<StableId, AccountId> for InsuranceFundAccounts {
+	fn convert(stable_id: StableId) -> AccountId {
+		insurance_account(stable_id)
+	}
 }
 
 parameter_types! {
 	pub const FeeDestAccount: AccountId = FEE_ACCOUNT;
 }
 
-pub struct RedemptionsManagerOrigin;
-impl frame::deps::frame_support::traits::EnsureOrigin<RuntimeOrigin> for RedemptionsManagerOrigin {
-	type Success = ();
-	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
-		match Into::<Result<frame_system::RawOrigin<u64>, RuntimeOrigin>>::into(o.clone()) {
-			Ok(frame_system::RawOrigin::Root) | Ok(frame_system::RawOrigin::Signed(999)) => Ok(()),
-			_ => Err(o),
-		}
-	}
-
-	#[cfg(feature = "runtime-benchmarks")]
-	fn try_successful_origin() -> Result<RuntimeOrigin, ()> {
-		Ok(RuntimeOrigin::root())
-	}
-}
+/// Root (the governance override) or the market's stored full admin, the same
+/// composition a production runtime would use.
+pub type RedemptionsUpdateOrigin = EitherOf<
+	AsEnsureOriginWithArg<frame_system::EnsureRoot<AccountId>>,
+	pallet_vaults::EnsureBranchFullAdmin<Test>,
+>;
 
 parameter_types! {
 	pub static DefaultRedemptionConfig: RedemptionConfig<Balance, Moment> = RedemptionConfig {
 		minimum_redemption_amount: 100,
-		base_rate_decay_period: 6 * 3_600 * 1_000,
-		base_rate_floor: FixedU128::zero(),
-		base_rate_ceiling: FixedU128::one(),
-		redemption_fee_floor: FixedU128::from_rational(5u128, 1_000u128),
-		redemption_fee_ceiling: FixedU128::one(),
-		base_rate_increase_divisor: FixedU128::from_rational(2u128, 1u128),
+		dynamic_fee_decay_period: 6 * 3_600 * 1_000,
+		dynamic_fee_floor: FixedU128::zero(),
+		dynamic_fee_ceiling: FixedU128::one(),
+		base_fee: FixedU128::from_rational(5u128, 1_000u128),
+		fee_ceiling: FixedU128::one(),
+		dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
 		final_recovery_bonus_buffer: FixedU128::from_rational(1u128, 100u128),
 	};
 }
@@ -347,10 +364,10 @@ impl pallet_redemptions::Config for Test {
 	type StableAssets = VaultStableAssets;
 	type Oracle = MockOracle;
 	type Vaults = Vaults;
-	type InsuranceFundAccount = InsuranceFundAccount;
+	type InsuranceFundAccount = InsuranceFundAccounts;
 	type FeeHandler = ResolveAssetTo<FeeDestAccount, VaultStableAssets>;
 	type TimeProvider = Timestamp;
-	type ManagerOrigin = RedemptionsManagerOrigin;
+	type UpdateOrigin = RedemptionsUpdateOrigin;
 	type DefaultRedemptionConfig = DefaultRedemptionConfig;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
@@ -415,6 +432,7 @@ pub fn new_test_ext() -> TestState {
 		Timestamp::set_timestamp(1_000);
 		MockPrices::set(alloc::collections::BTreeMap::new());
 		MockOracleAvailable::set(true);
+		assert_eq!(insurance_account(PUSD), INSURANCE_FUND);
 	});
 	ext
 }
@@ -454,8 +472,7 @@ pub fn register_default_branch() {
 		RuntimeOrigin::root(),
 		DOT,
 		PUSD,
-		admin_caller(ADMIN),
-		admin_caller(EMERGENCY_ADMIN),
+		branch_admins(ADMIN, EMERGENCY_ADMIN),
 		default_branch_config(),
 	)
 	.expect("create_branch ok");
@@ -567,12 +584,12 @@ pub fn redemption_state() -> pallet_redemptions::RedemptionState<Moment> {
 }
 
 /// Anchored at current time so the next redemption observes exactly `rate`.
-pub fn set_base_rate(rate: FixedU128) {
+pub fn set_dynamic_fee(rate: FixedU128) {
 	let now = pallet_timestamp::Pallet::<Test>::get();
 	pallet_redemptions::RedemptionStates::<Test>::insert(
 		DOT,
 		PUSD,
-		pallet_redemptions::RedemptionState { base_rate: rate, last_fee_operation: now },
+		pallet_redemptions::RedemptionState { dynamic_fee: rate, last_fee_operation: now },
 	);
 }
 
@@ -585,14 +602,9 @@ pub fn branch_tcr() -> FixedU128 {
 	pallet_vaults::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("branch registered")
 }
 
-/// Fully accrued branch debt: the denominator the base-rate accelerator uses.
+/// Fully accrued branch debt: the denominator the dynamic-fee accelerator uses.
 pub fn branch_debt() -> Balance {
-	<pallet_vaults::Pallet<Test> as VaultRedemptionInterface<
-		AssetId,
-		StableId,
-		AccountId,
-		Balance,
-	>>::branch_debt(&DOT, &PUSD)
+	<pallet_vaults::Pallet<Test> as VaultInterface>::branch_debt(&DOT, &PUSD)
 }
 
 /// The interest-clock value stamped on a vault the last time it was poked.
@@ -604,18 +616,19 @@ pub fn vault_interest_time(who: AccountId) -> Moment {
 
 /// The interest-clock value a poke at `now` writes onto a touched vault.
 pub fn branch_interest_time(now: Moment) -> Moment {
-	pallet_vaults::BranchStates::<Test>::get(DOT, PUSD)
+	pallet_vaults::Branches::<Test>::get((DOT, PUSD))
 		.expect("branch")
+		.state
 		.interest_time(now)
 }
 
-/// Overwrites the branch config so redemptions carry no fee and the base rate
+/// Overwrites the branch config so redemptions carry no fee and the dynamic fee
 /// stays pinned at zero, isolating the redemption mechanic from fee dynamics.
 pub fn set_fee_free_config() {
 	let mut cfg = DefaultRedemptionConfig::get();
-	cfg.base_rate_ceiling = FixedU128::zero();
-	cfg.redemption_fee_floor = FixedU128::zero();
-	cfg.redemption_fee_ceiling = FixedU128::zero();
+	cfg.dynamic_fee_ceiling = FixedU128::zero();
+	cfg.base_fee = FixedU128::zero();
+	cfg.fee_ceiling = FixedU128::zero();
 	pallet_redemptions::Pallet::<Test>::set_redemption_config(
 		RuntimeOrigin::root(),
 		DOT,

@@ -111,19 +111,19 @@ pub mod pallet {
 				traits::{
 					fungibles::{self, Balanced as FungiblesBalanced},
 					tokens::{Fortitude, Precision, Preservation},
-					OnUnbalanced, Time,
+					EnsureOriginWithArg, OnUnbalanced, Time,
 				},
 			},
 			sp_runtime::{
-				traits::{SaturatedConversion, Saturating, Zero},
+				traits::{Convert, SaturatedConversion, Saturating, Zero},
 				FixedPointNumber, FixedU128,
 			},
 		},
 		prelude::*,
 	};
 	use pusd_primitives::{
-		recovery_pricing, ProvidePrice, RedemptionAllocation, RedemptionRegime,
-		RedemptionStepSnapshot, RedemptionTarget, VaultBadDebtInterface, VaultRedemptionInterface,
+		recovery_pricing, ProvidePrice, RedemptionAllocation, RedemptionStepSnapshot,
+		VaultInterface,
 	};
 
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
@@ -178,19 +178,19 @@ pub mod pallet {
 		type Oracle: ProvidePrice<AssetId = Self::CollateralAssetId>;
 
 		/// Vaults owns ordering and state so redemptions cannot fork a local queue.
-		type Vaults: VaultRedemptionInterface<
-				Self::CollateralAssetId,
-				Self::StableAssetId,
-				Self::AccountId,
-				BalanceOf<Self>,
-			> + VaultBadDebtInterface<
-				Self::CollateralAssetId,
-				Self::StableAssetId,
-				StableCreditOf<Self>,
-			>;
+		type Vaults: VaultInterface<
+			CollateralId = Self::CollateralAssetId,
+			StableId = Self::StableAssetId,
+			AccountId = Self::AccountId,
+			Balance = BalanceOf<Self>,
+			Credit = StableCreditOf<Self>,
+		>;
 
-		/// Cover is read at settlement time; the fund is not reserved per vault.
-		type InsuranceFundAccount: Get<Self::AccountId>;
+		/// Maps each stablecoin to the account holding its insurance cover.
+		/// Cover is read at settlement time — nothing is reserved per vault —
+		/// and per-stable accounts keep one coin's cover from settling another
+		/// coin's bad debt.
+		type InsuranceFundAccount: Convert<Self::StableAssetId, Self::AccountId>;
 
 		/// Destination for redemption fees.
 		type FeeHandler: OnUnbalanced<StableCreditOf<Self>>;
@@ -198,7 +198,15 @@ pub mod pallet {
 		/// Fee decay assumes this moment is expressed in milliseconds.
 		type TimeProvider: Time;
 
-		type ManagerOrigin: EnsureOrigin<Self::RuntimeOrigin, Success = ()>;
+		/// Authorizes [`Pallet::set_redemption_config`] for the market given
+		/// as argument. Point this at the market's admin authority (e.g.
+		/// vaults' `EnsureBranchFullAdmin`) and compose a governance override
+		/// with `EitherOf`.
+		type UpdateOrigin: EnsureOriginWithArg<
+			Self::RuntimeOrigin,
+			(Self::CollateralAssetId, Self::StableAssetId),
+			Success = (),
+		>;
 
 		type DefaultRedemptionConfig: Get<RedemptionConfigOf<Self>>;
 
@@ -263,12 +271,12 @@ pub mod pallet {
 			collateral_out: BalanceOf<T>,
 			regime: RecoveryRegime,
 		},
-		/// The branch base rate moved after an ordinary redemption.
-		RedemptionBaseRateUpdated {
+		/// The branch dynamic fee moved after an ordinary redemption.
+		RedemptionDynamicFeeUpdated {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			old_base_rate: FixedU128,
-			new_base_rate: FixedU128,
+			old_dynamic_fee: FixedU128,
+			new_dynamic_fee: FixedU128,
 		},
 		/// Governance replaced a market's redemption config.
 		RedemptionConfigUpdated { collateral_id: T::CollateralAssetId, stable_id: T::StableAssetId },
@@ -298,6 +306,18 @@ pub mod pallet {
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
+		/// Swap up to `max_pusd_in` pUSD for collateral at face value, walking
+		/// redemption targets from the cheapest borrow rate upward.
+		///
+		/// `max_steps` caps how many vaults the walk may touch; `0` means the
+		/// runtime's [`Config::MaxRedemptionSteps`] ceiling. Weight is charged
+		/// up front for the whole cap and refunded to the steps actually
+		/// taken, so a small redemption can bound the fee it must be able to
+		/// pre-pay, and a large one can bound how far past the cheapest
+		/// vaults it is willing to sweep.
+		///
+		/// `min_collateral_out` is the redeemer's slippage floor; partial
+		/// fills scale it pro-rata to the pUSD actually spent.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps)))]
 		pub fn redeem(
@@ -332,7 +352,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			config: RedemptionConfigOf<T>,
 		) -> DispatchResult {
-			T::ManagerOrigin::ensure_origin(origin)?;
+			T::UpdateOrigin::ensure_origin(origin, &(collateral_id.clone(), stable_id.clone()))?;
 			ensure!(
 				RedemptionConfigs::<T>::contains_key(&collateral_id, &stable_id),
 				Error::<T>::InvalidBranch
@@ -391,9 +411,8 @@ pub mod pallet {
 			ensure!(!price.is_zero(), Error::<T>::OracleUnavailable);
 			let now = T::TimeProvider::now();
 			let state = RedemptionStates::<T>::get(collateral_id, stable_id);
-			let decayed = Self::decayed_base_rate(&state, &config, now);
-			let fee_rate =
-				fees::fee_rate(decayed, config.redemption_fee_floor, config.redemption_fee_ceiling);
+			let decayed = Self::decayed_dynamic_fee(&state, &config, now);
+			let fee_rate = fees::fee_rate(decayed, config.base_fee, config.fee_ceiling);
 			Ok(RedemptionPreamble { config, state, price, now, decayed, fee_rate })
 		}
 
@@ -440,7 +459,7 @@ pub mod pallet {
 				branch_debt_before,
 				&config,
 				now,
-				state.base_rate,
+				state.dynamic_fee,
 			);
 			Ok(steps)
 		}
@@ -448,7 +467,7 @@ pub mod pallet {
 		/// Classify a prepared target so the barrier/redeemability ladder is defined
 		/// once and cannot drift between execution (`run_loop`) and preview.
 		fn classify(snap: &SnapshotOf<T>, price: FixedU128) -> StepAction {
-			if snap.regime.is_final_recovery() {
+			if snap.status.is_final_recovery() {
 				return StepAction::Recovery;
 			}
 			let redeemable = matches!(
@@ -457,7 +476,7 @@ pub mod pallet {
 			);
 			if redeemable {
 				StepAction::Redeem
-			} else if snap.regime.is_dormant() {
+			} else if snap.status.is_dormant() {
 				// Dormant is a hard barrier; an active underwater target can be skipped.
 				StepAction::Stop
 			} else {
@@ -467,6 +486,11 @@ pub mod pallet {
 
 		/// Recovery stops at one FIFO head so a call cannot silently cross into a
 		/// different recovery price and Insurance Fund snapshot.
+		///
+		/// The cursor advances past skipped (underwater) targets so one call
+		/// walks the rate index linearly: without it, every drained vault would
+		/// restart the lookup at the index head and burn the remaining step
+		/// budget re-visiting the same unredeemable prefix.
 		fn run_loop(
 			redeemer: &T::AccountId,
 			collateral_id: &T::CollateralAssetId,
@@ -481,14 +505,14 @@ pub mod pallet {
 			let mut steps = 0u32;
 			let mut cursor: Option<T::AccountId> = None;
 			while steps < step_cap && !acc.remaining.is_zero() {
-				let Some(target) =
+				let Some((owner, _)) =
 					T::Vaults::next_redemption_target(collateral_id, stable_id, cursor.as_ref())
 				else {
 					break;
 				};
 				let budget = acc.remaining;
 				let mut outcome = StepOutcome::Stopped;
-				T::Vaults::redeem_step(collateral_id, stable_id, &target.owner, |snap| {
+				T::Vaults::redeem_step(collateral_id, stable_id, &owner, |snap| {
 					let (allocation, decision) = Self::execute_step(
 						stable_id, redeemer, recipient, &snap, price, fee_rate, budget, config,
 					)?;
@@ -498,18 +522,18 @@ pub mod pallet {
 				steps = steps.saturating_add(1);
 				match outcome {
 					StepOutcome::Stopped => break,
-					StepOutcome::Skipped => cursor = Some(target.owner),
+					StepOutcome::Skipped => cursor = Some(owner),
 					// The cursor is intentionally left as-is on a successful redeem: a
 					// drained vault leaves the rate index, so the next lookup advances
 					// without bypassing any newly created Dormant/FinalRecovery barrier.
 					StepOutcome::Redeemed(step) => acc.apply_ordinary(&step),
 					StepOutcome::Recovery { step, settle_residual } => {
 						let residual = if settle_residual {
-							Self::settle_residual_via_if(collateral_id, stable_id, &target.owner)?
+							Self::settle_residual_via_if(collateral_id, stable_id, &owner)?
 						} else {
 							Zero::zero()
 						};
-						acc.apply_recovery(target.owner, &step, residual);
+						acc.apply_recovery(owner, &step, residual);
 						// The next recovery head may have a different price/fund split.
 						break;
 					},
@@ -580,11 +604,12 @@ pub mod pallet {
 			budget: BalanceOf<T>,
 			config: &RedemptionConfigOf<T>,
 		) -> Option<RecoveryPricing<BalanceOf<T>>> {
-			// The regime is the only carrier of the penalty, so a non-recovery
-			// snapshot cannot be priced here by construction.
-			let RedemptionRegime::FinalRecovery { redistribution_penalty } = snap.regime else {
+			// `snap.redistribution_penalty` is only consulted by `FinalRecovery`
+			// pricing, so a non-recovery snapshot cannot be priced here.
+			if !snap.status.is_final_recovery() {
 				return None;
-			};
+			}
+			let redistribution_penalty = snap.redistribution_penalty;
 			let cr = pusd_primitives::collateralization_ratio(snap.collateral, snap.debt, price)?;
 			if cr >= FixedU128::one() {
 				let bonus = recovery_pricing::recovery_bonus(
@@ -708,7 +733,7 @@ pub mod pallet {
 		fn insurance_fund_available(stable_id: &T::StableAssetId) -> BalanceOf<T> {
 			<T::StableAssets as fungibles::Inspect<_>>::reducible_balance(
 				stable_id.clone(),
-				&T::InsuranceFundAccount::get(),
+				&T::InsuranceFundAccount::convert(stable_id.clone()),
 				Preservation::Expendable,
 				Fortitude::Polite,
 			)
@@ -720,7 +745,7 @@ pub mod pallet {
 		) -> Result<StableCreditOf<T>, DispatchError> {
 			<T::StableAssets as FungiblesBalanced<_>>::withdraw(
 				stable_id.clone(),
-				&T::InsuranceFundAccount::get(),
+				&T::InsuranceFundAccount::convert(stable_id.clone()),
 				amount,
 				Precision::Exact,
 				Preservation::Expendable,
@@ -741,12 +766,8 @@ pub mod pallet {
 			}
 			let credit = Self::insurance_fund_withdraw(stable_id, residual)
 				.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
-			let surplus = <T::Vaults as VaultBadDebtInterface<_, _, _>>::heal(
-				collateral_id,
-				stable_id,
-				credit,
-			)
-			.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
+			let surplus = T::Vaults::heal(collateral_id, stable_id, credit)
+				.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
 			if !surplus.peek().is_zero() {
 				log::error!(
 					target: crate::LOG_TARGET,
@@ -759,9 +780,9 @@ pub mod pallet {
 			Ok(residual)
 		}
 
-		// Post-loop settlement emits both redemption events and updates the base
-		// rate from the full execution context; the inputs are irreducible without
-		// splitting one atomic finalize into several partial passes.
+		// Post-loop settlement emits both redemption events and updates the
+		// dynamic fee from the full execution context; the inputs are irreducible
+		// without splitting one atomic finalize into several partial passes.
 		#[allow(clippy::too_many_arguments)]
 		fn finalize(
 			redeemer: &T::AccountId,
@@ -774,30 +795,30 @@ pub mod pallet {
 			branch_debt_before: BalanceOf<T>,
 			config: &RedemptionConfigOf<T>,
 			now: MomentOf<T>,
-			old_base_rate: FixedU128,
+			old_dynamic_fee: FixedU128,
 		) {
 			if !acc.ordinary_debt.is_zero() {
 				let fraction =
 					FixedU128::checked_from_rational(acc.ordinary_debt, branch_debt_before)
 						.unwrap_or_else(FixedU128::one);
-				let new_base = fees::increased_base_rate(
+				let new_fee = fees::increased_dynamic_fee(
 					decayed,
 					fraction,
-					config.base_rate_increase_divisor,
-					config.base_rate_floor,
-					config.base_rate_ceiling,
+					config.dynamic_fee_increase_divisor,
+					config.dynamic_fee_floor,
+					config.dynamic_fee_ceiling,
 				);
 				RedemptionStates::<T>::insert(
 					collateral_id,
 					stable_id,
-					RedemptionState { base_rate: new_base, last_fee_operation: now },
+					RedemptionState { dynamic_fee: new_fee, last_fee_operation: now },
 				);
-				if new_base != old_base_rate {
-					Self::deposit_event(Event::RedemptionBaseRateUpdated {
+				if new_fee != old_dynamic_fee {
+					Self::deposit_event(Event::RedemptionDynamicFeeUpdated {
 						collateral_id: collateral_id.clone(),
 						stable_id: stable_id.clone(),
-						old_base_rate,
-						new_base_rate: new_base,
+						old_dynamic_fee,
+						new_dynamic_fee: new_fee,
 					});
 				}
 				Self::deposit_event(Event::OrdinaryRedemptionExecuted {
@@ -825,16 +846,16 @@ pub mod pallet {
 			}
 		}
 
-		fn decayed_base_rate(
+		fn decayed_dynamic_fee(
 			state: &RedemptionState<MomentOf<T>>,
 			config: &RedemptionConfigOf<T>,
 			now: MomentOf<T>,
 		) -> FixedU128 {
 			let elapsed = now.saturating_sub(state.last_fee_operation).saturated_into::<u64>();
-			let period = config.base_rate_decay_period.saturated_into::<u64>();
-			fees::decay_base_rate(state.base_rate, elapsed, period)
-				.max(config.base_rate_floor)
-				.min(config.base_rate_ceiling)
+			let period = config.dynamic_fee_decay_period.saturated_into::<u64>();
+			fees::decay_dynamic_fee(state.dynamic_fee, elapsed, period)
+				.max(config.dynamic_fee_floor)
+				.min(config.dynamic_fee_ceiling)
 		}
 
 		/// Mirrors execution pricing, but lets touched vault snapshots roll back.
@@ -892,7 +913,7 @@ pub mod pallet {
 				if steps >= cap {
 					return (detail, steps, true);
 				}
-				let Some(target) =
+				let Some((owner, _)) =
 					T::Vaults::next_redemption_target(collateral_id, stable_id, cursor.as_ref())
 				else {
 					break;
@@ -900,17 +921,16 @@ pub mod pallet {
 				// A touch-only step: capture the post-touch snapshot, apply nothing.
 				// The preview's surrounding transaction rolls the touch back.
 				let mut captured = None;
-				let touch =
-					T::Vaults::redeem_step(collateral_id, stable_id, &target.owner, |snap| {
-						captured = Some(snap);
-						Ok(None)
-					});
+				let touch = T::Vaults::redeem_step(collateral_id, stable_id, &owner, |snap| {
+					captured = Some(snap);
+					Ok(None)
+				});
 				let (Ok(_), Some(snap)) = (touch, captured) else { break };
 				steps = steps.saturating_add(1);
 				match Self::classify(&snap, price) {
 					StepAction::Recovery => {
 						if let Some(step) = Self::preview_recovery_step(
-							stable_id, config, &target, &snap, price, remaining,
+							stable_id, config, &owner, &snap, price, remaining,
 						) {
 							detail.push(step);
 						}
@@ -918,12 +938,12 @@ pub mod pallet {
 					},
 					StepAction::Stop => break,
 					StepAction::Skip => {
-						cursor = Some(target.owner);
+						cursor = Some(owner);
 						continue;
 					},
 					StepAction::Redeem => {
 						let Some(step) =
-							Self::preview_ordinary_step(&target, &snap, price, rate, remaining)
+							Self::preview_ordinary_step(&owner, &snap, price, rate, remaining)
 						else {
 							break;
 						};
@@ -932,10 +952,10 @@ pub mod pallet {
 						detail.push(step);
 						// A drained Dormant is a barrier the preview cannot cross (it does not
 						// mutate to remove it), so stop rather than re-walking it.
-						if !drained || snap.regime.is_dormant() {
+						if !drained || snap.status.is_dormant() {
 							break;
 						}
-						cursor = Some(target.owner);
+						cursor = Some(owner);
 					},
 				}
 			}
@@ -943,7 +963,7 @@ pub mod pallet {
 		}
 
 		fn preview_ordinary_step(
-			target: &RedemptionTarget<T::AccountId>,
+			owner: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
 			rate: FixedU128,
@@ -951,8 +971,8 @@ pub mod pallet {
 		) -> Option<RedemptionPreviewStepOf<T>> {
 			let step = Self::price_ordinary(snap, price, rate, budget)?;
 			Some(RedemptionPreviewStep {
-				target: target.owner.clone(),
-				kind: target.kind,
+				target: owner.clone(),
+				status: snap.status,
 				debt_cancellable: step.debt,
 				collateral_out: step.collateral_out,
 				fee_pusd: step.fee,
@@ -963,15 +983,15 @@ pub mod pallet {
 		fn preview_recovery_step(
 			stable_id: &T::StableAssetId,
 			config: &RedemptionConfigOf<T>,
-			target: &RedemptionTarget<T::AccountId>,
+			owner: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
 			budget: BalanceOf<T>,
 		) -> Option<RedemptionPreviewStepOf<T>> {
 			let pricing = Self::price_recovery(stable_id, snap, price, budget, config)?;
 			Some(RedemptionPreviewStep {
-				target: target.owner.clone(),
-				kind: target.kind,
+				target: owner.clone(),
+				status: snap.status,
 				debt_cancellable: pricing.debt,
 				collateral_out: pricing.collateral_out,
 				fee_pusd: Zero::zero(),
