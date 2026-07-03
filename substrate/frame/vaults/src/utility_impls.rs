@@ -20,6 +20,14 @@ use frame::{
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::ProvidePrice;
 
+/// The two numbers a branch TCR depends on. [`Pallet::compute_tcr`] derives
+/// them from live state; the operation context captures them once at load as
+/// the structurally immutable "pre" side of its TCR gate.
+pub(crate) struct TcrInputs<Balance> {
+	pub collateral: Balance,
+	pub debt: Balance,
+}
+
 /// Deltas the next vault touch would apply.
 pub(crate) struct PendingTouch<Balance> {
 	/// Capped redistributed principal moved into `vault.debt.principal`
@@ -304,7 +312,7 @@ impl<T: Config> Pallet<T> {
 	/// interest + pending aggregate interest + pending redistribution principal +
 	/// bad debt + ownerless debt. Single definition shared by [`Self::compute_tcr`]
 	/// and the `branch_debt` redemption-fee accessor so the two cannot diverge.
-	fn accrued_branch_debt(
+	pub(crate) fn accrued_branch_debt(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
 	) -> BalanceOf<T> {
@@ -330,15 +338,27 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		now: Millis,
 	) -> Result<FixedU128, DispatchError> {
-		let total_debt = Self::accrued_branch_debt(state, now);
-		if total_debt.is_zero() {
+		let inputs = TcrInputs {
+			collateral: state.total_collateral,
+			debt: Self::accrued_branch_debt(state, now),
+		};
+		Self::tcr_from_inputs(&inputs, price)
+	}
+
+	/// The single TCR formula, shared by [`Self::compute_tcr`] (live state) and
+	/// the operation gate's load-time baseline so the pre and post sides of a
+	/// gate cannot diverge.
+	pub(crate) fn tcr_from_inputs(
+		inputs: &TcrInputs<BalanceOf<T>>,
+		price: FixedU128,
+	) -> Result<FixedU128, DispatchError> {
+		if inputs.debt.is_zero() {
 			// Branch with no debt is treated as "infinitely well-collateralized".
 			return Ok(FixedU128::max_value());
 		}
-		let value = price
-			.checked_mul_int(state.total_collateral)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		FixedU128::checked_from_rational(value, total_debt)
+		let value =
+			price.checked_mul_int(inputs.collateral).ok_or(Error::<T>::ArithmeticOverflow)?;
+		FixedU128::checked_from_rational(value, inputs.debt)
 			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 	}
 
