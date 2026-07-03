@@ -291,10 +291,10 @@ impl<T: Config> Pallet<T> {
 		let info = BranchAdmin::<T>::get((collateral_id, stable_id))
 			.ok_or(Error::<T>::UnknownCollateral)?;
 		let caller = origin.into_caller();
-		if caller == info.full_admin {
+		if caller == info.admins.full_admin {
 			return Ok(AdminLevel::Full);
 		}
-		if matches!(required, AdminLevel::Emergency) && caller == info.emergency_admin {
+		if matches!(required, AdminLevel::Emergency) && caller == info.admins.emergency_admin {
 			return Ok(AdminLevel::Emergency);
 		}
 		Err(Error::<T>::NotBranchAdmin.into())

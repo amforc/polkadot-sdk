@@ -796,14 +796,7 @@ impl<T: Config> Pallet<T> {
 			None => None,
 		};
 		Self::register_branch(collateral_id.clone(), stable_id.clone(), config)?;
-		BranchAdmin::<T>::insert(
-			(&collateral_id, &stable_id),
-			BranchAdminInfo {
-				full_admin: admins.full_admin,
-				emergency_admin: admins.emergency_admin,
-				deposit,
-			},
-		);
+		BranchAdmin::<T>::insert((&collateral_id, &stable_id), BranchAdminInfo { admins, deposit });
 		Ok(())
 	}
 

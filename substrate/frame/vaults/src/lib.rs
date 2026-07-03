@@ -891,27 +891,19 @@ pub mod pallet {
 		}
 
 		/// Permissionless market creation. The stable asset's owner (or Root,
-		/// deposit-free) opens a `(collateral, stable)` market with `full_admin`
-		/// and `emergency_admin` and a config inside the
-		/// governance envelope.
+		/// deposit-free) opens a `(collateral, stable)` market with the given
+		/// `admins` and a config inside the governance envelope.
 		#[pallet::call_index(10)]
 		#[pallet::weight(T::WeightInfo::register_branch())]
 		pub fn create_branch(
 			origin: OriginFor<T>,
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			full_admin: PalletsOriginOf<T>,
-			emergency_admin: PalletsOriginOf<T>,
+			admins: BranchAdmins<PalletsOriginOf<T>>,
 			config: BranchConfig<BalanceOf<T>>,
 		) -> DispatchResult {
 			let depositor = T::CreateOrigin::ensure_origin(origin, &stable_id)?;
-			Self::do_create_branch(
-				collateral_id,
-				stable_id,
-				BranchAdmins { full_admin, emergency_admin },
-				config,
-				depositor,
-			)
+			Self::do_create_branch(collateral_id, stable_id, admins, config, depositor)
 		}
 
 		/// Admin: update one branch-config parameter. The required admin tier,
@@ -1002,19 +994,18 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			full_admin: PalletsOriginOf<T>,
-			emergency_admin: PalletsOriginOf<T>,
+			admins: BranchAdmins<PalletsOriginOf<T>>,
 		) -> DispatchResult {
 			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
 			BranchAdmin::<T>::try_mutate(
 				(&collateral_id, &stable_id),
 				|maybe| -> Result<_, DispatchError> {
 					let info = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-					info.full_admin = full_admin.clone();
-					info.emergency_admin = emergency_admin.clone();
+					info.admins = admins.clone();
 					Ok(())
 				},
 			)?;
+			let BranchAdmins { full_admin, emergency_admin } = admins;
 			Self::deposit_event(Event::BranchAdminChanged {
 				collateral_id,
 				stable_id,
