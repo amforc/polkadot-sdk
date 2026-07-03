@@ -377,7 +377,7 @@ fn governance_clear_is_noop_for_oracle_frozen() {
 }
 
 #[test]
-fn frozen_poke_pins_interest_clock_without_minting() {
+fn frozen_poke_pins_interest_time_without_minting() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
