@@ -36,7 +36,7 @@ use frame::{
 pub use pallet_linked_list::Position;
 use pusd_primitives::{
 	KeeperCompensation, LiquidationAllocation, OffsetAllocation, RedemptionAllocation,
-	VaultLiquidationInterface, VaultRedemptionInterface,
+	VaultInterface,
 };
 
 pub type AccountId = u64;
@@ -635,7 +635,7 @@ pub fn liquidate_market_with(
 	owner: AccountId,
 	build: impl FnOnce(Balance) -> LiquidationAllocation<AccountId, Balance>,
 ) -> DispatchResult {
-	<Pallet<Test> as VaultLiquidationInterface<AssetId, StableId, AccountId, Balance>>::execute_liquidation(
+	<Pallet<Test> as VaultInterface>::execute_liquidation(
 		&collateral,
 		&stable,
 		&owner,
@@ -660,13 +660,9 @@ pub fn redeem_market(
 	redeemer: AccountId,
 	amount: Balance,
 ) -> Result<AccountId, DispatchError> {
-	let (owner, _status) = <Pallet<Test> as VaultRedemptionInterface<
-		AssetId,
-		StableId,
-		AccountId,
-		Balance,
-	>>::next_redemption_target(&collateral, &stable, None)
-	.ok_or(DispatchError::Other("no redemption target"))?;
+	let (owner, _status) =
+		<Pallet<Test> as VaultInterface>::next_redemption_target(&collateral, &stable, None)
+			.ok_or(DispatchError::Other("no redemption target"))?;
 	let price = MockPrices::get().get(&collateral).copied().expect("price set");
 	redeem_step(&collateral, &stable, &owner, |snapshot| {
 		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
@@ -694,12 +690,7 @@ pub fn redeem_step(
 		DispatchError,
 	>,
 ) -> Result<Option<RedemptionAllocation<AccountId, Balance>>, DispatchError> {
-	<Pallet<Test> as VaultRedemptionInterface<AssetId, StableId, AccountId, Balance>>::redeem_step(
-		collateral,
-		stable,
-		owner,
-		build_allocation,
-	)
+	<Pallet<Test> as VaultInterface>::redeem_step(collateral, stable, owner, build_allocation)
 }
 
 /// Held collateral on `(collateral, who)` for the `VaultCollateral` reason.

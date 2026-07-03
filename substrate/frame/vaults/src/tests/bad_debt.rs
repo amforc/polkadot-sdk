@@ -1,7 +1,7 @@
-//! `VaultBadDebtInterface` healing.
+//! Bad-debt healing through `VaultInterface::heal`.
 
 use crate::{mock::*, pallet::BranchStates};
-use pusd_primitives::VaultBadDebtInterface;
+use pusd_primitives::VaultInterface;
 
 /// Seed recorded bad debt directly: recording only ever happens inside the
 /// vault pallet (recovery settlement / orphan-debt sweeps).
@@ -16,8 +16,7 @@ fn record(amount: Balance) {
 /// handed back (the unconsumed part of the credit).
 fn heal(amount: Balance) -> Result<Balance, DispatchError> {
 	let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, amount);
-	<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, _>>::heal(&DOT, &PUSD, credit)
-		.map(|surplus| surplus.peek())
+	<crate::Pallet<Test> as VaultInterface>::heal(&DOT, &PUSD, credit).map(|surplus| surplus.peek())
 }
 
 fn bad_debt() -> Balance {
@@ -86,10 +85,8 @@ fn heal_unknown_branch_errors() {
 		register_default_branch();
 		let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, 10);
 		assert_err!(
-			<crate::Pallet<Test> as VaultBadDebtInterface<AssetId, StableId, _>>::heal(
-				&TOKEN_X, &PUSD, credit
-			)
-			.map(|surplus| surplus.peek()),
+			<crate::Pallet<Test> as VaultInterface>::heal(&TOKEN_X, &PUSD, credit)
+				.map(|surplus| surplus.peek()),
 			crate::Error::<Test>::UnknownCollateral
 		);
 	});

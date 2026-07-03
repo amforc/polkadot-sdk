@@ -76,7 +76,7 @@ fn execute_liquidation_rejects_frozen_branch() {
 //
 // In production this can't be reached from a user: the `LiquidationAllocation`
 // is computed *inside* the pallet from the liquidation math, never externally
-// supplied. These two tests defensively guard the `VaultLiquidationInterface`
+// supplied. These two tests defensively guard the `VaultInterface` liquidation
 // boundary (rejecting an inconsistent allocation and rolling back cleanly); the
 // allocation *calculation* itself is exercised where that math lives.
 #[test]

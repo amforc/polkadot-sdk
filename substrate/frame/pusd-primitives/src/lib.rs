@@ -13,22 +13,18 @@ use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::deps::sp_runtime::{FixedPointNumber, FixedPointOperand, FixedU128};
 use scale_info::TypeInfo;
 
-pub mod bad_debt;
-pub mod liquidation;
 pub mod oracle;
 pub mod recovery_pricing;
-pub mod redemption;
 pub mod registration;
+pub mod vault_interface;
 
-pub use bad_debt::VaultBadDebtInterface;
-pub use liquidation::{
-	AllocationResult, KeeperCompensation, LiquidationAllocation, LiquidationSnapshot,
-	OffsetAllocation, VaultLiquidationInterface,
-};
 pub use oracle::ProvidePrice;
 pub use recovery_pricing::InsuranceAdjusted;
-pub use redemption::{RedemptionAllocation, RedemptionStepSnapshot, VaultRedemptionInterface};
 pub use registration::OnBranchLifecycle;
+pub use vault_interface::{
+	KeeperCompensation, LiquidationAllocation, LiquidationSnapshot, OffsetAllocation,
+	RedemptionAllocation, RedemptionStepSnapshot, VaultInterface,
+};
 
 /// TODO: Check if this is the best way to handle the "time"
 pub type Millis = u64;
