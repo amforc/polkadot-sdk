@@ -6,7 +6,8 @@
 
 use crate::{
 	pallet::{
-		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, Pallet, PalletsOriginOf, Vaults,
+		BalanceOf, BranchConfigs, BranchStates, Config, HoldReason, IdleCursor, Pallet,
+		PalletsOriginOf, Vaults,
 	},
 	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
@@ -763,14 +764,8 @@ mod benchmarks {
 
 		#[block]
 		{
-			if Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)) {
-				let _ =
-					crate::context::OpContext::<T>::refresh(asset.clone(), stable::<T>(), &owner);
-				let _ = T::VaultLists::neighbors(
-					&VaultListId::Rate(asset.clone(), stable::<T>()),
-					&owner,
-				);
-			}
+			let _ = crate::context::OpContext::<T>::refresh(asset.clone(), stable::<T>(), &owner);
+			IdleCursor::<T>::put((asset.clone(), stable::<T>(), owner.clone()));
 		}
 
 		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)));

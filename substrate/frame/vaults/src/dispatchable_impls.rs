@@ -758,7 +758,6 @@ impl<T: Config> Pallet<T> {
 				interest_epoch: now,
 				next_final_recovery_nonce: 0,
 				dormant_redemption_target: None,
-				idle_cursor: None,
 				frozen: None,
 				effective_ceiling: initial_ceiling,
 				ceiling_last_inc: now,
