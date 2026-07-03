@@ -1,6 +1,5 @@
 //! Internal (non-dispatchable) `Pallet` helpers: storage accessors, safety
-//! gates, interest/fee accounting, mode rules, view-function backends, and the
-//! `on_idle` refresh walk.
+//! gates, interest/fee accounting, mode rules, and the `on_idle` refresh walk.
 
 use crate::{
 	context::OpContext,
@@ -539,50 +538,6 @@ impl<T: Config> Pallet<T> {
 		fee
 	}
 
-	/// Fully-accrued total branch debt (principal + minted interest + pending
-	/// aggregate interest + pending redistribution + bad debt + ownerless debt).
-	/// Mirrors the numerator-side of [`Self::compute_tcr`]; used to size the
-	/// redemption fee's redeemed fraction. Zero for an unregistered branch.
-	pub(crate) fn view_branch_debt(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		now: Millis,
-	) -> BalanceOf<T> {
-		let Some(bs) = BranchStates::<T>::get(collateral_id, stable_id) else {
-			return BalanceOf::<T>::zero();
-		};
-		Self::accrued_branch_debt(&bs, now)
-	}
-
-	pub(crate) fn view_vault_cr(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		owner: &T::AccountId,
-	) -> Option<FixedU128> {
-		let vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
-		let state = BranchStates::<T>::get(collateral_id, stable_id)?;
-		let now = T::TimeProvider::now();
-		let price = T::Oracle::provide_price(collateral_id).ok()?;
-		let pending = Self::pending_touch_for(&vault, &state, now);
-		let total_coll = vault.collateral.saturating_add(pending.collateral);
-		let total_debt = vault
-			.debt
-			.total()
-			.saturating_add(pending.principal)
-			.saturating_add(pending.interest);
-		pusd_primitives::collateralization_ratio::<BalanceOf<T>>(total_coll, total_debt, price)
-	}
-
-	pub(crate) fn view_branch_tcr(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-	) -> Option<FixedU128> {
-		let state = BranchStates::<T>::get(collateral_id, stable_id)?;
-		let price = T::Oracle::provide_price(collateral_id).ok()?;
-		let now = T::TimeProvider::now();
-		Self::compute_tcr(&state, price, now).ok()
-	}
-
 	/// Lazily walk a vault list from its tail, following `prev` pointers — the same
 	/// order as [`SortedListInterface::iter_from_tail`], but every storage read is
 	/// deferred until the iterator advances, so a caller taking only the head pays
@@ -651,104 +606,10 @@ impl<T: Config> Pallet<T> {
 		T::VaultLists::neighbors(&rate_list, owner).and_then(|p| p.prev)
 	}
 
-	/// Walk the rate index tail-first, summing active-vault principal while the
-	/// stored priority is strictly below `rate`, visiting at most `max_steps`
-	/// vaults. Returns the partial sum when the cap stops the walk early.
-	pub(crate) fn view_debt_in_front(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		rate: FixedU128,
-		max_steps: u32,
-	) -> BalanceOf<T> {
-		let mut total = BalanceOf::<T>::zero();
-		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
-		let mut cursor = T::VaultLists::tail(&rate_list);
-		for _ in 0..max_steps {
-			let Some(o) = cursor else { break };
-			let Some((priority, neighbors)) = T::VaultLists::node(&rate_list, &o) else { break };
-			if priority >= rate {
-				break;
-			}
-			if let Some(v) = Vaults::<T>::get((collateral_id, stable_id, &o)) {
-				total = total.saturating_add(v.debt.principal);
-			}
-			cursor = neighbors.prev;
-		}
-		total
-	}
-
-	pub(crate) fn predict_upfront_fee_open(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		initial_debt: BalanceOf<T>,
-		annual_rate: FixedU128,
-	) -> BalanceOf<T> {
-		match (
-			BranchConfigs::<T>::get((collateral_id, stable_id)),
-			BranchStates::<T>::get(collateral_id, stable_id),
-		) {
-			(Some(config), Some(mut state)) => {
-				let now = T::TimeProvider::now();
-				let scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
-				Self::apply_borrow(
-					&mut state,
-					&config,
-					&scratch,
-					initial_debt,
-					annual_rate,
-					Zero::zero(),
-				)
-			},
-			_ => BalanceOf::<T>::zero(),
-		}
-	}
-
-	pub(crate) fn predict_upfront_fee_borrow(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		owner: &T::AccountId,
-		debt_increase: BalanceOf<T>,
-		maybe_new_rate: Option<FixedU128>,
-	) -> BalanceOf<T> {
-		let Some((config, mut state, vault)) =
-			Self::predict_inputs(collateral_id, stable_id, owner)
-		else {
-			return BalanceOf::<T>::zero();
-		};
-		let new_rate = maybe_new_rate.unwrap_or(vault.annual_rate);
-		let now = T::TimeProvider::now();
-		let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
-		let rate_change_fee_base = vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
-		Self::apply_borrow(
-			&mut state,
-			&config,
-			&vault,
-			debt_increase,
-			new_rate,
-			rate_change_fee_base,
-		)
-	}
-
-	pub(crate) fn predict_upfront_fee_rate_change(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		owner: &T::AccountId,
-		new_rate: FixedU128,
-	) -> BalanceOf<T> {
-		let Some((config, mut state, vault)) =
-			Self::predict_inputs(collateral_id, stable_id, owner)
-		else {
-			return BalanceOf::<T>::zero();
-		};
-		let now = T::TimeProvider::now();
-		let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
-		Self::apply_rate_change(&mut state, &config, &vault, new_rate, cooldown_elapsed)
-	}
-
 	/// Read the `(config, branch state, vault)` triple for a `predict_*` view.
 	/// Returns `None` if any row is missing — the predict APIs treat that as
 	/// "no fee" rather than an error.
-	fn predict_inputs(
+	pub(crate) fn predict_inputs(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		owner: &T::AccountId,

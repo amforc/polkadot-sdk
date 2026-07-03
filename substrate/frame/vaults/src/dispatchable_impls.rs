@@ -578,14 +578,6 @@ impl<T: Config> Pallet<T> {
 		op.commit_removing_vault(TcrGate::Check { price, config, settlement: branch_empties })
 	}
 
-	pub(crate) fn do_poke(
-		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
-	) -> Result<(), DispatchError> {
-		OpContext::<T>::refresh(collateral_id, stable_id, &owner)
-	}
-
 	pub(crate) fn do_enter_final_recovery(
 		owner: T::AccountId,
 		collateral_id: T::CollateralAssetId,

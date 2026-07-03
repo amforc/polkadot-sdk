@@ -79,6 +79,7 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 pub mod pallet {
 	use super::*;
 	use crate::{
+		context::OpContext,
 		recovery,
 		types::{AdminLevel, BranchAdminInfo, BranchAdmins, BranchConfigGuard},
 	};
@@ -566,7 +567,18 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			owner: T::AccountId,
 		) -> Option<FixedU128> {
-			Self::view_vault_cr(&collateral_id, &stable_id, &owner)
+			let vault = Vaults::<T>::get((&collateral_id, &stable_id, &owner))?;
+			let state = BranchStates::<T>::get(&collateral_id, &stable_id)?;
+			let now = T::TimeProvider::now();
+			let price = T::Oracle::provide_price(&collateral_id).ok()?;
+			let pending = Self::pending_touch_for(&vault, &state, now);
+			let total_coll = vault.collateral.saturating_add(pending.collateral);
+			let total_debt = vault
+				.debt
+				.total()
+				.saturating_add(pending.principal)
+				.saturating_add(pending.interest);
+			pusd_primitives::collateralization_ratio::<BalanceOf<T>>(total_coll, total_debt, price)
 		}
 
 		/// Derived lifecycle status of the vault.
@@ -586,7 +598,10 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		) -> Option<FixedU128> {
-			Self::view_branch_tcr(&collateral_id, &stable_id)
+			let state = BranchStates::<T>::get(&collateral_id, &stable_id)?;
+			let price = T::Oracle::provide_price(&collateral_id).ok()?;
+			let now = T::TimeProvider::now();
+			Self::compute_tcr(&state, price, now).ok()
 		}
 
 		/// Registered `(collateral, stable)` markets.
@@ -675,7 +690,23 @@ pub mod pallet {
 			rate: FixedU128,
 			max_steps: u32,
 		) -> BalanceOf<T> {
-			Self::view_debt_in_front(&collateral_id, &stable_id, rate, max_steps)
+			let mut total = BalanceOf::<T>::zero();
+			let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
+			let mut cursor = T::VaultLists::tail(&rate_list);
+			for _ in 0..max_steps {
+				let Some(o) = cursor else { break };
+				let Some((priority, neighbors)) = T::VaultLists::node(&rate_list, &o) else {
+					break;
+				};
+				if priority >= rate {
+					break;
+				}
+				if let Some(v) = Vaults::<T>::get((&collateral_id, &stable_id, &o)) {
+					total = total.saturating_add(v.debt.principal);
+				}
+				cursor = neighbors.prev;
+			}
+			total
 		}
 
 		/// Predict the upfront fee `open_vault` would charge for
@@ -686,7 +717,24 @@ pub mod pallet {
 			initial_debt: BalanceOf<T>,
 			annual_rate: FixedU128,
 		) -> BalanceOf<T> {
-			Self::predict_upfront_fee_open(&collateral_id, &stable_id, initial_debt, annual_rate)
+			match (
+				BranchConfigs::<T>::get((&collateral_id, &stable_id)),
+				BranchStates::<T>::get(&collateral_id, &stable_id),
+			) {
+				(Some(config), Some(mut state)) => {
+					let now = T::TimeProvider::now();
+					let scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
+					Self::apply_borrow(
+						&mut state,
+						&config,
+						&scratch,
+						initial_debt,
+						annual_rate,
+						Zero::zero(),
+					)
+				},
+				_ => BalanceOf::<T>::zero(),
+			}
 		}
 
 		/// Predict the upfront fee `borrow` would charge.
@@ -697,12 +745,22 @@ pub mod pallet {
 			debt_increase: BalanceOf<T>,
 			maybe_new_rate: Option<FixedU128>,
 		) -> BalanceOf<T> {
-			Self::predict_upfront_fee_borrow(
-				&collateral_id,
-				&stable_id,
-				&owner,
+			let Some((config, mut state, vault)) =
+				Self::predict_inputs(&collateral_id, &stable_id, &owner)
+			else {
+				return BalanceOf::<T>::zero();
+			};
+			let new_rate = maybe_new_rate.unwrap_or(vault.annual_rate);
+			let now = T::TimeProvider::now();
+			let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
+			let rate_change_fee_base = vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
+			Self::apply_borrow(
+				&mut state,
+				&config,
+				&vault,
 				debt_increase,
-				maybe_new_rate,
+				new_rate,
+				rate_change_fee_base,
 			)
 		}
 
@@ -714,7 +772,14 @@ pub mod pallet {
 			owner: T::AccountId,
 			new_rate: FixedU128,
 		) -> BalanceOf<T> {
-			Self::predict_upfront_fee_rate_change(&collateral_id, &stable_id, &owner, new_rate)
+			let Some((config, mut state, vault)) =
+				Self::predict_inputs(&collateral_id, &stable_id, &owner)
+			else {
+				return BalanceOf::<T>::zero();
+			};
+			let now = T::TimeProvider::now();
+			let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
+			Self::apply_rate_change(&mut state, &config, &vault, new_rate, cooldown_elapsed)
 		}
 	}
 
@@ -850,7 +915,7 @@ pub mod pallet {
 			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			Self::do_poke(owner, collateral_id, stable_id)
+			OpContext::<T>::refresh(collateral_id, stable_id, &owner)
 		}
 
 		/// Permissionless: move an unsafe last-eligible vault into
