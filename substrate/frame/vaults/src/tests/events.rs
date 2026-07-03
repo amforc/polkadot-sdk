@@ -292,10 +292,10 @@ fn set_parameter_emits_parameter_updated() {
 	});
 }
 
-// set_debt_ceiling goes through the shared parameter machinery and emits
-// ParameterUpdated.
+// A DebtCeiling update goes through the same shared parameter machinery and
+// emits ParameterUpdated.
 #[test]
-fn set_debt_ceiling_emits_parameter_updated() {
+fn debt_ceiling_update_emits_parameter_updated() {
 	build_and_execute(|| {
 		register_default_branch();
 		assert_ok!(crate::Pallet::<Test>::set_param(
