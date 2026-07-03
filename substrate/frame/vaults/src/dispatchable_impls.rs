@@ -8,8 +8,8 @@ use crate::{
 	recovery,
 	types::{
 		AdminLevel, BranchAdminInfo, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchDebt,
-		BranchMode, BranchRounding, BranchStakes, BranchState, DebtPayment, FrozenReason,
-		FrozenState, RedistributionSnapshot, Vault, VaultDebt, VaultStatus,
+		BranchMode, BranchStakes, BranchState, DebtPayment, FrozenReason, FrozenState,
+		RedistributionSnapshot, Vault, VaultDebt, VaultStatus,
 	},
 };
 use frame::{
@@ -747,7 +747,8 @@ impl<T: Config> Pallet<T> {
 				total_collateral: BalanceOf::<T>::zero(),
 				debt: BranchDebt::default(),
 				stakes: BranchStakes::default(),
-				rounding: BranchRounding::default(),
+				ownerless_debt: Zero::zero(),
+				ownerless_collateral: Zero::zero(),
 				redistribution: RedistributionSnapshot::default(),
 				interest_epoch: now,
 				next_final_recovery_nonce: 0,

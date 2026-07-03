@@ -304,7 +304,7 @@ impl<T: Config> Pallet<T> {
 			.saturating_add(pending_aggregate)
 			.saturating_add(state.debt.pending_redistribution_principal)
 			.saturating_add(state.debt.bad_debt)
-			.saturating_add(state.rounding.ownerless_pusd_debt)
+			.saturating_add(state.ownerless_debt)
 	}
 
 	/// Compute TCR including aggregate interest accrued since the last update.
