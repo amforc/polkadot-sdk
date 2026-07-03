@@ -17,9 +17,8 @@ use frame::{
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
-	AllocationResult, LiquidationSnapshot, RedemptionAllocation, RedemptionRegime,
-	RedemptionStepSnapshot, RedemptionTarget, RedemptionTargetKind, VaultBadDebtInterface,
-	VaultLiquidationInterface, VaultRedemptionInterface,
+	AllocationResult, LiquidationSnapshot, RedemptionAllocation, RedemptionStepSnapshot,
+	VaultBadDebtInterface, VaultLiquidationInterface, VaultRedemptionInterface,
 };
 
 impl<T: Config>
@@ -156,19 +155,17 @@ impl<T: Config>
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		after: Option<&T::AccountId>,
-	) -> Option<RedemptionTarget<T::AccountId>> {
+	) -> Option<(T::AccountId, VaultStatus)> {
 		// The priority head (FinalRecovery FIFO, then the dormant slot) is a
-		// barrier that preempts any carried ordinary cursor: the previous step
+		// barrier that preempts any carried rate-index cursor: the previous step
 		// may have created one. Re-check it regardless of `after`; the cursor
-		// only resolves the ordinary-tail position when no barrier gates.
+		// only resolves the rate-index tail position when no barrier gates.
 		match Self::redemption_targets(collateral_id, stable_id).next() {
-			Some((owner, kind)) if !matches!(kind, RedemptionTargetKind::Ordinary) => {
-				Some(RedemptionTarget { owner, kind })
-			},
+			Some((owner, status)) if !status.is_active() => Some((owner, status)),
 			head => match after {
-				None => head.map(|(owner, kind)| RedemptionTarget { owner, kind }),
+				None => head,
 				Some(owner) => Self::ordinary_target_after(collateral_id, stable_id, owner)
-					.map(|owner| RedemptionTarget { owner, kind: RedemptionTargetKind::Ordinary }),
+					.map(|owner| (owner, VaultStatus::Active)),
 			},
 		}
 	}
@@ -188,20 +185,17 @@ impl<T: Config>
 		let op = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
 		op.ensure_not_frozen()?;
 		let mut op = op.touch(owner)?;
-		// Only FinalRecovery pricing consumes the redistribution penalty, so defer
-		// the branch-config read on the common ordinary/dormant skip path.
-		let regime = match op.status {
-			VaultStatus::Active => RedemptionRegime::Ordinary,
-			VaultStatus::Dormant => RedemptionRegime::Dormant,
-			VaultStatus::FinalRecovery => RedemptionRegime::FinalRecovery {
-				redistribution_penalty: op.ctx.config()?.redistribution_penalty,
-			},
-		};
+		let config = op.ctx.config()?;
 		let post_touch_debt = op.vault.debt.total();
 		// Collateral lives on the vault row (a shared on-hold balance may back
 		// several markets on the same collateral asset), so read it directly.
 		let held = op.vault.collateral;
-		let snapshot = RedemptionStepSnapshot { regime, debt: post_touch_debt, collateral: held };
+		let snapshot = RedemptionStepSnapshot {
+			status: op.status,
+			debt: post_touch_debt,
+			collateral: held,
+			redistribution_penalty: config.redistribution_penalty,
+		};
 
 		let Some(allocation) = build_allocation(snapshot)? else {
 			// Skipped target: persist the touch so the accrual it caused is paid for.
@@ -237,7 +231,6 @@ impl<T: Config>
 			)?;
 		}
 
-		let config = op.ctx.config()?;
 		let new_total = op.vault.debt.total();
 		let stake_changes = matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) &&
 			!allocation.collateral_to_redeemer.is_zero();
