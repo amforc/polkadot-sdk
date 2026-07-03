@@ -11,6 +11,7 @@
 use crate::{
 	pallet::{BalanceOf, BranchStates, Config, Error, Event, HoldReason, Millis, Pallet, Vaults},
 	types::{BranchConfig, BranchState, Vault, VaultListId, VaultStatus},
+	utility_impls::TcrInputs,
 };
 use frame::{
 	prelude::*,
@@ -23,12 +24,11 @@ use pusd_primitives::ProvidePrice;
 /// operation's mode-rule stance is explicit (and greppable) at its commit
 /// site.
 pub(crate) enum TcrGate<'a, Balance> {
-	/// The Normal/Safety mode rules apply: the op may not drop the branch TCR
+	/// Pre- and post-TCR are computed — surfacing arithmetic overflow. Unless
+	/// `settlement` (a branch-emptying close, where worsening is allowed), the
+	/// Normal/Safety mode rules apply: the op may not drop the branch TCR
 	/// below the safety threshold, nor worsen it while already below.
-	Enforce { price: FixedU128, config: &'a BranchConfig<Balance> },
-	/// Settlement path (a branch-emptying close): TCRs are still computed —
-	/// surfacing arithmetic overflow — but worsening is allowed.
-	Settle { price: FixedU128, config: &'a BranchConfig<Balance> },
+	Check { price: FixedU128, config: &'a BranchConfig<Balance>, settlement: bool },
 	/// No TCR computation: the op is structurally TCR-improving (repay,
 	/// deposit, redemption) or gated elsewhere (MCR on the liquidation and
 	/// recovery paths).
@@ -44,10 +44,11 @@ pub(crate) struct OpContext<T: Config> {
 	pub state: BranchState<T::AccountId, BalanceOf<T>>,
 	pending_interest_mint: BalanceOf<T>,
 	pending_fee: Option<BalanceOf<T>>,
-	/// Post-accrual state at load: the "pre" side of the commit's TCR gate.
-	/// A touch preserves the TCR inputs (the debt sum and collateral are
-	/// invariant under a touch), so this doubles as the [`VaultOp`] baseline.
-	tcr_baseline: BranchState<T::AccountId, BalanceOf<T>>,
+	/// The post-accrual TCR inputs at load: the "pre" side of the commit's
+	/// TCR gate. A touch preserves them (the debt sum and collateral are
+	/// invariant under a touch), and the captured pair is structurally
+	/// immutable, so it doubles as the [`VaultOp`] baseline.
+	tcr_baseline: TcrInputs<BalanceOf<T>>,
 	#[cfg(debug_assertions)]
 	loaded: BranchState<T::AccountId, BalanceOf<T>>,
 }
@@ -77,11 +78,17 @@ impl<T: Config> OpContext<T> {
 
 		let pending_interest_mint = Pallet::<T>::accrue_aggregate_interest(&mut state, now);
 
+		// The accrual above folded pending aggregate interest into the state,
+		// so the baseline debt is exactly the sum `compute_tcr` would see.
+		let tcr_baseline = TcrInputs {
+			collateral: state.total_collateral,
+			debt: Pallet::<T>::accrued_branch_debt(&state, now),
+		};
 		Ok(Self {
 			collateral_id,
 			stable_id,
 			now,
-			tcr_baseline: state.clone(),
+			tcr_baseline,
 			state,
 			pending_interest_mint,
 			pending_fee: None,
@@ -250,19 +257,15 @@ impl<T: Config> VaultOp<T> {
 
 /// Apply `gate` to one operation's `baseline` → `state` change.
 fn enforce_tcr_gate<T: Config>(
-	baseline: &BranchState<T::AccountId, BalanceOf<T>>,
+	baseline: &TcrInputs<BalanceOf<T>>,
 	state: &BranchState<T::AccountId, BalanceOf<T>>,
 	now: Millis,
 	gate: TcrGate<'_, BalanceOf<T>>,
 ) -> Result<(), DispatchError> {
-	let (price, config, is_settlement) = match gate {
-		TcrGate::Enforce { price, config } => (price, config, false),
-		TcrGate::Settle { price, config } => (price, config, true),
-		TcrGate::Exempt => return Ok(()),
-	};
-	let pre_tcr = Pallet::<T>::compute_tcr(baseline, price, now)?;
+	let TcrGate::Check { price, config, settlement } = gate else { return Ok(()) };
+	let pre_tcr = Pallet::<T>::tcr_from_inputs(baseline, price)?;
 	let post_tcr = Pallet::<T>::compute_tcr(state, price, now)?;
-	Pallet::<T>::enforce_mode_rules(config, state, pre_tcr, post_tcr, is_settlement)
+	Pallet::<T>::enforce_mode_rules(config, state, pre_tcr, post_tcr, settlement)
 }
 
 /// Deferred effects, run after the storage commit: aggregate interest minting,
