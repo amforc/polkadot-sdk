@@ -1,6 +1,6 @@
 use crate::{mock::*, tests::rate_pct};
 
-// `view_debt_in_front` returns the total debt at rates strictly below a given
+// `debt_in_front` returns the total debt at rates strictly below a given
 // rate. A debt-between-two-rates range is derivable from two calls:
 // `debt_in_front(high) - debt_in_front(low)`.
 //
