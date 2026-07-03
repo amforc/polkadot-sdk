@@ -160,7 +160,7 @@ impl<T: Config> Pallet<T> {
 		T::StableAssets::mint_into(op.stable_id.clone(), &owner, initial_debt)?;
 		op.charge_upfront_fee(upfront_fee);
 
-		T::VaultLists::insert(op.rate_list().clone(), owner.clone(), annual_rate, hint)
+		T::VaultLists::insert(op.rate_list(), owner.clone(), annual_rate, hint)
 			.map_err(Self::map_error)?;
 
 		Self::deposit_event(Event::Borrowed {
@@ -182,7 +182,7 @@ impl<T: Config> Pallet<T> {
 			stable_id: op.stable_id.clone(),
 			owner: owner.clone(),
 		});
-		op.commit_new_vault(&owner, &vault, TcrGate::Enforce { price, config: &config })
+		op.attach_new(&owner, vault).commit(TcrGate::Enforce { price, config: &config })
 	}
 
 	/// Permissionless deposit. Dormant vaults must be revived by borrowing.
@@ -199,7 +199,7 @@ impl<T: Config> Pallet<T> {
 		ensure!(!op.status.is_dormant(), Error::<T>::DebtBelowMinimum);
 
 		T::CollateralAssets::transfer_and_hold(
-			op.collateral_id.clone(),
+			op.ctx.collateral_id.clone(),
 			&HoldReason::VaultCollateral.into(),
 			&from,
 			&owner,
@@ -209,16 +209,16 @@ impl<T: Config> Pallet<T> {
 			Fortitude::Polite,
 		)?;
 
-		op.state.add_collateral(amount);
+		op.ctx.state.add_collateral(amount);
 		op.vault.collateral = op.vault.collateral.saturating_add(amount);
 		if op.status.is_active() {
 			let new_stake = op.vault.redistribution_stake.saturating_add(amount);
-			op.state.set_vault_stake(&mut op.vault, new_stake);
+			op.ctx.state.set_vault_stake(&mut op.vault, new_stake);
 		}
 
 		Self::deposit_event(Event::CollateralDeposited {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner,
 			from,
 			amount,
@@ -239,7 +239,7 @@ impl<T: Config> Pallet<T> {
 		let mut op = op.touch(&owner)?;
 		ensure!(!op.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		let collateral = op.vault.collateral;
 		ensure!(collateral >= amount, Error::<T>::InsufficientCollateral);
 
@@ -249,11 +249,11 @@ impl<T: Config> Pallet<T> {
 			Self::ensure_above_icr(new_collateral, total_debt, price, &config)?;
 		}
 
-		op.state.remove_collateral(amount);
-		op.state.set_vault_stake(&mut op.vault, new_collateral);
+		op.ctx.state.remove_collateral(amount);
+		op.ctx.state.set_vault_stake(&mut op.vault, new_collateral);
 
 		T::CollateralAssets::transfer_on_hold(
-			op.collateral_id.clone(),
+			op.ctx.collateral_id.clone(),
 			&HoldReason::VaultCollateral.into(),
 			&owner,
 			&recipient,
@@ -265,8 +265,8 @@ impl<T: Config> Pallet<T> {
 
 		op.vault.collateral = new_collateral;
 		Self::deposit_event(Event::CollateralWithdrawn {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner,
 			recipient,
 			amount,
@@ -289,27 +289,27 @@ impl<T: Config> Pallet<T> {
 		let mut op = op.touch(&owner)?;
 		ensure!(!op.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		let old_rate = op.vault.annual_rate;
 		let new_rate = maybe_new_rate.unwrap_or(old_rate);
 		Self::validate_rate(&config, new_rate)?;
 
 		let new_ib_debt = op.vault.debt.principal.saturating_add(amount);
 		// Advance the autoline in-band (still ttl-gated); see `do_open_vault`.
-		Self::ratchet_ceiling(&mut op.state, &config, op.now);
+		Self::ratchet_ceiling(&mut op.ctx.state, &config, op.ctx.now);
 		Self::ensure_within_ceilings(
-			&op.collateral_id,
-			&op.stable_id,
-			&op.state,
+			&op.ctx.collateral_id,
+			&op.ctx.stable_id,
+			&op.ctx.state,
 			&config,
-			op.state.debt.principal.saturating_add(amount),
+			op.ctx.state.debt.principal.saturating_add(amount),
 			price,
 		)?;
 
-		let cooldown_elapsed = op.vault.cooldown_elapsed(&config, op.now);
+		let cooldown_elapsed = op.vault.cooldown_elapsed(&config, op.ctx.now);
 		let rate_change_fee_base = op.vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
 		let upfront_fee = Self::apply_borrow(
-			&mut op.state,
+			&mut op.ctx.state,
 			&config,
 			&op.vault,
 			amount,
@@ -322,7 +322,7 @@ impl<T: Config> Pallet<T> {
 		op.vault.debt.interest = op.vault.debt.interest.saturating_add(upfront_fee);
 		if old_rate != new_rate {
 			op.vault.annual_rate = new_rate;
-			op.vault.last_rate_update = op.now;
+			op.vault.last_rate_update = op.ctx.now;
 		}
 		ensure!(op.vault.debt.principal >= config.minimum_debt, Error::<T>::DebtBelowMinimum);
 
@@ -331,39 +331,39 @@ impl<T: Config> Pallet<T> {
 		Self::ensure_above_icr(collateral, total_debt, price, &config)?;
 
 		if dormant_to_active {
-			op.state.release_dormant_target(&owner);
+			op.ctx.state.release_dormant_target(&owner);
 		}
 
-		T::StableAssets::mint_into(op.stable_id.clone(), &recipient, amount)?;
-		op.charge_upfront_fee(upfront_fee);
+		T::StableAssets::mint_into(op.ctx.stable_id.clone(), &recipient, amount)?;
+		op.ctx.charge_upfront_fee(upfront_fee);
 
 		if dormant_to_active {
-			T::VaultLists::insert(op.rate_list().clone(), owner.clone(), new_rate, hint)
+			T::VaultLists::insert(op.ctx.rate_list(), owner.clone(), new_rate, hint)
 				.map_err(Self::map_error)?;
 			Self::deposit_event(Event::VaultStatusChanged {
-				collateral_id: op.collateral_id.clone(),
-				stable_id: op.stable_id.clone(),
+				collateral_id: op.ctx.collateral_id.clone(),
+				stable_id: op.ctx.stable_id.clone(),
 				owner: owner.clone(),
 				old_status: VaultStatus::Dormant,
 				new_status: VaultStatus::Active,
 			});
 		} else if old_rate != new_rate {
-			T::VaultLists::re_insert(op.rate_list().clone(), owner.clone(), new_rate, hint)
+			T::VaultLists::re_insert(op.ctx.rate_list(), owner.clone(), new_rate, hint)
 				.map_err(Self::map_error)?;
 		}
 
 		if old_rate != new_rate {
 			Self::deposit_event(Event::BorrowRateChanged {
-				collateral_id: op.collateral_id.clone(),
-				stable_id: op.stable_id.clone(),
+				collateral_id: op.ctx.collateral_id.clone(),
+				stable_id: op.ctx.stable_id.clone(),
 				owner: owner.clone(),
 				old_rate,
 				new_rate,
 			});
 		}
 		Self::deposit_event(Event::Borrowed {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner,
 			recipient,
 			amount,
@@ -383,12 +383,12 @@ impl<T: Config> Pallet<T> {
 		let mut op = op.touch(&owner)?;
 		ensure!(!op.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 
 		// Cap overpayment at the touched debt.
 		let repay = amount.min(op.vault.debt.total());
 		T::StableAssets::burn_from(
-			op.stable_id.clone(),
+			op.ctx.stable_id.clone(),
 			&from,
 			repay,
 			Preservation::Expendable,
@@ -405,8 +405,8 @@ impl<T: Config> Pallet<T> {
 		}
 
 		Self::deposit_event(Event::Repaid {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner: owner.clone(),
 			from,
 			amount: repay,
@@ -416,7 +416,7 @@ impl<T: Config> Pallet<T> {
 		// fully-redeemed husk) is closed outright — there is nothing to keep it
 		// open for.
 		if new_total.is_zero() && op.vault.collateral.is_zero() {
-			let price = op.price()?;
+			let price = op.ctx.price()?;
 			return Self::close_inner(
 				op,
 				CloseRequest {
@@ -428,16 +428,17 @@ impl<T: Config> Pallet<T> {
 			);
 		}
 
-		op.state
+		op.ctx
+			.state
 			.apply_debt_payment(payment, op.vault.annual_rate, op.vault.debt.principal);
 		if new_total.is_zero() {
 			// Repaying to zero does not close the vault: the collateral stays held and
 			// the row survives as a zero-debt Dormant husk (mirroring a redeem-to-zero).
 			// The owner reclaims collateral with an explicit `close_vault`. Keeping the
 			// vault open lets debt be repaid in Safety mode purely to improve branch TCR.
-			op.state.release_dormant_target(&owner);
+			op.ctx.state.release_dormant_target(&owner);
 			if op.status.is_active() {
-				T::VaultLists::remove(op.rate_list(), &owner)
+				T::VaultLists::remove(&op.ctx.rate_list(), &owner)
 					.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 			}
 		}
@@ -460,25 +461,30 @@ impl<T: Config> Pallet<T> {
 			return op.commit(TcrGate::Exempt);
 		}
 
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		Self::validate_rate(&config, new_rate)?;
 
-		let cooldown_elapsed = op.vault.cooldown_elapsed(&config, op.now);
-		let upfront_fee =
-			Self::apply_rate_change(&mut op.state, &config, &op.vault, new_rate, cooldown_elapsed);
+		let cooldown_elapsed = op.vault.cooldown_elapsed(&config, op.ctx.now);
+		let upfront_fee = Self::apply_rate_change(
+			&mut op.ctx.state,
+			&config,
+			&op.vault,
+			new_rate,
+			cooldown_elapsed,
+		);
 
-		let price = op.price()?;
-		op.charge_upfront_fee(upfront_fee);
+		let price = op.ctx.price()?;
+		op.ctx.charge_upfront_fee(upfront_fee);
 
 		op.vault.annual_rate = new_rate;
-		op.vault.last_rate_update = op.now;
+		op.vault.last_rate_update = op.ctx.now;
 		op.vault.debt.interest = op.vault.debt.interest.saturating_add(upfront_fee);
 
-		T::VaultLists::re_insert(op.rate_list().clone(), owner.clone(), new_rate, hint)
+		T::VaultLists::re_insert(op.ctx.rate_list(), owner.clone(), new_rate, hint)
 			.map_err(Self::map_error)?;
 		Self::deposit_event(Event::BorrowRateChanged {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner,
 			old_rate,
 			new_rate,
@@ -499,7 +505,7 @@ impl<T: Config> Pallet<T> {
 		let op = op.touch(&owner)?;
 		ensure!(op.vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		Self::close_inner(
 			op,
 			CloseRequest { recipient: &recipient, config: &config, price, maybe_payment: None },
@@ -513,22 +519,23 @@ impl<T: Config> Pallet<T> {
 		// included (where the stake is zero but the collateral persists).
 		let collateral = op.vault.collateral;
 		if let Some(payment) = maybe_payment {
-			op.state
+			op.ctx
+				.state
 				.apply_debt_payment(payment, op.vault.annual_rate, op.vault.debt.principal);
 		}
-		op.state.detach_vault(&op.vault);
-		op.state.remove_collateral(collateral);
-		op.state.release_dormant_target(&op.owner);
+		op.ctx.state.detach_vault(&op.vault);
+		op.ctx.state.remove_collateral(collateral);
+		op.ctx.state.release_dormant_target(&op.owner);
 
-		let branch_empties = op.state.is_empty_of_liability();
+		let branch_empties = op.ctx.state.is_empty_of_liability();
 		// Sweep ahead of the commit's TCR gate; defer the event until the close is
 		// past every fallible step, just before commit.
 		let orphan_debt =
-			if branch_empties { op.state.sweep_orphan_debt() } else { BalanceOf::<T>::zero() };
+			if branch_empties { op.ctx.state.sweep_orphan_debt() } else { BalanceOf::<T>::zero() };
 
 		if !collateral.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
-				op.collateral_id.clone(),
+				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				&op.owner,
 				recipient,
@@ -542,25 +549,25 @@ impl<T: Config> Pallet<T> {
 		match op.status {
 			VaultStatus::Active => {
 				// Active vaults must be in the rate index.
-				T::VaultLists::remove(op.rate_list(), &op.owner)
+				T::VaultLists::remove(&op.ctx.rate_list(), &op.owner)
 					.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 			},
 			VaultStatus::FinalRecovery => {
-				recovery::remove::<T>(&op.collateral_id, &op.stable_id, &op.owner)?;
+				recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, &op.owner)?;
 			},
 			VaultStatus::Dormant => {},
 		}
 
 		if !orphan_debt.is_zero() {
 			Self::deposit_event(Event::BadDebtRecorded {
-				collateral_id: op.collateral_id.clone(),
-				stable_id: op.stable_id.clone(),
+				collateral_id: op.ctx.collateral_id.clone(),
+				stable_id: op.ctx.stable_id.clone(),
 				amount: orphan_debt,
 			});
 		}
 		Self::deposit_event(Event::VaultClosed {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner: op.owner.clone(),
 			recipient: recipient.clone(),
 		});
@@ -592,24 +599,29 @@ impl<T: Config> Pallet<T> {
 		let mut op = op.touch(&owner)?;
 		ensure!(op.status.is_active(), Error::<T>::InvalidVaultStatus);
 
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		let collateral = op.vault.redistribution_stake;
 		let total_debt = op.vault.debt.total();
 		Self::ensure_below_mcr(collateral, total_debt, price, &config)?;
 
 		ensure!(
-			op.state.stakes.total == op.vault.redistribution_stake,
+			op.ctx.state.stakes.total == op.vault.redistribution_stake,
 			Error::<T>::NotLastEligibleVault
 		);
 
-		T::VaultLists::remove(op.rate_list(), &owner)
+		T::VaultLists::remove(&op.ctx.rate_list(), &owner)
 			.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
-		op.state.set_vault_stake(&mut op.vault, BalanceOf::<T>::zero());
-		recovery::append::<T>(&mut op.state, &op.collateral_id, &op.stable_id, owner.clone())?;
+		op.ctx.state.set_vault_stake(&mut op.vault, BalanceOf::<T>::zero());
+		recovery::append::<T>(
+			&mut op.ctx.state,
+			&op.ctx.collateral_id,
+			&op.ctx.stable_id,
+			owner.clone(),
+		)?;
 
 		Self::deposit_event(Event::VaultStatusChanged {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner,
 			old_status: VaultStatus::Active,
 			new_status: VaultStatus::FinalRecovery,
@@ -630,7 +642,7 @@ impl<T: Config> Pallet<T> {
 		let mut op = op.touch(&owner)?;
 		ensure!(op.status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
 
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		let collateral = op.vault.collateral;
 		let total_debt = op.vault.debt.total();
 		Self::ensure_at_or_above_mcr(collateral, total_debt, price, &config)?;
@@ -638,27 +650,22 @@ impl<T: Config> Pallet<T> {
 		let rejoin_active = total_debt >= config.minimum_debt;
 		let new_status = if rejoin_active { VaultStatus::Active } else { VaultStatus::Dormant };
 
-		recovery::remove::<T>(&op.collateral_id, &op.stable_id, &owner)?;
-		op.state.set_vault_stake(&mut op.vault, collateral);
-		op.vault.redistribution_snapshot = op.state.redistribution;
+		recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, &owner)?;
+		op.ctx.state.set_vault_stake(&mut op.vault, collateral);
+		op.vault.redistribution_snapshot = op.ctx.state.redistribution;
 		if !rejoin_active &&
 			!total_debt.is_zero() &&
-			!op.state.try_park_dormant_target(owner.clone())
+			!op.ctx.state.try_park_dormant_target(owner.clone())
 		{
 			return Err(Error::<T>::DormantTargetOccupied.into());
 		}
 		if rejoin_active {
-			T::VaultLists::insert(
-				op.rate_list().clone(),
-				owner.clone(),
-				op.vault.annual_rate,
-				hint,
-			)
-			.map_err(Self::map_error)?;
+			T::VaultLists::insert(op.ctx.rate_list(), owner.clone(), op.vault.annual_rate, hint)
+				.map_err(Self::map_error)?;
 		}
 		Self::deposit_event(Event::VaultStatusChanged {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner,
 			old_status: VaultStatus::FinalRecovery,
 			new_status,
@@ -677,16 +684,16 @@ impl<T: Config> Pallet<T> {
 		op.ensure_not_frozen()?;
 		let mut op = op.touch(&owner)?;
 		ensure!(op.status.is_dormant(), Error::<T>::InvalidVaultStatus);
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		ensure!(op.vault.debt.total() >= config.minimum_debt, Error::<T>::DebtBelowMinimum);
 
-		T::VaultLists::insert(op.rate_list().clone(), owner.clone(), op.vault.annual_rate, hint)
+		T::VaultLists::insert(op.ctx.rate_list(), owner.clone(), op.vault.annual_rate, hint)
 			.map_err(Self::map_error)?;
-		op.state.release_dormant_target(&owner);
+		op.ctx.state.release_dormant_target(&owner);
 
 		Self::deposit_event(Event::VaultStatusChanged {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner,
 			old_status: VaultStatus::Dormant,
 			new_status: VaultStatus::Active,
