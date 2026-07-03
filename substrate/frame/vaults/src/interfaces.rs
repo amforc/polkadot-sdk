@@ -43,14 +43,14 @@ impl<T: Config>
 
 		let post_touch_debt = op.vault.debt.total();
 		let held = op.vault.collateral;
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		let cr =
 			pusd_primitives::collateralization_ratio::<BalanceOf<T>>(held, post_touch_debt, price)
 				.ok_or(Error::<T>::VaultNotLiquidatable)?;
 		ensure!(cr < config.minimum_collateralization_ratio, Error::<T>::VaultNotLiquidatable);
 
 		ensure!(
-			op.state.stakes.total != op.vault.redistribution_stake,
+			op.ctx.state.stakes.total != op.vault.redistribution_stake,
 			Error::<T>::LastVaultCannotBeLiquidated
 		);
 
@@ -68,32 +68,33 @@ impl<T: Config>
 		ensure!(total_paid_out <= held, Error::<T>::InvalidLiquidationAllocation);
 
 		let redistributed_debt = post_touch_debt.saturating_sub(allocation.offset.debt);
-		op.state.detach_vault(&op.vault);
-		op.state.release_dormant_target(owner);
+		op.ctx.state.detach_vault(&op.vault);
+		op.ctx.state.release_dormant_target(owner);
 		// Redistributed collateral stays branch-owned until recipient touch.
 		let non_redistribution_out = held.saturating_sub(allocation.redistribution_collateral);
-		op.state.remove_collateral(non_redistribution_out);
+		op.ctx.state.remove_collateral(non_redistribution_out);
 		if !redistributed_debt.is_zero() || !allocation.redistribution_collateral.is_zero() {
-			op.state
+			op.ctx
+				.state
 				.record_redistribution(
 					redistributed_debt,
 					allocation.redistribution_collateral,
-					op.now,
+					op.ctx.now,
 				)
 				.ok_or(Error::<T>::RedistributionWouldOverflow)?;
 		}
 
-		match T::VaultLists::remove(op.rate_list(), owner) {
+		match T::VaultLists::remove(&op.ctx.rate_list(), owner) {
 			Ok(()) | Err(ListError::ItemNotFound) => {},
 			Err(_) => return Err(Error::<T>::RateIndexInvariantBroken.into()),
 		}
 
 		if !allocation.redistribution_collateral.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
-				op.collateral_id.clone(),
+				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
-				&Pallet::<T>::redistribution_account(&op.collateral_id, &op.stable_id),
+				&Pallet::<T>::redistribution_account(&op.ctx.collateral_id, &op.ctx.stable_id),
 				allocation.redistribution_collateral,
 				Precision::Exact,
 				Restriction::OnHold,
@@ -103,7 +104,7 @@ impl<T: Config>
 
 		if !allocation.offset.collateral.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
-				op.collateral_id.clone(),
+				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
 				&allocation.offset.recipient,
@@ -116,7 +117,7 @@ impl<T: Config>
 
 		if !allocation.keeper.collateral.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
-				op.collateral_id.clone(),
+				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
 				&allocation.keeper.recipient,
@@ -132,7 +133,7 @@ impl<T: Config>
 		let leftover = held.saturating_sub(total_paid_out);
 		if !leftover.is_zero() {
 			T::CollateralAssets::release(
-				op.collateral_id.clone(),
+				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
 				leftover,
@@ -193,7 +194,7 @@ impl<T: Config>
 			VaultStatus::Active => RedemptionRegime::Ordinary,
 			VaultStatus::Dormant => RedemptionRegime::Dormant,
 			VaultStatus::FinalRecovery => RedemptionRegime::FinalRecovery {
-				redistribution_penalty: op.config()?.redistribution_penalty,
+				redistribution_penalty: op.ctx.config()?.redistribution_penalty,
 			},
 		};
 		let post_touch_debt = op.vault.debt.total();
@@ -225,7 +226,7 @@ impl<T: Config>
 
 		if !allocation.collateral_to_redeemer.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
-				op.collateral_id.clone(),
+				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
 				&allocation.redeemer,
@@ -236,24 +237,25 @@ impl<T: Config>
 			)?;
 		}
 
-		let config = op.config()?;
+		let config = op.ctx.config()?;
 		let new_total = op.vault.debt.total();
 		let stake_changes = matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) &&
 			!allocation.collateral_to_redeemer.is_zero();
-		op.state
+		op.ctx
+			.state
 			.apply_debt_payment(payment, op.vault.annual_rate, op.vault.debt.principal);
-		op.state.remove_collateral(allocation.collateral_to_redeemer);
+		op.ctx.state.remove_collateral(allocation.collateral_to_redeemer);
 		op.vault.collateral = op.vault.collateral.saturating_sub(allocation.collateral_to_redeemer);
 		if stake_changes {
 			let new_stake =
 				op.vault.redistribution_stake.saturating_sub(allocation.collateral_to_redeemer);
-			op.state.set_vault_stake(&mut op.vault, new_stake);
+			op.ctx.state.set_vault_stake(&mut op.vault, new_stake);
 		}
 		if matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) {
 			if new_total.is_zero() {
-				op.state.release_dormant_target(owner);
+				op.ctx.state.release_dormant_target(owner);
 			} else if new_total < config.minimum_debt &&
-				!op.state.try_park_dormant_target(owner.clone())
+				!op.ctx.state.try_park_dormant_target(owner.clone())
 			{
 				return Err(Error::<T>::DormantTargetOccupied.into());
 			}
@@ -262,8 +264,8 @@ impl<T: Config>
 		settle_redemption_status::<T>(&mut op, &config)?;
 
 		Pallet::<T>::deposit_event(Event::VaultRedeemed {
-			collateral_id: op.collateral_id.clone(),
-			stable_id: op.stable_id.clone(),
+			collateral_id: op.ctx.collateral_id.clone(),
+			stable_id: op.ctx.stable_id.clone(),
 			owner: owner.clone(),
 			redeemer: allocation.redeemer.clone(),
 			debt_cancelled: allocation.debt_to_cancel,
@@ -291,21 +293,21 @@ impl<T: Config>
 		let residual = op.vault.debt.total();
 		// Collateral lives on the vault row; the leftover here is sub-atom dust.
 		let dust = op.vault.collateral;
-		op.state.detach_vault(&op.vault);
-		op.state.record_bad_debt(residual);
-		op.state.remove_collateral(dust);
-		let swept = if op.state.is_empty_of_liability() {
-			op.state.sweep_orphan_debt()
+		op.ctx.state.detach_vault(&op.vault);
+		op.ctx.state.record_bad_debt(residual);
+		op.ctx.state.remove_collateral(dust);
+		let swept = if op.ctx.state.is_empty_of_liability() {
+			op.ctx.state.sweep_orphan_debt()
 		} else {
 			BalanceOf::<T>::zero()
 		};
-		recovery::remove::<T>(&op.collateral_id, &op.stable_id, owner)?;
+		recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, owner)?;
 
 		// Release only this market's residual dust from the shared hold before the
 		// vault row vanishes; the owner's hold may still back other markets.
 		if !dust.is_zero() {
 			T::CollateralAssets::release(
-				op.collateral_id.clone(),
+				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
 				dust,
@@ -315,15 +317,15 @@ impl<T: Config>
 
 		if !swept.is_zero() {
 			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id: op.collateral_id.clone(),
-				stable_id: op.stable_id.clone(),
+				collateral_id: op.ctx.collateral_id.clone(),
+				stable_id: op.ctx.stable_id.clone(),
 				amount: swept,
 			});
 		}
 		if !residual.is_zero() {
 			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id: op.collateral_id.clone(),
-				stable_id: op.stable_id.clone(),
+				collateral_id: op.ctx.collateral_id.clone(),
+				stable_id: op.ctx.stable_id.clone(),
 				amount: residual,
 			});
 		}
@@ -348,14 +350,14 @@ fn settle_redemption_status<T: Config>(
 	let new_total = op.vault.debt.total();
 	match op.status {
 		VaultStatus::Active if new_total < config.minimum_debt => {
-			T::VaultLists::remove(op.rate_list(), &op.owner)
+			T::VaultLists::remove(&op.ctx.rate_list(), &op.owner)
 				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		},
 		VaultStatus::FinalRecovery if new_total.is_zero() => {
-			recovery::remove::<T>(&op.collateral_id, &op.stable_id, &op.owner)?;
+			recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, &op.owner)?;
 			let new_stake = op.vault.collateral;
-			op.state.set_vault_stake(&mut op.vault, new_stake);
-			op.vault.redistribution_snapshot = op.state.redistribution;
+			op.ctx.state.set_vault_stake(&mut op.vault, new_stake);
+			op.vault.redistribution_snapshot = op.ctx.state.redistribution;
 		},
 		_ => {},
 	}
