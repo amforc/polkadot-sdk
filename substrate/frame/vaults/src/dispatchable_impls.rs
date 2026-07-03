@@ -9,7 +9,7 @@ use crate::{
 	types::{
 		AdminLevel, BranchAdminInfo, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchDebt,
 		BranchMode, BranchStakes, BranchState, FrozenReason, FrozenState, RedistributionSnapshot,
-		Vault, VaultDebt, VaultStatus,
+		VaultDebt, VaultStatus,
 	},
 };
 use frame::{
@@ -610,12 +610,7 @@ impl<T: Config> Pallet<T> {
 		T::VaultLists::remove(&op.ctx.rate_list(), &owner)
 			.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		op.ctx.state.set_vault_stake(&mut op.vault, BalanceOf::<T>::zero());
-		recovery::append::<T>(
-			&mut op.ctx.state,
-			&op.ctx.collateral_id,
-			&op.ctx.stable_id,
-			owner.clone(),
-		)?;
+		recovery::append::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, owner.clone())?;
 
 		Self::deposit_event(Event::VaultStatusChanged {
 			collateral_id: op.ctx.collateral_id.clone(),
@@ -756,7 +751,6 @@ impl<T: Config> Pallet<T> {
 				ownerless_collateral: Zero::zero(),
 				redistribution: RedistributionSnapshot::default(),
 				interest_epoch: now,
-				next_final_recovery_nonce: 0,
 				dormant_redemption_target: None,
 				frozen: None,
 				effective_ceiling: initial_ceiling,

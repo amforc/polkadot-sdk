@@ -70,8 +70,8 @@ pub struct FrozenState {
 /// `(collateral_id, stable_id)` market.
 ///
 /// `Rate(collateral, stable)` is the active-vault rate index.
-/// `FinalRecovery(collateral, stable)` is the per-market recovery FIFO, using a
-/// monotonically increasing insertion sequence as the stored priority.
+/// `FinalRecovery(collateral, stable)` is the per-market recovery FIFO; each
+/// append derives its stored priority from the current head, one above it.
 #[derive(
 	Encode,
 	Decode,
@@ -299,7 +299,6 @@ pub struct BranchState<AccountId, Balance> {
 	/// units rather than raw wall-clock time so that freezing a branch suspends
 	/// accrual without ever rewinding the clock. See [`Self::interest_time`].
 	pub interest_epoch: Millis,
-	pub next_final_recovery_nonce: u128,
 	pub dormant_redemption_target: Option<AccountId>,
 	pub frozen: Option<FrozenState>,
 	/// Autoline current line — the self-adjusting borrow cap, maintained while
@@ -754,7 +753,6 @@ mod tests {
 			ownerless_collateral: 0,
 			redistribution: RedistributionSnapshot::default(),
 			interest_epoch: 0,
-			next_final_recovery_nonce: 0,
 			dormant_redemption_target: None,
 			frozen: None,
 			effective_ceiling: 0,

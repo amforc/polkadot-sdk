@@ -5,8 +5,8 @@
 //! math and passes the resulting `RedemptionAllocation` to `redeem_step`.
 
 use crate::{
-	pallet::{BalanceOf, Config, Error, Event, Pallet},
-	types::{BranchState, VaultListId},
+	pallet::{Config, Error},
+	types::VaultListId,
 };
 use alloc::vec::Vec;
 use frame::prelude::*;
@@ -21,8 +21,13 @@ pub(crate) fn list_id<T: Config>(
 }
 
 /// Append `owner` to the per-branch FIFO.
+///
+/// The insertion priority is derived from the current head: one above it, so
+/// it is strictly greater than every present priority — FIFO order holds
+/// across arbitrary enter/exit interleavings, the stored priorities stay
+/// distinct (the linked list's permissionless re-anchoring can never legally
+/// relocate a member), and the sequence resets whenever the list empties.
 pub fn append<T: Config>(
-	state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 	collateral_id: &T::CollateralAssetId,
 	stable_id: &T::StableAssetId,
 	owner: T::AccountId,
@@ -30,20 +35,25 @@ pub fn append<T: Config>(
 	let list_id = list_id::<T>(collateral_id, stable_id);
 	ensure!(!T::VaultLists::contains(&list_id, &owner), Error::<T>::FinalRecoveryInvariantBroken,);
 
-	let nonce = state.next_final_recovery_nonce;
-	state.next_final_recovery_nonce =
-		nonce.checked_add(1).ok_or(Error::<T>::FinalRecoverySequenceOverflow)?;
-	let priority = FixedU128::from_inner(nonce);
+	let head = T::VaultLists::head(&list_id);
+	let priority = match &head {
+		Some(head_owner) => {
+			let head_priority = T::VaultLists::priority(&list_id, head_owner)
+				.ok_or(Error::<T>::FinalRecoveryInvariantBroken)?;
+			// Unreachable in practice (u128::MAX consecutive occupied appends);
+			// checked so an overflow can only surface, never wrap.
+			let inner = head_priority
+				.into_inner()
+				.checked_add(1)
+				.ok_or(Error::<T>::FinalRecoveryInvariantBroken)?;
+			FixedU128::from_inner(inner)
+		},
+		None => FixedU128::zero(),
+	};
 
-	let hint = Position { prev: None, next: T::VaultLists::head(&list_id) };
-	T::VaultLists::insert(list_id, owner.clone(), priority, hint)
+	let hint = Position { prev: None, next: head };
+	T::VaultLists::insert(list_id, owner, priority, hint)
 		.map_err(|_| Error::<T>::FinalRecoveryInvariantBroken)?;
-
-	Pallet::<T>::deposit_event(Event::FinalRecoveryEntered {
-		collateral_id: collateral_id.clone(),
-		stable_id: stable_id.clone(),
-		owner,
-	});
 	Ok(())
 }
 
@@ -55,11 +65,6 @@ pub fn remove<T: Config>(
 ) -> Result<(), DispatchError> {
 	T::VaultLists::remove(&list_id::<T>(collateral_id, stable_id), owner)
 		.map_err(|_| Error::<T>::FinalRecoveryInvariantBroken)?;
-	Pallet::<T>::deposit_event(Event::FinalRecoveryExited {
-		collateral_id: collateral_id.clone(),
-		stable_id: stable_id.clone(),
-		owner: owner.clone(),
-	});
 	Ok(())
 }
 
