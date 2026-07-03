@@ -398,3 +398,34 @@ fn frozen_poke_pins_interest_time_without_minting() {
 		assert!(after.is_frozen(), "poke does not clear Frozen");
 	});
 }
+
+// The flat idle walk: a first pass exhausts its budget mid-map and parks the
+// cursor; the second pass finishes the map, wraps by clearing the cursor, and
+// every vault has been refreshed exactly once across the two passes.
+#[test]
+fn on_idle_walk_budgets_touches_and_wraps_the_cursor() {
+	build_and_execute(|| {
+		register_default_branch();
+		// One more vault than `MaxOnIdleVaultRefresh` (4 in the mock).
+		for owner in 1..=5u64 {
+			assert_ok!(open(owner, DOT, 1_000, 500, rate_pct(5, 100)));
+		}
+		advance_time(365 * 24 * 3_600 * 1_000);
+
+		// Placeholder weights are zero, so only the count cap binds.
+		let _ = crate::Pallet::<Test>::on_idle_walk(frame::prelude::Weight::MAX);
+		assert!(
+			crate::pallet::IdleCursor::<Test>::get().is_some(),
+			"budget exhausted mid-map parks the cursor"
+		);
+		let _ = crate::Pallet::<Test>::on_idle_walk(frame::prelude::Weight::MAX);
+		assert!(
+			crate::pallet::IdleCursor::<Test>::get().is_none(),
+			"draining the map wraps by clearing the cursor"
+		);
+		for owner in 1..=5u64 {
+			let vault = Vaults::<Test>::get((DOT, PUSD, owner)).expect("vault stored");
+			assert!(vault.debt.interest > 0, "every vault was touched across the two passes");
+		}
+	});
+}
