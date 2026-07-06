@@ -152,7 +152,9 @@ pub mod pallet {
 		StepOutcome<BalanceOf<T>>,
 	);
 
-	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(1);
+	/// Version 0: a pallet added to a live chain starts with on-chain version 0,
+	/// so any higher declared version would demand a version-set migration.
+	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
 	#[pallet::pallet]
 	#[pallet::storage_version(STORAGE_VERSION)]
@@ -304,6 +306,26 @@ pub mod pallet {
 		InvalidRedemptionConfig,
 	}
 
+	#[pallet::hooks]
+	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		fn integrity_test() {
+			// A zero cap makes `effective_step_cap(0)` zero: the walk never
+			// runs and every redeem fails with `NoRedeemableVault`.
+			assert!(T::MaxRedemptionSteps::get() > 0, "`MaxRedemptionSteps` must be > 0");
+			// An invalid default would reject every market registration at
+			// runtime; under permissionless creation that bricks the pallet.
+			assert!(
+				T::DefaultRedemptionConfig::get().is_valid(),
+				"`DefaultRedemptionConfig` must satisfy `RedemptionConfig::is_valid`"
+			);
+		}
+
+		#[cfg(feature = "try-runtime")]
+		fn try_state(_: BlockNumberFor<T>) -> Result<(), frame::try_runtime::TryRuntimeError> {
+			Self::do_try_state()
+		}
+	}
+
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		/// Swap up to `max_pusd_in` pUSD for collateral at face value, walking
@@ -390,6 +412,29 @@ pub mod pallet {
 			} else {
 				max_steps.min(ceiling)
 			}
+		}
+
+		#[cfg(feature = "try-runtime")]
+		pub(crate) fn do_try_state() -> Result<(), frame::try_runtime::TryRuntimeError> {
+			// Every write path validates before inserting; a stored config
+			// failing here means a path skipped the shared validation.
+			for (_collateral_id, _stable_id, config) in RedemptionConfigs::<T>::iter() {
+				if !config.is_valid() {
+					return Err("stored redemption config fails `is_valid`".into());
+				}
+			}
+			let now = T::TimeProvider::now();
+			for (collateral_id, stable_id, state) in RedemptionStates::<T>::iter() {
+				// Configs are the registration proxy (seeded on registration,
+				// removed on deregistration); fee state must never outlive them.
+				if !RedemptionConfigs::<T>::contains_key(&collateral_id, &stable_id) {
+					return Err("redemption fee state row without a config row".into());
+				}
+				if state.last_fee_operation > now {
+					return Err("`last_fee_operation` is ahead of now".into());
+				}
+			}
+			Ok(())
 		}
 
 		/// Config, price, and decayed-fee-rate setup shared by execution and
