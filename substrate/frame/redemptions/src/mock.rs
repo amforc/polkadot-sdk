@@ -440,6 +440,8 @@ pub fn new_test_ext() -> TestState {
 pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
+		#[cfg(feature = "try-runtime")]
+		crate::Pallet::<Test>::do_try_state().expect("post-test invariants hold");
 	});
 }
 
