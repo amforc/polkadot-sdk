@@ -62,40 +62,91 @@ where
 	(items, priorities)
 }
 
+/// Worst-case relocate fixture shared by `re_insert_relocate` and
+/// `reprioritize_relocate`: seed `s + 5` gap-2 items, target the interior
+/// node `seeded[s + 3]`, and move it to `priorities[0] - 1` — the interior
+/// gap `(seeded[0], seeded[1])`. Returns `(seeded, target, new_priority,
+/// hint)`; see `re_insert_relocate`'s doc for the step-count reasoning.
+fn relocate_fixture<T: Config>(
+	list_id: &T::ListId,
+	s: u32,
+) -> (Vec<T::ItemId>, T::ItemId, T::Priority, Position<T::ItemId>)
+where
+	T::ItemId: Decode,
+	T::Priority: One + Saturating,
+{
+	let s_idx = s as usize;
+	let (seeded, priorities) = seed_chain::<T>(list_id, s + 5);
+	let target = seeded[s_idx + 3].clone();
+	let new_priority = priorities[0].saturating_sub(T::Priority::one());
+	let hint = Position::between(seeded[s_idx].clone(), seeded[s_idx + 1].clone());
+	(seeded, target, new_priority, hint)
+}
+
+/// Shared verify block for the two relocate benchmarks: the target sits in
+/// the destination gap at the new priority, the vacated gap is spliced shut,
+/// and the endpoints are as expected.
+fn assert_relocated<T: Config>(
+	list_id: &T::ListId,
+	seeded: &[T::ItemId],
+	s: u32,
+	target: &T::ItemId,
+	new_priority: T::Priority,
+) {
+	let s_idx = s as usize;
+	let node = ListNodes::<T>::get(list_id, target).expect("relocated item is stored");
+	assert_eq!(node.prev, Some(seeded[0].clone()));
+	assert_eq!(node.next, Some(seeded[1].clone()));
+	assert_eq!(node.priority, new_priority);
+	assert_eq!(
+		ListNodes::<T>::get(list_id, &seeded[s_idx + 2])
+			.expect("old prev is stored")
+			.next,
+		Some(seeded[s_idx + 4].clone())
+	);
+	assert_eq!(Pallet::<T>::head(list_id.clone()), Some(seeded[0].clone()));
+	assert_eq!(Pallet::<T>::tail(list_id.clone()), Some(seeded[s_idx + 4].clone()));
+}
+
 #[benchmarks(
 	where
 		T::ListId: Default,
 		T::ItemId: Decode,
-		T::Priority: One + Bounded + Saturating,
+		T::Priority: One + Saturating,
 )]
 mod benchmarks {
 	use super::*;
 
-	/// `insert` parametric over the hint-repair walk length `s`.
+	/// `insert` parametric over the hint-repair walk length `s`, in the
+	/// worst-case (interior) shape: the final position has BOTH neighbors, so
+	/// the splice writes prev + next + item.
 	///
-	/// Setup: seed `s + 2` items at strictly descending priorities and insert a
-	/// new item with priority above the head. The hint
-	/// `(seeded[s - 1], seeded[s])` (or `(None, seeded[0])` for `s = 0`) sits
-	/// exactly `s` head-ward steps from the correct slot, so the walk runs for
-	/// exactly `s` steps. `s = 0` exercises the immediate-valid-hint path.
+	/// Setup: seed `s + 3` items at strictly descending gap-2 priorities and
+	/// insert a new item at `priorities[0] - 1`, which lands in the interior
+	/// gap `(seeded[0], seeded[1])`. The hint `(seeded[s], seeded[s+1])` sits
+	/// exactly `s` head-ward pure priority-walk steps from that gap (each
+	/// cursor `(seeded[k], seeded[k+1])`, `k >= 1`, has consistent links and
+	/// fails validation only on `prev.priority < priority`). `s = 0` is the
+	/// immediate-valid-hint path with both neighbors present.
 	#[benchmark]
 	fn insert(s: Linear<0, { T::MaxHintRepairSteps::get() }>) -> Result<(), BenchmarkError> {
 		let list_id = T::ListId::default();
 		let s_idx = s as usize;
-		let (seeded, _) = seed_chain::<T>(&list_id, s + 2);
+		let (seeded, priorities) = seed_chain::<T>(&list_id, s + 3);
 		let new_item: T::ItemId = account("new", 0, 0);
-		let new_priority = T::Priority::max_value();
-		let hint = Position {
-			prev: if s_idx == 0 { None } else { Some(seeded[s_idx - 1].clone()) },
-			next: Some(seeded[s_idx].clone()),
-		};
+		let new_priority = priorities[0].saturating_sub(T::Priority::one());
+		let hint = Position::between(seeded[s_idx].clone(), seeded[s_idx + 1].clone());
 
 		#[block]
 		{
 			Pallet::<T>::insert(list_id.clone(), new_item.clone(), new_priority, hint).unwrap();
 		}
 
-		assert_eq!(Pallet::<T>::head(list_id), Some(new_item));
+		let node = ListNodes::<T>::get(&list_id, &new_item).unwrap();
+		assert_eq!(node.prev, Some(seeded[0].clone()));
+		assert_eq!(node.next, Some(seeded[1].clone()));
+		// Interior insert: the head is intentionally untouched.
+		assert_eq!(Pallet::<T>::head(list_id), Some(seeded[0].clone()));
 		Ok(())
 	}
 
@@ -139,33 +190,33 @@ mod benchmarks {
 		assert_eq!(ListNodes::<T>::get(&list_id, &middle).map(|n| n.priority), Some(new_priority),);
 	}
 
-	/// `re_insert` slow path parametric over the hint-repair walk length `s`.
+	/// `re_insert` slow path parametric over the hint-repair walk length `s`,
+	/// in the worst-case middle-to-middle shape: the target has BOTH old
+	/// neighbors (2 splice-out writes), the destination gap has BOTH new
+	/// neighbors (2 splice-in writes), and the two neighborhoods are disjoint
+	/// — 5 unique node writes and `s + 5` unique node reads.
 	///
-	/// Setup: seed `s + 2` items at strictly descending priorities, target the
-	/// tail (`seeded[s + 1]`) so its current neighbors cannot admit the new
-	/// priority (forcing the slow path), and supply a hint that, after the
-	/// internal splice, sits exactly `s` head-ward steps from the new position.
-	/// `s = 0` exercises the splice + immediate-valid-hint path.
+	/// Setup: seed `s + 5` items at strictly descending gap-2 priorities;
+	/// target the interior node `seeded[s + 3]` (old neighbors `seeded[s+2]`,
+	/// `seeded[s+4]`) and move it to `priorities[0] - 1`, i.e. the interior
+	/// gap `(seeded[0], seeded[1])`. The old neighbors cannot admit the new
+	/// priority, forcing the splice path. The splice never touches the hint
+	/// `(seeded[s], seeded[s+1])` or the walked prefix, so the walk takes
+	/// exactly `s` pure head-ward priority steps. `s = 0` exercises the
+	/// splice + immediate-valid-hint path.
 	#[benchmark]
 	fn re_insert_relocate(
 		s: Linear<0, { T::MaxHintRepairSteps::get() }>,
 	) -> Result<(), BenchmarkError> {
 		let list_id = T::ListId::default();
-		let s_idx = s as usize;
-		let (seeded, _) = seed_chain::<T>(&list_id, s + 2);
-		let target = seeded[s_idx + 1].clone();
-		let new_priority = T::Priority::max_value();
-		let hint = Position {
-			prev: if s_idx == 0 { None } else { Some(seeded[s_idx - 1].clone()) },
-			next: Some(seeded[s_idx].clone()),
-		};
+		let (seeded, target, new_priority, hint) = relocate_fixture::<T>(&list_id, s);
 
 		#[block]
 		{
 			Pallet::<T>::re_insert(list_id.clone(), target.clone(), new_priority, hint).unwrap();
 		}
 
-		assert_eq!(Pallet::<T>::head(list_id), Some(target));
+		assert_relocated::<T>(&list_id, &seeded, s, &target, new_priority);
 		Ok(())
 	}
 
@@ -223,33 +274,22 @@ mod benchmarks {
 	}
 
 	/// `reprioritize` on the slow splice path, parametric over the hint-repair
-	/// walk length `s`.
-	///
-	/// Setup: seed `s + 2` items at strictly descending priorities, target the
-	/// tail (`seeded[s + 1]`) so its current neighbors cannot admit the new
-	/// priority (forcing the splice path), drift the authoritative priority
-	/// above the head, and supply a hint that, after the internal splice, sits
-	/// exactly `s` head-ward steps from the new position. `s = 0` exercises the
-	/// splice + immediate-valid-hint path.
+	/// walk length `s`. Same worst-case middle-to-middle shape as
+	/// [`re_insert_relocate`], driven through the dispatchable with the
+	/// authoritative priority drifted to `priorities[0] - 1`.
 	#[benchmark]
 	fn reprioritize_relocate(
 		s: Linear<0, { T::MaxHintRepairSteps::get() }>,
 	) -> Result<(), BenchmarkError> {
 		let list_id = T::ListId::default();
-		let s_idx = s as usize;
-		let (seeded, _) = seed_chain::<T>(&list_id, s + 2);
-		let target = seeded[s_idx + 1].clone();
-		T::PriorityProvider::set_priority(&list_id, &target, T::Priority::max_value());
+		let (seeded, target, new_priority, hint) = relocate_fixture::<T>(&list_id, s);
+		T::PriorityProvider::set_priority(&list_id, &target, new_priority);
 		let caller: T::AccountId = whitelisted_caller();
-		let hint = Position {
-			prev: if s_idx == 0 { None } else { Some(seeded[s_idx - 1].clone()) },
-			next: Some(seeded[s_idx].clone()),
-		};
 
 		#[extrinsic_call]
 		reprioritize(RawOrigin::Signed(caller), list_id.clone(), target.clone(), hint);
 
-		assert_eq!(Pallet::<T>::head(list_id), Some(target));
+		assert_relocated::<T>(&list_id, &seeded, s, &target, new_priority);
 		Ok(())
 	}
 
