@@ -13,7 +13,7 @@ use crate::{
 	weights::WeightInfo,
 };
 use frame::{
-	deps::frame_support::{defensive_assert, storage::with_storage_layer},
+	deps::frame_support::storage::with_storage_layer,
 	prelude::*,
 	traits::{fungibles::Balanced as FungiblesBalanced, OriginTrait, Time},
 };
