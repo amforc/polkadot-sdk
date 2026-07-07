@@ -103,8 +103,7 @@ pub(crate) fn build_and_execute_no_post_check(test: impl FnOnce()) {
 /// from `find_position`. Returns the `repair_steps` count.
 pub(crate) fn insert(list_id: ListId, item: ItemId, priority: Priority) -> u32 {
 	use pallet_linked_list::SortedListInterface;
-	let hint =
-		<LinkedList as SortedListInterface<ListId, ItemId>>::find_position(&list_id, priority);
+	let hint = LinkedList::find_position(list_id, priority);
 	LinkedList::insert(list_id, item, priority, hint).expect("insert succeeds in tests")
 }
 

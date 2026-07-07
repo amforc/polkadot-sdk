@@ -135,14 +135,12 @@ pub fn re_insert_steps_needed<T: Config>(
 	hint: Position<T::ItemId>,
 ) -> u32 {
 	let dry_run = with_transaction_opaque_err::<Outcome, ListError, _>(|| {
-		TransactionOutcome::Rollback(
-			<Pallet<T> as SortedListInterface<T::ListId, T::ItemId>>::re_insert(
-				list_id.clone(),
-				item.clone(),
-				new_priority,
-				hint,
-			),
-		)
+		TransactionOutcome::Rollback(Pallet::<T>::re_insert(
+			list_id.clone(),
+			item.clone(),
+			new_priority,
+			hint,
+		))
 	});
 	match dry_run {
 		Ok(Ok(Outcome::NoOp | Outcome::InPlace)) => 0,
