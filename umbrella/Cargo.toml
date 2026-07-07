@@ -153,6 +153,7 @@ std = [
 	"pallet-session?/std",
 	"pallet-skip-feeless-payment?/std",
 	"pallet-society?/std",
+	"pallet-stability?/std",
 	"pallet-staking-async-ah-client?/std",
 	"pallet-staking-async-rc-client?/std",
 	"pallet-staking-async-runtime-api?/std",
@@ -355,6 +356,7 @@ runtime-benchmarks = [
 	"pallet-session?/runtime-benchmarks",
 	"pallet-skip-feeless-payment?/runtime-benchmarks",
 	"pallet-society?/runtime-benchmarks",
+	"pallet-stability?/runtime-benchmarks",
 	"pallet-staking-async-ah-client?/runtime-benchmarks",
 	"pallet-staking-async-rc-client?/runtime-benchmarks",
 	"pallet-staking-async?/runtime-benchmarks",
@@ -511,6 +513,7 @@ try-runtime = [
 	"pallet-session?/try-runtime",
 	"pallet-skip-feeless-payment?/try-runtime",
 	"pallet-society?/try-runtime",
+	"pallet-stability?/try-runtime",
 	"pallet-staking-async-ah-client?/try-runtime",
 	"pallet-staking-async-rc-client?/try-runtime",
 	"pallet-staking-async?/try-runtime",
@@ -744,6 +747,7 @@ runtime-full = [
 	"pallet-session-benchmarking",
 	"pallet-skip-feeless-payment",
 	"pallet-society",
+	"pallet-stability",
 	"pallet-staking",
 	"pallet-staking-async",
 	"pallet-staking-async-ah-client",
@@ -1820,6 +1824,11 @@ path = "../substrate/frame/transaction-payment/skip-feeless-payment"
 default-features = false
 optional = true
 path = "../substrate/frame/society"
+
+[dependencies.pallet-stability]
+default-features = false
+optional = true
+path = "../substrate/frame/stability"
 
 [dependencies.pallet-staking]
 default-features = false
