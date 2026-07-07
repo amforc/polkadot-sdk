@@ -10,6 +10,28 @@ fn effective_ceiling(collateral: AssetId, stable: StableId) -> Balance {
 	branch_state(collateral, stable).unwrap().effective_ceiling
 }
 
+/// Register a market with the autoline enabled (`gap`/`ttl`), priced at 10.
+/// `line_max` is the static `debt_ceiling` cap.
+fn register_autoline_market(
+	collateral: AssetId,
+	stable: StableId,
+	line_max: Balance,
+	gap: Balance,
+	ttl: Moment,
+) {
+	register_market_with(
+		collateral,
+		stable,
+		FixedU128::from_rational(10u128, 1u128),
+		BranchConfig {
+			debt_ceiling: line_max,
+			ceiling_gap: gap,
+			ceiling_ttl: ttl,
+			..default_branch_config()
+		},
+	);
+}
+
 // A collateral whose global ceiling is the default `0` cannot be borrowed
 // against, even though a market on it can be registered.
 #[test]
@@ -19,7 +41,7 @@ fn collateral_with_zero_ceiling_cannot_be_borrowed() {
 		// Governance pins the global ceiling back to 0 (allow-list off).
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::root(), DOT, 0));
 		assert_noop!(
-			open(1, DOT, 10_000, 2_000, rate_pct(5, 100)),
+			open(1, DOT, PUSD, 10_000, 2_000, rate_pct(5, 100)),
 			Error::<Test>::GlobalDebtCeilingExceeded
 		);
 	});
@@ -35,14 +57,14 @@ fn borrow_breaching_global_ceiling_is_rejected() {
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::root(), DOT, 250));
 
 		// 2_000 PUSD == 200 DOT, fits.
-		assert_ok!(open(1, DOT, 100_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 100_000, 2_000, rate_pct(5, 100)));
 		// Another 1_000 PUSD == 100 DOT => 300 DOT total, breaches.
 		assert_noop!(
-			open(2, DOT, 100_000, 1_000, rate_pct(5, 100)),
+			open(2, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)),
 			Error::<Test>::GlobalDebtCeilingExceeded
 		);
 		// A 400 PUSD borrow == 40 DOT keeps the total at 240 DOT, fits.
-		assert_ok!(open(2, DOT, 100_000, 400, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 100_000, 400, rate_pct(5, 100)));
 	});
 }
 
@@ -59,14 +81,14 @@ fn global_ceiling_is_shared_across_a_collaterals_markets() {
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::root(), DOT, 260));
 
 		// ~200 DOT of debt on the first market (2_000 PUSD plus a small upfront fee).
-		assert_ok!(open_market(1, DOT, PUSD, 100_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 100_000, 2_000, rate_pct(5, 100)));
 		// 1_000 EUSD == 100 DOT on the second would take the shared total past 260 DOT.
 		assert_noop!(
-			open_market(2, DOT, EUSD, 100_000, 1_000, rate_pct(5, 100)),
+			open(2, DOT, EUSD, 100_000, 1_000, rate_pct(5, 100)),
 			Error::<Test>::GlobalDebtCeilingExceeded
 		);
 		// 500 EUSD == 50 DOT fits the remaining shared headroom.
-		assert_ok!(open_market(2, DOT, EUSD, 100_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, EUSD, 100_000, 500, rate_pct(5, 100)));
 	});
 }
 
@@ -87,7 +109,7 @@ fn global_ceiling_counts_all_outstanding_debt() {
 		});
 		// 150 DOT principal + 60 DOT non-principal debt == 210 DOT > the 200 DOT cap.
 		assert_noop!(
-			open(1, DOT, 100_000, 1_500, rate_pct(1, 1_000)),
+			open(1, DOT, PUSD, 100_000, 1_500, rate_pct(1, 1_000)),
 			Error::<Test>::GlobalDebtCeilingExceeded
 		);
 		// Clearing the non-principal debt frees the headroom; the same borrow lands.
@@ -96,7 +118,7 @@ fn global_ceiling_counts_all_outstanding_debt() {
 			state.debt.pending_redistribution_principal = 0;
 			state.debt.bad_debt = 0;
 		});
-		assert_ok!(open(1, DOT, 100_000, 1_500, rate_pct(1, 1_000)));
+		assert_ok!(open(1, DOT, PUSD, 100_000, 1_500, rate_pct(1, 1_000)));
 	});
 }
 
@@ -106,9 +128,9 @@ fn repaying_frees_global_ceiling_headroom() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::root(), DOT, 250));
-		assert_ok!(open(1, DOT, 100_000, 2_000, rate_pct(5, 100))); // 200 DOT
+		assert_ok!(open(1, DOT, PUSD, 100_000, 2_000, rate_pct(5, 100))); // 200 DOT
 		assert_noop!(
-			open(2, DOT, 100_000, 1_000, rate_pct(5, 100)),
+			open(2, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)),
 			Error::<Test>::GlobalDebtCeilingExceeded
 		);
 
@@ -117,7 +139,7 @@ fn repaying_frees_global_ceiling_headroom() {
 		assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 1_500));
 
 		// The freed headroom now admits the previously-rejected borrow.
-		assert_ok!(open(2, DOT, 100_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
 	});
 }
 
@@ -129,11 +151,11 @@ fn autoline_rises_by_gap_only_after_ttl() {
 		register_autoline_market(DOT, PUSD, 10_000, 1_000, DAY_MS);
 		// Initial line is min(gap, line_max) == 1_000.
 		assert_eq!(effective_ceiling(DOT, PUSD), 1_000);
-		assert_ok!(open_market(1, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
 
 		// The line binds: no more can be borrowed yet.
 		assert_noop!(
-			open_market(2, DOT, PUSD, 100_000, 500, rate_pct(5, 100)),
+			open(2, DOT, PUSD, 100_000, 500, rate_pct(5, 100)),
 			Error::<Test>::DebtCeilingExceeded
 		);
 		// Poking before `ttl` does nothing.
@@ -145,7 +167,7 @@ fn autoline_rises_by_gap_only_after_ttl() {
 		assert_ok!(Pallet::<Test>::poke_ceiling(RuntimeOrigin::signed(9), DOT, PUSD));
 		assert_eq!(effective_ceiling(DOT, PUSD), 2_000);
 		// The headroom is now usable.
-		assert_ok!(open_market(2, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
 	});
 }
 
@@ -154,7 +176,7 @@ fn autoline_rises_by_gap_only_after_ttl() {
 fn autoline_falls_instantly() {
 	build_and_execute(|| {
 		register_autoline_market(DOT, PUSD, 10_000, 1_000, DAY_MS);
-		assert_ok!(open_market(1, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
 		advance_time(DAY_MS);
 		assert_ok!(Pallet::<Test>::poke_ceiling(RuntimeOrigin::signed(9), DOT, PUSD));
 		assert_eq!(effective_ceiling(DOT, PUSD), 2_000);
@@ -170,7 +192,7 @@ fn autoline_falls_instantly() {
 		// The lowered line now binds: a new vault whose debt would push branch principal
 		// (301) past 1_301 is rejected — though it would have fit under the old 2_000.
 		assert_noop!(
-			open_market(2, DOT, PUSD, 100_000, 1_100, rate_pct(5, 100)),
+			open(2, DOT, PUSD, 100_000, 1_100, rate_pct(5, 100)),
 			Error::<Test>::DebtCeilingExceeded
 		);
 	});
@@ -181,7 +203,7 @@ fn autoline_falls_instantly() {
 fn autoline_does_not_rise_while_frozen() {
 	build_and_execute(|| {
 		register_autoline_market(DOT, PUSD, 10_000, 1_000, DAY_MS);
-		assert_ok!(open_market(1, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
 		assert_ok!(Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 
 		advance_time(DAY_MS);
@@ -200,10 +222,10 @@ fn autoline_expansion_cannot_exceed_global_ceiling() {
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::root(), DOT, 250));
 
 		// 2_000 PUSD == 200 DOT fits.
-		assert_ok!(open_market(1, DOT, PUSD, 100_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 100_000, 2_000, rate_pct(5, 100)));
 		// The autoline line (1_000_000) clears this, but the global cap (250 DOT) does not.
 		assert_noop!(
-			open_market(2, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)),
+			open(2, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)),
 			Error::<Test>::GlobalDebtCeilingExceeded
 		);
 	});

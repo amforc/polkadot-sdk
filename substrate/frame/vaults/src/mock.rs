@@ -3,8 +3,8 @@
 //! Conventions used in the tests:
 //! - Collateral `AssetId::Native` routes to `Balances`; `AssetId::WithId(asset)` routes to
 //!   `AssetsHolder`.
-//! - Stablecoins are plain `pallet-assets` ids: [`PUSD`] (dotUSD) is the default coin every helper
-//!   mints; [`EUSD`] (ethUSD) is the second coin used by the multi-stablecoin tests.
+//! - Stablecoins are plain `pallet-assets` ids: [`PUSD`] (dotUSD) is the coin most tests trade;
+//!   [`EUSD`] (ethUSD) is the second coin used by the multi-stablecoin tests.
 //! - `AccountId = u64`. Per-market redistribution sub-account derivation is exercised in production
 //!   (`AccountId32`); a `u64` account is too narrow to keep those sub-accounts distinct, so the
 //!   mock does not assert their independence.
@@ -102,12 +102,8 @@ impl pallet_balances::Config for Test {
 	type RuntimeHoldReason = RuntimeHoldReason;
 }
 
-impl pallet_timestamp::Config for Test {
-	type Moment = Moment;
-	type OnTimestampSet = ();
-	type MinimumPeriod = ConstU64<1>;
-	type WeightInfo = ();
-}
+#[derive_impl(pallet_timestamp::config_preludes::TestDefaultConfig)]
+impl pallet_timestamp::Config for Test {}
 
 #[derive_impl(pallet_assets::config_preludes::TestDefaultConfig as pallet_assets::DefaultConfig)]
 impl pallet_assets::Config for Test {
@@ -212,12 +208,8 @@ pub fn mutate_branch_state(
 
 /// Derived branch mode (`None` when the market is unknown or the mode cannot
 /// be computed), for tests observing Normal/Safety/Frozen transitions.
-pub fn branch_mode(collateral: &AssetId, stable: &StableId) -> Option<BranchMode> {
-	crate::Pallet::<Test>::current_mode(collateral, stable).ok()
-}
-
-pub fn set_oracle_available(v: bool) {
-	MockOracleAvailable::set(v);
+pub fn branch_mode(collateral: AssetId, stable: StableId) -> Option<BranchMode> {
+	crate::Pallet::<Test>::current_mode(&collateral, &stable).ok()
 }
 
 /// Account the protocol's fee residual resolves into, so tests can assert the
@@ -329,7 +321,7 @@ parameter_types! {
 			min_minimum_debt: 100,
 			min_minimum_collateral: 1,
 			max_borrow_rate: FixedU128::from_rational(400u128, 100u128),
-			max_branch_line: 1_000_000_000,
+			max_branch_line: 1_000_000_000_000_000,
 			max_ceiling_gap: 1_000_000_000,
 			min_ceiling_ttl: 24 * 3_600 * 1_000,
 		};
@@ -407,16 +399,8 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId, Balance> for M
 	}
 }
 
-pub fn rate_list(collateral: AssetId) -> VaultList {
-	pallet_vaults::VaultListId::Rate(collateral, PUSD)
-}
-
-pub fn final_recovery_list(collateral: AssetId) -> VaultList {
-	pallet_vaults::VaultListId::FinalRecovery(collateral, PUSD)
-}
-
-/// Rate index list id for an explicit market.
-pub fn rate_list_for(collateral: AssetId, stable: StableId) -> VaultList {
+/// Rate index list id for a market.
+pub fn rate_list(collateral: AssetId, stable: StableId) -> VaultList {
 	pallet_vaults::VaultListId::Rate(collateral, stable)
 }
 
@@ -445,6 +429,21 @@ pub const PUSD: StableId = 1_000;
 /// Second stablecoin ("ethUSD") on a different peg.
 pub const EUSD: StableId = 1_001;
 
+/// Stablecoin with 6 decimals, minimum balance 0.01 UNIT.
+pub const USDX: StableId = 1_002;
+/// One whole USDX in minor units (6 decimals).
+pub const USD: Balance = 1_000_000;
+/// USDX minimum balance: $0.01.
+pub const USDX_ED: Balance = USD / 100;
+
+/// Stablecoin with 10 decimals, minimum balance 0.01 UNIT.
+pub const XBT_ID: AssetIdForAssets = 5;
+pub const XBT: AssetId = AssetId::WithId(XBT_ID);
+/// One whole XBT in minor units (10 decimals).
+pub const XBT_UNIT: Balance = 10_000_000_000;
+/// XBT minimum balance: 0.01 token.
+pub const XBT_ED: Balance = XBT_UNIT / 100;
+
 pub fn new_test_ext() -> TestState {
 	let t = RuntimeGenesisConfig {
 		assets: pallet_assets::GenesisConfig {
@@ -455,6 +454,8 @@ pub fn new_test_ext() -> TestState {
 				(COLL_D_ID, 1, true, 1),
 				(PUSD, 1, true, 1),
 				(EUSD, 1, true, 1),
+				(USDX, 1, true, USDX_ED),
+				(XBT_ID, 1, true, XBT_ED),
 			],
 			metadata: vec![],
 			accounts: vec![],
@@ -484,6 +485,12 @@ pub fn new_test_ext() -> TestState {
 				)
 				.expect("mint issued collateral in test setup");
 			}
+			<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
+				XBT_ID,
+				&who,
+				100_000_000 * XBT_UNIT,
+			)
+			.expect("mint realistic collateral in test setup");
 		}
 		MockPrices::set(alloc::collections::BTreeMap::new());
 		MockOracleAvailable::set(true);
@@ -522,38 +529,21 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	}
 }
 
-/// Register the default `(DOT, PUSD)` market and price it at 10.
-pub fn register_default_branch() {
-	register_market(DOT, PUSD);
-}
-
-/// Register a `(collateral, PUSD)` market and price it at 10.
-pub fn register_branch_for(collateral: AssetId) {
-	register_market(collateral, PUSD);
-}
-
 /// Default per-collateral global debt ceiling for test markets — high enough
 /// that the global cap never binds unless a test sets a lower one.
 pub const GLOBAL_CEILING: Balance = 1_000_000_000_000_000;
 
-/// Register an explicit `(collateral, stable)` market, price it at 10, and grant
-/// the collateral a high global debt ceiling so borrowing is enabled.
-/// Register a market with the autoline enabled (`gap`/`ttl`) and a high global
-/// ceiling. `line_max` is the static `debt_ceiling` cap.
-pub fn register_autoline_market(
+/// Register a `(collateral, stable)` market at an explicit oracle price and
+/// branch config, and grant the collateral a high global debt ceiling so
+/// borrowing is enabled.
+pub fn register_market_with(
 	collateral: AssetId,
 	stable: StableId,
-	line_max: Balance,
-	gap: Balance,
-	ttl: Moment,
+	price: FixedU128,
+	config: BranchConfig<Balance>,
 ) {
-	let config = BranchConfig {
-		debt_ceiling: line_max,
-		ceiling_gap: gap,
-		ceiling_ttl: ttl,
-		..default_branch_config()
-	};
-	set_price(collateral.clone(), FixedU128::from_rational(10u128, 1u128));
+	// `create_branch` requires a price, so set it before creating.
+	set_price(collateral.clone(), price);
 	pallet_vaults::Pallet::<Test>::create_branch(
 		RuntimeOrigin::root(),
 		collateral.clone(),
@@ -570,23 +560,15 @@ pub fn register_autoline_market(
 	.expect("set global debt ceiling");
 }
 
+/// Register a `(collateral, stable)` market with the default config, priced
+/// at 10.
 pub fn register_market(collateral: AssetId, stable: StableId) {
-	// `create_branch` requires a price, so set it before creating.
-	set_price(collateral.clone(), FixedU128::from_rational(10u128, 1u128));
-	pallet_vaults::Pallet::<Test>::create_branch(
-		RuntimeOrigin::root(),
-		collateral.clone(),
-		stable,
-		branch_admins(ADMIN, EMERGENCY_ADMIN),
-		default_branch_config(),
-	)
-	.expect("create_branch ok");
-	pallet_vaults::Pallet::<Test>::set_global_debt_ceiling(
-		RuntimeOrigin::root(),
+	register_market_with(
 		collateral,
-		GLOBAL_CEILING,
-	)
-	.expect("set global debt ceiling");
+		stable,
+		FixedU128::from_rational(10u128, 1u128),
+		default_branch_config(),
+	);
 }
 
 /// Advance `pallet_timestamp` by `ms` milliseconds without touching block #.
@@ -596,29 +578,8 @@ pub fn advance_time(ms: Moment) {
 	Timestamp::set_timestamp(now + ms);
 }
 
-/// Advance both block number and timestamp by `n` blocks of `ms_per_block`.
-/// Use this for `on_idle`-sensitive tests.
-pub fn advance_blocks(n: u64, ms_per_block: Moment) {
-	for _ in 0..n {
-		let block = System::block_number();
-		System::set_block_number(block + 1);
-		advance_time(ms_per_block);
-	}
-}
-
-/// Open a vault on the default `PUSD` market with `(None, None)` hints.
+/// Open a vault on a `(collateral, stable)` market with endpoints-only hints.
 pub fn open(
-	who: AccountId,
-	collateral: AssetId,
-	collateral_amount: Balance,
-	debt: Balance,
-	rate: FixedU128,
-) -> DispatchResult {
-	open_market(who, collateral, PUSD, collateral_amount, debt, rate)
-}
-
-/// Open a vault on an explicit `(collateral, stable)` market.
-pub fn open_market(
 	who: AccountId,
 	collateral: AssetId,
 	stable: StableId,
@@ -637,26 +598,19 @@ pub fn open_market(
 	)
 }
 
-/// Drive a liquidation on the default `PUSD` market through the trait surface.
-pub fn liquidate(collateral: AssetId, owner: AccountId) -> DispatchResult {
-	liquidate_with(collateral, owner, |post_touch| LiquidationAllocation {
+/// Fully offset the vault's post-touch debt to `owner` through the trait
+/// surface — the simplest allocation that clears the vault.
+pub fn liquidate(collateral: AssetId, stable: StableId, owner: AccountId) -> DispatchResult {
+	liquidate_with(collateral, stable, owner, |post_touch| LiquidationAllocation {
 		offset: OffsetAllocation { recipient: owner, debt: post_touch, collateral: 0 },
 		redistribution_collateral: 0,
 		keeper: KeeperCompensation { recipient: owner, collateral: 0 },
 	})
 }
 
-/// Same as `liquidate` but the caller supplies the post-touch debt allocation.
+/// Liquidate through the trait surface with a caller-supplied allocation
+/// built from the post-touch debt.
 pub fn liquidate_with(
-	collateral: AssetId,
-	owner: AccountId,
-	build: impl FnOnce(Balance) -> LiquidationAllocation<AccountId, Balance>,
-) -> DispatchResult {
-	liquidate_market_with(collateral, PUSD, owner, build)
-}
-
-/// Liquidate on an explicit market with a caller-supplied allocation.
-pub fn liquidate_market_with(
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
@@ -670,18 +624,10 @@ pub fn liquidate_market_with(
 	)
 }
 
-/// Drive a redemption on the default `PUSD` market through the trait surface.
-/// Returns the owner that was redeemed against.
+/// Redeem `amount` against the market's current FIFO target through the trait
+/// surface, paying collateral out at the oracle price. Returns the owner that
+/// was redeemed against.
 pub fn redeem(
-	collateral: AssetId,
-	redeemer: AccountId,
-	amount: Balance,
-) -> Result<AccountId, DispatchError> {
-	redeem_market(collateral, PUSD, redeemer, amount)
-}
-
-/// Redeem on an explicit `(collateral, stable)` market.
-pub fn redeem_market(
 	collateral: AssetId,
 	stable: StableId,
 	redeemer: AccountId,
@@ -691,7 +637,7 @@ pub fn redeem_market(
 		<Pallet<Test> as VaultInterface>::next_redemption_target(&collateral, &stable, None)
 			.ok_or(DispatchError::Other("no redemption target"))?;
 	let price = MockPrices::get().get(&collateral).copied().expect("price set");
-	redeem_step(&collateral, &stable, &owner, |snapshot| {
+	redeem_step(collateral, stable, owner, |snapshot| {
 		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
 		let collateral_to_redeemer =
 			(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
@@ -707,9 +653,9 @@ pub fn redeem_market(
 
 /// One redemption step against an explicit vault, through the trait surface.
 pub fn redeem_step(
-	collateral: &AssetId,
-	stable: &StableId,
-	owner: &AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
 	build_allocation: impl FnOnce(
 		pusd_primitives::RedemptionStepSnapshot<Balance>,
 	) -> Result<
@@ -717,7 +663,7 @@ pub fn redeem_step(
 		DispatchError,
 	>,
 ) -> Result<Option<RedemptionAllocation<AccountId, Balance>>, DispatchError> {
-	<Pallet<Test> as VaultInterface>::redeem_step(collateral, stable, owner, build_allocation)
+	<Pallet<Test> as VaultInterface>::redeem_step(&collateral, &stable, &owner, build_allocation)
 }
 
 /// Held collateral on `(collateral, who)` for the `VaultCollateral` reason.
@@ -735,20 +681,14 @@ pub fn collateral_balance(collateral: AssetId, who: AccountId) -> Balance {
 	<VaultCollateralAssets as FungiblesInspect<AccountId>>::balance(collateral, &who)
 }
 
-/// Default-stablecoin (`PUSD`) balance of `who`.
-pub fn pusd_balance(who: AccountId) -> Balance {
-	stable_balance(PUSD, who)
-}
-
-/// pUSD routed to [`FEE_DEST`] by the `FeeHandler` — the cumulative protocol
-/// fee (upfront-fee and branch-interest residual) in the default coin.
-pub fn fee_dest_balance() -> Balance {
-	stable_balance(PUSD, FEE_DEST)
-}
-
 /// Balance of an explicit stablecoin for `who`.
 pub fn stable_balance(stable: StableId, who: AccountId) -> Balance {
 	<VaultStableAssets as FungiblesInspect<AccountId>>::balance(stable, &who)
+}
+
+/// Total issuance of an explicit stablecoin.
+pub fn total_stable(stable: StableId) -> Balance {
+	<VaultStableAssets as FungiblesInspect<AccountId>>::total_issuance(stable)
 }
 
 /// Native creation deposit currently held against `who`.

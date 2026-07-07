@@ -14,16 +14,21 @@ mod last_vault;
 mod lifecycle;
 mod multi_market;
 mod rate_index;
+mod realistic_scale;
 mod redemptions;
 mod redistribution_accounting;
 mod risk_controls;
 
-use crate::mock::{AccountId, AssetId, FixedU128, Test, PUSD};
+use crate::mock::{AccountId, AssetId, FixedU128, StableId, Test};
 
 pub(super) fn rate_pct(num: u128, denom: u128) -> FixedU128 {
 	FixedU128::from_rational(num, denom)
 }
 
-pub(super) fn vault_status(asset: AssetId, owner: AccountId) -> crate::types::VaultStatus {
-	crate::Pallet::<Test>::vault_status(asset, PUSD, owner).expect("vault status")
+pub(super) fn vault_status(
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+) -> crate::types::VaultStatus {
+	crate::Pallet::<Test>::vault_status(collateral, stable, owner).expect("vault status")
 }

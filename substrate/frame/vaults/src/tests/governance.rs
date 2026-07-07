@@ -116,7 +116,9 @@ fn create_branch_rejects_config_outside_envelope() {
 fn create_branch_rejects_line_above_envelope() {
 	build_and_execute(|| {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		let config = BranchConfig { debt_ceiling: 2_000_000_000, ..default_branch_config() };
+		// One above the guard's `max_branch_line` (10^15).
+		let config =
+			BranchConfig { debt_ceiling: 1_000_000_000_000_001, ..default_branch_config() };
 		assert_noop!(
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
@@ -153,7 +155,7 @@ fn create_branch_rejects_unpriced_collateral() {
 #[test]
 fn full_admin_loosens_within_envelope_but_not_past_floor() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// 110% -> 106% is a loosening the full admin may apply (floor is 105%).
 		assert_ok!(Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
@@ -183,8 +185,8 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 #[test]
 fn remove_branch_requires_empty_market() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(PUSD_OWNER, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
 			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
 			Error::<Test>::MarketNotEmpty
@@ -202,7 +204,7 @@ fn remove_branch_requires_empty_market() {
 #[test]
 fn set_branch_admins_reassigns_authority() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// The emergency admin cannot reassign.
 		assert_noop!(
 			Pallet::<Test>::set_branch_admins(
@@ -242,7 +244,7 @@ fn set_branch_admins_reassigns_authority() {
 #[test]
 fn emergency_admin_can_freeze() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_ok!(Pallet::<Test>::enable_frozen_mode(
 			RuntimeOrigin::signed(EMERGENCY_ADMIN),
 			DOT,
@@ -257,7 +259,7 @@ fn emergency_admin_can_freeze() {
 #[test]
 fn governance_can_freeze_bypassing_admins() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Root is not a branch admin, yet the kill switch passes.
 		assert_ok!(Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
@@ -269,7 +271,7 @@ fn governance_can_freeze_bypassing_admins() {
 #[test]
 fn freeze_and_remove_reject_unauthorized_signers() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		const NOBODY: AccountId = 999;
 		assert_noop!(
 			Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::signed(NOBODY), DOT, PUSD),
@@ -287,8 +289,8 @@ fn freeze_and_remove_reject_unauthorized_signers() {
 #[test]
 fn governance_remove_bypasses_admins_and_requires_empty() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(PUSD_OWNER, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
 			Pallet::<Test>::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
 			Error::<Test>::MarketNotEmpty
@@ -455,8 +457,8 @@ fn create_branch_rejects_autoline_knobs_outside_envelope() {
 #[test]
 fn set_ceiling_knobs_apply_within_envelope() {
 	build_and_execute(|| {
-		register_default_branch(); // autoline off: gap == 0, ttl == 0
-							 // Raise the ttl first (valid while the autoline is still disabled), then the gap.
+		register_market(DOT, PUSD); // autoline off: gap == 0, ttl == 0
+							  // Raise the ttl first (valid while the autoline is still disabled), then the gap.
 		assert_ok!(Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
@@ -500,7 +502,7 @@ fn set_ceiling_knobs_apply_within_envelope() {
 #[test]
 fn remove_branch_rejected_while_bad_debt_remains() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		mutate_branch_state(DOT, PUSD, |state| {
 			state.debt.bad_debt = 1;
 		});
@@ -522,7 +524,7 @@ fn remove_branch_rejected_while_bad_debt_remains() {
 #[test]
 fn remove_branch_rejected_while_collateral_remains() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		mutate_branch_state(DOT, PUSD, |state| {
 			state.total_collateral = 1;
 		});

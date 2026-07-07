@@ -11,16 +11,16 @@ use crate::{mock::*, tests::rate_pct};
 #[test]
 fn debt_in_front_sums_lower_rate_vaults_only() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Eight vaults: 2 each at 0.5%, 0.6%, 0.7%, 0.8% with distinct debts.
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 1000))); // 0.5%
-		assert_ok!(open(2, DOT, 1_000, 700, rate_pct(5, 1000)));
-		assert_ok!(open(3, DOT, 1_000, 600, rate_pct(6, 1000))); // 0.6%
-		assert_ok!(open(4, DOT, 1_000, 800, rate_pct(6, 1000)));
-		assert_ok!(open(5, DOT, 1_000, 900, rate_pct(7, 1000))); // 0.7%
-		assert_ok!(open(6, DOT, 1_000, 1_000, rate_pct(7, 1000)));
-		assert_ok!(open(7, DOT, 1_000, 400, rate_pct(8, 1000))); // 0.8%
-		assert_ok!(open(8, DOT, 1_000, 500, rate_pct(8, 1000)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 1000))); // 0.5%
+		assert_ok!(open(2, DOT, PUSD, 1_000, 700, rate_pct(5, 1000)));
+		assert_ok!(open(3, DOT, PUSD, 1_000, 600, rate_pct(6, 1000))); // 0.6%
+		assert_ok!(open(4, DOT, PUSD, 1_000, 800, rate_pct(6, 1000)));
+		assert_ok!(open(5, DOT, PUSD, 1_000, 900, rate_pct(7, 1000))); // 0.7%
+		assert_ok!(open(6, DOT, PUSD, 1_000, 1_000, rate_pct(7, 1000)));
+		assert_ok!(open(7, DOT, PUSD, 1_000, 400, rate_pct(8, 1000))); // 0.8%
+		assert_ok!(open(8, DOT, PUSD, 1_000, 500, rate_pct(8, 1000)));
 
 		// Query: total debt at rates strictly < 0.7%.
 		// Sum of vaults 1..=4: 500+700+600+800 = 2600.
@@ -46,18 +46,15 @@ fn debt_in_front_sums_lower_rate_vaults_only() {
 	});
 }
 
-// The walk sums recorded *principal*, never the accrued interest folded into a
-// vault's stored debt on touch. Interest is excluded on purpose: it depends on
-// when each vault was last poked, so counting it would make debt-in-front vary
-// with poke timing rather than track the vaults' rate-ordered principal — the
-// stable quantity a redeemer needs to reason about their place in the queue.
+// Interest is excluded on purpose: it varies with poke timing, while
+// debt-in-front tracks the stable, rate-ordered principal.
 #[test]
 fn debt_in_front_counts_principal_not_total_debt() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 5_000, 500, rate_pct(5, 1000))); // 0.5%
-		assert_ok!(open(2, DOT, 5_000, 700, rate_pct(6, 1000))); // 0.6%
-														   // Accrue a year of interest and materialise it into stored debt.
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000))); // 0.5%
+		assert_ok!(open(2, DOT, PUSD, 5_000, 700, rate_pct(6, 1000))); // 0.6%
+																 // Accrue a year of interest and materialise it into stored debt.
 		advance_time(365 * 24 * 3_600 * 1_000);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
@@ -74,18 +71,16 @@ fn debt_in_front_counts_principal_not_total_debt() {
 #[test]
 fn debt_in_front_excludes_dormant_vaults() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 5_000, 500, rate_pct(5, 1000))); // 0.5%, tail
-		assert_ok!(open(2, DOT, 5_000, 700, rate_pct(6, 1000))); // 0.6%
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000))); // 0.5%, tail
+		assert_ok!(open(2, DOT, PUSD, 5_000, 700, rate_pct(6, 1000))); // 0.6%
 		assert_eq!(
 			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX),
 			1_200
 		);
-		// Fully redeem the tail vault (acct 1) → Dormant, out of the rate index.
-		// `redeem` at the vaults-trait layer does not burn the redeemer's pUSD
-		// (the redemptions pallet owns the pUSD leg), so acct 3 needs no funding —
-		// unlike the repay-based tests, where `repay_for` burns the payer's balance.
-		assert_ok!(redeem(DOT, 3, 600));
+		// `redeem` does not burn the redeemer's pUSD (the redemptions pallet owns
+		// that leg), so acct 3 needs no funding — unlike the repay-based tests.
+		assert_ok!(redeem(DOT, PUSD, 3, 600));
 		assert_eq!(
 			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX),
 			700,
@@ -98,10 +93,10 @@ fn debt_in_front_excludes_dormant_vaults() {
 #[test]
 fn debt_in_front_zero_for_no_steps_or_empty_index() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Empty rate index → nothing in front.
 		assert_eq!(crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX), 0);
-		assert_ok!(open(1, DOT, 5_000, 500, rate_pct(5, 1000)));
+		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000)));
 		// A zero step budget visits no vaults.
 		assert_eq!(crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), 0), 0);
 	});

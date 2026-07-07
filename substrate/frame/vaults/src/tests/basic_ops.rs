@@ -11,16 +11,16 @@ use pallet_linked_list::SortedListInterface;
 #[test]
 fn open_vault_fails_without_balance() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert!(open(100, DOT, 1_000, 500, rate_pct(5, 100)).is_err());
+		register_market(DOT, PUSD);
+		assert!(open(100, DOT, PUSD, 1_000, 500, rate_pct(5, 100)).is_err());
 	});
 }
 
 #[test]
 fn adjust_vault_via_deposit_then_borrow() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// +200 collateral.
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
@@ -49,22 +49,22 @@ fn adjust_vault_via_deposit_then_borrow() {
 		// Each 1-unit fee is split per `SpFeeShare` before the residual reaches
 		// FEE_DEST (Permill multiplication rounds 75% of 1 up to 1, leaving 0).
 		let residual_per_fee = 1u128 - SpFeeShare::get() * 1u128;
-		assert_eq!(fee_dest_balance(), 2 * residual_per_fee);
+		assert_eq!(stable_balance(PUSD, FEE_DEST), 2 * residual_per_fee);
 		// Branch aggregate mirrors the vault principal.
 		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.principal, 800);
 		// pUSD net to user: initial 500 + 300 borrowed. The upfront fee is recorded as
 		// debt, not deducted from the minted pUSD the user receives.
-		assert_eq!(pusd_balance(1), 800);
+		assert_eq!(stable_balance(PUSD, 1), 800);
 	});
 }
 
 #[test]
 fn borrow_with_recipient_mints_to_recipient_not_owner() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 2_000, 500, rate_pct(5, 100)));
-		let owner_pre = pusd_balance(1);
-		let recipient_pre = pusd_balance(4);
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 2_000, 500, rate_pct(5, 100)));
+		let owner_pre = stable_balance(PUSD, 1);
+		let recipient_pre = stable_balance(PUSD, 4);
 
 		assert_ok!(crate::Pallet::<Test>::borrow(
 			RuntimeOrigin::signed(1),
@@ -76,8 +76,8 @@ fn borrow_with_recipient_mints_to_recipient_not_owner() {
 			Position::endpoints_only()
 		));
 
-		assert_eq!(pusd_balance(1), owner_pre);
-		assert_eq!(pusd_balance(4), recipient_pre + 300);
+		assert_eq!(stable_balance(PUSD, 1), owner_pre);
+		assert_eq!(stable_balance(PUSD, 4), recipient_pre + 300);
 		let v = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(v.debt.principal, 800);
 	});
@@ -86,8 +86,8 @@ fn borrow_with_recipient_mints_to_recipient_not_owner() {
 #[test]
 fn withdraw_collateral_with_recipient_transfers_to_recipient() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 500, rate_pct(5, 100)));
 		let recipient_pre = collateral_balance(DOT, 4);
 
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
@@ -106,15 +106,15 @@ fn withdraw_collateral_with_recipient_transfers_to_recipient() {
 #[test]
 fn repay_for_by_third_party_burns_payer_balance_and_updates_owner_vault() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 2_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 2_000, 500, rate_pct(5, 100)));
-		let payer_pre = pusd_balance(2);
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 2_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 2_000, 500, rate_pct(5, 100)));
+		let payer_pre = stable_balance(PUSD, 2);
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, PUSD, 1, 100));
 
-		assert_eq!(pusd_balance(2), payer_pre - 100);
+		assert_eq!(stable_balance(PUSD, 2), payer_pre - 100);
 		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(v_post.debt.total(), v_pre.debt.total() - 100);
 	});
@@ -123,13 +123,13 @@ fn repay_for_by_third_party_burns_payer_balance_and_updates_owner_vault() {
 #[test]
 fn close_vault_with_recipient_releases_collateral_to_recipient() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		let v = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		let total = v.debt.total();
-		assert_eq!(redeem(DOT, 3, total).expect("redeem ok"), 1);
-		assert!(vault_status(DOT, 1).is_dormant());
+		assert_eq!(redeem(DOT, PUSD, 3, total).expect("redeem ok"), 1);
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 
 		let residual = held(DOT, 1);
 		let recipient_pre = collateral_balance(DOT, 4);
@@ -154,9 +154,9 @@ fn close_vault_with_recipient_releases_collateral_to_recipient() {
 #[test]
 fn repay_for_to_zero_leaves_dormant_husk() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		let v = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		let total = v.debt.principal + v.debt.interest;
 		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
@@ -171,9 +171,12 @@ fn repay_for_to_zero_leaves_dormant_husk() {
 		let husk = Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk survives");
 		assert_eq!(husk.debt.total(), 0, "debt cleared to zero");
 		assert_eq!(held(DOT, 1), 1_000, "collateral stays held by the vault");
-		assert!(vault_status(DOT, 1).is_dormant(), "zero-debt vault is Dormant");
+		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "zero-debt vault is Dormant");
 		assert!(
-			!<LinkedList as SortedListInterface<VaultList, u64>>::contains(&rate_list(DOT), &1),
+			!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
+				&rate_list(DOT, PUSD),
+				&1
+			),
 			"husk left the rate index"
 		);
 		assert!(
@@ -207,7 +210,7 @@ fn repay_for_to_zero_leaves_dormant_husk() {
 #[test]
 fn poke_missing_vault_errors() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_noop!(
 			crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 99),
 			crate::Error::<Test>::VaultNotFound
@@ -221,9 +224,9 @@ fn poke_missing_vault_errors() {
 #[test]
 fn repay_overpay_burns_only_debt_and_leaves_husk() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// Acct 2's minted pUSD funds the surplus over acct 1's own balance.
 		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&2,
@@ -233,7 +236,7 @@ fn repay_overpay_burns_only_debt_and_leaves_husk() {
 		));
 		let v = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		let total = v.debt.principal + v.debt.interest;
-		let balance_before = pusd_balance(1);
+		let balance_before = stable_balance(PUSD, 1);
 		assert!(balance_before > total, "overpay setup needs a surplus");
 
 		assert_ok!(crate::Pallet::<Test>::repay_for(
@@ -244,7 +247,7 @@ fn repay_overpay_burns_only_debt_and_leaves_husk() {
 			balance_before
 		));
 
-		assert_eq!(pusd_balance(1), balance_before - total, "only the debt burned");
+		assert_eq!(stable_balance(PUSD, 1), balance_before - total, "only the debt burned");
 		let husk = Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk survives");
 		assert_eq!(husk.debt.total(), 0, "debt cleared");
 		assert_eq!(held(DOT, 1), 1_000, "collateral untouched by repay");
@@ -271,18 +274,18 @@ fn repay_overpay_burns_only_debt_and_leaves_husk() {
 #[test]
 fn repay_overpay_rescues_subminimum_dormant_vault() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		// Redeem acct 1 (the rate-index tail) down to exactly MinimumDebt - 1 (199),
 		// the largest sub-minimum residual, so it parks in the Dormant slot.
 		let debt = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total();
-		assert_ok!(redeem(DOT, 3, debt - 199));
-		assert!(vault_status(DOT, 1).is_dormant());
+		assert_ok!(redeem(DOT, PUSD, 3, debt - 199));
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		let residual = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total();
 		assert_eq!(residual, 199, "residual is MinimumDebt - 1");
 
-		let balance_before = pusd_balance(1);
+		let balance_before = stable_balance(PUSD, 1);
 		assert_ok!(crate::Pallet::<Test>::repay_for(
 			RuntimeOrigin::signed(1),
 			DOT,
@@ -291,10 +294,14 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 			balance_before
 		));
 
-		assert_eq!(pusd_balance(1), balance_before - residual, "only the dust residual burned");
+		assert_eq!(
+			stable_balance(PUSD, 1),
+			balance_before - residual,
+			"only the dust residual burned"
+		);
 		let husk = Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk survives");
 		assert_eq!(husk.debt.total(), 0, "sub-minimum dust cleared to zero");
-		assert!(vault_status(DOT, 1).is_dormant());
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 	});
 }
 
@@ -303,12 +310,12 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 #[test]
 fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		// Push acct 1 to Dormant with a small residual debt; it parks the slot.
-		assert_ok!(redeem(DOT, 3, 350));
-		assert!(vault_status(DOT, 1).is_dormant());
+		assert_ok!(redeem(DOT, PUSD, 3, 350));
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_eq!(
 			branch_state(DOT, PUSD).unwrap().dormant_redemption_target,
 			Some(1),
@@ -321,7 +328,7 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&2,
 			&1,
-			total.saturating_sub(pusd_balance(1)),
+			total.saturating_sub(stable_balance(PUSD, 1)),
 			frame::traits::tokens::Preservation::Expendable,
 		));
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, total));
@@ -329,7 +336,7 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 		let husk = Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk survives");
 		assert_eq!(husk.debt.total(), 0);
 		assert_eq!(held(DOT, 1), held_before, "collateral untouched by repay");
-		assert!(vault_status(DOT, 1).is_dormant());
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		let state = branch_state(DOT, PUSD).expect("state");
 		assert_eq!(state.dormant_redemption_target, None, "slot released on repay-to-zero");
 	});
@@ -350,9 +357,9 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 	use frame::traits::fungible::Mutate;
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 400, rate_pct(7, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 400, rate_pct(7, 100)));
 		// Distinct accrual timestamps make several ceiling mints land while
 		// the vaults only ever accrue floors.
 		advance_time(30 * 24 * 3_600 * 1_000);
@@ -379,8 +386,8 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 			1,
 			10_000
 		));
-		assert!(vault_status(DOT, 2).is_dormant(), "vault 2 is a husk");
-		assert!(vault_status(DOT, 1).is_dormant(), "vault 1 is a husk");
+		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "vault 2 is a husk");
+		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "vault 1 is a husk");
 		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.debt.bad_debt, 0, "no sweep while husks still hold stake");
 
@@ -426,7 +433,7 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 fn redemption_slot_rejects_second_owner() {
 	use pusd_primitives::RedemptionAllocation;
 	fn park(owner: AccountId) -> DispatchResult {
-		redeem_step(&DOT, &PUSD, &owner, |snapshot| {
+		redeem_step(DOT, PUSD, owner, |snapshot| {
 			Ok(Some(RedemptionAllocation {
 				redeemer: 7,
 				debt_to_cancel: snapshot.debt - 150,
@@ -440,16 +447,19 @@ fn redemption_slot_rejects_second_owner() {
 		branch_state(DOT, PUSD).expect("branch state").dormant_redemption_target
 	}
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
-		assert_ok!(open(3, DOT, 1_000, 500, rate_pct(3, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(3, 100)));
 
 		assert_ok!(park(1));
 		assert_eq!(parked(), Some(1));
 		assert_eq!(park(2).unwrap_err(), crate::Error::<Test>::DormantTargetOccupied.into());
 		assert_eq!(parked(), Some(1), "slot still points at the first owner");
-		assert!(vault_status(DOT, 1).is_dormant(), "first dormant intact");
-		assert!(vault_status(DOT, 2).is_active(), "second vault stays Active (step rolled back)");
+		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "first dormant intact");
+		assert!(
+			vault_status(DOT, PUSD, 2).is_active(),
+			"second vault stays Active (step rolled back)"
+		);
 	});
 }
