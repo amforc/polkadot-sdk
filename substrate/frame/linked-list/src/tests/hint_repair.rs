@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, ListError, Position, SortedListInterface};
+use crate::{mock::*, ListError, ListNodes, Position, SortedListInterface};
 use frame::testing_prelude::assert_storage_noop;
 
 fn build_chain(priorities: &[(ItemId, Priority)]) {
@@ -142,6 +142,25 @@ fn strict_mode_zero_budget_accepts_valid_hint_rejects_invalid() {
 			LinkedList::insert(1, 300, 70, Position::at_head(100)),
 			Err(ListError::InvalidPositionHints)
 		));
+	});
+}
+
+/// The walk detects the no-progress repair and reports corruption.
+#[test]
+#[should_panic = "repair step made no progress"]
+fn walk_repair_asymmetric_links_is_defensive() {
+	build_and_execute_no_post_check(|| {
+		build_chain(&[(1, 90), (2, 70), (3, 50)]);
+		// Break the back-link: 2.next still names 3, but 3.prev now names 1.
+		ListNodes::<Test>::mutate(1, 3, |maybe| {
+			if let Some(n) = maybe {
+				n.prev = Some(1);
+			}
+		});
+		// Hint (2, 3) with priority 60: the prev side is consistent
+		// (2.next == 3) and admits 60, but the broken back-link makes the
+		// position invalid while the reanchor rewrite is a no-op.
+		let _ = LinkedList::insert(1, 99, 60, Position::between(2, 3));
 	});
 }
 

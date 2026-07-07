@@ -395,18 +395,19 @@ impl pallet_linked_list::Config for Runtime {
 	#[cfg(feature = "runtime-benchmarks")]
 	type PriorityProvider = pallet_linked_list::BenchPriorityProvider<Runtime>;
 	#[cfg(not(feature = "runtime-benchmarks"))]
-	type PriorityProvider = LinkedListNoopPriorityProvider;
+	type PriorityProvider = LinkedListDummyPriorityProvider;
 }
 
-/// No-op `PriorityProvider` for kitchensink's non-benchmark builds: `linked-list`
-/// has no consumer pallet here, so every item is reported as "no authoritative
-/// priority" and `reprioritize` would always remove. Kitchensink just needs the
-/// pallet to compile and benchmark.
-pub struct LinkedListNoopPriorityProvider;
-impl pallet_linked_list::PriorityProvider<u32, u32> for LinkedListNoopPriorityProvider {
+/// Constant-priority `PriorityProvider` for non-benchmark builds.
+/// Real runtimes must (a) implement `PriorityProvider` against their
+/// authoritative state and (b) regenerate this pallet's weights with that
+/// provider wired for benchmarks — the committed weights account for exactly
+/// one storage read of the benchmark-only provider.
+pub struct LinkedListDummyPriorityProvider;
+impl pallet_linked_list::PriorityProvider<u32, u32> for LinkedListDummyPriorityProvider {
 	type Priority = u32;
 	fn priority(_list_id: &u32, _item: &u32) -> Option<u32> {
-		None
+		Some(1)
 	}
 }
 

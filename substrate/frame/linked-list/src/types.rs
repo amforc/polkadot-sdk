@@ -133,6 +133,9 @@ pub enum ListError {
 	CorruptList,
 	/// The supplied hint could not be repaired within `MaxHintRepairSteps`.
 	InvalidPositionHints,
+	/// An internal limit prevented the operation. Not caused by caller input and not
+	/// storage corruption; retrying with a different hint will not help.
+	Internal,
 }
 
 /// Outcome of [`crate::SortedListInterface::re_insert`]. Distinguishes the

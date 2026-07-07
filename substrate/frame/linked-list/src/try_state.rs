@@ -23,17 +23,20 @@
 //!    one `ListNodes` row exists for `list_id`).
 //! 2. When the meta row exists, its `head`/`tail` are both `Some(_)` and `len >= 1`; the head node
 //!    has `prev = None` and the tail node has `next = None`.
-//! 3. Forward and reverse walks visit exactly `meta.len` nodes (capped at `len + 1` to detect
-//!    cycles).
+//! 3. Forward and reverse walks visit exactly `meta.len` nodes (capped at `len + 1` so cyclic
+//!    corruption terminates), every visited node's `prev` matches the walk, and the reverse walk is
+//!    the forward walk reversed. Self-loops, dangling neighbor references, and cross-list
+//!    references all surface through these checks.
 //! 4. Priorities are non-increasing from head to tail.
-//! 5. No node points to itself; every neighbor reference resolves to an existing node in the same
-//!    list.
-//! 6. `ListNodes` has no orphan rows.
+//! 5. `ListNodes` has no orphan rows (total row count equals the chain length).
 
 use crate::pallet::*;
 
 #[cfg(feature = "try-runtime")]
-use alloc::vec::Vec;
+use alloc::{collections::BTreeSet, vec::Vec};
+
+#[cfg(feature = "try-runtime")]
+use codec::Encode;
 
 #[cfg(feature = "try-runtime")]
 use frame::try_runtime::TryRuntimeError;
@@ -43,22 +46,16 @@ impl<T: Config> Pallet<T> {
 	/// Returns the first violation found.
 	#[cfg(feature = "try-runtime")]
 	pub fn do_try_state() -> Result<(), TryRuntimeError> {
-		// Dedup with `Vec::contains` to avoid adding an `Ord` bound on `ListId`.
-		let mut list_ids: Vec<T::ListId> = Vec::new();
-		let push_unique = |list_id: T::ListId, list_ids: &mut Vec<T::ListId>| {
-			if !list_ids.contains(&list_id) {
-				list_ids.push(list_id);
+		// Dedup on the SCALE encoding to avoid an `Ord` bound on `ListId`
+		// while staying O(n log n) over the total row count. `try_state_list`
+		// only reads storage, so running it mid-iteration is safe.
+		let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+		for list_id in
+			ListMetas::<T>::iter_keys().chain(ListNodes::<T>::iter_keys().map(|(b, _)| b))
+		{
+			if seen.insert(list_id.encode()) {
+				Self::try_state_list(&list_id)?;
 			}
-		};
-		for k in ListMetas::<T>::iter_keys() {
-			push_unique(k, &mut list_ids);
-		}
-		for (b, _) in ListNodes::<T>::iter_keys() {
-			push_unique(b, &mut list_ids);
-		}
-
-		for list_id in list_ids {
-			Self::try_state_list(&list_id)?;
 		}
 		Ok(())
 	}
@@ -97,7 +94,10 @@ impl<T: Config> Pallet<T> {
 			return Err("tail node has non-None next".into());
 		}
 
-		// Forward walk: count, link consistency, monotone priorities, no self-loops.
+		// Forward walk: count, link consistency, monotone priorities. Wrong,
+		// missing, or self-looping neighbor links are all caught by the
+		// `node.prev != prev` check, the next iteration's failed fetch, or
+		// the walk cap; per-node `contains_key` probes would be redundant.
 		let cap = stored_size.saturating_add(1) as usize;
 		let mut forward: alloc::vec::Vec<T::ItemId> = alloc::vec::Vec::with_capacity(cap);
 		let mut prev: Option<T::ItemId> = None;
@@ -105,28 +105,14 @@ impl<T: Config> Pallet<T> {
 		let mut last_priority: Option<T::Priority> = None;
 		while let Some(cur) = cursor {
 			if forward.len() >= cap {
-				return Err("forward walk exceeded size+1 (cycle detected)".into());
+				return Err(
+					"forward walk exceeded ListMetas.len + 1 (cycle or undercounted len)".into()
+				);
 			}
 			let node = ListNodes::<T>::get(list_id, &cur)
 				.ok_or::<TryRuntimeError>("forward walk: missing node".into())?;
 			if node.prev != prev {
 				return Err("forward walk: node.prev != expected".into());
-			}
-			if let Some(p) = node.prev.as_ref() {
-				if p == &cur {
-					return Err("self-loop on prev".into());
-				}
-				if !ListNodes::<T>::contains_key(list_id, p) {
-					return Err("prev points to missing node".into());
-				}
-			}
-			if let Some(n) = node.next.as_ref() {
-				if n == &cur {
-					return Err("self-loop on next".into());
-				}
-				if !ListNodes::<T>::contains_key(list_id, n) {
-					return Err("next points to missing node".into());
-				}
 			}
 			if let Some(ls) = last_priority {
 				if node.priority > ls {
@@ -147,7 +133,9 @@ impl<T: Config> Pallet<T> {
 		let mut cursor = Some(tail_id);
 		while let Some(cur) = cursor {
 			if reverse.len() >= cap {
-				return Err("reverse walk exceeded size+1 (cycle detected)".into());
+				return Err(
+					"reverse walk exceeded ListMetas.len + 1 (cycle or undercounted len)".into()
+				);
 			}
 			let node = ListNodes::<T>::get(list_id, &cur)
 				.ok_or::<TryRuntimeError>("reverse walk: missing node".into())?;
