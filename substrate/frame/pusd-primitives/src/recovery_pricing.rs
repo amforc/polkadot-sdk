@@ -206,15 +206,23 @@ mod tests {
 	#[test]
 	fn recovery_bonus_capped_by_penalty_and_buffer() {
 		let penalty = Permill::from_percent(5);
-		let buffer = FixedU128::from_rational(1, 100); // 1%
-												 // CR = 130% → excess = 30% - 1% = 29%, capped at 5%.
+		// A 1% buffer below which no excess is paid out.
+		let buffer = FixedU128::from_rational(1, 100);
+		// CR = 130% → excess = 30% - 1% = 29%, capped at 5%.
 		let cr = FixedU128::from_rational(130, 100);
 		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::from_rational(5, 100));
 		// CR = 102% → excess = 2% - 1% = 1% < 5% cap.
 		let cr = FixedU128::from_rational(102, 100);
 		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::from_rational(1, 100));
+		// CR = 101% sits exactly at 100% + buffer: the excess is zero, so the
+		// buffer guarantees the bonus never reaches into CR − 100% itself.
+		let cr = FixedU128::from_rational(101, 100);
+		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::zero());
 		// CR = 100% → excess saturates to 0.
 		assert_eq!(recovery_bonus(FixedU128::one(), buffer, penalty), FixedU128::zero());
+		// CR below 100% (an underwater vault) → still 0, no underflow.
+		let cr = FixedU128::from_rational(99, 100);
+		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::zero());
 	}
 
 	#[test]
@@ -292,20 +300,25 @@ mod tests {
 	}
 
 	#[test]
-	fn recovery_rate_collateral_out_floors() {
-		// x = 950 at rate 800/950, price 10 → value floor(950 * 0.8421..) = 800,
-		// collateral floor(800/10) = 80.
-		let r = insurance_adjusted::<u128>(1000, 800, 50).expect("below-par split");
-		let price = FixedU128::from_rational(10, 1);
-		let out = recovery_rate_collateral_out::<u128>(950, r.recovery_rate, price)
-			.expect("non-zero price sizes a payout");
-		// Rounding down keeps payout at or just below 80.
-		assert!(out <= 80);
-		assert!(out >= 79);
-		// A zero price cannot size a payout.
+	fn recovery_rate_collateral_out_floors_twice() {
+		// D = 10_000, C = 8_000, IF = 1_000 → market_cancel = 9_000 at a
+		// fixed-point rate truncated just below the true 8_000/9_000.
+		let r = insurance_adjusted::<u128>(10_000, 8_000, 1_000).expect("below-par split");
+		assert_eq!(r.effective_cover, 1_000);
+		assert_eq!(r.market_cancel_debt, 9_000);
+		let price = FixedU128::from_rational(2, 1);
+		// Double flooring is intentional: value first, then collateral units.
+		// x = 3_000: value floor(3_000 · 0.888…) = 2_666, out floor(2_666/2) = 1_333.
 		assert_eq!(
-			recovery_rate_collateral_out::<u128>(950, r.recovery_rate, FixedU128::zero()),
-			None
+			recovery_rate_collateral_out::<u128>(3_000, r.recovery_rate, price),
+			Some(1_333)
+		);
+		// x = 9_000 (the full market debt): the truncated rate already loses one
+		// unit (value 7_999, not 8_000) and the second floor keeps the loss:
+		// out floor(7_999/2) = 3_999 — both floors round against the redeemer.
+		assert_eq!(
+			recovery_rate_collateral_out::<u128>(9_000, r.recovery_rate, price),
+			Some(3_999)
 		);
 	}
 }
