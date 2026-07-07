@@ -10,8 +10,8 @@ fn assert_event(event: crate::Event<Test>) {
 #[test]
 fn open_vault_emits_canonical_events() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(10, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(10, 100)));
 		assert_event(crate::Event::VaultOpened { collateral_id: DOT, stable_id: PUSD, owner: 1 });
 		assert_event(crate::Event::CollateralDeposited {
 			collateral_id: DOT,
@@ -48,8 +48,8 @@ fn open_vault_emits_canonical_events() {
 #[test]
 fn deposit_collateral_emits_collateral_deposited() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
 			DOT,
@@ -71,8 +71,8 @@ fn deposit_collateral_emits_collateral_deposited() {
 #[test]
 fn borrow_emits_borrowed() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(5, 100)));
 		// `None` recipient defaults to the owner; the emitted event confirms it.
 		assert_ok!(crate::Pallet::<Test>::borrow(
 			RuntimeOrigin::signed(1),
@@ -96,8 +96,8 @@ fn borrow_emits_borrowed() {
 #[test]
 fn withdraw_collateral_emits_collateral_withdrawn() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 500, rate_pct(5, 100)));
 		// `None` recipient defaults to the owner; the emitted event confirms it.
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
 			RuntimeOrigin::signed(1),
@@ -119,8 +119,8 @@ fn withdraw_collateral_emits_collateral_withdrawn() {
 #[test]
 fn repay_emits_repaid() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 1_000, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 200));
 		assert_event(crate::Event::Repaid {
 			collateral_id: DOT,
@@ -136,8 +136,8 @@ fn repay_emits_repaid() {
 #[test]
 fn change_rate_emits_borrow_rate_changed() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		// After the cooldown, no fee — only BorrowRateChanged.
 		advance_time(24 * 3_600 * 1_000);
 		assert_ok!(crate::Pallet::<Test>::change_rate(
@@ -160,8 +160,8 @@ fn change_rate_emits_borrow_rate_changed() {
 #[test]
 fn premature_change_rate_emits_upfront_fee_charged() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		// Within the cooldown window — fee charged.
 		advance_time(12 * 3_600 * 1_000);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
@@ -195,8 +195,8 @@ fn premature_change_rate_emits_upfront_fee_charged() {
 #[test]
 fn poke_emits_interest_accrued() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(50, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(50, 100)));
 		advance_time(7 * 24 * 3_600 * 1_000);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
 		// Exact magnitude: 7 days at 50% on 2_000 principal accrues
@@ -214,10 +214,10 @@ fn poke_emits_interest_accrued() {
 #[test]
 fn redemption_emits_vault_redeemed() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(2, 100)));
-		let target = redeem(DOT, 3, 200).expect("redeem ok");
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		let target = redeem(DOT, PUSD, 3, 200).expect("redeem ok");
 		assert_eq!(target, 1);
 		// VaultRedeemed event: don't pin the exact magnitudes (collateral
 		// rounding depends on price), just confirm the event landed.
@@ -240,7 +240,7 @@ fn redemption_emits_vault_redeemed() {
 #[test]
 fn register_branch_emits_branch_registered() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_event(crate::Event::BranchRegistered { collateral_id: DOT, stable_id: PUSD });
 	});
 }
@@ -249,7 +249,7 @@ fn register_branch_emits_branch_registered() {
 #[test]
 fn enable_frozen_mode_emits_mode_changed() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
@@ -273,7 +273,7 @@ fn enable_frozen_mode_emits_mode_changed() {
 #[test]
 fn set_parameter_emits_parameter_updated() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_ok!(crate::Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
@@ -297,7 +297,7 @@ fn set_parameter_emits_parameter_updated() {
 #[test]
 fn debt_ceiling_update_emits_parameter_updated() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_ok!(crate::Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
@@ -317,9 +317,9 @@ fn debt_ceiling_update_emits_parameter_updated() {
 #[test]
 fn enter_final_recovery_emits_status_change() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Single vault that we'll push into FinalRecovery via a price drop.
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(2u128, 100u128));
 		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
 			RuntimeOrigin::signed(2),

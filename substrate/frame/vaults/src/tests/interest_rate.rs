@@ -32,9 +32,9 @@ fn top_up_pusd(who: AccountId, donor: AccountId, delta: Balance) {
 #[test]
 fn open_sets_annual_rate() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(37, 100)));
-		assert_ok!(open(2, DOT, 1_000, 2_000, rate_pct(100, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(37, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 2_000, rate_pct(100, 100)));
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().annual_rate, rate_pct(37, 100));
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().annual_rate, rate_pct(100, 100));
 	});
@@ -43,16 +43,16 @@ fn open_sets_annual_rate() {
 #[test]
 fn open_sets_last_interest_time_to_now() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		let t0 = pallet_timestamp::Pallet::<Test>::get();
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		assert_eq!(
 			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().last_interest_time,
 			interest_time_at(DOT, t0)
 		);
 		advance_time(1_000);
 		let t1 = pallet_timestamp::Pallet::<Test>::get();
-		assert_ok!(open(2, DOT, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		assert_eq!(
 			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().last_interest_time,
 			interest_time_at(DOT, t0)
@@ -79,8 +79,8 @@ fn open_sets_last_interest_time_to_now() {
 #[test]
 fn change_rate_from_non_owner_returns_vault_not_found() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(37, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(37, 100)));
 		assert_noop!(
 			crate::Pallet::<Test>::change_rate(
 				RuntimeOrigin::signed(2),
@@ -101,11 +101,11 @@ fn change_rate_from_non_owner_returns_vault_not_found() {
 #[test]
 fn change_rate_sets_new_rate() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Open three vaults at 50%, then change each to a different rate
 		// after the cooldown elapses (so no upfront fees intrude here).
 		for who in 1u64..=3 {
-			assert_ok!(open(who, DOT, 1_000, 2_000, rate_pct(50, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 2_000, rate_pct(50, 100)));
 		}
 		advance_time(2 * ONE_DAY_MS);
 		assert_ok!(crate::Pallet::<Test>::change_rate(
@@ -145,8 +145,8 @@ fn change_rate_sets_new_rate() {
 #[test]
 fn change_rate_post_cooldown_full_state() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(50, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(50, 100)));
 		let interest_at_open = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest;
 		// Advance one full cooldown, then poke so the elapsed interest is settled
 		// before the rate change (which then has nothing left to materialise).
@@ -189,8 +189,8 @@ fn change_rate_post_cooldown_full_state() {
 #[test]
 fn change_rate_premature_increases_recorded_debt_by_fee() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(50, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(50, 100)));
 		advance_time(ONE_DAY_MS / 2);
 		// Settle pending interest into accrued first so the change_rate
 		// delta isolates the upfront-fee component.
@@ -218,12 +218,12 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 #[test]
 fn collateral_or_debt_adjust_does_not_reorder_dll() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		for (who, pct) in [(1u64, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		let order_before = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			10,
 		);
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
@@ -244,7 +244,7 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 		));
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), DOT, PUSD, 3, 50));
 		let order_after = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			10,
 		);
 		assert_eq!(order_before, order_after);
@@ -260,8 +260,8 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 #[test]
 fn borrow_full_state_changes() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(25, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(25, 100)));
 		advance_time(ONE_DAY_MS);
 		// Settle pending into accrued so the borrow delta isolates the
 		// upfront fee.
@@ -292,9 +292,9 @@ fn borrow_full_state_changes() {
 #[test]
 fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		for (who, pct) in [(1u64, 20), (2, 10), (3, 30)] {
-			assert_ok!(open(who, DOT, 5_000, 2_000, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 5_000, 2_000, rate_pct(pct, 100)));
 		}
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		// The upfront fee is charged at the branch *average* borrow rate (via
@@ -326,7 +326,7 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted);
 		let order = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			10,
 		);
 		assert_eq!(order, alloc::vec![1, 2, 3]);
@@ -343,10 +343,10 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 #[test]
 fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 5_000, 2_000, rate_pct(20, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 5_000, 2_000, rate_pct(20, 100)));
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		let balance_pre = pusd_balance(1);
+		let balance_pre = stable_balance(PUSD, 1);
 
 		assert_noop!(
 			crate::Pallet::<Test>::borrow(
@@ -363,7 +363,7 @@ fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
 		);
 
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap(), v_pre);
-		assert_eq!(pusd_balance(1), balance_pre);
+		assert_eq!(stable_balance(PUSD, 1), balance_pre);
 	});
 }
 
@@ -373,8 +373,8 @@ fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
 #[test]
 fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 5_000, 2_000, rate_pct(20, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 5_000, 2_000, rate_pct(20, 100)));
 		let opened_at = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().last_rate_update;
 
 		// Advance only part-way into the rate-adjustment cooldown so a (buggy)
@@ -420,8 +420,8 @@ fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 #[test]
 fn repay_full_state_changes() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 3_000, rate_pct(25, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 3_000, rate_pct(25, 100)));
 		advance_time(ONE_DAY_MS);
 
 		// Settle pending interest into a known-quantity accrued, then top up
@@ -430,7 +430,7 @@ fn repay_full_state_changes() {
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		// Borrow more pUSD into a second account so we can shuttle some over.
-		assert_ok!(open(2, DOT, 5_000, 3_000, rate_pct(25, 100)));
+		assert_ok!(open(2, DOT, PUSD, 5_000, 3_000, rate_pct(25, 100)));
 		top_up_pusd(1, 2, v_pre.debt.interest + 500);
 
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
@@ -469,8 +469,8 @@ fn repay_full_state_changes() {
 #[test]
 fn poke_full_state_changes() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(25, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(25, 100)));
 		advance_time(ONE_DAY_MS);
 
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
@@ -495,9 +495,9 @@ fn poke_full_state_changes() {
 #[test]
 fn poke_after_full_repayment_pokes_dormant_husk() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(25, 100)));
-		assert_ok!(open(2, DOT, 3_000, 2_000, rate_pct(25, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(25, 100)));
+		assert_ok!(open(2, DOT, PUSD, 3_000, 2_000, rate_pct(25, 100)));
 		// Repay all of vault 1's debt — first poke to settle accrued, then
 		// transfer accrued from vault 2 to cover the residual.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
@@ -506,7 +506,7 @@ fn poke_after_full_repayment_pokes_dormant_husk() {
 		top_up_pusd(1, 2, v.debt.interest);
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, total));
 		// The husk survives as a Dormant zero-debt row and remains pokeable.
-		assert!(vault_status(DOT, 1).is_dormant());
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(3), DOT, PUSD, 1));
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total(), 0);
 	});
@@ -519,11 +519,11 @@ fn poke_after_full_repayment_pokes_dormant_husk() {
 #[test]
 fn redemption_full_state_changes() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Six vaults across ascending rates so the rate index has a clear
 		// "lowest rate" target at the tail.
 		for (who, pct) in [(1u64, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Settle acct 1's recorded interest, then let a full year accrue so it
 		// carries non-zero *pending* interest at redemption time. The redemption
@@ -542,7 +542,7 @@ fn redemption_full_state_changes() {
 		let branch_collateral_pre = branch_state(DOT, PUSD).unwrap().total_collateral;
 		// Redeem 200 pUSD from acct 5 (the redeemer) — the helper uses the
 		// rate-index tail, which is acct 1 (lowest rate).
-		let target = redeem(DOT, 5, 200).expect("redeem ok");
+		let target = redeem(DOT, PUSD, 5, 200).expect("redeem ok");
 		assert_eq!(target, 1);
 
 		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
@@ -573,7 +573,7 @@ fn redemption_full_state_changes() {
 			branch_collateral_pre - collateral_released,
 		);
 
-		assert!(vault_status(DOT, 1).is_active());
+		assert!(vault_status(DOT, PUSD, 1).is_active());
 	});
 }
 
@@ -587,18 +587,22 @@ fn redemption_full_state_changes() {
 #[test]
 fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		let total_pre = <Pusd as FungibleInspect<AccountId>>::total_issuance();
 		let predicted_fee =
 			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100));
 		assert!(predicted_fee > 0);
 
-		assert_ok!(open(1, DOT, 1_000, 2_000, rate_pct(10, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(10, 100)));
 
 		// `DealWithFees` takes the `SpFeeShare` cut; the residual reaches FEE_DEST.
 		let sp_share = SpFeeShare::get() * predicted_fee;
 		let fee_residual = predicted_fee - sp_share;
-		assert_eq!(fee_dest_balance(), fee_residual, "residual fee routed to FEE_DEST in pUSD");
+		assert_eq!(
+			stable_balance(PUSD, FEE_DEST),
+			fee_residual,
+			"residual fee routed to FEE_DEST in pUSD"
+		);
 
 		let total_post = <Pusd as FungibleInspect<AccountId>>::total_issuance();
 		assert_eq!(total_post, total_pre + 2_000 + fee_residual);
@@ -620,15 +624,15 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 #[test]
 fn poke_after_liquidation_applies_redistribution_gains() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 3_000, 2_000, rate_pct(25, 100)));
-		assert_ok!(open(3, DOT, 1_000, 2_000, rate_pct(25, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(25, 100)));
+		assert_ok!(open(3, DOT, PUSD, 1_000, 2_000, rate_pct(25, 100)));
 		set_price(DOT, FixedU128::from_rational(15u128, 10u128));
 
 		let v_a_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		let entire_a_pre = v_a_pre.debt.principal + v_a_pre.debt.interest;
 
-		assert_ok!(liquidate(DOT, 3));
+		assert_ok!(liquidate(DOT, PUSD, 3));
 
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
 		let v_a_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
@@ -648,11 +652,11 @@ fn poke_after_liquidation_applies_redistribution_gains() {
 #[test]
 fn accrued_interest_is_path_independent_across_pokes() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Two identical vaults with a large principal so the daily floor dust is a
 		// negligible fraction. Acct 1 is poked daily; acct 2 only once at the end.
-		assert_ok!(open(1, DOT, 1_000_000, 1_000_000, rate_pct(50, 100)));
-		assert_ok!(open(2, DOT, 1_000_000, 1_000_000, rate_pct(50, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
 		let base1 = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest;
 		let base2 = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.interest;
 
@@ -682,9 +686,9 @@ fn accrued_interest_is_path_independent_across_pokes() {
 #[test]
 fn open_fee_matches_post_open_average_rate_closed_form() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Pre-existing debt at 5% so the average is a genuine blend.
-		assert_ok!(open(1, DOT, 10_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 10_000, 500, rate_pct(5, 100)));
 
 		let state = branch_state(DOT, PUSD).unwrap();
 		let config = branch_config(DOT, PUSD).unwrap();
@@ -701,7 +705,7 @@ fn open_fee_matches_post_open_average_rate_closed_form() {
 			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, new_debt, new_rate),
 			expected
 		);
-		assert_ok!(open(2, DOT, 20_000, new_debt, new_rate));
+		assert_ok!(open(2, DOT, PUSD, 20_000, new_debt, new_rate));
 		let vault = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
 		assert_eq!(vault.debt.interest, expected, "charged fee matches the quote");
 	});

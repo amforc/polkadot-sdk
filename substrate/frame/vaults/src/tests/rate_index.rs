@@ -16,14 +16,14 @@ const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 #[test]
 fn open_orders_dll_by_annual_interest_rate() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Open in scrambled order with distinct rates.
 		for (who, pct) in [(3u64, 30), (1, 5), (5, 50), (2, 10), (4, 40)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Tail-first walk gives ascending rate. Expect [1, 2, 3, 4, 5].
 		let order = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			10,
 		);
 		assert_eq!(order, alloc::vec![1, 2, 3, 4, 5]);
@@ -34,10 +34,10 @@ fn open_orders_dll_by_annual_interest_rate() {
 #[test]
 fn find_rate_position_returns_valid_neighbors() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Vaults at 5%, 10%, 20%, 30%, 50%.
 		for (who, pct) in [(1u64, 5), (2, 10), (3, 20), (4, 30), (5, 50)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Insert position for 15% should be between 10% (acct 2) and 20%
 		// (acct 3). The DLL stores low-at-tail; "prev" walking head-first is
@@ -63,9 +63,9 @@ fn find_rate_position_returns_valid_neighbors() {
 #[test]
 fn repay_to_zero_drops_vault_from_rate_index() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		for (who, pct) in [(1u64, 5), (2, 10), (3, 20), (4, 30), (5, 50)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Repay vault 3 fully (top up the accrued interest from acct 4).
 		let v = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 3)).unwrap();
@@ -79,12 +79,12 @@ fn repay_to_zero_drops_vault_from_rate_index() {
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), DOT, PUSD, 3, total));
 		// The husk is out of the rate index even though its row survives.
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			&3
 		));
 		// Order without acct 3: [1, 2, 4, 5].
 		let order = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			10,
 		);
 		assert_eq!(order, alloc::vec![1, 2, 4, 5]);
@@ -100,9 +100,9 @@ fn repay_to_zero_drops_vault_from_rate_index() {
 #[test]
 fn change_rate_re_inserts_in_correct_position() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		for (who, pct) in [(1u64, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		advance_time(2 * ONE_DAY_MS);
 
@@ -125,7 +125,7 @@ fn change_rate_re_inserts_in_correct_position() {
 
 		// Final ascending order: 3 (5%), 2 (20%), 4 (40%), 5 (50%), 1 (60%).
 		let order = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			10,
 		);
 		assert_eq!(order, alloc::vec![3, 2, 4, 5, 1]);
@@ -137,9 +137,9 @@ fn change_rate_re_inserts_in_correct_position() {
 #[test]
 fn find_re_insert_position_locates_target_and_none_for_unlisted() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		for (who, pct) in [(1u64, 5), (2, 10), (3, 20), (4, 30), (5, 50)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Move vault 3 (currently 20%) to 25%: its own node is skipped, so among
 		// the remaining {5, 10, 30, 50} the new rate sits between 10% (vault 2,
@@ -176,9 +176,9 @@ fn find_re_insert_position_locates_target_and_none_for_unlisted() {
 #[test]
 fn vault_rate_index_neighbors_reports_ends_and_none_when_unlisted() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		for (who, pct) in [(1u64, 5), (2, 10), (3, 20), (4, 30), (5, 50)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Tail = lowest rate (vault 1, 5%): no lower (tail-side) neighbor.
 		let tail = crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 1).expect("listed");
@@ -195,7 +195,7 @@ fn vault_rate_index_neighbors_reports_ends_and_none_when_unlisted() {
 		// A never-opened owner is not in the index.
 		assert_eq!(crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 99), None);
 		// Redeeming the tail vault to zero drops it from the index → no neighbors.
-		assert_ok!(redeem(DOT, 6, 600));
+		assert_ok!(redeem(DOT, PUSD, 6, 600));
 		assert_eq!(crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 1), None);
 	});
 }
