@@ -13,16 +13,11 @@ use crate::{
 };
 use alloc::vec::Vec;
 use frame::{
+	arithmetic::{FixedU128, Permill},
 	benchmarking::prelude::*,
-	deps::{
-		frame_support::traits::{
-			fungibles::{Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold},
-			EnsureOrigin, EnsureOriginWithArg,
-		},
-		sp_runtime::{
-			traits::{SaturatedConversion, Zero},
-			FixedU128, Permill,
-		},
+	traits::{
+		fungibles::{Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold},
+		EnsureOrigin, EnsureOriginWithArg, SaturatedConversion, Zero,
 	},
 };
 use frame_system::RawOrigin;
@@ -305,7 +300,7 @@ fn recovery_cycle<T: Config>(
 fn prefill_branches<T: Config>(count: u32) {
 	// The registry is the `Branches` key set, so each synthetic market seeds a
 	// complete (empty) record.
-	let now = frame::deps::sp_runtime::traits::Zero::zero();
+	let now = Zero::zero();
 	for seed in 0..count {
 		let (collateral, stable) = T::BenchmarkHelper::synth_market(seed);
 		let config = default_branch_config::<T>();
