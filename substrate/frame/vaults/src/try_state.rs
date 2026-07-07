@@ -9,13 +9,8 @@ use crate::{
 };
 use alloc::collections::BTreeMap;
 use frame::{
-	deps::{
-		frame_support::traits::{fungibles::InspectHold, Time},
-		sp_runtime::{
-			traits::{One, Saturating, UniqueSaturatedInto, Zero},
-			FixedPointNumber, FixedU128,
-		},
-	},
+	arithmetic::{FixedPointNumber, FixedU128, One, Saturating, UniqueSaturatedInto, Zero},
+	traits::{fungibles::InspectHold, Time},
 	try_runtime::TryRuntimeError,
 };
 use pallet_linked_list::SortedListInterface;
