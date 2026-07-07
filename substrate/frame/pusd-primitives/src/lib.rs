@@ -10,14 +10,22 @@
 extern crate alloc;
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::deps::sp_runtime::{FixedPointNumber, FixedPointOperand, FixedU128};
+use frame::{
+	arithmetic::{helpers_128bit::multiply_by_rational_with_rounding, Rounding, Zero},
+	deps::sp_runtime::{FixedPointNumber, FixedPointOperand, FixedU128},
+};
 use scale_info::TypeInfo;
 
+pub mod branch_mode;
+pub mod list_id;
 pub mod oracle;
 pub mod recovery_pricing;
 pub mod registration;
 pub mod vault_interface;
+pub mod yield_routing;
 
+pub use branch_mode::{BranchMode, BranchModeProvider};
+pub use list_id::StableListId;
 pub use oracle::ProvidePrice;
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
@@ -25,6 +33,7 @@ pub use vault_interface::{
 	KeeperCompensation, LiquidationAllocation, LiquidationSnapshot, OffsetAllocation,
 	RedemptionAllocation, RedemptionStepSnapshot, VaultInterface,
 };
+pub use yield_routing::OnBranchYield;
 
 /// TODO: Check if this is the best way to handle the "time"
 pub type Millis = u64;
@@ -85,4 +94,28 @@ pub fn collateralization_ratio<Balance: FixedPointOperand>(
 ) -> Option<FixedU128> {
 	let value = price.checked_mul_int(collateral)?;
 	FixedU128::checked_from_rational(value, debt)
+}
+
+/// `floor(value * rate / denominator)` reinterpreted as a `FixedU128` per-unit
+/// delta — the shared per-stake accumulator step for vault redistribution
+/// weights. `Some(0)` when there is nothing to distribute, `None` when the
+/// stake denominator is zero or the product overflows `u128`.
+pub fn mul_div_rate_floor<Balance: FixedPointOperand>(
+	value: Balance,
+	rate: FixedU128,
+	denominator: Balance,
+) -> Option<FixedU128> {
+	if value.is_zero() || rate.is_zero() {
+		return Some(FixedU128::zero());
+	}
+	if denominator.is_zero() {
+		return None;
+	}
+	multiply_by_rational_with_rounding(
+		value.unique_saturated_into(),
+		rate.into_inner(),
+		denominator.unique_saturated_into(),
+		Rounding::Down,
+	)
+	.map(FixedU128::from_inner)
 }
