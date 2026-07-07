@@ -94,7 +94,7 @@ pub mod pallet {
 		},
 	};
 	use pallet_linked_list::{Position, PriorityProvider, SortedListInterface};
-	use pusd_primitives::{OnBranchLifecycle, ProvidePrice};
+	use pusd_primitives::{OnBranchLifecycle, OnBranchYield, ProvidePrice};
 
 	pub type BalanceOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
 		<T as frame_system::Config>::AccountId,
@@ -169,10 +169,19 @@ pub mod pallet {
 
 		/// Destination for minted pUSD fees (branch interest and upfront fees).
 		/// The credit carries the coin (`Credit::asset()`), so a runtime can
-		/// route revenue per stablecoin. The Stability-Pool yield share arrives
-		/// with `pallet-stability-pool`; until then the whole minted amount
-		/// routes here.
+		/// route revenue per stablecoin. Receives what [`Config::YieldHook`]
+		/// leaves.
 		type FeeHandler: OnUnbalanced<StableCreditOf<Self>>;
+
+		/// Takes the Stability Pool's share of every stable-coin credit the
+		/// engine mints for a market (branch interest and upfront fees); the
+		/// remainder goes to [`Config::FeeHandler`]. Runtimes without a pool
+		/// use `()`.
+		type YieldHook: OnBranchYield<
+			Self::CollateralAssetId,
+			Self::StableAssetId,
+			StableCreditOf<Self>,
+		>;
 
 		/// Market lifecycle hook: `register_branch` calls `on_registered` so
 		/// siblings seed their own per-market rows, and `remove_branch` calls
@@ -1114,16 +1123,19 @@ pub mod pallet {
 				VaultListId::Rate(collateral_id, stable_id) => {
 					Vaults::<T>::get((collateral_id, stable_id, item)).map(|v| v.annual_rate)
 				},
-				VaultListId::FinalRecovery(..) => T::VaultLists::priority(list_id, item),
+				// FIFO lists never drift: the stored priority (assigned once
+				// at insertion) is authoritative. This also serves sibling
+				// pallets' FIFO variants on the shared list instance.
+				VaultListId::FinalRecovery(..) | VaultListId::StabilityPending(..) => {
+					T::VaultLists::priority(list_id, item)
+				},
 			}
 		}
 	}
 
 	impl<T: Config> Pallet<T> {
 		/// Per-market account holding that market's redistribution-pending
-		/// collateral. Derived from the `(collateral, stable)` pair via a bounded
-		/// hash preimage so a large asset-id pair cannot overflow the sub-account
-		/// seed and collide across markets.
+		/// collateral.
 		pub fn redistribution_account(
 			collateral_id: &T::CollateralAssetId,
 			stable_id: &T::StableAssetId,

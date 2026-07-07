@@ -860,7 +860,7 @@ impl<T: Config> Pallet<T> {
 						// Flush before freezing so the frozen window accrues nothing.
 						let minted = Self::accrue_aggregate_interest(state, now);
 						if !minted.is_zero() {
-							Self::mint_and_route_yield(stable_id, minted);
+							Self::mint_and_route_yield(collateral_id, stable_id, minted);
 						}
 					},
 					(Some(frozen), None) => {

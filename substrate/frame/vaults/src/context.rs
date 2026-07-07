@@ -245,10 +245,14 @@ impl<T: Config> VaultOp<T> {
 		// Mint only after the state is written; the two amounts stay separate
 		// credits so the fee handler's per-credit rounding is unchanged.
 		if !self.ctx.pending_interest_mint.is_zero() {
-			Pallet::<T>::mint_and_route_yield(&self.ctx.stable_id, self.ctx.pending_interest_mint);
+			Pallet::<T>::mint_and_route_yield(
+				&self.ctx.collateral_id,
+				&self.ctx.stable_id,
+				self.ctx.pending_interest_mint,
+			);
 		}
 		if let Some(fee) = self.ctx.pending_fee {
-			Pallet::<T>::mint_and_route_yield(&self.ctx.stable_id, fee);
+			Pallet::<T>::mint_and_route_yield(&self.ctx.collateral_id, &self.ctx.stable_id, fee);
 		}
 		Ok(())
 	}

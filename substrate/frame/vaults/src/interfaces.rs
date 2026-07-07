@@ -17,9 +17,18 @@ use frame::{
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
-	LiquidationAllocation, LiquidationSnapshot, RedemptionAllocation, RedemptionStepSnapshot,
-	VaultInterface,
+	BranchMode, BranchModeProvider, LiquidationAllocation, LiquidationSnapshot,
+	RedemptionAllocation, RedemptionStepSnapshot, VaultInterface,
 };
+
+impl<T: Config> BranchModeProvider<T::CollateralAssetId, T::StableAssetId> for Pallet<T> {
+	fn branch_mode(
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
+	) -> Result<BranchMode, DispatchError> {
+		Self::current_mode(collateral_id, stable_id)
+	}
+}
 
 impl<T: Config> VaultInterface for Pallet<T> {
 	type CollateralId = T::CollateralAssetId;
