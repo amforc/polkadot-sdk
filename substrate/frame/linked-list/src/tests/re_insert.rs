@@ -77,8 +77,7 @@ fn re_insert_priority_increase_moves_toward_head() {
 		insert(1, 1, 90);
 		insert(1, 2, 50);
 		insert(1, 3, 10);
-		let hint =
-			<LinkedList as SortedListInterface<_, _>>::find_re_insert_position(&1, &3, 95).unwrap();
+		let hint = LinkedList::find_re_insert_position(1, 3, 95).unwrap();
 		assert_eq!(LinkedList::re_insert(1, 3, 95, hint), Ok(Outcome::Relocated { steps: 0 }));
 		assert_eq!(dump(1), vec![(3, 95), (1, 90), (2, 50)]);
 	});
@@ -90,8 +89,7 @@ fn re_insert_priority_decrease_moves_toward_tail() {
 		insert(1, 1, 90);
 		insert(1, 2, 50);
 		insert(1, 3, 10);
-		let hint =
-			<LinkedList as SortedListInterface<_, _>>::find_re_insert_position(&1, &1, 5).unwrap();
+		let hint = LinkedList::find_re_insert_position(1, 1, 5).unwrap();
 		assert_ok!(LinkedList::re_insert(1, 1, 5, hint));
 		assert_eq!(dump(1), vec![(2, 50), (3, 10), (1, 5)]);
 	});

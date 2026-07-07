@@ -51,9 +51,7 @@ where
 	let mut items = Vec::with_capacity(count as usize);
 	for (i, priority) in priorities.iter().enumerate() {
 		let item: T::ItemId = account("seed", i as u32, 0);
-		let hint = <Pallet<T> as SortedListInterface<T::ListId, T::ItemId>>::find_position(
-			list_id, *priority,
-		);
+		let hint = Pallet::<T>::find_position(list_id.clone(), *priority);
 		Pallet::<T>::insert(list_id.clone(), item.clone(), *priority, hint)
 			.expect("benchmark seed insert");
 		items.push(item);
