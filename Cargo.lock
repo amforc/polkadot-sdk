@@ -14508,6 +14508,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet-stability"
+version = "0.1.0"
+dependencies = [
+ "parity-scale-codec",
+ "polkadot-sdk-frame",
+ "scale-info",
+]
+
+[[package]]
 name = "pallet-staking"
 version = "28.0.0"
 dependencies = [
@@ -17572,6 +17581,7 @@ dependencies = [
  "pallet-session-benchmarking",
  "pallet-skip-feeless-payment",
  "pallet-society",
+ "pallet-stability",
  "pallet-staking",
  "pallet-staking-async",
  "pallet-staking-async-ah-client",
