@@ -14,7 +14,7 @@ use pallet_linked_list::SortedListInterface;
 #[test]
 fn register_branch_creates_state() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		let state = branch_state(DOT, PUSD).expect("branch registered");
 		assert_eq!(state.total_collateral, 0);
 		assert!(!state.is_frozen());
@@ -68,7 +68,7 @@ fn create_branch_rejects_unknown_asset() {
 #[test]
 fn create_branch_rejects_duplicate_collateral() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_noop!(
 			crate::Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
@@ -85,8 +85,8 @@ fn create_branch_rejects_duplicate_collateral() {
 #[test]
 fn branches_view_lists_registered_assets_in_registration_order() {
 	build_and_execute(|| {
-		register_default_branch();
-		register_branch_for(TOKEN_X);
+		register_market(DOT, PUSD);
+		register_market(TOKEN_X, PUSD);
 		assert_eq!(crate::Pallet::<Test>::branches(), alloc::vec![(DOT, PUSD), (TOKEN_X, PUSD)]);
 	});
 }
@@ -94,26 +94,29 @@ fn branches_view_lists_registered_assets_in_registration_order() {
 #[test]
 fn open_vault_holds_collateral_and_mints_pusd() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// 1000 DOT @ $10 = $10000 collateral; borrow 1000 pUSD with 5% rate.
-		assert_ok!(open(1, DOT, 1_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
 		let v = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(v.debt.principal, 1_000);
-		assert!(vault_status(DOT, 1).is_active());
-		assert_eq!(pusd_balance(1), 1_000);
+		assert!(vault_status(DOT, PUSD, 1).is_active());
+		assert_eq!(stable_balance(PUSD, 1), 1_000);
 		assert_eq!(held(DOT, 1), 1_000);
 		// Rate index contains the vault.
-		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(&rate_list(DOT), &1));
+		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(
+			&rate_list(DOT, PUSD),
+			&1
+		));
 	});
 }
 
 #[test]
 fn open_vault_rejects_existing_owner_vault() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
-			open(1, DOT, 2_000, 500, rate_pct(5, 100)),
+			open(1, DOT, PUSD, 2_000, 500, rate_pct(5, 100)),
 			crate::Error::<Test>::VaultAlreadyExists
 		);
 	});
@@ -122,9 +125,9 @@ fn open_vault_rejects_existing_owner_vault() {
 #[test]
 fn open_vault_below_min_debt_rejected() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_noop!(
-			open(1, DOT, 1_000, 100, rate_pct(5, 100)), // < min_debt 200
+			open(1, DOT, PUSD, 1_000, 100, rate_pct(5, 100)), // < min_debt 200
 			crate::Error::<Test>::DebtBelowMinimum
 		);
 	});
@@ -133,16 +136,16 @@ fn open_vault_below_min_debt_rejected() {
 #[test]
 fn open_vault_rate_out_of_bounds_rejected() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Below the branch `minimum_borrow_rate` (0.1%).
 		assert_noop!(
-			open(1, DOT, 1_000, 500, rate_pct(0, 1)),
+			open(1, DOT, PUSD, 1_000, 500, rate_pct(0, 1)),
 			crate::Error::<Test>::RateOutOfBounds
 		);
 		// Above the branch `maximum_borrow_rate` (400%): the cap is the
 		// per-branch config bound, not a hard-coded 100%.
 		assert_noop!(
-			open(1, DOT, 1_000, 500, rate_pct(401, 100)),
+			open(1, DOT, PUSD, 1_000, 500, rate_pct(401, 100)),
 			crate::Error::<Test>::RateOutOfBounds
 		);
 	});
@@ -151,9 +154,9 @@ fn open_vault_rate_out_of_bounds_rejected() {
 #[test]
 fn open_vault_exceeds_ceiling_rejected() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_noop!(
-			open(1, DOT, 100_000_000_000, 200_000_000, rate_pct(5, 100)), // > ceiling 100M
+			open(1, DOT, PUSD, 100_000_000_000, 200_000_000, rate_pct(5, 100)), // > ceiling 100M
 			crate::Error::<Test>::DebtCeilingExceeded
 		);
 	});
@@ -162,10 +165,10 @@ fn open_vault_exceeds_ceiling_rejected() {
 #[test]
 fn open_vault_below_icr_rejected() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// 100 DOT @ $10 = $1000; borrow 1000 pUSD => CR=100% < ICR 120%.
 		assert_err!(
-			open(1, DOT, 100, 1_000, rate_pct(5, 100)),
+			open(1, DOT, PUSD, 100, 1_000, rate_pct(5, 100)),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
 	});
@@ -174,7 +177,7 @@ fn open_vault_below_icr_rejected() {
 #[test]
 fn defensive_manager_can_only_tighten_selected_risk_parameters() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 
 		assert_ok!(crate::Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(EMERGENCY_ADMIN),
@@ -223,14 +226,16 @@ fn defensive_manager_can_only_tighten_selected_risk_parameters() {
 #[test]
 fn same_rate_lifo_redemption_order() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Three vaults at the same rate, in order: 1, 2, 3.
 		for who in 1u64..=3 {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(5, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		}
 		// Tail-first iteration produces 3, 2, 1 (LIFO).
-		let tail =
-			<LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(&rate_list(DOT), 5);
+		let tail = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
+			&rate_list(DOT, PUSD),
+			5,
+		);
 		assert_eq!(tail, alloc::vec![3, 2, 1]);
 	});
 }
@@ -242,8 +247,8 @@ fn open_vault_on_multi_asset_branch() {
 	// native DOT. Confirms the union routes hold operations to
 	// `pallet-assets-holder` for non-native ids.
 	build_and_execute(|| {
-		register_branch_for(TOKEN_X);
-		assert_ok!(open(1, TOKEN_X, 1_000, 500, rate_pct(5, 100)));
+		register_market(TOKEN_X, PUSD);
+		assert_ok!(open(1, TOKEN_X, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_eq!(held(TOKEN_X, 1), 1_000);
 	});
 }
@@ -251,14 +256,14 @@ fn open_vault_on_multi_asset_branch() {
 #[test]
 fn frozen_branch_blocks_user_ops() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD
 		));
 		assert_noop!(
-			open(1, DOT, 1_000, 500, rate_pct(5, 100)),
+			open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)),
 			crate::Error::<Test>::BranchFrozen
 		);
 	});
@@ -267,9 +272,9 @@ fn frozen_branch_blocks_user_ops() {
 #[test]
 fn refresh_branch_persists_frozen_on_oracle_failure() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		set_oracle_available(false);
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		MockOracleAvailable::set(false);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		let state = branch_state(DOT, PUSD).expect("state");
 		let frozen = state.frozen.expect("frozen persisted");
@@ -283,23 +288,22 @@ fn refresh_branch_persists_frozen_on_oracle_failure() {
 #[test]
 fn mode_reports_frozen_while_oracle_unavailable() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		let mode = branch_mode;
-		assert_eq!(mode(&DOT, &PUSD), Some(BranchMode::Normal));
-		set_oracle_available(false);
-		assert_eq!(mode(&DOT, &PUSD), Some(BranchMode::Frozen));
-		set_oracle_available(true);
-		assert_eq!(mode(&DOT, &PUSD), Some(BranchMode::Normal));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Normal));
+		MockOracleAvailable::set(false);
+		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Frozen));
+		MockOracleAvailable::set(true);
+		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Normal));
 	});
 }
 
 #[test]
 fn refresh_branch_clears_oracle_frozen() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		set_oracle_available(false);
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		MockOracleAvailable::set(false);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Oracle still down → second refresh is a no-op (already frozen for
@@ -307,7 +311,7 @@ fn refresh_branch_clears_oracle_frozen() {
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Restore oracle and refresh → unfreezes.
-		set_oracle_available(true);
+		MockOracleAvailable::set(true);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
@@ -316,7 +320,7 @@ fn refresh_branch_clears_oracle_frozen() {
 #[test]
 fn refresh_branch_does_not_clear_governance_frozen() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
@@ -330,7 +334,7 @@ fn refresh_branch_does_not_clear_governance_frozen() {
 #[test]
 fn governance_clear_clears_governance_frozen() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Defensive (acct 999) cannot clear governance Frozen — needs Full.
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
 			RuntimeOrigin::signed(ADMIN),
@@ -358,9 +362,9 @@ fn governance_clear_clears_governance_frozen() {
 #[test]
 fn governance_clear_is_noop_for_oracle_frozen() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		set_oracle_available(false);
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		MockOracleAvailable::set(false);
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Governance clear refuses oracle-Frozen state — branch stays frozen.
@@ -376,8 +380,8 @@ fn governance_clear_is_noop_for_oracle_frozen() {
 #[test]
 fn frozen_poke_pins_interest_time_without_minting() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
@@ -405,10 +409,10 @@ fn frozen_poke_pins_interest_time_without_minting() {
 #[test]
 fn on_idle_walk_budgets_touches_and_wraps_the_cursor() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// One more vault than `MaxOnIdleVaultRefresh` (4 in the mock).
 		for owner in 1..=5u64 {
-			assert_ok!(open(owner, DOT, 1_000, 500, rate_pct(5, 100)));
+			assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		}
 		advance_time(365 * 24 * 3_600 * 1_000);
 

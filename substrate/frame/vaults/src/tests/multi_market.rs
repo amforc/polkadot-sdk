@@ -6,17 +6,12 @@
 //! in-market isolation of redemption, liquidation, redistribution, and yield.
 
 use crate::{mock::*, pallet::Vaults, tests::rate_pct};
-use frame::traits::fungibles::{Balanced, Inspect, Mutate};
+use frame::traits::fungibles::{Balanced, Mutate};
 use pusd_primitives::{
 	KeeperCompensation, LiquidationAllocation, OffsetAllocation, VaultInterface,
 };
 
-/// One Julian year in milliseconds (matches `pusd_primitives::MILLIS_PER_YEAR`).
-const ONE_YEAR_MS: Moment = 31_557_600_000;
-
-fn total_stable(stable: StableId) -> Balance {
-	<VaultStableAssets as Inspect<AccountId>>::total_issuance(stable)
-}
+const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
 
 // One owner runs dotUSD/DOT and ethUSD/ETH independently: each market mints
 // only its own coin and locks only its own collateral.
@@ -26,8 +21,8 @@ fn owner_runs_two_markets_independently() {
 		register_market(DOT, PUSD);
 		register_market(ETH, EUSD);
 
-		assert_ok!(open_market(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open_market(1, ETH, EUSD, 500, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, ETH, EUSD, 500, 1_000, rate_pct(5, 100)));
 
 		// Each market minted only its own coin.
 		assert_eq!(stable_balance(PUSD, 1), 2_000);
@@ -53,8 +48,8 @@ fn same_stable_two_collaterals_are_independent() {
 		register_market(DOT, PUSD);
 		register_market(ETH, PUSD);
 
-		assert_ok!(open_market(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open_market(1, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
 
 		// The same coin is minted from both markets into one balance.
 		assert_eq!(stable_balance(PUSD, 1), 5_000);
@@ -64,11 +59,11 @@ fn same_stable_two_collaterals_are_independent() {
 		assert_eq!(branch_state(ETH, PUSD).unwrap().debt.principal, 3_000);
 
 		// Independent rate lists (distinct list ids).
-		assert_ne!(rate_list_for(DOT, PUSD), rate_list_for(ETH, PUSD));
+		assert_ne!(rate_list(DOT, PUSD), rate_list(ETH, PUSD));
 
 		// Redeeming on the DOT market leaves the ETH market's vault untouched.
 		let eth_before = Vaults::<Test>::get((ETH, PUSD, 1)).unwrap();
-		assert_eq!(redeem_market(DOT, PUSD, 9, 500).unwrap(), 1);
+		assert_eq!(redeem(DOT, PUSD, 9, 500).unwrap(), 1);
 		assert_eq!(Vaults::<Test>::get((ETH, PUSD, 1)).unwrap(), eth_before);
 	});
 }
@@ -81,8 +76,8 @@ fn markets_sharing_a_collateral_share_the_owner_hold() {
 		register_market(DOT, PUSD);
 		register_market(DOT, EUSD);
 
-		assert_ok!(open_market(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open_market(1, DOT, EUSD, 600, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, EUSD, 600, 1_000, rate_pct(5, 100)));
 
 		// The owner's DOT hold aggregates both markets.
 		assert_eq!(held(DOT, 1), 1_600);
@@ -108,10 +103,10 @@ fn liquidation_stays_inside_its_market() {
 		register_market(ETH, EUSD);
 
 		// Two PUSD-market vaults so the liquidatee is not the last stake-bearer.
-		assert_ok!(open_market(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open_market(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// An untouched vault on the other market.
-		assert_ok!(open_market(3, ETH, EUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(3, ETH, EUSD, 1_000, 500, rate_pct(5, 100)));
 
 		let other_vault = Vaults::<Test>::get((ETH, EUSD, 3)).unwrap();
 		let other_state = branch_state(ETH, EUSD).unwrap();
@@ -119,7 +114,7 @@ fn liquidation_stays_inside_its_market() {
 
 		// Drop DOT so owner 1 falls below MCR, then liquidate it.
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(liquidate(DOT, 1));
+		assert_ok!(liquidate(DOT, PUSD, 1));
 
 		// The ETH/EUSD market is byte-for-byte untouched.
 		assert_eq!(Vaults::<Test>::get((ETH, EUSD, 3)).unwrap(), other_vault);
@@ -136,8 +131,8 @@ fn closing_one_market_leaves_shared_collateral_held() {
 		register_market(DOT, PUSD);
 		register_market(DOT, EUSD);
 
-		assert_ok!(open_market(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open_market(1, DOT, EUSD, 600, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, EUSD, 600, 1_000, rate_pct(5, 100)));
 		assert_eq!(held(DOT, 1), 1_600);
 
 		// Fund acct 1 to cover the principal plus the upfront fee, then close.
@@ -192,7 +187,7 @@ fn heal_rejects_a_wrong_coin_credit() {
 fn yield_accrues_in_the_markets_own_coin() {
 	build_and_execute(|| {
 		register_market(ETH, EUSD);
-		assert_ok!(open_market(1, ETH, EUSD, 100_000, 5_000, rate_pct(50, 100)));
+		assert_ok!(open(1, ETH, EUSD, 100_000, 5_000, rate_pct(50, 100)));
 
 		let pusd_before = total_stable(PUSD);
 		let interest_before = Vaults::<Test>::get((ETH, EUSD, 1)).unwrap().debt.interest;
@@ -227,17 +222,17 @@ fn redistribution_stays_inside_its_market() {
 		register_market(ETH, EUSD);
 
 		// Two PUSD-market vaults: owner 1 is liquidated, owner 2 is the recipient.
-		assert_ok!(open_market(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open_market(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// An untouched vault on the other collateral.
-		assert_ok!(open_market(3, ETH, EUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(3, ETH, EUSD, 1_000, 500, rate_pct(5, 100)));
 
 		let other_vault = Vaults::<Test>::get((ETH, EUSD, 3)).unwrap();
 		let other_state = branch_state(ETH, EUSD).unwrap();
 		let other_hold = held(ETH, 3);
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(liquidate_with(DOT, 1, |_post_touch| LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, PUSD, 1, |_post_touch| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 1, debt: 0, collateral: 0 },
 			redistribution_collateral: 1_000,
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
@@ -260,8 +255,8 @@ fn cr_differs_across_markets_when_prices_differ() {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		set_price(ETH, FixedU128::from_rational(20u128, 1u128));
 
-		assert_ok!(open_market(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open_market(2, ETH, EUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(2, ETH, EUSD, 1_000, 2_000, rate_pct(5, 100)));
 
 		let cr_dot = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).unwrap();
 		let cr_eth = crate::Pallet::<Test>::vault_cr(ETH, EUSD, 2).unwrap();

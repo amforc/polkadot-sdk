@@ -15,7 +15,7 @@ use crate::{
 };
 use pusd_primitives::{KeeperCompensation, LiquidationAllocation, OffsetAllocation};
 
-const ONE_YEAR_MS: Moment = 31_557_600_000;
+const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
 
 /// `floor(x * rate)` for the recipient-rate assertions.
 fn weighted(x: Balance, rate: FixedU128) -> Balance {
@@ -74,18 +74,18 @@ fn assert_accounting_identity_holds() {
 #[test]
 fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Liquidatee at 5%, recipient at 20% (distinct rates so the recipient-rate
 		// weighting is genuinely exercised, not masked by equal rates). Both
 		// stakes are 1000.
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(20, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
 
 		// Drop price below MCR. Vault 1 is now liquidatable.
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 
 		let coll_1 = held(DOT, 1);
-		assert_ok!(liquidate_with(DOT, 1, |_| LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, PUSD, 1, |_| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_1,
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
@@ -100,10 +100,9 @@ fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 		let state = branch_state(DOT, PUSD).expect("branch state");
 		let total_econ =
 			state.debt.principal.saturating_add(state.debt.pending_redistribution_principal);
-		// weighted_sum ≈ total_econ * 0.20 (vault 2's rate, the only recipient).
+		// Vault 2 (20%) is the only recipient; ≤3 dust units of ceil/floor mismatch.
 		let expected = weighted(total_econ, rate_pct(20, 100));
 		let actual = state.debt.weighted_principal_sum;
-		// Tolerance: a couple of dust units from ceil/floor mismatches.
 		assert!(
 			actual.abs_diff(expected) <= 3,
 			"weighted_sum after redistribution out of bounds: actual={}, expected={} (20% of {})",
@@ -124,12 +123,12 @@ fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 #[test]
 fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(20, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_1 = held(DOT, 1);
-		assert_ok!(liquidate_with(DOT, 1, |_| LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, PUSD, 1, |_| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_1,
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
@@ -148,6 +147,8 @@ fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 		let post_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
 		let delta = post_minted.saturating_sub(pre_minted);
 
+		// Deliberate ±20% regime band (recipient 20% vs liquidatee 5% vs raw 100%),
+		// not rounding slack.
 		let target = weighted(total_econ_pre, rate_pct(20, 100));
 		let lower = target.saturating_mul(80).saturating_div(100);
 		let upper = target.saturating_mul(120).saturating_div(100);
@@ -169,14 +170,14 @@ fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 #[test]
 fn mixed_rate_recipients_reconcile_on_touch() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100))); // A — recipient
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(50, 100))); // B — recipient
-		assert_ok!(open(3, DOT, 1_000, 500, rate_pct(10, 100))); // C — liquidated
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100))); // A — recipient
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(50, 100))); // B — recipient
+		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(10, 100))); // C — liquidated
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, 3, |_| LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_3,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
@@ -191,8 +192,9 @@ fn mixed_rate_recipients_reconcile_on_touch() {
 		let expected = weighted(v_a.debt.principal, rate_pct(5, 100))
 			.saturating_add(weighted(v_b.debt.principal, rate_pct(50, 100)));
 		let actual = state.debt.weighted_principal_sum;
+		// One ceil (`average_branch_rate`) against two per-recipient floors.
 		assert!(
-			actual.abs_diff(expected) <= 10,
+			actual.abs_diff(expected) <= 2,
 			"mixed-rate weighted sum drift too large: actual={}, expected={}",
 			actual,
 			expected,
@@ -207,14 +209,14 @@ fn mixed_rate_recipients_reconcile_on_touch() {
 #[test]
 fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100))); // A — recipient + borrower
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(50, 100))); // B — recipient
-		assert_ok!(open(3, DOT, 1_000, 500, rate_pct(10, 100))); // C — liquidated
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100))); // A — recipient + borrower
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(50, 100))); // B — recipient
+		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(10, 100))); // C — liquidated
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, 3, |_| LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_3,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
@@ -238,8 +240,9 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 		let expected = weighted(v_a.debt.principal, rate_pct(5, 100))
 			.saturating_add(weighted(v_b.debt.principal, rate_pct(50, 100)));
 		let actual = state.debt.weighted_principal_sum;
+		// Same ceil-vs-floor drift as above, plus the borrow's own reconciliation.
 		assert!(
-			actual.abs_diff(expected) <= 10,
+			actual.abs_diff(expected) <= 2,
 			"weighted_sum drift after borrow: actual={}, expected={}",
 			actual,
 			expected,
@@ -255,8 +258,8 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 #[test]
 fn final_recovery_exit_requires_explicit_hint() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
 			RuntimeOrigin::signed(99),
@@ -264,11 +267,11 @@ fn final_recovery_exit_requires_explicit_hint() {
 			PUSD,
 			1
 		));
-		assert!(matches!(vault_status(DOT, 1), crate::types::VaultStatus::FinalRecovery));
+		assert!(matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::FinalRecovery));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
 		assert!(
-			matches!(vault_status(DOT, 1), crate::types::VaultStatus::FinalRecovery),
+			matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::FinalRecovery),
 			"poke must not auto-exit FinalRecovery; exit requires an explicit hint",
 		);
 		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
@@ -278,7 +281,7 @@ fn final_recovery_exit_requires_explicit_hint() {
 			1,
 			Position::endpoints_only()
 		));
-		assert!(matches!(vault_status(DOT, 1), crate::types::VaultStatus::Active));
+		assert!(matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::Active));
 	});
 }
 
@@ -287,15 +290,15 @@ fn final_recovery_exit_requires_explicit_hint() {
 #[test]
 fn execute_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 
 		let recipient: AccountId = 999;
 		let pre_recipient = collateral_balance(DOT, recipient);
 
-		assert_ok!(liquidate_with(DOT, 1, |post_touch| LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| LiquidationAllocation {
 			offset: OffsetAllocation { recipient, debt: post_touch, collateral: 500 },
 			redistribution_collateral: 0,
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
@@ -313,16 +316,16 @@ fn execute_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 #[test]
 fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(3, DOT, 5_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(3, DOT, PUSD, 5_000, 500, rate_pct(5, 100)));
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 
 		for liquidatee in [1u64, 2u64] {
 			let collateral = held(DOT, liquidatee);
-			assert_ok!(liquidate_with(DOT, liquidatee, |_| LiquidationAllocation {
+			assert_ok!(liquidate_with(DOT, PUSD, liquidatee, |_| LiquidationAllocation {
 				offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
 				redistribution_collateral: collateral,
 				keeper: KeeperCompensation { recipient: liquidatee, collateral: 0 },
@@ -335,14 +338,14 @@ fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
 #[test]
 fn vault_cr_view_includes_pending_redistribution() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(3, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, 3, |_| LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_3,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
@@ -361,15 +364,15 @@ fn vault_cr_view_includes_pending_redistribution() {
 #[test]
 fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 100_000, 500, rate_pct(50, 100))); // co-recipient
-		assert_ok!(open(2, DOT, 10_000, 500, rate_pct(50, 100))); // target
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 100_000, 500, rate_pct(50, 100))); // co-recipient
+		assert_ok!(open(2, DOT, PUSD, 10_000, 500, rate_pct(50, 100))); // target
 
 		// Reduce vault 2 to a small dust principal (well under MinimumDebt=200)
 		// via a redemption cancel so the vault becomes Dormant with non-zero
 		// residual debt.
 		use pusd_primitives::RedemptionAllocation;
-		assert_ok!(redeem_step(&DOT, &PUSD, &2, |_| Ok(Some(RedemptionAllocation {
+		assert_ok!(redeem_step(DOT, PUSD, 2, |_| Ok(Some(RedemptionAllocation {
 			redeemer: 99,
 			debt_to_cancel: 450,
 			collateral_to_redeemer: 9_000,
@@ -406,20 +409,18 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 #[test]
 fn redistribution_residue_lands_in_ownerless_debt() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Two recipients with stakes that do not evenly divide an
 		// arbitrary redistributed debt, guaranteeing per-stake floor residue.
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 999, 500, rate_pct(5, 100)));
-		assert_ok!(open(3, DOT, 5_000, 500, rate_pct(5, 100))); // liquidatee
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 999, 500, rate_pct(5, 100)));
+		assert_ok!(open(3, DOT, PUSD, 5_000, 500, rate_pct(5, 100))); // liquidatee
 
 		let pre_owner = branch_state(DOT, PUSD).unwrap().ownerless_debt;
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		// Force a full redistribution path: no offset, all debt redistributed.
-		// `redistribution_collateral: 0` on purpose — this test isolates the
-		// per-stake *debt* flooring residue, which surfaces regardless of whether
-		// any collateral is moved to recipients, so we keep the collateral leg out.
-		assert_ok!(liquidate_with(DOT, 3, |_post_touch| LiquidationAllocation {
+		// `redistribution_collateral: 0` on purpose — the per-stake *debt* flooring
+		// residue surfaces regardless of the collateral leg, so it is left out.
+		assert_ok!(liquidate_with(DOT, PUSD, 3, |_post_touch| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: 0,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
@@ -444,10 +445,10 @@ fn full_lifecycle_holds_branch_identities() {
 		crate::try_state::do_try_state::<Test>().expect("branch identities hold");
 	}
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 2_000, 800, rate_pct(25, 100)));
-		assert_ok!(open(3, DOT, 3_000, 1_000, rate_pct(50, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 2_000, 800, rate_pct(25, 100)));
+		assert_ok!(open(3, DOT, PUSD, 3_000, 1_000, rate_pct(50, 100)));
 		assert_identities();
 
 		// A month of accrual so touches materialise real interest.
@@ -458,7 +459,7 @@ fn full_lifecycle_holds_branch_identities() {
 		set_price(DOT, FixedU128::from_rational(55u128, 100u128));
 		let keeper_8_pre = collateral_balance(DOT, 8);
 		let offset_9_pre = collateral_balance(DOT, 9);
-		assert_ok!(liquidate_with(DOT, 1, |post_touch| LiquidationAllocation {
+		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| LiquidationAllocation {
 			offset: OffsetAllocation { recipient: 9, debt: post_touch / 3, collateral: 100 },
 			redistribution_collateral: 500,
 			keeper: KeeperCompensation { recipient: 8, collateral: 10 },
@@ -480,7 +481,7 @@ fn full_lifecycle_holds_branch_identities() {
 		// Redemption against the cheapest vault at a healthy price.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		let redeemer_7_pre = collateral_balance(DOT, 7);
-		assert_ok!(redeem(DOT, 7, 400));
+		assert_ok!(redeem(DOT, PUSD, 7, 400));
 		// At price 10 the redemption releases floor(debt_cancelled / 10) collateral free
 		// to the redeemer.
 		let released = collateral_balance(DOT, 7) - redeemer_7_pre;
@@ -493,7 +494,7 @@ fn full_lifecycle_holds_branch_identities() {
 		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&1,
 			&3,
-			pusd_balance(1),
+			stable_balance(PUSD, 1),
 			frame::traits::tokens::Preservation::Expendable,
 		));
 		assert_ok!(crate::Pallet::<Test>::repay_for(
@@ -501,7 +502,7 @@ fn full_lifecycle_holds_branch_identities() {
 			DOT,
 			PUSD,
 			3,
-			pusd_balance(3)
+			stable_balance(PUSD, 3)
 		));
 		// Repay-to-zero leaves a husk; close it to release the collateral and end
 		// the lifecycle with the row gone.
@@ -519,9 +520,9 @@ fn full_lifecycle_holds_branch_identities() {
 #[test]
 fn redistributed_principal_accrues_interest_from_liquidation_moment() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, 2_000, 800, rate_pct(50, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 2_000, 800, rate_pct(50, 100)));
 		// Age the branch so the interest-time origin and t1 are well separated.
 		advance_time(10 * 24 * 3_600 * 1_000);
 		// Settle vault 2's own interest at t1 so the t2 delta decomposes into
@@ -531,7 +532,7 @@ fn redistributed_principal_accrues_interest_from_liquidation_moment() {
 		// Fully redistribute vault 1's debt at t1.
 		set_price(DOT, FixedU128::from_rational(55u128, 100u128));
 		let mut redistributed: Balance = 0;
-		assert_ok!(liquidate_with(DOT, 1, |post_touch| {
+		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| {
 			redistributed = post_touch;
 			LiquidationAllocation {
 				offset: OffsetAllocation { recipient: 9, debt: 0, collateral: 0 },
