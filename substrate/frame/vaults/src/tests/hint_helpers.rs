@@ -12,7 +12,7 @@ fn fund_account(who: AccountId) {
 fn seed_long_rate_index() {
 	for who in 1u64..=20 {
 		fund_account(who);
-		assert_ok!(open(who, DOT, 2_000, 500, rate_pct(20 + u128::from(who), 100)));
+		assert_ok!(open(who, DOT, PUSD, 2_000, 500, rate_pct(20 + u128::from(who), 100)));
 	}
 }
 
@@ -21,21 +21,21 @@ fn seed_long_rate_index() {
 #[test]
 fn find_rate_position_skips_dormant_vaults() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Five vaults at 1%, 2%, 3%, 4%, 5%.
 		for (who, pct) in [(1u64, 1), (2, 2), (3, 3), (4, 4), (5, 5)] {
-			assert_ok!(open(who, DOT, 1_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 
 		// Redeem acct 1's full debt. redeem_step transitions the vault to
 		// Dormant when residual debt is zero (see interfaces.rs).
-		let target = redeem(DOT, 5, 600).expect("redeem ok"); // 600 > vault 1's debt to fully clear it
+		let target = redeem(DOT, PUSD, 5, 600).expect("redeem ok"); // 600 > vault 1's debt to fully clear it
 		assert_eq!(target, 1);
 		// Vault is Dormant or its debt is below MinimumDebt — either way it
 		// should be out of the rate index.
-		assert!(vault_status(DOT, 1).is_dormant());
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			&1
 		));
 
@@ -52,9 +52,9 @@ fn find_rate_position_skips_dormant_vaults() {
 #[test]
 fn repair_steps_needed_zero_for_valid_positive_for_stale() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		for (who, pct) in [(1u64, 10), (2, 20), (3, 30)] {
-			assert_ok!(open(who, DOT, 2_000, 500, rate_pct(pct, 100)));
+			assert_ok!(open(who, DOT, PUSD, 2_000, 500, rate_pct(pct, 100)));
 		}
 		let budget = <LinkedList as SortedListInterface<VaultList, u64>>::repair_budget();
 		let rate = rate_pct(25, 100);
@@ -71,7 +71,7 @@ fn repair_steps_needed_zero_for_valid_positive_for_stale() {
 #[test]
 fn repair_steps_needed_exceeds_budget_for_extreme_hint_in_long_index() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		seed_long_rate_index();
 		let budget = <LinkedList as SortedListInterface<VaultList, u64>>::repair_budget();
 		let steps = crate::Pallet::<Test>::repair_steps_needed(
@@ -89,10 +89,10 @@ fn repair_steps_needed_exceeds_budget_for_extreme_hint_in_long_index() {
 #[test]
 fn exit_final_recovery_invalid_hint_rolls_back() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Account 21 alone enters FinalRecovery after a price crash.
 		fund_account(21);
-		assert_ok!(open(21, DOT, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(21, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
 		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
 			RuntimeOrigin::signed(99),
@@ -117,7 +117,7 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 			),
 			crate::Error::<Test>::InvalidPositionHints
 		);
-		assert!(vault_status(DOT, 21).is_final_recovery());
+		assert!(vault_status(DOT, PUSD, 21).is_final_recovery());
 		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).unwrap(), vault_pre);
 		assert_eq!(
 			crate::Pallet::<Test>::final_recovery_queue_head(DOT, PUSD, 10),
@@ -129,11 +129,11 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 #[test]
 fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		seed_long_rate_index();
 		fund_account(21);
 		let collateral_pre = collateral_balance(DOT, 21);
-		let pusd_pre = pusd_balance(21);
+		let pusd_pre = stable_balance(PUSD, 21);
 
 		assert_noop!(
 			crate::Pallet::<Test>::open_vault(
@@ -151,19 +151,19 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).is_none());
 		assert_eq!(held(DOT, 21), 0);
 		assert_eq!(collateral_balance(DOT, 21), collateral_pre);
-		assert_eq!(pusd_balance(21), pusd_pre);
+		assert_eq!(stable_balance(PUSD, 21), pusd_pre);
 	});
 }
 
 #[test]
 fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		seed_long_rate_index();
 		let vault_pre = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).expect("vault stored");
 		let branch_pre = branch_state(DOT, PUSD).expect("branch state");
 		let order_pre = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			25,
 		);
 
@@ -181,7 +181,7 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).unwrap(), vault_pre);
 		assert_eq!(branch_state(DOT, PUSD).unwrap(), branch_pre);
 		let order_post = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT),
+			&rate_list(DOT, PUSD),
 			25,
 		);
 		assert_eq!(order_post, order_pre);

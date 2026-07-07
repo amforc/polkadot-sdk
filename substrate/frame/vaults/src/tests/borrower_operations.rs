@@ -6,8 +6,8 @@ use crate::{mock::*, pallet::Vaults, tests::rate_pct};
 #[test]
 fn close_last_vault_with_debt_reverts() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
 			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None),
 			crate::Error::<Test>::DebtOutstanding
@@ -20,9 +20,9 @@ fn close_last_vault_with_debt_reverts() {
 #[test]
 fn repay_into_dust_window_reverts() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// borrow=1000, min_debt=200. Repay 850 would leave 150 < 200.
-		assert_ok!(open(1, DOT, 1_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
 		assert_noop!(
 			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 850),
 			crate::Error::<Test>::DebtWouldBecomeDust
@@ -35,8 +35,8 @@ fn repay_into_dust_window_reverts() {
 #[test]
 fn withdraw_more_than_held_reverts() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
 			crate::Pallet::<Test>::withdraw_collateral(
 				RuntimeOrigin::signed(1),
@@ -53,10 +53,10 @@ fn withdraw_more_than_held_reverts() {
 #[test]
 fn withdraw_breaking_cr_reverts() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 500, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// open another vault so that we don't hit the last-vault rule.
-		assert_ok!(open(2, DOT, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// 1000 DOT @ $10 backs 500 pUSD — withdrawing 950 leaves
 		// 50 DOT × $10 = $500, CR == 100% < ICR 120%.
 		assert_noop!(
@@ -79,10 +79,10 @@ fn withdraw_breaking_cr_reverts() {
 #[test]
 fn zero_amount_ops_are_no_ops() {
 	build_and_execute(|| {
-		register_default_branch();
+		register_market(DOT, PUSD);
 		// Non-trivial principal/rate so a day of interest is observable:
 		// floor(5_000 * 0.5 * 1day / year) = 6.
-		assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(50, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
 		let pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		advance_time(86_400_000); // one day
 		let now = pallet_timestamp::Pallet::<Test>::get();
@@ -127,8 +127,8 @@ fn zero_amount_ops_are_no_ops() {
 #[test]
 fn repay_for_allowed_in_safety_mode() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 1_000, 5_000, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(5, 100)));
 		// Drop price into Safety (TCR ≈ 126%, between ICR 120% and Safety 130%).
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		let tcr_before = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
@@ -146,8 +146,8 @@ fn repay_for_allowed_in_safety_mode() {
 #[test]
 fn change_rate_to_same_rate_is_no_op() {
 	build_and_execute(|| {
-		register_default_branch();
-		assert_ok!(open(1, DOT, 5_000, 10_000, rate_pct(5, 100)));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 5_000, 10_000, rate_pct(5, 100)));
 		let pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		advance_time(86_400_000); // one day of pending interest
 		let now = pallet_timestamp::Pallet::<Test>::get();
