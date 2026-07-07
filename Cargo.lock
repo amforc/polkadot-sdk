@@ -14702,8 +14702,16 @@ dependencies = [
 name = "pallet-stability"
 version = "0.1.0"
 dependencies = [
+ "pallet-assets",
+ "pallet-assets-holder",
+ "pallet-balances",
+ "pallet-linked-list",
+ "pallet-redemptions",
+ "pallet-timestamp",
+ "pallet-vaults",
  "parity-scale-codec",
  "polkadot-sdk-frame",
+ "pusd-primitives",
  "scale-info",
 ]
 
