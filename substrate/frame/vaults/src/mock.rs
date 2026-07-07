@@ -336,6 +336,7 @@ impl pallet_vaults::Config for Test {
 	type StableAssets = VaultStableAssets;
 	type Oracle = MockOracle;
 	type FeeHandler = DealWithFees;
+	type YieldHook = ();
 	type OnBranchLifecycle = RecordingLifecycle;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;

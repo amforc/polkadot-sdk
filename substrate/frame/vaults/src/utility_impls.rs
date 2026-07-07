@@ -18,7 +18,7 @@ use frame::{
 	traits::{fungibles::Balanced as FungiblesBalanced, OriginTrait, Time},
 };
 use pallet_linked_list::{ListError, SortedListInterface};
-use pusd_primitives::ProvidePrice;
+use pusd_primitives::{OnBranchYield, ProvidePrice};
 
 /// The two numbers a branch TCR depends on. [`Pallet::compute_tcr`] derives
 /// them from live state; the operation context captures them once at load as
@@ -375,12 +375,17 @@ impl<T: Config> Pallet<T> {
 		new_interest
 	}
 
-	/// Issue `amount` of the market's coin (branch interest or an upfront fee) and
-	/// hand it to `T::FeeHandler`. The Stability-Pool yield-share split returns
-	/// with `pallet-stability-pool`; until then the whole minted amount routes to
-	/// the fee destination.
-	pub(crate) fn mint_and_route_yield(stable_id: &T::StableAssetId, amount: BalanceOf<T>) {
+	/// Issue `amount` of the market's coin (branch interest or an upfront
+	/// fee), let `T::YieldHook` take the Stability-Pool share, and hand the
+	/// remainder to `T::FeeHandler`.
+	pub(crate) fn mint_and_route_yield(
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
+		amount: BalanceOf<T>,
+	) {
+		// TODO: Check if this is the best/most-idomatic way to split the Credit (I don't think so)
 		let credit = T::StableAssets::issue(stable_id.clone(), amount);
+		let credit = T::YieldHook::distribute_yield(collateral_id, stable_id, credit);
 		T::FeeHandler::on_unbalanced(credit);
 	}
 

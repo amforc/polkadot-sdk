@@ -10,25 +10,7 @@ use scale_info::TypeInfo;
 
 pub use pusd_primitives::VaultStatus;
 
-/// Branch operating mode. `Normal` and `Safety` are derived from live TCR;
-/// `Frozen` is the only persisted mode.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
-pub enum BranchMode {
-	Normal,
-	Safety,
-	Frozen,
-}
+pub use pusd_primitives::BranchMode;
 
 /// Reason the branch was put into `Frozen` mode.
 #[derive(
@@ -66,35 +48,9 @@ pub struct FrozenState {
 	pub entered_at: Millis,
 }
 
-/// Logical linked-list partitions owned by this pallet, one pair of lists per
-/// `(collateral_id, stable_id)` market.
-///
-/// `Rate(collateral, stable)` is the active-vault rate index.
-/// `FinalRecovery(collateral, stable)` is the per-market recovery FIFO; each
-/// append derives its stored priority from the current head, one above it.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	PartialEq,
-	Eq,
-	PartialOrd,
-	Ord,
-	Debug,
-)]
-pub enum VaultListId<CollateralId, StableId> {
-	Rate(CollateralId, StableId),
-	FinalRecovery(CollateralId, StableId),
-}
-
-impl<CollateralId: Default, StableId: Default> Default for VaultListId<CollateralId, StableId> {
-	fn default() -> Self {
-		Self::Rate(CollateralId::default(), StableId::default())
-	}
-}
+/// Logical linked-list partitions, one list per `(collateral_id, stable_id)`
+/// market and per use case.
+pub use pusd_primitives::StableListId as VaultListId;
 
 /// Debt split by bucket: the state tracked on a vault row, and equally the
 /// shape of a cancelled portion of it (a payment is itself a debt breakdown).
