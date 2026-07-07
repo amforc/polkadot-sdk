@@ -1,3 +1,15 @@
+mod activation;
+mod claims;
+mod deposit;
+mod epoch_scale;
+mod governance;
+mod mode;
+mod offsets;
+mod pending_offsets;
+mod recovery;
+mod withdrawals;
+mod yield_distribution;
+
 use crate::{mock::*, pallet::STORAGE_VERSION};
 use frame::traits::GetStorageVersion;
 
