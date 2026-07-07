@@ -19,10 +19,12 @@
 
 use crate::{list, pallet::*, view_helpers, ListError, Outcome, Position};
 use alloc::vec::Vec;
-use frame::deps::frame_support::{
-	defensive,
-	storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
-	traits::Get,
+use frame::{
+	deps::frame_support::{
+		storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
+		traits::DefensiveOption,
+	},
+	prelude::*,
 };
 
 /// Authoritative source of the priority for `(list_id, item)`. Consulted by
@@ -34,6 +36,17 @@ pub trait PriorityProvider<ListId, ItemId> {
 	/// Current authoritative priority for `(list_id, item)`.
 	///
 	/// Returns `None` when the item should not remain in the list.
+	///
+	/// # Removal contract
+	///
+	/// [`crate::Pallet::reprioritize`] is permissionless: the moment this
+	/// method returns `None` for a listed item, ANY signed origin can remove
+	/// it, announced only by an `ItemRemoved` event. Implementations must
+	/// therefore return `None` only once the consumer's own bookkeeping
+	/// tolerates third-party removal at any time, and consumer cleanup paths
+	/// must treat [`ListError::ItemNotFound`] from their own later
+	/// [`SortedListInterface::remove`] call as "already removed", not as a
+	/// hard error.
 	fn priority(list_id: &ListId, item: &ItemId) -> Option<Self::Priority>;
 
 	/// For benchmarks (and `std` test fixtures): pin the authoritative priority
@@ -45,9 +58,11 @@ pub trait PriorityProvider<ListId, ItemId> {
 /// Mutation and query surface for consumer pallets.
 ///
 /// Position hints are [`Position`] values; endpoints are encoded as `None` in
-/// each field. Mutating methods fail with [`ListError`] and return the number
-/// of hint-repair steps actually walked so callers can refund unused weight
-/// via `PostDispatchInfo::actual_weight`.
+/// each field. Mutating methods fail with [`ListError`]; the hint-taking ones
+/// ([`Self::insert`], [`Self::re_insert`]) additionally return the number of
+/// hint-repair steps actually walked so callers can refund unused weight via
+/// `PostDispatchInfo::actual_weight` ([`Self::remove`] and [`Self::pop_tail`]
+/// take no hint and return no step count).
 pub trait SortedListInterface<ListId, ItemId> {
 	/// Priority type used to order items within a list.
 	type Priority;
@@ -59,8 +74,10 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// - [`ListError::ItemAlreadyExists`] if `(list_id, item)` is already in the list.
 	/// - [`ListError::ListTooLong`] if the list's size counter would overflow.
 	/// - [`ListError::InvalidPositionHints`] if the hint cannot be repaired within the budget.
-	/// - [`ListError::CorruptList`] if a hinted neighbor row is missing or its links are
-	///   inconsistent.
+	///   Stale hints (a removed neighbor, no-longer-adjacent neighbors, a drifted priority bracket)
+	///   are repaired transparently and are NOT errors while the budget lasts.
+	/// - [`ListError::CorruptList`] only when stored state is internally inconsistent — never as a
+	///   result of caller input.
 	fn insert(
 		list_id: ListId,
 		item: ItemId,
@@ -97,6 +114,8 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// - [`ListError::ItemNotFound`] if `(list_id, item)` is not in the list.
 	/// - [`ListError::CorruptList`] if the node exists but list metadata is inconsistent.
 	/// - [`ListError::InvalidPositionHints`] if the hint cannot be repaired within the budget.
+	/// - [`ListError::Internal`] if the transactional storage-layer limit blocked the splice
+	///   (environmental; retrying with a different hint will not help).
 	fn re_insert(
 		list_id: ListId,
 		item: ItemId,
@@ -150,19 +169,66 @@ pub trait SortedListInterface<ListId, ItemId> {
 		new_priority: Self::Priority,
 	) -> Option<Position<ItemId>>;
 
-	/// Steps needed to repair `hint` for `priority` in `list_id`.
+	/// Steps needed to repair `hint` for inserting a NEW item at `priority`
+	/// in `list_id`.
 	///
 	/// Returns `0` if the hint is already valid, or a value greater than
-	/// `MaxHintRepairSteps` if the same dispatch would fail.
+	/// `MaxHintRepairSteps` if an [`Self::insert`] with the same hint would
+	/// fail. Faithful to `insert` ONLY: [`Self::re_insert`] (and the
+	/// `reprioritize` dispatchable) splice the item out before walking, so
+	/// their walk runs against different state — use
+	/// [`Self::re_insert_steps_needed`] for those. (With `MaxHintRepairSteps
+	/// == u32::MAX` the infeasibility sentinel saturates to `u32::MAX` and
+	/// cannot exceed the budget.)
 	fn repair_steps_needed(
 		list_id: &ListId,
 		priority: Self::Priority,
 		hint: Position<ItemId>,
 	) -> u32;
 
+	/// Steps [`Self::re_insert`] (and therefore the `reprioritize`
+	/// dispatchable) would need to repair `hint` when moving `(list_id,
+	/// item)` to `new_priority`, simulating the dispatch exactly.
+	///
+	/// Returns `0` when the no-op or in-place fast path would run (neither
+	/// consults the hint), the post-splice walk length otherwise, and a value
+	/// greater than `MaxHintRepairSteps` when the same call would fail
+	/// (including when the item is not in the list).
+	fn re_insert_steps_needed(
+		list_id: &ListId,
+		item: &ItemId,
+		new_priority: Self::Priority,
+		hint: Position<ItemId>,
+	) -> u32;
+
 	/// Maximum hint-repair walk length the implementation will accept before
 	/// returning [`ListError::InvalidPositionHints`].
+	///
+	/// Deliberately part of the trait even though the pallet also exposes it
+	/// as the `MaxHintRepairSteps` constant: a generic consumer holding only
+	/// `SortedListInterface` has no access to pallet constants and needs the
+	/// budget to size its own hint and weight logic.
 	fn repair_budget() -> u32;
+}
+
+impl<T: Config> Pallet<T> {
+	/// Shared event tail of every removal path: `ItemRemoved`, then
+	/// `ListRemoved` when the removal emptied the list.
+	fn deposit_removed(
+		list_id: &T::ListId,
+		item: &T::ItemId,
+		priority: T::Priority,
+		list_removed: bool,
+	) {
+		Self::deposit_event(Event::ItemRemoved {
+			list_id: list_id.clone(),
+			item: item.clone(),
+			priority,
+		});
+		if list_removed {
+			Self::deposit_event(Event::ListRemoved { list_id: list_id.clone() });
+		}
+	}
 }
 
 impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
@@ -177,30 +243,33 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		if ListNodes::<T>::contains_key(&list_id, &item) {
 			return Err(ListError::ItemAlreadyExists);
 		}
-		let (position, steps) = list::walk_repair::<T>(&list_id, &priority, hint)?;
-		let list_created = list::insert_at::<T>(&list_id, &item, priority, position)?;
+		let valid = list::walk_repair::<T>(&list_id, &priority, hint)?;
+		let list_created = list::insert_at_inner::<T>(
+			&list_id,
+			&item,
+			priority,
+			valid.position,
+			valid.prev_node,
+			valid.next_node,
+		)?;
 		if list_created {
 			Self::deposit_event(Event::ListCreated { list_id: list_id.clone() });
 		}
 		Self::deposit_event(Event::ItemInserted { list_id, item, priority });
-		Ok(steps)
+		Ok(valid.steps)
 	}
 
 	fn remove(list_id: &T::ListId, item: &T::ItemId) -> Result<(), ListError> {
 		let (priority, list_removed) = list::remove_at::<T>(list_id, item)?;
-		Self::deposit_event(Event::ItemRemoved {
-			list_id: list_id.clone(),
-			item: item.clone(),
-			priority,
-		});
-		if list_removed {
-			Self::deposit_event(Event::ListRemoved { list_id: list_id.clone() });
-		}
+		Self::deposit_removed(list_id, item, priority, list_removed);
 		Ok(())
 	}
 
 	fn pop_tail(list_id: &T::ListId) -> Result<Option<(T::ItemId, T::Priority)>, ListError> {
-		let Some(item) = ListMetas::<T>::get(list_id).and_then(|m| m.tail) else { return Ok(None) };
+		let Some(meta) = ListMetas::<T>::get(list_id) else { return Ok(None) };
+		// A present meta row always carries a tail pointer; `None` here is
+		// corruption, not an empty list.
+		let item = meta.tail.defensive_ok_or(ListError::CorruptList)?;
 		let (priority, list_removed) =
 			list::remove_at::<T>(list_id, &item).map_err(|e| match e {
 				// The item id came from the meta row, so a missing node row is
@@ -211,14 +280,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 				},
 				other => other,
 			})?;
-		Self::deposit_event(Event::ItemRemoved {
-			list_id: list_id.clone(),
-			item: item.clone(),
-			priority,
-		});
-		if list_removed {
-			Self::deposit_event(Event::ListRemoved { list_id: list_id.clone() });
-		}
+		Self::deposit_removed(list_id, &item, priority, list_removed);
 		Ok(Some((item, priority)))
 	}
 
@@ -264,12 +326,19 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		let outer = with_transaction_opaque_err::<u32, ListError, _>(|| {
 			let inner = (|| -> Result<u32, ListError> {
 				// The item never leaves the list, so the lifecycle flags from
-				// `remove_at`/`insert_at` are intentionally dropped — emitting
+				// `remove_at`/`insert_at_inner` are intentionally dropped — emitting
 				// `ListRemoved`/`ListCreated` here would churn a single-item relocate.
 				list::remove_at::<T>(&list_id, &item)?;
-				let (position, steps) = list::walk_repair::<T>(&list_id, &new_priority, hint)?;
-				list::insert_at::<T>(&list_id, &item, new_priority, position)?;
-				Ok(steps)
+				let valid = list::walk_repair::<T>(&list_id, &new_priority, hint)?;
+				list::insert_at_inner::<T>(
+					&list_id,
+					&item,
+					new_priority,
+					valid.position,
+					valid.prev_node,
+					valid.next_node,
+				)?;
+				Ok(valid.steps)
 			})();
 			if inner.is_ok() {
 				TransactionOutcome::Commit(inner)
@@ -277,8 +346,9 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 				TransactionOutcome::Rollback(inner)
 			}
 		});
-		// `Err(())` only fires on transactional-layer nesting overflow.
-		let steps = outer.map_err(|()| ListError::InvalidPositionHints)??;
+		// `Err(())` only fires on transactional-layer nesting overflow: an
+		// environmental limit, not a hint problem — surface it as such.
+		let steps = outer.map_err(|()| ListError::Internal)??;
 		Self::deposit_event(Event::ItemReinserted { list_id, item, old_priority, new_priority });
 		Ok(Outcome::Relocated { steps })
 	}
@@ -325,6 +395,15 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		hint: Position<T::ItemId>,
 	) -> u32 {
 		view_helpers::repair_steps_needed::<T>(list_id, priority, hint)
+	}
+
+	fn re_insert_steps_needed(
+		list_id: &T::ListId,
+		item: &T::ItemId,
+		new_priority: T::Priority,
+		hint: Position<T::ItemId>,
+	) -> u32 {
+		view_helpers::re_insert_steps_needed::<T>(list_id, item, new_priority, hint)
 	}
 
 	fn repair_budget() -> u32 {

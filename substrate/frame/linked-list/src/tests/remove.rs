@@ -231,3 +231,38 @@ fn pop_tail_with_missing_tail_node_is_defensive() {
 		let _ = LinkedList::pop_tail(&1);
 	});
 }
+
+#[test]
+#[should_panic = "prev and next name the same neighbor"]
+fn remove_at_aliased_neighbors_is_defensive() {
+	build_and_execute_no_post_check(|| {
+		insert(1, 100, 90);
+		insert(1, 200, 50);
+		// Corrupt 200 into a two-node cycle with 100: both sides name the same
+		// neighbor. Without the guard the two splice writes would target the
+		// same row and the second would clobber the first.
+		ListNodes::<Test>::mutate(1, 200, |maybe| {
+			if let Some(n) = maybe {
+				n.prev = Some(100);
+				n.next = Some(100);
+			}
+		});
+		let _ = LinkedList::remove(&1, &200);
+	});
+}
+
+#[test]
+#[should_panic = "Defensive failure has been triggered"]
+fn pop_tail_with_none_tail_on_present_meta_is_defensive() {
+	build_and_execute_no_post_check(|| {
+		insert(1, 100, 50);
+		// A present meta row with `tail: None` is corruption, not an empty
+		// list; `pop_tail` must not silently report `Ok(None)`.
+		ListMetas::<Test>::mutate(1, |maybe| {
+			if let Some(meta) = maybe {
+				meta.tail = None;
+			}
+		});
+		let _ = LinkedList::pop_tail(&1);
+	});
+}

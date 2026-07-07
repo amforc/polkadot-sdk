@@ -91,7 +91,7 @@ pub mod pallet {
 	use super::*;
 	use crate::weights::WeightInfo;
 
-	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(1);
+	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
 	#[pallet::pallet]
 	#[pallet::storage_version(STORAGE_VERSION)]
@@ -134,7 +134,7 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type ListNodes<T: Config> = StorageDoubleMap<
 		_,
-		Twox64Concat,
+		Blake2_128Concat,
 		T::ListId,
 		Blake2_128Concat,
 		T::ItemId,
@@ -146,7 +146,7 @@ pub mod pallet {
 	/// encodes the empty list.
 	#[pallet::storage]
 	pub type ListMetas<T: Config> =
-		StorageMap<_, Twox64Concat, T::ListId, ListMeta<T::ItemId>, OptionQuery>;
+		StorageMap<_, Blake2_128Concat, T::ListId, ListMeta<T::ItemId>, OptionQuery>;
 
 	/// Authoritative priority backing for benchmarks. Production runtimes derive
 	/// the priority from external state (e.g. stake) via their own
@@ -156,7 +156,7 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type BenchAuthoritativePriority<T: Config> = StorageDoubleMap<
 		_,
-		Twox64Concat,
+		Blake2_128Concat,
 		T::ListId,
 		Blake2_128Concat,
 		T::ItemId,
@@ -171,15 +171,14 @@ pub mod pallet {
 		ItemInserted { list_id: T::ListId, item: T::ItemId, priority: T::Priority },
 		/// An item was removed from a list.
 		ItemRemoved { list_id: T::ListId, item: T::ItemId, priority: T::Priority },
-		/// An item's priority was changed.
+		/// An item's priority was changed (by [`SortedListInterface::re_insert`]
+		/// or the [`Pallet::reprioritize`] dispatchable).
 		ItemReinserted {
 			list_id: T::ListId,
 			item: T::ItemId,
 			old_priority: T::Priority,
 			new_priority: T::Priority,
 		},
-		/// An item was reprioritized after its authoritative priority drifted.
-		Reprioritized { list_id: T::ListId, item: T::ItemId, new_priority: T::Priority },
 		/// A list was created by inserting its first item.
 		ListCreated { list_id: T::ListId },
 		/// A list was removed after its last item was removed.
@@ -273,9 +272,10 @@ pub mod pallet {
 			)
 		}
 
-		/// Steps the on-chain repair walk would take from `hint` to reach the
-		/// position for `priority`. Returns `0` if the hint is already valid,
-		/// or a value greater than `MaxHintRepairSteps` if the call would fail.
+		/// Steps the on-chain repair walk would take from `hint` for inserting
+		/// a NEW item at `priority`. Faithful to [`SortedListInterface::insert`]
+		/// only; see [`SortedListInterface::repair_steps_needed`] for the full
+		/// contract and [`Pallet::re_insert_steps_needed`] for `reprioritize`.
 		pub fn repair_steps_needed(
 			list_id: T::ListId,
 			priority: T::Priority,
@@ -283,6 +283,24 @@ pub mod pallet {
 		) -> u32 {
 			<Self as SortedListInterface<T::ListId, T::ItemId>>::repair_steps_needed(
 				&list_id, priority, hint,
+			)
+		}
+
+		/// Steps a [`Pallet::reprioritize`] moving `(list_id, item)` to
+		/// `new_priority` would need to repair `hint`, simulating the dispatch
+		/// exactly; see [`SortedListInterface::re_insert_steps_needed`] for
+		/// the full contract.
+		pub fn re_insert_steps_needed(
+			list_id: T::ListId,
+			item: T::ItemId,
+			new_priority: T::Priority,
+			hint: Position<T::ItemId>,
+		) -> u32 {
+			<Self as SortedListInterface<T::ListId, T::ItemId>>::re_insert_steps_needed(
+				&list_id,
+				&item,
+				new_priority,
+				hint,
 			)
 		}
 	}
@@ -295,6 +313,11 @@ pub mod pallet {
 		/// Anyone can call this. The caller supplies a [`Position`] hint for
 		/// the new position; stale hints are repaired up to
 		/// `MaxHintRepairSteps`.
+		///
+		/// When [`PriorityProvider::priority`] returns `None` the item is
+		/// REMOVED from the list (announced by an `ItemRemoved` event): the
+		/// provider declaring an item dead makes its removal permissionless.
+		/// See the removal contract on [`PriorityProvider::priority`].
 		#[pallet::call_index(0)]
 		#[pallet::weight(
 			T::WeightInfo::reprioritize_no_op()

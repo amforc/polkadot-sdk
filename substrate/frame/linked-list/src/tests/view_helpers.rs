@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, Position, SortedListInterface};
+use crate::{mock::*, ListNodes, Node, Position, SortedListInterface};
 
 #[test]
 fn find_position_empty_list_returns_none_none() {
@@ -95,6 +95,30 @@ fn find_re_insert_position_treats_item_as_logically_removed() {
 			<LinkedList as SortedListInterface<_, _>>::find_re_insert_position(&1, &2, 95),
 			Some(Position::at_head(1))
 		);
+	});
+}
+
+/// A cyclic corrupt list must terminate the head→tail walk (capped at
+/// `len + 1` visits) instead of hanging the caller.
+#[test]
+fn find_position_terminates_on_cyclic_corruption() {
+	build_and_execute_no_post_check(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		// Forge a cycle through the head: 2.next = 1.
+		ListNodes::<Test>::insert(
+			1,
+			2,
+			Node { prev: Some(1u64), next: Some(1u64), priority: 50u32 },
+		);
+		// Priority 5 never satisfies `priority > node.priority`, so an
+		// unbounded walk would loop forever chasing the cycle.
+		let position = <LinkedList as SortedListInterface<_, _>>::find_position(&1, 5);
+		assert_eq!(position.next, None);
+		// The skip-aware variant shares the same bounded walk.
+		let re_insert_position =
+			<LinkedList as SortedListInterface<_, _>>::find_re_insert_position(&1, &1, 5);
+		assert!(re_insert_position.is_some());
 	});
 }
 

@@ -99,14 +99,6 @@ pub(crate) fn build_and_execute_no_post_check(test: impl FnOnce()) {
 	new_test_ext().execute_with(test);
 }
 
-/// Set the authoritative priority for `(list_id, item)` so [`StaticPriorityProvider`]
-/// reports it. Used in `dispatchables` tests for the `reprioritize` flow.
-pub(crate) fn set_real_priority(list_id: ListId, item: ItemId, priority: Priority) {
-	StaticPriorities::mutate(|m| {
-		m.insert((list_id, item), priority);
-	});
-}
-
 /// Convenience: insert via the `SortedListInterface` with the hint fetched
 /// from `find_position`. Returns the `repair_steps` count.
 pub(crate) fn insert(list_id: ListId, item: ItemId, priority: Priority) -> u32 {
@@ -122,6 +114,7 @@ pub(crate) fn dump(list_id: ListId) -> alloc::vec::Vec<(ItemId, Priority)> {
 	let mut out = alloc::vec::Vec::with_capacity(count as usize);
 	let mut cursor = LinkedList::head(list_id);
 	while let Some(item) = cursor {
+		assert!(out.len() <= count as usize, "dump: walk exceeded count (cycle?)");
 		let node = pallet_linked_list::ListNodes::<Test>::get(list_id, item)
 			.expect("listed items are stored; qed");
 		out.push((item, node.priority));
