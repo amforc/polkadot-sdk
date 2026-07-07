@@ -113,7 +113,8 @@ fn links_consistent<ItemId: PartialEq, Priority>(
 /// next.priority`, with endpoints treated as `+inf` / `-inf`. The `>=`/`>`
 /// asymmetry places same-priority inserts on the tail side of their cluster,
 /// yielding LIFO under tail-first iteration. Used standalone by `re_insert`'s
-/// in-place fast path, where the existing links are valid by construction.
+/// in-place fast path, after [`validate_node_links`] has vetted the existing
+/// links.
 pub fn neighbor_priorities_admit<ItemId, Priority: Ord>(
 	priority: &Priority,
 	pos: &Position<ItemId>,
@@ -123,6 +124,64 @@ pub fn neighbor_priorities_admit<ItemId, Priority: Ord>(
 	let prev_ok = pos.prev.is_none() || prev_node.is_some_and(|n| n.priority >= *priority);
 	let next_ok = pos.next.is_none() || next_node.is_some_and(|n| *priority > n.priority);
 	prev_ok && next_ok
+}
+
+/// Validate `item`'s stored links: no self-links, distinct neighbors, no
+/// dangling sides, both neighbors linking back at `item`, and endpoint sides
+/// owning the matching [`ListMetas`] pointer. `position` is the item's own
+/// `(prev, next)` pair and `prev_node`/`next_node` its neighbor rows as
+/// fetched by [`neighbor_nodes`]; the meta row is read only when an endpoint
+/// side is present, so validating an interior node costs no extra reads.
+///
+/// The single node-link integrity predicate: `re_insert` and [`remove_at`]
+/// require it before mutating, and [`insert_at_inner`]'s debug post-condition
+/// re-checks it after writing. The endpoint checks inside
+/// [`update_meta_for_insert`]/[`update_meta_for_remove`] stay as its
+/// write-site pair.
+pub fn validate_node_links<T: Config>(
+	list_id: &T::ListId,
+	item: &T::ItemId,
+	position: &Position<T::ItemId>,
+	prev_node: Option<&Node<T::ItemId, T::Priority>>,
+	next_node: Option<&Node<T::ItemId, T::Priority>>,
+) -> Result<(), ListError> {
+	// Anti-cycle guard: a node's own links must never name itself.
+	if position.prev.as_ref() == Some(item) || position.next.as_ref() == Some(item) {
+		defensive!("validate_node_links: node linked against itself");
+		return Err(ListError::CorruptList);
+	}
+	if position.prev.is_some() && position.prev == position.next {
+		defensive!("validate_node_links: prev and next name the same neighbor");
+		return Err(ListError::CorruptList);
+	}
+	if position.prev.is_some() && prev_node.is_none() {
+		defensive!("validate_node_links: prev neighbor row is missing");
+		return Err(ListError::CorruptList);
+	}
+	if position.next.is_some() && next_node.is_none() {
+		defensive!("validate_node_links: next neighbor row is missing");
+		return Err(ListError::CorruptList);
+	}
+	if prev_node.is_some_and(|node| node.next.as_ref() != Some(item)) {
+		defensive!("validate_node_links: prev neighbor does not link back to item");
+		return Err(ListError::CorruptList);
+	}
+	if next_node.is_some_and(|node| node.prev.as_ref() != Some(item)) {
+		defensive!("validate_node_links: next neighbor does not link back to item");
+		return Err(ListError::CorruptList);
+	}
+	if position.prev.is_none() || position.next.is_none() {
+		let meta = ListMetas::<T>::get(list_id).defensive_ok_or(ListError::CorruptList)?;
+		if position.prev.is_none() && meta.head.as_ref() != Some(item) {
+			defensive!("validate_node_links: head pointer disagrees with head-claiming node");
+			return Err(ListError::CorruptList);
+		}
+		if position.next.is_none() && meta.tail.as_ref() != Some(item) {
+			defensive!("validate_node_links: tail pointer disagrees with tail-claiming node");
+			return Err(ListError::CorruptList);
+		}
+	}
+	Ok(())
 }
 
 // Each `try_*` returns `true` iff it applied a one-step mutation to `current`.
@@ -418,8 +477,9 @@ pub fn insert_at_inner<T: Config>(
 }
 
 /// Debug-only post-condition for [`insert_at_inner`]: re-read `item` and confirm the
-/// splice landed — the cached priorities still admit `item`, each present
-/// neighbor points back at it, and a `None` side owns the matching endpoint.
+/// splice landed — the written node passes the same [`validate_node_links`]
+/// predicate the mutating paths require before touching a node, and the
+/// cached neighbor priorities admit it.
 #[cfg(debug_assertions)]
 fn debug_assert_insert_post_condition<T: Config>(list_id: &T::ListId, item: &T::ItemId) {
 	let node = ListNodes::<T>::get(list_id, item).expect("insert_at just wrote item; qed");
@@ -433,31 +493,11 @@ fn debug_assert_insert_post_condition<T: Config>(list_id: &T::ListId, item: &T::
 		neighbor_priorities_admit(&priority, &position, prev_node.as_ref(), next_node.as_ref()),
 		"neighbor priorities reject item",
 	);
-
-	match position.prev {
-		Some(ref prev_id) => debug_assert_eq!(
-			ListNodes::<T>::get(list_id, prev_id).and_then(|n| n.next).as_ref(),
-			Some(item),
-			"prev.next must point to item",
-		),
-		None => debug_assert_eq!(
-			ListMetas::<T>::get(list_id).and_then(|m| m.head).as_ref(),
-			Some(item),
-			"head-side insert must own the head pointer",
-		),
-	}
-	match position.next {
-		Some(ref next_id) => debug_assert_eq!(
-			ListNodes::<T>::get(list_id, next_id).and_then(|n| n.prev).as_ref(),
-			Some(item),
-			"next.prev must point to item",
-		),
-		None => debug_assert_eq!(
-			ListMetas::<T>::get(list_id).and_then(|m| m.tail).as_ref(),
-			Some(item),
-			"tail-side insert must own the tail pointer",
-		),
-	}
+	debug_assert!(
+		validate_node_links::<T>(list_id, item, &position, prev_node.as_ref(), next_node.as_ref())
+			.is_ok(),
+		"written node fails link validation",
+	);
 }
 
 /// Apply the head/tail/len bookkeeping for removing `item`, whose stored
@@ -514,28 +554,18 @@ pub fn remove_at<T: Config>(
 	let node = ListNodes::<T>::get(list_id, item).ok_or(ListError::ItemNotFound)?;
 	let priority = node.priority;
 	let vacated = node.into_position();
-	// Anti-cycle guard: a node's own links must never name itself.
-	if vacated.prev.as_ref() == Some(item) || vacated.next.as_ref() == Some(item) {
-		defensive!("remove_at: node linked against itself");
-		return Err(ListError::CorruptList);
-	}
 
-	if vacated.prev.is_some() && vacated.prev == vacated.next {
-		defensive!("remove_at: prev and next name the same neighbor");
-		return Err(ListError::CorruptList);
-	}
-
+	// `fetch_neighbor` already rejects dangling sides defensively, pairing
+	// with the validator's own dangling arms.
 	let prev_node = fetch_neighbor::<T>(list_id, vacated.prev.clone())?;
 	let next_node = fetch_neighbor::<T>(list_id, vacated.next.clone())?;
-
-	if prev_node.as_ref().is_some_and(|(_, node)| node.next.as_ref() != Some(item)) {
-		defensive!("remove_at: prev neighbor does not link back to item");
-		return Err(ListError::CorruptList);
-	}
-	if next_node.as_ref().is_some_and(|(_, node)| node.prev.as_ref() != Some(item)) {
-		defensive!("remove_at: next neighbor does not link back to item");
-		return Err(ListError::CorruptList);
-	}
+	validate_node_links::<T>(
+		list_id,
+		item,
+		&vacated,
+		prev_node.as_ref().map(|(_, node)| node),
+		next_node.as_ref().map(|(_, node)| node),
+	)?;
 
 	// Validate endpoints and update the meta row first so that any cross-check
 	// failure surfaces as `CorruptList` before any node-row mutation happens.
