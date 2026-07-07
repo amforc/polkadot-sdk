@@ -17,9 +17,9 @@
 
 //! Storage primitives for the sorted doubly-linked list.
 //!
-//! [`Node`] is the per-item storage value. [`insert_at`], [`remove_at`] and
-//! [`walk_repair`] mutate or read the per-list [`ListNodes`] and [`ListMetas`]
-//! storage maps and are wrapped by the trait impl in
+//! [`Node`] is the per-item storage value. [`insert_at_inner`], [`remove_at`]
+//! and [`walk_repair`] mutate or read the per-list [`ListNodes`] and
+//! [`ListMetas`] storage maps and are wrapped by the trait impl in
 //! [`super::sorted_list_interface`].
 
 use crate::{pallet::*, ListError, ListMeta, Position};
@@ -208,19 +208,31 @@ fn try_walk_priority<ItemId: Clone, Priority: Ord>(
 	}
 }
 
+/// A validated insert position produced by [`walk_repair`]: the corrected
+/// position, the number of repair steps actually taken, and the neighbor rows
+/// fetched during the final validation pass so that [`insert_at_inner`] can
+/// splice without re-reading them.
+pub struct ValidPosition<ItemId, Priority> {
+	pub position: Position<ItemId>,
+	pub steps: u32,
+	pub prev_node: Option<Node<ItemId, Priority>>,
+	pub next_node: Option<Node<ItemId, Priority>>,
+}
+
 /// Walk from `hint` toward the correct insert position for `priority`, taking
 /// at most `MaxHintRepairSteps` steps. Each iteration fetches the two
 /// neighbor rows once; the decoded pair feeds both the validity check and
-/// the repair step.
+/// the repair step, and the final pair is handed to the caller.
 ///
-/// Returns the corrected position alongside the number of steps actually
-/// taken, or `InvalidPositionHints` if the budget is exhausted before a valid
-/// position is reached.
+/// Returns [`ValidPosition`], `InvalidPositionHints` if the budget is
+/// exhausted before a valid position is reached, or `CorruptList` if a repair
+/// step cannot make progress (only possible when stored links are internally
+/// inconsistent, e.g. asymmetric neighbor pointers).
 pub fn walk_repair<T: Config>(
 	list_id: &T::ListId,
 	priority: &T::Priority,
 	hint: Position<T::ItemId>,
-) -> Result<(Position<T::ItemId>, u32), ListError> {
+) -> Result<ValidPosition<T::ItemId, T::Priority>, ListError> {
 	let meta = ListMetas::<T>::get(list_id);
 	let mut current = hint;
 	let budget = T::MaxHintRepairSteps::get();
@@ -230,20 +242,18 @@ pub fn walk_repair<T: Config>(
 		let (prev_node, next_node) = neighbor_nodes::<T>(list_id, &current);
 		let (pn, nn) = (prev_node.as_ref(), next_node.as_ref());
 		if is_position_valid(priority, &current, pn, nn, meta.as_ref()) {
-			return Ok((current, steps));
+			return Ok(ValidPosition { position: current, steps, prev_node, next_node });
 		}
 		if steps == budget {
 			break;
 		}
+		let before = current.clone();
 		let progressed = try_clamp_dangling(&mut current, pn, nn) ||
 			try_reanchor_inconsistent(priority, &mut current, pn, nn, meta.as_ref()) ||
 			try_walk_priority(priority, &mut current, pn, nn);
-		if !progressed {
-			// Links are consistent and neither side's priority drives a walk,
-			// yet `is_position_valid` rejects us. Reset to the head so the
-			// loop still terminates within the budget.
-			defensive!("walk_repair: no repair step applicable, resetting to head");
-			current = Position { prev: None, next: meta.as_ref().and_then(|m| m.head.clone()) };
+		if !progressed || current == before {
+			defensive!("walk_repair: repair step made no progress");
+			return Err(ListError::CorruptList);
 		}
 	}
 
@@ -313,10 +323,17 @@ fn update_meta_for_insert<T: Config>(
 	})
 }
 
-/// Insert `item` at `position` in `list_id`. The caller is responsible for
-/// ensuring the position is valid; errors if `item` is already in the list.
+/// Insert `item` at `position` in `list_id`, fetching the neighbor rows from
+/// storage. The caller is responsible for ensuring the position is valid;
+/// errors if `item` is already in the list.
+///
+/// Thin wrapper over [`insert_at_inner`] for callers that did not just run
+/// [`walk_repair`] (which already holds the fetched neighbor rows). All
+/// production paths go through `walk_repair`, so only tests drive this
+/// entry point directly (to exercise the defensive guards in isolation).
 ///
 /// Returns `true` if this insert created the list (it was previously empty).
+#[cfg(test)]
 pub fn insert_at<T: Config>(
 	list_id: &T::ListId,
 	item: &T::ItemId,
@@ -327,32 +344,62 @@ pub fn insert_at<T: Config>(
 		return Err(ListError::ItemAlreadyExists);
 	}
 
+	// Anti-cycle guard: a node must never be linked against itself. Checked
+	// before the fetches so a self-naming hint surfaces as the cycle it is
+	// rather than as a missing-neighbor row.
+	if position.prev.as_ref() == Some(item) || position.next.as_ref() == Some(item) {
+		defensive!("insert_at: item linked against itself");
+		return Err(ListError::CorruptList);
+	}
+
+	let prev_node = fetch_neighbor::<T>(list_id, position.prev.clone())?.map(|(_, n)| n);
+	let next_node = fetch_neighbor::<T>(list_id, position.next.clone())?.map(|(_, n)| n);
+	insert_at_inner::<T>(list_id, item, priority, position, prev_node, next_node)
+}
+
+/// Splice `item` in at `position`, whose neighbor rows the caller has already
+/// fetched: `prev_node`/`next_node` must be the stored nodes for
+/// `position.prev`/`position.next`, `None` on endpoint sides. Called directly
+/// after [`walk_repair`] with the rows it validated, so the hot path never
+/// re-reads them.
+///
+/// Returns `true` if this insert created the list (it was previously empty).
+pub fn insert_at_inner<T: Config>(
+	list_id: &T::ListId,
+	item: &T::ItemId,
+	priority: T::Priority,
+	position: Position<T::ItemId>,
+	prev_node: Option<Node<T::ItemId, T::Priority>>,
+	next_node: Option<Node<T::ItemId, T::Priority>>,
+) -> Result<bool, ListError> {
 	// Anti-cycle guard: a node must never be linked against itself. `walk_repair`
 	// never yields such a position, so reaching it is internal corruption.
 	if position.prev.as_ref() == Some(item) || position.next.as_ref() == Some(item) {
 		defensive!("insert_at: item linked against itself");
 		return Err(ListError::CorruptList);
 	}
+	// Each `Some` side must come with its stored node; a dangling side here is
+	// corruption (the wrapper and `walk_repair` both guarantee agreement).
+	if position.prev.is_some() != prev_node.is_some() {
+		defensive!("insert_at: prev side and prev node disagree");
+		return Err(ListError::CorruptList);
+	}
+	if position.next.is_some() != next_node.is_some() {
+		defensive!("insert_at: next side and next node disagree");
+		return Err(ListError::CorruptList);
+	}
 
-	let prev_node = fetch_neighbor::<T>(list_id, position.prev.clone())?;
-	let next_node = fetch_neighbor::<T>(list_id, position.next.clone())?;
-
-	assert_position_admits::<T>(
-		&priority,
-		&position,
-		prev_node.as_ref().map(|(_, n)| n),
-		next_node.as_ref().map(|(_, n)| n),
-	)?;
+	assert_position_admits::<T>(&priority, &position, prev_node.as_ref(), next_node.as_ref())?;
 
 	let list_created = update_meta_for_insert::<T>(list_id, item, &position)?;
 
 	// Splice in on the head side: rewrite prev's `.next` to point at `item`.
-	if let Some((p, mut n)) = prev_node {
-		n.next = Some(item.clone());
-		ListNodes::<T>::insert(list_id, p, n);
+	if let (Some(p), Some(mut node)) = (position.prev.as_ref(), prev_node) {
+		node.next = Some(item.clone());
+		ListNodes::<T>::insert(list_id, p, node);
 	}
 	// Symmetric on the tail side.
-	if let Some((n, mut node)) = next_node {
+	if let (Some(n), Some(mut node)) = (position.next.as_ref(), next_node) {
 		node.prev = Some(item.clone());
 		ListNodes::<T>::insert(list_id, n, node);
 	}
@@ -370,7 +417,7 @@ pub fn insert_at<T: Config>(
 	Ok(list_created)
 }
 
-/// Debug-only post-condition for [`insert_at`]: re-read `item` and confirm the
+/// Debug-only post-condition for [`insert_at_inner`]: re-read `item` and confirm the
 /// splice landed — the cached priorities still admit `item`, each present
 /// neighbor points back at it, and a `None` side owns the matching endpoint.
 #[cfg(debug_assertions)]
@@ -470,6 +517,11 @@ pub fn remove_at<T: Config>(
 	// Anti-cycle guard: a node's own links must never name itself.
 	if vacated.prev.as_ref() == Some(item) || vacated.next.as_ref() == Some(item) {
 		defensive!("remove_at: node linked against itself");
+		return Err(ListError::CorruptList);
+	}
+
+	if vacated.prev.is_some() && vacated.prev == vacated.next {
+		defensive!("remove_at: prev and next name the same neighbor");
 		return Err(ListError::CorruptList);
 	}
 

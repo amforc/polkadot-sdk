@@ -36,9 +36,11 @@ A naive "reject if stale" policy forces callers to recompute and retry.
 
 **Bounded on-chain repair is the middle path.** When the supplied hint does
 not match the current list state, the pallet walks at most
-`MaxHintRepairSteps` nodes from the hint toward the correct position. The
-dispatch reports the actual number of steps walked back via
-`PostDispatchInfo::actual_weight`, so callers are refunded unused weight.
+`MaxHintRepairSteps` nodes from the hint toward the correct position. On
+success the dispatch reports the actual number of steps walked back via
+`PostDispatchInfo::actual_weight`, so callers are refunded unused weight (on
+failure the reserved worst-case weight is charged, except for the early
+item-not-found exit, which is refunded to the cheapest path).
 Repair handles three flavours of staleness, each counted as one step:
 
 - **Dangling references** — a hinted neighbor has been removed since the hint
@@ -105,6 +107,19 @@ drifted from the stored value. This is the mechanism by which consumer pallets
 surface authoritative priority changes (e.g. collateral ratio shifts) to the
 list.
 
+### Permissionless removal contract
+
+`reprioritize` REMOVES the item whenever [`PriorityProvider::priority`]
+returns `None`, and because the call is permissionless any third party can
+trigger that removal the moment the provider reports `None`. The obligations
+this places on implementations are documented on
+[`PriorityProvider::priority`] — the canonical statement of the contract.
+
+Unlike `pallet-bags-list` (whose `rebag` has the same removal-on-`None`
+semantics guarded by a `Lock`), this pallet deliberately ships no lock: the
+provider is the single control point, and the contract above is the price of
+that simplicity.
+
 ## Try-state invariants
 
 `try_state` (active under `try-runtime`) checks, for each list:
@@ -121,7 +136,9 @@ See `try_state.rs` for the exact checks.
 
 ## Weights and refunds
 
-The `reprioritize` dispatchable is weighted by `MaxHintRepairSteps` upfront and
-refunds the difference between the budget and steps actually walked.
-Trait-level `insert` and `re_insert` likewise return the step count so consumer
-pallets can do the same accounting at their own dispatchable boundary.
+The `reprioritize` dispatchable is weighted by `MaxHintRepairSteps` upfront
+and, on success, refunds the difference between the budget and steps actually
+walked. Trait-level `insert` and `re_insert` likewise
+return the step count so consumer pallets can do the same accounting at their
+own dispatchable boundary.
+
