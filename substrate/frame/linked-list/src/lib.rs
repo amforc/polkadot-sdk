@@ -64,7 +64,6 @@ pub mod weights;
 pub(crate) const LOG_TARGET: &str = "runtime::linked-list";
 
 // Syntactic sugar for logging.
-#[macro_export]
 macro_rules! log {
 	($level:tt, $pattern:expr $(, $values:expr)* $(,)?) => {
 		frame::log::$level!(
@@ -76,6 +75,7 @@ macro_rules! log {
 		)
 	};
 }
+pub(crate) use log;
 
 #[cfg(test)]
 mod mock;

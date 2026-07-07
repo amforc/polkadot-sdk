@@ -112,7 +112,8 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// # Errors
 	///
 	/// - [`ListError::ItemNotFound`] if `(list_id, item)` is not in the list.
-	/// - [`ListError::CorruptList`] if the node exists but list metadata is inconsistent.
+	/// - [`ListError::CorruptList`] if the node's stored links, its neighbors' back-links, or the
+	///   list metadata are inconsistent — never as a result of caller input.
 	/// - [`ListError::InvalidPositionHints`] if the hint cannot be repaired within the budget.
 	/// - [`ListError::Internal`] if the transactional storage-layer limit blocked the splice
 	///   (environmental; retrying with a different hint will not help).
@@ -298,9 +299,21 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 			return Ok(Outcome::NoOp);
 		}
 
-		// Fast path: existing neighbors still admit the new priority, mutate in place.
+		// Every mutating path validates the node's stored links up front so
+		// corruption surfaces as `CorruptList` here, matching the posture of
+		// `insert`/`remove`. Interior nodes pay no extra reads: the neighbor
+		// rows double as the in-place admissibility inputs below.
 		let existing_position = existing.into_position();
 		let (prev_node, next_node) = list::neighbor_nodes::<T>(&list_id, &existing_position);
+		list::validate_node_links::<T>(
+			&list_id,
+			&item,
+			&existing_position,
+			prev_node.as_ref(),
+			next_node.as_ref(),
+		)?;
+
+		// Fast path: existing neighbors still admit the new priority, mutate in place.
 		if list::neighbor_priorities_admit(
 			&new_priority,
 			&existing_position,
