@@ -1305,4 +1305,3 @@ fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_not_coins() {
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 	});
 }
-
