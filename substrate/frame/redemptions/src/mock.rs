@@ -245,6 +245,7 @@ impl pallet_vaults::Config for Test {
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
 	type FeeHandler = ();
+	type YieldHook = ();
 	// Registering a market seeds this pallet's redemption config via `on_registered`.
 	type OnBranchLifecycle = Redemptions;
 	type TimeProvider = Timestamp;
