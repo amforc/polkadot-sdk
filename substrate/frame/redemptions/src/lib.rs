@@ -122,8 +122,8 @@ pub mod pallet {
 		prelude::*,
 	};
 	use pusd_primitives::{
-		recovery_pricing, ProvidePrice, RedemptionAllocation, RedemptionStepSnapshot,
-		VaultInterface,
+		recovery_pricing, ProvidePrice, RecoveryOffsetInterface, RecoveryOffsetOutcome,
+		RecoveryOffsetQuote, RedemptionAllocation, RedemptionStepSnapshot, VaultInterface,
 	};
 
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
@@ -304,6 +304,12 @@ pub mod pallet {
 		InsuranceFundBurnFailed,
 		/// The supplied redemption config is internally inconsistent.
 		InvalidRedemptionConfig,
+		/// No `FinalRecovery` vault is queued, or nothing is cancellable
+		/// against the head.
+		NoRecoveryTarget,
+		/// The `FinalRecovery` head is below par (`CR < 100%`): recovery
+		/// offsets are restricted to the recovery-bonus regime.
+		RecoveryOffsetBelowPar,
 	}
 
 	#[pallet::hooks]
@@ -1042,6 +1048,125 @@ pub mod pallet {
 				fee_pusd: Zero::zero(),
 				pusd_in: pricing.debt,
 			})
+		}
+	}
+
+	impl<T: Config> Pallet<T> {
+		/// Config + oracle price for the recovery-offset paths. No fee state:
+		/// offsets are fee-free and leave the dynamic fee untouched.
+		fn offset_preamble(
+			collateral_id: &T::CollateralAssetId,
+			stable_id: &T::StableAssetId,
+		) -> Result<(RedemptionConfigOf<T>, FixedU128), DispatchError> {
+			let config = RedemptionConfigs::<T>::get(collateral_id, stable_id)
+				.ok_or(Error::<T>::InvalidBranch)?;
+			let price = T::Oracle::provide_price(collateral_id)
+				.map_err(|_| Error::<T>::OracleUnavailable)?;
+			ensure!(!price.is_zero(), Error::<T>::OracleUnavailable);
+			Ok((config, price))
+		}
+
+		/// Size a recovery offset against the FIFO head via a touch-only
+		/// `redeem_step`; the caller wraps this in a rolled-back transaction.
+		/// Prices through [`Self::price_recovery`], the same function that
+		/// prices recovery redemptions, so the two can never diverge.
+		fn quote_recovery_offset(
+			collateral_id: &T::CollateralAssetId,
+			stable_id: &T::StableAssetId,
+			max_debt_to_cancel: BalanceOf<T>,
+		) -> Result<RecoveryOffsetQuote<BalanceOf<T>>, DispatchError> {
+			// Target first, preamble second: the dominant path (no
+			// `FinalRecovery` head queued) then skips the config and oracle
+			// reads entirely.
+			let Some((owner, status)) =
+				T::Vaults::next_redemption_target(collateral_id, stable_id, None)
+			else {
+				return Ok(RecoveryOffsetQuote::NoTarget);
+			};
+			if !status.is_final_recovery() {
+				return Ok(RecoveryOffsetQuote::NoTarget);
+			}
+			let (config, price) = Self::offset_preamble(collateral_id, stable_id)?;
+			let mut captured = None;
+			T::Vaults::redeem_step(collateral_id, stable_id, &owner, |snap| {
+				captured = Some(snap);
+				Ok(None)
+			})?;
+			let Some(snap) = captured else {
+				return Ok(RecoveryOffsetQuote::NoTarget);
+			};
+			let Some(pricing) =
+				Self::price_recovery(stable_id, &snap, price, max_debt_to_cancel, &config)
+			else {
+				return Ok(RecoveryOffsetQuote::NoTarget);
+			};
+			if pricing.split.is_some() {
+				return Ok(RecoveryOffsetQuote::BelowPar);
+			}
+			Ok(RecoveryOffsetQuote::Available { debt: pricing.debt })
+		}
+	}
+
+	impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
+		type CollateralId = T::CollateralAssetId;
+		type StableId = T::StableAssetId;
+		type AccountId = T::AccountId;
+		type Balance = BalanceOf<T>;
+
+		/// Rolled back because sizing an accurate quote touches vault state.
+		fn preview_recovery_offset(
+			collateral_id: &T::CollateralAssetId,
+			stable_id: &T::StableAssetId,
+			max_debt_to_cancel: BalanceOf<T>,
+		) -> Result<RecoveryOffsetQuote<BalanceOf<T>>, DispatchError> {
+			with_transaction(|| {
+				let quote =
+					Self::quote_recovery_offset(collateral_id, stable_id, max_debt_to_cancel);
+				TransactionOutcome::Rollback(quote)
+			})
+		}
+
+		fn apply_recovery_offset(
+			collateral_id: &T::CollateralAssetId,
+			stable_id: &T::StableAssetId,
+			payer: &T::AccountId,
+			collateral_recipient: &T::AccountId,
+			max_debt_to_cancel: BalanceOf<T>,
+		) -> Result<RecoveryOffsetOutcome<T::AccountId, BalanceOf<T>>, DispatchError> {
+			let Some((owner, status)) =
+				T::Vaults::next_redemption_target(collateral_id, stable_id, None)
+			else {
+				return Err(Error::<T>::NoRecoveryTarget.into());
+			};
+			ensure!(status.is_final_recovery(), Error::<T>::NoRecoveryTarget);
+			let (config, price) = Self::offset_preamble(collateral_id, stable_id)?;
+
+			let mut outcome = None;
+			T::Vaults::redeem_step(collateral_id, stable_id, &owner, |snap| {
+				let pricing =
+					Self::price_recovery(stable_id, &snap, price, max_debt_to_cancel, &config)
+						.ok_or(Error::<T>::NoRecoveryTarget)?;
+				ensure!(pricing.split.is_none(), Error::<T>::RecoveryOffsetBelowPar);
+				ensure!(!pricing.debt.is_zero(), Error::<T>::NoRecoveryTarget);
+				// The same burn as a recovery redemption with a zero fee
+				// portion: offsets are fee-free settlement. A drained head
+				// flips to Dormant inside the vault step itself.
+				Self::burn_redeemer_pusd(stable_id, payer, pricing.debt, pricing.debt)?;
+				outcome = Some(RecoveryOffsetOutcome {
+					vault_owner: owner.clone(),
+					debt_cancelled: pricing.debt,
+					collateral_out: pricing.collateral_out,
+				});
+				Ok(Some(RedemptionAllocation {
+					redeemer: collateral_recipient.clone(),
+					debt_to_cancel: pricing.debt,
+					collateral_to_redeemer: pricing.collateral_out,
+					fee_collateral_retained: Zero::zero(),
+				}))
+			})?;
+			// The closure always sets the outcome before returning an
+			// allocation; reaching here without one is a vault-side breach.
+			outcome.ok_or_else(|| Error::<T>::NoRecoveryTarget.into())
 		}
 	}
 
