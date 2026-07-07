@@ -67,14 +67,7 @@ fn stale_hint_beyond_budget_returns_invalid_hints() {
 fn repair_steps_needed_zero_for_valid_hint() {
 	build_and_execute(|| {
 		build_chain(&[(1, 90), (2, 70), (3, 50)]);
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::repair_steps_needed(
-				&1,
-				80,
-				Position::between(1, 2),
-			),
-			0
-		);
+		assert_eq!(LinkedList::repair_steps_needed(1, 80, Position::between(1, 2),), 0);
 	});
 }
 
@@ -82,11 +75,7 @@ fn repair_steps_needed_zero_for_valid_hint() {
 fn repair_steps_needed_positive_for_stale_hint() {
 	build_and_execute(|| {
 		build_chain(&[(1, 90), (2, 70), (3, 50)]);
-		let n = <LinkedList as SortedListInterface<_, _>>::repair_steps_needed(
-			&1,
-			60,
-			Position::at_head(1),
-		);
+		let n = LinkedList::repair_steps_needed(1, 60, Position::at_head(1));
 		assert!(n > 0);
 	});
 }
@@ -102,11 +91,7 @@ fn repair_steps_needed_counts_dangling_hint_clamp() {
 		// `Some(999)` is dangling. Even though priority 80 is positionally between
 		// (1, 2), `walk_repair` must spend at least one step clamping the
 		// invalid `next` before it can land on the correct position.
-		let n = <LinkedList as SortedListInterface<_, _>>::repair_steps_needed(
-			&1,
-			80,
-			Position::between(1, 999),
-		);
+		let n = LinkedList::repair_steps_needed(1, 80, Position::between(1, 999));
 		assert!(n > 0);
 	});
 }
@@ -116,11 +101,7 @@ fn repair_steps_needed_exceeds_budget_signals_infeasible() {
 	build_and_execute(|| {
 		build_long_chain();
 		// priority=5 is tail; hint claims head. Distance > `MaxHintRepairSteps`.
-		let n = <LinkedList as SortedListInterface<_, _>>::repair_steps_needed(
-			&1,
-			5,
-			Position::at_head(1),
-		);
+		let n = LinkedList::repair_steps_needed(1, 5, Position::at_head(1));
 		assert!(n > MaxHintRepairSteps::get());
 	});
 }

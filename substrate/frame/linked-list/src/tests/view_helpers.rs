@@ -15,15 +15,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, ListNodes, Node, Position, SortedListInterface};
+use crate::{mock::*, ListNodes, Node, Position};
 
 #[test]
 fn find_position_empty_list_returns_none_none() {
 	build_and_execute(|| {
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::find_position(&1, 50),
-			Position::endpoints_only()
-		);
+		assert_eq!(LinkedList::find_position(1, 50), Position::endpoints_only());
 	});
 }
 
@@ -33,10 +30,7 @@ fn find_position_above_all_returns_none_some_head() {
 		insert(1, 1, 90);
 		insert(1, 2, 50);
 		// priority 100 is greater than head (90), so prev=None, next=head=1.
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::find_position(&1, 100),
-			Position::at_head(1)
-		);
+		assert_eq!(LinkedList::find_position(1, 100), Position::at_head(1));
 	});
 }
 
@@ -46,10 +40,7 @@ fn find_position_below_all_returns_some_tail_none() {
 		insert(1, 1, 90);
 		insert(1, 2, 50);
 		// priority 5 is less than tail (50), so prev=tail=2, next=None.
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::find_position(&1, 5),
-			Position::at_tail(2)
-		);
+		assert_eq!(LinkedList::find_position(1, 5), Position::at_tail(2));
 	});
 }
 
@@ -59,10 +50,7 @@ fn find_position_middle() {
 		insert(1, 1, 90);
 		insert(1, 2, 50);
 		insert(1, 3, 10);
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::find_position(&1, 70),
-			Position::between(1, 2)
-		);
+		assert_eq!(LinkedList::find_position(1, 70), Position::between(1, 2));
 	});
 }
 
@@ -76,10 +64,7 @@ fn find_position_same_priority_lands_at_tail_side() {
 		// has 50; both qualify), but next.priority < 50 (3 has 10). Walking from
 		// the head, we step past 1, then past 2 (since 50 > 50 is false → keep
 		// walking), and stop at 3.
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::find_position(&1, 50),
-			Position::between(2, 3)
-		);
+		assert_eq!(LinkedList::find_position(1, 50), Position::between(2, 3));
 	});
 }
 
@@ -91,10 +76,7 @@ fn find_re_insert_position_treats_item_as_logically_removed() {
 		insert(1, 3, 10);
 		// Re-insert 2 (currently 50) at priority 95: should be at head, prev=None,
 		// next=1. The algorithm must skip 2 itself.
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::find_re_insert_position(&1, &2, 95),
-			Some(Position::at_head(1))
-		);
+		assert_eq!(LinkedList::find_re_insert_position(1, 2, 95), Some(Position::at_head(1)));
 	});
 }
 
@@ -113,11 +95,10 @@ fn find_position_terminates_on_cyclic_corruption() {
 		);
 		// Priority 5 never satisfies `priority > node.priority`, so an
 		// unbounded walk would loop forever chasing the cycle.
-		let position = <LinkedList as SortedListInterface<_, _>>::find_position(&1, 5);
+		let position = LinkedList::find_position(1, 5);
 		assert_eq!(position.next, None);
 		// The skip-aware variant shares the same bounded walk.
-		let re_insert_position =
-			<LinkedList as SortedListInterface<_, _>>::find_re_insert_position(&1, &1, 5);
+		let re_insert_position = LinkedList::find_re_insert_position(1, 1, 5);
 		assert!(re_insert_position.is_some());
 	});
 }
@@ -126,7 +107,7 @@ fn find_position_terminates_on_cyclic_corruption() {
 fn neighbors_returns_none_for_unknown_item() {
 	build_and_execute(|| {
 		insert(1, 1, 90);
-		assert_eq!(<LinkedList as SortedListInterface<_, _>>::neighbors(&1, &999), None);
+		assert_eq!(LinkedList::neighbors(1, 999), None);
 	});
 }
 
@@ -136,10 +117,7 @@ fn neighbors_returns_links_for_known_item() {
 		insert(1, 1, 90);
 		insert(1, 2, 50);
 		insert(1, 3, 10);
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::neighbors(&1, &2),
-			Some(Position::between(1, 3))
-		);
+		assert_eq!(LinkedList::neighbors(1, 2), Some(Position::between(1, 3)));
 	});
 }
 
@@ -147,7 +125,7 @@ fn neighbors_returns_links_for_known_item() {
 fn priority_returns_none_for_unknown_item() {
 	build_and_execute(|| {
 		insert(1, 1, 90);
-		assert_eq!(<LinkedList as SortedListInterface<_, _>>::priority(&1, &999), None);
+		assert_eq!(LinkedList::priority(1, 999), None);
 	});
 }
 
@@ -156,8 +134,8 @@ fn priority_returns_stored_priority_for_known_item() {
 	build_and_execute(|| {
 		insert(1, 1, 90);
 		insert(1, 2, 50);
-		assert_eq!(<LinkedList as SortedListInterface<_, _>>::priority(&1, &1), Some(90));
-		assert_eq!(<LinkedList as SortedListInterface<_, _>>::priority(&1, &2), Some(50));
+		assert_eq!(LinkedList::priority(1, 1), Some(90));
+		assert_eq!(LinkedList::priority(1, 2), Some(50));
 	});
 }
 
@@ -167,18 +145,9 @@ fn node_returns_priority_and_position_for_known_item() {
 		insert(1, 1, 90);
 		insert(1, 2, 50);
 		insert(1, 3, 10);
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::node(&1, &1),
-			Some((90, Position::at_head(2)))
-		);
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::node(&1, &2),
-			Some((50, Position::between(1, 3)))
-		);
-		assert_eq!(
-			<LinkedList as SortedListInterface<_, _>>::node(&1, &3),
-			Some((10, Position::at_tail(2)))
-		);
+		assert_eq!(LinkedList::node(1, 1), Some((90, Position::at_head(2))));
+		assert_eq!(LinkedList::node(1, 2), Some((50, Position::between(1, 3))));
+		assert_eq!(LinkedList::node(1, 3), Some((10, Position::at_tail(2))));
 	});
 }
 
@@ -186,6 +155,6 @@ fn node_returns_priority_and_position_for_known_item() {
 fn node_returns_none_for_unknown_item() {
 	build_and_execute(|| {
 		insert(1, 1, 90);
-		assert_eq!(<LinkedList as SortedListInterface<_, _>>::node(&1, &999), None);
+		assert_eq!(LinkedList::node(1, 999), None);
 	});
 }
