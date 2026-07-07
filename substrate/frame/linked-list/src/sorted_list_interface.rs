@@ -20,6 +20,7 @@
 use crate::{list, pallet::*, view_helpers, ListError, Outcome, Position};
 use alloc::vec::Vec;
 use frame::{
+	arithmetic::{FixedU128, Zero},
 	deps::frame_support::{
 		storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
 		traits::DefensiveOption,
@@ -53,6 +54,41 @@ pub trait PriorityProvider<ListId, ItemId> {
 	/// returned by [`Self::priority`] for `(list_id, item)`.
 	#[cfg(any(feature = "runtime-benchmarks", feature = "std"))]
 	fn set_priority(_list_id: &ListId, _item: &ItemId, _priority: Self::Priority) {}
+}
+
+/// Append `item` to a list driven under FIFO discipline: the insertion
+/// priority is one above the current head's, so it is strictly greater than
+/// every present priority — FIFO order holds across arbitrary join/leave
+/// interleavings, the stored priorities stay distinct (permissionless
+/// re-anchoring can never legally relocate a member), the oldest member is
+/// the list tail, and the sequence resets whenever the list empties.
+///
+/// A FIFO list's `PriorityProvider` must treat the stored priority as
+/// authoritative (FIFO priorities never drift).
+///
+/// # Errors
+///
+/// - Everything [`SortedListInterface::insert`] can return.
+/// - [`ListError::CorruptList`] if the head has no stored priority, or its priority cannot be
+///   incremented (unreachable in practice: `u128::MAX` consecutive occupied appends).
+pub fn fifo_append<ListId, ItemId, List>(list_id: ListId, item: ItemId) -> Result<(), ListError>
+where
+	List: SortedListInterface<ListId, ItemId, Priority = FixedU128>,
+{
+	let head = List::head(&list_id);
+	let priority = match &head {
+		Some(head_item) => {
+			let head_priority =
+				List::priority(&list_id, head_item).ok_or(ListError::CorruptList)?;
+			let inner = head_priority.into_inner().checked_add(1).ok_or(ListError::CorruptList)?;
+			FixedU128::from_inner(inner)
+		},
+		None => FixedU128::zero(),
+	};
+
+	let hint = Position { prev: None, next: head };
+	List::insert(list_id, item, priority, hint)?;
+	Ok(())
 }
 
 /// Mutation and query surface for consumer pallets.

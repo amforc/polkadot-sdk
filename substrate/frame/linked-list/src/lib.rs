@@ -50,7 +50,7 @@ use frame::prelude::*;
 
 pub use list::Node;
 pub use pallet::*;
-pub use sorted_list_interface::{PriorityProvider, SortedListInterface};
+pub use sorted_list_interface::{fifo_append, PriorityProvider, SortedListInterface};
 pub use types::{ListError, ListMeta, Outcome, Position};
 
 mod dispatchables;
