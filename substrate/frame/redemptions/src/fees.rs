@@ -80,10 +80,7 @@ pub fn scale_floor<Balance: FixedPointOperand>(
 	if denom.is_zero() {
 		return Balance::zero();
 	}
-	let v: u128 = value.unique_saturated_into();
-	let n: u128 = num.unique_saturated_into();
-	let d: u128 = denom.unique_saturated_into();
-	mul_ratio_or(v, n, d, Rounding::Down, Balance::max_value)
+	pusd_primitives::mul_div_floor(value, num, denom).defensive_unwrap_or_else(Balance::max_value)
 }
 
 /// `a * num / denom` at `Balance` precision with the given rounding, falling
