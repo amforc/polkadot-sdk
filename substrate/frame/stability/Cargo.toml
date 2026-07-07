@@ -17,6 +17,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dependencies]
 codec = { workspace = true, features = ["derive"] }
 frame = { workspace = true, features = ["runtime"] }
+pallet-linked-list = { workspace = true }
 pusd-primitives = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
 
@@ -24,7 +25,7 @@ scale-info = { workspace = true, features = ["derive"] }
 pallet-assets = { workspace = true, features = ["std"] }
 pallet-assets-holder = { workspace = true, features = ["std"] }
 pallet-balances = { workspace = true, features = ["std"] }
-pallet-linked-list = { workspace = true, features = ["std"] }
+pallet-redemptions = { workspace = true, features = ["std"] }
 pallet-timestamp = { workspace = true, features = ["std"] }
 pallet-vaults = { workspace = true, features = ["std"] }
 
@@ -37,6 +38,7 @@ std = [
 	"pallet-assets/std",
 	"pallet-balances/std",
 	"pallet-linked-list/std",
+	"pallet-redemptions/std",
 	"pallet-timestamp/std",
 	"pallet-vaults/std",
 	"pusd-primitives/std",
@@ -48,6 +50,7 @@ runtime-benchmarks = [
 	"pallet-assets/runtime-benchmarks",
 	"pallet-balances/runtime-benchmarks",
 	"pallet-linked-list/runtime-benchmarks",
+	"pallet-redemptions/runtime-benchmarks",
 	"pallet-timestamp/runtime-benchmarks",
 	"pallet-vaults/runtime-benchmarks",
 	"pusd-primitives/runtime-benchmarks",
@@ -58,6 +61,7 @@ try-runtime = [
 	"pallet-assets/try-runtime",
 	"pallet-balances/try-runtime",
 	"pallet-linked-list/try-runtime",
+	"pallet-redemptions/try-runtime",
 	"pallet-timestamp/try-runtime",
 	"pallet-vaults/try-runtime",
 	"pusd-primitives/try-runtime",
