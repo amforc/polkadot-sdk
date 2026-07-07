@@ -117,16 +117,7 @@ pub fn redistribution_per_stake<Balance: FixedPointOperand>(
 	num: Balance,
 	denom: Balance,
 ) -> Option<FixedU128> {
-	if num.is_zero() {
-		return Some(FixedU128::zero());
-	}
-	if denom.is_zero() {
-		return None;
-	}
-	let n: u128 = num.unique_saturated_into();
-	let d: u128 = denom.unique_saturated_into();
-	multiply_by_rational_with_rounding(n, FixedU128::DIV, d, Rounding::Down)
-		.map(FixedU128::from_inner)
+	pusd_primitives::mul_div_rate_floor(num, FixedU128::one(), denom)
 }
 
 pub fn redistribution_weight_per_stake<Balance: FixedPointOperand>(
@@ -134,16 +125,7 @@ pub fn redistribution_weight_per_stake<Balance: FixedPointOperand>(
 	avg_rate: FixedU128,
 	denom: Balance,
 ) -> Option<FixedU128> {
-	if redistributed_debt.is_zero() || avg_rate.is_zero() {
-		return Some(FixedU128::zero());
-	}
-	if denom.is_zero() {
-		return None;
-	}
-	let n: u128 = redistributed_debt.unique_saturated_into();
-	let d: u128 = denom.unique_saturated_into();
-	multiply_by_rational_with_rounding(n, avg_rate.into_inner(), d, Rounding::Down)
-		.map(FixedU128::from_inner)
+	pusd_primitives::mul_div_rate_floor(redistributed_debt, avg_rate, denom)
 }
 
 #[cfg(test)]
