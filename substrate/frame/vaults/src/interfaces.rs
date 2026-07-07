@@ -7,7 +7,7 @@ use crate::{
 	types::VaultStatus,
 };
 use frame::{
-	deps::frame_support::{defensive, transactional},
+	deps::frame_support::transactional,
 	prelude::*,
 	traits::{
 		fungibles::{Balanced as FungiblesBalanced, MutateHold as FungiblesMutateHold},

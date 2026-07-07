@@ -67,9 +67,9 @@ fn simple_interest_with_rounding<Balance: FixedPointOperand>(
 }
 
 /// Value a stable-denominated `debt` in its collateral's unit: `ceil(debt /
-/// price)`, where `price` is the collateral price in stable units
-/// (stable-per-collateral). Rounds up so the systemic ceiling never undercounts.
-/// Returns `None` on a zero price (undefined) or on overflow.
+/// price)`, where `price` follows `ProvidePrice`'s unit contract. Rounds up so the systemic ceiling
+/// never undercounts. Returns `None` on a zero price (undefined) or on
+/// overflow.
 pub fn value_in_collateral<Balance: FixedPointOperand>(
 	debt: Balance,
 	price: FixedU128,
