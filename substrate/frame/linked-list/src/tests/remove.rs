@@ -143,7 +143,7 @@ fn remove_missing_neighbor_is_defensive() {
 }
 
 #[test]
-#[should_panic = "head pointer disagrees with removed head node"]
+#[should_panic = "head pointer disagrees with head-claiming node"]
 fn remove_at_node_with_none_prev_but_not_head_is_defensive() {
 	build_and_execute_no_post_check(|| {
 		insert(1, 100, 90);
@@ -160,7 +160,7 @@ fn remove_at_node_with_none_prev_but_not_head_is_defensive() {
 }
 
 #[test]
-#[should_panic = "tail pointer disagrees with removed tail node"]
+#[should_panic = "tail pointer disagrees with tail-claiming node"]
 fn remove_at_node_with_none_next_but_not_tail_is_defensive() {
 	build_and_execute_no_post_check(|| {
 		insert(1, 100, 90);
