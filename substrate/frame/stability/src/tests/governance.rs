@@ -1,10 +1,6 @@
 //! Branch lifecycle seeding and `set_stability_pool_config` governance.
 
-use crate::{
-	mock::*,
-	types::{PoolState, PoolSums},
-	Error,
-};
+use crate::{mock::*, types::PoolSums, Error};
 use frame::traits::Get;
 
 fn providers(who: AccountId) -> u32 {
@@ -12,7 +8,7 @@ fn providers(who: AccountId) -> u32 {
 }
 
 fn empty_deposit_row() -> crate::pallet::DepositOf<Test> {
-	crate::types::Deposit::fresh(PoolState::<Balance>::fresh().snapshot(&PoolSums::default()))
+	crate::types::Deposit::fresh(crate::types::DepositSnapshot::fresh())
 }
 
 #[test]
@@ -173,7 +169,7 @@ fn set_stability_pool_config_freezes_precision_parameters() {
 		// Still a valid config on its own (0.5e-9 * 1e9 = 0.5 <= 1), so it
 		// reaches the immutability check rather than failing validation.
 		let mut config = default_pool_config();
-		config.p_min = FixedU128::from_inner(500_000_000);
+		config.precision.p_min = FixedU128::from_inner(500_000_000);
 		assert_noop!(
 			Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config),
 			Error::<Test>::AccumulatorParamsImmutable
@@ -181,7 +177,7 @@ fn set_stability_pool_config_freezes_precision_parameters() {
 
 		// Same for the scale factor (1e8 is inside the validity bounds).
 		let mut config = default_pool_config();
-		config.scale_factor = FixedU128::from_u32(100_000_000);
+		config.precision.scale_factor = FixedU128::from_u32(100_000_000);
 		assert_noop!(
 			Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config),
 			Error::<Test>::AccumulatorParamsImmutable
@@ -230,7 +226,7 @@ fn pool_accounts_are_distinct_across_markets_and_pallets() {
 #[test]
 fn default_config_matches_integrity_expectations() {
 	// The same predicate `integrity_test` enforces at runtime-build time.
-	let config: crate::types::StabilityPoolConfig<Balance, u64> =
+	let config: crate::types::StabilityPoolConfig<Balance> =
 		<Test as crate::Config>::DefaultStabilityPoolConfig::get();
 	assert!(config.is_valid());
 	let max_iterations: u32 = <Test as crate::Config>::MaxPendingOffsetIterations::get();

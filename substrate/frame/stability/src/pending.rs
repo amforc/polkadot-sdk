@@ -15,24 +15,23 @@ pub(crate) fn list_id<T: Config>(
 	StableListId::StabilityPending(collateral_id.clone(), stable_id.clone())
 }
 
-/// Append `depositor` to the per-branch FIFO. Errors if already present.
+/// Append `depositor` to the `fifo` list. Errors if already present.
 pub(crate) fn append<T: Config>(
-	collateral_id: &T::CollateralAssetId,
-	stable_id: &T::StableAssetId,
+	fifo: &StableListId<T::CollateralAssetId, T::StableAssetId>,
 	depositor: T::AccountId,
 ) -> Result<(), DispatchError> {
-	fifo_append::<_, _, T::PendingLists>(list_id::<T>(collateral_id, stable_id), depositor)
+	fifo_append::<_, _, T::PendingLists>(fifo.clone(), depositor)
 		.map_err(|_| Error::<T>::PendingFifoInvariantBroken)?;
 	Ok(())
 }
 
-/// Remove `depositor` from the per-branch FIFO. Errors if not present.
+/// Remove `depositor` from the `fifo` list. Errors if not present. Both ops
+/// take the prebuilt list id ([`list_id`]) so loops do not reclone the asset
+/// ids per call.
 pub(crate) fn remove<T: Config>(
-	collateral_id: &T::CollateralAssetId,
-	stable_id: &T::StableAssetId,
+	fifo: &StableListId<T::CollateralAssetId, T::StableAssetId>,
 	depositor: &T::AccountId,
 ) -> Result<(), DispatchError> {
-	T::PendingLists::remove(&list_id::<T>(collateral_id, stable_id), depositor)
-		.map_err(|_| Error::<T>::PendingFifoInvariantBroken)?;
+	T::PendingLists::remove(fifo, depositor).map_err(|_| Error::<T>::PendingFifoInvariantBroken)?;
 	Ok(())
 }

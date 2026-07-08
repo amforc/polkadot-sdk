@@ -10,7 +10,7 @@
 //!   default coin, [`USDX`] the 6-decimals coin the scale tests use.
 
 use crate as pallet_stability;
-use crate::types::StabilityPoolConfig;
+use crate::types::{PoolPrecision, StabilityPoolConfig};
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, One, Permill, Saturating, Zero},
 	prelude::DispatchError,
@@ -338,8 +338,7 @@ pub type StabilityUpdateOrigin = EitherOf<
 >;
 
 parameter_types! {
-	pub static DefaultStabilityPoolConfig: StabilityPoolConfig<Balance, Moment> =
-		default_pool_config();
+	pub static DefaultStabilityPoolConfig: StabilityPoolConfig<Balance> = default_pool_config();
 }
 
 /// Account the redemption `FeeHandler` resolves pUSD fees into. Recovery
@@ -492,14 +491,16 @@ pub fn build_and_execute(test: impl FnOnce()) {
 
 /// The reference pool config seeded into every registered branch: 5_000 ms
 /// entry delay, 600_000 ms safety withdrawal delay.
-pub fn default_pool_config() -> StabilityPoolConfig<Balance, Moment> {
+pub fn default_pool_config() -> StabilityPoolConfig<Balance> {
 	StabilityPoolConfig {
 		minimum_deposit: 100,
 		minimum_active_pool_balance: 100,
 		entry_delay: 5_000,
 		safety_withdrawal_delay: 600_000,
-		p_min: FixedU128::from_inner(1_000_000_000),
-		scale_factor: FixedU128::from_u32(1_000_000_000),
+		precision: PoolPrecision {
+			p_min: FixedU128::from_inner(1_000_000_000),
+			scale_factor: FixedU128::from_u32(1_000_000_000),
+		},
 		yield_share: Permill::from_percent(75),
 	}
 }
