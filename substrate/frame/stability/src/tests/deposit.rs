@@ -22,9 +22,9 @@ fn deposit_moves_funds_and_queues_pending() {
 		assert_eq!(pending.activatable_at, 6_000);
 		assert_eq!(row.claimable_collateral, 0);
 		assert_eq!(row.claimable_yield, 0);
-		assert_eq!(row.snapshot_p, FixedU128::one());
-		assert_eq!(row.snapshot_epoch, 0);
-		assert_eq!(row.snapshot_scale, 0);
+		assert_eq!(row.snapshot.p, FixedU128::one());
+		assert_eq!(row.snapshot.epoch, 0);
+		assert_eq!(row.snapshot.scale, 0);
 		assert!(row.withdrawal_request.is_none());
 
 		let state = pool_state(DOT, PUSD);
