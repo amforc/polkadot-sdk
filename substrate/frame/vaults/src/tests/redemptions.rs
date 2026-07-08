@@ -95,7 +95,7 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_noop!(
-			redeem_step(DOT, PUSD, 99, |_| panic!("closure must not run")),
+			redeem_step(DOT, PUSD, 99, 3, |_| panic!("closure must not run")),
 			crate::Error::<Test>::VaultNotFound
 		);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
@@ -107,7 +107,7 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 			PUSD
 		));
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, |_| panic!("closure must not run")),
+			redeem_step(DOT, PUSD, 1, 3, |_| panic!("closure must not run")),
 			crate::Error::<Test>::BranchFrozen
 		);
 	});
@@ -123,20 +123,16 @@ fn redeem_step_rejects_invalid_allocations_without_state_change() {
 		let held_pre = held(DOT, 1);
 
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, |snapshot| Ok(Some(RedemptionAllocation {
-				redeemer: 3,
+			redeem_step(DOT, PUSD, 1, 3, |snapshot| Ok(Some(RedemptionAllocation {
 				debt_to_cancel: snapshot.debt + 1,
-				collateral_to_redeemer: 0,
-				fee_collateral_retained: 0,
+				collateral_to_recipient: 0,
 			}))),
 			crate::Error::<Test>::InvalidRedemptionAllocation
 		);
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, |snapshot| Ok(Some(RedemptionAllocation {
-				redeemer: 3,
+			redeem_step(DOT, PUSD, 1, 3, |snapshot| Ok(Some(RedemptionAllocation {
 				debt_to_cancel: 0,
-				collateral_to_redeemer: snapshot.collateral + 1,
-				fee_collateral_retained: 0,
+				collateral_to_recipient: snapshot.collateral + 1,
 			}))),
 			crate::Error::<Test>::InvalidRedemptionAllocation
 		);
@@ -159,7 +155,7 @@ fn redeem_step_skip_persists_touch_without_redeeming() {
 
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		let held_pre = held(DOT, 1);
-		assert_ok!(redeem_step(DOT, PUSD, 1, |_| Ok(None)));
+		assert_ok!(redeem_step(DOT, PUSD, 1, 3, |_| Ok(None)));
 
 		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		// No debt cancelled, no collateral moved — but the year of pending
@@ -170,33 +166,6 @@ fn redeem_step_skip_persists_touch_without_redeeming() {
 		assert_eq!(held(DOT, 1), held_pre);
 		assert_eq!(v_post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
 		assert!(vault_status(DOT, PUSD, 1).is_active());
-	});
-}
-
-// A redemption's fee is *retained collateral* — the redeemer simply receives
-// less collateral than the debt they cancel; nothing routes through `FeeHandler`.
-#[test]
-fn redemption_with_retained_fee_leaves_fee_collateral_on_vault() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		let held_pre = held(DOT, 1);
-		let coll_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().collateral;
-		let redeemer_pre = collateral_balance(DOT, 3);
-
-		assert_ok!(redeem_step(DOT, PUSD, 1, |_| Ok(Some(RedemptionAllocation {
-			redeemer: 3,
-			debt_to_cancel: 100,
-			collateral_to_redeemer: 10,
-			fee_collateral_retained: 5,
-		}))));
-
-		// Only the redeemer's 10 leaves the hold; the 5-unit fee stays locked.
-		assert_eq!(held(DOT, 1), held_pre - 10);
-		assert_eq!(collateral_balance(DOT, 3), redeemer_pre + 10);
-		let coll_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().collateral;
-		assert_eq!(coll_post, coll_pre - 10, "fee_collateral_retained stays on the vault");
 	});
 }
 
@@ -501,8 +470,8 @@ fn redemption_is_path_independent_across_chunks() {
 		assert_eq!(dot_pre.debt.total(), tokenx_pre.debt.total());
 		let dot_held_pre = held(DOT, 1);
 		let tokenx_held_pre = held(TOKEN_X, 1);
-		let redeemer_dot_pre = collateral_balance(DOT, 3);
-		let redeemer_tokenx_pre = collateral_balance(TOKEN_X, 3);
+		let recipient_dot_pre = collateral_balance(DOT, 3);
+		let recipient_tokenx_pre = collateral_balance(TOKEN_X, 3);
 
 		// Many: three 100-unit redemptions against the DOT vault (stays Active > 200).
 		for _ in 0..3 {
@@ -521,7 +490,7 @@ fn redemption_is_path_independent_across_chunks() {
 		// Exactly 30 collateral released on each path (3 * floor(100/10) == floor(300/10)).
 		assert_eq!(dot_held_pre - held(DOT, 1), 30);
 		assert_eq!(tokenx_held_pre - held(TOKEN_X, 1), 30);
-		assert_eq!(collateral_balance(DOT, 3) - redeemer_dot_pre, 30);
-		assert_eq!(collateral_balance(TOKEN_X, 3) - redeemer_tokenx_pre, 30);
+		assert_eq!(collateral_balance(DOT, 3) - recipient_dot_pre, 30);
+		assert_eq!(collateral_balance(TOKEN_X, 3) - recipient_tokenx_pre, 30);
 	});
 }

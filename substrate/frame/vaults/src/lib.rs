@@ -428,10 +428,9 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 			owner: T::AccountId,
-			redeemer: T::AccountId,
+			recipient: T::AccountId,
 			debt_cancelled: BalanceOf<T>,
-			collateral_to_redeemer: BalanceOf<T>,
-			fee_collateral_retained: BalanceOf<T>,
+			collateral_to_recipient: BalanceOf<T>,
 			vault_annual_rate: FixedU128,
 		},
 	}

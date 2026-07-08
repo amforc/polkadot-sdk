@@ -225,10 +225,10 @@ fn redemption_emits_vault_redeemed() {
 			matches!(
 				e.event,
 				RuntimeEvent::Vaults(crate::Event::VaultRedeemed {
-					collateral_id, owner, redeemer, debt_cancelled, ..
+					collateral_id, owner, recipient, debt_cancelled, ..
 				}) if collateral_id == DOT
 					&& owner == 1
-					&& redeemer == 3
+					&& recipient == 3
 					&& debt_cancelled == 200
 			)
 		});

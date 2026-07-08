@@ -636,25 +636,33 @@ pub fn liquidate_with(
 pub fn redeem(
 	collateral: AssetId,
 	stable: StableId,
-	redeemer: AccountId,
+	recipient: AccountId,
 	amount: Balance,
 ) -> Result<AccountId, DispatchError> {
 	let (owner, _status) =
 		<Pallet<Test> as VaultInterface>::next_redemption_target(&collateral, &stable, None)
 			.ok_or(DispatchError::Other("no redemption target"))?;
-	let price = MockPrices::get().get(&collateral).copied().expect("price set");
-	redeem_step(collateral, stable, owner, |snapshot| {
-		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
-		let collateral_to_redeemer =
-			(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
-		Ok(Some(RedemptionAllocation {
-			redeemer,
-			debt_to_cancel,
-			collateral_to_redeemer,
-			fee_collateral_retained: 0,
-		}))
-	})?;
+	redeem_from(collateral, stable, owner, recipient, amount)?;
 	Ok(owner)
+}
+
+/// Redeem `amount` against an explicit vault owner at the oracle price,
+/// bypassing `next_redemption_target`. As with [`redeem`], no stablecoin is
+/// burned from the redeemer.
+pub fn redeem_from(
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+	recipient: AccountId,
+	amount: Balance,
+) -> Result<Option<RedemptionAllocation<Balance>>, DispatchError> {
+	let price = MockPrices::get().get(&collateral).copied().expect("price set");
+	redeem_step(collateral, stable, owner, recipient, |snapshot| {
+		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
+		let collateral_to_recipient =
+			(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
+		Ok(Some(RedemptionAllocation { debt_to_cancel, collateral_to_recipient }))
+	})
 }
 
 /// One redemption step against an explicit vault, through the trait surface.
@@ -663,14 +671,18 @@ pub fn redeem_step(
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
+	recipient: AccountId,
 	build_allocation: impl FnOnce(
 		pusd_primitives::RedemptionStepSnapshot<Balance>,
-	) -> Result<
-		Option<RedemptionAllocation<AccountId, Balance>>,
-		DispatchError,
-	>,
-) -> Result<Option<RedemptionAllocation<AccountId, Balance>>, DispatchError> {
-	<Pallet<Test> as VaultInterface>::redeem_step(&collateral, &stable, &owner, build_allocation)
+	) -> Result<Option<RedemptionAllocation<Balance>>, DispatchError>,
+) -> Result<Option<RedemptionAllocation<Balance>>, DispatchError> {
+	<Pallet<Test> as VaultInterface>::redeem_step(
+		&collateral,
+		&stable,
+		&owner,
+		&recipient,
+		build_allocation,
+	)
 }
 
 /// Held collateral on `(collateral, who)` for the `VaultCollateral` reason.

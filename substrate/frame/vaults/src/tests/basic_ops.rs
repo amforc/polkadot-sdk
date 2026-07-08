@@ -433,12 +433,10 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 fn redemption_slot_rejects_second_owner() {
 	use pusd_primitives::RedemptionAllocation;
 	fn park(owner: AccountId) -> DispatchResult {
-		redeem_step(DOT, PUSD, owner, |snapshot| {
+		redeem_step(DOT, PUSD, owner, 7, |snapshot| {
 			Ok(Some(RedemptionAllocation {
-				redeemer: 7,
 				debt_to_cancel: snapshot.debt - 150,
-				collateral_to_redeemer: (snapshot.debt - 150) / 10,
-				fee_collateral_retained: 0,
+				collateral_to_recipient: (snapshot.debt - 150) / 10,
 			}))
 		})
 		.map(|_| ())
