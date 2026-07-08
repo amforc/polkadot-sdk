@@ -48,11 +48,11 @@ pub mod pallet {
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
 
-	pub type DepositOf<T> = Deposit<BalanceOf<T>, Millis>;
+	pub type DepositOf<T> = Deposit<BalanceOf<T>>;
 
 	pub type PoolStateOf<T> = PoolState<BalanceOf<T>>;
 
-	pub type StabilityPoolConfigOf<T> = StabilityPoolConfig<BalanceOf<T>, Millis>;
+	pub type StabilityPoolConfigOf<T> = StabilityPoolConfig<BalanceOf<T>>;
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
@@ -352,10 +352,9 @@ pub mod pallet {
 		PendingFifoInvariantBroken,
 		/// The supplied stability-pool config is internally inconsistent.
 		InvalidStabilityPoolConfig,
-		/// `p_min` and `scale_factor` are frozen at registration: deposits
-		/// left behind a scale boundary realize against the factor that was
-		/// live when the boundary was crossed, so changing it would misprice
-		/// them.
+		/// The `precision` pair is frozen at registration: deposits left
+		/// behind a scale boundary realize against the factor that was live
+		/// when the boundary was crossed, so changing it would misprice them.
 		AccumulatorParamsImmutable,
 		/// The pool still holds depositor rows; the branch cannot be removed.
 		PoolNotEmpty,
@@ -524,9 +523,9 @@ pub mod pallet {
 			Self::do_poke_deposit(owner, collateral_id, stable_id)
 		}
 
-		/// Replace a market's stability-pool parameters. The accumulator
-		/// precision parameters (`p_min`, `scale_factor`) must match the
-		/// stored values — see [`Error::AccumulatorParamsImmutable`].
+		/// Replace a market's stability-pool parameters. The `precision`
+		/// pair must match the stored values — see
+		/// [`Error::AccumulatorParamsImmutable`].
 		///
 		/// Call indices 0-7 are reserved for the user-facing deposit
 		/// lifecycle so calls can land milestone by milestone without
@@ -540,17 +539,7 @@ pub mod pallet {
 			config: StabilityPoolConfigOf<T>,
 		) -> DispatchResult {
 			T::UpdateOrigin::ensure_origin(origin, &(collateral_id.clone(), stable_id.clone()))?;
-			let existing = StabilityPoolConfigs::<T>::get(&collateral_id, &stable_id)
-				.ok_or(Error::<T>::BranchNotRegistered)?;
-			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
-			ensure!(config.p_min == existing.p_min, Error::<T>::AccumulatorParamsImmutable);
-			ensure!(
-				config.scale_factor == existing.scale_factor,
-				Error::<T>::AccumulatorParamsImmutable
-			);
-			StabilityPoolConfigs::<T>::insert(&collateral_id, &stable_id, config);
-			Self::deposit_event(Event::StabilityPoolConfigUpdated { collateral_id, stable_id });
-			Ok(())
+			Self::do_set_stability_pool_config(collateral_id, stable_id, config)
 		}
 	}
 

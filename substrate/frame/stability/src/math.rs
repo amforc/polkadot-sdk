@@ -1,4 +1,6 @@
-//! Pure (storage-free) product-sum accounting for the Stability Pool.
+//! Product-sum accounting for the Stability Pool: the pure (storage-free)
+//! kernel plus the accumulator-coordinate types it interprets, some of which
+//! are SCALE-encoded into storage rows (`types` re-exports those).
 //!
 //! The pool tracks depositor state lazily through three global accumulators
 //! (SPEC.md §6):
@@ -15,9 +17,9 @@
 //! gains) round down; the flooring dust stays inside pool-owned totals.
 //!
 //! Overflow paths use the [`Defensive`] family like `pallet-vaults`' math:
-//! loud in `debug_assertions` builds, log-and-degrade in release. The config
-//! bounds enforced by `StabilityPoolConfig::is_valid` keep every reachable
-//! intermediate inside `u128`.
+//! loud in `debug_assertions` builds, log-and-degrade in release. The bounds
+//! enforced by [`PoolPrecision::is_valid`] keep every reachable intermediate
+//! inside `u128`.
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
@@ -52,6 +54,26 @@ pub struct Accumulators {
 	pub scale: u32,
 }
 
+/// `S` and `G` for one `(epoch, scale)` coordinate (SPEC.md §5.2). Stored
+/// per coordinate in the pallet's sums store.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+	Default,
+)]
+pub struct PoolSums {
+	pub s_collateral: FixedU128,
+	pub g_yield: FixedU128,
+}
+
 /// A deposit's stored snapshot of the accumulators at its last realization.
 /// Embedded in every `Deposit` storage row, hence the codec derives.
 #[derive(
@@ -68,10 +90,17 @@ pub struct Accumulators {
 )]
 pub struct DepositSnapshot {
 	pub p: FixedU128,
-	pub s: FixedU128,
-	pub g: FixedU128,
+	pub sums: PoolSums,
 	pub epoch: u32,
 	pub scale: u32,
+}
+
+impl DepositSnapshot {
+	/// The genesis coordinates a fresh pool hands out: `P = 1`, zero sums,
+	/// epoch and scale 0. Realization against a fresh pool is the identity.
+	pub fn fresh() -> Self {
+		Self { p: FixedU128::one(), sums: PoolSums::default(), epoch: 0, scale: 0 }
+	}
 }
 
 /// Gain sums a deposit realizes against: the row at its snapshot
@@ -81,20 +110,52 @@ pub struct DepositSnapshot {
 /// part in 1e18 of the deposit and are deliberately ignored (SPEC.md §6.4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SumsWindow {
-	pub s_snap: FixedU128,
-	pub g_snap: FixedU128,
-	pub s_next: FixedU128,
-	pub g_next: FixedU128,
+	pub snap: PoolSums,
+	pub next: PoolSums,
 }
 
 /// Accumulator precision parameters from `StabilityPoolConfig`. Immutable
 /// per branch: historical snapshots realize against the `scale_factor` that
 /// was live when their scale was crossed, so changing it would misprice
 /// every deposit left behind a scale boundary.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
 pub struct PoolPrecision {
 	pub p_min: FixedU128,
 	pub scale_factor: FixedU128,
+}
+
+impl PoolPrecision {
+	/// Out-of-range parameters break product-sum accounting: `scale_factor`
+	/// must be an integer in `[SCALE_FACTOR_INT_MIN, SCALE_FACTOR_INT_MAX]`,
+	/// and a rescale must land `P` back at or below one:
+	/// `p_min * scale_factor <= 1`.
+	pub fn is_valid(&self) -> bool {
+		if self.p_min.is_zero() {
+			return false;
+		}
+		if !self.scale_factor.frac().is_zero() {
+			return false;
+		}
+		let scale_factor_int = self.scale_factor.into_inner() / FixedU128::DIV;
+		if scale_factor_int < SCALE_FACTOR_INT_MIN {
+			return false;
+		}
+		if scale_factor_int > SCALE_FACTOR_INT_MAX {
+			return false;
+		}
+		self.p_min.saturating_mul(self.scale_factor) <= FixedU128::one()
+	}
 }
 
 /// Outcome of realizing a deposit against the current accumulators.
@@ -132,8 +193,8 @@ pub fn realize<Balance: FixedPointOperand>(
 	debug_assert!(!snapshot.p.is_zero());
 	debug_assert!(current.p <= FixedU128::one());
 	debug_assert!(snapshot.epoch <= current.epoch);
-	debug_assert!(window.s_snap >= snapshot.s);
-	debug_assert!(window.g_snap >= snapshot.g);
+	debug_assert!(window.snap.s_collateral >= snapshot.sums.s_collateral);
+	debug_assert!(window.snap.g_yield >= snapshot.sums.g_yield);
 	if d0.is_zero() {
 		return Realized {
 			compounded: Balance::zero(),
@@ -162,8 +223,22 @@ pub fn realize<Balance: FixedPointOperand>(
 	};
 	debug_assert!(compounded_raw.unwrap_or(0) <= d);
 
-	let collateral_gain_raw = gain(d, window.s_snap, snapshot.s, window.s_next, sf_int, snapshot.p);
-	let yield_gain_raw = gain(d, window.g_snap, snapshot.g, window.g_next, sf_int, snapshot.p);
+	let collateral_gain_raw = gain(
+		d,
+		window.snap.s_collateral,
+		snapshot.sums.s_collateral,
+		window.next.s_collateral,
+		sf_int,
+		snapshot.p,
+	);
+	let yield_gain_raw = gain(
+		d,
+		window.snap.g_yield,
+		snapshot.sums.g_yield,
+		window.next.g_yield,
+		sf_int,
+		snapshot.p,
+	);
 
 	Realized {
 		compounded: to_balance(compounded_raw),
@@ -331,11 +406,14 @@ mod tests {
 		epoch: u32,
 		scale: u32,
 	) -> DepositSnapshot {
-		DepositSnapshot { p, s, g, epoch, scale }
+		DepositSnapshot { p, sums: PoolSums { s_collateral: s, g_yield: g }, epoch, scale }
 	}
 
 	fn window(s_snap: FixedU128, g_snap: FixedU128) -> SumsWindow {
-		SumsWindow { s_snap, g_snap, s_next: FixedU128::zero(), g_next: FixedU128::zero() }
+		SumsWindow {
+			snap: PoolSums { s_collateral: s_snap, g_yield: g_snap },
+			next: PoolSums::default(),
+		}
 	}
 
 	#[test]
@@ -396,10 +474,11 @@ mod tests {
 		);
 		let current = accumulators(FixedU128::from_rational(4, 5), 0, 1);
 		let sums = SumsWindow {
-			s_snap: FixedU128::from_rational(1, 2),
-			g_snap: FixedU128::zero(),
-			s_next: FixedU128::from_u32(300),
-			g_next: FixedU128::zero(),
+			snap: PoolSums {
+				s_collateral: FixedU128::from_rational(1, 2),
+				g_yield: FixedU128::zero(),
+			},
+			next: PoolSums { s_collateral: FixedU128::from_u32(300), g_yield: FixedU128::zero() },
 		};
 		let got = realize::<u128>(1_000_000_000_000, &snap, &current, &sums, &PRECISION);
 		assert_eq!(got.collateral_gain, 600_000_600_000);
