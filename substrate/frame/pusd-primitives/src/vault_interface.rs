@@ -10,15 +10,10 @@ use frame::deps::{
 
 /// Per-vault allocation produced by the redemption orchestrator and applied by
 /// [`VaultInterface::redeem_step`].
-///
-/// `redeemer` receives `collateral_to_redeemer`; `fee_collateral_retained`
-/// stays in the vault as a branch-local fee.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct RedemptionAllocation<AccountId, Balance> {
-	pub redeemer: AccountId,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RedemptionAllocation<Balance> {
 	pub debt_to_cancel: Balance,
-	pub collateral_to_redeemer: Balance,
-	pub fee_collateral_retained: Balance,
+	pub collateral_to_recipient: Balance,
 }
 
 /// Fully-accrued, post-touch snapshot of a redemption target. These are the
@@ -111,20 +106,27 @@ pub trait VaultInterface {
 		after: Option<&Self::AccountId>,
 	) -> Option<(Self::AccountId, VaultStatus)>;
 
-	/// TODO: Doc
+	/// One redemption step against `owner`'s vault: touch it, hand the caller a
+	/// fully-accrued snapshot, and apply the returned allocation atomically
+	/// (cancel debt, pay `collateral_to_recipient` to `recipient`). `Ok(None)`
+	/// from the closure skips the target but persists the touch. Burning the
+	/// redeemer's stablecoin and charging the fee stay with the caller.
 	fn redeem_step(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,
 		owner: &Self::AccountId,
+		recipient: &Self::AccountId,
 		build_allocation: impl FnOnce(
 			RedemptionStepSnapshot<Self::Balance>,
 		) -> Result<
-			Option<RedemptionAllocation<Self::AccountId, Self::Balance>>,
+			Option<RedemptionAllocation<Self::Balance>>,
 			DispatchError,
 		>,
-	) -> Result<Option<RedemptionAllocation<Self::AccountId, Self::Balance>>, DispatchError>;
+	) -> Result<Option<RedemptionAllocation<Self::Balance>>, DispatchError>;
 
-	/// TODO: Doc
+	/// Move a `FinalRecovery` vault's fully-accrued residual debt off the row
+	/// and into the branch bad-debt ledger, returning the amount. The caller
+	/// settles it (Insurance Fund burn) atomically.
 	fn settle_recovery_residual(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,
