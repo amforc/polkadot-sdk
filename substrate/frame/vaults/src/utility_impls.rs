@@ -109,19 +109,20 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Ensure a vault's fully-accrued collateralization ratio is strictly below the
-	/// branch MCR. Used by the liquidation-eligibility and enter-final-recovery
-	/// gates.
+	/// Ensure a vault's fully-accrued collateralization ratio is strictly below
+	/// the branch MCR. Used by the enter-final-recovery gate. A `None` ratio
+	/// (zero debt) counts as too healthy.
 	pub(crate) fn ensure_below_mcr(
 		collateral: BalanceOf<T>,
 		debt: BalanceOf<T>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> Result<(), DispatchError> {
-		let cr = Self::ratio(collateral, debt, price)?;
+		let cr = pusd_primitives::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+			.ok_or(Error::<T>::CollateralizationRatioTooHealthy)?;
 		ensure!(
 			cr < config.minimum_collateralization_ratio,
-			Error::<T>::UnsafeCollateralizationRatio
+			Error::<T>::CollateralizationRatioTooHealthy
 		);
 		Ok(())
 	}

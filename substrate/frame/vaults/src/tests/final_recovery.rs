@@ -59,9 +59,6 @@ fn enter_final_recovery_rejects_non_last_eligible_vault() {
 	});
 }
 
-// A vault at or above MCR is too healthy for FinalRecovery. The shared CR-gate
-// error `UnsafeCollateralizationRatio` means "CR on the wrong side of the
-// threshold for this op": user ops want CR ≥ ICR, FR entry wants CR < MCR.
 #[test]
 fn enter_final_recovery_rejects_vault_above_mcr() {
 	build_and_execute(|| {
@@ -71,7 +68,7 @@ fn enter_final_recovery_rejects_vault_above_mcr() {
 
 		assert_noop!(
 			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, PUSD, 1),
-			crate::Error::<Test>::UnsafeCollateralizationRatio
+			crate::Error::<Test>::CollateralizationRatioTooHealthy
 		);
 	});
 }
