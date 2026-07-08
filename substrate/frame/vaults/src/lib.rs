@@ -564,11 +564,7 @@ pub mod pallet {
 			let price = T::Oracle::provide_price(&collateral_id).ok()?;
 			let pending = Self::pending_touch_for(&vault, &state, now);
 			let total_coll = vault.collateral.saturating_add(pending.collateral);
-			let total_debt = vault
-				.debt
-				.total()
-				.saturating_add(pending.principal)
-				.saturating_add(pending.interest);
+			let total_debt = pending.total_debt(&vault.debt);
 			pusd_primitives::collateralization_ratio::<BalanceOf<T>>(total_coll, total_debt, price)
 		}
 
@@ -672,9 +668,13 @@ pub mod pallet {
 			T::VaultLists::neighbors(&VaultListId::Rate(collateral_id, stable_id), &owner)
 		}
 
-		/// Total active-vault interest-bearing debt at rates strictly less
-		/// than `rate`, walking at most `max_steps` vaults from the tail.
-		/// Returns the partial sum when the cap stops the walk early.
+		/// How much debt a redemption consumes before reaching `rate`: the
+		/// projected entire debt of every listed vault at a rate strictly
+		/// below it. Walks at most `max_steps` vaults from the tail and
+		/// returns the partial sum if the cap stops the walk.
+		///
+		/// The dormant redemption target is redeemed first but not counted
+		/// here.
 		pub fn debt_in_front(
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
@@ -682,6 +682,10 @@ pub mod pallet {
 			max_steps: u32,
 		) -> BalanceOf<T> {
 			let mut total = BalanceOf::<T>::zero();
+			let Some(branch) = Branches::<T>::get((&collateral_id, &stable_id)) else {
+				return total;
+			};
+			let now = T::TimeProvider::now();
 			let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 			let mut cursor = T::VaultLists::tail(&rate_list);
 			for _ in 0..max_steps {
@@ -693,7 +697,8 @@ pub mod pallet {
 					break;
 				}
 				if let Some(v) = Vaults::<T>::get((&collateral_id, &stable_id, &o)) {
-					total = total.saturating_add(v.debt.principal);
+					let pending = Self::pending_touch_for(&v, &branch.state, now);
+					total = total.saturating_add(pending.total_debt(&v.debt));
 				}
 				cursor = neighbors.prev;
 			}
