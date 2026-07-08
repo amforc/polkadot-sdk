@@ -1,13 +1,10 @@
-use crate::{mock::*, tests::rate_pct};
+use crate::{
+	mock::*,
+	tests::{rate_pct, vault_status},
+};
 
-// `debt_in_front` returns the total debt at rates strictly below a given
-// rate. A debt-between-two-rates range is derivable from two calls:
-// `debt_in_front(high) - debt_in_front(low)`.
-//
-// (For later: the redemptions pallet will expose the analogous preview — which
-// vaults a redemption of X pUSD hits — which matters because an oracle that lags
-// the true price on the way up makes being redeemed against profitable for the
-// redeemer, so vault owners have an incentive to know their position.)
+// `debt_in_front` sums the projected entire debt of vaults at rates strictly
+// below a given rate, the amount a redemption eats before reaching that rate.
 #[test]
 fn debt_in_front_sums_lower_rate_vaults_only() {
 	build_and_execute(|| {
@@ -22,69 +19,90 @@ fn debt_in_front_sums_lower_rate_vaults_only() {
 		assert_ok!(open(7, DOT, PUSD, 1_000, 400, rate_pct(8, 1000))); // 0.8%
 		assert_ok!(open(8, DOT, PUSD, 1_000, 500, rate_pct(8, 1000)));
 
-		// Query: total debt at rates strictly < 0.7%.
-		// Sum of vaults 1..=4: 500+700+600+800 = 2600.
-		let in_front = crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(7, 1000), u32::MAX);
-		assert_eq!(in_front, 2_600);
+		// Every open charges an upfront fee of exactly 1: the fee is
+		// ceil(principal × avg_rate × 7d/year) and every product here is
+		// below 1. No time passes, so each vault's entire debt is
+		// `principal + FEE`.
+		const FEE: Balance = 1;
+		for who in 1u64..=8 {
+			let v = crate::pallet::Vaults::<Test>::get((DOT, PUSD, who)).expect("vault stored");
+			assert_eq!(v.debt.interest, FEE, "upfront fee ceils to 1 at these magnitudes");
+		}
+		let debt_in_front =
+			|rate, steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate, steps);
 
-		// Query: total debt at rates strictly < 0.6%.
-		// Sum of vaults 1..=2: 500+700 = 1200.
-		let in_front = crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(6, 1000), u32::MAX);
-		assert_eq!(in_front, 1_200);
+		// Entire debt at rates strictly < 0.7%: vaults 1..=4.
+		assert_eq!(debt_in_front(rate_pct(7, 1000), u32::MAX), 500 + 700 + 600 + 800 + 4 * FEE);
 
-		// Query: total debt at rates strictly < 1% (covers everything).
-		let in_front = crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX);
-		assert_eq!(in_front, 500 + 700 + 600 + 800 + 900 + 1_000 + 400 + 500);
+		// Entire debt at rates strictly < 0.6%: vaults 1..=2.
+		assert_eq!(debt_in_front(rate_pct(6, 1000), u32::MAX), 500 + 700 + 2 * FEE);
 
-		// The step cap bounds the walk: only the two cheapest vaults are
-		// visited, returning the partial sum.
-		let capped = crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), 2);
-		assert_eq!(capped, 500 + 700, "cap of 2 visits only the two tail vaults");
+		// Entire debt at rates strictly < 1% covers everything.
+		let all = 500 + 700 + 600 + 800 + 900 + 1_000 + 400 + 500 + 8 * FEE;
+		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), all);
+
+		// The step cap stops the walk early.
+		assert_eq!(
+			debt_in_front(rate_pct(1, 100), 2),
+			500 + 700 + 2 * FEE,
+			"cap of 2 visits only the two tail vaults"
+		);
 		// A cap at least the list length matches the uncapped result.
-		let exact = crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), 8);
-		assert_eq!(exact, 500 + 700 + 600 + 800 + 900 + 1_000 + 400 + 500);
+		assert_eq!(debt_in_front(rate_pct(1, 100), 8), all);
 	});
 }
 
-// Interest is excluded on purpose: it varies with poke timing, while
-// debt-in-front tracks the stable, rate-ordered principal.
+// The walk counts pending interest, not just what pokes have settled, so the
+// total does not depend on who was poked when.
 #[test]
-fn debt_in_front_counts_principal_not_total_debt() {
+fn debt_in_front_projects_pending_interest_poke_independent() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000))); // 0.5%
 		assert_ok!(open(2, DOT, PUSD, 5_000, 700, rate_pct(6, 1000))); // 0.6%
-																 // Accrue a year of interest and materialise it into stored debt.
-		advance_time(365 * 24 * 3_600 * 1_000);
+
+		let debt_in_front =
+			|| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX);
+
+		// One year of unpoked accrual. Projected per-vault entire debt:
+		//   vault 1: 500 + 1 (fee) + floor(500 × 0.5%) = 503
+		//   vault 2: 700 + 1 (fee) + floor(700 × 0.6%) = 705
+		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		assert_eq!(debt_in_front(), 503 + 705);
+
+		// Poking vault 1 moves its pending interest into recorded debt; the
+		// total must not change.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
 		let v1 = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("v1");
-		assert!(v1.debt.interest > 0, "interest must have materialised on top of principal");
-		// Still just the principals: 500 + 700.
-		let in_front = crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX);
-		assert_eq!(in_front, 1_200);
+		assert_eq!(v1.debt.interest, 3, "fee 1 + year interest 2 settled by the poke");
+		assert_eq!(debt_in_front(), 503 + 705, "projection unchanged by the poke");
 	});
 }
 
-// A vault redeemed out of the rate index (to Dormant) is no longer walked, so
-// its principal leaves the debt-in-front total.
+// A vault redeemed below `MinimumDebt` parks as the dormant target. The next
+// redemption drains it first, but it left the rate index, so it is not counted.
 #[test]
-fn debt_in_front_excludes_dormant_vaults() {
+fn debt_in_front_excludes_dormant_redemption_target() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000))); // 0.5%, tail
 		assert_ok!(open(2, DOT, PUSD, 5_000, 700, rate_pct(6, 1000))); // 0.6%
+		let debt_in_front =
+			|| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX);
+		assert_eq!(debt_in_front(), 501 + 701); // principal + fee 1 each, no elapsed time
+
+		// Redeem vault 1 (entire debt 501) down to 199, one below `MinimumDebt`.
+		assert_ok!(redeem(DOT, PUSD, 3, 302));
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_eq!(
-			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX),
-			1_200
+			branch_state(DOT, PUSD).expect("state").dormant_redemption_target,
+			Some(1),
+			"sub-minimum residual parks vault 1 as the dormant target"
 		);
-		// `redeem` does not burn the redeemer's pUSD (the redemptions pallet owns
-		// that leg), so acct 3 needs no funding — unlike the repay-based tests.
-		assert_ok!(redeem(DOT, PUSD, 3, 600));
 		assert_eq!(
-			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX),
-			700,
-			"dormant vault's principal is no longer counted"
+			debt_in_front(),
+			701,
+			"the dormant target's residual (199) is consumed first but not counted"
 		);
 	});
 }
