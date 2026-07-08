@@ -1,11 +1,12 @@
 //! Storage types for `pallet-stability`.
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::arithmetic::{FixedPointNumber, FixedU128, One, Permill, Saturating, Zero};
+use frame::arithmetic::{FixedPointOperand, FixedU128, One, Permill, Zero};
+use pusd_primitives::Millis;
 use scale_info::TypeInfo;
 
 use crate::math;
-pub use crate::math::DepositSnapshot;
+pub use crate::math::{DepositSnapshot, PoolPrecision, PoolSums};
 
 /// Per-branch depositor state (SPEC.md §5.1).
 ///
@@ -16,7 +17,7 @@ pub use crate::math::DepositSnapshot;
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct Deposit<Balance, Moment> {
+pub struct Deposit<Balance> {
 	pub active_deposit: Balance,
 
 	pub snapshot: DepositSnapshot,
@@ -25,11 +26,11 @@ pub struct Deposit<Balance, Moment> {
 	pub claimable_collateral: Balance,
 	pub claimable_yield: Balance,
 
-	pub pending_deposit: Option<PendingDeposit<Balance, Moment>>,
-	pub withdrawal_request: Option<WithdrawalRequest<Balance, Moment>>,
+	pub pending_deposit: Option<PendingDeposit<Balance>>,
+	pub withdrawal_request: Option<WithdrawalRequest<Balance>>,
 }
 
-impl<Balance: Zero, Moment> Deposit<Balance, Moment> {
+impl<Balance: Zero> Deposit<Balance> {
 	/// A value-free row at the given snapshot (realization on a fresh row is
 	/// the identity).
 	pub fn fresh(snapshot: DepositSnapshot) -> Self {
@@ -60,9 +61,9 @@ impl<Balance: Zero, Moment> Deposit<Balance, Moment> {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct PendingDeposit<Balance, Moment> {
+pub struct PendingDeposit<Balance> {
 	pub amount: Balance,
-	pub activatable_at: Moment,
+	pub activatable_at: Millis,
 }
 
 /// Two-step withdrawal state; only load-bearing in Safety Mode (§6.9).
@@ -71,9 +72,9 @@ pub struct PendingDeposit<Balance, Moment> {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct WithdrawalRequest<Balance, Moment> {
+pub struct WithdrawalRequest<Balance> {
 	pub amount: Balance,
-	pub executable_at: Moment,
+	pub executable_at: Millis,
 }
 
 /// Branch pool totals and current product-sum coordinates (SPEC.md §5.2).
@@ -98,7 +99,7 @@ pub struct PoolState<Balance> {
 	pub total_yield_unclaimed: Balance,
 }
 
-impl<Balance: Zero> PoolState<Balance> {
+impl<Balance: FixedPointOperand> PoolState<Balance> {
 	/// State seeded at branch registration: empty pool at `P = 1`,
 	/// epoch 0, scale 0.
 	pub fn fresh() -> Self {
@@ -120,64 +121,38 @@ impl<Balance: Zero> PoolState<Balance> {
 	/// The deposit snapshot at the pool's current coordinates; `sums` is the
 	/// live `(epoch, scale)` sums row.
 	pub fn snapshot(&self, sums: &PoolSums) -> DepositSnapshot {
-		DepositSnapshot {
-			p: self.p,
-			s: sums.s_collateral,
-			g: sums.g_yield,
-			epoch: self.epoch,
-			scale: self.scale,
-		}
+		DepositSnapshot { p: self.p, sums: *sums, epoch: self.epoch, scale: self.scale }
 	}
-}
 
-/// `S` and `G` for one `(epoch, scale)` coordinate (SPEC.md §5.2).
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
-pub struct PoolSums {
-	pub s_collateral: FixedU128,
-	pub g_yield: FixedU128,
+	/// `S`/`G` delta for distributing `distributed` over the active pool
+	/// (SPEC.md §6.3); `None` when the pool is empty or the product overflows.
+	pub fn delta_sum(&self, distributed: Balance) -> Option<FixedU128> {
+		math::delta_sum(distributed, self.p, self.total_active_deposits)
+	}
 }
 
 /// Per-branch governance parameters (SPEC.md §5.3, plus `yield_share`).
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct StabilityPoolConfig<Balance, Moment> {
+pub struct StabilityPoolConfig<Balance> {
 	/// Smallest accepted deposit; prevents dust rows.
 	pub minimum_deposit: Balance,
 	/// Post-offset floor for the active pool: an offset either leaves at
 	/// least this much active or fully depletes the pool (§6.5).
 	pub minimum_active_pool_balance: Balance,
-	pub entry_delay: Moment,
-	pub safety_withdrawal_delay: Moment,
-	/// Precision floor for `P`; immutable after registration (see
-	/// `math::PoolPrecision` for why).
-	pub p_min: FixedU128,
-	/// Rescale multiplier applied when `P` falls below `p_min`; immutable
-	/// after registration.
-	pub scale_factor: FixedU128,
+	pub entry_delay: Millis,
+	pub safety_withdrawal_delay: Millis,
+	/// Accumulator precision parameters; immutable after registration.
+	pub precision: PoolPrecision,
 	/// Share of routed branch yield the active pool takes; the remainder
 	/// goes to the vault engine's fee destination.
 	pub yield_share: Permill,
 }
 
-impl<Balance: Zero, Moment> StabilityPoolConfig<Balance, Moment> {
+impl<Balance: Zero> StabilityPoolConfig<Balance> {
 	/// Zero thresholds break dust protection and the §6.5 offset floor;
-	/// out-of-range precision parameters break product-sum accounting
-	/// (`scale_factor` must be an integer in
-	/// `[SCALE_FACTOR_INT_MIN, SCALE_FACTOR_INT_MAX]`, and a rescale must
-	/// land `P` back at or below one: `p_min * scale_factor <= 1`).
+	/// the precision bounds are [`PoolPrecision::is_valid`]'s.
 	pub fn is_valid(&self) -> bool {
 		if self.minimum_deposit.is_zero() {
 			return false;
@@ -185,24 +160,7 @@ impl<Balance: Zero, Moment> StabilityPoolConfig<Balance, Moment> {
 		if self.minimum_active_pool_balance.is_zero() {
 			return false;
 		}
-		if self.p_min.is_zero() {
-			return false;
-		}
-		if !self.scale_factor.frac().is_zero() {
-			return false;
-		}
-		let scale_factor_int = self.scale_factor.into_inner() / FixedU128::DIV;
-		if scale_factor_int < math::SCALE_FACTOR_INT_MIN {
-			return false;
-		}
-		if scale_factor_int > math::SCALE_FACTOR_INT_MAX {
-			return false;
-		}
-		self.p_min.saturating_mul(self.scale_factor) <= FixedU128::one()
-	}
-
-	pub(crate) fn precision(&self) -> math::PoolPrecision {
-		math::PoolPrecision { p_min: self.p_min, scale_factor: self.scale_factor }
+		self.precision.is_valid()
 	}
 }
 
@@ -231,15 +189,18 @@ pub enum RecoveryOffsetSource {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use frame::arithmetic::FixedPointNumber;
 
-	fn valid_config() -> StabilityPoolConfig<u128, u64> {
+	fn valid_config() -> StabilityPoolConfig<u128> {
 		StabilityPoolConfig {
 			minimum_deposit: 100,
 			minimum_active_pool_balance: 100,
 			entry_delay: 5_000,
 			safety_withdrawal_delay: 600_000,
-			p_min: FixedU128::from_inner(1_000_000_000),
-			scale_factor: FixedU128::from_u32(1_000_000_000),
+			precision: PoolPrecision {
+				p_min: FixedU128::from_inner(1_000_000_000),
+				scale_factor: FixedU128::from_u32(1_000_000_000),
+			},
 			yield_share: Permill::from_percent(75),
 		}
 	}
@@ -267,27 +228,27 @@ mod tests {
 		assert!(!config.is_valid());
 
 		let mut config = valid_config();
-		config.p_min = FixedU128::zero();
+		config.precision.p_min = FixedU128::zero();
 		assert!(!config.is_valid());
 
 		// Fractional scale factor.
 		let mut config = valid_config();
-		config.scale_factor = FixedU128::from_rational(3, 2);
+		config.precision.scale_factor = FixedU128::from_rational(3, 2);
 		assert!(!config.is_valid());
 
 		// Below the minimum useful rescale.
 		let mut config = valid_config();
-		config.scale_factor = FixedU128::from_u32(999);
+		config.precision.scale_factor = FixedU128::from_u32(999);
 		assert!(!config.is_valid());
 
 		// Above the u128 overflow guard (1e10).
 		let mut config = valid_config();
-		config.scale_factor = FixedU128::saturating_from_integer(10_000_000_001u64);
+		config.precision.scale_factor = FixedU128::saturating_from_integer(10_000_000_001u64);
 		assert!(!config.is_valid());
 
 		// A rescale would push P above one: p_min * scale_factor > 1.
 		let mut config = valid_config();
-		config.p_min = FixedU128::from_inner(2_000_000_000);
+		config.precision.p_min = FixedU128::from_inner(2_000_000_000);
 		assert!(!config.is_valid());
 	}
 
@@ -303,8 +264,7 @@ mod tests {
 
 	#[test]
 	fn deposit_emptiness_ignores_withdrawal_requests() {
-		let mut deposit =
-			Deposit::<u128, u64>::fresh(PoolState::<u128>::fresh().snapshot(&PoolSums::default()));
+		let mut deposit = Deposit::<u128>::fresh(DepositSnapshot::fresh());
 		deposit.withdrawal_request = Some(WithdrawalRequest { amount: 10, executable_at: 601_000 });
 		assert!(deposit.is_empty());
 

@@ -4,16 +4,13 @@
 
 use crate::{
 	mock::*,
-	types::{Deposit, PoolState, PoolSums, WithdrawalRequest},
+	types::{Deposit, DepositSnapshot, WithdrawalRequest},
 	Error,
 };
 use pusd_primitives::BranchMode;
 
-fn active_row(
-	active: Balance,
-	request: Option<WithdrawalRequest<Balance, u64>>,
-) -> Deposit<Balance, u64> {
-	let mut row = Deposit::fresh(PoolState::<Balance>::fresh().snapshot(&PoolSums::default()));
+fn active_row(active: Balance, request: Option<WithdrawalRequest<Balance>>) -> Deposit<Balance> {
+	let mut row = Deposit::fresh(DepositSnapshot::fresh());
 	row.active_deposit = active;
 	row.withdrawal_request = request;
 	row
