@@ -186,13 +186,14 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		owner: &T::AccountId,
+		recipient: &T::AccountId,
 		build_allocation: impl FnOnce(
 			RedemptionStepSnapshot<BalanceOf<T>>,
 		) -> Result<
-			Option<RedemptionAllocation<T::AccountId, BalanceOf<T>>>,
+			Option<RedemptionAllocation<BalanceOf<T>>>,
 			DispatchError,
 		>,
-	) -> Result<Option<RedemptionAllocation<T::AccountId, BalanceOf<T>>>, DispatchError> {
+	) -> Result<Option<RedemptionAllocation<BalanceOf<T>>>, DispatchError> {
 		let op = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
 		op.ensure_not_frozen()?;
 		let mut op = op.touch(owner)?;
@@ -219,23 +220,20 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			Error::<T>::InvalidRedemptionAllocation
 		);
 		ensure!(
-			allocation
-				.collateral_to_redeemer
-				.saturating_add(allocation.fee_collateral_retained) <=
-				held,
+			allocation.collateral_to_recipient <= held,
 			Error::<T>::InvalidRedemptionAllocation
 		);
 
 		let payment = op.vault.debt.cancel(allocation.debt_to_cancel);
 		debug_assert_eq!(payment.total(), allocation.debt_to_cancel);
 
-		if !allocation.collateral_to_redeemer.is_zero() {
+		if !allocation.collateral_to_recipient.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
 				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
-				&allocation.redeemer,
-				allocation.collateral_to_redeemer,
+				recipient,
+				allocation.collateral_to_recipient,
 				Precision::Exact,
 				Restriction::Free,
 				Fortitude::Polite,
@@ -244,17 +242,18 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 		let new_total = op.vault.debt.total();
 		let stake_changes = matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) &&
-			!allocation.collateral_to_redeemer.is_zero();
+			!allocation.collateral_to_recipient.is_zero();
 		op.ctx.branch.state.apply_debt_payment(
 			payment,
 			op.vault.annual_rate,
 			op.vault.debt.principal,
 		);
-		op.ctx.branch.state.remove_collateral(allocation.collateral_to_redeemer);
-		op.vault.collateral = op.vault.collateral.saturating_sub(allocation.collateral_to_redeemer);
+		op.ctx.branch.state.remove_collateral(allocation.collateral_to_recipient);
+		op.vault.collateral =
+			op.vault.collateral.saturating_sub(allocation.collateral_to_recipient);
 		if stake_changes {
 			let new_stake =
-				op.vault.redistribution_stake.saturating_sub(allocation.collateral_to_redeemer);
+				op.vault.redistribution_stake.saturating_sub(allocation.collateral_to_recipient);
 			op.ctx.branch.state.set_vault_stake(&mut op.vault, new_stake);
 		}
 		if matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) {
@@ -273,10 +272,9 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			collateral_id: op.ctx.collateral_id.clone(),
 			stable_id: op.ctx.stable_id.clone(),
 			owner: owner.clone(),
-			redeemer: allocation.redeemer.clone(),
+			recipient: recipient.clone(),
 			debt_cancelled: allocation.debt_to_cancel,
-			collateral_to_redeemer: allocation.collateral_to_redeemer,
-			fee_collateral_retained: allocation.fee_collateral_retained,
+			collateral_to_recipient: allocation.collateral_to_recipient,
 			vault_annual_rate: op.vault.annual_rate,
 		});
 		op.commit(TcrGate::Exempt)?;
