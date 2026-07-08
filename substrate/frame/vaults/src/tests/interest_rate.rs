@@ -538,9 +538,9 @@ fn redemption_full_state_changes() {
 
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 		// Collateral-leg baselines before the redemption.
-		let redeemer_collateral_pre = collateral_balance(DOT, 5);
+		let recipient_collateral_pre = collateral_balance(DOT, 5);
 		let branch_collateral_pre = branch_state(DOT, PUSD).unwrap().total_collateral;
-		// Redeem 200 pUSD from acct 5 (the redeemer) — the helper uses the
+		// Redeem 200 pUSD to acct 5 (the recipient) — the helper uses the
 		// rate-index tail, which is acct 1 (lowest rate).
 		let target = redeem(DOT, PUSD, 5, 200).expect("redeem ok");
 		assert_eq!(target, 1);
@@ -563,11 +563,11 @@ fn redemption_full_state_changes() {
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal - pay_principal);
 
 		// Collateral leg: 200 pUSD / price 10 = 20 collateral released from acct 1's
-		// hold to the redeemer, who receives it free (not held).
+		// hold to the recipient, who receives it free (not held).
 		let collateral_released: Balance = 20;
 		assert_eq!(v_post.collateral, v_pre.collateral - collateral_released); // 1_000 -> 980
 		assert_eq!(held(DOT, 1), v_pre.collateral - collateral_released);
-		assert_eq!(collateral_balance(DOT, 5), redeemer_collateral_pre + collateral_released);
+		assert_eq!(collateral_balance(DOT, 5), recipient_collateral_pre + collateral_released);
 		assert_eq!(
 			branch_state(DOT, PUSD).unwrap().total_collateral,
 			branch_collateral_pre - collateral_released,

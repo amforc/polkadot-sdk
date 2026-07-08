@@ -533,15 +533,19 @@ mod benchmarks {
 		// as here, a full redemption) leaves a Dormant husk — zero debt, row
 		// intact, collateral still held, out of the rate index — which is the
 		// state this extrinsic acts on.
-		let redeemer: T::AccountId = whitelisted_caller();
-		<Pallet<T> as VaultInterface>::redeem_step(&asset, &stable::<T>(), &caller, |snapshot| {
-			Ok(Some(RedemptionAllocation {
-				redeemer,
-				debt_to_cancel: snapshot.debt,
-				collateral_to_redeemer: BalanceOf::<T>::zero(),
-				fee_collateral_retained: BalanceOf::<T>::zero(),
-			}))
-		})?;
+		let recipient: T::AccountId = whitelisted_caller();
+		<Pallet<T> as VaultInterface>::redeem_step(
+			&asset,
+			&stable::<T>(),
+			&caller,
+			&recipient,
+			|snapshot| {
+				Ok(Some(RedemptionAllocation {
+					debt_to_cancel: snapshot.debt,
+					collateral_to_recipient: BalanceOf::<T>::zero(),
+				}))
+			},
+		)?;
 
 		#[extrinsic_call]
 		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), None);
@@ -657,15 +661,19 @@ mod benchmarks {
 		// Redeem the target to just below `minimum_debt`, leaving a debt-bearing
 		// Dormant vault outside the rate index.
 		let remaining = balance::<T>(199);
-		let redeemer: T::AccountId = whitelisted_caller();
-		<Pallet<T> as VaultInterface>::redeem_step(&asset, &stable::<T>(), &owner, |snapshot| {
-			Ok(Some(RedemptionAllocation {
-				redeemer,
-				debt_to_cancel: snapshot.debt.saturating_sub(remaining),
-				collateral_to_redeemer: BalanceOf::<T>::zero(),
-				fee_collateral_retained: BalanceOf::<T>::zero(),
-			}))
-		})?;
+		let recipient: T::AccountId = whitelisted_caller();
+		<Pallet<T> as VaultInterface>::redeem_step(
+			&asset,
+			&stable::<T>(),
+			&owner,
+			&recipient,
+			|snapshot| {
+				Ok(Some(RedemptionAllocation {
+					debt_to_cancel: snapshot.debt.saturating_sub(remaining),
+					collateral_to_recipient: BalanceOf::<T>::zero(),
+				}))
+			},
+		)?;
 		assert_eq!(
 			Pallet::<T>::vault_status(asset.clone(), stable::<T>(), owner.clone()),
 			Some(VaultStatus::Dormant)
