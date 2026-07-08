@@ -40,6 +40,13 @@ pub(crate) struct PendingTouch<Balance> {
 	pub interest: Balance,
 }
 
+impl<Balance: Ord + Saturating + Copy> PendingTouch<Balance> {
+	/// Entire debt the vault would have after a touch.
+	pub fn total_debt(&self, debt: &VaultDebt<Balance>) -> Balance {
+		debt.total().saturating_add(self.principal).saturating_add(self.interest)
+	}
+}
+
 impl<T: Config> Pallet<T> {
 	/// Translate a rate-index insert/re-insert failure. A stale user-supplied
 	/// hint surfaces as [`Error::InvalidPositionHints`]; every other kind —
