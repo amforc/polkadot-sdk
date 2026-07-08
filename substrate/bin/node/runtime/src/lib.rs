@@ -3349,6 +3349,7 @@ impl pallet_vaults::Config for Runtime {
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
 	type FeeHandler = ();
+	type YieldHook = ();
 	type OnBranchLifecycle = ();
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
