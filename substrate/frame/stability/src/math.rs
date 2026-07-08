@@ -197,9 +197,9 @@ pub fn clamp_offset_debt<Balance: FixedPointOperand + Ord>(
 	};
 	debug_assert!(clamped <= max_debt);
 	debug_assert!(
-		clamped.is_zero()
-			|| clamped == total_active
-			|| total_active.saturating_sub(clamped) >= min_active_pool
+		clamped.is_zero() ||
+			clamped == total_active ||
+			total_active.saturating_sub(clamped) >= min_active_pool
 	);
 	clamped
 }

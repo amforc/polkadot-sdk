@@ -9,8 +9,9 @@ fn activate_before_maturity_reverts() {
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 
-		// Deposited at block 1, activatable at 6; block 5 is one short.
-		run_to_block(5);
+		// Deposited at t = 1_000, activatable at 6_000; t = 5_999 is one
+		// millisecond short.
+		advance_time(4_999);
 		assert_noop!(activate(1, DOT, PUSD), Error::<Test>::PendingDepositNotMatured);
 	});
 }
@@ -22,7 +23,7 @@ fn activate_at_exact_boundary_succeeds() {
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 
-		run_to_block(6);
+		advance_time(5_000);
 		assert_ok!(activate(1, DOT, PUSD));
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
@@ -70,7 +71,7 @@ fn activate_with_nothing_pending_reverts() {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
-		run_to_block(6);
+		advance_time(5_000);
 		assert_ok!(activate(1, DOT, PUSD));
 
 		// The row still exists (active 400) but nothing is pending.

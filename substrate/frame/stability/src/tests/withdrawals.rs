@@ -147,8 +147,8 @@ fn request_withdraw_records_exact_executable_at() {
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		let request = row.withdrawal_request.expect("request recorded");
 		assert_eq!(request.amount, 250);
-		// Requested at block 6 with the 600-block Safety delay.
-		assert_eq!(request.executable_at, 606);
+		// Requested at t = 6_000 with the 600_000 ms Safety delay.
+		assert_eq!(request.executable_at, 606_000);
 
 		System::assert_last_event(
 			crate::Event::WithdrawalRequested {
@@ -156,7 +156,7 @@ fn request_withdraw_records_exact_executable_at() {
 				stable_id: PUSD,
 				depositor: 1,
 				amount: 250,
-				executable_at: 606,
+				executable_at: 606_000,
 			}
 			.into(),
 		);
@@ -169,7 +169,7 @@ fn new_request_replaces_old() {
 		seed_active_deposit();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 
-		run_to_block(10);
+		advance_time(4_000);
 		assert_ok!(request_withdraw(1, DOT, PUSD, 100));
 
 		let request = deposit_row(DOT, PUSD, 1)
@@ -177,8 +177,8 @@ fn new_request_replaces_old() {
 			.withdrawal_request
 			.expect("request recorded");
 		assert_eq!(request.amount, 100);
-		// Re-requested at block 10: the delay restarts.
-		assert_eq!(request.executable_at, 610);
+		// Re-requested at t = 10_000: the delay restarts.
+		assert_eq!(request.executable_at, 610_000);
 	});
 }
 
@@ -197,7 +197,7 @@ fn deposit_leaves_request_unchanged() {
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 
 		// SPEC.md §6.9: a new deposit leaves the request as it was.
-		run_to_block(7);
+		advance_time(1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 300));
 
 		let request = deposit_row(DOT, PUSD, 1)
@@ -205,7 +205,7 @@ fn deposit_leaves_request_unchanged() {
 			.withdrawal_request
 			.expect("request survives the deposit");
 		assert_eq!(request.amount, 250);
-		assert_eq!(request.executable_at, 606);
+		assert_eq!(request.executable_at, 606_000);
 	});
 }
 
@@ -230,21 +230,21 @@ fn normal_withdraw_ignores_request_and_prunes_it_with_the_row() {
 #[test]
 fn safety_withdrawal_requires_request() {
 	let mut row = active_row(400, None);
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 700, 100, &mut row);
+	let got = Stability::resolve_withdrawal(BranchMode::Safety, 700_000, 100, &mut row);
 	assert_eq!(got, Err(Error::<Test>::WithdrawalRequestMissing.into()));
 }
 
 #[test]
 fn safety_withdrawal_respects_delay_boundary() {
-	let request = WithdrawalRequest { amount: 250, executable_at: 606 };
+	let request = WithdrawalRequest { amount: 250, executable_at: 606_000 };
 	let mut row = active_row(400, Some(request.clone()));
-	// One block early: rejected, request untouched.
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 605, 100, &mut row);
+	// One millisecond early: rejected, request untouched.
+	let got = Stability::resolve_withdrawal(BranchMode::Safety, 605_999, 100, &mut row);
 	assert_eq!(got, Err(Error::<Test>::SafetyWithdrawalDelayActive.into()));
 	assert_eq!(row.withdrawal_request, Some(request));
 
 	// At exactly `executable_at`: allowed.
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606, 100, &mut row);
+	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606_000, 100, &mut row);
 	assert_eq!(got, Ok(100));
 	assert_eq!(row.withdrawal_request.as_ref().expect("still open").amount, 150);
 }
@@ -253,17 +253,17 @@ fn safety_withdrawal_respects_delay_boundary() {
 fn safety_withdrawal_takes_min_and_consumes_request() {
 	// take = min(amount 300, request 250, active 400) = 250; the exhausted
 	// request clears.
-	let request = WithdrawalRequest { amount: 250, executable_at: 606 };
+	let request = WithdrawalRequest { amount: 250, executable_at: 606_000 };
 	let mut row = active_row(400, Some(request));
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606, 300, &mut row);
+	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606_000, 300, &mut row);
 	assert_eq!(got, Ok(250));
 	assert!(row.withdrawal_request.is_none());
 
 	// Bounded by the active deposit when the request exceeds it:
 	// take = min(500, 500, 400) = 400, leaving 100 of the request open.
-	let request = WithdrawalRequest { amount: 500, executable_at: 606 };
+	let request = WithdrawalRequest { amount: 500, executable_at: 606_000 };
 	let mut row = active_row(400, Some(request));
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606, 500, &mut row);
+	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606_000, 500, &mut row);
 	assert_eq!(got, Ok(400));
 	assert_eq!(row.withdrawal_request.as_ref().expect("still open").amount, 100);
 }
@@ -271,6 +271,6 @@ fn safety_withdrawal_takes_min_and_consumes_request() {
 #[test]
 fn frozen_withdrawal_rejected() {
 	let mut row = active_row(400, None);
-	let got = Stability::resolve_withdrawal(BranchMode::Frozen, 700, 100, &mut row);
+	let got = Stability::resolve_withdrawal(BranchMode::Frozen, 700_000, 100, &mut row);
 	assert_eq!(got, Err(Error::<Test>::BranchFrozen.into()));
 }

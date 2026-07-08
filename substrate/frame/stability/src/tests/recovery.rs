@@ -22,7 +22,7 @@ fn open_standing_vault() {
 fn seed_active_pool() {
 	mint_stable(PUSD, 1, 1_000);
 	assert_ok!(deposit(1, DOT, PUSD, 400));
-	run_to_block(6);
+	advance_time(5_000);
 	assert_ok!(activate(1, DOT, PUSD));
 }
 

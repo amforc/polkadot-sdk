@@ -338,7 +338,7 @@ pub type StabilityUpdateOrigin = EitherOf<
 >;
 
 parameter_types! {
-	pub static DefaultStabilityPoolConfig: StabilityPoolConfig<Balance, u64> =
+	pub static DefaultStabilityPoolConfig: StabilityPoolConfig<Balance, Moment> =
 		default_pool_config();
 }
 
@@ -422,6 +422,7 @@ impl pallet_stability::Config for Test {
 	// The runtime's single linked-list instance, shared with vaults; this
 	// pallet only touches its `StabilityPending` lists.
 	type PendingLists = LinkedList;
+	type TimeProvider = Timestamp;
 	type UpdateOrigin = StabilityUpdateOrigin;
 	type DefaultStabilityPoolConfig = DefaultStabilityPoolConfig;
 	type MaxPendingOffsetIterations = ConstU32<8>;
@@ -489,13 +490,14 @@ pub fn build_and_execute(test: impl FnOnce()) {
 	});
 }
 
-/// The reference pool config seeded into every registered branch.
-pub fn default_pool_config() -> StabilityPoolConfig<Balance, u64> {
+/// The reference pool config seeded into every registered branch: 5_000 ms
+/// entry delay, 600_000 ms safety withdrawal delay.
+pub fn default_pool_config() -> StabilityPoolConfig<Balance, Moment> {
 	StabilityPoolConfig {
 		minimum_deposit: 100,
 		minimum_active_pool_balance: 100,
-		entry_delay_blocks: 5,
-		safety_withdrawal_delay: 600,
+		entry_delay: 5_000,
+		safety_withdrawal_delay: 600_000,
 		p_min: FixedU128::from_inner(1_000_000_000),
 		scale_factor: FixedU128::from_u32(1_000_000_000),
 		yield_share: Permill::from_percent(75),
@@ -603,13 +605,9 @@ pub fn collateral_balance(collateral: AssetId, who: AccountId) -> Balance {
 	<PoolCollateralAssets as FungiblesInspect<AccountId>>::balance(collateral, &who)
 }
 
-/// Jump straight to block `n`; this pallet has no block hooks to run.
-pub fn run_to_block(n: u64) {
-	assert!(n >= System::block_number(), "cannot rewind blocks");
-	System::set_block_number(n);
-}
-
-/// Advance `pallet_timestamp` by `ms` milliseconds without touching block #.
+/// Advance mock time by `ms` milliseconds. The pallet is purely time-based;
+/// the block number stays at its genesis value of 1 (needed only so events
+/// are recorded).
 pub fn advance_time(ms: Moment) {
 	Timestamp::set_timestamp(Timestamp::get() + ms);
 }
@@ -695,18 +693,18 @@ pub fn seed_deposit(who: AccountId, amount: Balance) {
 	assert_ok!(deposit(who, DOT, PUSD, amount));
 }
 
-/// Advance past the default entry delay (block 6) and activate every
-/// depositor's pending deposit on the (DOT, PUSD) pool.
+/// Advance past the default entry delay and activate every depositor's
+/// pending deposit on the (DOT, PUSD) pool.
 pub fn activate_all(depositors: &[AccountId]) {
-	run_to_block(6);
+	advance_time(5_000);
 	for who in depositors {
 		assert_ok!(activate(*who, DOT, PUSD));
 	}
 }
 
 /// The canonical single-depositor fixture: register the default (DOT, PUSD)
-/// market, deposit 400 for user 1 at block 1 (minting 1_000, so 600 stays in
-/// the wallet), and activate at block 6.
+/// market, deposit 400 for user 1 at t = 1_000 (minting 1_000, so 600 stays
+/// in the wallet), and activate at t = 6_000.
 pub fn seed_active_deposit() {
 	register_branch(DOT, PUSD, default_branch_config());
 	mint_stable(PUSD, 1, 1_000);
