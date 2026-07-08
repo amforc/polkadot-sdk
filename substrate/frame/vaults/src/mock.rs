@@ -628,6 +628,11 @@ pub fn liquidate_with(
 /// Redeem `amount` against the market's current FIFO target through the trait
 /// surface, paying collateral out at the oracle price. Returns the owner that
 /// was redeemed against.
+///
+/// Drives the vaults half of the contract only — the redeemer's stablecoin is
+/// *not* burned here (that is the orchestrator's job; pallet-redemptions pins
+/// issuance falling by exactly the debt burned), so the redeemer needs no
+/// stablecoin balance.
 pub fn redeem(
 	collateral: AssetId,
 	stable: StableId,
@@ -653,6 +658,7 @@ pub fn redeem(
 }
 
 /// One redemption step against an explicit vault, through the trait surface.
+/// As with [`redeem`], no stablecoin is burned from the redeemer.
 pub fn redeem_step(
 	collateral: AssetId,
 	stable: StableId,
