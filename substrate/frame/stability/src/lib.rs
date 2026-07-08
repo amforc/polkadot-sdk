@@ -31,7 +31,6 @@ pub mod pallet {
 	};
 	use frame::{
 		deps::frame_support::{
-			storage::with_storage_layer,
 			traits::{fungibles, EnsureOriginWithArg},
 			PalletId,
 		},
@@ -55,8 +54,6 @@ pub mod pallet {
 
 	pub type StabilityPoolConfigOf<T> = StabilityPoolConfig<BalanceOf<T>, BlockNumberFor<T>>;
 
-	/// Version 0: a pallet added to a live chain starts with on-chain version 0,
-	/// so any higher declared version would demand a version-set migration.
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
 	#[pallet::pallet]
@@ -399,7 +396,7 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			with_storage_layer(|| Self::do_deposit(who, collateral_id, stable_id, amount))
+			Self::do_deposit(who, collateral_id, stable_id, amount)
 		}
 
 		/// Activate the caller's matured pending deposit, making it
@@ -412,7 +409,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			with_storage_layer(|| Self::do_activate_deposit(who, collateral_id, stable_id))
+			Self::do_activate_deposit(who, collateral_id, stable_id)
 		}
 
 		/// Create or replace a withdrawal request for up to `amount` active
@@ -428,7 +425,7 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			with_storage_layer(|| Self::do_request_withdraw(who, collateral_id, stable_id, amount))
+			Self::do_request_withdraw(who, collateral_id, stable_id, amount)
 		}
 
 		/// Withdraw up to `amount` active stablecoin to `recipient` —
@@ -445,9 +442,7 @@ pub mod pallet {
 			recipient: T::AccountId,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			with_storage_layer(|| {
-				Self::do_withdraw(who, collateral_id, stable_id, amount, recipient)
-			})
+			Self::do_withdraw(who, collateral_id, stable_id, amount, recipient)
 		}
 
 		/// Pay the caller's realized collateral gains to `recipient`.
@@ -460,9 +455,7 @@ pub mod pallet {
 			recipient: T::AccountId,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			with_storage_layer(|| {
-				Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Collateral)
-			})
+			Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Collateral)
 		}
 
 		/// Pay the caller's realized stablecoin yield to `recipient`. Yield
@@ -476,9 +469,7 @@ pub mod pallet {
 			recipient: T::AccountId,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			with_storage_layer(|| {
-				Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Yield)
-			})
+			Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Yield)
 		}
 
 		/// Permissionlessly burn active pool stablecoin against the current
@@ -495,7 +486,7 @@ pub mod pallet {
 			max_stable_in: BalanceOf<T>,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			with_storage_layer(|| Self::do_offset_recovery(collateral_id, stable_id, max_stable_in))
+			Self::do_offset_recovery(collateral_id, stable_id, max_stable_in)
 		}
 
 		/// Move up to `amount` of the caller's claimable yield into the
@@ -511,7 +502,7 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			with_storage_layer(|| Self::do_compound_yield(who, collateral_id, stable_id, amount))
+			Self::do_compound_yield(who, collateral_id, stable_id, amount)
 		}
 
 		/// Permissionlessly realize `owner`'s deposit against the current
@@ -526,7 +517,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			with_storage_layer(|| Self::do_poke_deposit(owner, collateral_id, stable_id))
+			Self::do_poke_deposit(owner, collateral_id, stable_id)
 		}
 
 		/// Replace a market's stability-pool parameters. The accumulator
