@@ -372,11 +372,9 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 		// via a redemption cancel so the vault becomes Dormant with non-zero
 		// residual debt.
 		use pusd_primitives::RedemptionAllocation;
-		assert_ok!(redeem_step(DOT, PUSD, 2, |_| Ok(Some(RedemptionAllocation {
-			redeemer: 99,
+		assert_ok!(redeem_step(DOT, PUSD, 2, 99, |_| Ok(Some(RedemptionAllocation {
 			debt_to_cancel: 450,
-			collateral_to_redeemer: 9_000,
-			fee_collateral_retained: 0,
+			collateral_to_recipient: 9_000,
 		}))));
 		assert!(crate::Pallet::<Test>::vault_status(DOT, PUSD, 2).unwrap().is_dormant());
 
@@ -480,11 +478,11 @@ fn full_lifecycle_holds_branch_identities() {
 
 		// Redemption against the cheapest vault at a healthy price.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		let redeemer_7_pre = collateral_balance(DOT, 7);
+		let recipient_7_pre = collateral_balance(DOT, 7);
 		assert_ok!(redeem(DOT, PUSD, 7, 400));
 		// At price 10 the redemption releases floor(debt_cancelled / 10) collateral free
-		// to the redeemer.
-		let released = collateral_balance(DOT, 7) - redeemer_7_pre;
+		// to the recipient.
+		let released = collateral_balance(DOT, 7) - recipient_7_pre;
 		assert_eq!(released, 40, "redeemed 400 debt at price 10 releases 40 collateral");
 		assert_identities();
 

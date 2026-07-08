@@ -214,34 +214,28 @@ fn liquidation_reverts_on_sub_ed_keeper_leg() {
 	});
 }
 
-// A redeemer leg below the collateral's ED to a fresh redeemer reverts the
-// step; `fee_collateral_retained` has no such floor — it never leaves the
-// vault's hold.
+// A recipient leg below the collateral's ED to a fresh recipient reverts the
+// step; an ED-sized leg passes.
 #[test]
-fn redemption_reverts_on_sub_ed_redeemer_leg() {
+fn redemption_reverts_on_sub_ed_recipient_leg() {
 	build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 
-		assert_eq!(collateral_balance(XBT, 997), 0, "redeemer is fresh");
+		assert_eq!(collateral_balance(XBT, 997), 0, "recipient is fresh");
 		assert_noop!(
-			redeem_step(XBT, USDX, 1, |_| Ok(Some(RedemptionAllocation {
-				redeemer: 997,
+			redeem_step(XBT, USDX, 1, 997, |_| Ok(Some(RedemptionAllocation {
 				debt_to_cancel: 100 * USD,
-				collateral_to_redeemer: XBT_ED - 1,
-				fee_collateral_retained: 0,
+				collateral_to_recipient: XBT_ED - 1,
 			}))),
 			TokenError::CannotCreate
 		);
 
-		// A retained fee below the collateral ED is fine: no transfer happens.
-		assert_ok!(redeem_step(XBT, USDX, 1, |_| Ok(Some(RedemptionAllocation {
-			redeemer: 997,
+		assert_ok!(redeem_step(XBT, USDX, 1, 997, |_| Ok(Some(RedemptionAllocation {
 			debt_to_cancel: 100 * USD,
-			collateral_to_redeemer: 0,
-			fee_collateral_retained: XBT_ED / 2,
+			collateral_to_recipient: XBT_ED,
 		}))));
+		assert_eq!(collateral_balance(XBT, 997), XBT_ED, "ED-sized recipient leg paid");
 	});
 }
 

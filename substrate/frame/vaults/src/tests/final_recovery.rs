@@ -5,7 +5,7 @@ use crate::{
 	tests::{rate_pct, vault_status},
 };
 use pallet_linked_list::SortedListInterface;
-use pusd_primitives::{RedemptionAllocation, VaultInterface};
+use pusd_primitives::VaultInterface;
 
 fn low_recovery_price() -> FixedU128 {
 	FixedU128::from_rational(1u128, 10u128)
@@ -21,21 +21,6 @@ fn enter_recovery(who: AccountId, rate: FixedU128) {
 		PUSD,
 		who
 	));
-}
-
-fn direct_redeem(owner: AccountId, redeemer: AccountId, amount: Balance) {
-	let price = MockPrices::get().get(&DOT).copied().expect("price set");
-	assert_ok!(redeem_step(DOT, PUSD, owner, |snapshot| {
-		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
-		let collateral_to_redeemer =
-			(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
-		Ok(Some(RedemptionAllocation {
-			redeemer,
-			debt_to_cancel,
-			collateral_to_redeemer,
-			fee_collateral_retained: 0,
-		}))
-	}));
 }
 
 #[test]
@@ -204,7 +189,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		enter_recovery(1, rate_pct(5, 100));
-		// Restore the price so the redeemer's collateral payout is affordable.
+		// Restore the price so the recipient's collateral payout is affordable.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		let full = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1))
 			.expect("vault stored")
@@ -213,7 +198,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 
 		// Cancelling the entire debt pulls the vault out of the FIFO; it settles
 		// to Dormant with its stake re-synced to the still-held collateral.
-		direct_redeem(1, 7, full);
+		assert_ok!(redeem_from(DOT, PUSD, 1, 7, full));
 
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultStatusChanged {
 			collateral_id: DOT,
@@ -287,7 +272,7 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		// Redeem most of vault 1's debt — pulls it below MinimumDebt (200) but
 		// leaves a non-zero residual, so it stays in the FR FIFO.
-		direct_redeem(1, 99, 350);
+		assert_ok!(redeem_from(DOT, PUSD, 1, 99, 350));
 		let v = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert!(v.debt.total() > 0);
 		assert!(v.debt.total() < 200);
@@ -319,8 +304,8 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 		enter_recovery(2, rate_pct(5, 100));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		// Push both FR vaults below MinimumDebt but non-zero.
-		direct_redeem(1, 99, 350);
-		direct_redeem(2, 98, 350);
+		assert_ok!(redeem_from(DOT, PUSD, 1, 99, 350));
+		assert_ok!(redeem_from(DOT, PUSD, 2, 98, 350));
 
 		// First exit parks vault 1 in the (empty) dormant slot.
 		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
@@ -424,11 +409,11 @@ fn redemption_queue_head_gates_on_final_recovery() {
 		assert_ok!(open(4, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		assert_ok!(open(5, DOT, PUSD, 1_000, 500, rate_pct(3, 100)));
 
-		// `direct_redeem` targets vault 3 explicitly, bypassing the normal
+		// `redeem_from` targets vault 3 explicitly, bypassing the normal
 		// FR-first targeting (which would pick head 1) — a deliberate workaround
 		// to manufacture a Dormant vault sitting *behind* the FR FIFO, so the
 		// gating assertion below is meaningful.
-		direct_redeem(3, 10, 350);
+		assert_ok!(redeem_from(DOT, PUSD, 3, 10, 350));
 		assert!(vault_status(DOT, PUSD, 3).is_dormant());
 
 		// Only the FinalRecovery head (1), regardless of `n`; the dormant target
