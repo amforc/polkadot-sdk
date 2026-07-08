@@ -130,7 +130,7 @@ fn strict_mode_zero_budget_accepts_valid_hint_rejects_invalid() {
 #[test]
 #[should_panic = "repair step made no progress"]
 fn walk_repair_asymmetric_links_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		build_chain(&[(1, 90), (2, 70), (3, 50)]);
 		// Break the back-link: 2.next still names 3, but 3.prev now names 1.
 		ListNodes::<Test>::mutate(1, 3, |maybe| {

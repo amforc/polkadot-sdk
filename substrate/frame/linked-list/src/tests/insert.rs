@@ -152,7 +152,7 @@ fn insert_does_not_saturate_size_counter() {
 #[test]
 #[should_panic = "Defensive failure has been triggered"]
 fn insert_at_missing_neighbor_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		// The hint names a prev neighbor (100) that does not exist.
 		let _ = list::insert_at::<Test>(&1, &200, 50, Position::at_tail(100));
 	});
@@ -161,7 +161,7 @@ fn insert_at_missing_neighbor_is_defensive() {
 #[test]
 #[should_panic = "head pointer disagrees with head-side insert"]
 fn insert_at_endpoint_mismatch_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// `Position::endpoints_only()` on a non-empty list: `prev = next = None`
@@ -174,7 +174,7 @@ fn insert_at_endpoint_mismatch_is_defensive() {
 #[test]
 #[should_panic = "prev neighbor rejects the resolved position"]
 fn insert_at_priority_above_prev_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Priority 100 violates `prev.priority (90) >= priority (100)`; the
@@ -186,7 +186,7 @@ fn insert_at_priority_above_prev_is_defensive() {
 #[test]
 #[should_panic = "next neighbor rejects the resolved position"]
 fn insert_at_priority_not_above_next_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Priority 50 violates `priority (50) > next.priority (50)`; the
@@ -198,7 +198,7 @@ fn insert_at_priority_not_above_next_is_defensive() {
 #[test]
 #[should_panic = "item linked against itself"]
 fn insert_at_self_link_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		// The hint claims the new item 200 is its own predecessor.
 		let _ = list::insert_at::<Test>(&1, &200, 40, Position::at_tail(200));
 	});
@@ -207,7 +207,7 @@ fn insert_at_self_link_is_defensive() {
 #[test]
 #[should_panic = "tail pointer disagrees with tail-side insert"]
 fn insert_at_tail_endpoint_mismatch_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Corrupt the tail pointer so a tail-side insert (`next = None`) past the
