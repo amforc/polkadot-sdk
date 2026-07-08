@@ -477,9 +477,12 @@ pub mod pallet {
 		ConfigOutsideEnvelope,
 		/// The annual rate is outside the branch's configured bounds.
 		RateOutOfBounds,
-		/// The vault's collateralization ratio fails the gate for this
-		/// operation (ICR on user ops, MCR on liquidation/recovery paths).
+		/// The vault's collateralization ratio is too low for this operation
+		/// (below ICR on user ops, below MCR on `exit_final_recovery`).
 		UnsafeCollateralizationRatio,
+		/// The vault's fully-accrued collateralization ratio is at or above
+		/// MCR — too healthy to enter `FinalRecovery`.
+		CollateralizationRatioTooHealthy,
 		/// In Safety mode, the operation would lower the branch TCR.
 		SafetyModeTcrWorsening,
 		/// In Normal mode, the operation would drop the branch TCR below the
