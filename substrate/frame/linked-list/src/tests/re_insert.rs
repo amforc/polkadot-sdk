@@ -157,7 +157,7 @@ fn re_insert_no_op_skips_link_validation() {
 #[test]
 #[should_panic = "validate_node_links: prev neighbor does not link back to item"]
 fn re_insert_in_place_broken_prev_back_link_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		insert(1, 300, 10);
@@ -175,7 +175,7 @@ fn re_insert_in_place_broken_prev_back_link_is_defensive() {
 #[test]
 #[should_panic = "validate_node_links: next neighbor does not link back to item"]
 fn re_insert_in_place_broken_next_back_link_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		insert(1, 300, 10);
@@ -192,7 +192,7 @@ fn re_insert_in_place_broken_next_back_link_is_defensive() {
 #[test]
 #[should_panic = "validate_node_links: node linked against itself"]
 fn re_insert_self_loop_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// 100's `prev` names itself, forming a self-loop.
 		ListNodes::<Test>::mutate(1, 100, |maybe| {
@@ -207,7 +207,7 @@ fn re_insert_self_loop_is_defensive() {
 #[test]
 #[should_panic = "validate_node_links: prev and next name the same neighbor"]
 fn re_insert_same_neighbor_both_sides_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		insert(1, 300, 10);
@@ -224,7 +224,7 @@ fn re_insert_same_neighbor_both_sides_is_defensive() {
 #[test]
 #[should_panic = "validate_node_links: prev neighbor row is missing"]
 fn re_insert_dangling_prev_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// 200's `prev` names an item with no stored row.
@@ -240,7 +240,7 @@ fn re_insert_dangling_prev_is_defensive() {
 #[test]
 #[should_panic = "validate_node_links: next neighbor row is missing"]
 fn re_insert_dangling_next_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// 100's `next` names an item with no stored row.
@@ -256,7 +256,7 @@ fn re_insert_dangling_next_is_defensive() {
 #[test]
 #[should_panic = "validate_node_links: head pointer disagrees with head-claiming node"]
 fn re_insert_false_head_claim_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// 200 falsely claims to be the head; the meta row still names 100.
@@ -272,7 +272,7 @@ fn re_insert_false_head_claim_is_defensive() {
 #[test]
 #[should_panic = "validate_node_links: tail pointer disagrees with tail-claiming node"]
 fn re_insert_false_tail_claim_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// 100 falsely claims to be the tail; the meta row still names 200.

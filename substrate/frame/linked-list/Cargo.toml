@@ -19,6 +19,9 @@ codec = { workspace = true, features = ["derive"] }
 frame = { workspace = true, features = ["runtime"] }
 scale-info = { workspace = true, features = ["derive"] }
 
+[dev-dependencies]
+sp-tracing = { workspace = true, default-features = true }
+
 [features]
 default = ["std"]
 std = [

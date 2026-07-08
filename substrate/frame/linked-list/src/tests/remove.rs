@@ -133,7 +133,7 @@ fn pop_tail_is_lifo_for_same_priority_cluster() {
 #[test]
 #[should_panic = "Defensive failure has been triggered"]
 fn remove_missing_neighbor_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Drop 100, orphaning 200's prev link.
@@ -145,7 +145,7 @@ fn remove_missing_neighbor_is_defensive() {
 #[test]
 #[should_panic = "head pointer disagrees with head-claiming node"]
 fn remove_at_node_with_none_prev_but_not_head_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Corrupt node 200's `prev` to `None` so it falsely claims to be the head
@@ -162,7 +162,7 @@ fn remove_at_node_with_none_prev_but_not_head_is_defensive() {
 #[test]
 #[should_panic = "tail pointer disagrees with tail-claiming node"]
 fn remove_at_node_with_none_next_but_not_tail_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Corrupt node 100's `next` to `None` so it falsely claims to be the tail
@@ -179,7 +179,7 @@ fn remove_at_node_with_none_next_but_not_tail_is_defensive() {
 #[test]
 #[should_panic = "node linked against itself"]
 fn remove_at_self_loop_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// Corrupt 100 so its `prev` names itself, forming a self-loop. The
 		// anti-cycle guard trips defensively; production logs and returns
@@ -196,7 +196,7 @@ fn remove_at_self_loop_is_defensive() {
 #[test]
 #[should_panic = "Defensive failure has been triggered"]
 fn remove_at_missing_meta_row_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// Drop the metadata row while the node persists: a present node without a
 		// meta row violates the all-or-nothing invariant.
@@ -208,7 +208,7 @@ fn remove_at_missing_meta_row_is_defensive() {
 #[test]
 #[should_panic = "Defensive failure has been triggered"]
 fn remove_at_len_underflow_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// Corrupt the length counter to 0 while the node and head/tail persist, so
 		// the decrement underflows.
@@ -224,7 +224,7 @@ fn remove_at_len_underflow_is_defensive() {
 #[test]
 #[should_panic = "Defensive failure has been triggered"]
 fn pop_tail_with_missing_tail_node_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// Remove the node but leave `ListMetas.tail` pointing at it.
 		ListNodes::<Test>::remove(1, 100);
@@ -235,7 +235,7 @@ fn pop_tail_with_missing_tail_node_is_defensive() {
 #[test]
 #[should_panic = "prev and next name the same neighbor"]
 fn remove_at_aliased_neighbors_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Corrupt 200 into a two-node cycle with 100: both sides name the same
@@ -254,7 +254,7 @@ fn remove_at_aliased_neighbors_is_defensive() {
 #[test]
 #[should_panic = "Defensive failure has been triggered"]
 fn pop_tail_with_none_tail_on_present_meta_is_defensive() {
-	build_and_execute_no_post_check(|| {
+	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// A present meta row with `tail: None` is corruption, not an empty
 		// list; `pop_tail` must not silently report `Ok(None)`.
