@@ -191,7 +191,7 @@ fn set_stability_pool_config_updates_and_emits() {
 		register_branch(DOT, PUSD, default_branch_config());
 		let mut config = default_pool_config();
 		config.minimum_deposit = 250;
-		config.entry_delay_blocks = 10;
+		config.entry_delay = 10_000;
 
 		assert_ok!(Stability::set_stability_pool_config(
 			RuntimeOrigin::root(),

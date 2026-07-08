@@ -15,11 +15,12 @@ use frame::{
 	traits::{
 		fungibles::{Balanced as FungiblesBalanced, Mutate as FungiblesMutate},
 		tokens::{Fortitude, Precision, Preservation},
+		Time,
 	},
 };
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{
-	BranchMode, BranchModeProvider, RecoveryOffsetInterface, RecoveryOffsetQuote,
+	BranchMode, BranchModeProvider, Millis, RecoveryOffsetInterface, RecoveryOffsetQuote,
 };
 
 /// Which realized gain a claim pays out; the two sides share one flow
@@ -54,9 +55,10 @@ impl<T: Config> Pallet<T> {
 		state: &mut PoolStateOf<T>,
 		config: &StabilityPoolConfigOf<T>,
 		deposit: &mut DepositOf<T>,
+		now: Millis,
 	) -> Result<bool, DispatchError> {
 		Self::realize_deposit(collateral_id, stable_id, state, config, deposit)?;
-		Self::activate_matured_pending(collateral_id, stable_id, who, state, deposit)
+		Self::activate_matured_pending(collateral_id, stable_id, who, state, deposit, now)
 	}
 
 	/// SPEC.md §6.6: realize, activate any matured pending deposit, attempt
@@ -72,6 +74,7 @@ impl<T: Config> Pallet<T> {
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		ensure!(amount >= config.minimum_deposit, Error::<T>::DepositTooSmall);
 
+		let now = T::TimeProvider::now();
 		let mut deposit = Self::load_or_fresh_deposit(&collateral_id, &stable_id, &who, &state);
 		Self::realize_and_activate(
 			&collateral_id,
@@ -80,6 +83,7 @@ impl<T: Config> Pallet<T> {
 			&mut state,
 			&config,
 			&mut deposit,
+			now,
 		)?;
 
 		let used_for_recovery = Self::try_incoming_recovery(
@@ -102,8 +106,7 @@ impl<T: Config> Pallet<T> {
 				pending_amount,
 				Preservation::Expendable,
 			)?;
-			let activatable_at =
-				frame_system::Pallet::<T>::block_number().saturating_add(config.entry_delay_blocks);
+			let activatable_at = now.saturating_add(config.entry_delay);
 			match deposit.pending_deposit.as_mut() {
 				Some(pending) => {
 					// Merging a top-up resets the whole pending amount's
@@ -275,10 +278,8 @@ impl<T: Config> Pallet<T> {
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
 		let pending = deposit.pending_deposit.as_ref().ok_or(Error::<T>::NoPendingDeposit)?;
-		ensure!(
-			frame_system::Pallet::<T>::block_number() >= pending.activatable_at,
-			Error::<T>::PendingDepositNotMatured
-		);
+		let now = T::TimeProvider::now();
+		ensure!(now >= pending.activatable_at, Error::<T>::PendingDepositNotMatured);
 
 		Self::realize_and_activate(
 			&collateral_id,
@@ -287,6 +288,7 @@ impl<T: Config> Pallet<T> {
 			&mut state,
 			&config,
 			&mut deposit,
+			now,
 		)?;
 		debug_assert!(deposit.pending_deposit.is_none());
 
@@ -312,6 +314,7 @@ impl<T: Config> Pallet<T> {
 			.ok_or(Error::<T>::DepositNotFound)?;
 		ensure!(!amount.is_zero(), Error::<T>::NoActiveDeposit);
 
+		let now = T::TimeProvider::now();
 		let activated = Self::realize_and_activate(
 			&collateral_id,
 			&stable_id,
@@ -319,9 +322,9 @@ impl<T: Config> Pallet<T> {
 			&mut state,
 			&config,
 			&mut deposit,
+			now,
 		)?;
 
-		let now = frame_system::Pallet::<T>::block_number();
 		let executable_at = now.saturating_add(config.safety_withdrawal_delay);
 		deposit.withdrawal_request = Some(WithdrawalRequest { amount, executable_at });
 
@@ -354,6 +357,7 @@ impl<T: Config> Pallet<T> {
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
 
+		let now = T::TimeProvider::now();
 		Self::realize_and_activate(
 			&collateral_id,
 			&stable_id,
@@ -361,10 +365,10 @@ impl<T: Config> Pallet<T> {
 			&mut state,
 			&config,
 			&mut deposit,
+			now,
 		)?;
 
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
-		let now = frame_system::Pallet::<T>::block_number();
 		let take = Self::resolve_withdrawal(mode, now, amount, &mut deposit)?;
 		ensure!(!take.is_zero(), Error::<T>::NoActiveDeposit);
 
@@ -420,6 +424,7 @@ impl<T: Config> Pallet<T> {
 			&mut state,
 			&config,
 			&mut deposit,
+			T::TimeProvider::now(),
 		)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
@@ -822,6 +827,7 @@ impl<T: Config> Pallet<T> {
 			&mut state,
 			&config,
 			&mut deposit,
+			T::TimeProvider::now(),
 		)?;
 
 		let take = amount.min(deposit.claimable_yield);
@@ -879,7 +885,7 @@ impl<T: Config> Pallet<T> {
 	/// - `Frozen`: rejected outright.
 	pub(crate) fn resolve_withdrawal(
 		mode: BranchMode,
-		now: BlockNumberFor<T>,
+		now: Millis,
 		amount: BalanceOf<T>,
 		deposit: &mut DepositOf<T>,
 	) -> Result<BalanceOf<T>, DispatchError> {
@@ -992,13 +998,14 @@ impl<T: Config> Pallet<T> {
 		who: &T::AccountId,
 		state: &mut PoolStateOf<T>,
 		deposit: &mut DepositOf<T>,
+		now: Millis,
 	) -> Result<bool, DispatchError> {
 		debug_assert!(deposit.snapshot_p == state.p);
 		debug_assert!(deposit.snapshot_epoch == state.epoch);
 		let Some(pending) = &deposit.pending_deposit else {
 			return Ok(false);
 		};
-		if frame_system::Pallet::<T>::block_number() < pending.activatable_at {
+		if now < pending.activatable_at {
 			return Ok(false);
 		}
 		let amount = pending.amount;

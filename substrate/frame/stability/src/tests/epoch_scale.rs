@@ -23,7 +23,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		mint_stable(PUSD, 2, 400);
 		assert_ok!(deposit(1, DOT, PUSD, 600));
 		assert_ok!(deposit(2, DOT, PUSD, 400));
-		run_to_block(6);
+		advance_time(5_000);
 		assert_ok!(activate(1, DOT, PUSD));
 		assert_ok!(activate(2, DOT, PUSD));
 
@@ -58,7 +58,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		// A fresh epoch-1 depositor is untouched by epoch-0 history.
 		mint_stable(PUSD, 3, 500);
 		assert_ok!(deposit(3, DOT, PUSD, 500));
-		run_to_block(11);
+		advance_time(5_000);
 		assert_ok!(activate(3, DOT, PUSD));
 		let before_3 = collateral_balance(DOT, 3);
 		assert_ok!(simulate_offset(DOT, PUSD, 250, 100));
