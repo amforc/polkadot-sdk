@@ -1,6 +1,10 @@
 //! Branch lifecycle seeding and `set_stability_pool_config` governance.
 
-use crate::{mock::*, types::PoolSums, Error};
+use crate::{
+	mock::*,
+	types::{PoolState, PoolSums},
+	Error,
+};
 use frame::traits::Get;
 
 fn providers(who: AccountId) -> u32 {
@@ -8,7 +12,7 @@ fn providers(who: AccountId) -> u32 {
 }
 
 fn empty_deposit_row() -> crate::pallet::DepositOf<Test> {
-	crate::types::Deposit::fresh(FixedU128::one(), &PoolSums::default(), 0, 0)
+	crate::types::Deposit::fresh(PoolState::<Balance>::fresh().snapshot(&PoolSums::default()))
 }
 
 #[test]

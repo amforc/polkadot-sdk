@@ -932,34 +932,22 @@ impl<T: Config> Pallet<T> {
 		config: &StabilityPoolConfigOf<T>,
 		deposit: &mut DepositOf<T>,
 	) -> DispatchResult {
-		let snapshot = math::DepositSnapshot {
-			p: deposit.snapshot_p,
-			s: deposit.snapshot_s,
-			g: deposit.snapshot_g,
-			epoch: deposit.snapshot_epoch,
-			scale: deposit.snapshot_scale,
-		};
+		let snapshot = deposit.snapshot;
 		let current = PoolSumsStore::<T>::get((collateral_id, stable_id, state.epoch, state.scale))
 			.unwrap_or_default();
 		// A snapshot already at the live coordinates realizes against the
 		// current row alone — no row above the live scale can exist — which
 		// makes the snapshot-reset read below cover the whole window.
-		let window =
-			if deposit.snapshot_epoch == state.epoch && deposit.snapshot_scale == state.scale {
-				math::SumsWindow {
-					s_snap: current.s_collateral,
-					g_snap: current.g_yield,
-					s_next: FixedU128::zero(),
-					g_next: FixedU128::zero(),
-				}
-			} else {
-				Self::sums_window(
-					collateral_id,
-					stable_id,
-					deposit.snapshot_epoch,
-					deposit.snapshot_scale,
-				)
-			};
+		let window = if snapshot.epoch == state.epoch && snapshot.scale == state.scale {
+			math::SumsWindow {
+				s_snap: current.s_collateral,
+				g_snap: current.g_yield,
+				s_next: FixedU128::zero(),
+				g_next: FixedU128::zero(),
+			}
+		} else {
+			Self::sums_window(collateral_id, stable_id, snapshot.epoch, snapshot.scale)
+		};
 		let realized = math::realize(
 			deposit.active_deposit,
 			&snapshot,
@@ -979,11 +967,7 @@ impl<T: Config> Pallet<T> {
 			.checked_add(&realized.yield_gain)
 			.ok_or(ArithmeticError::Overflow)?;
 
-		deposit.snapshot_p = state.p;
-		deposit.snapshot_s = current.s_collateral;
-		deposit.snapshot_g = current.g_yield;
-		deposit.snapshot_epoch = state.epoch;
-		deposit.snapshot_scale = state.scale;
+		deposit.snapshot = state.snapshot(&current);
 		Ok(())
 	}
 
@@ -1000,8 +984,8 @@ impl<T: Config> Pallet<T> {
 		deposit: &mut DepositOf<T>,
 		now: Millis,
 	) -> Result<bool, DispatchError> {
-		debug_assert!(deposit.snapshot_p == state.p);
-		debug_assert!(deposit.snapshot_epoch == state.epoch);
+		debug_assert!(deposit.snapshot.p == state.p);
+		debug_assert!(deposit.snapshot.epoch == state.epoch);
 		let Some(pending) = &deposit.pending_deposit else {
 			return Ok(false);
 		};
@@ -1044,7 +1028,7 @@ impl<T: Config> Pallet<T> {
 			let current =
 				PoolSumsStore::<T>::get((collateral_id, stable_id, state.epoch, state.scale))
 					.unwrap_or_default();
-			Deposit::fresh(state.p, &current, state.epoch, state.scale)
+			Deposit::fresh(state.snapshot(&current))
 		})
 	}
 
