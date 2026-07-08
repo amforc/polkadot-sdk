@@ -24,7 +24,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if state.p > FixedU128::one() {
 			return Err("`P` above one".into());
 		}
-		if state.p < config.p_min {
+		if state.p < config.precision.p_min {
 			return Err("`P` below the configured precision floor".into());
 		}
 		if !PoolSumsStore::<T>::contains_key((&collateral_id, &stable_id, state.epoch, state.scale))
@@ -73,18 +73,13 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				pending_rows = pending_rows.saturating_add(1);
 			}
 
-			let window = Pallet::<T>::sums_window(
-				&collateral_id,
-				&stable_id,
-				deposit.snapshot.epoch,
-				deposit.snapshot.scale,
-			);
+			let window = Pallet::<T>::sums_window(&collateral_id, &stable_id, &deposit.snapshot);
 			let realized = crate::math::realize(
 				deposit.active_deposit,
 				&deposit.snapshot,
 				&state.accumulators(),
 				&window,
-				&config.precision(),
+				&config.precision,
 			);
 			compounded_sum = compounded_sum.saturating_add(realized.compounded);
 		}
