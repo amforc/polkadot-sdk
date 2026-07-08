@@ -13688,6 +13688,7 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-sdk-frame",
  "scale-info",
+ "sp-tracing 16.0.0",
 ]
 
 [[package]]
