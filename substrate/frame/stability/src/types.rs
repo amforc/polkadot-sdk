@@ -15,7 +15,7 @@ use crate::math;
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct Deposit<Balance, BlockNumber> {
+pub struct Deposit<Balance, Moment> {
 	pub active_deposit: Balance,
 
 	pub snapshot_p: FixedU128,
@@ -28,11 +28,11 @@ pub struct Deposit<Balance, BlockNumber> {
 	pub claimable_collateral: Balance,
 	pub claimable_yield: Balance,
 
-	pub pending_deposit: Option<PendingDeposit<Balance, BlockNumber>>,
-	pub withdrawal_request: Option<WithdrawalRequest<Balance, BlockNumber>>,
+	pub pending_deposit: Option<PendingDeposit<Balance, Moment>>,
+	pub withdrawal_request: Option<WithdrawalRequest<Balance, Moment>>,
 }
 
-impl<Balance: Zero, BlockNumber> Deposit<Balance, BlockNumber> {
+impl<Balance: Zero, Moment> Deposit<Balance, Moment> {
 	/// A value-free row snapshotted at the given accumulator coordinates
 	/// (realization on a fresh row is the identity).
 	pub fn fresh(p: FixedU128, sums: &PoolSums, epoch: u32, scale: u32) -> Self {
@@ -54,10 +54,10 @@ impl<Balance: Zero, BlockNumber> Deposit<Balance, BlockNumber> {
 	/// `withdrawal_request` is deliberately ignored: with nothing left to
 	/// withdraw it is dead state and goes with the row.
 	pub fn is_empty(&self) -> bool {
-		self.active_deposit.is_zero()
-			&& self.claimable_collateral.is_zero()
-			&& self.claimable_yield.is_zero()
-			&& self.pending_deposit.is_none()
+		self.active_deposit.is_zero() &&
+			self.claimable_collateral.is_zero() &&
+			self.claimable_yield.is_zero() &&
+			self.pending_deposit.is_none()
 	}
 }
 
@@ -67,9 +67,9 @@ impl<Balance: Zero, BlockNumber> Deposit<Balance, BlockNumber> {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct PendingDeposit<Balance, BlockNumber> {
+pub struct PendingDeposit<Balance, Moment> {
 	pub amount: Balance,
-	pub activatable_at: BlockNumber,
+	pub activatable_at: Moment,
 }
 
 /// Two-step withdrawal state; only load-bearing in Safety Mode (§6.9).
@@ -78,9 +78,9 @@ pub struct PendingDeposit<Balance, BlockNumber> {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct WithdrawalRequest<Balance, BlockNumber> {
+pub struct WithdrawalRequest<Balance, Moment> {
 	pub amount: Balance,
-	pub executable_at: BlockNumber,
+	pub executable_at: Moment,
 }
 
 /// Branch pool totals and current product-sum coordinates (SPEC.md §5.2).
@@ -148,14 +148,14 @@ pub struct PoolSums {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct StabilityPoolConfig<Balance, BlockNumber> {
+pub struct StabilityPoolConfig<Balance, Moment> {
 	/// Smallest accepted deposit; prevents dust rows.
 	pub minimum_deposit: Balance,
 	/// Post-offset floor for the active pool: an offset either leaves at
 	/// least this much active or fully depletes the pool (§6.5).
 	pub minimum_active_pool_balance: Balance,
-	pub entry_delay_blocks: BlockNumber,
-	pub safety_withdrawal_delay: BlockNumber,
+	pub entry_delay: Moment,
+	pub safety_withdrawal_delay: Moment,
 	/// Precision floor for `P`; immutable after registration (see
 	/// `math::PoolPrecision` for why).
 	pub p_min: FixedU128,
@@ -167,7 +167,7 @@ pub struct StabilityPoolConfig<Balance, BlockNumber> {
 	pub yield_share: Permill,
 }
 
-impl<Balance: Zero, BlockNumber> StabilityPoolConfig<Balance, BlockNumber> {
+impl<Balance: Zero, Moment> StabilityPoolConfig<Balance, Moment> {
 	/// Zero thresholds break dust protection and the §6.5 offset floor;
 	/// out-of-range precision parameters break product-sum accounting
 	/// (`scale_factor` must be an integer in
@@ -231,8 +231,8 @@ mod tests {
 		StabilityPoolConfig {
 			minimum_deposit: 100,
 			minimum_active_pool_balance: 100,
-			entry_delay_blocks: 5,
-			safety_withdrawal_delay: 600,
+			entry_delay: 5_000,
+			safety_withdrawal_delay: 600_000,
 			p_min: FixedU128::from_inner(1_000_000_000),
 			scale_factor: FixedU128::from_u32(1_000_000_000),
 			yield_share: Permill::from_percent(75),
@@ -245,7 +245,7 @@ mod tests {
 		// Zero delays are legitimate governance choices (they disable the
 		// respective protection), zero yield share as well.
 		let mut config = valid_config();
-		config.entry_delay_blocks = 0;
+		config.entry_delay = 0;
 		config.safety_withdrawal_delay = 0;
 		config.yield_share = Permill::zero();
 		assert!(config.is_valid());
@@ -299,10 +299,10 @@ mod tests {
 	#[test]
 	fn deposit_emptiness_ignores_withdrawal_requests() {
 		let mut deposit = Deposit::<u128, u64>::fresh(FixedU128::one(), &PoolSums::default(), 0, 0);
-		deposit.withdrawal_request = Some(WithdrawalRequest { amount: 10, executable_at: 601 });
+		deposit.withdrawal_request = Some(WithdrawalRequest { amount: 10, executable_at: 601_000 });
 		assert!(deposit.is_empty());
 
-		deposit.pending_deposit = Some(PendingDeposit { amount: 1, activatable_at: 6 });
+		deposit.pending_deposit = Some(PendingDeposit { amount: 1, activatable_at: 6_000 });
 		assert!(!deposit.is_empty());
 
 		deposit.pending_deposit = None;

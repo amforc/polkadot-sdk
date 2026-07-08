@@ -13,7 +13,7 @@ fn seed_branch_with_debt() {
 	assert_ok!(open_vault(5, DOT, PUSD, 1_000, 500));
 	mint_stable(PUSD, 1, 1_000);
 	assert_ok!(deposit(1, DOT, PUSD, 400));
-	run_to_block(6);
+	advance_time(5_000);
 	assert_ok!(activate(1, DOT, PUSD));
 }
 
@@ -86,8 +86,8 @@ fn safety_mode_enforces_two_step_withdrawals() {
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::SafetyWithdrawalDelayActive);
 
-		// Requested at block 6 + the 600-block delay.
-		run_to_block(606);
+		// Wait out the full 600_000 ms Safety delay.
+		advance_time(600_000);
 		assert_ok!(withdraw(1, DOT, PUSD, 300, 1));
 		// take = min(requested-remaining 250, active 400): the request
 		// bounds the exit and is consumed by it.
@@ -144,13 +144,13 @@ fn normal_request_carries_its_delay_into_safety() {
 	build_and_execute(|| {
 		seed_branch_with_debt();
 
-		// Requested in Normal Mode at block 6: executable_at = 606.
+		// Requested in Normal Mode at t = 6_000: executable_at = 606_000.
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 		enter_safety_mode();
 
 		// The branch turned, but the request already carries its delay.
 		assert_noop!(withdraw(1, DOT, PUSD, 250, 1), Error::<Test>::SafetyWithdrawalDelayActive);
-		run_to_block(606);
+		advance_time(600_000);
 		assert_ok!(withdraw(1, DOT, PUSD, 250, 1));
 		assert_eq!(stable_balance(PUSD, 1), 850);
 	});

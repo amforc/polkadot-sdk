@@ -117,7 +117,7 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 600);
 		assert_ok!(deposit(1, DOT, PUSD, 600));
-		run_to_block(6);
+		advance_time(5_000);
 		assert_ok!(activate(1, DOT, PUSD));
 		seed_pending(2, 300);
 		drop(distribute_yield(DOT, PUSD, 60));
