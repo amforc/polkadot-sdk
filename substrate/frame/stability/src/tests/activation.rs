@@ -30,9 +30,9 @@ fn activate_at_exact_boundary_succeeds() {
 		assert_eq!(row.active_deposit, 400);
 		assert!(row.pending_deposit.is_none());
 		// Activation joins at the current accumulators.
-		assert_eq!(row.snapshot_p, FixedU128::one());
-		assert_eq!(row.snapshot_epoch, 0);
-		assert_eq!(row.snapshot_scale, 0);
+		assert_eq!(row.snapshot.p, FixedU128::one());
+		assert_eq!(row.snapshot.epoch, 0);
+		assert_eq!(row.snapshot.scale, 0);
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 400);

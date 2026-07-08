@@ -5,24 +5,21 @@ use frame::arithmetic::{FixedPointNumber, FixedU128, One, Permill, Saturating, Z
 use scale_info::TypeInfo;
 
 use crate::math;
+pub use crate::math::DepositSnapshot;
 
 /// Per-branch depositor state (SPEC.md §5.1).
 ///
 /// `active_deposit` is the amount last realized against the accumulators; it
 /// may be stale relative to the live `P`. Every user operation realizes
-/// losses and gains through the snapshot fields first, then applies its
-/// change and resets the snapshots.
+/// losses and gains through the snapshot first, then applies its change and
+/// resets it.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct Deposit<Balance, Moment> {
 	pub active_deposit: Balance,
 
-	pub snapshot_p: FixedU128,
-	pub snapshot_s: FixedU128,
-	pub snapshot_g: FixedU128,
-	pub snapshot_epoch: u32,
-	pub snapshot_scale: u32,
+	pub snapshot: DepositSnapshot,
 
 	/// Realized-but-unclaimed gains; accumulate across realizations.
 	pub claimable_collateral: Balance,
@@ -33,16 +30,12 @@ pub struct Deposit<Balance, Moment> {
 }
 
 impl<Balance: Zero, Moment> Deposit<Balance, Moment> {
-	/// A value-free row snapshotted at the given accumulator coordinates
-	/// (realization on a fresh row is the identity).
-	pub fn fresh(p: FixedU128, sums: &PoolSums, epoch: u32, scale: u32) -> Self {
+	/// A value-free row at the given snapshot (realization on a fresh row is
+	/// the identity).
+	pub fn fresh(snapshot: DepositSnapshot) -> Self {
 		Self {
 			active_deposit: Balance::zero(),
-			snapshot_p: p,
-			snapshot_s: sums.s_collateral,
-			snapshot_g: sums.g_yield,
-			snapshot_epoch: epoch,
-			snapshot_scale: scale,
+			snapshot,
 			claimable_collateral: Balance::zero(),
 			claimable_yield: Balance::zero(),
 			pending_deposit: None,
@@ -122,6 +115,18 @@ impl<Balance: Zero> PoolState<Balance> {
 
 	pub fn accumulators(&self) -> math::Accumulators {
 		math::Accumulators { p: self.p, epoch: self.epoch, scale: self.scale }
+	}
+
+	/// The deposit snapshot at the pool's current coordinates; `sums` is the
+	/// live `(epoch, scale)` sums row.
+	pub fn snapshot(&self, sums: &PoolSums) -> DepositSnapshot {
+		DepositSnapshot {
+			p: self.p,
+			s: sums.s_collateral,
+			g: sums.g_yield,
+			epoch: self.epoch,
+			scale: self.scale,
+		}
 	}
 }
 
@@ -298,7 +303,8 @@ mod tests {
 
 	#[test]
 	fn deposit_emptiness_ignores_withdrawal_requests() {
-		let mut deposit = Deposit::<u128, u64>::fresh(FixedU128::one(), &PoolSums::default(), 0, 0);
+		let mut deposit =
+			Deposit::<u128, u64>::fresh(PoolState::<u128>::fresh().snapshot(&PoolSums::default()));
 		deposit.withdrawal_request = Some(WithdrawalRequest { amount: 10, executable_at: 601_000 });
 		assert!(deposit.is_empty());
 
