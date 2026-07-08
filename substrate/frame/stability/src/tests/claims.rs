@@ -148,7 +148,7 @@ fn claim_activates_matured_pending() {
 
 		// The claim is a caller-initiated operation, so it performs the
 		// standard housekeeping: the matured 300 becomes active.
-		run_to_block(11);
+		advance_time(5_000);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
@@ -170,7 +170,7 @@ fn poke_realizes_but_never_activates() {
 		// Long past maturity, a third party pokes the row: it stays pending.
 		// Activating would expose the owner's capital to ordinary offsets,
 		// and that choice belongs to the owner alone.
-		run_to_block(50);
+		advance_time(49_000);
 		assert_ok!(poke(7, 1, DOT, PUSD));
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");

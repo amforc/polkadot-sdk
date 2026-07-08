@@ -151,7 +151,7 @@ fn late_depositor_earns_only_after_their_snapshot() {
 
 		// User 2 joins at G0 = 0.1.
 		seed_active(2, 400);
-		run_to_block(11);
+		advance_time(5_000);
 		assert_ok!(activate(2, DOT, PUSD));
 
 		// Second distribution splits over A = 1000: G = 0.1 + 0.1 = 0.2.
@@ -345,7 +345,7 @@ fn pending_deposits_earn_no_yield() {
 		// The whole distribution went to the 600 active: G = 0.1, and user
 		// 2 snapshots G at deposit time, so nothing accrues to them even
 		// after activation.
-		run_to_block(11);
+		advance_time(5_000);
 		assert_ok!(activate(2, DOT, PUSD));
 		assert_noop!(claim_yield(2, DOT, PUSD, 2), Error::<Test>::NoClaimableYield);
 
