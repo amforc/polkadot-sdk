@@ -73,22 +73,15 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				pending_rows = pending_rows.saturating_add(1);
 			}
 
-			let snapshot = crate::math::DepositSnapshot {
-				p: deposit.snapshot_p,
-				s: deposit.snapshot_s,
-				g: deposit.snapshot_g,
-				epoch: deposit.snapshot_epoch,
-				scale: deposit.snapshot_scale,
-			};
 			let window = Pallet::<T>::sums_window(
 				&collateral_id,
 				&stable_id,
-				deposit.snapshot_epoch,
-				deposit.snapshot_scale,
+				deposit.snapshot.epoch,
+				deposit.snapshot.scale,
 			);
 			let realized = crate::math::realize(
 				deposit.active_deposit,
-				&snapshot,
+				&deposit.snapshot,
 				&state.accumulators(),
 				&window,
 				&config.precision(),
@@ -115,11 +108,11 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	for ((collateral_id, stable_id, _who), deposit) in Deposits::<T>::iter() {
 		let state = PoolStates::<T>::get(&collateral_id, &stable_id)
 			.ok_or("deposit row without a pool state row")?;
-		if deposit.snapshot_epoch > state.epoch {
+		if deposit.snapshot.epoch > state.epoch {
 			return Err("deposit snapshot epoch ahead of the pool".into());
 		}
-		if deposit.snapshot_epoch == state.epoch {
-			if deposit.snapshot_scale > state.scale {
+		if deposit.snapshot.epoch == state.epoch {
+			if deposit.snapshot.scale > state.scale {
 				return Err("deposit snapshot scale ahead of the pool".into());
 			}
 		}
@@ -127,8 +120,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if !PoolSumsStore::<T>::contains_key((
 			&collateral_id,
 			&stable_id,
-			deposit.snapshot_epoch,
-			deposit.snapshot_scale,
+			deposit.snapshot.epoch,
+			deposit.snapshot.scale,
 		)) {
 			return Err("deposit snapshot references a pruned sums row".into());
 		}

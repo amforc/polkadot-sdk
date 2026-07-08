@@ -19,6 +19,7 @@
 //! bounds enforced by `StabilityPoolConfig::is_valid` keep every reachable
 //! intermediate inside `u128`.
 
+use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
 	arithmetic::{
 		helpers_128bit::multiply_by_rational_with_rounding, FixedPointNumber, FixedPointOperand,
@@ -26,6 +27,7 @@ use frame::{
 	},
 	traits::Defensive,
 };
+use scale_info::TypeInfo;
 
 /// A single offset may rescale `P` at most this many times before the pallet
 /// rejects it as unresolvable precision loss. Two crossings are only
@@ -51,7 +53,19 @@ pub struct Accumulators {
 }
 
 /// A deposit's stored snapshot of the accumulators at its last realization.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Embedded in every `Deposit` storage row, hence the codec derives.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
 pub struct DepositSnapshot {
 	pub p: FixedU128,
 	pub s: FixedU128,
