@@ -31,14 +31,14 @@ pub mod pallet {
 	};
 	use frame::{
 		deps::frame_support::{
-			traits::{fungibles, EnsureOriginWithArg},
+			traits::{fungibles, EnsureOriginWithArg, Time},
 			PalletId,
 		},
 		prelude::*,
 	};
 	use pallet_linked_list::SortedListInterface;
 	use pusd_primitives::{
-		BranchModeProvider, OnBranchLifecycle, RecoveryOffsetInterface, StableListId,
+		BranchModeProvider, Millis, OnBranchLifecycle, RecoveryOffsetInterface, StableListId,
 	};
 
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
@@ -48,11 +48,11 @@ pub mod pallet {
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
 
-	pub type DepositOf<T> = Deposit<BalanceOf<T>, BlockNumberFor<T>>;
+	pub type DepositOf<T> = Deposit<BalanceOf<T>, Millis>;
 
 	pub type PoolStateOf<T> = PoolState<BalanceOf<T>>;
 
-	pub type StabilityPoolConfigOf<T> = StabilityPoolConfig<BalanceOf<T>, BlockNumberFor<T>>;
+	pub type StabilityPoolConfigOf<T> = StabilityPoolConfig<BalanceOf<T>, Millis>;
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
@@ -85,6 +85,10 @@ pub mod pallet {
 				AssetId = Self::CollateralAssetId,
 				Balance = BalanceOf<Self>,
 			> + fungibles::Mutate<Self::AccountId>;
+
+		/// Time source the entry delay and the Safety-Mode withdrawal delay
+		/// are measured against.
+		type TimeProvider: Time<Moment = Millis>;
 
 		/// Branch operating-mode source of truth (point it at the vault
 		/// pallet). Frozen branches reject every value-moving pool operation
@@ -216,7 +220,7 @@ pub mod pallet {
 			stable_id: T::StableAssetId,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
-			executable_at: BlockNumberFor<T>,
+			executable_at: Millis,
 		},
 		/// Active stablecoin left the pool. `amount` is what was actually
 		/// taken, which may be less than requested.
@@ -383,7 +387,7 @@ pub mod pallet {
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		/// Supply `amount` stablecoin to the market's stability pool. The
-		/// funds queue as a pending deposit until `entry_delay_blocks` have
+		/// funds queue as a pending deposit until `entry_delay` has
 		/// passed, then activate on the next touch (or via
 		/// [`Pallet::activate_deposit`]). A second deposit merges into the
 		/// existing pending amount and restarts its delay.
