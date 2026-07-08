@@ -147,10 +147,7 @@ pub mod pallet {
 
 	/// One priced step: the vault-facing allocation (the `redeem_step`-closure
 	/// return value) plus the loop-facing outcome it implies.
-	type StepDecision<T> = (
-		Option<RedemptionAllocation<<T as frame_system::Config>::AccountId, BalanceOf<T>>>,
-		StepOutcome<BalanceOf<T>>,
-	);
+	type StepDecision<T> = (Option<RedemptionAllocation<BalanceOf<T>>>, StepOutcome<BalanceOf<T>>);
 
 	/// Version 0: a pallet added to a live chain starts with on-chain version 0,
 	/// so any higher declared version would demand a version-set migration.
@@ -563,9 +560,9 @@ pub mod pallet {
 				};
 				let budget = acc.remaining;
 				let mut outcome = StepOutcome::Stopped;
-				T::Vaults::redeem_step(collateral_id, stable_id, &owner, |snap| {
+				T::Vaults::redeem_step(collateral_id, stable_id, &owner, recipient, |snap| {
 					let (allocation, decision) = Self::execute_step(
-						stable_id, redeemer, recipient, &snap, price, fee_rate, budget, config,
+						stable_id, redeemer, &snap, price, fee_rate, budget, config,
 					)?;
 					outcome = decision;
 					Ok(allocation)
@@ -599,7 +596,6 @@ pub mod pallet {
 		fn execute_step(
 			stable_id: &T::StableAssetId,
 			redeemer: &T::AccountId,
-			recipient: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
 			fee_rate: FixedU128,
@@ -616,16 +612,14 @@ pub mod pallet {
 					let total_in = step.debt.saturating_add(step.fee);
 					Self::burn_redeemer_pusd(stable_id, redeemer, step.debt, total_in)?;
 					let allocation = RedemptionAllocation {
-						redeemer: recipient.clone(),
 						debt_to_cancel: step.debt,
-						collateral_to_redeemer: step.collateral_out,
-						fee_collateral_retained: Zero::zero(),
+						collateral_to_recipient: step.collateral_out,
 					};
 					Ok((Some(allocation), StepOutcome::Redeemed(step)))
 				},
-				StepAction::Recovery => Self::recovery_decision(
-					stable_id, redeemer, recipient, snap, price, budget, config,
-				),
+				StepAction::Recovery => {
+					Self::recovery_decision(stable_id, redeemer, snap, price, budget, config)
+				},
 			}
 		}
 
@@ -690,7 +684,6 @@ pub mod pallet {
 		fn recovery_decision(
 			stable_id: &T::StableAssetId,
 			redeemer: &T::AccountId,
-			recipient: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
 			budget: BalanceOf<T>,
@@ -710,7 +703,7 @@ pub mod pallet {
 				};
 				return Ok((None, StepOutcome::Recovery { step, settle_residual: true }));
 			}
-			Self::fund_recovery(stable_id, redeemer, recipient, &pricing)
+			Self::fund_recovery(stable_id, redeemer, &pricing)
 		}
 
 		/// Redeemer-funded recovery burn shared by both regimes; stops the loop —
@@ -719,7 +712,6 @@ pub mod pallet {
 		fn fund_recovery(
 			stable_id: &T::StableAssetId,
 			redeemer: &T::AccountId,
-			recipient: &T::AccountId,
 			pricing: &RecoveryPricing<BalanceOf<T>>,
 		) -> Result<StepDecision<T>, DispatchError> {
 			if pricing.debt.is_zero() {
@@ -741,10 +733,8 @@ pub mod pallet {
 				regime,
 			};
 			let allocation = RedemptionAllocation {
-				redeemer: recipient.clone(),
 				debt_to_cancel: pricing.debt,
-				collateral_to_redeemer: pricing.collateral_out,
-				fee_collateral_retained: Zero::zero(),
+				collateral_to_recipient: pricing.collateral_out,
 			};
 			Ok((Some(allocation), StepOutcome::Recovery { step, settle_residual }))
 		}
@@ -969,13 +959,15 @@ pub mod pallet {
 				else {
 					break;
 				};
-				// A touch-only step: capture the post-touch snapshot, apply nothing.
+				// A touch-only step: capture the post-touch snapshot, apply nothing,
+				// so the recipient (never paid) is irrelevant and `owner` stands in.
 				// The preview's surrounding transaction rolls the touch back.
 				let mut captured = None;
-				let touch = T::Vaults::redeem_step(collateral_id, stable_id, &owner, |snap| {
-					captured = Some(snap);
-					Ok(None)
-				});
+				let touch =
+					T::Vaults::redeem_step(collateral_id, stable_id, &owner, &owner, |snap| {
+						captured = Some(snap);
+						Ok(None)
+					});
 				let (Ok(_), Some(snap)) = (touch, captured) else { break };
 				steps = steps.saturating_add(1);
 				match Self::classify(&snap, price) {
@@ -1087,8 +1079,10 @@ pub mod pallet {
 				return Ok(RecoveryOffsetQuote::NoTarget);
 			}
 			let (config, price) = Self::offset_preamble(collateral_id, stable_id)?;
+			// Touch-only, so the recipient (never paid) is irrelevant and `owner`
+			// stands in.
 			let mut captured = None;
-			T::Vaults::redeem_step(collateral_id, stable_id, &owner, |snap| {
+			T::Vaults::redeem_step(collateral_id, stable_id, &owner, &owner, |snap| {
 				captured = Some(snap);
 				Ok(None)
 			})?;
@@ -1142,28 +1136,32 @@ pub mod pallet {
 			let (config, price) = Self::offset_preamble(collateral_id, stable_id)?;
 
 			let mut outcome = None;
-			T::Vaults::redeem_step(collateral_id, stable_id, &owner, |snap| {
-				let pricing =
-					Self::price_recovery(stable_id, &snap, price, max_debt_to_cancel, &config)
-						.ok_or(Error::<T>::NoRecoveryTarget)?;
-				ensure!(pricing.split.is_none(), Error::<T>::RecoveryOffsetBelowPar);
-				ensure!(!pricing.debt.is_zero(), Error::<T>::NoRecoveryTarget);
-				// The same burn as a recovery redemption with a zero fee
-				// portion: offsets are fee-free settlement. A drained head
-				// flips to Dormant inside the vault step itself.
-				Self::burn_redeemer_pusd(stable_id, payer, pricing.debt, pricing.debt)?;
-				outcome = Some(RecoveryOffsetOutcome {
-					vault_owner: owner.clone(),
-					debt_cancelled: pricing.debt,
-					collateral_out: pricing.collateral_out,
-				});
-				Ok(Some(RedemptionAllocation {
-					redeemer: collateral_recipient.clone(),
-					debt_to_cancel: pricing.debt,
-					collateral_to_redeemer: pricing.collateral_out,
-					fee_collateral_retained: Zero::zero(),
-				}))
-			})?;
+			T::Vaults::redeem_step(
+				collateral_id,
+				stable_id,
+				&owner,
+				collateral_recipient,
+				|snap| {
+					let pricing =
+						Self::price_recovery(stable_id, &snap, price, max_debt_to_cancel, &config)
+							.ok_or(Error::<T>::NoRecoveryTarget)?;
+					ensure!(pricing.split.is_none(), Error::<T>::RecoveryOffsetBelowPar);
+					ensure!(!pricing.debt.is_zero(), Error::<T>::NoRecoveryTarget);
+					// The same burn as a recovery redemption with a zero fee
+					// portion: offsets are fee-free settlement. A drained head
+					// flips to Dormant inside the vault step itself.
+					Self::burn_redeemer_pusd(stable_id, payer, pricing.debt, pricing.debt)?;
+					outcome = Some(RecoveryOffsetOutcome {
+						vault_owner: owner.clone(),
+						debt_cancelled: pricing.debt,
+						collateral_out: pricing.collateral_out,
+					});
+					Ok(Some(RedemptionAllocation {
+						debt_to_cancel: pricing.debt,
+						collateral_to_recipient: pricing.collateral_out,
+					}))
+				},
+			)?;
 			// The closure always sets the outcome before returning an
 			// allocation; reaching here without one is a vault-side breach.
 			outcome.ok_or_else(|| Error::<T>::NoRecoveryTarget.into())
