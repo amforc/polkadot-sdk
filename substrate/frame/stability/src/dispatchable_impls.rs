@@ -567,8 +567,7 @@ impl<T: Config> Pallet<T> {
 		let mut collateral_credited = BalanceOf::<T>::zero();
 		let mut iterations: u32 = 0;
 
-		// Bounded by `cap <= MaxPendingOffsetIterations` (`integrity_test`
-		// asserts the constant is nonzero).
+		// Bounded by `cap <= MaxPendingOffsetIterations`
 		while iterations < cap {
 			if debt_left.is_zero() {
 				break;
