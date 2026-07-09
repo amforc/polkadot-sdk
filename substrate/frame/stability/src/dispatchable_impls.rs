@@ -2,8 +2,7 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, CollateralCreditOf, Config, DepositOf, Deposits, Error, Event, Pallet,
-		PoolStateOf, PoolStates, PoolSumsStore, StabilityPoolConfigOf, StabilityPoolConfigs,
-		StableCreditOf,
+		PoolStateOf, PoolSumsStore, Pools, StabilityPoolConfigOf, StabilityPoolOf, StableCreditOf,
 	},
 	pending,
 	types::{
@@ -51,17 +50,15 @@ struct PendingStep<Balance> {
 }
 
 impl<T: Config> Pallet<T> {
-	/// The shared entry-point prologue: a branch is registered iff both its
-	/// state and config rows exist.
-	fn load_branch(
+	/// The shared entry-point prologue: a branch is registered iff its pool
+	/// row exists.
+	fn load_pool(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-	) -> Result<(PoolStateOf<T>, StabilityPoolConfigOf<T>), DispatchError> {
-		let state = PoolStates::<T>::get(collateral_id, stable_id)
-			.ok_or(Error::<T>::BranchNotRegistered)?;
-		let config = StabilityPoolConfigs::<T>::get(collateral_id, stable_id)
-			.ok_or(Error::<T>::BranchNotRegistered)?;
-		Ok((state, config))
+	) -> Result<StabilityPoolOf<T>, DispatchError> {
+		let pool =
+			Pools::<T>::get(collateral_id, stable_id).ok_or(Error::<T>::BranchNotRegistered)?;
+		Ok(pool)
 	}
 
 	/// The realization pair every value-moving entry point runs before its own
@@ -72,13 +69,12 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		who: &T::AccountId,
-		state: &mut PoolStateOf<T>,
-		config: &StabilityPoolConfigOf<T>,
+		pool: &mut StabilityPoolOf<T>,
 		deposit: &mut DepositOf<T>,
 		now: Millis,
 	) -> Result<bool, DispatchError> {
-		Self::realize_deposit(collateral_id, stable_id, state, config, deposit)?;
-		Self::activate_matured_pending(collateral_id, stable_id, who, state, deposit, now)
+		Self::realize_deposit(collateral_id, stable_id, pool, deposit)?;
+		Self::activate_matured_pending(collateral_id, stable_id, who, &mut pool.state, deposit, now)
 	}
 
 	/// SPEC.md §6.6: realize, activate any matured pending deposit, attempt
@@ -90,21 +86,14 @@ impl<T: Config> Pallet<T> {
 		stable_id: T::StableAssetId,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
-		let (mut state, config) = Self::load_branch(&collateral_id, &stable_id)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
-		ensure!(amount >= config.minimum_deposit, Error::<T>::DepositTooSmall);
+		ensure!(amount >= pool.config.minimum_deposit, Error::<T>::DepositTooSmall);
 
 		let now = T::TimeProvider::now();
-		let mut deposit = Self::load_or_fresh_deposit(&collateral_id, &stable_id, &who, &state);
-		Self::realize_and_activate(
-			&collateral_id,
-			&stable_id,
-			&who,
-			&mut state,
-			&config,
-			&mut deposit,
-			now,
-		)?;
+		let mut deposit =
+			Self::load_or_fresh_deposit(&collateral_id, &stable_id, &who, &pool.state);
+		Self::realize_and_activate(&collateral_id, &stable_id, &who, &mut pool, &mut deposit, now)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
 		let used_for_recovery = Self::try_incoming_recovery(
@@ -112,7 +101,7 @@ impl<T: Config> Pallet<T> {
 			&stable_id,
 			&who,
 			&pool_account,
-			&mut state,
+			&mut pool.state,
 			&mut deposit,
 			amount,
 		)?;
@@ -127,7 +116,7 @@ impl<T: Config> Pallet<T> {
 				pending_amount,
 				Preservation::Expendable,
 			)?;
-			let activatable_at = now.saturating_add(config.entry_delay);
+			let activatable_at = now.saturating_add(pool.config.entry_delay);
 			match deposit.pending_deposit.as_mut() {
 				Some(pending) => {
 					// Merging a top-up resets the whole pending amount's
@@ -148,7 +137,8 @@ impl<T: Config> Pallet<T> {
 					pending::append::<T>(&fifo, who.clone())?;
 				},
 			}
-			state.total_pending_deposits = state
+			pool.state.total_pending_deposits = pool
+				.state
 				.total_pending_deposits
 				.checked_add(&pending_amount)
 				.ok_or(ArithmeticError::Overflow)?;
@@ -158,7 +148,7 @@ impl<T: Config> Pallet<T> {
 		// collateral credit on the row (or, if that floored to zero,
 		// nothing at all).
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
-		PoolStates::<T>::insert(&collateral_id, &stable_id, state);
+		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(Event::DepositReceived {
 			collateral_id,
 			stable_id,
@@ -235,7 +225,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: T::StableAssetId,
 		max_stable_in: BalanceOf<T>,
 	) -> DispatchResult {
-		let (mut state, config) = Self::load_branch(&collateral_id, &stable_id)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		// Recovery offsets are settlement operations: allowed in Safety
 		// Mode, halted only by Frozen.
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
@@ -255,8 +245,8 @@ impl<T: Config> Pallet<T> {
 		// floor cap what the settlement may take.
 		let debt = math::clamp_offset_debt(
 			max_stable_in.min(capacity),
-			state.total_active_deposits,
-			config.minimum_active_pool_balance,
+			pool.state.total_active_deposits,
+			pool.config.minimum_active_pool_balance,
 		);
 		ensure!(!debt.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
 
@@ -275,12 +265,11 @@ impl<T: Config> Pallet<T> {
 		Self::apply_active_offset(
 			&collateral_id,
 			&stable_id,
-			&mut state,
-			&config,
+			&mut pool,
 			outcome.debt_cancelled,
 			outcome.collateral_out,
 		)?;
-		PoolStates::<T>::insert(&collateral_id, &stable_id, state);
+		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(Event::RecoveryOffsetApplied {
 			collateral_id,
 			stable_id,
@@ -297,7 +286,7 @@ impl<T: Config> Pallet<T> {
 		collateral_id: T::CollateralAssetId,
 		stable_id: T::StableAssetId,
 	) -> DispatchResult {
-		let (mut state, config) = Self::load_branch(&collateral_id, &stable_id)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
@@ -305,19 +294,11 @@ impl<T: Config> Pallet<T> {
 		let now = T::TimeProvider::now();
 		ensure!(now >= pending.activatable_at, Error::<T>::PendingDepositNotMatured);
 
-		Self::realize_and_activate(
-			&collateral_id,
-			&stable_id,
-			&who,
-			&mut state,
-			&config,
-			&mut deposit,
-			now,
-		)?;
+		Self::realize_and_activate(&collateral_id, &stable_id, &who, &mut pool, &mut deposit, now)?;
 		debug_assert!(deposit.pending_deposit.is_none());
 
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
-		PoolStates::<T>::insert(&collateral_id, &stable_id, state);
+		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Ok(())
 	}
 
@@ -332,7 +313,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: T::StableAssetId,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
-		let (mut state, config) = Self::load_branch(&collateral_id, &stable_id)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
@@ -343,20 +324,19 @@ impl<T: Config> Pallet<T> {
 			&collateral_id,
 			&stable_id,
 			&who,
-			&mut state,
-			&config,
+			&mut pool,
 			&mut deposit,
 			now,
 		)?;
 
-		let executable_at = now.saturating_add(config.safety_withdrawal_delay);
+		let executable_at = now.saturating_add(pool.config.safety_withdrawal_delay);
 		deposit.withdrawal_request = Some(WithdrawalRequest { amount, executable_at });
 
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
-		// Requests live on the row; the pool state only changed if a pending
+		// Requests live on the row; the pool row only changed if a pending
 		// deposit activated along the way.
 		if activated {
-			PoolStates::<T>::insert(&collateral_id, &stable_id, state);
+			Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		}
 		Self::deposit_event(Event::WithdrawalRequested {
 			collateral_id,
@@ -377,20 +357,12 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 		recipient: T::AccountId,
 	) -> DispatchResult {
-		let (mut state, config) = Self::load_branch(&collateral_id, &stable_id)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
 
 		let now = T::TimeProvider::now();
-		Self::realize_and_activate(
-			&collateral_id,
-			&stable_id,
-			&who,
-			&mut state,
-			&config,
-			&mut deposit,
-			now,
-		)?;
+		Self::realize_and_activate(&collateral_id, &stable_id, &who, &mut pool, &mut deposit, now)?;
 
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let take = Self::resolve_withdrawal(mode, now, amount, &mut deposit)?;
@@ -400,7 +372,8 @@ impl<T: Config> Pallet<T> {
 		// which flooring keeps at or below the pool aggregate.
 		deposit.active_deposit =
 			deposit.active_deposit.checked_sub(&take).ok_or(ArithmeticError::Underflow)?;
-		state.total_active_deposits = state
+		pool.state.total_active_deposits = pool
+			.state
 			.total_active_deposits
 			.checked_sub(&take)
 			.ok_or(ArithmeticError::Underflow)?;
@@ -415,7 +388,7 @@ impl<T: Config> Pallet<T> {
 		)?;
 
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
-		PoolStates::<T>::insert(&collateral_id, &stable_id, state);
+		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(Event::WithdrawalExecuted {
 			collateral_id,
 			stable_id,
@@ -436,7 +409,7 @@ impl<T: Config> Pallet<T> {
 		recipient: T::AccountId,
 		kind: ClaimKind,
 	) -> DispatchResult {
-		let (mut state, config) = Self::load_branch(&collateral_id, &stable_id)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
@@ -445,8 +418,7 @@ impl<T: Config> Pallet<T> {
 			&collateral_id,
 			&stable_id,
 			&who,
-			&mut state,
-			&config,
+			&mut pool,
 			&mut deposit,
 			T::TimeProvider::now(),
 		)?;
@@ -459,7 +431,8 @@ impl<T: Config> Pallet<T> {
 				let amount = deposit.claimable_collateral;
 				ensure!(!amount.is_zero(), Error::<T>::NoClaimableCollateral);
 				deposit.claimable_collateral = BalanceOf::<T>::zero();
-				state.total_collateral_gains_unclaimed = state
+				pool.state.total_collateral_gains_unclaimed = pool
+					.state
 					.total_collateral_gains_unclaimed
 					.checked_sub(&amount)
 					.ok_or(ArithmeticError::Underflow)?;
@@ -476,7 +449,8 @@ impl<T: Config> Pallet<T> {
 				let amount = deposit.claimable_yield;
 				ensure!(!amount.is_zero(), Error::<T>::NoClaimableYield);
 				deposit.claimable_yield = BalanceOf::<T>::zero();
-				state.total_yield_unclaimed = state
+				pool.state.total_yield_unclaimed = pool
+					.state
 					.total_yield_unclaimed
 					.checked_sub(&amount)
 					.ok_or(ArithmeticError::Underflow)?;
@@ -492,7 +466,7 @@ impl<T: Config> Pallet<T> {
 		};
 
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
-		PoolStates::<T>::insert(&collateral_id, &stable_id, state);
+		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(match kind {
 			ClaimKind::Collateral => Event::CollateralClaimed {
 				collateral_id,
@@ -521,7 +495,7 @@ impl<T: Config> Pallet<T> {
 		max_debt_to_offset: BalanceOf<T>,
 		collateral: CollateralCreditOf<T>,
 	) -> (PoolOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
-		let Ok((mut state, config)) = Self::load_branch(collateral_id, stable_id) else {
+		let Ok(mut pool) = Self::load_pool(collateral_id, stable_id) else {
 			return (PoolOffsetResult::zero(), collateral);
 		};
 		// Defense in depth: the vault engine already refuses to liquidate
@@ -532,8 +506,8 @@ impl<T: Config> Pallet<T> {
 
 		let sp_offset_debt = math::clamp_offset_debt(
 			max_debt_to_offset,
-			state.total_active_deposits,
-			config.minimum_active_pool_balance,
+			pool.state.total_active_deposits,
+			pool.config.minimum_active_pool_balance,
 		);
 		if sp_offset_debt.is_zero() {
 			return (PoolOffsetResult::zero(), collateral);
@@ -543,8 +517,7 @@ impl<T: Config> Pallet<T> {
 		let Ok(plan) = Self::plan_active_offset(
 			collateral_id,
 			stable_id,
-			&state,
-			&config,
+			&pool,
 			sp_offset_debt,
 			sp_offset_collateral,
 		) else {
@@ -566,16 +539,16 @@ impl<T: Config> Pallet<T> {
 			Err(remainder) => return (PoolOffsetResult::zero(), remainder),
 		};
 
-		Self::commit_active_offset(collateral_id, stable_id, &mut state, plan);
+		Self::commit_active_offset(collateral_id, stable_id, &mut pool.state, plan);
 		Self::deposit_event(Event::PoolOffsetApplied {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
 			debt_burned: sp_offset_debt,
 			collateral_gain: sp_offset_collateral,
-			epoch: state.coords.epoch,
-			scale: state.coords.scale,
+			epoch: pool.state.coords.epoch,
+			scale: pool.state.coords.scale,
 		});
-		PoolStates::<T>::insert(collateral_id, stable_id, state);
+		Pools::<T>::insert(collateral_id, stable_id, pool);
 		(
 			PoolOffsetResult {
 				debt_offset: sp_offset_debt,
@@ -599,7 +572,7 @@ impl<T: Config> Pallet<T> {
 		max_pending_iterations: u32,
 		mut collateral: CollateralCreditOf<T>,
 	) -> (PendingOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
-		let Some(mut state) = PoolStates::<T>::get(collateral_id, stable_id) else {
+		let Some(mut pool) = Pools::<T>::get(collateral_id, stable_id) else {
 			return (PendingOffsetResult::zero(remaining_debt), collateral);
 		};
 		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
@@ -630,7 +603,7 @@ impl<T: Config> Pallet<T> {
 				&fifo,
 				&pool_account,
 				&oldest,
-				&mut state,
+				&mut pool.state,
 				debt_left,
 				collateral,
 			);
@@ -645,7 +618,7 @@ impl<T: Config> Pallet<T> {
 		}
 
 		if !debt_burned.is_zero() {
-			PoolStates::<T>::insert(collateral_id, stable_id, state);
+			Pools::<T>::insert(collateral_id, stable_id, pool);
 			Self::deposit_event(Event::PendingDepositOffsetApplied {
 				collateral_id: collateral_id.clone(),
 				stable_id: stable_id.clone(),
@@ -752,22 +725,16 @@ impl<T: Config> Pallet<T> {
 	fn plan_active_offset(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-		state: &PoolStateOf<T>,
-		config: &StabilityPoolConfigOf<T>,
+		pool: &StabilityPoolOf<T>,
 		debt: BalanceOf<T>,
 		collateral: BalanceOf<T>,
 	) -> Result<ActiveOffsetPlan<BalanceOf<T>>, DispatchError> {
+		let state = &pool.state;
 		debug_assert!(!debt.is_zero());
 		debug_assert!(debt <= state.total_active_deposits);
 
 		let delta_s = state.delta_sum(collateral).ok_or(ArithmeticError::Overflow)?;
-		let mut new_sums = PoolSumsStore::<T>::get((
-			collateral_id,
-			stable_id,
-			state.coords.epoch,
-			state.coords.scale,
-		))
-		.unwrap_or_default();
+		let mut new_sums = Self::sums_at(collateral_id, stable_id, &state.coords);
 		new_sums.s_collateral =
 			new_sums.s_collateral.checked_add(&delta_s).ok_or(ArithmeticError::Overflow)?;
 		let new_unclaimed = state
@@ -779,7 +746,7 @@ impl<T: Config> Pallet<T> {
 			state.coords.p,
 			state.total_active_deposits,
 			debt,
-			&config.precision,
+			&pool.config.precision,
 		)
 		.ok_or(Error::<T>::UnsupportedOffsetPrecision)?;
 		let (new_coords, new_total_active) = match update {
@@ -849,14 +816,12 @@ impl<T: Config> Pallet<T> {
 	fn apply_active_offset(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-		state: &mut PoolStateOf<T>,
-		config: &StabilityPoolConfigOf<T>,
+		pool: &mut StabilityPoolOf<T>,
 		debt: BalanceOf<T>,
 		collateral: BalanceOf<T>,
 	) -> DispatchResult {
-		let plan =
-			Self::plan_active_offset(collateral_id, stable_id, state, config, debt, collateral)?;
-		Self::commit_active_offset(collateral_id, stable_id, state, plan);
+		let plan = Self::plan_active_offset(collateral_id, stable_id, pool, debt, collateral)?;
+		Self::commit_active_offset(collateral_id, stable_id, &mut pool.state, plan);
 		Ok(())
 	}
 
@@ -962,25 +927,24 @@ impl<T: Config> Pallet<T> {
 
 	/// SPEC.md §6.3: distribute same-stablecoin yield to active depositors
 	/// through `G`, returning whatever could not be distributed — the whole
-	/// credit when the branch is unknown, the active pool is empty, or the
+	/// credit when the active pool is empty, the branch is frozen, or the
 	/// deposit into the pool account fails — so the caller routes the
 	/// remainder to its fee destination. Infallible by design: this runs on
 	/// the vault engine's commit paths, which must not fail over yield
 	/// routing. The vault engine reaches it through the `OnBranchYield`
-	/// impl (`interfaces.rs`), which takes the `yield_share` cut first.
+	/// impl (`interfaces.rs`), which loads `pool`, takes the `yield_share`
+	/// cut, and hands the row down so the branch is read once.
 	pub(crate) fn do_distribute_yield(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
+		mut pool: StabilityPoolOf<T>,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
 		let amount = credit.peek();
 		if amount.is_zero() {
 			return credit;
 		}
-		let Some(mut state) = PoolStates::<T>::get(collateral_id, stable_id) else {
-			return credit;
-		};
-		if state.total_active_deposits.is_zero() {
+		if pool.state.total_active_deposits.is_zero() {
 			return credit;
 		}
 		// A frozen (or mode-unreadable) branch takes no yield; the caller
@@ -992,20 +956,14 @@ impl<T: Config> Pallet<T> {
 
 		// Every fallible step runs before the credit is consumed; after
 		// `resolve` succeeds only plain writes remain.
-		let Some(delta_g) = state.delta_sum(amount) else {
+		let Some(delta_g) = pool.state.delta_sum(amount) else {
 			return credit;
 		};
-		let mut sums = PoolSumsStore::<T>::get((
-			collateral_id,
-			stable_id,
-			state.coords.epoch,
-			state.coords.scale,
-		))
-		.unwrap_or_default();
+		let mut sums = Self::sums_at(collateral_id, stable_id, &pool.state.coords);
 		let Some(new_g) = sums.g_yield.checked_add(&delta_g) else {
 			return credit;
 		};
-		let Some(new_total_yield) = state.total_yield_unclaimed.checked_add(&amount) else {
+		let Some(new_total_yield) = pool.state.total_yield_unclaimed.checked_add(&amount) else {
 			return credit;
 		};
 
@@ -1017,11 +975,11 @@ impl<T: Config> Pallet<T> {
 
 		sums.g_yield = new_g;
 		PoolSumsStore::<T>::insert(
-			(collateral_id, stable_id, state.coords.epoch, state.coords.scale),
+			(collateral_id, stable_id, pool.state.coords.epoch, pool.state.coords.scale),
 			sums,
 		);
-		state.total_yield_unclaimed = new_total_yield;
-		PoolStates::<T>::insert(collateral_id, stable_id, state);
+		pool.state.total_yield_unclaimed = new_total_yield;
+		Pools::<T>::insert(collateral_id, stable_id, pool);
 		Self::deposit_event(Event::YieldDistributed {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
@@ -1041,7 +999,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: T::StableAssetId,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
-		let (mut state, config) = Self::load_branch(&collateral_id, &stable_id)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
@@ -1050,8 +1008,7 @@ impl<T: Config> Pallet<T> {
 			&collateral_id,
 			&stable_id,
 			&who,
-			&mut state,
-			&config,
+			&mut pool,
 			&mut deposit,
 			T::TimeProvider::now(),
 		)?;
@@ -1062,18 +1019,20 @@ impl<T: Config> Pallet<T> {
 			deposit.claimable_yield.checked_sub(&take).ok_or(ArithmeticError::Underflow)?;
 		deposit.active_deposit =
 			deposit.active_deposit.checked_add(&take).ok_or(ArithmeticError::Overflow)?;
-		state.total_active_deposits = state
+		pool.state.total_active_deposits = pool
+			.state
 			.total_active_deposits
 			.checked_add(&take)
 			.ok_or(ArithmeticError::Overflow)?;
 		// An underflow would mean a claimable exceeding the tracked total.
-		state.total_yield_unclaimed = state
+		pool.state.total_yield_unclaimed = pool
+			.state
 			.total_yield_unclaimed
 			.checked_sub(&take)
 			.ok_or(ArithmeticError::Underflow)?;
 
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
-		PoolStates::<T>::insert(&collateral_id, &stable_id, state);
+		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(Event::YieldCompounded {
 			collateral_id,
 			stable_id,
@@ -1094,11 +1053,11 @@ impl<T: Config> Pallet<T> {
 		collateral_id: T::CollateralAssetId,
 		stable_id: T::StableAssetId,
 	) -> DispatchResult {
-		let (state, config) = Self::load_branch(&collateral_id, &stable_id)?;
+		let pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &owner))
 			.ok_or(Error::<T>::DepositNotFound)?;
 
-		Self::realize_deposit(&collateral_id, &stable_id, &state, &config, &mut deposit)?;
+		Self::realize_deposit(&collateral_id, &stable_id, &pool, &mut deposit)?;
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &owner, deposit);
 		Ok(())
 	}
@@ -1154,18 +1113,12 @@ impl<T: Config> Pallet<T> {
 	fn realize_deposit(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-		state: &PoolStateOf<T>,
-		config: &StabilityPoolConfigOf<T>,
+		pool: &StabilityPoolOf<T>,
 		deposit: &mut DepositOf<T>,
 	) -> DispatchResult {
+		let state = &pool.state;
 		let snapshot = deposit.snapshot;
-		let current = PoolSumsStore::<T>::get((
-			collateral_id,
-			stable_id,
-			state.coords.epoch,
-			state.coords.scale,
-		))
-		.unwrap_or_default();
+		let current = Self::sums_at(collateral_id, stable_id, &state.coords);
 		// A snapshot already at the live coordinates realizes against the
 		// current row alone — no row above the live scale can exist — which
 		// makes the snapshot-reset read below cover the whole window.
@@ -1181,7 +1134,7 @@ impl<T: Config> Pallet<T> {
 			&snapshot,
 			&state.coords,
 			&window,
-			&config.precision,
+			&pool.config.precision,
 		);
 		debug_assert!(realized.compounded <= deposit.active_deposit);
 
@@ -1254,13 +1207,7 @@ impl<T: Config> Pallet<T> {
 		state: &PoolStateOf<T>,
 	) -> DepositOf<T> {
 		Deposits::<T>::get((collateral_id, stable_id, who)).unwrap_or_else(|| {
-			let current = PoolSumsStore::<T>::get((
-				collateral_id,
-				stable_id,
-				state.coords.epoch,
-				state.coords.scale,
-			))
-			.unwrap_or_default();
+			let current = Self::sums_at(collateral_id, stable_id, &state.coords);
 			Deposit::fresh(state.snapshot(&current))
 		})
 	}
@@ -1271,11 +1218,11 @@ impl<T: Config> Pallet<T> {
 		stable_id: T::StableAssetId,
 		config: StabilityPoolConfigOf<T>,
 	) -> DispatchResult {
-		let existing = StabilityPoolConfigs::<T>::get(&collateral_id, &stable_id)
-			.ok_or(Error::<T>::BranchNotRegistered)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
-		ensure!(config.precision == existing.precision, Error::<T>::AccumulatorParamsImmutable);
-		StabilityPoolConfigs::<T>::insert(&collateral_id, &stable_id, config);
+		ensure!(config.precision == pool.config.precision, Error::<T>::AccumulatorParamsImmutable);
+		pool.config = config;
+		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(Event::StabilityPoolConfigUpdated { collateral_id, stable_id });
 		Ok(())
 	}
@@ -1294,29 +1241,36 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
+	/// The sums row at `coords`; an absent row reads as zero,
+	/// which floors gains instead of overpaying them.
+	pub(crate) fn sums_at(
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
+		coords: &Accumulators,
+	) -> PoolSums {
+		PoolSumsStore::<T>::get((collateral_id, stable_id, coords.epoch, coords.scale))
+	}
+
 	/// The sums rows a snapshot realizes against: its own `(epoch, scale)`
 	/// row plus the [`math::SCALE_SPAN`] scales after it. Rows are seeded
-	/// contiguously per epoch, so reading stops at the first gap; missing
-	/// rows read as zero, which floors gains instead of overpaying them.
+	/// contiguously per epoch, so reading stops at the first gap (`try_get`
+	/// keeps absence observable through the `ValueQuery`).
 	pub(crate) fn sums_window(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		snapshot: &DepositSnapshot,
 	) -> SumsWindow {
-		let snap = PoolSumsStore::<T>::get((
-			collateral_id,
-			stable_id,
-			snapshot.coords.epoch,
-			snapshot.coords.scale,
-		))
-		.unwrap_or_default();
+		let snap = Self::sums_at(collateral_id, stable_id, &snapshot.coords);
 		let mut ahead = [PoolSums::default(); math::SCALE_SPAN as usize];
 		let mut scale = snapshot.coords.scale;
 		for slot in &mut ahead {
 			scale = scale.saturating_add(1);
-			let Some(sums) =
-				PoolSumsStore::<T>::get((collateral_id, stable_id, snapshot.coords.epoch, scale))
-			else {
+			let Ok(sums) = PoolSumsStore::<T>::try_get((
+				collateral_id,
+				stable_id,
+				snapshot.coords.epoch,
+				scale,
+			)) else {
 				break;
 			};
 			*slot = sums;

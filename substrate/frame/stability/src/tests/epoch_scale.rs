@@ -37,9 +37,10 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		assert_eq!(state.total_active_deposits, 0);
 		// The new epoch's sums row is seeded; the old one keeps the gains:
 		// delta_S = floor(800 * 1e18 / 1000) = 8e17.
-		let old = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("kept");
+		let old = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 		assert_eq!(old.s_collateral, FixedU128::from_inner(800_000_000_000_000_000));
-		let fresh = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 1u32, 0u32)).expect("seeded");
+		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 1u32, 0u32)));
+		let fresh = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 1u32, 0u32));
 		assert_eq!(fresh.s_collateral, FixedU128::zero());
 
 		// Old-epoch depositors realize to zero active but keep their epoch's
