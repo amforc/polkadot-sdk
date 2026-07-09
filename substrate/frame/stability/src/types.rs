@@ -1,12 +1,166 @@
-//! Storage types for `pallet-stability`.
+//! Data types for `pallet-stability`.
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::arithmetic::{FixedPointOperand, FixedU128, One, Permill, Zero};
+use frame::arithmetic::{
+	FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Saturating, Zero,
+};
 use pusd_primitives::Millis;
 use scale_info::TypeInfo;
 
 use crate::math;
-pub use crate::math::{DepositSnapshot, PoolPrecision, PoolSums};
+
+/// Live product-sum coordinates of a pool. Embedded verbatim in every encoded
+/// [`DepositSnapshot`] and [`PoolState`], hence the codec derives.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
+pub struct Accumulators {
+	pub p: FixedU128,
+	pub epoch: u32,
+	pub scale: u32,
+}
+
+impl Accumulators {
+	/// The genesis coordinates a fresh pool hands out: `P = 1`, epoch and
+	/// scale 0. Realization against these is the identity.
+	pub fn fresh() -> Self {
+		Self { p: FixedU128::one(), epoch: 0, scale: 0 }
+	}
+}
+
+/// `S` and `G` for one `(epoch, scale)` coordinate (SPEC.md §5.2).
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+	Default,
+)]
+pub struct PoolSums {
+	pub s_collateral: FixedU128,
+	pub g_yield: FixedU128,
+}
+
+/// A deposit's stored snapshot at its last realization: the accumulator
+/// coordinates ([`Accumulators`]) plus the `(epoch, scale)` sums row they point
+/// at. Embedded in every [`Deposit`] storage row, hence the codec derives.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
+pub struct DepositSnapshot {
+	pub coords: Accumulators,
+	pub sums: PoolSums,
+}
+
+impl DepositSnapshot {
+	/// A fresh pool's snapshot: [`Accumulators::fresh`] coordinates and zero
+	/// sums. Realization against it is the identity.
+	pub fn fresh() -> Self {
+		Self { coords: Accumulators::fresh(), sums: PoolSums::default() }
+	}
+}
+
+/// Gain sums a deposit realizes against: the row at its snapshot
+/// `(epoch, scale)` plus the [`SCALE_SPAN`](math::SCALE_SPAN) rows after it
+/// (zero when absent).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SumsWindow {
+	pub snap: PoolSums,
+	pub ahead: [PoolSums; math::SCALE_SPAN as usize],
+}
+
+/// Accumulator precision parameters from [`StabilityPoolConfig`]. Immutable
+/// per branch: historical snapshots realize against the `scale_factor` that
+/// was live when their scale was crossed, so changing it would misprice
+/// every deposit left behind a scale boundary.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
+pub struct PoolPrecision {
+	pub p_min: FixedU128,
+	// TODO: Check visibility
+	pub scale_factor: u64,
+}
+
+impl PoolPrecision {
+	/// Out-of-range parameters break product-sum accounting: `scale_factor`
+	/// must lie in `[SCALE_FACTOR_INT_MIN, SCALE_FACTOR_INT_MAX]`, and a
+	/// rescale must land `P` back at or below one: `p_min * scale_factor <= 1`.
+	pub fn is_valid(&self) -> bool {
+		if self.p_min.is_zero() {
+			return false;
+		}
+		if self.scale_factor < math::SCALE_FACTOR_INT_MIN {
+			return false;
+		}
+		if self.scale_factor > math::SCALE_FACTOR_INT_MAX {
+			return false;
+		}
+		self.p_min.saturating_mul(FixedU128::saturating_from_integer(self.scale_factor)) <=
+			FixedU128::one()
+	}
+
+	/// `scale_factor` widened for the u128 accumulator math, floored at 1 as a
+	/// guard against a decoded zero dividing by zero in the gain division.
+	pub fn scale_factor(&self) -> u128 {
+		debug_assert!(self.scale_factor >= math::SCALE_FACTOR_INT_MIN);
+		debug_assert!(self.scale_factor <= math::SCALE_FACTOR_INT_MAX);
+		u128::from(self.scale_factor).max(1)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn set_scale_factor(&mut self, scale_factor: u64) {
+		self.scale_factor = scale_factor;
+	}
+}
+
+/// Outcome of realizing a deposit against the current accumulators.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Realized<Balance> {
+	pub compounded: Balance,
+	pub collateral_gain: Balance,
+	pub yield_gain: Balance,
+}
+
+/// Outcome of shrinking `P` after an active-pool offset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PUpdate {
+	Updated { new_p: FixedU128, scales_crossed: u32 },
+	Depleted,
+}
 
 /// Per-branch depositor state (SPEC.md §5.1).
 ///
@@ -90,44 +244,38 @@ pub struct WithdrawalRequest<Balance> {
 pub struct PoolState<Balance> {
 	pub total_active_deposits: Balance,
 	pub total_pending_deposits: Balance,
-
-	pub p: FixedU128,
-	pub epoch: u32,
-	pub scale: u32,
-
+	pub coords: Accumulators,
 	pub total_collateral_gains_unclaimed: Balance,
 	pub total_yield_unclaimed: Balance,
 }
 
-impl<Balance: FixedPointOperand> PoolState<Balance> {
+impl<Balance> PoolState<Balance> {
+	/// The deposit snapshot at the pool's current coordinates; `sums` is the
+	/// live `(epoch, scale)` sums row.
+	pub fn snapshot(&self, sums: &PoolSums) -> DepositSnapshot {
+		DepositSnapshot { coords: self.coords, sums: *sums }
+	}
+}
+
+impl<Balance: Zero> PoolState<Balance> {
 	/// State seeded at branch registration: empty pool at `P = 1`,
 	/// epoch 0, scale 0.
 	pub fn fresh() -> Self {
 		Self {
 			total_active_deposits: Balance::zero(),
 			total_pending_deposits: Balance::zero(),
-			p: FixedU128::one(),
-			epoch: 0,
-			scale: 0,
+			coords: Accumulators::fresh(),
 			total_collateral_gains_unclaimed: Balance::zero(),
 			total_yield_unclaimed: Balance::zero(),
 		}
 	}
+}
 
-	pub fn accumulators(&self) -> math::Accumulators {
-		math::Accumulators { p: self.p, epoch: self.epoch, scale: self.scale }
-	}
-
-	/// The deposit snapshot at the pool's current coordinates; `sums` is the
-	/// live `(epoch, scale)` sums row.
-	pub fn snapshot(&self, sums: &PoolSums) -> DepositSnapshot {
-		DepositSnapshot { p: self.p, sums: *sums, epoch: self.epoch, scale: self.scale }
-	}
-
+impl<Balance: FixedPointOperand> PoolState<Balance> {
 	/// `S`/`G` delta for distributing `distributed` over the active pool
 	/// (SPEC.md §6.3); `None` when the pool is empty or the product overflows.
 	pub fn delta_sum(&self, distributed: Balance) -> Option<FixedU128> {
-		math::delta_sum(distributed, self.p, self.total_active_deposits)
+		math::delta_sum(distributed, self.coords.p, self.total_active_deposits)
 	}
 }
 
@@ -249,9 +397,9 @@ mod tests {
 	#[test]
 	fn fresh_pool_state_starts_at_p_one_epoch_zero() {
 		let state = PoolState::<u128>::fresh();
-		assert_eq!(state.p, FixedU128::one());
-		assert_eq!(state.epoch, 0);
-		assert_eq!(state.scale, 0);
+		assert_eq!(state.coords.p, FixedU128::one());
+		assert_eq!(state.coords.epoch, 0);
+		assert_eq!(state.coords.scale, 0);
 		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(state.total_pending_deposits, 0);
 	}

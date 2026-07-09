@@ -19,7 +19,7 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 500);
 		// P = 1 * (1000 - 500) / 1000 = 0.5.
-		assert_eq!(state.p, FixedU128::from_rational(1, 2));
+		assert_eq!(state.coords.p, FixedU128::from_rational(1, 2));
 		assert_eq!(state.total_collateral_gains_unclaimed, 450);
 		// delta_S = floor(450 * 1e18 / 1000) = 4.5e17.
 		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("row");
@@ -86,9 +86,9 @@ fn offset_clamps_at_the_floor_then_only_depletion_passes() {
 		assert_eq!(result.debt_offset, 100);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.epoch, 1);
-		assert_eq!(state.scale, 0);
-		assert_eq!(state.p, FixedU128::one());
+		assert_eq!(state.coords.epoch, 1);
+		assert_eq!(state.coords.scale, 0);
+		assert_eq!(state.coords.p, FixedU128::one());
 
 		// Fully depleted: nothing left to withdraw (the row still exists,
 		// carrying the unclaimed gains).
@@ -122,7 +122,7 @@ fn offset_zero_request_or_empty_pool_noops() {
 		assert_eq!(result.debt_offset, 0);
 		assert_eq!(leftover, 50);
 		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.p, FixedU128::one());
+		assert_eq!(state.coords.p, FixedU128::one());
 		assert_eq!(state.total_active_deposits, 1_000);
 	});
 }
@@ -148,7 +148,7 @@ fn sequential_offsets_compound_p() {
 		// P = 1 * (500/1000) = 0.5, then 0.5 * (300/500) = 0.3.
 		assert_eq!(simulate_offset(DOT, PUSD, 500, 0).0.debt_offset, 500);
 		assert_eq!(simulate_offset(DOT, PUSD, 200, 0).0.debt_offset, 200);
-		assert_eq!(pool_state(DOT, PUSD).p, FixedU128::from_rational(3, 10));
+		assert_eq!(pool_state(DOT, PUSD).coords.p, FixedU128::from_rational(3, 10));
 
 		// Compounded: floor(1000 * 0.3) = 300.
 		assert_ok!(withdraw(1, DOT, PUSD, 1_000, 1));
@@ -248,7 +248,7 @@ fn offset_with_sub_minimum_collateral_gain_steps_aside() {
 		assert_eq!(leftover, 500);
 		let state = pool_state(coll.clone(), PUSD);
 		assert_eq!(state.total_active_deposits, 1_000);
-		assert_eq!(state.p, FixedU128::one());
+		assert_eq!(state.coords.p, FixedU128::one());
 
 		// A gain clearing the minimum lands normally.
 		let (result, leftover) = simulate_offset(coll.clone(), PUSD, 500, 1_500);
