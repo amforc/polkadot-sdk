@@ -122,7 +122,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
-				&allocation.offset.recipient,
+				&allocation.offset.collateral_recipient,
 				allocation.offset.collateral,
 				Precision::Exact,
 				Restriction::Free,

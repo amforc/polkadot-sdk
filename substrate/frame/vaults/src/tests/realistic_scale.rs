@@ -197,7 +197,7 @@ fn liquidation_reverts_on_sub_ed_keeper_leg() {
 
 		let keeper_leg = |collateral: Balance| {
 			liquidate_with(XBT, USDX, 1, |_| LiquidationAllocation {
-				offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+				offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 				redistribution_collateral: 0,
 				keeper: KeeperCompensation { recipient: 998, collateral },
 			})

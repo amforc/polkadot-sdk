@@ -603,7 +603,7 @@ pub fn open(
 /// surface — the simplest allocation that clears the vault.
 pub fn liquidate(collateral: AssetId, stable: StableId, owner: AccountId) -> DispatchResult {
 	liquidate_with(collateral, stable, owner, |post_touch| LiquidationAllocation {
-		offset: OffsetAllocation { recipient: owner, debt: post_touch, collateral: 0 },
+		offset: OffsetAllocation { collateral_recipient: owner, debt: post_touch, collateral: 0 },
 		redistribution_collateral: 0,
 		keeper: KeeperCompensation { recipient: owner, collateral: 0 },
 	})
