@@ -7,7 +7,7 @@ use crate::{
 };
 use frame::{
 	arithmetic::{FixedU128, One, Saturating, Zero},
-	deps::frame_support::traits::fungibles::Inspect as FungiblesInspect,
+	deps::frame_support::traits::fungibles::Inspect as _,
 	try_runtime::TryRuntimeError,
 };
 use pallet_linked_list::SortedListInterface;
@@ -38,8 +38,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		// out of the pool account mirrors exactly one aggregate, and
 		// flooring dust strands inside the unclaimed totals, never outside.
 		let pool_account = Pallet::<T>::pool_account(&collateral_id, &stable_id);
-		let stable_held =
-			<T::StableAssets as FungiblesInspect<_>>::balance(stable_id.clone(), &pool_account);
+		let stable_held = T::StableAssets::balance(stable_id.clone(), &pool_account);
 		let stable_owed = state
 			.total_active_deposits
 			.saturating_add(state.total_pending_deposits)
@@ -47,10 +46,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if stable_held != stable_owed {
 			return Err("pool stablecoin balance diverges from tracked totals".into());
 		}
-		let collateral_held = <T::CollateralAssets as FungiblesInspect<_>>::balance(
-			collateral_id.clone(),
-			&pool_account,
-		);
+		let collateral_held = T::CollateralAssets::balance(collateral_id.clone(), &pool_account);
 		let collateral_owed = state.total_collateral_gains_unclaimed;
 		if collateral_held != collateral_owed {
 			return Err("pool collateral balance diverges from tracked totals".into());
