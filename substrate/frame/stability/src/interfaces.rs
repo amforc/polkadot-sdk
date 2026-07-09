@@ -1,9 +1,10 @@
 //! pUSD primitive trait implementations: the surfaces sibling pallets drive
-//! on the pool. (`OnBranchLifecycle` lives next to the storage it seeds, in
-//! `lib.rs`.)
+//! on the pool.
 
-use crate::pallet::{BalanceOf, Config, Pallet, PoolStates, StabilityPoolConfigs, StableCreditOf};
-use frame::{deps::frame_support::storage::with_storage_layer, prelude::*};
+use crate::pallet::{
+	BalanceOf, CollateralCreditOf, Config, Pallet, StabilityPoolConfigs, StableCreditOf,
+};
+use frame::prelude::*;
 use pusd_primitives::{
 	OnBranchYield, PendingOffsetResult, PoolOffsetResult, StabilityPoolOffsetApi,
 };
@@ -39,52 +40,38 @@ impl<T: Config> OnBranchYield<T::CollateralAssetId, T::StableAssetId, StableCred
 	}
 }
 
-/// The offset surface the future liquidations pallet drives. The engine
-/// functions are not extrinsics, so this impl owns their atomicity: each call
-/// runs in its own storage layer and rolls back entirely on error.
+/// The offset surface the future liquidations pallet drives. Collateral
+/// travels as a `Credit`.
 impl<T: Config>
-	StabilityPoolOffsetApi<T::CollateralAssetId, T::StableAssetId, T::AccountId, BalanceOf<T>>
-	for Pallet<T>
+	StabilityPoolOffsetApi<
+		T::CollateralAssetId,
+		T::StableAssetId,
+		BalanceOf<T>,
+		CollateralCreditOf<T>,
+	> for Pallet<T>
 {
-	fn pool_account(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-	) -> Option<T::AccountId> {
-		PoolStates::<T>::contains_key(collateral_id, stable_id)
-			.then(|| Self::pool_account(collateral_id, stable_id))
-	}
-
 	fn offset_liquidation(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		max_debt_to_offset: BalanceOf<T>,
-		collateral_for_pool: BalanceOf<T>,
-	) -> Result<PoolOffsetResult<BalanceOf<T>>, DispatchError> {
-		with_storage_layer(|| {
-			Self::do_offset_liquidation(
-				collateral_id,
-				stable_id,
-				max_debt_to_offset,
-				collateral_for_pool,
-			)
-		})
+		collateral: CollateralCreditOf<T>,
+	) -> (PoolOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
+		Self::do_offset_liquidation(collateral_id, stable_id, max_debt_to_offset, collateral)
 	}
 
 	fn offset_pending_liquidation(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		remaining_debt: BalanceOf<T>,
-		remaining_collateral: BalanceOf<T>,
 		max_pending_iterations: u32,
-	) -> Result<PendingOffsetResult<BalanceOf<T>>, DispatchError> {
-		with_storage_layer(|| {
-			Self::do_offset_pending_liquidation(
-				collateral_id,
-				stable_id,
-				remaining_debt,
-				remaining_collateral,
-				max_pending_iterations,
-			)
-		})
+		collateral: CollateralCreditOf<T>,
+	) -> (PendingOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
+		Self::do_offset_pending_liquidation(
+			collateral_id,
+			stable_id,
+			remaining_debt,
+			max_pending_iterations,
+			collateral,
+		)
 	}
 }
