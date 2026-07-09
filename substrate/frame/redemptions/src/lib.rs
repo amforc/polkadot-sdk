@@ -123,7 +123,8 @@ pub mod pallet {
 	};
 	use pusd_primitives::{
 		recovery_pricing, ProvidePrice, RecoveryOffsetInterface, RecoveryOffsetOutcome,
-		RecoveryOffsetQuote, RedemptionAllocation, RedemptionStepSnapshot, VaultInterface,
+		RecoveryOffsetQuote, RecoveryOffsetResult, RedemptionAllocation, RedemptionStepSnapshot,
+		VaultInterface,
 	};
 
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
@@ -1120,51 +1121,72 @@ pub mod pallet {
 			})
 		}
 
-		fn apply_recovery_offset(
+		fn execute_recovery_offset(
 			collateral_id: &T::CollateralAssetId,
 			stable_id: &T::StableAssetId,
 			payer: &T::AccountId,
 			collateral_recipient: &T::AccountId,
 			max_debt_to_cancel: BalanceOf<T>,
-		) -> Result<RecoveryOffsetOutcome<T::AccountId, BalanceOf<T>>, DispatchError> {
+		) -> Result<RecoveryOffsetResult<T::AccountId, BalanceOf<T>>, DispatchError> {
 			let Some((owner, status)) =
 				T::Vaults::next_redemption_target(collateral_id, stable_id, None)
 			else {
-				return Err(Error::<T>::NoRecoveryTarget.into());
+				return Ok(RecoveryOffsetResult::NoTarget);
 			};
-			ensure!(status.is_final_recovery(), Error::<T>::NoRecoveryTarget);
+			if !status.is_final_recovery() {
+				return Ok(RecoveryOffsetResult::NoTarget);
+			}
 			let (config, price) = Self::offset_preamble(collateral_id, stable_id)?;
 
-			let mut outcome = None;
-			T::Vaults::redeem_step(
-				collateral_id,
-				stable_id,
-				&owner,
-				collateral_recipient,
-				|snap| {
-					let pricing =
-						Self::price_recovery(stable_id, &snap, price, max_debt_to_cancel, &config)
-							.ok_or(Error::<T>::NoRecoveryTarget)?;
-					ensure!(pricing.split.is_none(), Error::<T>::RecoveryOffsetBelowPar);
-					ensure!(!pricing.debt.is_zero(), Error::<T>::NoRecoveryTarget);
-					// The same burn as a recovery redemption with a zero fee
-					// portion: offsets are fee-free settlement. A drained head
-					// flips to Dormant inside the vault step itself.
-					Self::burn_redeemer_pusd(stable_id, payer, pricing.debt, pricing.debt)?;
-					outcome = Some(RecoveryOffsetOutcome {
-						vault_owner: owner.clone(),
-						debt_cancelled: pricing.debt,
-						collateral_out: pricing.collateral_out,
-					});
-					Ok(Some(RedemptionAllocation {
-						debt_to_cancel: pricing.debt,
-						collateral_to_recipient: pricing.collateral_out,
-					}))
-				},
-			)?;
-			// The closure always sets the outcome before returning an
-			// allocation; reaching here without one is a vault-side breach.
-			outcome.ok_or_else(|| Error::<T>::NoRecoveryTarget.into())
+			with_transaction(|| {
+				let mut result = RecoveryOffsetResult::NoTarget;
+				let step = T::Vaults::redeem_step(
+					collateral_id,
+					stable_id,
+					&owner,
+					collateral_recipient,
+					|snap| {
+						let Some(pricing) = Self::price_recovery(
+							stable_id,
+							&snap,
+							price,
+							max_debt_to_cancel,
+							&config,
+						) else {
+							result = RecoveryOffsetResult::NoTarget;
+							return Ok(None);
+						};
+						if pricing.split.is_some() {
+							result = RecoveryOffsetResult::BelowPar;
+							return Ok(None);
+						}
+						if pricing.debt.is_zero() {
+							result = RecoveryOffsetResult::NoTarget;
+							return Ok(None);
+						}
+						// The same burn as a recovery redemption with a zero fee
+						// portion: offsets are fee-free settlement. A drained head
+						// flips to Dormant inside the vault step itself.
+						Self::burn_redeemer_pusd(stable_id, payer, pricing.debt, pricing.debt)?;
+						result = RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
+							vault_owner: owner.clone(),
+							debt_cancelled: pricing.debt,
+							collateral_out: pricing.collateral_out,
+						});
+						Ok(Some(RedemptionAllocation {
+							debt_to_cancel: pricing.debt,
+							collateral_to_recipient: pricing.collateral_out,
+						}))
+					},
+				);
+				match step {
+					Err(error) => TransactionOutcome::Rollback(Err(error)),
+					Ok(_) if matches!(result, RecoveryOffsetResult::Applied(_)) => {
+						TransactionOutcome::Commit(Ok(result))
+					},
+					Ok(_) => TransactionOutcome::Rollback(Ok(result)),
+				}
+			})
 		}
 	}
 
