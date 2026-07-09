@@ -27,7 +27,9 @@ pub mod pallet {
 	use super::*;
 	use crate::{
 		dispatchable_impls::ClaimKind,
-		types::{Deposit, PoolState, PoolSums, RecoveryOffsetSource, StabilityPoolConfig},
+		types::{
+			Deposit, PoolState, PoolSums, RecoveryOffsetSource, StabilityPool, StabilityPoolConfig,
+		},
 	};
 	use frame::{
 		deps::frame_support::{
@@ -56,6 +58,8 @@ pub mod pallet {
 	pub type PoolStateOf<T> = PoolState<BalanceOf<T>>;
 
 	pub type StabilityPoolConfigOf<T> = StabilityPoolConfig<BalanceOf<T>>;
+
+	pub type StabilityPoolOf<T> = StabilityPool<BalanceOf<T>>;
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
@@ -156,20 +160,23 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Branch pool totals and current product-sum coordinates.
+	/// The registered markets' pools: governance parameters and hot
+	/// accounting state in one record, so the pieces can never partially
+	/// exist. Existence of the row is what "registered" means.
 	#[pallet::storage]
-	pub type PoolStates<T: Config> = StorageDoubleMap<
+	pub type Pools<T: Config> = StorageDoubleMap<
 		_,
 		Twox64Concat,
 		T::CollateralAssetId,
 		Twox64Concat,
 		T::StableAssetId,
-		PoolStateOf<T>,
+		StabilityPoolOf<T>,
 		OptionQuery,
 	>;
 
-	/// Historical and current `S`/`G` sums, keyed by `(epoch, scale)`. Rows
-	/// may be pruned only when no deposit snapshot references them.
+	/// Historical and current `S`/`G` sums, keyed by `(epoch, scale)`.
+	/// Rows may be pruned only when no deposit snapshot
+	/// references them.
 	#[pallet::storage]
 	pub type PoolSumsStore<T: Config> = StorageNMap<
 		_,
@@ -180,19 +187,7 @@ pub mod pallet {
 			NMapKey<Twox64Concat, u32>,
 		),
 		PoolSums,
-		OptionQuery,
-	>;
-
-	/// Per-branch deposit, withdrawal, and accumulator parameters.
-	#[pallet::storage]
-	pub type StabilityPoolConfigs<T: Config> = StorageDoubleMap<
-		_,
-		Twox64Concat,
-		T::CollateralAssetId,
-		Twox64Concat,
-		T::StableAssetId,
-		StabilityPoolConfigOf<T>,
-		OptionQuery,
+		ValueQuery,
 	>;
 
 	#[pallet::event]
@@ -564,9 +559,8 @@ pub mod pallet {
 		) -> DispatchResult {
 			let config = T::DefaultStabilityPoolConfig::get();
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
-			PoolStates::<T>::insert(collateral_id, stable_id, PoolStateOf::<T>::fresh());
+			Pools::<T>::insert(collateral_id, stable_id, StabilityPoolOf::<T>::fresh(config));
 			PoolSumsStore::<T>::insert((collateral_id, stable_id, 0u32, 0u32), PoolSums::default());
-			StabilityPoolConfigs::<T>::insert(collateral_id, stable_id, config);
 
 			// A provider reference keeps the sub-account alive across
 			// zero-balance moments without depositing an existential deposit.
@@ -598,8 +592,7 @@ pub mod pallet {
 			// queue of a re-registered branch.
 			let fifo = crate::pending::list_id::<T>(collateral_id, stable_id);
 			ensure!(T::PendingLists::count(&fifo) == 0, Error::<T>::PendingFifoInvariantBroken);
-			PoolStates::<T>::remove(collateral_id, stable_id);
-			StabilityPoolConfigs::<T>::remove(collateral_id, stable_id);
+			Pools::<T>::remove(collateral_id, stable_id);
 			// Safe to clear wholesale: without deposit rows, no snapshot can
 			// reference a sums row.
 			let removal = PoolSumsStore::<T>::clear_prefix(

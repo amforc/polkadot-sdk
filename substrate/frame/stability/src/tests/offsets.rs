@@ -22,7 +22,7 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 		assert_eq!(state.coords.p, FixedU128::from_rational(1, 2));
 		assert_eq!(state.total_collateral_gains_unclaimed, 450);
 		// delta_S = floor(450 * 1e18 / 1000) = 4.5e17.
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("row");
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::from_inner(450_000_000_000_000_000));
 
 		// 500 of the pool's 1000 stablecoin was burned.

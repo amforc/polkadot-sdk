@@ -244,7 +244,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		assert_eq!(state.coords.epoch, 1);
 		assert_eq!(state.coords.scale, 0);
 		assert_eq!(state.coords.p, FixedU128::one());
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("row");
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(7_865_547_022_727, 1_501));
 
 		System::assert_has_event(

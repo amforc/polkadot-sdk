@@ -17,8 +17,8 @@ fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Balance
 		row.claimable_collateral += collateral_gain;
 		row.claimable_yield += yield_gain;
 	});
-	crate::PoolStates::<Test>::mutate(DOT, PUSD, |state| {
-		let state = state.as_mut().expect("pool state exists");
+	crate::Pools::<Test>::mutate(DOT, PUSD, |pool| {
+		let state = &mut pool.as_mut().expect("pool registered").state;
 		state.total_collateral_gains_unclaimed += collateral_gain;
 		state.total_yield_unclaimed += yield_gain;
 	});
