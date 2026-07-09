@@ -197,7 +197,7 @@ fn set_stability_pool_config_freezes_precision_parameters() {
 
 		// Same for the scale factor (1e8 is inside the validity bounds).
 		let mut config = default_pool_config();
-		config.precision.scale_factor = 100_000_000;
+		config.precision.set_scale_factor(100_000_000);
 		assert_noop!(
 			Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config),
 			Error::<Test>::AccumulatorParamsImmutable

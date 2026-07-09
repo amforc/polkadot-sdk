@@ -2,7 +2,7 @@
 //! Never touches `P`/`S`/`G` (invariant 11); collateral is credited straight
 //! to the consumed depositors.
 
-use crate::mock::*;
+use crate::{math::pro_rata_floor, mock::*, Error};
 
 /// Queue a pending (unactivated) deposit for `who`.
 fn seed_pending(who: AccountId, amount: Balance) {
@@ -208,5 +208,115 @@ fn pending_offset_on_unregistered_branch_noops_and_returns_the_credit() {
 		assert_eq!(result.debt_offset, 0);
 		assert_eq!(result.remaining_debt, 100);
 		assert_eq!(leftover, 50);
+	});
+}
+
+/// One liquidation cascading through the full waterfall —
+/// active-pool offset, keeper JIT, the pending-deposit backstop, and the
+/// redistribution residual. Only the two offset stages are pallet calls; the
+/// keeper JIT and the final redistribution belong to the external liquidation
+/// orchestrator and are modelled here as plain arithmetic between the calls.
+#[test]
+fn full_liquidation_waterfall_active_jit_pending_and_residual() {
+	build_and_execute(|| {
+		const DOT_E10: Balance = 10_000_000_000;
+
+		register_branch(DOT, PUSD, default_branch_config());
+		seed_deposit(1, 1_501); // active pool = 1501 pUSD, P = 1, epoch 0.
+		activate_all(&[1]);
+		seed_pending(2, 250); // pending FIFO, user 2 oldest ...
+		seed_pending(3, 100); // ... then user 3.
+
+		// Stage 1 — active offset. The vault owes 2200 pUSD; its post-keeper
+		// resolution collateral is 1152.845 DOT (keeper comp is external, so we
+		// take it as the input). The offered 2200 exceeds the 1501 pool, so the
+		// offset depletes the pool exactly and keeps only the collateral backing
+		// the 1501 it burns; the rest flows on to the next stage.
+		let c0 = 1_152_845 * (DOT_E10 / 1_000); // 11_528_450_000_000
+		let (r1, leftover1) = simulate_offset(DOT, PUSD, 2_200, c0);
+		assert_eq!(r1.debt_offset, 1_501);
+		// floor(11_528_450_000_000 * 1501 / 2200) = 786.5547022727 DOT.
+		assert_eq!(r1.collateral_to_pool, 7_865_547_022_727);
+		assert_eq!(leftover1, 3_662_902_977_273); // 366.2902977273 DOT.
+
+		let state = pool_state(DOT, PUSD);
+		assert_eq!(state.total_active_deposits, 0);
+		assert_eq!(state.epoch, 1);
+		assert_eq!(state.scale, 0);
+		assert_eq!(state.p, FixedU128::one());
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("row");
+		assert_eq!(sums.s_collateral, FixedU128::from_rational(7_865_547_022_727, 1_501));
+
+		System::assert_has_event(
+			crate::Event::PoolOffsetApplied {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				debt_burned: 1_501,
+				collateral_gain: 7_865_547_022_727,
+				epoch: 1,
+				scale: 0,
+			}
+			.into(),
+		);
+
+		// Stage 2 — keeper JIT (external orchestrator, not a pallet call). It
+		// burns 300 pUSD with keeper liquidity and takes the matching collateral
+		// share off the remainder before the pending backstop runs.
+		let jit_debt = 300;
+		let jit_collateral = pro_rata_floor(leftover1, jit_debt, 699);
+		assert_eq!(jit_collateral, 1_572_061_363_636); // 157.2061363636 DOT.
+		let after_jit_debt = 699 - jit_debt; // 399 pUSD.
+		let after_jit_collat = leftover1 - jit_collateral; // 2_090_841_613_637 = 209.0841613637 DOT.
+		assert_eq!(after_jit_collat, 2_090_841_613_637);
+
+		// Stage 3+4 — pending-deposit FIFO backstop. User 2 (250) is consumed in
+		// full, then user 3 (100), each priced against the debt still standing:
+		//   floor(2_090_841_613_637 * 250 / 399) = 1_310_051_136_364
+		//   floor(  780_790_477_273 * 100 / 149) =   524_020_454_545
+		let (r2, leftover2) =
+			simulate_pending_offset(DOT, PUSD, after_jit_debt, after_jit_collat, 8);
+		assert_eq!(r2.debt_offset, 350);
+		assert_eq!(r2.collateral_to_pool, 1_834_071_590_909);
+		assert_eq!(r2.iterations_used, 2);
+		// The residual — 49 pUSD debt + this collateral — is what the
+		// orchestrator hands to redistribution (external).
+		assert_eq!(r2.remaining_debt, 49);
+		assert_eq!(leftover2, 256_770_022_728); // 25.6770022728 DOT.
+
+		let row2 = deposit_row(DOT, PUSD, 2).expect("kept: holds a claimable");
+		assert!(row2.pending_deposit.is_none());
+		assert_eq!(row2.claimable_collateral, 1_310_051_136_364);
+		let row3 = deposit_row(DOT, PUSD, 3).expect("kept");
+		assert!(row3.pending_deposit.is_none());
+		assert_eq!(row3.claimable_collateral, 524_020_454_545);
+		assert!(!pending_contains(DOT, PUSD, 2));
+		assert!(!pending_contains(DOT, PUSD, 3));
+		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 0);
+
+		System::assert_has_event(
+			crate::Event::PendingDepositOffsetApplied {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				debt_burned: 350,
+				collateral_gain: 1_834_071_590_909,
+				iterations: 2,
+			}
+			.into(),
+		);
+
+		// Stage 5 — the sole active depositor. The depletion compounded its
+		// deposit to zero; its collateral is realized through S on claim. The
+		// double-floor (`floor(1501 * floor(collat * 1e18 / 1501) / 1e18)`)
+		// strands 1 base unit in the unclaimed total, so it realizes one less
+		// than `collateral_to_pool`.
+		assert_noop!(withdraw(1, DOT, PUSD, 1, 1), Error::<Test>::NoActiveDeposit);
+		let before = collateral_balance(DOT, 1);
+		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
+		assert_eq!(collateral_balance(DOT, 1) - before, 7_865_547_022_726);
+		assert!(deposit_row(DOT, PUSD, 1).is_none());
+
+		// Every pUSD the pool held (1501 active + 350 pending) was burned.
+		let pool = Stability::pool_account(&DOT, &PUSD);
+		assert_eq!(stable_balance(PUSD, pool), 0);
 	});
 }

@@ -137,6 +137,7 @@ pub struct SumsWindow {
 )]
 pub struct PoolPrecision {
 	pub p_min: FixedU128,
+	// TODO: Check visibility
 	pub scale_factor: u64,
 }
 
@@ -157,6 +158,19 @@ impl PoolPrecision {
 		self.p_min.saturating_mul(FixedU128::saturating_from_integer(self.scale_factor)) <=
 			FixedU128::one()
 	}
+
+	/// `scale_factor` widened for the u128 accumulator math, floored at 1 as a
+	/// guard against a decoded zero dividing by zero in [`gain`].
+	pub fn scale_factor(&self) -> u128 {
+		debug_assert!(self.scale_factor >= SCALE_FACTOR_INT_MIN);
+		debug_assert!(self.scale_factor <= SCALE_FACTOR_INT_MAX);
+		u128::from(self.scale_factor).max(1)
+	}
+
+	#[cfg(test)]
+    pub(crate) fn set_scale_factor(&mut self, scale_factor: u64) {
+        self.scale_factor = scale_factor;
+    }
 }
 
 /// Outcome of realizing a deposit against the current accumulators.
@@ -205,7 +219,7 @@ pub fn realize<Balance: FixedPointOperand>(
 		};
 	}
 	let d: u128 = d0.unique_saturated_into();
-	let sf_int = scale_factor_u128(precision.scale_factor);
+	let sf_int = precision.scale_factor();
 
 	let compounded_raw = if snapshot.epoch == current.epoch {
 		// Each scale behind adds a `scale_factor` divisor; `is_valid` bounds
@@ -263,7 +277,7 @@ fn gain(
 	sf_int: u128,
 	p0: FixedU128,
 ) -> Option<u128> {
-	// `scale_factor_u128` guarantees `1 <= sf_int <= 1e10`, so every divisor
+	// `scale_factor` guarantees `1 <= sf_int <= 1e10`, so every divisor
 	// (at most `sf_int^SCALE_SPAN = 1e20`) stays inside `u128`.
 	debug_assert!(sf_int >= 1);
 	let mut delta = sum_snap.saturating_sub(sum0);
@@ -368,7 +382,7 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	}
 	let total: u128 = total_active.unique_saturated_into();
 	let new_total: u128 = total_active.saturating_sub(offset_debt).unique_saturated_into();
-	let sf_int = scale_factor_u128(precision.scale_factor);
+	let sf_int = precision.scale_factor();
 
 	let mut factor: u128 = 1;
 	for scales_crossed in 0..=MAX_SCALE_CROSSINGS {
@@ -385,14 +399,6 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 		factor = factor.checked_mul(sf_int)?;
 	}
 	None
-}
-
-/// The validated `scale_factor` widened for u128 arithmetic, floored at 1 so
-/// a misconfigured zero cannot divide-by-zero in [`gain`].
-fn scale_factor_u128(scale_factor: u64) -> u128 {
-	debug_assert!(scale_factor >= SCALE_FACTOR_INT_MIN);
-	debug_assert!(scale_factor <= SCALE_FACTOR_INT_MAX);
-	u128::from(scale_factor).max(1)
 }
 
 /// Convert a raw payout to `Balance`, flooring impossible states to zero.
