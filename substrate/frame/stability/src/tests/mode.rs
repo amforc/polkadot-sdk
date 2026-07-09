@@ -40,14 +40,15 @@ fn frozen_branch_blocks_every_value_moving_operation() {
 		assert_noop!(claim_collateral(1, DOT, PUSD, 1), Error::<Test>::BranchFrozen);
 		assert_noop!(claim_yield(1, DOT, PUSD, 1), Error::<Test>::BranchFrozen);
 		assert_noop!(compound(1, DOT, PUSD, 10), Error::<Test>::BranchFrozen);
-		assert_noop!(
-			Stability::offset_liquidation(&DOT, &PUSD, 100, 50),
-			Error::<Test>::BranchFrozen
-		);
-		assert_noop!(
-			Stability::offset_pending_liquidation(&DOT, &PUSD, 100, 50, 5),
-			Error::<Test>::BranchFrozen
-		);
+		// The infallible offset surfaces step aside on a frozen branch:
+		// zeroed results, credits returned whole.
+		let (result, leftover) = simulate_offset(DOT, PUSD, 100, 50);
+		assert_eq!(result.debt_offset, 0);
+		assert_eq!(leftover, 50);
+		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 100, 50, 5);
+		assert_eq!(result.debt_offset, 0);
+		assert_eq!(result.remaining_debt, 100);
+		assert_eq!(leftover, 50);
 		// Yield routing cannot fail: the frozen pool just takes nothing.
 		let leftover = distribute_yield(DOT, PUSD, 40);
 		assert_eq!(leftover.peek(), 40);
@@ -117,7 +118,7 @@ fn safety_mode_keeps_deposits_claims_and_offsets_working() {
 		// Liquidation offsets keep operating in Safety Mode: A = 400,
 		// delta_S = floor(20 * 1e18 / 400) = 5e16,
 		// gain = floor(400 * 0.05) = 20, compounded = floor(400 * 0.875).
-		assert_ok!(simulate_offset(DOT, PUSD, 50, 20));
+		assert_eq!(simulate_offset(DOT, PUSD, 50, 20).0.debt_offset, 50);
 		let before = collateral_balance(DOT, 1);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
 		assert_eq!(collateral_balance(DOT, 1) - before, 20);

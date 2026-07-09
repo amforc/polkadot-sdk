@@ -48,6 +48,9 @@ pub mod pallet {
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
 
+	pub type CollateralCreditOf<T> =
+		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::CollateralAssets>;
+
 	pub type DepositOf<T> = Deposit<BalanceOf<T>>;
 
 	pub type PoolStateOf<T> = PoolState<BalanceOf<T>>;
@@ -78,13 +81,12 @@ pub mod pallet {
 			> + fungibles::Mutate<Self::AccountId>
 			+ fungibles::Balanced<Self::AccountId>;
 
-		/// Collateral surface the pool receives offset gains on and pays
-		/// depositor claims from.
-		type CollateralAssets: fungibles::Inspect<
+		/// Collateral surface the pool receives offset gains on and pays depositor claims from.
+		type CollateralAssets: fungibles::Mutate<
 				Self::AccountId,
 				AssetId = Self::CollateralAssetId,
 				Balance = BalanceOf<Self>,
-			> + fungibles::Mutate<Self::AccountId>;
+			> + fungibles::Balanced<Self::AccountId>;
 
 		/// Time source the entry delay and the Safety-Mode withdrawal delay
 		/// are measured against.
@@ -591,6 +593,11 @@ pub mod pallet {
 					.is_none(),
 				Error::<T>::PoolNotEmpty
 			);
+			// Defense in depth: the rows↔FIFO bijection makes an orphan node
+			// unreachable, but one stranded past teardown would corrupt the
+			// queue of a re-registered branch.
+			let fifo = crate::pending::list_id::<T>(collateral_id, stable_id);
+			ensure!(T::PendingLists::count(&fifo) == 0, Error::<T>::PendingFifoInvariantBroken);
 			PoolStates::<T>::remove(collateral_id, stable_id);
 			StabilityPoolConfigs::<T>::remove(collateral_id, stable_id);
 			// Safe to clear wholesale: without deposit rows, no snapshot can
