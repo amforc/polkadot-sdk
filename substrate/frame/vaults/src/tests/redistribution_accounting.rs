@@ -22,10 +22,9 @@ fn weighted(x: Balance, rate: FixedU128) -> Balance {
 	rate.saturating_mul_int(x)
 }
 
-/// Shared post-redistribution invariant, co-located with the tests that call it:
-/// the branch stake aggregate equals the sum of per-vault stakes, and the
-/// pending-redistribution principal matches the sum of per-vault shares to within
-/// per-stake flooring dust.
+/// Invariant: the branch stake aggregate equals the sum of per-vault stakes, and
+/// the pending-redistribution principal matches the sum of per-vault shares to
+/// within per-stake flooring dust.
 fn assert_accounting_identity_holds() {
 	let state = branch_state(DOT, PUSD).unwrap();
 	let cumul = state.redistribution.debt_per_stake;
@@ -34,7 +33,10 @@ fn assert_accounting_identity_holds() {
 	let mut n: u128 = 0;
 	for (owner, vault) in Vaults::<Test>::iter_prefix((DOT, PUSD)) {
 		let snap = vault.redistribution_snapshot;
+		// How much debt-per-stake has accumulated since this vault's snapshot?
 		let delta = cumul.saturating_sub(snap.debt_per_stake);
+		// This vault's pending redistribution share; summed over all vaults it
+		// must recover the branch's pending-redistribution principal.
 		sum_shares =
 			sum_shares.saturating_add(delta.saturating_mul_int(vault.redistribution_stake));
 		let h = held(DOT, owner);
