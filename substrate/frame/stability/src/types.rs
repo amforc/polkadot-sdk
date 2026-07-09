@@ -189,7 +189,6 @@ pub enum RecoveryOffsetSource {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use frame::arithmetic::FixedPointNumber;
 
 	fn valid_config() -> StabilityPoolConfig<u128> {
 		StabilityPoolConfig {
@@ -199,7 +198,7 @@ mod tests {
 			safety_withdrawal_delay: 600_000,
 			precision: PoolPrecision {
 				p_min: FixedU128::from_inner(1_000_000_000),
-				scale_factor: FixedU128::from_u32(1_000_000_000),
+				scale_factor: 1_000_000_000,
 			},
 			yield_share: Permill::from_percent(75),
 		}
@@ -231,19 +230,14 @@ mod tests {
 		config.precision.p_min = FixedU128::zero();
 		assert!(!config.is_valid());
 
-		// Fractional scale factor.
-		let mut config = valid_config();
-		config.precision.scale_factor = FixedU128::from_rational(3, 2);
-		assert!(!config.is_valid());
-
 		// Below the minimum useful rescale.
 		let mut config = valid_config();
-		config.precision.scale_factor = FixedU128::from_u32(999);
+		config.precision.scale_factor = 999;
 		assert!(!config.is_valid());
 
 		// Above the u128 overflow guard (1e10).
 		let mut config = valid_config();
-		config.precision.scale_factor = FixedU128::saturating_from_integer(10_000_000_001u64);
+		config.precision.scale_factor = 10_000_000_001;
 		assert!(!config.is_valid());
 
 		// A rescale would push P above one: p_min * scale_factor > 1.

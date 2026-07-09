@@ -2,7 +2,7 @@
 //! Never touches `P`/`S`/`G` (invariant 11); collateral is credited straight
 //! to the consumed depositors.
 
-use crate::{mock::*, Error};
+use crate::mock::*;
 
 /// Queue a pending (unactivated) deposit for `who`.
 fn seed_pending(who: AccountId, amount: Balance) {
@@ -21,11 +21,11 @@ fn pending_offset_consumes_fifo_in_order() {
 		// floor(175 * 200 / 350) = 100 — fully consumed, leaves the FIFO.
 		// Step 2 (user 2): debt min(300, 150) = 150, collateral
 		// floor(75 * 150 / 150) = 75 — 150 pending remain, keeps its slot.
-		let result = simulate_pending_offset(DOT, PUSD, 350, 175, 10).expect("offsets");
+		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 350, 175, 10);
 		assert_eq!(result.debt_offset, 350);
 		assert_eq!(result.collateral_to_pool, 175);
 		assert_eq!(result.remaining_debt, 0);
-		assert_eq!(result.remaining_collateral, 0);
+		assert_eq!(leftover, 0);
 		assert_eq!(result.iterations_used, 2);
 
 		let row1 = deposit_row(DOT, PUSD, 1).expect("kept: it holds a claimable");
@@ -75,7 +75,7 @@ fn pending_offset_respects_caller_and_pallet_caps() {
 		seed_pending(3, 100);
 
 		// The caller's cap stops the walk after two of three entries.
-		let result = simulate_pending_offset(DOT, PUSD, 1_000, 0, 2).expect("offsets");
+		let (result, _) = simulate_pending_offset(DOT, PUSD, 1_000, 0, 2);
 		assert_eq!(result.debt_offset, 200);
 		assert_eq!(result.iterations_used, 2);
 		assert_eq!(result.remaining_debt, 800);
@@ -83,7 +83,7 @@ fn pending_offset_respects_caller_and_pallet_caps() {
 		assert_eq!(pending_oldest(DOT, PUSD), Some(3));
 
 		// A zero cap walks nothing.
-		let result = simulate_pending_offset(DOT, PUSD, 800, 0, 0).expect("no-op");
+		let (result, _) = simulate_pending_offset(DOT, PUSD, 800, 0, 0);
 		assert_eq!(result.debt_offset, 0);
 		assert_eq!(result.iterations_used, 0);
 		assert_eq!(pending_count(DOT, PUSD), 1);
@@ -96,17 +96,17 @@ fn pending_offset_noop_cases_pass_remainders_through() {
 		register_branch(DOT, PUSD, default_branch_config());
 
 		// Empty queue.
-		let result = simulate_pending_offset(DOT, PUSD, 100, 50, 5).expect("no-op");
+		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 100, 50, 5);
 		assert_eq!(result.debt_offset, 0);
 		assert_eq!(result.remaining_debt, 100);
-		assert_eq!(result.remaining_collateral, 50);
+		assert_eq!(leftover, 50);
 		assert_eq!(result.iterations_used, 0);
 
 		// Zero remaining debt with a populated queue.
 		seed_pending(1, 200);
-		let result = simulate_pending_offset(DOT, PUSD, 0, 50, 5).expect("no-op");
+		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 0, 50, 5);
 		assert_eq!(result.debt_offset, 0);
-		assert_eq!(result.remaining_collateral, 50);
+		assert_eq!(leftover, 50);
 		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 200);
 	});
 }
@@ -125,7 +125,7 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		let before = pool_state(DOT, PUSD);
 		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 
-		let result = simulate_pending_offset(DOT, PUSD, 200, 100, 5).expect("offsets");
+		let (result, _) = simulate_pending_offset(DOT, PUSD, 200, 100, 5);
 		assert_eq!(result.debt_offset, 200);
 		assert_eq!(result.collateral_to_pool, 100);
 
@@ -162,11 +162,11 @@ fn pending_offset_flooring_credits_zero_and_prunes() {
 
 		// floor(1 * 100 / 1000) = 0: the whole pending amount burns for a
 		// zero collateral credit, and the emptied row is pruned.
-		let result = simulate_pending_offset(DOT, PUSD, 1_000, 1, 5).expect("offsets");
+		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 1_000, 1, 5);
 		assert_eq!(result.debt_offset, 100);
 		assert_eq!(result.collateral_to_pool, 0);
 		assert_eq!(result.remaining_debt, 900);
-		assert_eq!(result.remaining_collateral, 1);
+		assert_eq!(leftover, 1);
 
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 		assert!(!pending_contains(DOT, PUSD, 1));
@@ -178,11 +178,35 @@ fn pending_offset_flooring_credits_zero_and_prunes() {
 }
 
 #[test]
-fn pending_offset_on_unregistered_branch_errors() {
+fn pending_offset_with_sub_minimum_collateral_gain_stops_before_the_step() {
 	build_and_execute(|| {
-		assert_noop!(
-			Stability::offset_pending_liquidation(&DOT, &PUSD, 100, 50, 5),
-			Error::<Test>::BranchNotRegistered
-		);
+		// Same sub-minimum first-gain guard as the active offset: the walk
+		// stops before the step commits anything (roll-forward semantics).
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		let coll = AssetId::WithId(77);
+		register_branch(coll.clone(), PUSD, default_branch_config());
+		mint_stable(PUSD, 1, 200);
+		assert_ok!(deposit(1, coll.clone(), PUSD, 200));
+
+		// Gain floor(500 * 200 / 200) = 500 < the 1_000 minimum on an empty
+		// pool account: the step is attempted but nothing of it applies.
+		let (result, leftover) = simulate_pending_offset(coll.clone(), PUSD, 200, 500, 5);
+		assert_eq!(result.debt_offset, 0);
+		assert_eq!(result.remaining_debt, 200);
+		assert_eq!(result.iterations_used, 1);
+		assert_eq!(leftover, 500);
+		let row = deposit_row(coll.clone(), PUSD, 1).expect("kept");
+		assert_eq!(row.pending_deposit.expect("untouched").amount, 200);
+		assert_eq!(pool_state(coll, PUSD).total_pending_deposits, 200);
+	});
+}
+
+#[test]
+fn pending_offset_on_unregistered_branch_noops_and_returns_the_credit() {
+	build_and_execute(|| {
+		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 100, 50, 5);
+		assert_eq!(result.debt_offset, 0);
+		assert_eq!(result.remaining_debt, 100);
+		assert_eq!(leftover, 50);
 	});
 }

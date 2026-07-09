@@ -20,13 +20,12 @@ use frame::{
 	testing_prelude::*,
 	traits::{
 		fungible::{HoldConsideration, NativeFromLeft, NativeOrWithId},
-		fungibles::roles::Inspect as FungiblesRolesInspect,
+		fungibles::{roles::Inspect as FungiblesRolesInspect, Balanced as FungiblesBalanced},
 		tokens::{fungible, imbalance::ResolveAssetTo},
 		AsEnsureOriginWithArg, Convert, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
 use pusd_primitives::ProvidePrice;
-pub use pusd_primitives::StabilityPoolOffsetApi;
 
 // 16 bytes so `into_sub_account_truncating` keeps the pallet id plus part of
 // the market seed: a `u64` would truncate every pusd-pallet sub-account to
@@ -499,7 +498,7 @@ pub fn default_pool_config() -> StabilityPoolConfig<Balance> {
 		safety_withdrawal_delay: 600_000,
 		precision: PoolPrecision {
 			p_min: FixedU128::from_inner(1_000_000_000),
-			scale_factor: FixedU128::from_u32(1_000_000_000),
+			scale_factor: 1_000_000_000,
 		},
 		yield_share: Permill::from_percent(75),
 	}
@@ -721,50 +720,53 @@ pub fn distribute_yield(
 	stable: StableId,
 	amount: Balance,
 ) -> crate::pallet::StableCreditOf<Test> {
-	use frame::traits::fungibles::Balanced;
-	let credit = <Assets as Balanced<AccountId>>::issue(stable, amount);
+	let credit = <Assets as FungiblesBalanced<AccountId>>::issue(stable, amount);
 	// The engine fn, not the `OnBranchYield` impl: the full credit enters
 	// the pool, with no `yield_share` cut taken.
 	Stability::do_distribute_yield(&collateral, &stable, credit)
 }
 
-/// Run an active-pool offset and deliver the collateral the way the future
-/// liquidations pallet must: into the pool account, same transaction.
+/// Issue a fresh collateral credit, standing in for the future liquidations
+/// pallet's seized collateral. Dropping it (or a remainder split off it)
+/// only rescinds the issuance created here.
+pub fn issue_collateral(
+	collateral: AssetId,
+	amount: Balance,
+) -> crate::pallet::CollateralCreditOf<Test> {
+	<PoolCollateralAssets as FungiblesBalanced<AccountId>>::issue(collateral, amount)
+}
+
+/// Run an active-pool offset against a freshly issued collateral credit.
+/// Returns the result and the unconsumed remainder's amount.
 pub fn simulate_offset(
 	collateral: AssetId,
 	stable: StableId,
 	max_debt: Balance,
 	collateral_for_pool: Balance,
-) -> Result<crate::types::PoolOffsetResult<Balance>, DispatchError> {
-	let result =
-		Stability::offset_liquidation(&collateral, &stable, max_debt, collateral_for_pool)?;
-	if result.collateral_to_pool > 0 {
-		let pool = Stability::pool_account(&collateral, &stable);
-		mint_collateral(collateral, pool, result.collateral_to_pool);
-	}
-	Ok(result)
+) -> (crate::types::PoolOffsetResult<Balance>, Balance) {
+	let credit = issue_collateral(collateral.clone(), collateral_for_pool);
+	let (result, remainder) =
+		Stability::do_offset_liquidation(&collateral, &stable, max_debt, credit);
+	(result, remainder.peek())
 }
 
-/// Run a pending-deposit backstop offset with the same delivery contract.
+/// Run a pending-deposit backstop offset with the same credit plumbing.
 pub fn simulate_pending_offset(
 	collateral: AssetId,
 	stable: StableId,
 	remaining_debt: Balance,
 	remaining_collateral: Balance,
 	max_iterations: u32,
-) -> Result<crate::types::PendingOffsetResult<Balance>, DispatchError> {
-	let result = Stability::offset_pending_liquidation(
+) -> (crate::types::PendingOffsetResult<Balance>, Balance) {
+	let credit = issue_collateral(collateral.clone(), remaining_collateral);
+	let (result, remainder) = Stability::do_offset_pending_liquidation(
 		&collateral,
 		&stable,
 		remaining_debt,
-		remaining_collateral,
 		max_iterations,
-	)?;
-	if result.collateral_to_pool > 0 {
-		let pool = Stability::pool_account(&collateral, &stable);
-		mint_collateral(collateral, pool, result.collateral_to_pool);
-	}
-	Ok(result)
+		credit,
+	);
+	(result, remainder.peek())
 }
 
 /// The caller's deposit row; `None` when pruned or never created.
