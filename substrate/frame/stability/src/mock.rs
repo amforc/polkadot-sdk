@@ -723,7 +723,10 @@ pub fn distribute_yield(
 	let credit = <Assets as FungiblesBalanced<AccountId>>::issue(stable, amount);
 	// The engine fn, not the `OnBranchYield` impl: the full credit enters
 	// the pool, with no `yield_share` cut taken.
-	Stability::do_distribute_yield(&collateral, &stable, credit)
+	let Some(pool) = crate::Pools::<Test>::get(&collateral, &stable) else {
+		return credit;
+	};
+	Stability::do_distribute_yield(&collateral, &stable, pool, credit)
 }
 
 /// Issue a fresh collateral credit, standing in for the future liquidations
@@ -798,7 +801,7 @@ pub fn pending_count(collateral: AssetId, stable: StableId) -> u32 {
 
 /// The branch's live pool state; panics when the branch is not registered.
 pub fn pool_state(collateral: AssetId, stable: StableId) -> crate::types::PoolState<Balance> {
-	crate::PoolStates::<Test>::get(collateral, stable).expect("pool state exists")
+	crate::Pools::<Test>::get(collateral, stable).expect("pool registered").state
 }
 
 /// Park `owner`'s vault in `FinalRecovery`. The call is permissionless, so

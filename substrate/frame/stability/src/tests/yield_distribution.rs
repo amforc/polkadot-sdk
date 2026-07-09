@@ -27,7 +27,7 @@ fn distribute_to_empty_or_unknown_pool_returns_the_credit() {
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_yield_unclaimed, 0);
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("seeded");
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 		assert_eq!(sums.g_yield, FixedU128::zero());
 	});
 }
@@ -44,7 +44,7 @@ fn distribute_updates_g_exactly() {
 		drop(leftover);
 
 		// delta_G = floor(100 * P / A) = floor(100 * 1e18 / 1000) = 1e17.
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("seeded");
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 		assert_eq!(sums.g_yield, FixedU128::from_inner(100_000_000_000_000_000));
 
 		let state = pool_state(DOT, PUSD);
@@ -305,7 +305,7 @@ fn vault_interest_flows_to_pool_through_the_hook() {
 		// destination.
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_yield_unclaimed, 18);
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("row");
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 		// delta_G = floor(18 * 1e18 / 400) = 4.5e16.
 		assert_eq!(sums.g_yield, FixedU128::from_inner(45_000_000_000_000_000));
 		let pool = Stability::pool_account(&DOT, &PUSD);

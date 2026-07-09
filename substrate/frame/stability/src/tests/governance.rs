@@ -14,7 +14,7 @@ fn empty_deposit_row() -> crate::pallet::DepositOf<Test> {
 #[test]
 fn branch_registration_seeds_pool_rows() {
 	build_and_execute(|| {
-		assert!(crate::PoolStates::<Test>::get(DOT, PUSD).is_none());
+		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
 
 		register_branch(DOT, PUSD, default_branch_config());
 
@@ -26,13 +26,12 @@ fn branch_registration_seeds_pool_rows() {
 		assert_eq!(state.coords.scale, 0);
 		assert_eq!(state.total_collateral_gains_unclaimed, 0);
 		assert_eq!(state.total_yield_unclaimed, 0);
+		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 0u32, 0u32)));
+		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), PoolSums::default());
 
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32))
-			.expect("epoch 0 / scale 0 sums row seeded on registration");
-		assert_eq!(sums, PoolSums::default());
-
-		let config = crate::StabilityPoolConfigs::<Test>::get(DOT, PUSD)
-			.expect("config seeded on registration");
+		let config = crate::Pools::<Test>::get(DOT, PUSD)
+			.expect("pool seeded on registration")
+			.config;
 		assert_eq!(config, default_pool_config());
 
 		// The provider reference keeps the pool account alive without ED.
@@ -60,8 +59,7 @@ fn branch_registration_rejects_invalid_default_config() {
 			Error::<Test>::InvalidStabilityPoolConfig
 		);
 		// The whole registration rolled back, vaults side included.
-		assert!(crate::PoolStates::<Test>::get(DOT, PUSD).is_none());
-		assert!(crate::StabilityPoolConfigs::<Test>::get(DOT, PUSD).is_none());
+		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
 		assert!(Vaults::branch_tcr(DOT, PUSD).is_none());
 	});
 }
@@ -76,7 +74,7 @@ fn branch_removal_blocked_while_depositor_rows_exist() {
 			Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
 			Error::<Test>::PoolNotEmpty
 		);
-		assert!(crate::PoolStates::<Test>::get(DOT, PUSD).is_some());
+		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_some());
 
 		crate::Deposits::<Test>::remove((DOT, PUSD, 5u128));
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
@@ -96,7 +94,7 @@ fn branch_removal_blocked_while_fifo_nodes_exist() {
 			Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
 			Error::<Test>::PendingFifoInvariantBroken
 		);
-		assert!(crate::PoolStates::<Test>::get(DOT, PUSD).is_some());
+		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_some());
 
 		assert_ok!(pending::remove::<Test>(&fifo, &5));
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
@@ -112,8 +110,7 @@ fn branch_removal_tears_down_pool_rows() {
 
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 
-		assert!(crate::PoolStates::<Test>::get(DOT, PUSD).is_none());
-		assert!(crate::StabilityPoolConfigs::<Test>::get(DOT, PUSD).is_none());
+		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
 		assert!(!crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 0u32, 0u32)));
 		assert_eq!(providers(pool), providers_before - 1);
 	});
@@ -148,7 +145,7 @@ fn set_stability_pool_config_origin_matrix() {
 		// Root is the governance override.
 		config.minimum_deposit = 300;
 		assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
-		let stored = crate::StabilityPoolConfigs::<Test>::get(DOT, PUSD).expect("stored");
+		let stored = crate::Pools::<Test>::get(DOT, PUSD).expect("stored").config;
 		assert_eq!(stored.minimum_deposit, 300);
 	});
 }
@@ -220,7 +217,7 @@ fn set_stability_pool_config_updates_and_emits() {
 			config.clone()
 		));
 
-		let stored = crate::StabilityPoolConfigs::<Test>::get(DOT, PUSD).expect("stored");
+		let stored = crate::Pools::<Test>::get(DOT, PUSD).expect("stored").config;
 		assert_eq!(stored, config);
 		System::assert_last_event(
 			crate::Event::StabilityPoolConfigUpdated { collateral_id: DOT, stable_id: PUSD }.into(),
