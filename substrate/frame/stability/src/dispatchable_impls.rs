@@ -20,7 +20,7 @@ use frame::{
 };
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{
-	BranchMode, BranchModeProvider, Millis, RecoveryOffsetInterface, RecoveryOffsetQuote,
+	BranchMode, BranchModeProvider, Millis, RecoveryOffsetInterface, RecoveryOffsetResult,
 	StableListId,
 };
 
@@ -174,29 +174,23 @@ impl<T: Config> Pallet<T> {
 		deposit: &mut DepositOf<T>,
 		amount: BalanceOf<T>,
 	) -> Result<BalanceOf<T>, DispatchError> {
-		let quote = T::RecoveryOffsets::preview_recovery_offset(collateral_id, stable_id, amount)?;
-		let capacity = match quote {
-			RecoveryOffsetQuote::NoTarget => return Ok(BalanceOf::<T>::zero()),
-			RecoveryOffsetQuote::BelowPar => {
-				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
-			},
-			RecoveryOffsetQuote::Available { debt } => debt,
-		};
-		let used = amount.min(capacity);
-		if used.is_zero() {
-			return Ok(used);
-		}
-
-		let outcome = T::RecoveryOffsets::apply_recovery_offset(
+		let result = T::RecoveryOffsets::execute_recovery_offset(
 			collateral_id,
 			stable_id,
 			who,
 			pool_account,
-			used,
+			amount,
 		)?;
-		// Same dispatch, same oracle price: the quote and the execution see
-		// one snapshot, so the settlement matches the sized amount exactly.
-		ensure!(outcome.debt_cancelled == used, Error::<T>::InvalidRecoveryOffsetSnapshot);
+		let outcome = match result {
+			RecoveryOffsetResult::NoTarget => return Ok(BalanceOf::<T>::zero()),
+			RecoveryOffsetResult::BelowPar => {
+				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
+			},
+			RecoveryOffsetResult::Applied(outcome) => outcome,
+		};
+		// Redemptions caps execution at the requested amount and returns the
+		// actually cancelled debt; the remainder becomes pending deposit below.
+		ensure!(outcome.debt_cancelled <= amount, Error::<T>::InvalidRecoveryOffsetSnapshot);
 
 		deposit.claimable_collateral = deposit
 			.claimable_collateral
@@ -213,7 +207,7 @@ impl<T: Config> Pallet<T> {
 			collateral_gain: outcome.collateral_out,
 			source: RecoveryOffsetSource::IncomingDeposit,
 		});
-		Ok(used)
+		Ok(outcome.debt_cancelled)
 	}
 
 	/// SPEC.md §7.3: burn active pool stablecoin against the `FinalRecovery`
@@ -230,37 +224,37 @@ impl<T: Config> Pallet<T> {
 		// Mode, halted only by Frozen.
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 
-		let quote =
-			T::RecoveryOffsets::preview_recovery_offset(&collateral_id, &stable_id, max_stable_in)?;
-		let capacity = match quote {
-			RecoveryOffsetQuote::NoTarget => {
-				return Err(Error::<T>::RecoveryVaultNotFound.into());
-			},
-			RecoveryOffsetQuote::BelowPar => {
-				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
-			},
-			RecoveryOffsetQuote::Available { debt } => debt,
-		};
 		// Size the burn before touching anything: pool depth and the §6.5
 		// floor cap what the settlement may take.
 		let debt = math::clamp_offset_debt(
-			max_stable_in.min(capacity),
+			max_stable_in,
 			pool.state.total_active_deposits,
 			pool.config.minimum_active_pool_balance,
 		);
 		ensure!(!debt.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		let outcome = T::RecoveryOffsets::apply_recovery_offset(
+		let result = T::RecoveryOffsets::execute_recovery_offset(
 			&collateral_id,
 			&stable_id,
 			&pool_account,
 			&pool_account,
 			debt,
 		)?;
-		// Same dispatch, same oracle price: the settlement burns exactly
-		// what the clamp sized, keeping the §6.5 floor intact.
-		ensure!(outcome.debt_cancelled == debt, Error::<T>::InvalidRecoveryOffsetSnapshot);
+		let outcome = match result {
+			RecoveryOffsetResult::NoTarget => {
+				return Err(Error::<T>::RecoveryVaultNotFound.into());
+			},
+			RecoveryOffsetResult::BelowPar => {
+				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
+			},
+			RecoveryOffsetResult::Applied(outcome) => outcome,
+		};
+		// Redemptions caps execution at the clamp result. A smaller burn means
+		// the recovery head had less cancellable debt than the active pool could
+		// safely spend.
+		ensure!(outcome.debt_cancelled <= debt, Error::<T>::InvalidRecoveryOffsetSnapshot);
+		ensure!(!outcome.debt_cancelled.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
 
 		Self::apply_active_offset(
 			&collateral_id,
