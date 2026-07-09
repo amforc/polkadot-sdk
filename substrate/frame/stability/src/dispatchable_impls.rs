@@ -15,8 +15,7 @@ use frame::{
 	traits::{
 		fungibles::{Balanced as _, Mutate as _},
 		tokens::{Fortitude, Precision, Preservation},
-		Defensive,
-		Time,
+		Defensive, Time,
 	},
 };
 use pallet_linked_list::SortedListInterface;
