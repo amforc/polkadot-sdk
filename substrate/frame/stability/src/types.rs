@@ -232,12 +232,12 @@ mod tests {
 
 		// Below the minimum useful rescale.
 		let mut config = valid_config();
-		config.precision.scale_factor = 999;
+		config.precision.set_scale_factor(999);
 		assert!(!config.is_valid());
 
 		// Above the u128 overflow guard (1e10).
 		let mut config = valid_config();
-		config.precision.scale_factor = 10_000_000_001;
+		config.precision.set_scale_factor(10_000_000_001);
 		assert!(!config.is_valid());
 
 		// A rescale would push P above one: p_min * scale_factor > 1.
