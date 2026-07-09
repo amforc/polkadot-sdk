@@ -7,8 +7,8 @@ use crate::{
 	},
 	pending,
 	types::{
-		Deposit, PendingDeposit, PendingOffsetResult, PoolOffsetResult, PoolSums,
-		RecoveryOffsetSource, WithdrawalRequest,
+		Accumulators, Deposit, DepositSnapshot, PUpdate, PendingDeposit, PendingOffsetResult,
+		PoolOffsetResult, PoolSums, RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
 	},
 };
 use frame::{
@@ -41,9 +41,7 @@ struct ActiveOffsetPlan<Balance> {
 	new_sums: PoolSums,
 	new_unclaimed: Balance,
 	new_total_active: Balance,
-	new_epoch: u32,
-	new_scale: u32,
-	new_p: FixedU128,
+	new_coords: Accumulators,
 }
 
 /// One committed §6.8 backstop step: what it burned and credited.
@@ -574,8 +572,8 @@ impl<T: Config> Pallet<T> {
 			stable_id: stable_id.clone(),
 			debt_burned: sp_offset_debt,
 			collateral_gain: sp_offset_collateral,
-			epoch: state.epoch,
-			scale: state.scale,
+			epoch: state.coords.epoch,
+			scale: state.coords.scale,
 		});
 		PoolStates::<T>::insert(collateral_id, stable_id, state);
 		(
@@ -763,9 +761,13 @@ impl<T: Config> Pallet<T> {
 		debug_assert!(debt <= state.total_active_deposits);
 
 		let delta_s = state.delta_sum(collateral).ok_or(ArithmeticError::Overflow)?;
-		let mut new_sums =
-			PoolSumsStore::<T>::get((collateral_id, stable_id, state.epoch, state.scale))
-				.unwrap_or_default();
+		let mut new_sums = PoolSumsStore::<T>::get((
+			collateral_id,
+			stable_id,
+			state.coords.epoch,
+			state.coords.scale,
+		))
+		.unwrap_or_default();
 		new_sums.s_collateral =
 			new_sums.s_collateral.checked_add(&delta_s).ok_or(ArithmeticError::Overflow)?;
 		let new_unclaimed = state
@@ -774,37 +776,38 @@ impl<T: Config> Pallet<T> {
 			.ok_or(ArithmeticError::Overflow)?;
 
 		let update = math::update_p_after_offset(
-			state.p,
+			state.coords.p,
 			state.total_active_deposits,
 			debt,
 			&config.precision,
 		)
 		.ok_or(Error::<T>::UnsupportedOffsetPrecision)?;
-		let (new_epoch, new_scale, new_p, new_total_active) = match update {
-			math::PUpdate::Depleted => (
-				state.epoch.checked_add(1).ok_or(ArithmeticError::Overflow)?,
-				0,
-				FixedU128::one(),
+		let (new_coords, new_total_active) = match update {
+			PUpdate::Depleted => (
+				Accumulators {
+					p: FixedU128::one(),
+					epoch: state.coords.epoch.checked_add(1).ok_or(ArithmeticError::Overflow)?,
+					scale: 0,
+				},
 				BalanceOf::<T>::zero(),
 			),
-			math::PUpdate::Updated { new_p, scales_crossed } => (
-				state.epoch,
-				state.scale.checked_add(scales_crossed).ok_or(ArithmeticError::Overflow)?,
-				new_p,
+			PUpdate::Updated { new_p, scales_crossed } => (
+				Accumulators {
+					p: new_p,
+					epoch: state.coords.epoch,
+					scale: state
+						.coords
+						.scale
+						.checked_add(scales_crossed)
+						.ok_or(ArithmeticError::Overflow)?,
+				},
 				state
 					.total_active_deposits
 					.checked_sub(&debt)
 					.ok_or(ArithmeticError::Underflow)?,
 			),
 		};
-		Ok(ActiveOffsetPlan {
-			new_sums,
-			new_unclaimed,
-			new_total_active,
-			new_epoch,
-			new_scale,
-			new_p,
-		})
+		Ok(ActiveOffsetPlan { new_sums, new_unclaimed, new_total_active, new_coords })
 	}
 
 	/// Write an [`ActiveOffsetPlan`] into the sums store and `state`,
@@ -817,26 +820,24 @@ impl<T: Config> Pallet<T> {
 		plan: ActiveOffsetPlan<BalanceOf<T>>,
 	) {
 		PoolSumsStore::<T>::insert(
-			(collateral_id, stable_id, state.epoch, state.scale),
+			(collateral_id, stable_id, state.coords.epoch, state.coords.scale),
 			plan.new_sums,
 		);
-		if plan.new_epoch == state.epoch {
+		if plan.new_coords.epoch == state.coords.epoch {
 			// Bounded by `math::MAX_SCALE_CROSSINGS`.
-			for scale in state.scale.saturating_add(1)..=plan.new_scale {
+			for scale in state.coords.scale.saturating_add(1)..=plan.new_coords.scale {
 				PoolSumsStore::<T>::insert(
-					(collateral_id, stable_id, state.epoch, scale),
+					(collateral_id, stable_id, state.coords.epoch, scale),
 					PoolSums::default(),
 				);
 			}
 		} else {
 			PoolSumsStore::<T>::insert(
-				(collateral_id, stable_id, plan.new_epoch, 0u32),
+				(collateral_id, stable_id, plan.new_coords.epoch, 0u32),
 				PoolSums::default(),
 			);
 		}
-		state.epoch = plan.new_epoch;
-		state.scale = plan.new_scale;
-		state.p = plan.new_p;
+		state.coords = plan.new_coords;
 		state.total_active_deposits = plan.new_total_active;
 		state.total_collateral_gains_unclaimed = plan.new_unclaimed;
 	}
@@ -994,9 +995,13 @@ impl<T: Config> Pallet<T> {
 		let Some(delta_g) = state.delta_sum(amount) else {
 			return credit;
 		};
-		let mut sums =
-			PoolSumsStore::<T>::get((collateral_id, stable_id, state.epoch, state.scale))
-				.unwrap_or_default();
+		let mut sums = PoolSumsStore::<T>::get((
+			collateral_id,
+			stable_id,
+			state.coords.epoch,
+			state.coords.scale,
+		))
+		.unwrap_or_default();
 		let Some(new_g) = sums.g_yield.checked_add(&delta_g) else {
 			return credit;
 		};
@@ -1011,7 +1016,10 @@ impl<T: Config> Pallet<T> {
 		};
 
 		sums.g_yield = new_g;
-		PoolSumsStore::<T>::insert((collateral_id, stable_id, state.epoch, state.scale), sums);
+		PoolSumsStore::<T>::insert(
+			(collateral_id, stable_id, state.coords.epoch, state.coords.scale),
+			sums,
+		);
 		state.total_yield_unclaimed = new_total_yield;
 		PoolStates::<T>::insert(collateral_id, stable_id, state);
 		Self::deposit_event(Event::YieldDistributed {
@@ -1151,20 +1159,27 @@ impl<T: Config> Pallet<T> {
 		deposit: &mut DepositOf<T>,
 	) -> DispatchResult {
 		let snapshot = deposit.snapshot;
-		let current = PoolSumsStore::<T>::get((collateral_id, stable_id, state.epoch, state.scale))
-			.unwrap_or_default();
+		let current = PoolSumsStore::<T>::get((
+			collateral_id,
+			stable_id,
+			state.coords.epoch,
+			state.coords.scale,
+		))
+		.unwrap_or_default();
 		// A snapshot already at the live coordinates realizes against the
 		// current row alone — no row above the live scale can exist — which
 		// makes the snapshot-reset read below cover the whole window.
-		let window = if snapshot.epoch == state.epoch && snapshot.scale == state.scale {
-			math::SumsWindow { snap: current, ahead: Default::default() }
+		let window = if snapshot.coords.epoch == state.coords.epoch &&
+			snapshot.coords.scale == state.coords.scale
+		{
+			SumsWindow { snap: current, ahead: Default::default() }
 		} else {
 			Self::sums_window(collateral_id, stable_id, &snapshot)
 		};
 		let realized = math::realize(
 			deposit.active_deposit,
 			&snapshot,
-			&state.accumulators(),
+			&state.coords,
 			&window,
 			&config.precision,
 		);
@@ -1197,8 +1212,8 @@ impl<T: Config> Pallet<T> {
 		deposit: &mut DepositOf<T>,
 		now: Millis,
 	) -> Result<bool, DispatchError> {
-		debug_assert!(deposit.snapshot.p == state.p);
-		debug_assert!(deposit.snapshot.epoch == state.epoch);
+		debug_assert!(deposit.snapshot.coords.p == state.coords.p);
+		debug_assert!(deposit.snapshot.coords.epoch == state.coords.epoch);
 		let Some(pending) = &deposit.pending_deposit else {
 			return Ok(false);
 		};
@@ -1239,9 +1254,13 @@ impl<T: Config> Pallet<T> {
 		state: &PoolStateOf<T>,
 	) -> DepositOf<T> {
 		Deposits::<T>::get((collateral_id, stable_id, who)).unwrap_or_else(|| {
-			let current =
-				PoolSumsStore::<T>::get((collateral_id, stable_id, state.epoch, state.scale))
-					.unwrap_or_default();
+			let current = PoolSumsStore::<T>::get((
+				collateral_id,
+				stable_id,
+				state.coords.epoch,
+				state.coords.scale,
+			))
+			.unwrap_or_default();
 			Deposit::fresh(state.snapshot(&current))
 		})
 	}
@@ -1282,22 +1301,26 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn sums_window(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-		snapshot: &math::DepositSnapshot,
-	) -> math::SumsWindow {
-		let snap =
-			PoolSumsStore::<T>::get((collateral_id, stable_id, snapshot.epoch, snapshot.scale))
-				.unwrap_or_default();
+		snapshot: &DepositSnapshot,
+	) -> SumsWindow {
+		let snap = PoolSumsStore::<T>::get((
+			collateral_id,
+			stable_id,
+			snapshot.coords.epoch,
+			snapshot.coords.scale,
+		))
+		.unwrap_or_default();
 		let mut ahead = [PoolSums::default(); math::SCALE_SPAN as usize];
-		let mut scale = snapshot.scale;
+		let mut scale = snapshot.coords.scale;
 		for slot in &mut ahead {
 			scale = scale.saturating_add(1);
 			let Some(sums) =
-				PoolSumsStore::<T>::get((collateral_id, stable_id, snapshot.epoch, scale))
+				PoolSumsStore::<T>::get((collateral_id, stable_id, snapshot.coords.epoch, scale))
 			else {
 				break;
 			};
 			*slot = sums;
 		}
-		math::SumsWindow { snap, ahead }
+		SumsWindow { snap, ahead }
 	}
 }

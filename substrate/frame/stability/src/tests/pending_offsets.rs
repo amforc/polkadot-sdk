@@ -132,9 +132,9 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		// Only pending capital moved: the accumulators and the active side
 		// are bit-identical (invariant 11).
 		let after = pool_state(DOT, PUSD);
-		assert_eq!(after.p, before.p);
-		assert_eq!(after.epoch, before.epoch);
-		assert_eq!(after.scale, before.scale);
+		assert_eq!(after.coords.p, before.coords.p);
+		assert_eq!(after.coords.epoch, before.coords.epoch);
+		assert_eq!(after.coords.scale, before.coords.scale);
 		assert_eq!(after.total_active_deposits, 600);
 		assert_eq!(after.total_pending_deposits, 100);
 		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), sums_before);
@@ -241,9 +241,9 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.epoch, 1);
-		assert_eq!(state.scale, 0);
-		assert_eq!(state.p, FixedU128::one());
+		assert_eq!(state.coords.epoch, 1);
+		assert_eq!(state.coords.scale, 0);
+		assert_eq!(state.coords.p, FixedU128::one());
 		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("row");
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(7_865_547_022_727, 1_501));
 
