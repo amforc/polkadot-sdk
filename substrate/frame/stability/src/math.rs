@@ -1,5 +1,5 @@
-//! Product-sum accounting for the Stability Pool: the pure accumulator-coordinate types it
-//! interprets, some of which are SCALE-encoded into storage rows.
+//! Product-sum accounting for the Stability Pool: the pure functions that
+//! interpret the lazy accumulator model.
 //!
 //! The pool tracks depositor state lazily through three global accumulators
 //! (SPEC.md §6):
@@ -15,15 +15,14 @@
 //! Rounding: user payouts (compounded deposits, collateral gains, yield
 //! gains) round down; the flooring dust stays inside pool-owned totals.
 
-use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
+use crate::types::{Accumulators, DepositSnapshot, PUpdate, PoolPrecision, Realized, SumsWindow};
 use frame::{
 	arithmetic::{
-		helpers_128bit::multiply_by_rational_with_rounding, FixedPointNumber, FixedPointOperand,
-		FixedU128, One, Rounding, Saturating, Zero,
+		helpers_128bit::multiply_by_rational_with_rounding, FixedPointOperand, FixedU128, One,
+		Rounding, Saturating, Zero,
 	},
 	traits::Defensive,
 };
-use scale_info::TypeInfo;
 
 /// A single offset may rescale `P` at most this many times before the pallet
 /// rejects it as unresolvable precision loss. Two crossings are only
@@ -47,141 +46,6 @@ pub const SCALE_FACTOR_INT_MAX: u64 = 10_000_000_000;
 /// offset; this bounds realization lag.
 pub const SCALE_SPAN: u32 = 2;
 
-/// Live product-sum coordinates of a pool.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Accumulators {
-	pub p: FixedU128,
-	pub epoch: u32,
-	pub scale: u32,
-}
-
-/// `S` and `G` for one `(epoch, scale)` coordinate (SPEC.md §5.2). Stored
-/// per coordinate in the pallet's sums store.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
-pub struct PoolSums {
-	pub s_collateral: FixedU128,
-	pub g_yield: FixedU128,
-}
-
-/// A deposit's stored snapshot of the accumulators at its last realization.
-/// Embedded in every `Deposit` storage row, hence the codec derives.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
-pub struct DepositSnapshot {
-	pub p: FixedU128,
-	pub sums: PoolSums,
-	pub epoch: u32,
-	pub scale: u32,
-}
-
-impl DepositSnapshot {
-	/// The genesis coordinates a fresh pool hands out: `P = 1`, zero sums,
-	/// epoch and scale 0. Realization against a fresh pool is the identity.
-	pub fn fresh() -> Self {
-		Self { p: FixedU128::one(), sums: PoolSums::default(), epoch: 0, scale: 0 }
-	}
-}
-
-/// Gain sums a deposit realizes against: the row at its snapshot
-/// `(epoch, scale)` plus the [`SCALE_SPAN`] rows after it (zero when
-/// absent).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SumsWindow {
-	pub snap: PoolSums,
-	pub ahead: [PoolSums; SCALE_SPAN as usize],
-}
-
-/// Accumulator precision parameters from `StabilityPoolConfig`. Immutable
-/// per branch: historical snapshots realize against the `scale_factor` that
-/// was live when their scale was crossed, so changing it would misprice
-/// every deposit left behind a scale boundary.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
-pub struct PoolPrecision {
-	pub p_min: FixedU128,
-	// TODO: Check visibility
-	pub scale_factor: u64,
-}
-
-impl PoolPrecision {
-	/// Out-of-range parameters break product-sum accounting: `scale_factor`
-	/// must lie in `[SCALE_FACTOR_INT_MIN, SCALE_FACTOR_INT_MAX]`, and a
-	/// rescale must land `P` back at or below one: `p_min * scale_factor <= 1`.
-	pub fn is_valid(&self) -> bool {
-		if self.p_min.is_zero() {
-			return false;
-		}
-		if self.scale_factor < SCALE_FACTOR_INT_MIN {
-			return false;
-		}
-		if self.scale_factor > SCALE_FACTOR_INT_MAX {
-			return false;
-		}
-		self.p_min.saturating_mul(FixedU128::saturating_from_integer(self.scale_factor)) <=
-			FixedU128::one()
-	}
-
-	/// `scale_factor` widened for the u128 accumulator math, floored at 1 as a
-	/// guard against a decoded zero dividing by zero in [`gain`].
-	pub fn scale_factor(&self) -> u128 {
-		debug_assert!(self.scale_factor >= SCALE_FACTOR_INT_MIN);
-		debug_assert!(self.scale_factor <= SCALE_FACTOR_INT_MAX);
-		u128::from(self.scale_factor).max(1)
-	}
-
-	#[cfg(test)]
-	pub(crate) fn set_scale_factor(&mut self, scale_factor: u64) {
-		self.scale_factor = scale_factor;
-	}
-}
-
-/// Outcome of realizing a deposit against the current accumulators.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Realized<Balance> {
-	pub compounded: Balance,
-	pub collateral_gain: Balance,
-	pub yield_gain: Balance,
-}
-
-/// Outcome of shrinking `P` after an active-pool offset.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PUpdate {
-	Updated { new_p: FixedU128, scales_crossed: u32 },
-	Depleted,
-}
-
 /// Realize a deposit of `d0` (as of its snapshot) against the current
 /// accumulators: SPEC.md §6.2 with the §6.4 epoch/scale rules folded in.
 ///
@@ -200,9 +64,9 @@ pub fn realize<Balance: FixedPointOperand>(
 	window: &SumsWindow,
 	precision: &PoolPrecision,
 ) -> Realized<Balance> {
-	debug_assert!(!snapshot.p.is_zero());
+	debug_assert!(!snapshot.coords.p.is_zero());
 	debug_assert!(current.p <= FixedU128::one());
-	debug_assert!(snapshot.epoch <= current.epoch);
+	debug_assert!(snapshot.coords.epoch <= current.epoch);
 	debug_assert!(window.snap.s_collateral >= snapshot.sums.s_collateral);
 	debug_assert!(window.snap.g_yield >= snapshot.sums.g_yield);
 	if d0.is_zero() {
@@ -214,14 +78,14 @@ pub fn realize<Balance: FixedPointOperand>(
 	}
 	let sf_int = precision.scale_factor();
 
-	let compounded = if snapshot.epoch == current.epoch {
+	let compounded = if snapshot.coords.epoch == current.epoch {
 		// Each scale behind adds a `scale_factor` divisor; `is_valid` bounds
 		// keep the worst-case denominator
 		// `1e18 * (1e10)^SCALE_SPAN = 1e38` inside `u128`.
-		let denominator = match current.scale.checked_sub(snapshot.scale) {
+		let denominator = match current.scale.checked_sub(snapshot.coords.scale) {
 			Some(behind) if behind <= SCALE_SPAN => sf_int
 				.checked_pow(behind)
-				.and_then(|factor| snapshot.p.into_inner().checked_mul(factor)),
+				.and_then(|factor| snapshot.coords.p.into_inner().checked_mul(factor)),
 			Some(_) | None => None,
 		};
 		match denominator {
@@ -239,7 +103,7 @@ pub fn realize<Balance: FixedPointOperand>(
 		snapshot.sums.s_collateral,
 		window.ahead.map(|row| row.s_collateral),
 		sf_int,
-		snapshot.p,
+		snapshot.coords.p,
 	);
 	let yield_gain = gain(
 		d0,
@@ -247,7 +111,7 @@ pub fn realize<Balance: FixedPointOperand>(
 		snapshot.sums.g_yield,
 		window.ahead.map(|row| row.g_yield),
 		sf_int,
-		snapshot.p,
+		snapshot.coords.p,
 	);
 
 	Realized { compounded, collateral_gain, yield_gain }
@@ -409,6 +273,7 @@ fn mul_ratio_floor<Balance: FixedPointOperand>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::types::PoolSums;
 
 	const SF: u64 = 1_000_000_000;
 	const P_MIN: FixedU128 = FixedU128::from_inner(1_000_000_000);
@@ -425,7 +290,10 @@ mod tests {
 		epoch: u32,
 		scale: u32,
 	) -> DepositSnapshot {
-		DepositSnapshot { p, sums: PoolSums { s_collateral: s, g_yield: g }, epoch, scale }
+		DepositSnapshot {
+			coords: Accumulators { p, epoch, scale },
+			sums: PoolSums { s_collateral: s, g_yield: g },
+		}
 	}
 
 	fn window(s_snap: FixedU128, g_snap: FixedU128) -> SumsWindow {
