@@ -2,9 +2,7 @@
 //! that must hold after every operation.
 
 use crate::{
-	pallet::{
-		BalanceOf, Config, Deposits, Pallet, PoolStates, PoolSumsStore, StabilityPoolConfigs,
-	},
+	pallet::{BalanceOf, Config, Deposits, Pallet, PoolSumsStore, Pools},
 	pending,
 };
 use frame::{
@@ -15,9 +13,9 @@ use frame::{
 use pallet_linked_list::SortedListInterface;
 
 pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
-	for (collateral_id, stable_id, state) in PoolStates::<T>::iter() {
-		let config = StabilityPoolConfigs::<T>::get(&collateral_id, &stable_id)
-			.ok_or("pool state row without a config row")?;
+	for (collateral_id, stable_id, pool) in Pools::<T>::iter() {
+		let state = &pool.state;
+		let config = &pool.config;
 		if !config.is_valid() {
 			return Err("stored stability-pool config fails `is_valid`".into());
 		}
@@ -98,15 +96,11 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		}
 	}
 
-	// State rows are the registration proxy: nothing may outlive them.
-	for (collateral_id, stable_id, _config) in StabilityPoolConfigs::<T>::iter() {
-		if !PoolStates::<T>::contains_key(&collateral_id, &stable_id) {
-			return Err("stability-pool config row without a state row".into());
-		}
-	}
+	// Pool rows are the registration proxy: nothing may outlive them.
 	for ((collateral_id, stable_id, _who), deposit) in Deposits::<T>::iter() {
-		let state = PoolStates::<T>::get(&collateral_id, &stable_id)
-			.ok_or("deposit row without a pool state row")?;
+		let state = Pools::<T>::get(&collateral_id, &stable_id)
+			.ok_or("deposit row without a pool row")?
+			.state;
 		if deposit.snapshot.coords.epoch > state.coords.epoch {
 			return Err("deposit snapshot epoch ahead of the pool".into());
 		}
