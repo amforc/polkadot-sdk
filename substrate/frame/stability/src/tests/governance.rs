@@ -1,6 +1,6 @@
 //! Branch lifecycle seeding and `set_stability_pool_config` governance.
 
-use crate::{mock::*, types::PoolSums, Error};
+use crate::{mock::*, pending, types::PoolSums, Error};
 use frame::traits::Get;
 
 fn providers(who: AccountId) -> u32 {
@@ -79,6 +79,26 @@ fn branch_removal_blocked_while_depositor_rows_exist() {
 		assert!(crate::PoolStates::<Test>::get(DOT, PUSD).is_some());
 
 		crate::Deposits::<Test>::remove((DOT, PUSD, 5u128));
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
+	});
+}
+
+#[test]
+fn branch_removal_blocked_while_fifo_nodes_exist() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		// An orphan FIFO node without a deposit row is only reachable through
+		// a bug elsewhere; teardown must still refuse to strand it.
+		let fifo = pending::list_id::<Test>(&DOT, &PUSD);
+		assert_ok!(pending::append::<Test>(&fifo, 5));
+
+		assert_noop!(
+			Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
+			Error::<Test>::PendingFifoInvariantBroken
+		);
+		assert!(crate::PoolStates::<Test>::get(DOT, PUSD).is_some());
+
+		assert_ok!(pending::remove::<Test>(&fifo, &5));
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 	});
 }
@@ -177,7 +197,7 @@ fn set_stability_pool_config_freezes_precision_parameters() {
 
 		// Same for the scale factor (1e8 is inside the validity bounds).
 		let mut config = default_pool_config();
-		config.precision.scale_factor = FixedU128::from_u32(100_000_000);
+		config.precision.scale_factor = 100_000_000;
 		assert_noop!(
 			Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config),
 			Error::<Test>::AccumulatorParamsImmutable

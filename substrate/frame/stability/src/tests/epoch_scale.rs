@@ -1,7 +1,7 @@
 //! Epoch bumps and scale crossings: the product-sum coordinates under full
 //! depletion and extreme partial offsets.
 
-use crate::{mock::*, Error};
+use crate::mock::*;
 
 /// Deposit and immediately activate `amount` for `who`.
 fn seed_active(who: AccountId, amount: Balance) {
@@ -27,7 +27,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		assert_ok!(activate(1, DOT, PUSD));
 		assert_ok!(activate(2, DOT, PUSD));
 
-		let result = simulate_offset(DOT, PUSD, 1_000, 800).expect("depletes");
+		let (result, _) = simulate_offset(DOT, PUSD, 1_000, 800);
 		assert_eq!(result.debt_offset, 1_000);
 
 		let state = pool_state(DOT, PUSD);
@@ -61,7 +61,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		advance_time(5_000);
 		assert_ok!(activate(3, DOT, PUSD));
 		let before_3 = collateral_balance(DOT, 3);
-		assert_ok!(simulate_offset(DOT, PUSD, 250, 100));
+		assert_eq!(simulate_offset(DOT, PUSD, 250, 100).0.debt_offset, 250);
 		assert_ok!(claim_collateral(3, DOT, PUSD, 3));
 		// floor(500 * floor(100 * 1e18 / 500) / 1e18) = 100, and the
 		// compounded deposit is floor(500 * 0.5) = 250.
@@ -81,7 +81,7 @@ fn scale_crossing_preserves_older_deposits() {
 		// Offset all but 100 (the exact floor): the survival ratio 1e-11
 		// pushes P below p_min once, so it crosses one scale:
 		// P = floor(1e18 * 1e9 * 100 / 1e13) = 1e16 (0.01), scale 1.
-		let result = simulate_offset(DOT, PUSD, unit - 100, 5_000_000_000_000).expect("crosses");
+		let (result, _) = simulate_offset(DOT, PUSD, unit - 100, 5_000_000_000_000);
 		assert_eq!(result.debt_offset, unit - 100);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.epoch, 0);
@@ -105,7 +105,7 @@ fn scale_crossing_preserves_older_deposits() {
 		// the floor: delta_S(0,1) = floor(40 * 0.01 / 100) = 4e15 inner,
 		// P = floor(1e16 * 50 / 100) = 5e15.
 		set_min_active_pool(10);
-		assert_ok!(simulate_offset(DOT, PUSD, 50, 40));
+		assert_eq!(simulate_offset(DOT, PUSD, 50, 40).0.debt_offset, 50);
 
 		// The scale-0 deposit realizes across the boundary:
 		// compounded = floor(1e13 * 5e15 / (1e18 * 1e9)) = 50;
@@ -122,7 +122,7 @@ fn scale_crossing_preserves_older_deposits() {
 }
 
 #[test]
-fn deposit_two_scales_behind_realizes_zero_but_keeps_window_gains() {
+fn deposit_two_scales_behind_realizes_through_the_squared_divisor() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		set_min_active_pool(5);
@@ -131,29 +131,30 @@ fn deposit_two_scales_behind_realizes_zero_but_keeps_window_gains() {
 
 		// Leaving 5 of 1e19 is a survival ratio of 5e-19 < 1e-18: two
 		// crossings in one offset, P = floor(1e36 * 5 / 1e19) = 5e17 (0.5).
-		assert_ok!(simulate_offset(DOT, PUSD, unit - 5, 8_000_000_000_000_000_000));
+		let (result, _) = simulate_offset(DOT, PUSD, unit - 5, 8_000_000_000_000_000_000);
+		assert_eq!(result.debt_offset, unit - 5);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.scale, 2);
 		assert_eq!(state.p, FixedU128::from_rational(1, 2));
 		assert_eq!(state.total_active_deposits, 5);
 
-		// Two scales behind: the compounded deposit is below one part in
-		// 1e18 of the original and rounds to zero — this is exactly the
-		// §6.5 failure mode a sane `minimum_active_pool_balance` prevents.
-		assert_noop!(withdraw(1, DOT, PUSD, unit, 1), Error::<Test>::NoActiveDeposit);
-		// The window gains survive: floor(1e19 * 0.8) = 8e18.
+		// Two scales behind, the sf² divisor still prices the survivor
+		// exactly: compounded = floor(1e19 * 0.5 / (1 * 1e18)) = 5 — the
+		// whole remaining pool, nothing stranded. The window gains survive
+		// alongside: floor(1e19 * 0.8) = 8e18.
 		let before = collateral_balance(DOT, 1);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
 		assert_eq!(collateral_balance(DOT, 1) - before, 8_000_000_000_000_000_000);
-		// The final claim pruned the realized-to-zero row; the 5 stranded
-		// units stay in the aggregate as unattributable dust.
+		assert_ok!(withdraw(1, DOT, PUSD, unit, 1));
+		assert_eq!(stable_balance(PUSD, 1), 5);
+		// The emptied row is gone and the aggregate holds no dust.
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 5);
+		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
 	});
 }
 
 #[test]
-fn offset_beyond_supported_precision_is_rejected_atomically() {
+fn offset_beyond_supported_precision_steps_aside_untouched() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		set_min_active_pool(1);
@@ -161,13 +162,14 @@ fn offset_beyond_supported_precision_is_rejected_atomically() {
 		seed_active(1, unit);
 
 		// A survival ratio of 1e-28 needs more than two crossings:
-		// floor(1e36 * 1 / 1e28) = 1e8 < p_min even at the cap.
-		assert_noop!(
-			Stability::offset_liquidation(&DOT, &PUSD, unit - 1, unit),
-			Error::<Test>::UnsupportedOffsetPrecision
-		);
+		// floor(1e36 * 1 / 1e28) = 1e8 < p_min even at the cap. The pool
+		// declines the offset and returns the whole credit.
+		let (result, leftover) = simulate_offset(DOT, PUSD, unit - 1, unit);
+		assert_eq!(result.debt_offset, 0);
+		assert_eq!(result.collateral_to_pool, 0);
+		assert_eq!(leftover, unit);
 
-		// Atomic: the partial S/burn writes rolled back with it.
+		// The plan failed before any value moved: nothing to roll back.
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.p, FixedU128::one());
 		assert_eq!(state.total_active_deposits, unit);

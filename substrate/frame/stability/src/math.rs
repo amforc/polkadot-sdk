@@ -39,12 +39,19 @@ pub const MAX_SCALE_CROSSINGS: u32 = 2;
 
 /// Lower bound on the integer value of `scale_factor`: rescaling by less
 /// buys back too little precision per crossing to be worth a scale index.
-pub const SCALE_FACTOR_INT_MIN: u128 = 1_000;
+pub const SCALE_FACTOR_INT_MIN: u64 = 1_000;
 
 /// Upper bound on the integer value of `scale_factor` (1e10). Keeps the
 /// worst-case [`update_p_after_offset`] numerator inside `u128`:
 /// `P.inner * scale_factor^MAX_SCALE_CROSSINGS <= 1e18 * 1e20 = 1e38`.
-pub const SCALE_FACTOR_INT_MAX: u128 = 10_000_000_000;
+pub const SCALE_FACTOR_INT_MAX: u64 = 10_000_000_000;
+
+/// How many scales past its snapshot a deposit still realizes: the row at `snapshot.scale + k`
+/// contributes with an extra `scale_factor^k` divisor for `k <= SCALE_SPAN`. Anything further is
+/// below one part in `scale_factor^SCALE_SPAN` (>= 1e6) of the deposit and
+/// is deliberately ignored. Distinct from [`MAX_SCALE_CROSSINGS`], which bounds a single
+/// offset; this bounds realization lag.
+pub const SCALE_SPAN: u32 = 2;
 
 /// Live product-sum coordinates of a pool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,14 +111,12 @@ impl DepositSnapshot {
 }
 
 /// Gain sums a deposit realizes against: the row at its snapshot
-/// `(epoch, scale)` and the row one scale later (zero when absent).
-///
-/// Rows two or more scales past the snapshot would contribute less than one
-/// part in 1e18 of the deposit and are deliberately ignored (SPEC.md §6.4).
+/// `(epoch, scale)` plus the [`SCALE_SPAN`] rows after it (zero when
+/// absent).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SumsWindow {
 	pub snap: PoolSums,
-	pub next: PoolSums,
+	pub ahead: [PoolSums; SCALE_SPAN as usize],
 }
 
 /// Accumulator precision parameters from `StabilityPoolConfig`. Immutable
@@ -132,29 +137,25 @@ pub struct SumsWindow {
 )]
 pub struct PoolPrecision {
 	pub p_min: FixedU128,
-	pub scale_factor: FixedU128,
+	pub scale_factor: u64,
 }
 
 impl PoolPrecision {
 	/// Out-of-range parameters break product-sum accounting: `scale_factor`
-	/// must be an integer in `[SCALE_FACTOR_INT_MIN, SCALE_FACTOR_INT_MAX]`,
-	/// and a rescale must land `P` back at or below one:
-	/// `p_min * scale_factor <= 1`.
+	/// must lie in `[SCALE_FACTOR_INT_MIN, SCALE_FACTOR_INT_MAX]`, and a
+	/// rescale must land `P` back at or below one: `p_min * scale_factor <= 1`.
 	pub fn is_valid(&self) -> bool {
 		if self.p_min.is_zero() {
 			return false;
 		}
-		if !self.scale_factor.frac().is_zero() {
+		if self.scale_factor < SCALE_FACTOR_INT_MIN {
 			return false;
 		}
-		let scale_factor_int = self.scale_factor.into_inner() / FixedU128::DIV;
-		if scale_factor_int < SCALE_FACTOR_INT_MIN {
+		if self.scale_factor > SCALE_FACTOR_INT_MAX {
 			return false;
 		}
-		if scale_factor_int > SCALE_FACTOR_INT_MAX {
-			return false;
-		}
-		self.p_min.saturating_mul(self.scale_factor) <= FixedU128::one()
+		self.p_min.saturating_mul(FixedU128::saturating_from_integer(self.scale_factor)) <=
+			FixedU128::one()
 	}
 }
 
@@ -176,13 +177,14 @@ pub enum PUpdate {
 /// Realize a deposit of `d0` (as of its snapshot) against the current
 /// accumulators: SPEC.md §6.2 with the §6.4 epoch/scale rules folded in.
 ///
-/// - same epoch and scale: `compounded = floor(d0 * P / P0)`;
-/// - one scale behind: extra `scale_factor` divisor on the compounded value;
-/// - two or more scales behind, or an earlier epoch: compounded is zero.
+/// - `k <= SCALE_SPAN` scales behind in the same epoch: `compounded = floor(d0 * P / (P0 *
+///   scale_factor^k))`;
+/// - further behind, or an earlier epoch: compounded is zero.
 ///
 /// Gains use one uniform formula across all cases:
-/// `floor(d0 * ((sum_snap - sum0) + sum_next / scale_factor) / P0)` — in the
-/// same-scale case `sum_snap` is the live row and `sum_next` is zero.
+/// `floor(d0 * ((sum_snap - sum0) + Σ ahead[k] / scale_factor^(k+1)) / P0)`
+/// — in the same-scale case `sum_snap` is the live row and the look-ahead
+/// rows are zero.
 pub fn realize<Balance: FixedPointOperand>(
 	d0: Balance,
 	snapshot: &DepositSnapshot,
@@ -203,20 +205,23 @@ pub fn realize<Balance: FixedPointOperand>(
 		};
 	}
 	let d: u128 = d0.unique_saturated_into();
-	let sf_int = scale_factor_int(precision.scale_factor);
+	let sf_int = scale_factor_u128(precision.scale_factor);
 
 	let compounded_raw = if snapshot.epoch == current.epoch {
-		match current.scale.checked_sub(snapshot.scale) {
-			Some(0) => multiply_by_rational_with_rounding(
-				d,
-				current.p.into_inner(),
-				snapshot.p.into_inner(),
-				Rounding::Down,
-			),
-			Some(1) => snapshot.p.into_inner().checked_mul(sf_int).and_then(|denom| {
+		// Each scale behind adds a `scale_factor` divisor; `is_valid` bounds
+		// keep the worst-case denominator
+		// `1e18 * (1e10)^SCALE_SPAN = 1e38` inside `u128`.
+		let denominator = match current.scale.checked_sub(snapshot.scale) {
+			Some(behind) if behind <= SCALE_SPAN => sf_int
+				.checked_pow(behind)
+				.and_then(|factor| snapshot.p.into_inner().checked_mul(factor)),
+			Some(_) | None => None,
+		};
+		match denominator {
+			Some(denom) => {
 				multiply_by_rational_with_rounding(d, current.p.into_inner(), denom, Rounding::Down)
-			}),
-			Some(_) | None => Some(0),
+			},
+			None => Some(0),
 		}
 	} else {
 		Some(0)
@@ -227,7 +232,7 @@ pub fn realize<Balance: FixedPointOperand>(
 		d,
 		window.snap.s_collateral,
 		snapshot.sums.s_collateral,
-		window.next.s_collateral,
+		window.ahead.map(|row| row.s_collateral),
 		sf_int,
 		snapshot.p,
 	);
@@ -235,7 +240,7 @@ pub fn realize<Balance: FixedPointOperand>(
 		d,
 		window.snap.g_yield,
 		snapshot.sums.g_yield,
-		window.next.g_yield,
+		window.ahead.map(|row| row.g_yield),
 		sf_int,
 		snapshot.p,
 	);
@@ -247,18 +252,30 @@ pub fn realize<Balance: FixedPointOperand>(
 	}
 }
 
-/// `floor(d * ((sum_snap - sum0) + sum_next / sf_int) / p0)`, the shared gain
-/// leg of [`realize`] for both the collateral (`S`) and yield (`G`) sums.
+/// `floor(d * ((sum_snap - sum0) + Σ ahead[k] / sf_int^(k+1)) / p0)`, the
+/// shared gain leg of [`realize`] for both the collateral (`S`) and yield
+/// (`G`) sums.
 fn gain(
 	d: u128,
 	sum_snap: FixedU128,
 	sum0: FixedU128,
-	sum_next: FixedU128,
+	ahead: [FixedU128; SCALE_SPAN as usize],
 	sf_int: u128,
 	p0: FixedU128,
 ) -> Option<u128> {
-	let next_scaled = FixedU128::from_inner(sum_next.into_inner() / sf_int.max(1));
-	let delta = sum_snap.saturating_sub(sum0).saturating_add(next_scaled);
+	// `scale_factor_u128` guarantees `1 <= sf_int <= 1e10`, so every divisor
+	// (at most `sf_int^SCALE_SPAN = 1e20`) stays inside `u128`.
+	debug_assert!(sf_int >= 1);
+	let mut delta = sum_snap.saturating_sub(sum0);
+	let mut divisor = sf_int;
+	for row in ahead {
+		// The hot same-coordinate path carries zero look-ahead rows; skip
+		// their divisions outright.
+		if !row.is_zero() {
+			delta = delta.saturating_add(FixedU128::from_inner(row.into_inner() / divisor));
+		}
+		divisor = divisor.saturating_mul(sf_int);
+	}
 	if delta.is_zero() {
 		return Some(0);
 	}
@@ -351,7 +368,7 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	}
 	let total: u128 = total_active.unique_saturated_into();
 	let new_total: u128 = total_active.saturating_sub(offset_debt).unique_saturated_into();
-	let sf_int = scale_factor_int(precision.scale_factor);
+	let sf_int = scale_factor_u128(precision.scale_factor);
 
 	let mut factor: u128 = 1;
 	for scales_crossed in 0..=MAX_SCALE_CROSSINGS {
@@ -370,13 +387,12 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	None
 }
 
-/// Integer value of the (validated integer-valued) `scale_factor`.
-fn scale_factor_int(scale_factor: FixedU128) -> u128 {
-	debug_assert!(scale_factor.frac().is_zero());
-	let sf_int = scale_factor.into_inner() / FixedU128::DIV;
-	debug_assert!(sf_int >= SCALE_FACTOR_INT_MIN);
-	debug_assert!(sf_int <= SCALE_FACTOR_INT_MAX);
-	sf_int.max(1)
+/// The validated `scale_factor` widened for u128 arithmetic, floored at 1 so
+/// a misconfigured zero cannot divide-by-zero in [`gain`].
+fn scale_factor_u128(scale_factor: u64) -> u128 {
+	debug_assert!(scale_factor >= SCALE_FACTOR_INT_MIN);
+	debug_assert!(scale_factor <= SCALE_FACTOR_INT_MAX);
+	u128::from(scale_factor).max(1)
 }
 
 /// Convert a raw payout to `Balance`, flooring impossible states to zero.
@@ -391,7 +407,7 @@ fn to_balance<Balance: FixedPointOperand>(raw: Option<u128>) -> Balance {
 mod tests {
 	use super::*;
 
-	const SF: FixedU128 = FixedU128::from_u32(1_000_000_000);
+	const SF: u64 = 1_000_000_000;
 	const P_MIN: FixedU128 = FixedU128::from_inner(1_000_000_000);
 	const PRECISION: PoolPrecision = PoolPrecision { p_min: P_MIN, scale_factor: SF };
 
@@ -412,7 +428,7 @@ mod tests {
 	fn window(s_snap: FixedU128, g_snap: FixedU128) -> SumsWindow {
 		SumsWindow {
 			snap: PoolSums { s_collateral: s_snap, g_yield: g_snap },
-			next: PoolSums::default(),
+			ahead: Default::default(),
 		}
 	}
 
@@ -478,24 +494,71 @@ mod tests {
 				s_collateral: FixedU128::from_rational(1, 2),
 				g_yield: FixedU128::zero(),
 			},
-			next: PoolSums { s_collateral: FixedU128::from_u32(300), g_yield: FixedU128::zero() },
+			ahead: [
+				PoolSums { s_collateral: FixedU128::from_u32(300), g_yield: FixedU128::zero() },
+				PoolSums::default(),
+			],
 		};
 		let got = realize::<u128>(1_000_000_000_000, &snap, &current, &sums, &PRECISION);
 		assert_eq!(got.collateral_gain, 600_000_600_000);
 	}
 
 	#[test]
-	fn realize_two_scales_behind_compounds_to_zero_but_pays_gains() {
-		// Crossing two scales means the surviving fraction is below 1e-18 of
-		// the original: the compounded deposit rounds to zero, while gains
-		// recorded in the snapshot window remain claimable.
+	fn realize_two_scales_behind_divides_by_scale_factor_squared() {
+		// D0=4e18 at P0=1 on scale 0; current scale 2 with P=0.5:
+		// compounded = floor(4e18 * 0.5 / (1 * 1e18)) = 2.
 		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
 		let current = accumulators(FixedU128::from_rational(1, 2), 0, 2);
 		let sums = window(FixedU128::from_rational(1, 4), FixedU128::zero());
-		let got = realize::<u128>(1_000, &snap, &current, &sums, &PRECISION);
+		let got = realize::<u128>(4_000_000_000_000_000_000, &snap, &current, &sums, &PRECISION);
+		assert_eq!(got.compounded, 2);
+		// gain = floor(4e18 * 0.25 / 1) = 1e18.
+		assert_eq!(got.collateral_gain, 1_000_000_000_000_000_000);
+	}
+
+	#[test]
+	fn realize_two_scales_behind_combines_three_sum_rows() {
+		// D0=1e18 at P0=0.5, S0=0.2; the snapshot row finished at 0.5, the
+		// next row holds 300 and the one after 500:
+		// delta = (0.5 - 0.2) + 300/1e9 + 500/1e18
+		//       (inner 3e17 + 3e11 + 500 = 300_000_300_000_000_500),
+		// gain = floor(1e18 * delta / 0.5) = 600_000_600_000_001_000.
+		let snap = snapshot(
+			FixedU128::from_rational(1, 2),
+			FixedU128::from_rational(1, 5),
+			FixedU128::zero(),
+			0,
+			0,
+		);
+		let current = accumulators(FixedU128::from_rational(4, 5), 0, 2);
+		let sums = SumsWindow {
+			snap: PoolSums {
+				s_collateral: FixedU128::from_rational(1, 2),
+				g_yield: FixedU128::zero(),
+			},
+			ahead: [
+				PoolSums { s_collateral: FixedU128::from_u32(300), g_yield: FixedU128::zero() },
+				PoolSums { s_collateral: FixedU128::from_u32(500), g_yield: FixedU128::zero() },
+			],
+		};
+		let got = realize::<u128>(1_000_000_000_000_000_000, &snap, &current, &sums, &PRECISION);
+		assert_eq!(got.collateral_gain, 600_000_600_000_001_000);
+		// compounded = floor(1e18 * 0.8 / (0.5 * 1e18)) = 1.
+		assert_eq!(got.compounded, 1);
+	}
+
+	#[test]
+	fn realize_three_scales_behind_compounds_to_zero_but_pays_window_gains() {
+		// Three crossings leave less than one part in scale_factor² of the
+		// deposit: compounded rounds to zero; gains inside the three-row
+		// window remain claimable.
+		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
+		let current = accumulators(FixedU128::from_rational(1, 2), 0, 3);
+		let sums = window(FixedU128::from_rational(1, 4), FixedU128::zero());
+		let got = realize::<u128>(4_000_000_000_000_000_000, &snap, &current, &sums, &PRECISION);
 		assert_eq!(got.compounded, 0);
-		// gain = floor(1000 * 0.25 / 1) = 250.
-		assert_eq!(got.collateral_gain, 250);
+		// gain = floor(4e18 * 0.25 / 1) = 1e18.
+		assert_eq!(got.collateral_gain, 1_000_000_000_000_000_000);
 	}
 
 	#[test]
