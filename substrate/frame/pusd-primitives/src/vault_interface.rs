@@ -33,15 +33,16 @@ pub struct RedemptionStepSnapshot<Balance> {
 }
 
 /// Debt cancelled by external pUSD (Stability Pool + JIT combined) and the
-/// matching collateral credited to the offset path. The orchestrator may
-/// internally split the collateral across standing depositors and JIT.
+/// matching vault-held collateral paid to the external offset path.
 ///
-/// `recipient` is the account that receives `collateral` — the vault pallet
-/// moves it inline during `execute_liquidation`, so the orchestrator never
-/// needs to take possession of liquidated collateral itself.
+/// `collateral_recipient` is the account that receives `collateral` from the
+/// vault pallet during [`VaultInterface::execute_liquidation`]. For Stability
+/// Pool offsets this must correspond to collateral already consumed through
+/// `StabilityPoolOffsetApi` as a real `CollateralCredit`; for JIT it is the
+/// JIT settlement recipient.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OffsetAllocation<AccountId, Balance> {
-	pub recipient: AccountId,
+	pub collateral_recipient: AccountId,
 	pub debt: Balance,
 	pub collateral: Balance,
 }

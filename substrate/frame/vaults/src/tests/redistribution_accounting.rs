@@ -88,7 +88,7 @@ fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 
 		let coll_1 = held(DOT, 1);
 		assert_ok!(liquidate_with(DOT, PUSD, 1, |_| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_1,
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
 		}));
@@ -131,7 +131,7 @@ fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_1 = held(DOT, 1);
 		assert_ok!(liquidate_with(DOT, PUSD, 1, |_| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_1,
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
 		}));
@@ -180,7 +180,7 @@ fn mixed_rate_recipients_reconcile_on_touch() {
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
 		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_3,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
@@ -219,7 +219,7 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
 		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_3,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
@@ -287,8 +287,8 @@ fn final_recovery_exit_requires_explicit_hint() {
 	});
 }
 
-// `OffsetAllocation` carries a `recipient` AccountId, and `execute_liquidation`
-// moves `offset.collateral` to that recipient.
+// `OffsetAllocation` carries a `collateral_recipient` AccountId, and
+// `execute_liquidation` moves `offset.collateral` to that recipient.
 #[test]
 fn execute_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 	build_and_execute(|| {
@@ -301,7 +301,11 @@ fn execute_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 		let pre_recipient = collateral_balance(DOT, recipient);
 
 		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| LiquidationAllocation {
-			offset: OffsetAllocation { recipient, debt: post_touch, collateral: 500 },
+			offset: OffsetAllocation {
+				collateral_recipient: recipient,
+				debt: post_touch,
+				collateral: 500,
+			},
 			redistribution_collateral: 0,
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
 		}));
@@ -328,7 +332,7 @@ fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
 		for liquidatee in [1u64, 2u64] {
 			let collateral = held(DOT, liquidatee);
 			assert_ok!(liquidate_with(DOT, PUSD, liquidatee, |_| LiquidationAllocation {
-				offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+				offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 				redistribution_collateral: collateral,
 				keeper: KeeperCompensation { recipient: liquidatee, collateral: 0 },
 			}));
@@ -348,7 +352,7 @@ fn vault_cr_view_includes_pending_redistribution() {
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
 		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_3,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
@@ -421,7 +425,7 @@ fn redistribution_residue_lands_in_ownerless_debt() {
 		// `redistribution_collateral: 0` on purpose — the per-stake *debt* flooring
 		// residue surfaces regardless of the collateral leg, so it is left out.
 		assert_ok!(liquidate_with(DOT, PUSD, 3, |_post_touch| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: 0,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
@@ -460,7 +464,11 @@ fn full_lifecycle_holds_branch_identities() {
 		let keeper_8_pre = collateral_balance(DOT, 8);
 		let offset_9_pre = collateral_balance(DOT, 9);
 		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 9, debt: post_touch / 3, collateral: 100 },
+			offset: OffsetAllocation {
+				collateral_recipient: 9,
+				debt: post_touch / 3,
+				collateral: 100
+			},
 			redistribution_collateral: 500,
 			keeper: KeeperCompensation { recipient: 8, collateral: 10 },
 		}));
@@ -535,7 +543,7 @@ fn redistributed_principal_accrues_interest_from_liquidation_moment() {
 		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| {
 			redistributed = post_touch;
 			LiquidationAllocation {
-				offset: OffsetAllocation { recipient: 9, debt: 0, collateral: 0 },
+				offset: OffsetAllocation { collateral_recipient: 9, debt: 0, collateral: 0 },
 				redistribution_collateral: 0,
 				keeper: KeeperCompensation { recipient: 8, collateral: 0 },
 			}

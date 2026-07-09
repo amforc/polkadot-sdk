@@ -321,7 +321,7 @@ fn dormant_vault_receives_redistribution_gains_on_touch() {
 		// Redistribute vault 3's whole debt across the recipients (no offset).
 		let coll_3 = held(DOT, 3);
 		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 0, debt: 0, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
 			redistribution_collateral: coll_3,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));

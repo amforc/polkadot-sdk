@@ -233,7 +233,7 @@ fn redistribution_stays_inside_its_market() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		assert_ok!(liquidate_with(DOT, PUSD, 1, |_post_touch| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 1, debt: 0, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 1, debt: 0, collateral: 0 },
 			redistribution_collateral: 1_000,
 			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
 		}));
