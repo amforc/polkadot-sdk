@@ -83,7 +83,11 @@ fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 
 		assert_noop!(
 			liquidate_with(DOT, PUSD, 1, |post_touch| LiquidationAllocation {
-				offset: OffsetAllocation { recipient: 10, debt: post_touch + 1, collateral: 0 },
+				offset: OffsetAllocation {
+					collateral_recipient: 10,
+					debt: post_touch + 1,
+					collateral: 0
+				},
 				redistribution_collateral: 0,
 				keeper: KeeperCompensation { recipient: 10, collateral: 0 },
 			}),
@@ -92,7 +96,7 @@ fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 		assert!(crate::pallet::Vaults::<Test>::contains_key((DOT, PUSD, 1)));
 
 		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| LiquidationAllocation {
-			offset: OffsetAllocation { recipient: 10, debt: post_touch, collateral: 0 },
+			offset: OffsetAllocation { collateral_recipient: 10, debt: post_touch, collateral: 0 },
 			redistribution_collateral: 0,
 			keeper: KeeperCompensation { recipient: 10, collateral: 0 },
 		}));
@@ -112,7 +116,11 @@ fn execute_liquidation_rejects_collateral_payout_above_held() {
 
 		assert_noop!(
 			liquidate_with(DOT, PUSD, 1, |_post_touch| LiquidationAllocation {
-				offset: OffsetAllocation { recipient: 10, debt: 0, collateral: held + 1 },
+				offset: OffsetAllocation {
+					collateral_recipient: 10,
+					debt: 0,
+					collateral: held + 1
+				},
 				redistribution_collateral: 0,
 				keeper: KeeperCompensation { recipient: 10, collateral: 0 },
 			}),
@@ -140,7 +148,7 @@ fn execute_liquidation_pays_keeper_and_derives_redistributed_debt() {
 		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| {
 			post_touch_debt = post_touch;
 			LiquidationAllocation {
-				offset: OffsetAllocation { recipient: 999, debt: 200, collateral: 300 },
+				offset: OffsetAllocation { collateral_recipient: 999, debt: 200, collateral: 300 },
 				redistribution_collateral: held_1 - 300 - 50,
 				keeper: KeeperCompensation { recipient: 998, collateral: 50 },
 			}
