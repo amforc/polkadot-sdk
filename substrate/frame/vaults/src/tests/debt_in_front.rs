@@ -80,16 +80,17 @@ fn debt_in_front_projects_pending_interest_poke_independent() {
 }
 
 // A vault redeemed below `MinimumDebt` parks as the dormant target. The next
-// redemption drains it first, but it left the rate index, so it is not counted.
+// redemption drains it first, so its residual counts as debt in front even
+// though it left the rate index — and it consumes one walk step.
 #[test]
-fn debt_in_front_excludes_dormant_redemption_target() {
+fn debt_in_front_includes_dormant_redemption_target() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000))); // 0.5%, tail
 		assert_ok!(open(2, DOT, PUSD, 5_000, 700, rate_pct(6, 1000))); // 0.6%
 		let debt_in_front =
-			|| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX);
-		assert_eq!(debt_in_front(), 501 + 701); // principal + fee 1 each, no elapsed time
+			|steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), steps);
+		assert_eq!(debt_in_front(u32::MAX), 501 + 701); // principal + fee 1 each, no elapsed time
 
 		// Redeem vault 1 (entire debt 501) down to 199, one below `MinimumDebt`.
 		assert_ok!(redeem(DOT, PUSD, 3, 302));
@@ -100,10 +101,14 @@ fn debt_in_front_excludes_dormant_redemption_target() {
 			"sub-minimum residual parks vault 1 as the dormant target"
 		);
 		assert_eq!(
-			debt_in_front(),
-			701,
-			"the dormant target's residual (199) is consumed first but not counted"
+			debt_in_front(u32::MAX),
+			199 + 701,
+			"the dormant target's residual (199) is consumed first and counted"
 		);
+		// The dormant target consumes one step of the walk budget, mirroring the
+		// per-touch step accounting a real redemption pays.
+		assert_eq!(debt_in_front(1), 199, "one step reaches only the dormant target");
+		assert_eq!(debt_in_front(0), 0, "a zero budget counts nothing");
 	});
 }
 

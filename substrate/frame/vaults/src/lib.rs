@@ -671,12 +671,11 @@ pub mod pallet {
 		}
 
 		/// How much debt a redemption consumes before reaching `rate`: the
-		/// projected entire debt of every listed vault at a rate strictly
-		/// below it. Walks at most `max_steps` vaults from the tail and
-		/// returns the partial sum if the cap stops the walk.
-		///
-		/// The dormant redemption target is redeemed first but not counted
-		/// here.
+		/// projected entire debt of the dormant redemption target (drained
+		/// first, whatever its rate), plus that of every listed vault at a
+		/// rate strictly below it. Walks at most `max_steps` vaults —
+		/// the dormant target counts as one — and returns the partial sum if
+		/// the cap stops the walk.
 		pub fn debt_in_front(
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
@@ -688,9 +687,20 @@ pub mod pallet {
 				return total;
 			};
 			let now = T::TimeProvider::now();
+			let mut steps_left = max_steps;
+			if let Some(target) = &branch.state.dormant_redemption_target {
+				if steps_left == 0 {
+					return total;
+				}
+				steps_left -= 1;
+				if let Some(v) = Vaults::<T>::get((&collateral_id, &stable_id, target)) {
+					let pending = Self::pending_touch_for(&v, &branch.state, now);
+					total = total.saturating_add(pending.total_debt(&v.debt));
+				}
+			}
 			let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 			let mut cursor = T::VaultLists::tail(&rate_list);
-			for _ in 0..max_steps {
+			for _ in 0..steps_left {
 				let Some(o) = cursor else { break };
 				let Some((priority, neighbors)) = T::VaultLists::node(&rate_list, &o) else {
 					break;
@@ -819,7 +829,8 @@ pub mod pallet {
 		}
 
 		/// Withdraw collateral from caller's vault on `collateral_id`.
-		/// `recipient` defaults to the caller when `None`.
+		/// `recipient` defaults to the caller when `None`. Withdrawing the
+		/// last collateral from a debt-free vault closes it outright.
 		#[pallet::call_index(2)]
 		#[pallet::weight(T::WeightInfo::withdraw_collateral())]
 		pub fn withdraw_collateral(
