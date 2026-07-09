@@ -65,7 +65,7 @@ fn active_pool_recovery_offset_settles_the_head() {
 		// delta_S = floor(594 * 1e18 / 400) = 1.485e18.
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 100);
-		assert_eq!(state.p, FixedU128::from_rational(1, 4));
+		assert_eq!(state.coords.p, FixedU128::from_rational(1, 4));
 		assert_eq!(state.total_collateral_gains_unclaimed, 594);
 		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("row");
 		assert_eq!(sums.s_collateral, FixedU128::from_inner(1_485_000_000_000_000_000));
@@ -96,8 +96,8 @@ fn recovery_offset_can_fully_deplete_the_pool() {
 		//                = 792.
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.epoch, 1);
-		assert_eq!(state.p, FixedU128::one());
+		assert_eq!(state.coords.epoch, 1);
+		assert_eq!(state.coords.p, FixedU128::one());
 		assert_eq!(vault_debt(DOT, PUSD, 5), 100);
 
 		// The old-epoch depositor realizes to zero active with the full
@@ -244,9 +244,9 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		assert_eq!(state.total_active_deposits, 400);
 		assert_eq!(state.total_pending_deposits, 300);
 		assert_eq!(state.total_collateral_gains_unclaimed, 990);
-		assert_eq!(state.p, state_before.p);
-		assert_eq!(state.epoch, state_before.epoch);
-		assert_eq!(state.scale, state_before.scale);
+		assert_eq!(state.coords.p, state_before.coords.p);
+		assert_eq!(state.coords.epoch, state_before.coords.epoch);
+		assert_eq!(state.coords.scale, state_before.coords.scale);
 		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), sums_before);
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert_eq!(stable_balance(PUSD, pool), 700);

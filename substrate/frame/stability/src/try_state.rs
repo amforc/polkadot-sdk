@@ -21,14 +21,18 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if !config.is_valid() {
 			return Err("stored stability-pool config fails `is_valid`".into());
 		}
-		if state.p > FixedU128::one() {
+		if state.coords.p > FixedU128::one() {
 			return Err("`P` above one".into());
 		}
-		if state.p < config.precision.p_min {
+		if state.coords.p < config.precision.p_min {
 			return Err("`P` below the configured precision floor".into());
 		}
-		if !PoolSumsStore::<T>::contains_key((&collateral_id, &stable_id, state.epoch, state.scale))
-		{
+		if !PoolSumsStore::<T>::contains_key((
+			&collateral_id,
+			&stable_id,
+			state.coords.epoch,
+			state.coords.scale,
+		)) {
 			return Err("current `(epoch, scale)` has no sums row".into());
 		}
 
@@ -77,7 +81,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			let realized = crate::math::realize(
 				deposit.active_deposit,
 				&deposit.snapshot,
-				&state.accumulators(),
+				&state.coords,
 				&window,
 				&config.precision,
 			);
@@ -103,11 +107,11 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	for ((collateral_id, stable_id, _who), deposit) in Deposits::<T>::iter() {
 		let state = PoolStates::<T>::get(&collateral_id, &stable_id)
 			.ok_or("deposit row without a pool state row")?;
-		if deposit.snapshot.epoch > state.epoch {
+		if deposit.snapshot.coords.epoch > state.coords.epoch {
 			return Err("deposit snapshot epoch ahead of the pool".into());
 		}
-		if deposit.snapshot.epoch == state.epoch {
-			if deposit.snapshot.scale > state.scale {
+		if deposit.snapshot.coords.epoch == state.coords.epoch {
+			if deposit.snapshot.coords.scale > state.coords.scale {
 				return Err("deposit snapshot scale ahead of the pool".into());
 			}
 		}
@@ -115,8 +119,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if !PoolSumsStore::<T>::contains_key((
 			&collateral_id,
 			&stable_id,
-			deposit.snapshot.epoch,
-			deposit.snapshot.scale,
+			deposit.snapshot.coords.epoch,
+			deposit.snapshot.coords.scale,
 		)) {
 			return Err("deposit snapshot references a pruned sums row".into());
 		}

@@ -21,9 +21,9 @@ fn branch_registration_seeds_pool_rows() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(state.total_pending_deposits, 0);
-		assert_eq!(state.p, FixedU128::one());
-		assert_eq!(state.epoch, 0);
-		assert_eq!(state.scale, 0);
+		assert_eq!(state.coords.p, FixedU128::one());
+		assert_eq!(state.coords.epoch, 0);
+		assert_eq!(state.coords.scale, 0);
 		assert_eq!(state.total_collateral_gains_unclaimed, 0);
 		assert_eq!(state.total_yield_unclaimed, 0);
 

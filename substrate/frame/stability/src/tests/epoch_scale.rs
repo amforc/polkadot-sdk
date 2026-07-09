@@ -31,9 +31,9 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		assert_eq!(result.debt_offset, 1_000);
 
 		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.epoch, 1);
-		assert_eq!(state.scale, 0);
-		assert_eq!(state.p, FixedU128::one());
+		assert_eq!(state.coords.epoch, 1);
+		assert_eq!(state.coords.scale, 0);
+		assert_eq!(state.coords.p, FixedU128::one());
 		assert_eq!(state.total_active_deposits, 0);
 		// The new epoch's sums row is seeded; the old one keeps the gains:
 		// delta_S = floor(800 * 1e18 / 1000) = 8e17.
@@ -84,9 +84,9 @@ fn scale_crossing_preserves_older_deposits() {
 		let (result, _) = simulate_offset(DOT, PUSD, unit - 100, 5_000_000_000_000);
 		assert_eq!(result.debt_offset, unit - 100);
 		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.epoch, 0);
-		assert_eq!(state.scale, 1);
-		assert_eq!(state.p, FixedU128::from_inner(10_000_000_000_000_000));
+		assert_eq!(state.coords.epoch, 0);
+		assert_eq!(state.coords.scale, 1);
+		assert_eq!(state.coords.p, FixedU128::from_inner(10_000_000_000_000_000));
 		assert_eq!(state.total_active_deposits, 100);
 		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 0u32, 1u32)));
 		System::assert_has_event(
@@ -134,8 +134,8 @@ fn deposit_two_scales_behind_realizes_through_the_squared_divisor() {
 		let (result, _) = simulate_offset(DOT, PUSD, unit - 5, 8_000_000_000_000_000_000);
 		assert_eq!(result.debt_offset, unit - 5);
 		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.scale, 2);
-		assert_eq!(state.p, FixedU128::from_rational(1, 2));
+		assert_eq!(state.coords.scale, 2);
+		assert_eq!(state.coords.p, FixedU128::from_rational(1, 2));
 		assert_eq!(state.total_active_deposits, 5);
 
 		// Two scales behind, the sf² divisor still prices the survivor
@@ -171,7 +171,7 @@ fn offset_beyond_supported_precision_steps_aside_untouched() {
 
 		// The plan failed before any value moved: nothing to roll back.
 		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.p, FixedU128::one());
+		assert_eq!(state.coords.p, FixedU128::one());
 		assert_eq!(state.total_active_deposits, unit);
 		assert_eq!(state.total_collateral_gains_unclaimed, 0);
 		let pool = Stability::pool_account(&DOT, &PUSD);
