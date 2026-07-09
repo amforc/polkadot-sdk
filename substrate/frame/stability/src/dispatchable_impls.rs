@@ -13,9 +13,10 @@ use crate::{
 use frame::{
 	prelude::*,
 	traits::{
-		fungibles::{Balanced as FungiblesBalanced, Mutate as FungiblesMutate},
+		fungibles::{Balanced as _, Mutate as _},
 		tokens::{Fortitude, Precision, Preservation},
-		Defensive, Time,
+		Defensive,
+		Time,
 	},
 };
 use pallet_linked_list::SortedListInterface;
@@ -883,7 +884,7 @@ impl<T: Config> Pallet<T> {
 		if amount.is_zero() {
 			return;
 		}
-		let clawed = <T::CollateralAssets as FungiblesBalanced<T::AccountId>>::withdraw(
+		let clawed = T::CollateralAssets::withdraw(
 			collateral_id.clone(),
 			pool_account,
 			amount,
@@ -897,25 +898,23 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Burn `amount` stablecoin held by the pool account: withdraw it as a
-	/// credit and drop the credit, rescinding issuance. The pool-balance
-	/// identity guarantees the balance covers every offset this pallet
+	/// Burn `amount` stablecoin held by the pool account against liquidation
+	/// debt. The pool-balance identity guarantees the balance covers every offset this pallet
 	/// authorizes.
 	fn burn_pool_stable(
 		stable_id: &T::StableAssetId,
 		pool_account: &T::AccountId,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
-		let credit = <T::StableAssets as FungiblesBalanced<T::AccountId>>::withdraw(
+		T::StableAssets::burn_from(
 			stable_id.clone(),
 			pool_account,
 			amount,
-			Precision::Exact,
 			Preservation::Expendable,
+			Precision::Exact,
 			Fortitude::Polite,
 		)
 		.map_err(|_| Error::<T>::StablecoinBurnFailed)?;
-		drop(credit);
 		Ok(())
 	}
 
