@@ -312,6 +312,26 @@ impl<Balance: Zero> StabilityPoolConfig<Balance> {
 	}
 }
 
+/// One registered market's pool in one record: created whole at branch
+/// registration, torn down whole at deregistration.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
+)]
+pub struct StabilityPool<Balance> {
+	/// Governance parameters, moved only through `set_stability_pool_config`.
+	pub config: StabilityPoolConfig<Balance>,
+	/// Hot accounting state, rewritten by every pool operation.
+	pub state: PoolState<Balance>,
+}
+
+impl<Balance: Zero> StabilityPool<Balance> {
+	/// The record seeded at branch registration: the given config over a
+	/// fresh [`PoolState`].
+	pub fn fresh(config: StabilityPoolConfig<Balance>) -> Self {
+		Self { config, state: PoolState::fresh() }
+	}
+}
+
 /// The offset result shapes live in `pusd-primitives` beside the
 /// `StabilityPoolOffsetApi` they belong to (SPEC.md §7.1 / §7.2).
 pub use pusd_primitives::{PendingOffsetResult, PoolOffsetResult};

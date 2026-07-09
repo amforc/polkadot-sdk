@@ -67,7 +67,7 @@ fn active_pool_recovery_offset_settles_the_head() {
 		assert_eq!(state.total_active_deposits, 100);
 		assert_eq!(state.coords.p, FixedU128::from_rational(1, 4));
 		assert_eq!(state.total_collateral_gains_unclaimed, 594);
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)).expect("row");
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::from_inner(1_485_000_000_000_000_000));
 
 		// The depositor realizes exactly the settled collateral:
