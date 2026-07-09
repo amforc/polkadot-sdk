@@ -1,6 +1,5 @@
-//! Product-sum accounting for the Stability Pool: the pure (storage-free)
-//! kernel plus the accumulator-coordinate types it interprets, some of which
-//! are SCALE-encoded into storage rows (`types` re-exports those).
+//! Product-sum accounting for the Stability Pool: the pure accumulator-coordinate types it
+//! interprets, some of which are SCALE-encoded into storage rows.
 //!
 //! The pool tracks depositor state lazily through three global accumulators
 //! (SPEC.md §6):
@@ -15,11 +14,6 @@
 //!
 //! Rounding: user payouts (compounded deposits, collateral gains, yield
 //! gains) round down; the flooring dust stays inside pool-owned totals.
-//!
-//! Overflow paths use the [`Defensive`] family like `pallet-vaults`' math:
-//! loud in `debug_assertions` builds, log-and-degrade in release. The bounds
-//! enforced by [`PoolPrecision::is_valid`] keep every reachable intermediate
-//! inside `u128`.
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
@@ -168,9 +162,9 @@ impl PoolPrecision {
 	}
 
 	#[cfg(test)]
-    pub(crate) fn set_scale_factor(&mut self, scale_factor: u64) {
-        self.scale_factor = scale_factor;
-    }
+	pub(crate) fn set_scale_factor(&mut self, scale_factor: u64) {
+		self.scale_factor = scale_factor;
+	}
 }
 
 /// Outcome of realizing a deposit against the current accumulators.
@@ -218,10 +212,9 @@ pub fn realize<Balance: FixedPointOperand>(
 			yield_gain: Balance::zero(),
 		};
 	}
-	let d: u128 = d0.unique_saturated_into();
 	let sf_int = precision.scale_factor();
 
-	let compounded_raw = if snapshot.epoch == current.epoch {
+	let compounded = if snapshot.epoch == current.epoch {
 		// Each scale behind adds a `scale_factor` divisor; `is_valid` bounds
 		// keep the worst-case denominator
 		// `1e18 * (1e10)^SCALE_SPAN = 1e38` inside `u128`.
@@ -232,26 +225,24 @@ pub fn realize<Balance: FixedPointOperand>(
 			Some(_) | None => None,
 		};
 		match denominator {
-			Some(denom) => {
-				multiply_by_rational_with_rounding(d, current.p.into_inner(), denom, Rounding::Down)
-			},
-			None => Some(0),
+			Some(denom) => mul_ratio_floor(d0, current.p.into_inner(), denom),
+			None => Balance::zero(),
 		}
 	} else {
-		Some(0)
+		Balance::zero()
 	};
-	debug_assert!(compounded_raw.unwrap_or(0) <= d);
+	debug_assert!(compounded <= d0);
 
-	let collateral_gain_raw = gain(
-		d,
+	let collateral_gain = gain(
+		d0,
 		window.snap.s_collateral,
 		snapshot.sums.s_collateral,
 		window.ahead.map(|row| row.s_collateral),
 		sf_int,
 		snapshot.p,
 	);
-	let yield_gain_raw = gain(
-		d,
+	let yield_gain = gain(
+		d0,
 		window.snap.g_yield,
 		snapshot.sums.g_yield,
 		window.ahead.map(|row| row.g_yield),
@@ -259,24 +250,20 @@ pub fn realize<Balance: FixedPointOperand>(
 		snapshot.p,
 	);
 
-	Realized {
-		compounded: to_balance(compounded_raw),
-		collateral_gain: to_balance(collateral_gain_raw),
-		yield_gain: to_balance(yield_gain_raw),
-	}
+	Realized { compounded, collateral_gain, yield_gain }
 }
 
 /// `floor(d * ((sum_snap - sum0) + Σ ahead[k] / sf_int^(k+1)) / p0)`, the
 /// shared gain leg of [`realize`] for both the collateral (`S`) and yield
 /// (`G`) sums.
-fn gain(
-	d: u128,
+fn gain<Balance: FixedPointOperand>(
+	d: Balance,
 	sum_snap: FixedU128,
 	sum0: FixedU128,
 	ahead: [FixedU128; SCALE_SPAN as usize],
 	sf_int: u128,
 	p0: FixedU128,
-) -> Option<u128> {
+) -> Balance {
 	// `scale_factor` guarantees `1 <= sf_int <= 1e10`, so every divisor
 	// (at most `sf_int^SCALE_SPAN = 1e20`) stays inside `u128`.
 	debug_assert!(sf_int >= 1);
@@ -291,9 +278,9 @@ fn gain(
 		divisor = divisor.saturating_mul(sf_int);
 	}
 	if delta.is_zero() {
-		return Some(0);
+		return Balance::zero();
 	}
-	multiply_by_rational_with_rounding(d, delta.into_inner(), p0.into_inner(), Rounding::Down)
+	mul_ratio_floor(d, delta.into_inner(), p0.into_inner())
 }
 
 /// SPEC.md §7.1: cap an offset so it never leaves
@@ -380,17 +367,18 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	if offset_debt.is_zero() {
 		return Some(PUpdate::Updated { new_p: p, scales_crossed: 0 });
 	}
-	let total: u128 = total_active.unique_saturated_into();
-	let new_total: u128 = total_active.saturating_sub(offset_debt).unique_saturated_into();
+	let new_total = total_active.saturating_sub(offset_debt);
 	let sf_int = precision.scale_factor();
 
 	let mut factor: u128 = 1;
 	for scales_crossed in 0..=MAX_SCALE_CROSSINGS {
 		let scaled_p = p.into_inner().checked_mul(factor)?;
-		let new_inner =
-			multiply_by_rational_with_rounding(scaled_p, new_total, total, Rounding::Down)?;
-		if new_inner >= precision.p_min.into_inner() {
-			let new_p = FixedU128::from_inner(new_inner);
+		let new_p = pusd_primitives::mul_div_rate_floor(
+			new_total,
+			FixedU128::from_inner(scaled_p),
+			total_active,
+		)?;
+		if new_p >= precision.p_min {
 			// A crossing lands `P` in `[p_min, p_min * scale_factor]` and
 			// `is_valid` bounds `p_min * scale_factor <= 1`.
 			debug_assert!(new_p <= FixedU128::one());
@@ -401,12 +389,21 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	None
 }
 
-/// Convert a raw payout to `Balance`, flooring impossible states to zero.
-/// `None` here means an overflowed intermediate or a payout wider than
-/// `Balance` — unreachable for values bounded by real pool holdings.
-fn to_balance<Balance: FixedPointOperand>(raw: Option<u128>) -> Balance {
-	raw.and_then(|value| Balance::try_from(value).ok())
-		.defensive_unwrap_or_else(Balance::zero)
+/// `floor(value * numerator / denominator)` at `Balance` precision, with the
+/// same defensive fallback used by the public payout paths.
+fn mul_ratio_floor<Balance: FixedPointOperand>(
+	value: Balance,
+	numerator: u128,
+	denominator: u128,
+) -> Balance {
+	multiply_by_rational_with_rounding(
+		value.unique_saturated_into(),
+		numerator,
+		denominator,
+		Rounding::Down,
+	)
+	.and_then(|raw| Balance::try_from(raw).ok())
+	.defensive_unwrap_or_else(Balance::zero)
 }
 
 #[cfg(test)]
