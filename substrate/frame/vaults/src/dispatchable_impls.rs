@@ -249,6 +249,13 @@ impl<T: Config> Pallet<T> {
 			Self::ensure_above_icr(new_collateral, total_debt, price, &config)?;
 		}
 
+		if total_debt.is_zero() && new_collateral.is_zero() {
+			return Self::close_inner(
+				op,
+				CloseRequest { recipient: &recipient, price, maybe_payment: None },
+			);
+		}
+
 		op.ctx.branch.state.remove_collateral(amount);
 		op.ctx.branch.state.set_vault_stake(&mut op.vault, new_collateral);
 

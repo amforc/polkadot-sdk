@@ -258,37 +258,65 @@ fn safety_mode_blocks_close_with_collateral() {
 	});
 }
 
+// Withdrawing the last collateral from a debt-free vault auto-closes it.
+// Because that withdraw releases collateral, it hits the same TCR gate as an explicit close.
 #[test]
-fn safety_mode_allows_close_zero_collateral() {
+fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		// Fully redeem vault 2 — it becomes Dormant with residual collateral
-		// and zero debt.
-		assert_ok!(redeem(DOT, PUSD, 3, 1_000));
-		// Withdraw the residual collateral while still in Normal mode.
-		let residual = held(DOT, 2);
-		assert!(residual > 0);
+		// Top up acct 2's pUSD so the repay can cover principal + upfront fee.
+		let v = Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault stored");
+		let total = v.debt.principal + v.debt.interest;
+		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
+			&1,
+			&2,
+			v.debt.interest,
+			frame::traits::tokens::Preservation::Expendable,
+		));
+		// Repay to zero — leaves a Dormant husk still holding its 1000 DOT.
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, PUSD, 2, total));
+		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "husk survives the repay");
+		// At $6.30 releasing the husk's 1000 DOT would push TCR into Safety, so
+		// the emptying withdraw is blocked exactly like the explicit close.
+		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
+		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Normal),);
+		assert_noop!(
+			crate::Pallet::<Test>::withdraw_collateral(
+				RuntimeOrigin::signed(2),
+				DOT,
+				PUSD,
+				1_000,
+				None
+			),
+			crate::Error::<Test>::WouldEnterSafetyMode
+		);
+		// Back at $10 the release keeps the branch in Normal mode: the withdraw
+		// empties the vault and auto-closes it, paying out the collateral.
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		let collateral_before = collateral_balance(DOT, 2);
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
 			RuntimeOrigin::signed(2),
 			DOT,
 			PUSD,
-			residual,
+			1_000,
 			None
 		));
-		assert_eq!(held(DOT, 2), 0);
-		// The vault now holds nothing (zero debt, zero collateral). Emptying it
-		// via `withdraw` leaves a husk — only repay-to-zero auto-closes a
-		// collateral-less vault — so the owner reclaims the row with an explicit
-		// close. Dropping into Safety does not block it: with no collateral to
-		// release, post_TCR == pre_TCR.
-		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
-		// The branch is now in Safety mode (TCR ≈ 126%, below the 130% threshold); the
-		// close is still allowed because it releases no collateral (post_TCR == pre_TCR).
-		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Safety),);
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
-		assert!(Vaults::<Test>::get((DOT, PUSD, 2)).is_none());
+		assert!(Vaults::<Test>::get((DOT, PUSD, 2)).is_none(), "zero/zero vault auto-closed");
+		assert_eq!(held(DOT, 2), 0, "hold fully released");
+		assert_eq!(collateral_balance(DOT, 2), collateral_before + 1_000);
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultClosed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 2,
+			recipient: 2,
+		}));
+		// The row is gone, so an explicit close has nothing to act on.
+		assert_noop!(
+			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None),
+			crate::Error::<Test>::VaultNotFound
+		);
 	});
 }
 
