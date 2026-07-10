@@ -1,10 +1,7 @@
 //! `claim_collateral` / `claim_yield` / `poke_deposit`.
 //!
-//! Offsets and yield distribution do not exist yet, so claimables are seeded
-//! by direct storage writes mirrored into the pool totals and backed by
-//! minted pool-account balances — exactly the shape the offset and yield
-//! engines will produce. End-to-end "earned" claims arrive with those
-//! milestones.
+//! Direct storage seeding isolates payout and pruning behavior from the offset
+//! and yield engines. Other modules cover claims earned through live flows.
 
 use crate::{mock::*, Error};
 
