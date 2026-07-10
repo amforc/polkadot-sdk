@@ -40,10 +40,31 @@ struct RecoveryStep<Balance> {
 }
 
 /// Shared by execution and preview so `FinalRecovery` pricing cannot drift.
-struct RecoveryPricing<Balance> {
-	debt: Balance,
-	collateral_out: Balance,
-	split: Option<pusd_primitives::InsuranceAdjusted<Balance>>,
+/// The variant is the settlement regime the head's CR selects.
+enum RecoveryPricing<Balance> {
+	/// `CR >= 100%`: face value plus a collateral bonus.
+	RecoveryBonus { debt: Balance, collateral_out: Balance },
+	/// `CR < 100%`: the Insurance Fund cover splits the debt.
+	InsuranceAdjusted {
+		debt: Balance,
+		collateral_out: Balance,
+		split: pusd_primitives::InsuranceAdjusted<Balance>,
+	},
+}
+
+impl<Balance: Copy> RecoveryPricing<Balance> {
+	fn debt(&self) -> Balance {
+		match self {
+			Self::RecoveryBonus { debt, .. } | Self::InsuranceAdjusted { debt, .. } => *debt,
+		}
+	}
+
+	fn collateral_out(&self) -> Balance {
+		match self {
+			Self::RecoveryBonus { collateral_out, .. } |
+			Self::InsuranceAdjusted { collateral_out, .. } => *collateral_out,
+		}
+	}
 }
 
 /// Per-target loop decision, shared by execution (`run_loop`) and preview
@@ -53,6 +74,14 @@ enum StepAction {
 	Redeem,
 	Skip,
 	Stop,
+}
+
+/// Offset classification of a priced `FinalRecovery` head, shared by the
+/// quote and execution surfaces so the two cannot diverge.
+enum OffsetDecision<Balance> {
+	NoTarget,
+	BelowPar,
+	Cancellable { debt: Balance, collateral_out: Balance },
 }
 
 /// What one vault-side `redeem_step` did, escaped from the pricing closure by
@@ -101,7 +130,8 @@ pub mod pallet {
 		fees,
 		types::{RedemptionConfig, RedemptionPreview, RedemptionPreviewStep, RedemptionState},
 		weights::WeightInfo,
-		Accumulators, OrdinaryStep, RecoveryPricing, RecoveryStep, Regime, StepAction, StepOutcome,
+		Accumulators, OffsetDecision, OrdinaryStep, RecoveryPricing, RecoveryStep, Regime,
+		StepAction, StepOutcome,
 	};
 	use alloc::vec::Vec;
 	use frame::{
@@ -302,12 +332,6 @@ pub mod pallet {
 		InsuranceFundBurnFailed,
 		/// The supplied redemption config is internally inconsistent.
 		InvalidRedemptionConfig,
-		/// No `FinalRecovery` vault is queued, or nothing is cancellable
-		/// against the head.
-		NoRecoveryTarget,
-		/// The `FinalRecovery` head is below par (`CR < 100%`): recovery
-		/// offsets are restricted to the recovery-bonus regime.
-		RecoveryOffsetBelowPar,
 	}
 
 	#[pallet::hooks]
@@ -667,7 +691,7 @@ pub mod pallet {
 				let collateral_out =
 					recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)
 						.min(snap.collateral);
-				return Some(RecoveryPricing { debt, collateral_out, split: None });
+				return Some(RecoveryPricing::RecoveryBonus { debt, collateral_out });
 			}
 			let collateral_value = price.saturating_mul_int(snap.collateral);
 			let split = recovery_pricing::insurance_adjusted(
@@ -679,7 +703,7 @@ pub mod pallet {
 			let collateral_out =
 				recovery_pricing::recovery_rate_collateral_out(debt, split.recovery_rate, price)
 					.min(snap.collateral);
-			Some(RecoveryPricing { debt, collateral_out, split: Some(split) })
+			Some(RecoveryPricing::InsuranceAdjusted { debt, collateral_out, split })
 		}
 
 		fn recovery_decision(
@@ -695,47 +719,50 @@ pub mod pallet {
 			};
 			// Full IF cover means no redeemer-funded burn is needed; the loop
 			// settles the residual once this (touch-only) step has committed.
-			if pricing.split.as_ref().is_some_and(|split| split.market_cancel_debt.is_zero()) {
-				let step = RecoveryStep {
-					burned: Zero::zero(),
-					collateral_out: Zero::zero(),
-					debt_settled: Zero::zero(),
-					regime: Regime::InsuranceAdjusted,
-				};
-				return Ok((None, StepOutcome::Recovery { step, settle_residual: true }));
+			if let RecoveryPricing::InsuranceAdjusted { split, .. } = &pricing {
+				if split.market_cancel_debt.is_zero() {
+					let step = RecoveryStep {
+						burned: Zero::zero(),
+						collateral_out: Zero::zero(),
+						debt_settled: Zero::zero(),
+						regime: Regime::InsuranceAdjusted,
+					};
+					return Ok((None, StepOutcome::Recovery { step, settle_residual: true }));
+				}
 			}
 			Self::fund_recovery(stable_id, redeemer, &pricing)
 		}
 
 		/// Redeemer-funded recovery burn shared by both regimes; stops the loop —
 		/// applying nothing — when there is nothing to cancel. The regime and the
-		/// residual-settlement decision both follow from `pricing.split`.
+		/// residual-settlement decision both follow from the pricing variant.
 		fn fund_recovery(
 			stable_id: &T::StableAssetId,
 			redeemer: &T::AccountId,
 			pricing: &RecoveryPricing<BalanceOf<T>>,
 		) -> Result<StepDecision<T>, DispatchError> {
-			if pricing.debt.is_zero() {
+			let debt = pricing.debt();
+			if debt.is_zero() {
 				return Ok((None, StepOutcome::Stopped));
 			}
-			let (regime, settle_residual) = match &pricing.split {
-				None => (Regime::RecoveryBonus, false),
+			let (regime, settle_residual) = match pricing {
+				RecoveryPricing::RecoveryBonus { .. } => (Regime::RecoveryBonus, false),
 				// IF residuals burn only after all externally cancellable debt is gone.
-				Some(split) => (
+				RecoveryPricing::InsuranceAdjusted { split, .. } => (
 					Regime::InsuranceAdjusted,
-					pricing.debt == split.market_cancel_debt && !split.effective_cover.is_zero(),
+					debt == split.market_cancel_debt && !split.effective_cover.is_zero(),
 				),
 			};
-			Self::burn_redeemer_pusd(stable_id, redeemer, pricing.debt, pricing.debt)?;
+			Self::burn_redeemer_pusd(stable_id, redeemer, debt, debt)?;
 			let step = RecoveryStep {
-				burned: pricing.debt,
-				collateral_out: pricing.collateral_out,
-				debt_settled: pricing.debt,
+				burned: debt,
+				collateral_out: pricing.collateral_out(),
+				debt_settled: debt,
 				regime,
 			};
 			let allocation = RedemptionAllocation {
-				debt_to_cancel: pricing.debt,
-				collateral_to_recipient: pricing.collateral_out,
+				debt_to_cancel: debt,
+				collateral_to_recipient: pricing.collateral_out(),
 			};
 			Ok((Some(allocation), StepOutcome::Recovery { step, settle_residual }))
 		}
@@ -1036,10 +1063,10 @@ pub mod pallet {
 			Some(RedemptionPreviewStep {
 				target: owner.clone(),
 				status: snap.status,
-				debt_cancellable: pricing.debt,
-				collateral_out: pricing.collateral_out,
+				debt_cancellable: pricing.debt(),
+				collateral_out: pricing.collateral_out(),
 				fee_pusd: Zero::zero(),
-				pusd_in: pricing.debt,
+				pusd_in: pricing.debt(),
 			})
 		}
 	}
@@ -1090,15 +1117,32 @@ pub mod pallet {
 			let Some(snap) = captured else {
 				return Ok(RecoveryOffsetQuote::NoTarget);
 			};
-			let Some(pricing) =
-				Self::price_recovery(stable_id, &snap, price, max_debt_to_cancel, &config)
-			else {
-				return Ok(RecoveryOffsetQuote::NoTarget);
-			};
-			if pricing.split.is_some() {
-				return Ok(RecoveryOffsetQuote::BelowPar);
+			let pricing =
+				Self::price_recovery(stable_id, &snap, price, max_debt_to_cancel, &config);
+			Ok(match Self::classify_offset(pricing) {
+				OffsetDecision::NoTarget => RecoveryOffsetQuote::NoTarget,
+				OffsetDecision::BelowPar => RecoveryOffsetQuote::BelowPar,
+				OffsetDecision::Cancellable { debt, .. } => RecoveryOffsetQuote::Available { debt },
+			})
+		}
+
+		/// Classify a priced head for the offset surface. Both the quote and
+		/// the execution map through this one function so they can never
+		/// diverge: offsets are restricted to the recovery-bonus regime, and
+		/// a zero-sized burn is no target rather than `Available { debt: 0 }`.
+		fn classify_offset(
+			pricing: Option<RecoveryPricing<BalanceOf<T>>>,
+		) -> OffsetDecision<BalanceOf<T>> {
+			match pricing {
+				None => OffsetDecision::NoTarget,
+				Some(RecoveryPricing::InsuranceAdjusted { .. }) => OffsetDecision::BelowPar,
+				Some(RecoveryPricing::RecoveryBonus { debt, .. }) if debt.is_zero() => {
+					OffsetDecision::NoTarget
+				},
+				Some(RecoveryPricing::RecoveryBonus { debt, collateral_out }) => {
+					OffsetDecision::Cancellable { debt, collateral_out }
+				},
 			}
-			Ok(RecoveryOffsetQuote::Available { debt: pricing.debt })
 		}
 	}
 
@@ -1146,36 +1190,38 @@ pub mod pallet {
 					&owner,
 					collateral_recipient,
 					|snap| {
-						let Some(pricing) = Self::price_recovery(
+						let pricing = Self::price_recovery(
 							stable_id,
 							&snap,
 							price,
 							max_debt_to_cancel,
 							&config,
-						) else {
-							result = RecoveryOffsetResult::NoTarget;
-							return Ok(None);
+						);
+						let (debt, collateral_out) = match Self::classify_offset(pricing) {
+							OffsetDecision::NoTarget => {
+								result = RecoveryOffsetResult::NoTarget;
+								return Ok(None);
+							},
+							OffsetDecision::BelowPar => {
+								result = RecoveryOffsetResult::BelowPar;
+								return Ok(None);
+							},
+							OffsetDecision::Cancellable { debt, collateral_out } => {
+								(debt, collateral_out)
+							},
 						};
-						if pricing.split.is_some() {
-							result = RecoveryOffsetResult::BelowPar;
-							return Ok(None);
-						}
-						if pricing.debt.is_zero() {
-							result = RecoveryOffsetResult::NoTarget;
-							return Ok(None);
-						}
 						// The same burn as a recovery redemption with a zero fee
 						// portion: offsets are fee-free settlement. A drained head
 						// flips to Dormant inside the vault step itself.
-						Self::burn_redeemer_pusd(stable_id, payer, pricing.debt, pricing.debt)?;
+						Self::burn_redeemer_pusd(stable_id, payer, debt, debt)?;
 						result = RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
 							vault_owner: owner.clone(),
-							debt_cancelled: pricing.debt,
-							collateral_out: pricing.collateral_out,
+							debt_cancelled: debt,
+							collateral_out,
 						});
 						Ok(Some(RedemptionAllocation {
-							debt_to_cancel: pricing.debt,
-							collateral_to_recipient: pricing.collateral_out,
+							debt_to_cancel: debt,
+							collateral_to_recipient: collateral_out,
 						}))
 					},
 				);
