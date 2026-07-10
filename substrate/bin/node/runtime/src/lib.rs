@@ -3392,10 +3392,10 @@ parameter_types! {
 			dynamic_fee_decay_period: 6 * 60 * 60 * 1_000, // 6 hours in ms
 			dynamic_fee_floor: FixedU128::from_rational(0u128, 1u128),
 			dynamic_fee_ceiling: FixedU128::from_rational(1u128, 1u128),
-			base_fee: FixedU128::from_rational(5u128, 1_000u128), // 0.5%
-			fee_ceiling: FixedU128::from_rational(1u128, 1u128),
+			base_fee: Permill::from_rational(5u32, 1_000u32), // 0.5%
+			fee_ceiling: Permill::one(),
 			dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
-			final_recovery_bonus_buffer: FixedU128::from_rational(1u128, 100u128), // 1%
+			final_recovery_bonus_buffer: Permill::from_percent(1),
 		};
 	pub const RedemptionsMaxSteps: u32 = 16;
 }
@@ -3407,7 +3407,7 @@ impl pallet_redemptions::Config for Runtime {
 	type Oracle = VaultsOracleAdapter;
 	type Vaults = Vaults;
 	type InsuranceFundAccount = StableInsuranceAccount;
-	type FeeHandler = ();
+	type FeeHandler = ResolveAssetTo<TreasuryAccount, Assets>;
 	type TimeProvider = Timestamp;
 	type UpdateOrigin = EitherOf<
 		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
