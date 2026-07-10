@@ -13,7 +13,7 @@ use crate::{
 use frame::{
 	prelude::*,
 	traits::{
-		fungibles::{Balanced as _, Mutate as _},
+		fungibles::{Balanced as _, Inspect as _, Mutate as _},
 		tokens::{Fortitude, Precision, Preservation},
 		Defensive, Time,
 	},
@@ -489,6 +489,9 @@ impl<T: Config> Pallet<T> {
 		max_debt_to_offset: BalanceOf<T>,
 		collateral: CollateralCreditOf<T>,
 	) -> (PoolOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
+		if collateral.asset() != *collateral_id {
+			return (PoolOffsetResult::zero(), collateral);
+		}
 		let Ok(mut pool) = Self::load_pool(collateral_id, stable_id) else {
 			return (PoolOffsetResult::zero(), collateral);
 		};
@@ -566,6 +569,9 @@ impl<T: Config> Pallet<T> {
 		max_pending_iterations: u32,
 		mut collateral: CollateralCreditOf<T>,
 	) -> (PendingOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
+		if collateral.asset() != *collateral_id {
+			return (PendingOffsetResult::zero(remaining_debt), collateral);
+		}
 		let Some(mut pool) = Pools::<T>::get(collateral_id, stable_id) else {
 			return (PendingOffsetResult::zero(remaining_debt), collateral);
 		};
@@ -819,11 +825,10 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// The §7 offset value movement: split `collateral_amount` off `credit`
-	/// and resolve it into the pool account, then burn `debt` pool
-	/// stablecoin. The genuinely-fallible resolve (a sub-minimum first gain)
-	/// runs first; the identity-guaranteed burn gets a defensive claw-back.
-	/// `Err` hands back the reassembled credit with no value moved.
+	/// The §7 offset value movement. Stablecoin is first withdrawn into a
+	/// credit, without changing issuance. If the collateral slice resolves,
+	/// dropping that stable credit commits the burn; otherwise the stable
+	/// credit is resolved back and `Err` returns the full collateral credit.
 	fn resolve_and_burn(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
@@ -832,21 +837,24 @@ impl<T: Config> Pallet<T> {
 		collateral_amount: BalanceOf<T>,
 		credit: CollateralCreditOf<T>,
 	) -> Result<CollateralCreditOf<T>, CollateralCreditOf<T>> {
+		debug_assert_eq!(credit.asset(), *collateral_id);
+		let stable_credit = match Self::withdraw_pool_stable(stable_id, pool_account, debt) {
+			Some(stable_credit) => stable_credit,
+			None => return Err(credit),
+		};
 		let (to_pool, mut remainder) = credit.split(collateral_amount);
-		if let Err(returned) = Self::resolve_pool_collateral(pool_account, to_pool) {
-			Self::subsume_returned(&mut remainder, returned);
-			return Err(remainder);
+		match Self::resolve_pool_collateral(pool_account, to_pool) {
+			Ok(()) => {
+				drop(stable_credit);
+				Ok(remainder)
+			},
+			Err(returned) => {
+				let _ = T::StableAssets::resolve(pool_account, stable_credit)
+					.defensive_proof("stable credit returns to the account it came from");
+				Self::subsume_returned(&mut remainder, returned);
+				Err(remainder)
+			},
 		}
-		if Self::burn_pool_stable(stable_id, pool_account, debt).defensive().is_err() {
-			Self::claw_back_pool_collateral(
-				collateral_id,
-				pool_account,
-				collateral_amount,
-				&mut remainder,
-			);
-			return Err(remainder);
-		}
-		Ok(remainder)
 	}
 
 	/// Resolve an offset's collateral slice into the pool account. A zero
@@ -871,50 +879,30 @@ impl<T: Config> Pallet<T> {
 		let _ = remainder.subsume(returned).defensive_proof("collateral credit halves diverged");
 	}
 
-	/// Defensive unwind for a burn failure after the collateral resolve:
-	/// pull the just-resolved amount back out of the pool account. Only
-	/// reachable when the pool-balance identity is already broken.
-	fn claw_back_pool_collateral(
-		collateral_id: &T::CollateralAssetId,
-		pool_account: &T::AccountId,
-		amount: BalanceOf<T>,
-		remainder: &mut CollateralCreditOf<T>,
-	) {
-		if amount.is_zero() {
-			return;
-		}
-		let clawed = T::CollateralAssets::withdraw(
-			collateral_id.clone(),
-			pool_account,
-			amount,
-			Precision::Exact,
-			Preservation::Expendable,
-			Fortitude::Polite,
-		)
-		.defensive();
-		if let Ok(credit) = clawed {
-			Self::subsume_returned(remainder, credit);
-		}
-	}
-
-	/// Burn `amount` stablecoin held by the pool account against liquidation
-	/// debt. The pool-balance identity guarantees the balance covers every offset this pallet
-	/// authorizes.
-	fn burn_pool_stable(
+	/// Withdraw the stablecoin slice that will be burned once collateral
+	/// resolution succeeds. Partial withdrawals preserve the asset account;
+	/// only an exact full depletion may reap it, so no dust is over-withdrawn.
+	fn withdraw_pool_stable(
 		stable_id: &T::StableAssetId,
 		pool_account: &T::AccountId,
 		amount: BalanceOf<T>,
-	) -> DispatchResult {
-		T::StableAssets::burn_from(
+	) -> Option<StableCreditOf<T>> {
+		let preservation = if T::StableAssets::balance(stable_id.clone(), pool_account) == amount {
+			Preservation::Expendable
+		} else {
+			Preservation::Preserve
+		};
+		let credit = T::StableAssets::withdraw(
 			stable_id.clone(),
 			pool_account,
 			amount,
-			Preservation::Expendable,
 			Precision::Exact,
+			preservation,
 			Fortitude::Polite,
 		)
-		.map_err(|_| Error::<T>::StablecoinBurnFailed)?;
-		Ok(())
+		.ok()?;
+		debug_assert_eq!(credit.peek(), amount);
+		Some(credit)
 	}
 
 	/// SPEC.md §6.3: distribute same-stablecoin yield to active depositors

@@ -9,6 +9,7 @@
 //! pays floor(floor(D * 1.03) / 0.52) collateral.
 
 use crate::{mock::*, Error};
+use frame::prelude::ArithmeticError;
 
 /// Open the standing vault (owner 5) and pin its exact debt.
 fn open_standing_vault() {
@@ -153,6 +154,59 @@ fn recovery_offset_error_paths() {
 		MockOracleAvailable::set(false);
 		assert_noop!(offset_recovery(DOT, PUSD, 300), Error::<Test>::BranchFrozen);
 		MockOracleAvailable::set(true);
+	});
+}
+
+#[test]
+fn active_recovery_rolls_back_when_pool_accounting_fails_after_settlement() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		open_standing_vault();
+		seed_active_pool();
+		park_at_104_percent();
+
+		crate::Pools::<Test>::mutate(DOT, PUSD, |pool| {
+			pool.as_mut().unwrap().state.total_collateral_gains_unclaimed = Balance::MAX;
+		});
+		assert_noop!(offset_recovery(DOT, PUSD, 300), ArithmeticError::Overflow);
+
+		// The whole cross-pallet settlement rolled back with the failed plan.
+		assert_eq!(vault_debt(DOT, PUSD, 5), 500);
+		let pool = Stability::pool_account(&DOT, &PUSD);
+		assert_eq!(stable_balance(PUSD, pool), 400);
+		assert_eq!(collateral_balance(DOT, pool), 0);
+
+		crate::Pools::<Test>::mutate(DOT, PUSD, |pool| {
+			pool.as_mut().unwrap().state.total_collateral_gains_unclaimed = 0;
+		});
+	});
+}
+
+#[test]
+fn incoming_recovery_rolls_back_when_deposit_accounting_fails_after_settlement() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		open_standing_vault();
+		mint_stable(PUSD, 2, 300);
+		assert_ok!(deposit(2, DOT, PUSD, 100));
+		park_at_104_percent();
+
+		crate::Deposits::<Test>::mutate((DOT, PUSD, 2), |row| {
+			row.as_mut().unwrap().claimable_collateral = Balance::MAX;
+		});
+		let collateral_before = collateral_balance(DOT, 2);
+		assert_noop!(deposit(2, DOT, PUSD, 200), ArithmeticError::Overflow);
+
+		// The depositor burn and vault settlement rolled back with the failed
+		// claimable-collateral update.
+		assert_eq!(vault_debt(DOT, PUSD, 5), 500);
+		assert_eq!(stable_balance(PUSD, 2), 200);
+		assert_eq!(collateral_balance(DOT, 2), collateral_before);
+		assert_eq!(deposit_row(DOT, PUSD, 2).unwrap().pending_deposit.unwrap().amount, 100);
+
+		crate::Deposits::<Test>::mutate((DOT, PUSD, 2), |row| {
+			row.as_mut().unwrap().claimable_collateral = 0;
+		});
 	});
 }
 

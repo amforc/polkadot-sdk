@@ -197,7 +197,9 @@ fn pending_offset_with_sub_minimum_collateral_gain_stops_before_the_step() {
 		assert_eq!(leftover, 500);
 		let row = deposit_row(coll.clone(), PUSD, 1).expect("kept");
 		assert_eq!(row.pending_deposit.expect("untouched").amount, 200);
-		assert_eq!(pool_state(coll, PUSD).total_pending_deposits, 200);
+		assert_eq!(pool_state(coll.clone(), PUSD).total_pending_deposits, 200);
+		let pool = Stability::pool_account(&coll, &PUSD);
+		assert_eq!(stable_balance(PUSD, pool), 200);
 	});
 }
 

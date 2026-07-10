@@ -327,10 +327,6 @@ pub mod pallet {
 		/// accumulator math; only reachable with a misconfigured
 		/// `minimum_active_pool_balance` on a gigantic pool.
 		UnsupportedOffsetPrecision,
-		/// Withdrawing the offset debt from the pool account failed —
-		/// storage corruption, not a user error (the balance identity
-		/// guarantees cover).
-		StablecoinBurnFailed,
 		/// No `FinalRecovery` vault is queued on this market.
 		RecoveryVaultNotFound,
 		/// The `FinalRecovery` head is below par (`CR < 100%`): deposits
