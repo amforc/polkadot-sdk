@@ -358,6 +358,13 @@ fn update_meta_for_insert<T: Config>(
 ) -> Result<bool, ListError> {
 	ListMetas::<T>::try_mutate_exists(list_id, |slot| -> Result<bool, ListError> {
 		let list_created = slot.is_none();
+		// No meta row means an empty list, so the only valid hint is
+		// `endpoints_only`. Any neighbor hint means nodes exist without a meta
+		// row: reject it as corruption instead of building a list over the orphans.
+		if list_created && *position != Position::endpoints_only() {
+			defensive!("insert_at: neighbor hint into absent list metadata");
+			return Err(ListError::CorruptList);
+		}
 		let mut meta = slot.take().unwrap_or_default();
 		if position.prev.is_none() && meta.head != position.next {
 			defensive!("insert_at: head pointer disagrees with head-side insert");
@@ -514,6 +521,16 @@ fn update_meta_for_remove<T: Config>(
 		// Defensive: by the all-or-nothing invariant a present node implies a
 		// present meta row with `len >= 1`.
 		let mut meta = slot.take().defensive_ok_or(ListError::CorruptList)?;
+		// Check `len` against the node's links: a lone node needs `len == 1`, an
+		// endpoint `len > 1`, an interior node `len > 2`. A smaller `len` would
+		// orphan the survivors or leave an empty meta row, so reject it.
+		let neighbors = u32::from(vacated.prev.is_some()) + u32::from(vacated.next.is_some());
+		let len_matches_topology =
+			if neighbors == 0 { meta.len == 1 } else { meta.len > neighbors };
+		if !len_matches_topology {
+			defensive!("remove_at: ListMetas.len incompatible with removed node topology");
+			return Err(ListError::CorruptList);
+		}
 		// Endpoint cross-check: a `None`-side neighbor link means `item` must
 		// be the stored head/tail; otherwise storage is internally inconsistent.
 		if vacated.prev.is_none() && meta.head.as_ref() != Some(item) {

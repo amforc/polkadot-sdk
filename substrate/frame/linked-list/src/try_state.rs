@@ -41,6 +41,12 @@ use codec::Encode;
 #[cfg(feature = "try-runtime")]
 use frame::try_runtime::TryRuntimeError;
 
+/// Cap on the walk vectors' initial capacity. `meta.len` is the value we are
+/// checking, so a corrupt near-`u32::MAX` len must not size a huge allocation.
+/// A longer list just grows its vector.
+#[cfg(feature = "try-runtime")]
+const MAX_WALK_PREALLOC: usize = 1 << 12;
+
 impl<T: Config> Pallet<T> {
 	/// Run the per-list invariant checks across every list with stored state.
 	/// Returns the first violation found.
@@ -98,8 +104,11 @@ impl<T: Config> Pallet<T> {
 		// missing, or self-looping neighbor links are all caught by the
 		// `node.prev != prev` check, the next iteration's failed fetch, or
 		// the walk cap; per-node `contains_key` probes would be redundant.
+		// `cap` bounds the walk (cycle detection); `prealloc` is the capped
+		// capacity.
 		let cap = stored_size.saturating_add(1) as usize;
-		let mut forward: alloc::vec::Vec<T::ItemId> = alloc::vec::Vec::with_capacity(cap);
+		let prealloc = cap.min(MAX_WALK_PREALLOC);
+		let mut forward: Vec<T::ItemId> = Vec::with_capacity(prealloc);
 		let mut prev: Option<T::ItemId> = None;
 		let mut cursor = Some(head_id);
 		let mut last_priority: Option<T::Priority> = None;
@@ -129,7 +138,7 @@ impl<T: Config> Pallet<T> {
 		}
 
 		// Reverse walk must match the reverse of the forward walk.
-		let mut reverse: alloc::vec::Vec<T::ItemId> = alloc::vec::Vec::with_capacity(cap);
+		let mut reverse: Vec<T::ItemId> = Vec::with_capacity(prealloc);
 		let mut cursor = Some(tail_id);
 		while let Some(cur) = cursor {
 			if reverse.len() >= cap {
