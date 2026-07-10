@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::deps::sp_runtime::{traits::Zero, FixedU128};
+use frame::deps::sp_runtime::{traits::Zero, FixedU128, Permill};
 use scale_info::TypeInfo;
 
 pub use pusd_primitives::VaultStatus;
@@ -18,14 +18,14 @@ pub struct RedemptionConfig<Balance, Moment> {
 	pub dynamic_fee_floor: FixedU128,
 	pub dynamic_fee_ceiling: FixedU128,
 	/// Constant fee component every ordinary redemption pays (e.g. 0.5%).
-	pub base_fee: FixedU128,
+	pub base_fee: Permill,
 	/// Cap on the total fee rate, base and dynamic components combined.
-	pub fee_ceiling: FixedU128,
+	pub fee_ceiling: Permill,
 	/// Divides the redeemed branch-debt fraction before it raises the
 	/// dynamic fee after an ordinary redemption.
 	pub dynamic_fee_increase_divisor: FixedU128,
 	/// Prevents the recovery bonus from worsening a `CR >= 100%` recovery vault.
-	pub final_recovery_bonus_buffer: FixedU128,
+	pub final_recovery_bonus_buffer: Permill,
 }
 
 impl<Balance: Zero, Moment: Zero> RedemptionConfig<Balance, Moment> {

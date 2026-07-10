@@ -4,7 +4,10 @@ use crate::{
 	weights::WeightInfo,
 	Error, Event,
 };
-use pusd_primitives::{collateralization_ratio, recovery_pricing, VaultStatus};
+use pusd_primitives::{
+	collateralization_ratio, recovery_pricing, RecoveryOffsetInterface, RecoveryOffsetOutcome,
+	RecoveryOffsetQuote, RecoveryOffsetResult, VaultStatus,
+};
 
 const HOUR_MS: Moment = 3_600 * 1_000;
 const ONE_YEAR_MS: Moment = 31_557_600_000;
@@ -405,7 +408,8 @@ fn dynamic_fee_decays_between_redemptions() {
 
 		// The stored fee is that exact decayed value plus this redemption's own
 		// increase, reproduced here with the very primitives execution uses.
-		let fee_rate = crate::fees::fee_rate(decayed, rate_pct(5, 1_000), FixedU128::one());
+		let fee_rate =
+			crate::fees::fee_rate(decayed, Permill::from_rational(5u32, 1_000u32), Permill::one());
 		let cancelled = crate::fees::max_debt_for_budget::<Balance>(1_000, fee_rate);
 		let fraction = FixedU128::checked_from_rational(cancelled, branch_debt_before)
 			.expect("nonzero branch debt");
@@ -547,8 +551,11 @@ fn recovery_bonus_buffer_keeps_redemption_cr_improving() {
 		assert!(cr_before > rate_pct(101, 100), "fixture must clear the 1% buffer");
 		// The bonus this fixture produces sits strictly inside (0, penalty):
 		// the mid-range case, where only the buffer bounds it.
-		let bonus =
-			recovery_pricing::recovery_bonus(cr_before, rate_pct(1, 100), Permill::from_percent(5));
+		let bonus = recovery_pricing::recovery_bonus(
+			cr_before,
+			Permill::from_percent(1),
+			Permill::from_percent(5),
+		);
 		assert!(bonus > FixedU128::zero());
 		assert!(bonus < FixedU128::from(Permill::from_percent(5)));
 
@@ -586,8 +593,11 @@ fn recovery_has_priority_over_ordinary_vaults() {
 		)
 		.expect("finite CR");
 		assert!(cr > rate_pct(106, 100), "fixture must put the raw excess above the cap");
-		let bonus =
-			recovery_pricing::recovery_bonus(cr, rate_pct(1, 100), Permill::from_percent(5));
+		let bonus = recovery_pricing::recovery_bonus(
+			cr,
+			Permill::from_percent(1),
+			Permill::from_percent(5),
+		);
 		assert_eq!(bonus, FixedU128::from(Permill::from_percent(5)), "bonus capped at penalty");
 
 		assert_ok!(redeem(3, DOT, PUSD, 200, 0, 4, 0));
@@ -743,8 +753,8 @@ fn set_redemption_config_updates_and_validates() {
 			|c| c.dynamic_fee_decay_period = 0,
 			// `base_fee` above `fee_ceiling`.
 			|c| {
-				c.base_fee = FixedU128::one();
-				c.fee_ceiling = FixedU128::zero();
+				c.base_fee = Permill::one();
+				c.fee_ceiling = Permill::zero();
 			},
 			// Zero `dynamic_fee_increase_divisor`.
 			|c| c.dynamic_fee_increase_divisor = FixedU128::zero(),
@@ -1228,8 +1238,8 @@ fn split_redemptions_equal_a_single_redemption_without_fees() {
 			// Zero every fee knob so the mechanic is isolated from fee dynamics.
 			let mut cfg = DefaultRedemptionConfig::get();
 			cfg.dynamic_fee_ceiling = FixedU128::zero();
-			cfg.base_fee = FixedU128::zero();
-			cfg.fee_ceiling = FixedU128::zero();
+			cfg.base_fee = Permill::zero();
+			cfg.fee_ceiling = Permill::zero();
 			assert_ok!(Redemptions::set_redemption_config(RuntimeOrigin::root(), DOT, PUSD, cfg));
 			assert_ok!(open(1, DOT, PUSD, 100_000, 10_000, rate_pct(5, 100)));
 			mint_stable(PUSD, 3, 1_000_000);
@@ -1272,6 +1282,248 @@ fn ordinary_redemption_at_six_decimals_scales_exactly() {
 		assert_eq!(held_before - held(DOT, 1), 160 * USDX_UNIT);
 		assert_eq!(Assets::balance(USDX, FEE_DEST), USDX_UNIT);
 		assert_eq!(issuance_before - Assets::total_supply(USDX), 200 * USDX_UNIT);
+	});
+}
+
+/// Quote a `(DOT, PUSD)` recovery offset through the trait surface the
+/// Stability Pool consumes.
+fn preview_offset(
+	max_debt_to_cancel: Balance,
+) -> Result<RecoveryOffsetQuote<Balance>, DispatchError> {
+	<Redemptions as RecoveryOffsetInterface>::preview_recovery_offset(
+		&DOT,
+		&PUSD,
+		max_debt_to_cancel,
+	)
+}
+
+/// Execute a `(DOT, PUSD)` recovery offset: `payer` burns, `recipient` is paid.
+fn execute_offset(
+	payer: AccountId,
+	recipient: AccountId,
+	max_debt_to_cancel: Balance,
+) -> Result<RecoveryOffsetResult<AccountId, Balance>, DispatchError> {
+	<Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
+		&DOT,
+		&PUSD,
+		&payer,
+		&recipient,
+		max_debt_to_cancel,
+	)
+}
+
+#[test]
+fn recovery_offset_settles_fifo_head_and_matches_preview() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+		setup_final_recovery(2, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+		// Back at the healthy price both queued vaults sit at CR >= 100%, the
+		// recovery-bonus regime offsets are restricted to.
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![1u64, 2u64]);
+		let debt1 = vault_debt(DOT, PUSD, 1);
+		// 500 principal + the 1-unit 7-day upfront fee.
+		assert_eq!(debt1, 501);
+		let debt2 = vault_debt(DOT, PUSD, 2);
+		mint_stable(PUSD, 3, 10_000);
+		let payer_before = Assets::balance(PUSD, 3);
+		let recipient_before = collateral_balance(DOT, 4);
+		let fee_before = Assets::balance(PUSD, FEE_DEST);
+		let issuance_before = Assets::total_supply(PUSD);
+
+		// The quote sizes exactly the burn the execution then performs.
+		assert_eq!(preview_offset(10_000), Ok(RecoveryOffsetQuote::Available { debt: debt1 }));
+		// CR = 1_250/501 ≈ 249% caps the bonus at the 5% redistribution
+		// penalty: collateral = floor(floor(501 · 1.05) / 1.25) = 420.
+		assert_eq!(
+			execute_offset(3, 4, 10_000),
+			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
+				vault_owner: 1,
+				debt_cancelled: debt1,
+				collateral_out: 420,
+			}))
+		);
+
+		// The drained head flips to Dormant and leaves the FIFO; the next
+		// head is untouched.
+		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![2u64]);
+		assert_eq!(vault_debt(DOT, PUSD, 2), debt2);
+		// The burn is fee-free, so issuance falls by exactly the cancelled
+		// debt and nothing reaches the fee destination.
+		assert_eq!(payer_before - Assets::balance(PUSD, 3), debt1);
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 420);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST), fee_before);
+		assert_eq!(issuance_before - Assets::total_supply(PUSD), debt1);
+	});
+}
+
+#[test]
+fn recovery_offset_partial_fill_keeps_head_queued() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		let debt_before = vault_debt(DOT, PUSD, 1);
+		mint_stable(PUSD, 3, 10_000);
+		let payer_before = Assets::balance(PUSD, 3);
+		let recipient_before = collateral_balance(DOT, 4);
+
+		// A 200 cap partially fills the 501-debt head; quote and execution
+		// agree on the capped size.
+		assert_eq!(preview_offset(200), Ok(RecoveryOffsetQuote::Available { debt: 200 }));
+		assert_eq!(
+			execute_offset(3, 4, 200),
+			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
+				vault_owner: 1,
+				debt_cancelled: 200,
+				// 5%-capped bonus: floor(floor(200 · 1.05) / 1.25) = 168.
+				collateral_out: 168,
+			}))
+		);
+
+		// The partially settled head keeps its place at the FIFO front.
+		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before - 200);
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
+		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![1u64]);
+		assert_eq!(payer_before - Assets::balance(PUSD, 3), 200);
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 168);
+	});
+}
+
+/// Regression pin for quote/execution parity: a zero `max_debt_to_cancel`
+/// against a recovery-bonus head used to quote `Available { debt: 0 }` while
+/// execution reported `NoTarget`.
+#[test]
+fn recovery_offset_zero_budget_is_no_target_in_both_paths() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		let debt_before = vault_debt(DOT, PUSD, 1);
+		mint_stable(PUSD, 3, 1_000);
+		let payer_before = Assets::balance(PUSD, 3);
+
+		assert_eq!(preview_offset(0), Ok(RecoveryOffsetQuote::NoTarget));
+		assert_eq!(execute_offset(3, 4, 0), Ok(RecoveryOffsetResult::NoTarget));
+
+		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
+		assert_eq!(Assets::balance(PUSD, 3), payer_before);
+	});
+}
+
+#[test]
+fn recovery_offset_below_par_head_is_refused_in_both_paths() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		// Price 0.40 parks the head below par (CR < 100%): settlement at a
+		// discount stays exclusive to the redemption pathway.
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(40u128, 100u128));
+		let debt_before = vault_debt(DOT, PUSD, 1);
+		let held_before = held(DOT, 1);
+		mint_stable(PUSD, 3, 10_000);
+		let payer_before = Assets::balance(PUSD, 3);
+
+		assert_eq!(preview_offset(10_000), Ok(RecoveryOffsetQuote::BelowPar));
+		assert_eq!(execute_offset(3, 4, 10_000), Ok(RecoveryOffsetResult::BelowPar));
+
+		// Refusal leaves the head fully intact.
+		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
+		assert_eq!(held(DOT, 1), held_before);
+		assert_eq!(Assets::balance(PUSD, 3), payer_before);
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
+	});
+}
+
+#[test]
+fn recovery_offset_without_recovery_head_is_no_target_in_both_paths() {
+	build_and_execute(|| {
+		// Unregistered market: the target-first fast path answers before the
+		// config lookup could report `InvalidBranch`.
+		assert_eq!(preview_offset(1_000), Ok(RecoveryOffsetQuote::NoTarget));
+		assert_eq!(execute_offset(3, 4, 1_000), Ok(RecoveryOffsetResult::NoTarget));
+
+		// An ordinary vault is not an offset target either: offsets exist
+		// only for the FinalRecovery FIFO head.
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		let debt_before = vault_debt(DOT, PUSD, 1);
+		mint_stable(PUSD, 3, 1_000);
+
+		assert_eq!(preview_offset(1_000), Ok(RecoveryOffsetQuote::NoTarget));
+		assert_eq!(execute_offset(3, 4, 1_000), Ok(RecoveryOffsetResult::NoTarget));
+		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
+	});
+}
+
+#[test]
+fn recovery_offset_insufficient_payer_balance_rolls_back() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		let debt_before = vault_debt(DOT, PUSD, 1);
+		// The payer holds less than the 501 the uncapped offset must burn.
+		mint_stable(PUSD, 3, 100);
+
+		assert_noop!(execute_offset(3, 4, 10_000), Error::<Test>::InsufficientPusdBalance);
+
+		// The vault-side step and the burn roll back together.
+		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
+		assert_eq!(Assets::balance(PUSD, 3), 100);
+		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![1u64]);
+	});
+}
+
+#[test]
+fn recovery_offset_frozen_branch_reverts() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		mint_stable(PUSD, 3, 1_000);
+		assert_ok!(Vaults::enable_frozen_mode(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+
+		// Frozen-mode enforcement lives vault-side: the head is still queued,
+		// so both paths reach `redeem_step` and are rejected there.
+		assert_noop!(preview_offset(200), pallet_vaults::Error::<Test>::BranchFrozen);
+		assert_noop!(execute_offset(3, 4, 200), pallet_vaults::Error::<Test>::BranchFrozen);
+	});
+}
+
+/// Near-twin of `recovery_redemption_leaves_ordinary_dynamic_fee_untouched`;
+/// the distinct path is the offset surface, which must also stay silent at
+/// the redemptions layer (no fee movement, no events).
+#[test]
+fn recovery_offset_leaves_dynamic_fee_untouched() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		set_dynamic_fee(DOT, PUSD, FixedU128::from_rational(3u128, 100u128));
+		let state_before = crate::RedemptionStates::<Test>::get(DOT, PUSD);
+		mint_stable(PUSD, 3, 1_000);
+		System::reset_events();
+
+		assert_eq!(
+			execute_offset(3, 4, 200),
+			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
+				vault_owner: 1,
+				debt_cancelled: 200,
+				collateral_out: 168,
+			}))
+		);
+
+		// Offsets are fee-free settlement: they neither move the dynamic fee
+		// nor emit redemption events.
+		assert_eq!(crate::RedemptionStates::<Test>::get(DOT, PUSD), state_before);
+		let redemption_events = System::events()
+			.into_iter()
+			.filter(|r| matches!(r.event, RuntimeEvent::Redemptions(_)))
+			.count();
+		assert_eq!(redemption_events, 0);
 	});
 }
 
