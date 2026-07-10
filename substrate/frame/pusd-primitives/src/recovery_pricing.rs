@@ -68,10 +68,10 @@ pub fn collateral_for_value_ceil<Balance: FixedPointOperand>(
 /// redemption.
 pub fn recovery_bonus(
 	cr: FixedU128,
-	buffer: FixedU128,
+	buffer: Permill,
 	redistribution_penalty: Permill,
 ) -> FixedU128 {
-	let excess = cr.saturating_sub(FixedU128::one()).saturating_sub(buffer);
+	let excess = cr.saturating_sub(FixedU128::one()).saturating_sub(FixedU128::from(buffer));
 	let bonus = excess.min(FixedU128::from(redistribution_penalty));
 	debug_assert!(
 		bonus <= cr.saturating_sub(FixedU128::one()),
@@ -207,7 +207,7 @@ mod tests {
 	fn recovery_bonus_capped_by_penalty_and_buffer() {
 		let penalty = Permill::from_percent(5);
 		// A 1% buffer below which no excess is paid out.
-		let buffer = FixedU128::from_rational(1, 100);
+		let buffer = Permill::from_percent(1);
 		// CR = 130% → excess = 30% - 1% = 29%, capped at 5%.
 		let cr = FixedU128::from_rational(130, 100);
 		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::from_rational(5, 100));
@@ -230,7 +230,7 @@ mod tests {
 		// bonus <= cr - 1 for any inputs; here a huge penalty cannot exceed the
 		// CR-derived excess.
 		let cr = FixedU128::from_rational(105, 100);
-		let bonus = recovery_bonus(cr, FixedU128::zero(), Permill::from_percent(100));
+		let bonus = recovery_bonus(cr, Permill::zero(), Permill::from_percent(100));
 		assert!(bonus <= cr.saturating_sub(FixedU128::one()));
 		assert_eq!(bonus, FixedU128::from_rational(5, 100));
 	}

@@ -3,7 +3,7 @@ use frame::deps::{
 	sp_runtime::{
 		helpers_128bit::multiply_by_rational_with_rounding,
 		traits::{CheckedDiv, One, Saturating, Zero},
-		FixedPointNumber, FixedPointOperand, FixedU128, Rounding,
+		FixedPointNumber, FixedPointOperand, FixedU128, Permill, Rounding,
 	},
 };
 
@@ -44,8 +44,10 @@ pub fn increased_dynamic_fee(
 	decayed.saturating_add(increase).max(floor).min(ceiling)
 }
 
-pub fn fee_rate(dynamic_fee: FixedU128, base_fee: FixedU128, fee_ceiling: FixedU128) -> FixedU128 {
-	dynamic_fee.saturating_add(base_fee).min(fee_ceiling)
+/// `min(dynamic_fee + base_fee, fee_ceiling)`. The `Permill` bounds widen
+/// losslessly into the fixed-point domain the dynamic fee lives in.
+pub fn fee_rate(dynamic_fee: FixedU128, base_fee: Permill, fee_ceiling: Permill) -> FixedU128 {
+	dynamic_fee.saturating_add(base_fee.into()).min(fee_ceiling.into())
 }
 
 pub fn fee_pusd<Balance: FixedPointOperand>(
@@ -156,12 +158,12 @@ mod tests {
 
 	#[test]
 	fn fee_rate_clamps_to_bounds() {
-		let floor = FixedU128::from_rational(5, 1000); // 0.5%
-		let ceiling = FixedU128::one();
-		assert_eq!(fee_rate(FixedU128::zero(), floor, ceiling), floor);
-		assert_eq!(fee_rate(FixedU128::from_rational(2, 1), floor, ceiling), ceiling);
+		let base = Permill::from_rational(5u32, 1_000u32); // 0.5%
+		let ceiling = Permill::one();
+		assert_eq!(fee_rate(FixedU128::zero(), base, ceiling), FixedU128::from_rational(5, 1000));
+		assert_eq!(fee_rate(FixedU128::from_rational(2, 1), base, ceiling), FixedU128::one());
 		assert_eq!(
-			fee_rate(FixedU128::from_rational(10, 100), floor, ceiling),
+			fee_rate(FixedU128::from_rational(10, 100), base, ceiling),
 			FixedU128::from_rational(105, 1000)
 		);
 	}
