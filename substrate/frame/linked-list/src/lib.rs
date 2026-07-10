@@ -17,21 +17,18 @@
 
 //! # Linked-list pallet
 //!
-//! A generic per-list sorted doubly-linked list. Items live in independent
-//! lists keyed by `ListId`; within a list they are kept in strict priority order,
-//! head (highest priority) to tail (lowest). Same-priority items land on the tail
-//! side of their cluster, so tail-first iteration is LIFO within a priority
-//! cluster.
+//! A generic sorted doubly-linked list, one list per `ListId`. Each list is
+//! kept in priority order, head (highest) to tail (lowest). Same-priority items
+//! go to the tail side of their cluster, so tail-first iteration is LIFO.
 //!
-//! Insertion accepts a [`Position`] hint (a typed `(prev, next)` pair where
-//! endpoints are encoded as `None`) and repairs stale hints on-chain up to
-//! `MaxHintRepairSteps`.
+//! Insertion takes a [`Position`] hint (a typed `(prev, next)` pair, endpoints
+//! as `None`) and repairs stale hints on-chain up to `MaxHintRepairSteps`.
 //!
 //! ## Overview
 //!
-//! Consumer pallets use the [`SortedListInterface`] trait. The single
-//! dispatchable, [`Pallet::reprioritize`], is permissionless and re-fetches an
-//! item's authoritative priority from [`PriorityProvider`] to correct drift.
+//! Consumer pallets use the [`SortedListInterface`] trait. The one dispatchable,
+//! [`Pallet::reprioritize`], is permissionless: it re-reads an item's
+//! authoritative priority from [`PriorityProvider`] to fix drift.
 //!
 //! ## Interface
 //!
@@ -63,7 +60,7 @@ pub mod weights;
 
 pub(crate) const LOG_TARGET: &str = "runtime::linked-list";
 
-// Syntactic sugar for logging.
+// Logging helper.
 macro_rules! log {
 	($level:tt, $pattern:expr $(, $values:expr)* $(,)?) => {
 		frame::log::$level!(
@@ -105,8 +102,7 @@ pub mod pallet {
 		/// Inner key identifying an item within a list.
 		type ItemId: Parameter + Member + MaxEncodedLen;
 
-		/// Sort key. Higher priorities are closer to the head, lower priorities closer
-		/// to the tail.
+		/// Sort key. Higher priorities sit near the head, lower ones near the tail.
 		type Priority: Parameter + Member + Copy + Ord + MaxEncodedLen;
 
 		/// Authoritative source of an item's priority. Consulted by
@@ -120,12 +116,11 @@ pub mod pallet {
 		/// Weight information for extrinsics in this pallet.
 		type WeightInfo: weights::WeightInfo;
 
-		/// Maximum nodes the on-chain hint-repair walk may traverse before
-		/// failing with [`ListError::InvalidPositionHints`].
+		/// Max nodes the on-chain hint-repair walk may cross before it gives up
+		/// with [`ListError::InvalidPositionHints`].
 		///
-		/// `0` puts the pallet in strict mode: any non-valid hint fails
-		/// immediately with [`ListError::InvalidPositionHints`], giving callers
-		/// a hard O(1) insertion guarantee at the cost of needing perfect hints.
+		/// `0` is strict mode: any invalid hint fails at once. That gives a hard
+		/// O(1) insert, but callers must supply perfect hints.
 		#[pallet::constant]
 		type MaxHintRepairSteps: Get<u32>;
 	}
@@ -142,16 +137,16 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Per-list head pointer, tail pointer, and item count. Removed when a list empties, absence
-	/// encodes the empty list.
+	/// Per-list head, tail, and item count. Dropped when a list empties; a
+	/// missing row means the empty list.
 	#[pallet::storage]
 	pub type ListMetas<T: Config> =
 		StorageMap<_, Blake2_128Concat, T::ListId, ListMeta<T::ItemId>, OptionQuery>;
 
-	/// Authoritative priority backing for benchmarks. Production runtimes derive
-	/// the priority from external state (e.g. stake) via their own
-	/// [`PriorityProvider`] impl; this storage exists so the pallet can be
-	/// benchmarked standalone, paired with [`crate::BenchPriorityProvider`].
+	/// Priority backing for benchmarks only. Production runtimes read the priority
+	/// from external state (e.g. stake) via their own [`PriorityProvider`]; this
+	/// storage lets the pallet be benchmarked alone, paired with
+	/// [`crate::BenchPriorityProvider`].
 	#[cfg(feature = "runtime-benchmarks")]
 	#[pallet::storage]
 	pub type BenchAuthoritativePriority<T: Config> = StorageDoubleMap<
@@ -272,10 +267,10 @@ pub mod pallet {
 			)
 		}
 
-		/// Steps the on-chain repair walk would take from `hint` for inserting
-		/// a NEW item at `priority`. Faithful to [`SortedListInterface::insert`]
-		/// only; see [`SortedListInterface::repair_steps_needed`] for the full
-		/// contract and [`Pallet::re_insert_steps_needed`] for `reprioritize`.
+		/// Steps the on-chain repair walk would take from `hint` to insert a NEW
+		/// item at `priority`. Matches [`SortedListInterface::insert`] only; see
+		/// [`SortedListInterface::repair_steps_needed`] for the full contract and
+		/// [`Pallet::re_insert_steps_needed`] for `reprioritize`.
 		pub fn repair_steps_needed(
 			list_id: T::ListId,
 			priority: T::Priority,
@@ -287,9 +282,9 @@ pub mod pallet {
 		}
 
 		/// Steps a [`Pallet::reprioritize`] moving `(list_id, item)` to
-		/// `new_priority` would need to repair `hint`, simulating the dispatch
-		/// exactly; see [`SortedListInterface::re_insert_steps_needed`] for
-		/// the full contract.
+		/// `new_priority` would take to repair `hint`, simulating the dispatch
+		/// exactly. See [`SortedListInterface::re_insert_steps_needed`] for the
+		/// full contract.
 		pub fn re_insert_steps_needed(
 			list_id: T::ListId,
 			item: T::ItemId,
@@ -307,17 +302,16 @@ pub mod pallet {
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// Reposition `(list_id, item)` after its authoritative priority, fetched
-		/// from [`PriorityProvider`], has drifted from the stored priority.
+		/// Move `(list_id, item)` to its authoritative priority from
+		/// [`PriorityProvider`] once that has drifted from the stored one.
 		///
-		/// Anyone can call this. The caller supplies a [`Position`] hint for
-		/// the new position; stale hints are repaired up to
-		/// `MaxHintRepairSteps`.
+		/// Anyone can call this. The caller passes a [`Position`] hint; stale
+		/// hints are repaired up to `MaxHintRepairSteps`.
 		///
-		/// When [`PriorityProvider::priority`] returns `None` the item is
-		/// REMOVED from the list (announced by an `ItemRemoved` event): the
-		/// provider declaring an item dead makes its removal permissionless.
-		/// See the removal contract on [`PriorityProvider::priority`].
+		/// If [`PriorityProvider::priority`] returns `None` the item is REMOVED
+		/// (announced by an `ItemRemoved` event): marking an item dead makes its
+		/// removal permissionless. See the removal contract on
+		/// [`PriorityProvider::priority`].
 		#[pallet::call_index(0)]
 		#[pallet::weight(
 			T::WeightInfo::reprioritize_no_op()
