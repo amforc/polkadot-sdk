@@ -20,6 +20,9 @@ impl<T: Config> OnBranchYield<T::CollateralAssetId, T::StableAssetId, StableCred
 		stable_id: &T::StableAssetId,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
+		if credit.asset() != *stable_id {
+			return credit;
+		}
 		let Some(pool) = Pools::<T>::get(collateral_id, stable_id) else {
 			return credit;
 		};

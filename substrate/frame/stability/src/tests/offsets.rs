@@ -249,13 +249,14 @@ fn offset_with_sub_minimum_collateral_gain_steps_aside() {
 		let state = pool_state(coll.clone(), PUSD);
 		assert_eq!(state.total_active_deposits, 1_000);
 		assert_eq!(state.coords.p, FixedU128::one());
+		let pool = Stability::pool_account(&coll, &PUSD);
+		assert_eq!(stable_balance(PUSD, pool), 1_000);
 
 		// A gain clearing the minimum lands normally.
 		let (result, leftover) = simulate_offset(coll.clone(), PUSD, 500, 1_500);
 		assert_eq!(result.debt_offset, 500);
 		assert_eq!(result.collateral_to_pool, 1_500);
 		assert_eq!(leftover, 0);
-		let pool = Stability::pool_account(&coll, &PUSD);
 		assert_eq!(collateral_balance(coll, pool), 1_500);
 	});
 }
