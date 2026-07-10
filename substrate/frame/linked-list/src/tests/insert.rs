@@ -205,6 +205,20 @@ fn insert_at_self_link_is_defensive() {
 }
 
 #[test]
+#[should_panic = "neighbor hint into absent list metadata"]
+fn insert_at_interior_into_absent_meta_is_defensive() {
+	build_and_execute_defensive(|| {
+		insert(1, 100, 90);
+		insert(1, 200, 50);
+		// Drop the meta row but keep both linked nodes. An interior insert must
+		// reject this as corruption, not treat the missing row as an empty list
+		// and build metadata over the orphans.
+		ListMetas::<Test>::remove(1);
+		let _ = list::insert_at::<Test>(&1, &150, 70, Position::between(100, 200));
+	});
+}
+
+#[test]
 #[should_panic = "tail pointer disagrees with tail-side insert"]
 fn insert_at_tail_endpoint_mismatch_is_defensive() {
 	build_and_execute_defensive(|| {
