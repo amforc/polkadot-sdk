@@ -145,11 +145,16 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// out and re-inserts at the hint. The returned [`Outcome`] tells the
 	/// caller which path ran so the matching weight can be charged.
 	///
+	/// When `new_priority` equals the stored priority the call is a no-op
+	/// ([`Outcome::NoOp`]): no write, no event, and no link check. So it can
+	/// return `Ok(NoOp)` over a corrupt node that a priority change would reject
+	/// with `CorruptList`.
+	///
 	/// # Errors
 	///
 	/// - [`ListError::ItemNotFound`] if `(list_id, item)` is not in the list.
-	/// - [`ListError::CorruptList`] if the node's stored links, its neighbors' back-links, or the
-	///   list metadata are inconsistent — never as a result of caller input.
+	/// - [`ListError::CorruptList`] if a mutating path finds the node's stored links, its
+	///   neighbors' back-links, or the list metadata inconsistent — never from caller input.
 	/// - [`ListError::InvalidPositionHints`] if the hint cannot be repaired within the budget.
 	/// - [`ListError::Internal`] if the transactional storage-layer limit blocked the splice
 	///   (environmental; retrying with a different hint will not help).
@@ -330,7 +335,8 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		let existing = ListNodes::<T>::get(&list_id, &item).ok_or(ListError::ItemNotFound)?;
 		let old_priority = existing.priority;
 
-		// Fast path: same priority. No write, no event.
+		// Fast path: same priority. No write, no event, no link check — a no-op
+		// mutates nothing, so it cannot make corruption worse.
 		if old_priority == new_priority {
 			return Ok(Outcome::NoOp);
 		}
