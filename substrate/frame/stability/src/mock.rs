@@ -361,10 +361,10 @@ parameter_types! {
 			dynamic_fee_decay_period: 6 * 3_600 * 1_000,
 			dynamic_fee_floor: FixedU128::zero(),
 			dynamic_fee_ceiling: FixedU128::one(),
-			base_fee: FixedU128::from_rational(5u128, 1_000u128),
-			fee_ceiling: FixedU128::one(),
+			base_fee: Permill::from_rational(5u32, 1_000u32),
+			fee_ceiling: Permill::one(),
 			dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
-			final_recovery_bonus_buffer: FixedU128::from_rational(1u128, 100u128),
+			final_recovery_bonus_buffer: Permill::from_percent(1),
 		};
 }
 

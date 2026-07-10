@@ -6,6 +6,7 @@ use frame::traits::{
 	fungibles::Balanced as FungiblesBalanced,
 	tokens::{Fortitude, Precision, Preservation},
 };
+use pusd_primitives::{OnBranchYield, StabilityPoolOffsetApi};
 
 fn seed_branch_with_debt() {
 	register_branch(DOT, PUSD, default_branch_config());
@@ -62,6 +63,92 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 		// Restore the artificial corruption before the post-test try-state
 		// identity check runs.
 		mint_stable(USDX, pool, USDX_MIN_BALANCE);
+	});
+}
+
+#[test]
+fn yield_distribution_rejects_a_credit_for_another_stablecoin() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		mint_stable(PUSD, 1, 400);
+		assert_ok!(deposit(1, DOT, PUSD, 400));
+		activate_all(&[1]);
+
+		let pool = Stability::pool_account(&DOT, &PUSD);
+		let state_before = pool_state(DOT, PUSD);
+		let credit = <Assets as FungiblesBalanced<AccountId>>::issue(USDX, 20_000);
+		let returned = Stability::distribute_yield(&DOT, &PUSD, credit);
+
+		assert_eq!(returned.asset(), USDX);
+		assert_eq!(returned.peek(), 20_000);
+		assert_eq!(stable_balance(USDX, pool), 0);
+		assert_eq!(pool_state(DOT, PUSD), state_before);
+		drop(returned);
+	});
+}
+
+#[test]
+fn offset_apis_reject_a_credit_for_another_collateral() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		mint_stable(PUSD, 1, 400);
+		assert_ok!(deposit(1, DOT, PUSD, 400));
+		activate_all(&[1]);
+		mint_stable(PUSD, 2, 200);
+		assert_ok!(deposit(2, DOT, PUSD, 200));
+
+		let pool = Stability::pool_account(&DOT, &PUSD);
+		let state_before = pool_state(DOT, PUSD);
+		let (result, returned) =
+			Stability::offset_liquidation(&DOT, &PUSD, 200, issue_collateral(TOKEN_X, 100));
+		assert_eq!(result.debt_offset, 0);
+		assert_eq!(returned.asset(), TOKEN_X);
+		assert_eq!(returned.peek(), 100);
+		drop(returned);
+
+		let (result, returned) = Stability::offset_pending_liquidation(
+			&DOT,
+			&PUSD,
+			200,
+			5,
+			issue_collateral(TOKEN_X, 100),
+		);
+		assert_eq!(result.debt_offset, 0);
+		assert_eq!(result.remaining_debt, 200);
+		assert_eq!(returned.asset(), TOKEN_X);
+		assert_eq!(returned.peek(), 100);
+		drop(returned);
+
+		assert_eq!(collateral_balance(TOKEN_X, pool), 0);
+		assert_eq!(pool_state(DOT, PUSD), state_before);
+		assert_eq!(deposit_row(DOT, PUSD, 2).unwrap().pending_deposit.unwrap().amount, 200);
+	});
+}
+
+#[test]
+fn stable_withdrawal_failure_returns_the_full_collateral_credit() {
+	build_and_execute(|| {
+		register_branch(TOKEN_X, PUSD, default_branch_config());
+		mint_stable(PUSD, 1, 400);
+		assert_ok!(deposit(1, TOKEN_X, PUSD, 400));
+		advance_time(5_000);
+		assert_ok!(activate(1, TOKEN_X, PUSD));
+
+		let pool = Stability::pool_account(&TOKEN_X, &PUSD);
+		// Break the stable-balance identity so the stable withdrawal fails
+		// before any part of the collateral credit is consumed.
+		burn_stable(PUSD, pool, 400);
+
+		let (result, returned) =
+			Stability::do_offset_liquidation(&TOKEN_X, &PUSD, 200, issue_collateral(TOKEN_X, 100));
+		assert_eq!(result.debt_offset, 0);
+		assert_eq!(returned.asset(), TOKEN_X);
+		assert_eq!(returned.peek(), 100);
+		assert_eq!(collateral_balance(TOKEN_X, pool), 0);
+		drop(returned);
+
+		// Repair the deliberate corruption before the post-test invariant check.
+		mint_stable(PUSD, pool, 400);
 	});
 }
 
