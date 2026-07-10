@@ -1,6 +1,5 @@
 //! `request_withdraw` / `withdraw`: Normal-Mode flow end to end, plus the
-//! Safety/Frozen resolution rules unit-tested through `resolve_withdrawal`
-//! in isolation (`tests/mode.rs` drives them through the live mode gate).
+//! amount and timing boundaries of Safety-Mode resolution.
 
 use crate::{
 	mock::*,
@@ -220,16 +219,8 @@ fn normal_withdraw_ignores_request_and_prunes_it_with_the_row() {
 	});
 }
 
-// The Safety/Frozen arms below go through `resolve_withdrawal` directly,
-// pinning the resolution rules in isolation; `tests/mode.rs` covers the
-// same rules end to end through the live vaults-derived mode.
-
-#[test]
-fn safety_withdrawal_requires_request() {
-	let mut row = active_row(400, None);
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 700_000, 100, &mut row);
-	assert_eq!(got, Err(Error::<Test>::WithdrawalRequestMissing.into()));
-}
+// Pin the partial-consumption boundary directly; `tests/mode.rs` covers the
+// broader Safety flow through the live vaults-derived mode.
 
 #[test]
 fn safety_withdrawal_respects_delay_boundary() {
@@ -244,30 +235,4 @@ fn safety_withdrawal_respects_delay_boundary() {
 	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606_000, 100, &mut row);
 	assert_eq!(got, Ok(100));
 	assert_eq!(row.withdrawal_request.as_ref().expect("still open").amount, 150);
-}
-
-#[test]
-fn safety_withdrawal_takes_min_and_consumes_request() {
-	// take = min(amount 300, request 250, active 400) = 250; the exhausted
-	// request clears.
-	let request = WithdrawalRequest { amount: 250, executable_at: 606_000 };
-	let mut row = active_row(400, Some(request));
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606_000, 300, &mut row);
-	assert_eq!(got, Ok(250));
-	assert!(row.withdrawal_request.is_none());
-
-	// Bounded by the active deposit when the request exceeds it:
-	// take = min(500, 500, 400) = 400, leaving 100 of the request open.
-	let request = WithdrawalRequest { amount: 500, executable_at: 606_000 };
-	let mut row = active_row(400, Some(request));
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606_000, 500, &mut row);
-	assert_eq!(got, Ok(400));
-	assert_eq!(row.withdrawal_request.as_ref().expect("still open").amount, 100);
-}
-
-#[test]
-fn frozen_withdrawal_rejected() {
-	let mut row = active_row(400, None);
-	let got = Stability::resolve_withdrawal(BranchMode::Frozen, 700_000, 100, &mut row);
-	assert_eq!(got, Err(Error::<Test>::BranchFrozen.into()));
 }

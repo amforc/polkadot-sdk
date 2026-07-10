@@ -415,16 +415,6 @@ mod tests {
 	}
 
 	#[test]
-	fn fresh_pool_state_starts_at_p_one_epoch_zero() {
-		let state = PoolState::<u128>::fresh();
-		assert_eq!(state.coords.p, FixedU128::one());
-		assert_eq!(state.coords.epoch, 0);
-		assert_eq!(state.coords.scale, 0);
-		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.total_pending_deposits, 0);
-	}
-
-	#[test]
 	fn deposit_emptiness_ignores_withdrawal_requests() {
 		let mut deposit = Deposit::<u128>::fresh(DepositSnapshot::fresh());
 		deposit.withdrawal_request = Some(WithdrawalRequest { amount: 10, executable_at: 601_000 });

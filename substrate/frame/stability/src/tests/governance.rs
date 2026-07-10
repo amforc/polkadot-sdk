@@ -1,7 +1,6 @@
 //! Branch lifecycle seeding and `set_stability_pool_config` governance.
 
 use crate::{mock::*, pending, types::PoolSums, Error};
-use frame::traits::Get;
 
 fn providers(who: AccountId) -> u32 {
 	System::providers(&who)
@@ -238,14 +237,4 @@ fn pool_accounts_are_distinct_across_markets_and_pallets() {
 		// pallets must never share a balance.
 		assert_ne!(dot_pusd, Vaults::redistribution_account(&DOT, &PUSD));
 	});
-}
-
-#[test]
-fn default_config_matches_integrity_expectations() {
-	// The same predicate `integrity_test` enforces at runtime-build time.
-	let config: crate::types::StabilityPoolConfig<Balance> =
-		<Test as crate::Config>::DefaultStabilityPoolConfig::get();
-	assert!(config.is_valid());
-	let max_iterations: u32 = <Test as crate::Config>::MaxPendingOffsetIterations::get();
-	assert!(max_iterations > 0);
 }
