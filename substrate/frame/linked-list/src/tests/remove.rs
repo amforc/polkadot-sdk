@@ -210,11 +210,44 @@ fn remove_at_missing_meta_row_is_defensive() {
 fn remove_at_len_underflow_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
-		// Corrupt the length counter to 0 while the node and head/tail persist, so
-		// the decrement underflows.
+		// Set `len` to 0 while the node persists. A lone node needs `len == 1`, so
+		// the topology check trips before the decrement can underflow.
 		ListMetas::<Test>::mutate(1, |maybe| {
 			if let Some(meta) = maybe {
 				meta.len = 0;
+			}
+		});
+		let _ = LinkedList::remove(&1, &100);
+	});
+}
+
+#[test]
+#[should_panic = "ListMetas.len incompatible with removed node topology"]
+fn remove_endpoint_with_undercounted_len_is_defensive() {
+	build_and_execute_defensive(|| {
+		insert(1, 100, 90);
+		insert(1, 200, 50);
+		// Two linked nodes but `len == 1`: removing an endpoint would drop the meta
+		// row and orphan the survivor. The topology check rejects it.
+		ListMetas::<Test>::mutate(1, |maybe| {
+			if let Some(meta) = maybe {
+				meta.len = 1;
+			}
+		});
+		let _ = LinkedList::remove(&1, &100);
+	});
+}
+
+#[test]
+#[should_panic = "ListMetas.len incompatible with removed node topology"]
+fn remove_sole_node_with_overcounted_len_is_defensive() {
+	build_and_execute_defensive(|| {
+		insert(1, 100, 50);
+		// A lone node but `len == 2`: removing it would leave an empty meta row
+		// (`len == 1`, no nodes). The topology check rejects it.
+		ListMetas::<Test>::mutate(1, |maybe| {
+			if let Some(meta) = maybe {
+				meta.len = 2;
 			}
 		});
 		let _ = LinkedList::remove(&1, &100);

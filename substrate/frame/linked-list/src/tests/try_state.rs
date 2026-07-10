@@ -56,6 +56,22 @@ fn corrupt_size_detected() {
 }
 
 #[test]
+fn corrupt_near_max_size_is_caught_without_preallocating() {
+	build_and_execute_no_post_check(|| {
+		insert(1, 1, 50);
+		insert(1, 2, 30);
+		// A near-`u32::MAX` `len` must be caught by the count check, not size a
+		// huge walk-vector before the walk runs.
+		ListMetas::<Test>::mutate(1, |maybe| {
+			if let Some(m) = maybe {
+				m.len = u32::MAX;
+			}
+		});
+		assert!(<LinkedList>::do_try_state().is_err());
+	});
+}
+
+#[test]
 fn corrupt_head_tail_mismatch_detected() {
 	build_and_execute_no_post_check(|| {
 		insert(1, 1, 50);
