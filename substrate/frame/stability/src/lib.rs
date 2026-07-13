@@ -107,9 +107,9 @@ pub mod pallet {
 		/// (SPEC.md §12 invariant 9).
 		type RecoveryOffsets: RecoveryOffsetInterface<
 			CollateralId = Self::CollateralAssetId,
-			StableId = Self::StableAssetId,
 			AccountId = Self::AccountId,
 			Balance = BalanceOf<Self>,
+			Credit = StableCreditOf<Self>,
 		>;
 
 		/// Backing store for the per-branch pending-deposit FIFO: the
@@ -336,10 +336,6 @@ pub mod pallet {
 		/// The recovery offset resolved to zero burnable stablecoin (empty
 		/// active pool, the §6.5 floor, or a zero request).
 		NoRecoveryOffsetPerformed,
-		/// The settlement executed against different figures than it was
-		/// sized with — storage corruption, not a user error (quote and
-		/// execution share one oracle price and block).
-		InvalidRecoveryOffsetSnapshot,
 		/// The pending-deposit FIFO and the deposit rows disagree — storage
 		/// corruption, not a user error.
 		PendingFifoInvariantBroken,

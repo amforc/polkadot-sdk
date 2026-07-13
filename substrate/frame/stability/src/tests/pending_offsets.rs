@@ -322,3 +322,33 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		assert_eq!(stable_balance(PUSD, pool), 0);
 	});
 }
+
+#[test]
+fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
+	build_and_execute(|| {
+		register_branch(DOT, USDX, default_branch_config());
+		mint_stable(USDX, 1, 60_000);
+		assert_ok!(deposit(1, DOT, USDX, 50_000));
+
+		let pool = Stability::pool_account(&DOT, &USDX);
+		assert_eq!(stable_balance(USDX, pool), 50_000);
+
+		// Burning 45_000 would strand 5_000 < 10_000 on the pool: the first
+		// step rounds down to 40_000 and ends the walk because nothing
+		// preservable remains.
+		let (result, leftover) = simulate_pending_offset(DOT, USDX, 45_000, 45_000, 5);
+		assert_eq!(result.debt_offset, 40_000);
+		assert_eq!(result.collateral_to_pool, 40_000);
+		assert_eq!(result.remaining_debt, 5_000);
+		assert_eq!(result.iterations_used, 1);
+		assert_eq!(leftover, 5_000);
+
+		// The pool sits exactly at the minimum and the row keeps the
+		// unconsumed pending remainder.
+		assert_eq!(stable_balance(USDX, pool), USDX_MIN_BALANCE);
+		assert_eq!(pool_state(DOT, USDX).total_pending_deposits, 10_000);
+		let row = deposit_row(DOT, USDX, 1).expect("row survives");
+		assert_eq!(row.pending_deposit.expect("pending remainder").amount, 10_000);
+		assert_eq!(row.claimable_collateral, 40_000);
+	});
+}
