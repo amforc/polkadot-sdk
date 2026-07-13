@@ -3,9 +3,7 @@
 
 use crate::pallet::{BalanceOf, CollateralCreditOf, Config, Pallet, Pools, StableCreditOf};
 use frame::prelude::*;
-use pusd_primitives::{
-	OnBranchYield, PendingOffsetResult, PoolOffsetResult, StabilityPoolOffsetApi,
-};
+use pusd_primitives::{OnBranchYield, PendingOffsetResult, StabilityPoolOffsetApi};
 
 /// The vault engine hands every minted branch credit through here; the pool
 /// takes `floor(yield_share * credit)` and returns the rest for the fee
@@ -57,21 +55,21 @@ impl<T: Config>
 		stable_id: &T::StableAssetId,
 		max_debt_to_offset: BalanceOf<T>,
 		collateral: CollateralCreditOf<T>,
-	) -> (PoolOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
+	) -> (BalanceOf<T>, CollateralCreditOf<T>) {
 		Self::do_offset_liquidation(collateral_id, stable_id, max_debt_to_offset, collateral)
 	}
 
 	fn offset_pending_liquidation(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-		remaining_debt: BalanceOf<T>,
+		max_debt_to_offset: BalanceOf<T>,
 		max_pending_iterations: u32,
 		collateral: CollateralCreditOf<T>,
 	) -> (PendingOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
 		Self::do_offset_pending_liquidation(
 			collateral_id,
 			stable_id,
-			remaining_debt,
+			max_debt_to_offset,
 			max_pending_iterations,
 			collateral,
 		)

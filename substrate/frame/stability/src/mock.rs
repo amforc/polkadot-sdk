@@ -740,13 +740,13 @@ pub fn issue_collateral(
 }
 
 /// Run an active-pool offset against a freshly issued collateral credit.
-/// Returns the result and the unconsumed remainder's amount.
+/// Returns the cancelled debt and the unconsumed remainder's amount.
 pub fn simulate_offset(
 	collateral: AssetId,
 	stable: StableId,
 	max_debt: Balance,
 	collateral_for_pool: Balance,
-) -> (crate::types::PoolOffsetResult<Balance>, Balance) {
+) -> (Balance, Balance) {
 	let credit = issue_collateral(collateral.clone(), collateral_for_pool);
 	let (result, remainder) =
 		Stability::do_offset_liquidation(&collateral, &stable, max_debt, credit);
@@ -757,7 +757,7 @@ pub fn simulate_offset(
 pub fn simulate_pending_offset(
 	collateral: AssetId,
 	stable: StableId,
-	remaining_debt: Balance,
+	max_debt_to_offset: Balance,
 	remaining_collateral: Balance,
 	max_iterations: u32,
 ) -> (crate::types::PendingOffsetResult<Balance>, Balance) {
@@ -765,7 +765,7 @@ pub fn simulate_pending_offset(
 	let (result, remainder) = Stability::do_offset_pending_liquidation(
 		&collateral,
 		&stable,
-		remaining_debt,
+		max_debt_to_offset,
 		max_iterations,
 		credit,
 	);

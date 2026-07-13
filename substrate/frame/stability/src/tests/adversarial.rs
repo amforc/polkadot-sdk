@@ -99,9 +99,9 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		let state_before = pool_state(DOT, PUSD);
-		let (result, returned) =
+		let (debt_offset, returned) =
 			Stability::offset_liquidation(&DOT, &PUSD, 200, issue_collateral(TOKEN_X, 100));
-		assert_eq!(result.debt_offset, 0);
+		assert_eq!(debt_offset, 0);
 		assert_eq!(returned.asset(), TOKEN_X);
 		assert_eq!(returned.peek(), 100);
 		drop(returned);
@@ -114,7 +114,6 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 			issue_collateral(TOKEN_X, 100),
 		);
 		assert_eq!(result.debt_offset, 0);
-		assert_eq!(result.remaining_debt, 200);
 		assert_eq!(returned.asset(), TOKEN_X);
 		assert_eq!(returned.peek(), 100);
 		drop(returned);
@@ -139,9 +138,9 @@ fn stable_withdrawal_failure_returns_the_full_collateral_credit() {
 		// before any part of the collateral credit is consumed.
 		burn_stable(PUSD, pool, 400);
 
-		let (result, returned) =
+		let (debt_offset, returned) =
 			Stability::do_offset_liquidation(&TOKEN_X, &PUSD, 200, issue_collateral(TOKEN_X, 100));
-		assert_eq!(result.debt_offset, 0);
+		assert_eq!(debt_offset, 0);
 		assert_eq!(returned.asset(), TOKEN_X);
 		assert_eq!(returned.peek(), 100);
 		assert_eq!(collateral_balance(TOKEN_X, pool), 0);
@@ -191,7 +190,7 @@ fn safety_withdraw_after_offset_cannot_overdraw_stale_request() {
 
 		// The request still says 400, but a liquidation offset shrinks the
 		// live active deposit to 100 before the request matures.
-		assert_eq!(simulate_offset(DOT, PUSD, 300, 120).0.debt_offset, 300);
+		assert_eq!(simulate_offset(DOT, PUSD, 300, 120).0, 300);
 		advance_time(600_000);
 
 		assert_ok!(withdraw(1, DOT, PUSD, 400, 1));
