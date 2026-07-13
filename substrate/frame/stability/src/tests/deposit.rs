@@ -171,3 +171,23 @@ fn fifo_orders_depositors_oldest_first() {
 		assert_eq!(pending_count(DOT, PUSD), 1);
 	});
 }
+
+#[test]
+fn deposit_in_the_wallet_dead_zone_fails_instead_of_dusting() {
+	build_and_execute(|| {
+		register_branch(DOT, USDX, default_branch_config());
+		mint_stable(USDX, 1, 50_000);
+
+		// 45_000 would leave 5_000 < the 10_000 USDX minimum in the wallet.
+		// The funding withdrawal runs under `Preserve` (not a full drain), so
+		// the asset pallet itself rejects it instead of folding the 5_000
+		// into the debit. Depositing the whole wallet is the legitimate full
+		// expend.
+		assert_noop!(deposit(1, DOT, USDX, 45_000), pallet_assets::Error::<Test>::BalanceLow);
+		assert_ok!(deposit(1, DOT, USDX, 50_000));
+		assert_eq!(stable_balance(USDX, 1), 0);
+
+		let pool = Stability::pool_account(&DOT, &USDX);
+		assert_eq!(stable_balance(USDX, pool), 50_000);
+	});
+}
