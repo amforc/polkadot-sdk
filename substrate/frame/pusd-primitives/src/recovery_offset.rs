@@ -5,20 +5,13 @@
 
 use frame::deps::sp_runtime::DispatchError;
 
-/// What an applied recovery offset actually did.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct RecoveryOffsetOutcome<AccountId, Balance> {
-	pub vault_owner: AccountId,
-	pub collateral_out: Balance,
-}
-
 /// Result of one execution attempt against the current `FinalRecovery` FIFO
 /// head.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum RecoveryOffsetResult<AccountId, Balance> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecoveryOffsetResult<Balance> {
 	NoTarget,
 	BelowPar,
-	Applied(RecoveryOffsetOutcome<AccountId, Balance>),
+	Applied { collateral_out: Balance },
 }
 
 /// Execution of recovery offsets against the `FinalRecovery` FIFO head,
@@ -29,30 +22,33 @@ pub enum RecoveryOffsetResult<AccountId, Balance> {
 /// different recovery price.
 pub trait RecoveryOffsetInterface {
 	type CollateralId;
+	type StableId;
 	type AccountId;
 	type Balance;
 	type Credit;
 
-	/// Cancel head debt against the `payment` credit at the shared
-	/// settlement pricing — the credit's value is the budget — and deliver
-	/// the priced collateral to `collateral_recipient`, atomically within
-	/// the underlying vault step. The unconsumed change returns with the
-	/// result: the whole payment on `NoTarget`/`BelowPar`, which are
-	/// ordinary results rather than errors. Fee-free: the redemption
-	/// dynamic fee is neither charged nor moved.
+	/// Cancel head debt of the `(collateral_id, stable_id)` market against
+	/// the `payment` credit at the shared settlement pricing — the credit's
+	/// value is the budget — and deliver the priced collateral to
+	/// `collateral_recipient`, atomically within the underlying vault step.
+	/// The unconsumed change returns with the result: the whole payment on
+	/// `NoTarget`/`BelowPar`, which are ordinary results rather than errors.
+	/// Fee-free: the redemption dynamic fee is neither charged nor moved.
 	///
-	/// The credit is authoritative twice over: its asset selects the
-	/// market's stablecoin (only the branch's collateral needs naming), and
-	/// conservation is structural — the implementation can only burn value
-	/// the credit carries, so callers derive the cancelled debt as
-	/// `payment - change` instead of trusting a reported figure.
+	/// The payment must be denominated in the market's stablecoin; a
+	/// mismatch is a caller wiring bug and fails with `Err` rather than
+	/// settling in whatever market the coin happens to name. Conservation
+	/// is structural — the implementation can only burn value the credit
+	/// carries, so callers derive the cancelled debt as `payment - change`
+	/// instead of trusting a reported figure.
 	///
 	/// On `Err` the payment was consumed in memory while its storage
 	/// effects unwind with the caller's transaction: callers must abort
 	/// the whole extrinsic, never continue past an error.
 	fn execute_recovery_offset(
 		collateral_id: &Self::CollateralId,
+		stable_id: &Self::StableId,
 		payment: Self::Credit,
 		collateral_recipient: &Self::AccountId,
-	) -> Result<(RecoveryOffsetResult<Self::AccountId, Self::Balance>, Self::Credit), DispatchError>;
+	) -> Result<(RecoveryOffsetResult<Self::Balance>, Self::Credit), DispatchError>;
 }

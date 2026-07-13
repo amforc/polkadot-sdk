@@ -30,7 +30,7 @@ pub use branch_mode::{BranchMode, BranchModeProvider};
 pub use debit::{debit_preservation, reducible_debit};
 pub use list_id::StableListId;
 pub use oracle::ProvidePrice;
-pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetOutcome, RecoveryOffsetResult};
+pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetResult};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
 pub use vault_interface::{
