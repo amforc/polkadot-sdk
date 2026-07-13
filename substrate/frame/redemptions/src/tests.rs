@@ -1,12 +1,12 @@
 use crate::{
 	mock::*,
-	types::{RecoveryRegime, RedemptionConfig},
+	types::{RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig},
 	weights::WeightInfo,
 	Error, Event,
 };
 use pusd_primitives::{
-	collateralization_ratio, recovery_pricing, RecoveryOffsetInterface, RecoveryOffsetOutcome,
-	RecoveryOffsetQuote, RecoveryOffsetResult, VaultStatus,
+	collateralization_ratio, recovery_pricing, reducible_debit, RecoveryOffsetInterface,
+	RecoveryOffsetOutcome, RecoveryOffsetResult, VaultStatus,
 };
 
 const HOUR_MS: Moment = 3_600 * 1_000;
@@ -1285,31 +1285,58 @@ fn ordinary_redemption_at_six_decimals_scales_exactly() {
 	});
 }
 
-/// Quote a `(DOT, PUSD)` recovery offset through the trait surface the
-/// Stability Pool consumes.
+/// Quote a `(DOT, PUSD)` recovery offset through the pallet's view surface.
 fn preview_offset(
 	max_debt_to_cancel: Balance,
 ) -> Result<RecoveryOffsetQuote<Balance>, DispatchError> {
-	<Redemptions as RecoveryOffsetInterface>::preview_recovery_offset(
-		&DOT,
-		&PUSD,
-		max_debt_to_cancel,
-	)
+	Redemptions::preview_recovery_offset(&DOT, &PUSD, max_debt_to_cancel)
 }
 
-/// Execute a `(DOT, PUSD)` recovery offset: `payer` burns, `recipient` is paid.
+/// Execute a `(DOT, PUSD)` recovery offset: `payer` funds the payment credit
+/// (capped at their whole balance, the way pool callers size their
+/// withdrawals) and receives the change back; `recipient` is paid the
+/// collateral. Transactional like the real callers, so an `Err` also rolls
+/// the funding withdrawal back.
 fn execute_offset(
 	payer: AccountId,
 	recipient: AccountId,
 	max_debt_to_cancel: Balance,
 ) -> Result<RecoveryOffsetResult<AccountId, Balance>, DispatchError> {
-	<Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
-		&DOT,
-		&PUSD,
-		&payer,
-		&recipient,
-		max_debt_to_cancel,
-	)
+	frame::deps::frame_support::storage::with_storage_layer(|| {
+		execute_offset_inner(payer, recipient, max_debt_to_cancel)
+	})
+}
+
+fn execute_offset_inner(
+	payer: AccountId,
+	recipient: AccountId,
+	max_debt_to_cancel: Balance,
+) -> Result<RecoveryOffsetResult<AccountId, Balance>, DispatchError> {
+	use frame::traits::{
+		fungibles::Balanced as FungiblesBalanced,
+		tokens::{Fortitude, Precision},
+	};
+	let (amount, preservation) = reducible_debit::<Assets, _>(PUSD, &payer, max_debt_to_cancel);
+	let payment = if amount.is_zero() {
+		crate::StableCreditOf::<Test>::zero(PUSD)
+	} else {
+		<Assets as FungiblesBalanced<AccountId>>::withdraw(
+			PUSD,
+			&payer,
+			amount,
+			Precision::Exact,
+			preservation,
+			Fortitude::Polite,
+		)?
+	};
+	let (result, change) = <Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
+		&DOT, payment, &recipient,
+	)?;
+	if let Err(change) = change.drop_zero() {
+		<Assets as FungiblesBalanced<AccountId>>::resolve(&payer, change)
+			.map_err(|_| DispatchError::Other("change does not fit the payer account"))?;
+	}
+	Ok(result)
 }
 
 #[test]
@@ -1340,7 +1367,6 @@ fn recovery_offset_settles_fifo_head_and_matches_preview() {
 			execute_offset(3, 4, 10_000),
 			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
 				vault_owner: 1,
-				debt_cancelled: debt1,
 				collateral_out: 420,
 			}))
 		);
@@ -1378,7 +1404,6 @@ fn recovery_offset_partial_fill_keeps_head_queued() {
 			execute_offset(3, 4, 200),
 			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
 				vault_owner: 1,
-				debt_cancelled: 200,
 				// 5%-capped bonus: floor(floor(200 · 1.05) / 1.25) = 168.
 				collateral_out: 168,
 			}))
@@ -1459,20 +1484,28 @@ fn recovery_offset_without_recovery_head_is_no_target_in_both_paths() {
 }
 
 #[test]
-fn recovery_offset_insufficient_payer_balance_rolls_back() {
+fn recovery_offset_underfunded_payment_partially_fills() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
 		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
 		let debt_before = vault_debt(DOT, PUSD, 1);
-		// The payer holds less than the 501 the uncapped offset must burn.
+		// The payer holds less than the 501 an uncapped offset could cancel.
+		// The payment credit is the budget, so the offset fills exactly what
+		// it carries instead of failing for the missing remainder.
 		mint_stable(PUSD, 3, 100);
 
-		assert_noop!(execute_offset(3, 4, 10_000), Error::<Test>::InsufficientPusdBalance);
+		assert_eq!(
+			execute_offset(3, 4, 10_000),
+			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
+				vault_owner: 1,
+				// 5%-capped bonus: floor(floor(100 · 1.05) / 1.25) = 84.
+				collateral_out: 84,
+			}))
+		);
 
-		// The vault-side step and the burn roll back together.
-		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
-		assert_eq!(Assets::balance(PUSD, 3), 100);
+		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before - 100);
+		assert_eq!(Assets::balance(PUSD, 3), 0);
 		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![1u64]);
 	});
 }
@@ -1511,7 +1544,6 @@ fn recovery_offset_leaves_dynamic_fee_untouched() {
 			execute_offset(3, 4, 200),
 			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
 				vault_owner: 1,
-				debt_cancelled: 200,
 				collateral_out: 168,
 			}))
 		);
@@ -1555,5 +1587,74 @@ fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_not_coins() {
 		assert_eq!(if_before - Assets::balance(USDX, insurance_account(USDX)), 50 * USDX_UNIT);
 		assert_eq!(issuance_before - Assets::total_supply(USDX), debt);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
+	});
+}
+
+/// The default config with every fee component zeroed, so a step's payment
+/// need equals its budget exactly and dead-zone arithmetic stays readable.
+fn zero_fee_redemption_config() -> RedemptionConfig<Balance, Moment> {
+	RedemptionConfig {
+		dynamic_fee_floor: FixedU128::zero(),
+		dynamic_fee_ceiling: FixedU128::zero(),
+		base_fee: Permill::zero(),
+		fee_ceiling: Permill::zero(),
+		..DefaultRedemptionConfig::get()
+	}
+}
+
+#[test]
+fn dead_zone_redemption_reprices_to_the_preserving_limit() {
+	build_and_execute(|| {
+		register_branch(DOT, USDX, usdx_branch_config());
+		assert_ok!(Redemptions::set_redemption_config(
+			RuntimeOrigin::root(),
+			DOT,
+			USDX,
+			zero_fee_redemption_config(),
+		));
+		assert_ok!(open(1, DOT, USDX, 1_000 * USDX_UNIT, 500 * USDX_UNIT, rate_pct(5, 100)));
+		let debt_before = vault_debt(DOT, USDX, 1);
+		mint_stable(USDX, 3, 300 * USDX_UNIT);
+		let recipient_before = collateral_balance(DOT, 4);
+		let issuance_before = Assets::total_supply(USDX);
+
+		// Spending all but 4_000 raw units would strand the wallet below the
+		// 10_000-unit minimum: the step reprices once at the preserving limit
+		// and commits the partial fill instead of folding the 4_000 in.
+		let request = 300 * USDX_UNIT - 4_000;
+		let burned = 300 * USDX_UNIT - USDX_MIN_BALANCE;
+		assert_ok!(redeem(3, DOT, USDX, request, 0, 4, 0));
+
+		assert_eq!(Assets::balance(USDX, 3), USDX_MIN_BALANCE);
+		assert_eq!(debt_before - vault_debt(DOT, USDX, 1), burned);
+		assert_eq!(issuance_before - Assets::total_supply(USDX), burned);
+		assert_eq!(Assets::balance(USDX, FEE_DEST), 0);
+		// Price 1.25: collateral out = burned / 1.25 exactly.
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, burned * 4 / 5);
+	});
+}
+
+#[test]
+fn full_wallet_redemption_expends_the_redeemer_account() {
+	build_and_execute(|| {
+		register_branch(DOT, USDX, usdx_branch_config());
+		assert_ok!(Redemptions::set_redemption_config(
+			RuntimeOrigin::root(),
+			DOT,
+			USDX,
+			zero_fee_redemption_config(),
+		));
+		assert_ok!(open(1, DOT, USDX, 1_000 * USDX_UNIT, 500 * USDX_UNIT, rate_pct(5, 100)));
+		let debt_before = vault_debt(DOT, USDX, 1);
+		mint_stable(USDX, 3, 300 * USDX_UNIT);
+		let issuance_before = Assets::total_supply(USDX);
+
+		// Spending the whole wallet is the legitimate full expend: the
+		// account reaps with no dust folded into the burn.
+		assert_ok!(redeem(3, DOT, USDX, 300 * USDX_UNIT, 0, 4, 0));
+
+		assert_eq!(Assets::balance(USDX, 3), 0);
+		assert_eq!(debt_before - vault_debt(DOT, USDX, 1), 300 * USDX_UNIT);
+		assert_eq!(issuance_before - Assets::total_supply(USDX), 300 * USDX_UNIT);
 	});
 }
