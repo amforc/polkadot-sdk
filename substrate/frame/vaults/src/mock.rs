@@ -25,8 +25,8 @@ use frame::{
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
 		fungibles::{
-			roles::Inspect as FungiblesRolesInspect, Credit, Inspect as FungiblesInspect,
-			InspectHold,
+			roles::Inspect as FungiblesRolesInspect, Balanced as FungiblesBalanced, Credit,
+			Inspect as FungiblesInspect, InspectHold,
 		},
 		tokens::{fungible, imbalance::ResolveAssetTo},
 		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
@@ -35,7 +35,7 @@ use frame::{
 };
 pub use pallet_linked_list::Position;
 use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, RedemptionAllocation,
+	KeeperCompensation, LiquidationAllocation, OffsetAllocation, RedemptionSettlement,
 	VaultInterface,
 };
 
@@ -628,11 +628,6 @@ pub fn liquidate_with(
 /// Redeem `amount` against the market's current FIFO target through the trait
 /// surface, paying collateral out at the oracle price. Returns the owner that
 /// was redeemed against.
-///
-/// Drives the vaults half of the contract only — the redeemer's stablecoin is
-/// *not* burned here (that is the orchestrator's job; pallet-redemptions pins
-/// issuance falling by exactly the debt burned), so the redeemer needs no
-/// stablecoin balance.
 pub fn redeem(
 	collateral: AssetId,
 	stable: StableId,
@@ -647,42 +642,55 @@ pub fn redeem(
 }
 
 /// Redeem `amount` against an explicit vault owner at the oracle price,
-/// bypassing `next_redemption_target`. As with [`redeem`], no stablecoin is
-/// burned from the redeemer.
+/// bypassing `next_redemption_target`. As with [`redeem`], the payment is
+/// freshly issued from the redeemer.
 pub fn redeem_from(
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
 	recipient: AccountId,
 	amount: Balance,
-) -> Result<Option<RedemptionAllocation<Balance>>, DispatchError> {
+) -> DispatchResult {
 	let price = MockPrices::get().get(&collateral).copied().expect("price set");
 	redeem_step(collateral, stable, owner, recipient, |snapshot| {
 		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
 		let collateral_to_recipient =
 			(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
-		Ok(Some(RedemptionAllocation { debt_to_cancel, collateral_to_recipient }))
+		Ok(Some(settlement(stable, debt_to_cancel, collateral_to_recipient)))
 	})
 }
 
 /// One redemption step against an explicit vault, through the trait surface.
-/// As with [`redeem`], no stablecoin is burned from the redeemer.
 pub fn redeem_step(
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
 	recipient: AccountId,
-	build_allocation: impl FnOnce(
+	build_settlement: impl FnOnce(
 		pusd_primitives::RedemptionStepSnapshot<Balance>,
-	) -> Result<Option<RedemptionAllocation<Balance>>, DispatchError>,
-) -> Result<Option<RedemptionAllocation<Balance>>, DispatchError> {
+	) -> Result<
+		Option<RedemptionSettlement<StableCreditOf<Test>, Balance>>,
+		DispatchError,
+	>,
+) -> DispatchResult {
 	<Pallet<Test> as VaultInterface>::redeem_step(
 		&collateral,
 		&stable,
 		&owner,
 		&recipient,
-		build_allocation,
+		build_settlement,
 	)
+}
+
+/// Settlement paying `debt_to_cancel` in freshly issued `stable` coin.
+pub fn settlement(
+	stable: StableId,
+	debt_to_cancel: Balance,
+	collateral_to_recipient: Balance,
+) -> RedemptionSettlement<StableCreditOf<Test>, Balance> {
+	let debt_payment =
+		<VaultStableAssets as FungiblesBalanced<AccountId>>::issue(stable, debt_to_cancel);
+	RedemptionSettlement { debt_payment, collateral_to_recipient }
 }
 
 /// Held collateral on `(collateral, who)` for the `VaultCollateral` reason.
