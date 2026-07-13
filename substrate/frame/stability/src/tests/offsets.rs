@@ -277,3 +277,39 @@ fn compounded_yield_absorbs_offsets() {
 		assert_eq!(stable_balance(PUSD, 1), 330);
 	});
 }
+
+#[test]
+fn offset_rounds_down_at_the_pool_minimum_balance_dead_zone() {
+	build_and_execute(|| {
+		register_branch(DOT, USDX, default_branch_config());
+		// One active depositor plus 6_000 raw units of pending deposit, so
+		// the pool balance exceeds the active total by less than the
+		// 10_000-unit USDX minimum.
+		mint_stable(USDX, 1, 100_000);
+		assert_ok!(deposit(1, DOT, USDX, 100_000));
+		advance_time(5_000);
+		assert_ok!(activate(1, DOT, USDX));
+		mint_stable(USDX, 2, 16_000);
+		assert_ok!(deposit(2, DOT, USDX, 6_000));
+
+		let pool = Stability::pool_account(&DOT, &USDX);
+		assert_eq!(stable_balance(USDX, pool), 106_000);
+
+		// The accounting cap allows the full 100_000 active total, but
+		// burning it would strand 6_000 < 10_000 on the pool account: the
+		// plan rounds the offset down to the preserving limit 96_000, and
+		// the collateral share scales with it: floor(80_000 * 96_000 /
+		// 100_000) = 76_800.
+		let (result, leftover) = simulate_offset(DOT, USDX, 100_000, 80_000);
+		assert_eq!(result.debt_offset, 96_000);
+		assert_eq!(result.collateral_to_pool, 76_800);
+		assert_eq!(leftover, 80_000 - 76_800);
+
+		// The pool sits exactly at the minimum: alive, no dust burned, and
+		// the balance still backs active 4_000 + pending 6_000.
+		assert_eq!(stable_balance(USDX, pool), USDX_MIN_BALANCE);
+		let state = pool_state(DOT, USDX);
+		assert_eq!(state.total_active_deposits, 4_000);
+		assert_eq!(state.total_pending_deposits, 6_000);
+	});
+}
