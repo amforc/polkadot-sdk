@@ -94,7 +94,6 @@ pub trait VaultInterface {
 	type StableId;
 	type AccountId;
 	type Balance;
-	/// Stable-coin credit shape consumed by [`Self::heal`].
 	type Credit;
 
 	/// The highest-priority redemption target and its lifecycle status:
