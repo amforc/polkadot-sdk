@@ -21,108 +21,7 @@ pub use types::{
 };
 pub use weights::WeightInfo;
 
-use frame::deps::sp_runtime::FixedU128;
-use types::RecoveryRegime as Regime;
-
 pub(crate) const LOG_TARGET: &str = "runtime::redemptions";
-
-struct OrdinaryStep<Balance> {
-	debt: Balance,
-	collateral_out: Balance,
-	fee: Balance,
-}
-
-struct RecoveryStep<Balance> {
-	burned: Balance,
-	collateral_out: Balance,
-	// Insurance Fund residuals settle debt without redeemer pUSD.
-	debt_settled: Balance,
-	regime: Regime,
-}
-
-/// Shared by execution and preview so `FinalRecovery` pricing cannot drift.
-/// The variant is the settlement regime the head's CR selects.
-enum RecoveryPricing<Balance> {
-	/// `CR >= 100%`: face value plus a collateral bonus.
-	RecoveryBonus { debt: Balance, collateral_out: Balance, bonus: FixedU128 },
-	/// `CR < 100%`: the Insurance Fund cover splits the debt.
-	InsuranceAdjusted {
-		debt: Balance,
-		collateral_out: Balance,
-		split: pusd_primitives::InsuranceAdjusted<Balance>,
-	},
-}
-
-impl<Balance: Copy> RecoveryPricing<Balance> {
-	fn debt(&self) -> Balance {
-		match self {
-			Self::RecoveryBonus { debt, .. } | Self::InsuranceAdjusted { debt, .. } => *debt,
-		}
-	}
-
-	fn collateral_out(&self) -> Balance {
-		match self {
-			Self::RecoveryBonus { collateral_out, .. } |
-			Self::InsuranceAdjusted { collateral_out, .. } => *collateral_out,
-		}
-	}
-}
-
-/// Per-target loop decision, shared by execution (`run_loop`) and preview
-/// (`simulate_walk`) so the barrier/redeemability ladder lives in one place.
-enum StepAction {
-	Recovery,
-	Redeem,
-	Skip,
-	Stop,
-}
-
-/// Offset classification of a priced `FinalRecovery` head, shared by the
-/// quote and execution surfaces so the two cannot diverge.
-enum OffsetDecision<Balance> {
-	NoTarget,
-	BelowPar,
-	Cancellable { debt: Balance, collateral_out: Balance },
-}
-
-/// What one vault-side `redeem_step` did, escaped from the pricing closure by
-/// `&mut` capture and consumed by `run_loop` to steer the walk.
-enum StepOutcome<Balance> {
-	/// An ordinary (or dormant-target) vault was redeemed at face value.
-	Redeemed(OrdinaryStep<Balance>),
-	/// A `FinalRecovery` vault was (partially) settled. `settle_residual`
-	/// defers the Insurance-Fund settlement to the loop: it re-enters the
-	/// vault pallet, which the in-flight step must not do.
-	Recovery { step: RecoveryStep<Balance>, settle_residual: bool },
-	/// Unredeemable target skipped; the cursor advances past it.
-	Skipped,
-	/// A barrier or an unpriceable target ended the walk.
-	Stopped,
-}
-
-struct Accumulators<Balance, AccountId> {
-	remaining: Balance,
-	debt_settled: Balance,
-	ordinary_debt: Balance,
-	ordinary_collateral: Balance,
-	ordinary_fee: Balance,
-	recovery_burned: Balance,
-	recovery_collateral: Balance,
-	// Recovery stops after one FIFO head, so one owner/regime is enough.
-	recovery_owner: Option<(AccountId, Regime)>,
-}
-
-/// Shared validation + fee-rate setup for `do_redeem` and `simulate`, so the
-/// preview can never diverge from execution. Execution surfaces the typed
-/// error; preview collapses it to `None`.
-struct RedemptionPreamble<Balance, Moment> {
-	config: RedemptionConfig<Balance, Moment>,
-	state: RedemptionState<Moment>,
-	price: FixedU128,
-	now: Moment,
-	decayed: FixedU128,
-	fee_rate: FixedU128,
-}
 
 #[frame::pallet]
 pub mod pallet {
@@ -130,12 +29,11 @@ pub mod pallet {
 	use crate::{
 		fees,
 		types::{
-			RecoveryOffsetQuote, RedemptionConfig, RedemptionPreview, RedemptionPreviewStep,
-			RedemptionState,
+			Accumulators, OffsetDecision, OrdinaryStep, RecoveryOffsetQuote, RecoveryPricing,
+			RecoveryRegime as Regime, RecoveryStep, RedemptionConfig, RedemptionPreamble,
+			RedemptionPreview, RedemptionPreviewStep, RedemptionState, StepAction, StepOutcome,
 		},
 		weights::WeightInfo,
-		Accumulators, OffsetDecision, OrdinaryStep, RecoveryPricing, RecoveryStep, Regime,
-		StepAction, StepOutcome,
 	};
 	use alloc::vec::Vec;
 	use frame::{
@@ -180,12 +78,10 @@ pub mod pallet {
 
 	pub type SnapshotOf<T> = RedemptionStepSnapshot<BalanceOf<T>>;
 
-	/// One priced step: the vault-facing allocation (the `redeem_step`-closure
-	/// return value) plus the loop-facing outcome it implies.
+	/// One priced step: the vault-facing allocation plus the loop-facing outcome it implies.
 	type StepDecision<T> = (Option<RedemptionAllocation<BalanceOf<T>>>, StepOutcome<BalanceOf<T>>);
 
-	/// Version 0: a pallet added to a live chain starts with on-chain version 0,
-	/// so any higher declared version would demand a version-set migration.
+
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
 	#[pallet::pallet]
@@ -1351,53 +1247,6 @@ pub mod pallet {
 			RedemptionStates::<T>::remove(collateral_id, stable_id);
 			Ok(())
 		}
-	}
-}
-
-impl<Balance, AccountId> Accumulators<Balance, AccountId>
-where
-	Balance:
-		frame::deps::sp_runtime::traits::Zero + frame::deps::sp_runtime::traits::Saturating + Copy,
-{
-	fn new(max_pusd_in: Balance) -> Self {
-		Self {
-			remaining: max_pusd_in,
-			debt_settled: Balance::zero(),
-			ordinary_debt: Balance::zero(),
-			ordinary_collateral: Balance::zero(),
-			ordinary_fee: Balance::zero(),
-			recovery_burned: Balance::zero(),
-			recovery_collateral: Balance::zero(),
-			recovery_owner: None,
-		}
-	}
-
-	fn collateral_out(&self) -> Balance {
-		self.ordinary_collateral.saturating_add(self.recovery_collateral)
-	}
-
-	fn apply_ordinary(&mut self, step: &OrdinaryStep<Balance>) {
-		self.remaining = self.remaining.saturating_sub(step.debt.saturating_add(step.fee));
-		self.debt_settled = self.debt_settled.saturating_add(step.debt);
-		self.ordinary_debt = self.ordinary_debt.saturating_add(step.debt);
-		self.ordinary_collateral = self.ordinary_collateral.saturating_add(step.collateral_out);
-		self.ordinary_fee = self.ordinary_fee.saturating_add(step.fee);
-	}
-
-	/// `residual` is the Insurance-Fund-settled debt the loop obtained after
-	/// the step committed; it settles debt without consuming redeemer pUSD.
-	fn apply_recovery(
-		&mut self,
-		owner: AccountId,
-		step: &RecoveryStep<Balance>,
-		residual: Balance,
-	) {
-		self.remaining = self.remaining.saturating_sub(step.burned);
-		self.debt_settled =
-			self.debt_settled.saturating_add(step.debt_settled).saturating_add(residual);
-		self.recovery_burned = self.recovery_burned.saturating_add(step.burned);
-		self.recovery_collateral = self.recovery_collateral.saturating_add(step.collateral_out);
-		self.recovery_owner = Some((owner, step.regime));
 	}
 }
 
