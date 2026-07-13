@@ -2,7 +2,7 @@
 //!
 //! Settlement pricing is intentionally not
 //! implemented here — the redemption orchestrator pallet owns recovery-pricing
-//! math and passes the resulting `RedemptionAllocation` to `redeem_step`.
+//! math and passes the resulting `RedemptionSettlement` to `redeem_step`.
 
 use crate::{
 	pallet::{Config, Error},

@@ -16,13 +16,16 @@ use frame::{
 	arithmetic::{FixedU128, Permill},
 	benchmarking::prelude::*,
 	traits::{
-		fungibles::{Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold},
+		fungibles::{
+			Balanced as FungiblesBalanced, Mutate as FungiblesMutate,
+			MutateHold as FungiblesMutateHold,
+		},
 		EnsureOrigin, EnsureOriginWithArg, SaturatedConversion, Zero,
 	},
 };
 use frame_system::RawOrigin;
 use pallet_linked_list::{Position, SortedListInterface};
-use pusd_primitives::{RedemptionAllocation, VaultInterface};
+use pusd_primitives::{RedemptionSettlement, VaultInterface};
 
 const ORACLE_PRICE: u128 = 10;
 /// High per-collateral global ceiling so the systemic cap never binds in benches.
@@ -540,8 +543,13 @@ mod benchmarks {
 			&caller,
 			&recipient,
 			|snapshot| {
-				Ok(Some(RedemptionAllocation {
-					debt_to_cancel: snapshot.debt,
+				// Freshly issued inside the closure per the credit contract.
+				let debt_payment = <T::StableAssets as FungiblesBalanced<T::AccountId>>::issue(
+					stable::<T>(),
+					snapshot.debt,
+				);
+				Ok(Some(RedemptionSettlement {
+					debt_payment,
 					collateral_to_recipient: BalanceOf::<T>::zero(),
 				}))
 			},
@@ -668,8 +676,13 @@ mod benchmarks {
 			&owner,
 			&recipient,
 			|snapshot| {
-				Ok(Some(RedemptionAllocation {
-					debt_to_cancel: snapshot.debt.saturating_sub(remaining),
+				// Freshly issued inside the closure per the credit contract.
+				let debt_payment = <T::StableAssets as FungiblesBalanced<T::AccountId>>::issue(
+					stable::<T>(),
+					snapshot.debt.saturating_sub(remaining),
+				);
+				Ok(Some(RedemptionSettlement {
+					debt_payment,
 					collateral_to_recipient: BalanceOf::<T>::zero(),
 				}))
 			},

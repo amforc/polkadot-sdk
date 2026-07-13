@@ -5,7 +5,7 @@ use crate::{
 };
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, RedemptionAllocation,
+	KeeperCompensation, LiquidationAllocation, OffsetAllocation, RedemptionSettlement,
 };
 
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
@@ -114,7 +114,7 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 }
 
 #[test]
-fn redeem_step_rejects_invalid_allocations_without_state_change() {
+fn redeem_step_rejects_invalid_settlements_without_state_change() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
@@ -122,19 +122,38 @@ fn redeem_step_rejects_invalid_allocations_without_state_change() {
 		let vault_pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		let held_pre = held(DOT, 1);
 
+		// `assert_noop!` pins the whole storage root, so each rejection also
+		// proves the rollback un-issues the credit synthesized inside the
+		// closure — the rollback contract for closure-created credits.
+		//
+		// Each case violates exactly one invariant so no check masks another.
+		// Excess debt.
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, 3, |snapshot| Ok(Some(RedemptionAllocation {
-				debt_to_cancel: snapshot.debt + 1,
-				collateral_to_recipient: 0,
-			}))),
-			crate::Error::<Test>::InvalidRedemptionAllocation
+			redeem_step(DOT, PUSD, 1, 3, |snapshot| Ok(Some(settlement(
+				PUSD,
+				snapshot.debt + 1,
+				0
+			)))),
+			crate::Error::<Test>::InvalidRedemptionSettlement
 		);
+		// Excess collateral, with valid nonzero payment.
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, 3, |snapshot| Ok(Some(RedemptionAllocation {
-				debt_to_cancel: 0,
-				collateral_to_recipient: snapshot.collateral + 1,
-			}))),
-			crate::Error::<Test>::InvalidRedemptionAllocation
+			redeem_step(DOT, PUSD, 1, 3, |snapshot| Ok(Some(settlement(
+				PUSD,
+				1,
+				snapshot.collateral + 1
+			)))),
+			crate::Error::<Test>::InvalidRedemptionSettlement
+		);
+		// Zero payment cannot release collateral; `Ok(None)` is the touch-only form.
+		assert_noop!(
+			redeem_step(DOT, PUSD, 1, 3, |_| Ok(Some(settlement(PUSD, 0, 1)))),
+			crate::Error::<Test>::InvalidRedemptionSettlement
+		);
+		// A payment in another market's coin cannot settle this market's debt.
+		assert_noop!(
+			redeem_step(DOT, PUSD, 1, 3, |_| Ok(Some(settlement(USDX, 100, 0)))),
+			crate::Error::<Test>::InvalidRedemptionSettlement
 		);
 
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap(), vault_pre);
@@ -166,6 +185,50 @@ fn redeem_step_skip_persists_touch_without_redeeming() {
 		assert_eq!(held(DOT, 1), held_pre);
 		assert_eq!(v_post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
 		assert!(vault_status(DOT, PUSD, 1).is_active());
+	});
+}
+
+// The payment credit is the sole authority on the burn. Withdrawing it from a
+// funded redeemer pins the full
+// settlement chain: the redeemer pays exactly the cancelled debt, total
+// issuance falls by exactly that amount, and the ledger debt falls with it.
+#[test]
+fn redeem_step_burns_exactly_the_debt_payment() {
+	use frame::traits::{
+		fungibles::{Balanced, Mutate},
+		tokens::{Fortitude, Precision, Preservation},
+	};
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		<Assets as Mutate<AccountId>>::mint_into(PUSD, &3, 1_000).expect("mint redeemer pUSD");
+
+		let issuance_pre = total_stable(PUSD);
+		let redeemer_pre = stable_balance(PUSD, 3);
+		let recipient_coll_pre = collateral_balance(DOT, 3);
+		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+
+		assert_ok!(redeem_step(DOT, PUSD, 1, 3, |snapshot| {
+			assert!(snapshot.debt >= 300);
+			let debt_payment = <VaultStableAssets as Balanced<AccountId>>::withdraw(
+				PUSD,
+				&3,
+				300,
+				Precision::Exact,
+				Preservation::Expendable,
+				Fortitude::Polite,
+			)?;
+			Ok(Some(RedemptionSettlement { debt_payment, collateral_to_recipient: 30 }))
+		}));
+
+		assert_eq!(total_stable(PUSD), issuance_pre - 300);
+		assert_eq!(stable_balance(PUSD, 3), redeemer_pre - 300);
+		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let cancelled = (v_pre.debt.principal + v_pre.debt.interest) -
+			(v_post.debt.principal + v_post.debt.interest);
+		assert_eq!(cancelled, 300);
+		assert_eq!(collateral_balance(DOT, 3), recipient_coll_pre + 30);
 	});
 }
 
