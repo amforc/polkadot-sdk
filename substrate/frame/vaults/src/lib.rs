@@ -518,9 +518,9 @@ pub mod pallet {
 		/// The liquidation allocation pays out more collateral than held or
 		/// offsets more debt than outstanding.
 		InvalidLiquidationAllocation,
-		/// The redemption allocation cancels more debt than outstanding or
-		/// takes more collateral than held.
-		InvalidRedemptionAllocation,
+		/// The redemption settlement pays zero or in the wrong coin, cancels
+		/// more debt than outstanding, or takes more collateral than held.
+		InvalidRedemptionSettlement,
 		/// Liquidating the branch's last stake-bearing vault would leave no
 		/// redistribution recipients; it must go through `FinalRecovery`.
 		LastVaultCannotBeLiquidated,
