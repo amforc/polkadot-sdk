@@ -39,7 +39,7 @@ pub mod pallet {
 	use frame::{
 		deps::{
 			frame_support::{
-				storage::{with_storage_layer, with_transaction, TransactionOutcome},
+				storage::{with_transaction, TransactionOutcome},
 				traits::{
 					fungibles::{self, Balanced as FungiblesBalanced},
 					tokens::{Fortitude, Precision, Preservation},
@@ -80,7 +80,6 @@ pub mod pallet {
 
 	/// One priced step: the vault-facing allocation plus the loop-facing outcome it implies.
 	type StepDecision<T> = (Option<RedemptionAllocation<BalanceOf<T>>>, StepOutcome<BalanceOf<T>>);
-
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
@@ -280,17 +279,15 @@ pub mod pallet {
 			max_steps: u32,
 		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
-			let steps = with_storage_layer(|| {
-				Self::do_redeem(
-					&who,
-					&collateral_id,
-					&stable_id,
-					max_pusd_in,
-					min_collateral_out,
-					&recipient,
-					max_steps,
-				)
-			})?;
+			let steps = Self::do_redeem(
+				&who,
+				&collateral_id,
+				&stable_id,
+				max_pusd_in,
+				min_collateral_out,
+				&recipient,
+				max_steps,
+			)?;
 			Ok(Some(T::WeightInfo::redeem(steps)).into())
 		}
 
