@@ -16,7 +16,8 @@ mod tests;
 
 pub use pallet::*;
 pub use types::{
-	RecoveryRegime, RedemptionConfig, RedemptionPreview, RedemptionPreviewStep, RedemptionState,
+	RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, RedemptionPreview,
+	RedemptionPreviewStep, RedemptionState,
 };
 pub use weights::WeightInfo;
 
@@ -43,7 +44,7 @@ struct RecoveryStep<Balance> {
 /// The variant is the settlement regime the head's CR selects.
 enum RecoveryPricing<Balance> {
 	/// `CR >= 100%`: face value plus a collateral bonus.
-	RecoveryBonus { debt: Balance, collateral_out: Balance },
+	RecoveryBonus { debt: Balance, collateral_out: Balance, bonus: FixedU128 },
 	/// `CR < 100%`: the Insurance Fund cover splits the debt.
 	InsuranceAdjusted {
 		debt: Balance,
@@ -128,7 +129,10 @@ pub mod pallet {
 	use super::*;
 	use crate::{
 		fees,
-		types::{RedemptionConfig, RedemptionPreview, RedemptionPreviewStep, RedemptionState},
+		types::{
+			RecoveryOffsetQuote, RedemptionConfig, RedemptionPreview, RedemptionPreviewStep,
+			RedemptionState,
+		},
 		weights::WeightInfo,
 		Accumulators, OffsetDecision, OrdinaryStep, RecoveryPricing, RecoveryStep, Regime,
 		StepAction, StepOutcome,
@@ -152,9 +156,9 @@ pub mod pallet {
 		prelude::*,
 	};
 	use pusd_primitives::{
-		recovery_pricing, ProvidePrice, RecoveryOffsetInterface, RecoveryOffsetOutcome,
-		RecoveryOffsetQuote, RecoveryOffsetResult, RedemptionAllocation, RedemptionStepSnapshot,
-		VaultInterface,
+		debit_preservation, recovery_pricing, reducible_debit, ProvidePrice,
+		RecoveryOffsetInterface, RecoveryOffsetOutcome, RecoveryOffsetResult, RedemptionAllocation,
+		RedemptionStepSnapshot, VaultInterface,
 	};
 
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
@@ -631,11 +635,29 @@ pub mod pallet {
 				StepAction::Stop => Ok((None, StepOutcome::Stopped)),
 				StepAction::Skip => Ok((None, StepOutcome::Skipped)),
 				StepAction::Redeem => {
-					let Some(step) = Self::price_ordinary(snap, price, fee_rate, budget) else {
+					let Some(mut step) = Self::price_ordinary(snap, price, fee_rate, budget) else {
 						return Ok((None, StepOutcome::Stopped));
 					};
+					let need = step.debt.saturating_add(step.fee);
+					let (funded, preservation) = Self::fundable_budget(stable_id, redeemer, need)?;
+					if funded < need {
+						// Reprice once at the preserving limit; pricing keeps
+						// the new need at or below the budget it is given.
+						let Some(repriced) = Self::price_ordinary(snap, price, fee_rate, funded)
+						else {
+							return Ok((None, StepOutcome::Stopped));
+						};
+						step = repriced;
+					}
 					let total_in = step.debt.saturating_add(step.fee);
-					Self::burn_redeemer_pusd(stable_id, redeemer, step.debt, total_in)?;
+					debug_assert!(total_in <= funded);
+					Self::burn_redeemer_pusd(
+						stable_id,
+						redeemer,
+						step.debt,
+						total_in,
+						preservation,
+					)?;
 					let allocation = RedemptionAllocation {
 						debt_to_cancel: step.debt,
 						collateral_to_recipient: step.collateral_out,
@@ -691,19 +713,69 @@ pub mod pallet {
 				let collateral_out =
 					recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)
 						.min(snap.collateral);
-				return Some(RecoveryPricing::RecoveryBonus { debt, collateral_out });
+				return Some(RecoveryPricing::RecoveryBonus { debt, collateral_out, bonus });
 			}
 			let collateral_value = price.saturating_mul_int(snap.collateral);
-			let split = recovery_pricing::insurance_adjusted(
-				snap.debt,
-				collateral_value,
-				Self::insurance_fund_available(stable_id),
-			);
+			// Cover the fund can pay without dusting itself: sizing the
+			// shortfall debit now keeps the residual settlement exactly
+			// burnable later.
+			let shortfall = snap.debt.saturating_sub(collateral_value);
+			let cover = Self::insurance_fund_cover(stable_id, shortfall);
+			let split = recovery_pricing::insurance_adjusted(snap.debt, collateral_value, cover);
 			let debt = split.market_cancel_debt.min(budget);
 			let collateral_out =
 				recovery_pricing::recovery_rate_collateral_out(debt, split.recovery_rate, price)
 					.min(snap.collateral);
 			Some(RecoveryPricing::InsuranceAdjusted { debt, collateral_out, split })
+		}
+
+		/// Apply a smaller funding budget to pricing that was already computed.
+		/// The recovery regime and its rate do not change with the budget.
+		fn rebudget_recovery(
+			snap: &SnapshotOf<T>,
+			price: FixedU128,
+			budget: BalanceOf<T>,
+			pricing: RecoveryPricing<BalanceOf<T>>,
+		) -> RecoveryPricing<BalanceOf<T>> {
+			match pricing {
+				RecoveryPricing::RecoveryBonus { bonus, .. } => {
+					let debt = snap.debt.min(budget);
+					let collateral_out =
+						recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)
+							.min(snap.collateral);
+					RecoveryPricing::RecoveryBonus { debt, collateral_out, bonus }
+				},
+				RecoveryPricing::InsuranceAdjusted { split, .. } => {
+					let debt = split.market_cancel_debt.min(budget);
+					let collateral_out = recovery_pricing::recovery_rate_collateral_out(
+						debt,
+						split.recovery_rate,
+						price,
+					)
+					.min(snap.collateral);
+					RecoveryPricing::InsuranceAdjusted { debt, collateral_out, split }
+				},
+			}
+		}
+
+		/// The budget `payer` can fund toward a step needing `need`: `need`
+		/// itself when fully fundable, otherwise the preserving limit for the
+		/// caller to reprice its step at, once. A debit capped by the payer's
+		/// whole balance is a genuine shortfall, not a dead zone, and errors.
+		fn fundable_budget(
+			stable_id: &T::StableAssetId,
+			payer: &T::AccountId,
+			need: BalanceOf<T>,
+		) -> Result<(BalanceOf<T>, Preservation), Error<T>> {
+			let (funded, preservation) =
+				reducible_debit::<T::StableAssets, _>(stable_id.clone(), payer, need);
+			if funded < need {
+				ensure!(
+					preservation == Preservation::Preserve,
+					Error::<T>::InsufficientPusdBalance
+				);
+			}
+			Ok((funded, preservation))
 		}
 
 		fn recovery_decision(
@@ -714,11 +786,13 @@ pub mod pallet {
 			budget: BalanceOf<T>,
 			config: &RedemptionConfigOf<T>,
 		) -> Result<StepDecision<T>, DispatchError> {
-			let Some(pricing) = Self::price_recovery(stable_id, snap, price, budget, config) else {
+			let Some(mut pricing) = Self::price_recovery(stable_id, snap, price, budget, config)
+			else {
 				return Ok((None, StepOutcome::Stopped));
 			};
 			// Full IF cover means no redeemer-funded burn is needed; the loop
 			// settles the residual once this (touch-only) step has committed.
+			// Budget-independent, so repricing below cannot change it.
 			if let RecoveryPricing::InsuranceAdjusted { split, .. } = &pricing {
 				if split.market_cancel_debt.is_zero() {
 					let step = RecoveryStep {
@@ -730,7 +804,13 @@ pub mod pallet {
 					return Ok((None, StepOutcome::Recovery { step, settle_residual: true }));
 				}
 			}
-			Self::fund_recovery(stable_id, redeemer, &pricing)
+			let (funded, preservation) =
+				Self::fundable_budget(stable_id, redeemer, pricing.debt())?;
+			if funded < pricing.debt() {
+				pricing = Self::rebudget_recovery(snap, price, funded, pricing);
+			}
+			debug_assert!(pricing.debt() <= funded);
+			Self::fund_recovery(stable_id, redeemer, &pricing, preservation)
 		}
 
 		/// Redeemer-funded recovery burn shared by both regimes; stops the loop —
@@ -740,6 +820,7 @@ pub mod pallet {
 			stable_id: &T::StableAssetId,
 			redeemer: &T::AccountId,
 			pricing: &RecoveryPricing<BalanceOf<T>>,
+			preservation: Preservation,
 		) -> Result<StepDecision<T>, DispatchError> {
 			let debt = pricing.debt();
 			if debt.is_zero() {
@@ -753,7 +834,7 @@ pub mod pallet {
 					debt == split.market_cancel_debt && !split.effective_cover.is_zero(),
 				),
 			};
-			Self::burn_redeemer_pusd(stable_id, redeemer, debt, debt)?;
+			Self::burn_redeemer_pusd(stable_id, redeemer, debt, debt, preservation)?;
 			let step = RecoveryStep {
 				burned: debt,
 				collateral_out: pricing.collateral_out(),
@@ -767,59 +848,48 @@ pub mod pallet {
 			Ok((Some(allocation), StepOutcome::Recovery { step, settle_residual }))
 		}
 
-		/// Withdraw `total_in` pUSD from the redeemer, burn the `debt` portion
-		/// (dropping the credit is the debt-cancelling burn), and route the rest
-		/// as the fee — so issuance only falls by cancelled debt. `Expendable` so
-		/// a redeemer can spend their entire pUSD balance. The vault-side debt
-		/// cancel happens in the surrounding `redeem_step`, atomically with this
-		/// burn.
+		/// Withdraw `total_in` pUSD from the redeemer with the preservation
+		/// sized by [`Self::fundable_budget`], burn the `debt` portion (dropping
+		/// the credit is the debt-cancelling burn), and route the rest as the
+		/// fee — so issuance only falls by cancelled debt. The vault-side debt
+		/// cancel happens in the surrounding `redeem_step`, atomically with
+		/// this burn.
 		fn burn_redeemer_pusd(
 			stable_id: &T::StableAssetId,
 			redeemer: &T::AccountId,
 			debt: BalanceOf<T>,
 			total_in: BalanceOf<T>,
+			preservation: Preservation,
 		) -> DispatchResult {
+			debug_assert!(debt <= total_in);
 			let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
 				stable_id.clone(),
 				redeemer,
 				total_in,
 				Precision::Exact,
-				Preservation::Expendable,
+				preservation,
 				Fortitude::Polite,
-			)
-			.map_err(|_| Error::<T>::InsufficientPusdBalance)?;
+			)?;
+			debug_assert_eq!(credit.peek(), total_in);
 			let (debt_credit, fee_credit) = credit.split(debt);
 			drop(debt_credit);
-			if fee_credit.peek().is_zero() {
-				drop(fee_credit);
-			} else {
-				T::FeeHandler::on_unbalanced(fee_credit);
-			}
+			T::FeeHandler::on_unbalanced(fee_credit);
 			Ok(())
 		}
 
-		/// Cover is intentionally unreserved, so settlement reads live balance.
-		fn insurance_fund_available(stable_id: &T::StableAssetId) -> BalanceOf<T> {
-			<T::StableAssets as fungibles::Inspect<_>>::reducible_balance(
-				stable_id.clone(),
-				&T::InsuranceFundAccount::convert(stable_id.clone()),
-				Preservation::Expendable,
-				Fortitude::Polite,
-			)
-		}
-
-		fn insurance_fund_withdraw(
+		/// The shortfall cover the fund can pay without dusting itself. Cover
+		/// is intentionally unreserved, so pricing and settlement read the
+		/// live account.
+		fn insurance_fund_cover(
 			stable_id: &T::StableAssetId,
-			amount: BalanceOf<T>,
-		) -> Result<StableCreditOf<T>, DispatchError> {
-			<T::StableAssets as FungiblesBalanced<_>>::withdraw(
+			shortfall: BalanceOf<T>,
+		) -> BalanceOf<T> {
+			reducible_debit::<T::StableAssets, _>(
 				stable_id.clone(),
 				&T::InsuranceFundAccount::convert(stable_id.clone()),
-				amount,
-				Precision::Exact,
-				Preservation::Expendable,
-				Fortitude::Polite,
+				shortfall,
 			)
+			.0
 		}
 
 		/// Healing verifies the vault residual and IF burn matched.
@@ -833,8 +903,22 @@ pub mod pallet {
 			if residual.is_zero() {
 				return Ok(residual);
 			}
-			let credit = Self::insurance_fund_withdraw(stable_id, residual)
-				.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
+			// Re-read the fund: fees routed earlier in this call may have
+			// changed it since pricing. `Expendable` only on a full drain, so
+			// the withdrawal itself fails — mapped to the domain error — when
+			// the fund cannot pay the residual exactly.
+			let account = T::InsuranceFundAccount::convert(stable_id.clone());
+			let preservation =
+				debit_preservation::<T::StableAssets, _>(stable_id.clone(), &account, residual);
+			let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
+				stable_id.clone(),
+				&account,
+				residual,
+				Precision::Exact,
+				preservation,
+				Fortitude::Polite,
+			)
+			.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
 			let surplus = T::Vaults::heal(collateral_id, stable_id, credit)
 				.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
 			if !surplus.peek().is_zero() {
@@ -1139,21 +1223,17 @@ pub mod pallet {
 				Some(RecoveryPricing::RecoveryBonus { debt, .. }) if debt.is_zero() => {
 					OffsetDecision::NoTarget
 				},
-				Some(RecoveryPricing::RecoveryBonus { debt, collateral_out }) => {
+				Some(RecoveryPricing::RecoveryBonus { debt, collateral_out, .. }) => {
 					OffsetDecision::Cancellable { debt, collateral_out }
 				},
 			}
 		}
-	}
 
-	impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
-		type CollateralId = T::CollateralAssetId;
-		type StableId = T::StableAssetId;
-		type AccountId = T::AccountId;
-		type Balance = BalanceOf<T>;
-
-		/// Rolled back because sizing an accurate quote touches vault state.
-		fn preview_recovery_offset(
+		/// Quote the head's capacity for up to `max_debt_to_cancel`. Rolled
+		/// back because sizing an accurate quote touches vault state; no
+		/// state changes. A view surface (like [`Pallet::preview_redeem`]),
+		/// not part of the [`RecoveryOffsetInterface`] execution seam.
+		pub fn preview_recovery_offset(
 			collateral_id: &T::CollateralAssetId,
 			stable_id: &T::StableAssetId,
 			max_debt_to_cancel: BalanceOf<T>,
@@ -1164,73 +1244,87 @@ pub mod pallet {
 				TransactionOutcome::Rollback(quote)
 			})
 		}
+	}
+
+	impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
+		type CollateralId = T::CollateralAssetId;
+		type AccountId = T::AccountId;
+		type Balance = BalanceOf<T>;
+		type Credit = StableCreditOf<T>;
 
 		fn execute_recovery_offset(
 			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
-			payer: &T::AccountId,
+			payment: StableCreditOf<T>,
 			collateral_recipient: &T::AccountId,
-			max_debt_to_cancel: BalanceOf<T>,
-		) -> Result<RecoveryOffsetResult<T::AccountId, BalanceOf<T>>, DispatchError> {
+		) -> Result<
+			(RecoveryOffsetResult<T::AccountId, BalanceOf<T>>, StableCreditOf<T>),
+			DispatchError,
+		> {
+			let stable_id = &payment.asset();
 			let Some((owner, status)) =
 				T::Vaults::next_redemption_target(collateral_id, stable_id, None)
 			else {
-				return Ok(RecoveryOffsetResult::NoTarget);
+				return Ok((RecoveryOffsetResult::NoTarget, payment));
 			};
 			if !status.is_final_recovery() {
-				return Ok(RecoveryOffsetResult::NoTarget);
+				return Ok((RecoveryOffsetResult::NoTarget, payment));
 			}
 			let (config, price) = Self::offset_preamble(collateral_id, stable_id)?;
+			// The credit is the budget: the burn can never exceed what the
+			// caller funded, so no payer sizing happens on this side.
+			let budget = payment.peek();
 
 			with_transaction(|| {
-				let mut result = RecoveryOffsetResult::NoTarget;
+				// The pricing closure only decides; the credit stays out here.
+				// `NoTarget` unless the closure refuses with something more
+				// specific — an echoed allocation means the step applied.
+				let mut refusal = RecoveryOffsetResult::NoTarget;
 				let step = T::Vaults::redeem_step(
 					collateral_id,
 					stable_id,
 					&owner,
 					collateral_recipient,
 					|snap| {
-						let pricing = Self::price_recovery(
-							stable_id,
-							&snap,
-							price,
-							max_debt_to_cancel,
-							&config,
-						);
-						let (debt, collateral_out) = match Self::classify_offset(pricing) {
-							OffsetDecision::NoTarget => {
-								result = RecoveryOffsetResult::NoTarget;
-								return Ok(None);
-							},
+						let pricing =
+							Self::price_recovery(stable_id, &snap, price, budget, &config);
+						match Self::classify_offset(pricing) {
+							OffsetDecision::NoTarget => Ok(None),
 							OffsetDecision::BelowPar => {
-								result = RecoveryOffsetResult::BelowPar;
-								return Ok(None);
+								refusal = RecoveryOffsetResult::BelowPar;
+								Ok(None)
 							},
 							OffsetDecision::Cancellable { debt, collateral_out } => {
-								(debt, collateral_out)
+								Ok(Some(RedemptionAllocation {
+									debt_to_cancel: debt,
+									collateral_to_recipient: collateral_out,
+								}))
 							},
-						};
-						// The same burn as a recovery redemption with a zero fee
-						// portion: offsets are fee-free settlement. A drained head
-						// flips to Dormant inside the vault step itself.
-						Self::burn_redeemer_pusd(stable_id, payer, debt, debt)?;
-						result = RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
-							vault_owner: owner.clone(),
-							debt_cancelled: debt,
-							collateral_out,
-						});
-						Ok(Some(RedemptionAllocation {
-							debt_to_cancel: debt,
-							collateral_to_recipient: collateral_out,
-						}))
+						}
 					},
 				);
 				match step {
 					Err(error) => TransactionOutcome::Rollback(Err(error)),
-					Ok(_) if matches!(result, RecoveryOffsetResult::Applied(_)) => {
-						TransactionOutcome::Commit(Ok(result))
+					// The step applied and echoed its allocation: dropping the
+					// consumed slice is the debt-cancelling burn — fee-free
+					// settlement, the same as a recovery redemption with a
+					// zero fee portion. Infallible, so it needs no place
+					// inside the vault step; the surrounding transaction is
+					// the atomicity boundary. A drained head flips to Dormant
+					// inside the vault step itself.
+					Ok(Some(allocation)) => {
+						debug_assert!(allocation.debt_to_cancel <= payment.peek());
+						let (burn, change) = payment.split(allocation.debt_to_cancel);
+						drop(burn);
+						let outcome = RecoveryOffsetOutcome {
+							vault_owner: owner.clone(),
+							collateral_out: allocation.collateral_to_recipient,
+						};
+						TransactionOutcome::Commit(Ok((
+							RecoveryOffsetResult::Applied(outcome),
+							change,
+						)))
 					},
-					Ok(_) => TransactionOutcome::Rollback(Ok(result)),
+					Ok(None) => TransactionOutcome::Rollback(Ok((refusal, payment))),
 				}
 			})
 		}
