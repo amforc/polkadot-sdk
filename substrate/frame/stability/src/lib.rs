@@ -107,6 +107,7 @@ pub mod pallet {
 		/// (SPEC.md §12 invariant 9).
 		type RecoveryOffsets: RecoveryOffsetInterface<
 			CollateralId = Self::CollateralAssetId,
+			StableId = Self::StableAssetId,
 			AccountId = Self::AccountId,
 			Balance = BalanceOf<Self>,
 			Credit = StableCreditOf<Self>,

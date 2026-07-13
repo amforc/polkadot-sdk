@@ -23,8 +23,6 @@ fn pending_offset_consumes_fifo_in_order() {
 		// floor(75 * 150 / 150) = 75 — 150 pending remain, keeps its slot.
 		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 350, 175, 10);
 		assert_eq!(result.debt_offset, 350);
-		assert_eq!(result.collateral_to_pool, 175);
-		assert_eq!(result.remaining_debt, 0);
 		assert_eq!(leftover, 0);
 		assert_eq!(result.iterations_used, 2);
 
@@ -78,7 +76,6 @@ fn pending_offset_respects_caller_and_pallet_caps() {
 		let (result, _) = simulate_pending_offset(DOT, PUSD, 1_000, 0, 2);
 		assert_eq!(result.debt_offset, 200);
 		assert_eq!(result.iterations_used, 2);
-		assert_eq!(result.remaining_debt, 800);
 		assert_eq!(pending_count(DOT, PUSD), 1);
 		assert_eq!(pending_oldest(DOT, PUSD), Some(3));
 
@@ -98,7 +95,6 @@ fn pending_offset_noop_cases_pass_remainders_through() {
 		// Empty queue.
 		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 100, 50, 5);
 		assert_eq!(result.debt_offset, 0);
-		assert_eq!(result.remaining_debt, 100);
 		assert_eq!(leftover, 50);
 		assert_eq!(result.iterations_used, 0);
 
@@ -125,9 +121,9 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		let before = pool_state(DOT, PUSD);
 		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 
-		let (result, _) = simulate_pending_offset(DOT, PUSD, 200, 100, 5);
+		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 200, 100, 5);
 		assert_eq!(result.debt_offset, 200);
-		assert_eq!(result.collateral_to_pool, 100);
+		assert_eq!(leftover, 0);
 
 		// Only pending capital moved: the accumulators and the active side
 		// are bit-identical (invariant 11).
@@ -164,8 +160,6 @@ fn pending_offset_flooring_credits_zero_and_prunes() {
 		// zero collateral credit, and the emptied row is pruned.
 		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 1_000, 1, 5);
 		assert_eq!(result.debt_offset, 100);
-		assert_eq!(result.collateral_to_pool, 0);
-		assert_eq!(result.remaining_debt, 900);
 		assert_eq!(leftover, 1);
 
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
@@ -192,7 +186,6 @@ fn pending_offset_with_sub_minimum_collateral_gain_stops_before_the_step() {
 		// pool account: the step is attempted but nothing of it applies.
 		let (result, leftover) = simulate_pending_offset(coll.clone(), PUSD, 200, 500, 5);
 		assert_eq!(result.debt_offset, 0);
-		assert_eq!(result.remaining_debt, 200);
 		assert_eq!(result.iterations_used, 1);
 		assert_eq!(leftover, 500);
 		let row = deposit_row(coll.clone(), PUSD, 1).expect("kept");
@@ -208,7 +201,6 @@ fn pending_offset_on_unregistered_branch_noops_and_returns_the_credit() {
 	build_and_execute(|| {
 		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 100, 50, 5);
 		assert_eq!(result.debt_offset, 0);
-		assert_eq!(result.remaining_debt, 100);
 		assert_eq!(leftover, 50);
 	});
 }
@@ -235,10 +227,10 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		// offset depletes the pool exactly and keeps only the collateral backing
 		// the 1501 it burns; the rest flows on to the next stage.
 		let c0 = 1_152_845 * (DOT_E10 / 1_000); // 11_528_450_000_000
-		let (r1, leftover1) = simulate_offset(DOT, PUSD, 2_200, c0);
-		assert_eq!(r1.debt_offset, 1_501);
-		// floor(11_528_450_000_000 * 1501 / 2200) = 786.5547022727 DOT.
-		assert_eq!(r1.collateral_to_pool, 7_865_547_022_727);
+		let (debt_offset1, leftover1) = simulate_offset(DOT, PUSD, 2_200, c0);
+		assert_eq!(debt_offset1, 1_501);
+		// The pool kept floor(11_528_450_000_000 * 1501 / 2200) =
+		// 7_865_547_022_727 (786.5547022727 DOT) of the credit.
 		assert_eq!(leftover1, 3_662_902_977_273); // 366.2902977273 DOT.
 
 		let state = pool_state(DOT, PUSD);
@@ -278,11 +270,9 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		let (r2, leftover2) =
 			simulate_pending_offset(DOT, PUSD, after_jit_debt, after_jit_collat, 8);
 		assert_eq!(r2.debt_offset, 350);
-		assert_eq!(r2.collateral_to_pool, 1_834_071_590_909);
 		assert_eq!(r2.iterations_used, 2);
-		// The residual — 49 pUSD debt + this collateral — is what the
-		// orchestrator hands to redistribution (external).
-		assert_eq!(r2.remaining_debt, 49);
+		// The residual — the 49 pUSD debt still standing + this collateral —
+		// is what the orchestrator hands to redistribution (external).
 		assert_eq!(leftover2, 256_770_022_728); // 25.6770022728 DOT.
 
 		let row2 = deposit_row(DOT, PUSD, 2).expect("kept: holds a claimable");
@@ -310,7 +300,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		// deposit to zero; its collateral is realized through S on claim. The
 		// double-floor (`floor(1501 * floor(collat * 1e18 / 1501) / 1e18)`)
 		// strands 1 base unit in the unclaimed total, so it realizes one less
-		// than `collateral_to_pool`.
+		// than the pool's recorded gain.
 		assert_noop!(withdraw(1, DOT, PUSD, 1, 1), Error::<Test>::NoActiveDeposit);
 		let before = collateral_balance(DOT, 1);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
@@ -338,8 +328,6 @@ fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 		// preservable remains.
 		let (result, leftover) = simulate_pending_offset(DOT, USDX, 45_000, 45_000, 5);
 		assert_eq!(result.debt_offset, 40_000);
-		assert_eq!(result.collateral_to_pool, 40_000);
-		assert_eq!(result.remaining_debt, 5_000);
 		assert_eq!(result.iterations_used, 1);
 		assert_eq!(leftover, 5_000);
 

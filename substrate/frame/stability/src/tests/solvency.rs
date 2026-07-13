@@ -40,7 +40,7 @@ fn mixed_lifecycle_sequence_drains_to_exact_zero() {
 		drop(distribute_yield(DOT, PUSD, 150));
 		// Offset 1: A = 1500 → 900, P = 0.6, delta_S = floor(600 * 1e18 /
 		// 1500) = 4e17, so S = 0.4.
-		assert_eq!(simulate_offset(DOT, PUSD, 600, 600).0.debt_offset, 600);
+		assert_eq!(simulate_offset(DOT, PUSD, 600, 600).0, 600);
 		assert_eq!(pool_state(DOT, PUSD).coords.p, FixedU128::from_rational(3, 5));
 
 		// A third depositor joins at P = 0.6, S = 0.4, G = 0.1: A = 900 + 900.
@@ -51,7 +51,7 @@ fn mixed_lifecycle_sequence_drains_to_exact_zero() {
 		drop(distribute_yield(DOT, PUSD, 180));
 		// Offset 2: A = 1800 → 900, P = 0.6 → floor(0.6 * 900 / 1800) = 0.3,
 		// delta_S = floor(450 * 0.6 / 1800) = 1.5e17, so S = 0.55.
-		assert_eq!(simulate_offset(DOT, PUSD, 900, 450).0.debt_offset, 900);
+		assert_eq!(simulate_offset(DOT, PUSD, 900, 450).0, 900);
 		assert_eq!(pool_state(DOT, PUSD).coords.p, FixedU128::from_rational(3, 10));
 
 		// Collateral: user1 floor(1000 * 0.55) = 550, user2 floor(500 * 0.55)
@@ -87,7 +87,7 @@ fn full_depletion_epoch_boundary_stays_solvent() {
 		drop(distribute_yield(DOT, PUSD, 100));
 		// A full offset bumps the epoch: delta_S = floor(800 * 1e18 / 1000) =
 		// 8e17 on the epoch-0 row, then coords reset to (epoch 1, P = 1).
-		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).0.debt_offset, 1_000);
+		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).0, 1_000);
 		assert_eq!(pool_state(DOT, PUSD).coords.epoch, 1);
 
 		// A fresh epoch-1 depositor is untouched by epoch-0 history.
@@ -96,7 +96,7 @@ fn full_depletion_epoch_boundary_stays_solvent() {
 		drop(distribute_yield(DOT, PUSD, 50));
 		// Offset on epoch 1: A = 1000 → 600, P = 0.6, delta_S =
 		// floor(200 * 1e18 / 1000) = 2e17, so S(1,0) = 0.2.
-		assert_eq!(simulate_offset(DOT, PUSD, 400, 200).0.debt_offset, 400);
+		assert_eq!(simulate_offset(DOT, PUSD, 400, 200).0, 400);
 
 		// user1 (epoch 0): compounded is zero (an epoch behind), but its
 		// epoch-0 gains stay claimable: collateral floor(1000 * 0.8) = 800,

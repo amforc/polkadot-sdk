@@ -334,7 +334,7 @@ impl<Balance: Zero> StabilityPool<Balance> {
 
 /// The offset result shapes live in `pusd-primitives` beside the
 /// `StabilityPoolOffsetApi` they belong to (SPEC.md §7.1 / §7.2).
-pub use pusd_primitives::{PendingOffsetResult, PoolOffsetResult};
+pub use pusd_primitives::PendingOffsetResult;
 
 /// Which capital funded a recovery offset (SPEC.md §10).
 #[derive(
