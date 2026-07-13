@@ -6,7 +6,7 @@ use crate::{
 };
 use pusd_primitives::{
 	collateralization_ratio, recovery_pricing, reducible_debit, RecoveryOffsetInterface,
-	RecoveryOffsetOutcome, RecoveryOffsetResult, VaultStatus,
+	RecoveryOffsetResult, VaultStatus,
 };
 
 const HOUR_MS: Moment = 3_600 * 1_000;
@@ -1301,7 +1301,7 @@ fn execute_offset(
 	payer: AccountId,
 	recipient: AccountId,
 	max_debt_to_cancel: Balance,
-) -> Result<RecoveryOffsetResult<AccountId, Balance>, DispatchError> {
+) -> Result<RecoveryOffsetResult<Balance>, DispatchError> {
 	frame::deps::frame_support::storage::with_storage_layer(|| {
 		execute_offset_inner(payer, recipient, max_debt_to_cancel)
 	})
@@ -1311,7 +1311,7 @@ fn execute_offset_inner(
 	payer: AccountId,
 	recipient: AccountId,
 	max_debt_to_cancel: Balance,
-) -> Result<RecoveryOffsetResult<AccountId, Balance>, DispatchError> {
+) -> Result<RecoveryOffsetResult<Balance>, DispatchError> {
 	use frame::traits::{
 		fungibles::Balanced as FungiblesBalanced,
 		tokens::{Fortitude, Precision},
@@ -1330,7 +1330,7 @@ fn execute_offset_inner(
 		)?
 	};
 	let (result, change) = <Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
-		&DOT, payment, &recipient,
+		&DOT, &PUSD, payment, &recipient,
 	)?;
 	if let Err(change) = change.drop_zero() {
 		<Assets as FungiblesBalanced<AccountId>>::resolve(&payer, change)
@@ -1365,10 +1365,7 @@ fn recovery_offset_settles_fifo_head_and_matches_preview() {
 		// penalty: collateral = floor(floor(501 · 1.05) / 1.25) = 420.
 		assert_eq!(
 			execute_offset(3, 4, 10_000),
-			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
-				vault_owner: 1,
-				collateral_out: 420,
-			}))
+			Ok(RecoveryOffsetResult::Applied { collateral_out: 420 })
 		);
 
 		// The drained head flips to Dormant and leaves the FIFO; the next
@@ -1402,11 +1399,10 @@ fn recovery_offset_partial_fill_keeps_head_queued() {
 		assert_eq!(preview_offset(200), Ok(RecoveryOffsetQuote::Available { debt: 200 }));
 		assert_eq!(
 			execute_offset(3, 4, 200),
-			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
-				vault_owner: 1,
+			Ok(RecoveryOffsetResult::Applied {
 				// 5%-capped bonus: floor(floor(200 · 1.05) / 1.25) = 168.
 				collateral_out: 168,
-			}))
+			})
 		);
 
 		// The partially settled head keeps its place at the FIFO front.
@@ -1497,11 +1493,10 @@ fn recovery_offset_underfunded_payment_partially_fills() {
 
 		assert_eq!(
 			execute_offset(3, 4, 10_000),
-			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
-				vault_owner: 1,
+			Ok(RecoveryOffsetResult::Applied {
 				// 5%-capped bonus: floor(floor(100 · 1.05) / 1.25) = 84.
 				collateral_out: 84,
-			}))
+			})
 		);
 
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before - 100);
@@ -1526,6 +1521,59 @@ fn recovery_offset_frozen_branch_reverts() {
 	});
 }
 
+#[test]
+fn recovery_offset_wrong_coin_payment_is_refused() {
+	build_and_execute(|| {
+		use frame::traits::{
+			fungibles::Balanced as FungiblesBalanced,
+			tokens::{Fortitude, Precision, Preservation},
+		};
+
+		register_branch(DOT, PUSD, default_branch_config());
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+
+		// Queue a settleable head in the sibling USDX market too.
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		register_branch(DOT, USDX, usdx_branch_config());
+		assert_ok!(open(2, DOT, USDX, 1_000 * USDX_UNIT, 500 * USDX_UNIT, rate_pct(5, 100)));
+		set_price(DOT, FixedU128::from_rational(52u128, 100u128));
+		assert_ok!(enter_final_recovery(DOT, USDX, 2));
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+
+		let pusd_debt_before = vault_debt(DOT, PUSD, 1);
+		let usdx_debt_before = vault_debt(DOT, USDX, 2);
+		mint_stable(USDX, 3, 100 * USDX_UNIT);
+		let payer_before = Assets::balance(USDX, 3);
+		let issuance_before = Assets::total_supply(USDX);
+
+		// Use a real withdrawn payment and the same outer transaction contract
+		// as production callers. The mismatch error must roll the withdrawal
+		// back, not merely avoid touching either recovery head.
+		let result: Result<(), DispatchError> =
+			frame::deps::frame_support::storage::with_storage_layer(|| {
+				let payment = <Assets as FungiblesBalanced<AccountId>>::withdraw(
+					USDX,
+					&3,
+					100 * USDX_UNIT,
+					Precision::Exact,
+					Preservation::Expendable,
+					Fortitude::Polite,
+				)?;
+				let (_result, change) =
+					<Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
+						&DOT, &PUSD, payment, &4,
+					)?;
+				drop(change);
+				Ok(())
+			});
+		assert_eq!(result, Err(crate::Error::<Test>::RecoveryOffsetCoinMismatch.into()));
+		assert_eq!(Assets::balance(USDX, 3), payer_before);
+		assert_eq!(Assets::total_supply(USDX), issuance_before);
+		assert_eq!(vault_debt(DOT, PUSD, 1), pusd_debt_before);
+		assert_eq!(vault_debt(DOT, USDX, 2), usdx_debt_before);
+	});
+}
+
 /// Near-twin of `recovery_redemption_leaves_ordinary_dynamic_fee_untouched`;
 /// the distinct path is the offset surface, which must also stay silent at
 /// the redemptions layer (no fee movement, no events).
@@ -1542,10 +1590,7 @@ fn recovery_offset_leaves_dynamic_fee_untouched() {
 
 		assert_eq!(
 			execute_offset(3, 4, 200),
-			Ok(RecoveryOffsetResult::Applied(RecoveryOffsetOutcome {
-				vault_owner: 1,
-				collateral_out: 168,
-			}))
+			Ok(RecoveryOffsetResult::Applied { collateral_out: 168 })
 		);
 
 		// Offsets are fee-free settlement: they neither move the dynamic fee
