@@ -55,7 +55,7 @@ pub mod pallet {
 	};
 	use pusd_primitives::{
 		debit_preservation, recovery_pricing, reducible_debit, ProvidePrice,
-		RecoveryOffsetInterface, RecoveryOffsetOutcome, RecoveryOffsetResult, RedemptionAllocation,
+		RecoveryOffsetInterface, RecoveryOffsetResult, RedemptionAllocation,
 		RedemptionStepSnapshot, VaultInterface,
 	};
 
@@ -231,6 +231,9 @@ pub mod pallet {
 		InsuranceFundBurnFailed,
 		/// The supplied redemption config is internally inconsistent.
 		InvalidRedemptionConfig,
+		/// A recovery-offset payment is denominated in a coin other than the
+		/// named market's stablecoin.
+		RecoveryOffsetCoinMismatch,
 	}
 
 	#[pallet::hooks]
@@ -1141,19 +1144,21 @@ pub mod pallet {
 
 	impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 		type CollateralId = T::CollateralAssetId;
+		type StableId = T::StableAssetId;
 		type AccountId = T::AccountId;
 		type Balance = BalanceOf<T>;
 		type Credit = StableCreditOf<T>;
 
 		fn execute_recovery_offset(
 			collateral_id: &T::CollateralAssetId,
+			stable_id: &T::StableAssetId,
 			payment: StableCreditOf<T>,
 			collateral_recipient: &T::AccountId,
-		) -> Result<
-			(RecoveryOffsetResult<T::AccountId, BalanceOf<T>>, StableCreditOf<T>),
-			DispatchError,
-		> {
-			let stable_id = &payment.asset();
+		) -> Result<(RecoveryOffsetResult<BalanceOf<T>>, StableCreditOf<T>), DispatchError> {
+			// A wrong-coin payment is a caller wiring bug: refuse loudly
+			// instead of settling in whatever market the coin names. The
+			// caller's rollback unwinds the dropped payment.
+			ensure!(payment.asset() == *stable_id, Error::<T>::RecoveryOffsetCoinMismatch);
 			let Some((owner, status)) =
 				T::Vaults::next_redemption_target(collateral_id, stable_id, None)
 			else {
@@ -1208,12 +1213,10 @@ pub mod pallet {
 						debug_assert!(allocation.debt_to_cancel <= payment.peek());
 						let (burn, change) = payment.split(allocation.debt_to_cancel);
 						drop(burn);
-						let outcome = RecoveryOffsetOutcome {
-							vault_owner: owner.clone(),
-							collateral_out: allocation.collateral_to_recipient,
-						};
 						TransactionOutcome::Commit(Ok((
-							RecoveryOffsetResult::Applied(outcome),
+							RecoveryOffsetResult::Applied {
+								collateral_out: allocation.collateral_to_recipient,
+							},
 							change,
 						)))
 					},

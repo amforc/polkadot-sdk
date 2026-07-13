@@ -21,7 +21,7 @@ pub enum RecoveryOffsetQuote<Balance> {
 	BelowPar,
 	/// Up to `debt` is cancellable against the head. The collateral the
 	/// settlement pays out arrives with the execution's
-	/// [`pusd_primitives::RecoveryOffsetOutcome`]; a quote only sizes the
+	/// [`pusd_primitives::RecoveryOffsetResult::Applied`]; a quote only sizes the
 	/// burn.
 	Available { debt: Balance },
 }
