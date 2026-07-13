@@ -8,11 +8,14 @@ use frame::deps::{
 	sp_runtime::Permill,
 };
 
-/// Per-vault allocation produced by the redemption orchestrator and applied by
-/// [`VaultInterface::redeem_step`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct RedemptionAllocation<Balance> {
-	pub debt_to_cancel: Balance,
+/// Settlement produced by the redemption orchestrator and consumed by
+/// [`VaultInterface::redeem_step`]. Owning `debt_payment` ties the burn to the
+/// cancellation by construction: the vault pallet cannot cancel ledger debt
+/// without consuming the matching coin, and the orchestrator cannot misreport
+/// the amount it paid.
+#[must_use = "the settlement must be returned to VaultInterface::redeem_step"]
+pub struct RedemptionSettlement<Credit, Balance> {
+	pub debt_payment: Credit,
 	pub collateral_to_recipient: Balance,
 }
 
@@ -23,7 +26,7 @@ pub struct RedemptionAllocation<Balance> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RedemptionStepSnapshot<Balance> {
 	pub status: VaultStatus,
-	/// Post-touch total debt; the cap on `debt_to_cancel`.
+	/// Post-touch total debt; the maximum debt the payment may cover.
 	pub debt: Balance,
 	/// Collateral currently held against the vault.
 	pub collateral: Balance,
@@ -80,15 +83,15 @@ pub struct LiquidationSnapshot<Balance> {
 /// Everything an orchestrator drives on the vault pallet. Reads are
 /// authoritative current state; writes re-shape the priority queue.
 ///
-/// The `build_allocation` closures make each step atomic: the orchestrator
-/// sizes its allocation against a post-touch snapshot inside the same call
-/// that applies it, and returning `Err` (or producing an invalid allocation)
+/// The builder closures make each step atomic: the orchestrator sizes its
+/// settlement or allocation against a post-touch snapshot inside the same
+/// call that applies it, and returning `Err` (or producing an invalid one)
 /// rolls the whole step back, so a rejected step never leaves partial state.
 ///
 /// Bad debt is only ever *recorded* inside the vault pallet (recovery
 /// settlement and orphan-debt sweeps); [`Self::heal`] carries the inverse
 /// side: the orchestrator withdraws cover from the Insurance Fund as a credit
-/// and hands it here to be rescinded against the recorded amount.
+/// and hands it here to be burned against the recorded amount.
 pub trait VaultInterface {
 	type CollateralId;
 	type StableId;
@@ -107,22 +110,24 @@ pub trait VaultInterface {
 	) -> Option<(Self::AccountId, VaultStatus)>;
 
 	/// One redemption step against `owner`'s vault: touch it, hand the caller a
-	/// fully-accrued snapshot, and apply the returned allocation atomically
-	/// (cancel debt, pay `collateral_to_recipient` to `recipient`). `Ok(None)`
-	/// from the closure skips the target but persists the touch. Burning the
-	/// redeemer's stablecoin and charging the fee stay with the caller.
+	/// fully-accrued snapshot, and apply the returned settlement atomically —
+	/// cancel exactly the debt `debt_payment` covers,
+	/// burn the payment, and pay `collateral_to_recipient` to `recipient`.
+	/// `Ok(None)` from the closure skips the target but persists the touch, so
+	/// build the payment only on the settlement path. Charging the redemption
+	/// fee stays with the caller.
 	fn redeem_step(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,
 		owner: &Self::AccountId,
 		recipient: &Self::AccountId,
-		build_allocation: impl FnOnce(
+		build_settlement: impl FnOnce(
 			RedemptionStepSnapshot<Self::Balance>,
 		) -> Result<
-			Option<RedemptionAllocation<Self::Balance>>,
+			Option<RedemptionSettlement<Self::Credit, Self::Balance>>,
 			DispatchError,
 		>,
-	) -> Result<Option<RedemptionAllocation<Self::Balance>>, DispatchError>;
+	) -> DispatchResult;
 
 	/// Move a `FinalRecovery` vault's fully-accrued residual debt off the row
 	/// and into the branch bad-debt ledger, returning the amount. The caller
@@ -154,7 +159,7 @@ pub trait VaultInterface {
 
 	/// Burn up to the recorded bad debt of the `(collateral_id, stable_id)`
 	/// market from `credit` and return the unconsumed surplus (zero when the
-	/// credit was fully used). The coin to rescind comes from `credit.asset()`;
+	/// credit was fully used). The coin to burn comes from `credit.asset()`;
 	/// `stable_id` is the intended market and must match it.
 	fn heal(
 		collateral_id: &Self::CollateralId,

@@ -9,16 +9,12 @@ use crate::{
 use frame::{
 	deps::frame_support::transactional,
 	prelude::*,
-	traits::{
-		fungibles::{Balanced as FungiblesBalanced, MutateHold as FungiblesMutateHold},
-		tokens::Restriction,
-		SameOrOther, Time,
-	},
+	traits::{fungibles::MutateHold as FungiblesMutateHold, tokens::Restriction, Time},
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
 	BranchMode, BranchModeProvider, LiquidationAllocation, LiquidationSnapshot,
-	RedemptionAllocation, RedemptionStepSnapshot, VaultInterface,
+	RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
 
 impl<T: Config> BranchModeProvider<T::CollateralAssetId, T::StableAssetId> for Pallet<T> {
@@ -187,13 +183,13 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		stable_id: &T::StableAssetId,
 		owner: &T::AccountId,
 		recipient: &T::AccountId,
-		build_allocation: impl FnOnce(
+		build_settlement: impl FnOnce(
 			RedemptionStepSnapshot<BalanceOf<T>>,
 		) -> Result<
-			Option<RedemptionAllocation<BalanceOf<T>>>,
+			Option<RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>>,
 			DispatchError,
 		>,
-	) -> Result<Option<RedemptionAllocation<BalanceOf<T>>>, DispatchError> {
+	) -> DispatchResult {
 		let op = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
 		op.ensure_not_frozen()?;
 		let mut op = op.touch(owner)?;
@@ -209,31 +205,37 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			redistribution_penalty: config.redistribution_penalty,
 		};
 
-		let Some(allocation) = build_allocation(snapshot)? else {
+		let Some(settlement) = build_settlement(snapshot)? else {
 			// Skipped target: persist the touch so the accrual it caused is paid for.
-			op.commit(TcrGate::Exempt)?;
-			return Ok(None);
+			return op.commit(TcrGate::Exempt);
 		};
+		let RedemptionSettlement { debt_payment, collateral_to_recipient } = settlement;
 
+		// The payment credit is the sole authority on how much debt this step
+		// cancels. It must carry real value: `Ok(None)` is the touch-only form,
+		// so a zero payment cannot release collateral.
+		ensure!(debt_payment.asset() == *stable_id, Error::<T>::InvalidRedemptionSettlement);
+		let debt_to_cancel = debt_payment.peek();
 		ensure!(
-			allocation.debt_to_cancel <= post_touch_debt,
-			Error::<T>::InvalidRedemptionAllocation
-		);
-		ensure!(
-			allocation.collateral_to_recipient <= held,
-			Error::<T>::InvalidRedemptionAllocation
+			!debt_to_cancel.is_zero() &&
+				debt_to_cancel <= post_touch_debt &&
+				collateral_to_recipient <= held,
+			Error::<T>::InvalidRedemptionSettlement
 		);
 
-		let payment = op.vault.debt.cancel(allocation.debt_to_cancel);
-		debug_assert_eq!(payment.total(), allocation.debt_to_cancel);
+		// Dropping the credit burns the withdrawn stablecoin.
+		drop(debt_payment);
 
-		if !allocation.collateral_to_recipient.is_zero() {
+		let payment = op.vault.debt.cancel(debt_to_cancel);
+		debug_assert_eq!(payment.total(), debt_to_cancel);
+
+		if !collateral_to_recipient.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
 				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
 				owner,
 				recipient,
-				allocation.collateral_to_recipient,
+				collateral_to_recipient,
 				Precision::Exact,
 				Restriction::Free,
 				Fortitude::Polite,
@@ -242,18 +244,16 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 		let new_total = op.vault.debt.total();
 		let stake_changes = matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) &&
-			!allocation.collateral_to_recipient.is_zero();
+			!collateral_to_recipient.is_zero();
 		op.ctx.branch.state.apply_debt_payment(
 			payment,
 			op.vault.annual_rate,
 			op.vault.debt.principal,
 		);
-		op.ctx.branch.state.remove_collateral(allocation.collateral_to_recipient);
-		op.vault.collateral =
-			op.vault.collateral.saturating_sub(allocation.collateral_to_recipient);
+		op.ctx.branch.state.remove_collateral(collateral_to_recipient);
+		op.vault.collateral = op.vault.collateral.saturating_sub(collateral_to_recipient);
 		if stake_changes {
-			let new_stake =
-				op.vault.redistribution_stake.saturating_sub(allocation.collateral_to_recipient);
+			let new_stake = op.vault.redistribution_stake.saturating_sub(collateral_to_recipient);
 			op.ctx.branch.state.set_vault_stake(&mut op.vault, new_stake);
 		}
 		if matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) {
@@ -273,12 +273,11 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			stable_id: op.ctx.stable_id.clone(),
 			owner: owner.clone(),
 			recipient: recipient.clone(),
-			debt_cancelled: allocation.debt_to_cancel,
-			collateral_to_recipient: allocation.collateral_to_recipient,
+			debt_cancelled: debt_to_cancel,
+			collateral_to_recipient,
 			vault_annual_rate: op.vault.annual_rate,
 		});
-		op.commit(TcrGate::Exempt)?;
-		Ok(Some(allocation))
+		op.commit(TcrGate::Exempt)
 	}
 
 	#[transactional]
@@ -364,9 +363,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		credit: StableCreditOf<T>,
 	) -> Result<StableCreditOf<T>, DispatchError> {
 		// A credit denominated in another coin cannot heal this market's bad
-		// debt — hand it straight back. The `offset` below would reject it
-		// anyway (mismatched asset), but checking up front keeps the imbalance
-		// intact for the caller.
+		// debt — hand it straight back.
 		if credit.asset() != *stable_id {
 			return Ok(credit);
 		}
@@ -377,15 +374,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			return Ok(credit);
 		}
 		let (to_burn, surplus) = credit.split(healable);
-		// Rescind the market's own coin to net the burn to zero. The credit's
-		// asset equals `stable_id` (checked above) and its size equals
-		// `healable`, so `offset` always nets fully; anything else is
-		// corruption, and rolling back keeps the ledgers coherent.
-		let debt = T::StableAssets::rescind(stable_id.clone(), healable);
-		if !matches!(to_burn.offset(debt), Ok(SameOrOther::None)) {
-			defensive!("healed credit must net to zero against its own rescind");
-			return Err(Error::<T>::ArithmeticOverflow.into());
-		}
+		// Dropping the credit burns the withdrawn stablecoin.
+		drop(to_burn);
 		Branches::<T>::try_mutate(
 			(collateral_id, stable_id),
 			|maybe| -> Result<_, DispatchError> {
