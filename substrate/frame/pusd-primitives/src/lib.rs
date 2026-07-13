@@ -17,16 +17,20 @@ use frame::{
 use scale_info::TypeInfo;
 
 pub mod branch_mode;
+pub mod debit;
 pub mod list_id;
 pub mod oracle;
+pub mod recovery_offset;
 pub mod recovery_pricing;
 pub mod registration;
 pub mod vault_interface;
 pub mod yield_routing;
 
 pub use branch_mode::{BranchMode, BranchModeProvider};
+pub use debit::{debit_preservation, reducible_debit};
 pub use list_id::StableListId;
 pub use oracle::ProvidePrice;
+pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetOutcome, RecoveryOffsetResult};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
 pub use vault_interface::{
@@ -94,6 +98,27 @@ pub fn collateralization_ratio<Balance: FixedPointOperand>(
 ) -> Option<FixedU128> {
 	let value = price.checked_mul_int(collateral)?;
 	FixedU128::checked_from_rational(value, debt)
+}
+
+/// `floor(value * numerator / denominator)` at `Balance` precision — the
+/// shared pro-rata building block of the pUSD math modules. `None` when
+/// `denominator` is zero, the product overflows, or the result exceeds
+/// `Balance`; callers pick their own defensive fallback.
+pub fn mul_div_floor<Balance: FixedPointOperand>(
+	value: Balance,
+	numerator: Balance,
+	denominator: Balance,
+) -> Option<Balance> {
+	if denominator.is_zero() {
+		return None;
+	}
+	multiply_by_rational_with_rounding(
+		value.unique_saturated_into(),
+		numerator.unique_saturated_into(),
+		denominator.unique_saturated_into(),
+		Rounding::Down,
+	)
+	.and_then(|raw| Balance::try_from(raw).ok())
 }
 
 /// `floor(value * rate / denominator)` reinterpreted as a `FixedU128` per-unit
