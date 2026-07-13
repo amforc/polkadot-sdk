@@ -14,14 +14,14 @@ use frame::{
 	prelude::*,
 	traits::{
 		fungibles::{Balanced as _, Inspect as _, Mutate as _},
-		tokens::{Fortitude, Precision, Preservation},
+		tokens::{Fortitude, Precision, Preservation, Provenance},
 		Defensive, Time,
 	},
 };
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{
-	BranchMode, BranchModeProvider, Millis, RecoveryOffsetInterface, RecoveryOffsetResult,
-	StableListId,
+	debit_preservation, reducible_debit, BranchMode, BranchModeProvider, Millis,
+	RecoveryOffsetInterface, RecoveryOffsetResult, StableListId,
 };
 
 /// Which realized gain a claim pays out; the two sides share one flow
@@ -47,6 +47,7 @@ struct ActiveOffsetPlan<Balance> {
 struct PendingStep<Balance> {
 	debt: Balance,
 	collateral: Balance,
+	exhausted: bool,
 }
 
 impl<T: Config> Pallet<T> {
@@ -96,26 +97,41 @@ impl<T: Config> Pallet<T> {
 		Self::realize_and_activate(&collateral_id, &stable_id, &who, &mut pool, &mut deposit, now)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		let used_for_recovery = Self::try_incoming_recovery(
+		// One withdrawal funds both halves: the recovery settlement consumes
+		// its slice from the credit and the change becomes the pending
+		// deposit. `Expendable` only on a full drain, so the withdrawal
+		// itself rejects a dead-zone amount instead of folding the dust in.
+		let preservation =
+			debit_preservation::<T::StableAssets, _>(stable_id.clone(), &who, amount);
+		let payment = T::StableAssets::withdraw(
+			stable_id.clone(),
+			&who,
+			amount,
+			Precision::Exact,
+			preservation,
+			Fortitude::Polite,
+		)?;
+		let (used_for_recovery, change) = Self::try_incoming_recovery(
 			&collateral_id,
 			&stable_id,
-			&who,
 			&pool_account,
 			&mut pool.state,
 			&mut deposit,
-			amount,
+			payment,
 		)?;
-		let pending_amount =
-			amount.checked_sub(&used_for_recovery).ok_or(ArithmeticError::Underflow)?;
+		let pending_amount = change.peek();
+		debug_assert_eq!(pending_amount, amount.saturating_sub(used_for_recovery));
 
-		if !pending_amount.is_zero() {
-			T::StableAssets::transfer(
+		if let Err(change) = change.drop_zero() {
+			T::StableAssets::can_deposit(
 				stable_id.clone(),
-				&who,
 				&pool_account,
 				pending_amount,
-				Preservation::Expendable,
-			)?;
+				Provenance::Extant,
+			)
+			.into_result()?;
+			let _ = T::StableAssets::resolve(&pool_account, change)
+				.defensive_proof("`can_deposit` just passed; qed");
 			let activatable_at = now.saturating_add(pool.config.entry_delay);
 			match deposit.pending_deposit.as_mut() {
 				Some(pending) => {
@@ -160,37 +176,37 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §7.4: burn up to `amount` of the incoming deposit straight
-	/// from the depositor against an at-or-above-par `FinalRecovery` head,
-	/// crediting the priced collateral directly to the depositor. The used
-	/// portion never touches the pool's stablecoin balance or `P`/`S`/`G`
-	/// (invariant 7). A below-par head rejects the whole deposit.
+	/// SPEC.md §7.4: settle up to the incoming deposit credit against an
+	/// at-or-above-par `FinalRecovery` head, crediting the priced collateral
+	/// directly to the depositor. The used portion never touches the pool's
+	/// stablecoin balance or `P`/`S`/`G` (invariant 7); the unconsumed
+	/// change returns to the caller to become the pending deposit. A
+	/// below-par head rejects the whole deposit.
 	fn try_incoming_recovery(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-		who: &T::AccountId,
 		pool_account: &T::AccountId,
 		state: &mut PoolStateOf<T>,
 		deposit: &mut DepositOf<T>,
-		amount: BalanceOf<T>,
-	) -> Result<BalanceOf<T>, DispatchError> {
-		let result = T::RecoveryOffsets::execute_recovery_offset(
-			collateral_id,
-			stable_id,
-			who,
-			pool_account,
-			amount,
-		)?;
+		payment: StableCreditOf<T>,
+	) -> Result<(BalanceOf<T>, StableCreditOf<T>), DispatchError> {
+		let amount = payment.peek();
+		let (result, change) =
+			T::RecoveryOffsets::execute_recovery_offset(collateral_id, payment, pool_account)?;
 		let outcome = match result {
-			RecoveryOffsetResult::NoTarget => return Ok(BalanceOf::<T>::zero()),
+			RecoveryOffsetResult::NoTarget => {
+				debug_assert_eq!(change.peek(), amount);
+				return Ok((BalanceOf::<T>::zero(), change));
+			},
 			RecoveryOffsetResult::BelowPar => {
+				// The dropped change unwinds with the failing extrinsic.
 				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
 			},
 			RecoveryOffsetResult::Applied(outcome) => outcome,
 		};
-		// Redemptions caps execution at the requested amount and returns the
-		// actually cancelled debt; the remainder becomes pending deposit below.
-		ensure!(outcome.debt_cancelled <= amount, Error::<T>::InvalidRecoveryOffsetSnapshot);
+		// Conservation by construction: the settlement can only have burned
+		// value the credit carried.
+		let used_for_recovery = amount.saturating_sub(change.peek());
 
 		deposit.claimable_collateral = deposit
 			.claimable_collateral
@@ -203,11 +219,11 @@ impl<T: Config> Pallet<T> {
 		Self::deposit_event(Event::RecoveryOffsetApplied {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
-			debt_burned: outcome.debt_cancelled,
+			debt_burned: used_for_recovery,
 			collateral_gain: outcome.collateral_out,
 			source: RecoveryOffsetSource::IncomingDeposit,
 		});
-		Ok(outcome.debt_cancelled)
+		Ok((used_for_recovery, change))
 	}
 
 	/// SPEC.md §7.3: burn active pool stablecoin against the `FinalRecovery`
@@ -225,23 +241,32 @@ impl<T: Config> Pallet<T> {
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 
 		// Size the burn before touching anything: pool depth and the §6.5
-		// floor cap what the settlement may take.
-		let debt = math::clamp_offset_debt(
+		// floor cap the accounting, and the burnable amount caps that — a
+		// minimum-balance dead zone rounds the offset down instead of
+		// dusting the pool account.
+		let accounting_cap = math::clamp_offset_debt(
 			max_stable_in,
 			pool.state.total_active_deposits,
 			pool.config.minimum_active_pool_balance,
 		);
-		ensure!(!debt.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
-
+		ensure!(!accounting_cap.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		let result = T::RecoveryOffsets::execute_recovery_offset(
-			&collateral_id,
-			&stable_id,
+		let (funded, preservation) =
+			reducible_debit::<T::StableAssets, _>(stable_id.clone(), &pool_account, accounting_cap);
+		ensure!(!funded.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
+
+		let payment = T::StableAssets::withdraw(
+			stable_id.clone(),
 			&pool_account,
-			&pool_account,
-			debt,
+			funded,
+			Precision::Exact,
+			preservation,
+			Fortitude::Polite,
 		)?;
+		let (result, change) =
+			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
 		let outcome = match result {
+			// The dropped change unwinds with the failing extrinsic.
 			RecoveryOffsetResult::NoTarget => {
 				return Err(Error::<T>::RecoveryVaultNotFound.into());
 			},
@@ -250,24 +275,39 @@ impl<T: Config> Pallet<T> {
 			},
 			RecoveryOffsetResult::Applied(outcome) => outcome,
 		};
-		// Redemptions caps execution at the clamp result. A smaller burn means
-		// the recovery head had less cancellable debt than the active pool could
-		// safely spend.
-		ensure!(outcome.debt_cancelled <= debt, Error::<T>::InvalidRecoveryOffsetSnapshot);
-		ensure!(!outcome.debt_cancelled.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
+		// Conservation by construction: the settlement can only have burned
+		// value the credit carried.
+		let debt_cancelled = funded.saturating_sub(change.peek());
+		ensure!(!debt_cancelled.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
+		if let Err(change) = change.drop_zero() {
+			// Return the unburned slice to the pool. Only a full-drain
+			// withdrawal whose head cancelled less, leaving a sub-minimum
+			// change, can be refused here: the revert asks the offsetter to
+			// size `max_stable_in` from the preview instead of dusting the
+			// pool.
+			T::StableAssets::can_deposit(
+				stable_id.clone(),
+				&pool_account,
+				change.peek(),
+				Provenance::Extant,
+			)
+			.into_result()?;
+			let _ = T::StableAssets::resolve(&pool_account, change)
+				.defensive_proof("`can_deposit` just passed; qed");
+		}
 
 		Self::apply_active_offset(
 			&collateral_id,
 			&stable_id,
 			&mut pool,
-			outcome.debt_cancelled,
+			debt_cancelled,
 			outcome.collateral_out,
 		)?;
 		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(Event::RecoveryOffsetApplied {
 			collateral_id,
 			stable_id,
-			debt_burned: outcome.debt_cancelled,
+			debt_burned: debt_cancelled,
 			collateral_gain: outcome.collateral_out,
 			source: RecoveryOffsetSource::ActivePool,
 		});
@@ -373,12 +413,16 @@ impl<T: Config> Pallet<T> {
 			.ok_or(ArithmeticError::Underflow)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
+		// `Expendable` only on a full drain: the transfer itself then rejects
+		// a dead-zone payout instead of dusting the pool account.
+		let preservation =
+			debit_preservation::<T::StableAssets, _>(stable_id.clone(), &pool_account, take);
 		T::StableAssets::transfer(
 			stable_id.clone(),
 			&pool_account,
 			&recipient,
 			take,
-			Preservation::Expendable,
+			preservation,
 		)?;
 
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
@@ -430,12 +474,19 @@ impl<T: Config> Pallet<T> {
 					.total_collateral_gains_unclaimed
 					.checked_sub(&amount)
 					.ok_or(ArithmeticError::Underflow)?;
+				// `Expendable` only on a full drain: the transfer itself then
+				// rejects a dead-zone payout instead of dusting the pool.
+				let preservation = debit_preservation::<T::CollateralAssets, _>(
+					collateral_id.clone(),
+					&pool_account,
+					amount,
+				);
 				T::CollateralAssets::transfer(
 					collateral_id.clone(),
 					&pool_account,
 					&recipient,
 					amount,
-					Preservation::Expendable,
+					preservation,
 				)?;
 				amount
 			},
@@ -448,12 +499,19 @@ impl<T: Config> Pallet<T> {
 					.total_yield_unclaimed
 					.checked_sub(&amount)
 					.ok_or(ArithmeticError::Underflow)?;
+				// `Expendable` only on a full drain: the transfer itself then
+				// rejects a dead-zone payout instead of dusting the pool.
+				let preservation = debit_preservation::<T::StableAssets, _>(
+					stable_id.clone(),
+					&pool_account,
+					amount,
+				);
 				T::StableAssets::transfer(
 					stable_id.clone(),
 					&pool_account,
 					&recipient,
 					amount,
-					Preservation::Expendable,
+					preservation,
 				)?;
 				amount
 			},
@@ -501,11 +559,19 @@ impl<T: Config> Pallet<T> {
 			return (PoolOffsetResult::zero(), collateral);
 		}
 
-		let sp_offset_debt = math::clamp_offset_debt(
+		let accounting_cap = math::clamp_offset_debt(
 			max_debt_to_offset,
 			pool.state.total_active_deposits,
 			pool.config.minimum_active_pool_balance,
 		);
+		if accounting_cap.is_zero() {
+			return (PoolOffsetResult::zero(), collateral);
+		}
+		// The burnable amount caps the accounting: a minimum-balance dead
+		// zone rounds the offset down instead of dusting the pool account.
+		let pool_account = Self::pool_account(collateral_id, stable_id);
+		let (sp_offset_debt, preservation) =
+			reducible_debit::<T::StableAssets, _>(stable_id.clone(), &pool_account, accounting_cap);
 		if sp_offset_debt.is_zero() {
 			return (PoolOffsetResult::zero(), collateral);
 		}
@@ -523,12 +589,12 @@ impl<T: Config> Pallet<T> {
 			return (PoolOffsetResult::zero(), collateral);
 		};
 
-		let pool_account = Self::pool_account(collateral_id, stable_id);
 		let remainder = match Self::resolve_and_burn(
 			collateral_id,
 			stable_id,
 			&pool_account,
 			sp_offset_debt,
+			preservation,
 			sp_offset_collateral,
 			collateral,
 		) {
@@ -615,6 +681,9 @@ impl<T: Config> Pallet<T> {
 			debt_left = debt_left.saturating_sub(step.debt);
 			debt_burned = debt_burned.saturating_add(step.debt);
 			collateral_credited = collateral_credited.saturating_add(step.collateral);
+			if step.exhausted {
+				break;
+			}
 		}
 
 		if !debt_burned.is_zero() {
@@ -664,7 +733,14 @@ impl<T: Config> Pallet<T> {
 		};
 		let pending_amount = pending.amount;
 		let activatable_at = pending.activatable_at;
-		let step_debt = pending_amount.min(debt_left);
+		// A minimum-balance dead zone rounds the slice down; a zero amount
+		// means nothing burnable is left, which ends the walk.
+		let requested_debt = pending_amount.min(debt_left);
+		let (step_debt, preservation) =
+			reducible_debit::<T::StableAssets, _>(stable_id.clone(), pool_account, requested_debt);
+		if step_debt.is_zero() {
+			return (None, collateral);
+		}
 		let step_collateral = math::pro_rata_floor(collateral.peek(), step_debt, debt_left);
 		let Some(new_pending_amount) = pending_amount.checked_sub(&step_debt).defensive() else {
 			return (None, collateral);
@@ -692,6 +768,7 @@ impl<T: Config> Pallet<T> {
 			stable_id,
 			pool_account,
 			step_debt,
+			preservation,
 			step_collateral,
 			collateral,
 		) {
@@ -715,7 +792,14 @@ impl<T: Config> Pallet<T> {
 		// Flooring can zero the credit; a fully-consumed row with no other
 		// value must not linger.
 		Self::store_or_prune_deposit(collateral_id, stable_id, oldest, row);
-		(Some(PendingStep { debt: step_debt, collateral: step_collateral }), remainder)
+		(
+			Some(PendingStep {
+				debt: step_debt,
+				collateral: step_collateral,
+				exhausted: step_debt < requested_debt,
+			}),
+			remainder,
+		)
 	}
 
 	/// The shared active-pool accumulator math for ordinary liquidation and
@@ -825,26 +909,39 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// The §7 offset value movement. Stablecoin is first withdrawn into a
-	/// credit, without changing issuance. If the collateral slice resolves,
-	/// dropping that stable credit commits the burn; otherwise the stable
-	/// credit is resolved back and `Err` returns the full collateral credit.
+	/// The §7 offset value movement. The stable debit is sized by
+	/// [`reducible_debit`] at the caller. If resolving the collateral fails,
+	/// the stable credit is returned and `Err` carries the full collateral
+	/// credit back to the caller.
 	fn resolve_and_burn(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		pool_account: &T::AccountId,
 		debt: BalanceOf<T>,
+		preservation: Preservation,
 		collateral_amount: BalanceOf<T>,
 		credit: CollateralCreditOf<T>,
 	) -> Result<CollateralCreditOf<T>, CollateralCreditOf<T>> {
 		debug_assert_eq!(credit.asset(), *collateral_id);
-		let stable_credit = match Self::withdraw_pool_stable(stable_id, pool_account, debt) {
-			Some(stable_credit) => stable_credit,
-			None => return Err(credit),
+		let stable_credit = match T::StableAssets::withdraw(
+			stable_id.clone(),
+			pool_account,
+			debt,
+			Precision::Exact,
+			preservation,
+			Fortitude::Polite,
+		) {
+			Ok(stable_credit) => stable_credit,
+			// Sized by the caller's `reducible_debit` with nothing
+			// interleaved; a refusal means the implementation disagrees with
+			// its own `reducible_balance`. Nothing has moved yet.
+			Err(_) => return Err(credit),
 		};
+		debug_assert_eq!(stable_credit.peek(), debt);
 		let (to_pool, mut remainder) = credit.split(collateral_amount);
 		match Self::resolve_pool_collateral(pool_account, to_pool) {
 			Ok(()) => {
+				// Dropping the withdrawn credit is the debt-cancelling burn.
 				drop(stable_credit);
 				Ok(remainder)
 			},
@@ -877,32 +974,6 @@ impl<T: Config> Pallet<T> {
 	/// (burns) the leftover, keeping issuance conservative.
 	fn subsume_returned(remainder: &mut CollateralCreditOf<T>, returned: CollateralCreditOf<T>) {
 		let _ = remainder.subsume(returned).defensive_proof("collateral credit halves diverged");
-	}
-
-	/// Withdraw the stablecoin slice that will be burned once collateral
-	/// resolution succeeds. Partial withdrawals preserve the asset account;
-	/// only an exact full depletion may reap it, so no dust is over-withdrawn.
-	fn withdraw_pool_stable(
-		stable_id: &T::StableAssetId,
-		pool_account: &T::AccountId,
-		amount: BalanceOf<T>,
-	) -> Option<StableCreditOf<T>> {
-		let preservation = if T::StableAssets::balance(stable_id.clone(), pool_account) == amount {
-			Preservation::Expendable
-		} else {
-			Preservation::Preserve
-		};
-		let credit = T::StableAssets::withdraw(
-			stable_id.clone(),
-			pool_account,
-			amount,
-			Precision::Exact,
-			preservation,
-			Fortitude::Polite,
-		)
-		.ok()?;
-		debug_assert_eq!(credit.peek(), amount);
-		Some(credit)
 	}
 
 	/// SPEC.md §6.3: distribute same-stablecoin yield to active depositors
