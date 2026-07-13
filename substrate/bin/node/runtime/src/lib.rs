@@ -2961,6 +2961,9 @@ mod runtime {
 
 	#[runtime::pallet_index(98)]
 	pub type Redemptions = pallet_redemptions::Pallet<Runtime>;
+
+	#[runtime::pallet_index(99)]
+	pub type Stability = pallet_stability::Pallet<Runtime>;
 }
 
 /// The address format for describing accounts.
@@ -3258,6 +3261,9 @@ fn vaults_oracle_key(collateral_id: &VaultsCollateralId) -> u32 {
 pub type VaultsCollateral =
 	UnionOf<Balances, AssetsHolder, NativeFromLeft, VaultsCollateralId, AccountId>;
 
+pub type StabilityCollateral =
+	UnionOf<Balances, Assets, NativeFromLeft, VaultsCollateralId, AccountId>;
+
 pub type VaultsStableId = u32;
 
 /// Bridges `pallet-oracle` (u32 → u128) to the vault pallet's `ProvidePrice`
@@ -3319,9 +3325,9 @@ impl pallet_vaults::Config for Runtime {
 	type CollateralAssets = VaultsCollateral;
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
-	type FeeHandler = ();
-	type YieldHook = ();
-	type OnBranchLifecycle = Redemptions;
+	type FeeHandler = ResolveAssetTo<TreasuryAccount, Assets>;
+	type YieldHook = Stability;
+	type OnBranchLifecycle = (Redemptions, Stability);
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
 	type Consideration = HoldConsideration<
@@ -3434,6 +3440,42 @@ impl pallet_redemptions::Config for Runtime {
 	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = RedemptionsBenchmarkHelper;
+}
+
+parameter_types! {
+	pub const StabilityPalletId: PalletId = PalletId(*b"py/stabl");
+	pub StabilityDefaultConfig: pallet_stability::types::StabilityPoolConfig<Balance> =
+		pallet_stability::types::StabilityPoolConfig {
+			minimum_deposit: 100_000_000, // 100 pUSD (6 decimals)
+			minimum_active_pool_balance: 100_000_000, // 100 pUSD (6 decimals)
+			entry_delay: 5_000, // 5 seconds
+			safety_withdrawal_delay: 10 * 60 * 1_000, // 10 minutes
+			precision: pallet_stability::types::PoolPrecision {
+				p_min: FixedU128::from_inner(1_000_000_000),
+				scale_factor: 1_000_000_000,
+			},
+			yield_share: Permill::from_percent(75),
+		};
+	pub const StabilityMaxPendingOffsetIterations: u32 = 8;
+}
+
+impl pallet_stability::Config for Runtime {
+	type CollateralAssetId = VaultsCollateralId;
+	type StableAssetId = VaultsStableId;
+	type StableAssets = Assets;
+	type CollateralAssets = StabilityCollateral;
+	type TimeProvider = Timestamp;
+	type BranchModes = Vaults;
+	type RecoveryOffsets = Redemptions;
+	type PendingLists = LinkedList;
+	type UpdateOrigin = EitherOf<
+		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
+		pallet_vaults::EnsureBranchFullAdmin<Runtime>,
+	>;
+	type DefaultStabilityPoolConfig = StabilityDefaultConfig;
+	type MaxPendingOffsetIterations = StabilityMaxPendingOffsetIterations;
+	type PalletId = StabilityPalletId;
+	type WeightInfo = ();
 }
 
 #[cfg(feature = "runtime-benchmarks")]
