@@ -27,8 +27,8 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		assert_ok!(activate(1, DOT, PUSD));
 		assert_ok!(activate(2, DOT, PUSD));
 
-		let (result, _) = simulate_offset(DOT, PUSD, 1_000, 800);
-		assert_eq!(result.debt_offset, 1_000);
+		let (debt_offset, _) = simulate_offset(DOT, PUSD, 1_000, 800);
+		assert_eq!(debt_offset, 1_000);
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.coords.epoch, 1);
@@ -62,7 +62,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		advance_time(5_000);
 		assert_ok!(activate(3, DOT, PUSD));
 		let before_3 = collateral_balance(DOT, 3);
-		assert_eq!(simulate_offset(DOT, PUSD, 250, 100).0.debt_offset, 250);
+		assert_eq!(simulate_offset(DOT, PUSD, 250, 100).0, 250);
 		assert_ok!(claim_collateral(3, DOT, PUSD, 3));
 		// floor(500 * floor(100 * 1e18 / 500) / 1e18) = 100, and the
 		// compounded deposit is floor(500 * 0.5) = 250.
@@ -82,8 +82,8 @@ fn scale_crossing_preserves_older_deposits() {
 		// Offset all but 100 (the exact floor): the survival ratio 1e-11
 		// pushes P below p_min once, so it crosses one scale:
 		// P = floor(1e18 * 1e9 * 100 / 1e13) = 1e16 (0.01), scale 1.
-		let (result, _) = simulate_offset(DOT, PUSD, unit - 100, 5_000_000_000_000);
-		assert_eq!(result.debt_offset, unit - 100);
+		let (debt_offset, _) = simulate_offset(DOT, PUSD, unit - 100, 5_000_000_000_000);
+		assert_eq!(debt_offset, unit - 100);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.coords.epoch, 0);
 		assert_eq!(state.coords.scale, 1);
@@ -106,7 +106,7 @@ fn scale_crossing_preserves_older_deposits() {
 		// the floor: delta_S(0,1) = floor(40 * 0.01 / 100) = 4e15 inner,
 		// P = floor(1e16 * 50 / 100) = 5e15.
 		set_min_active_pool(10);
-		assert_eq!(simulate_offset(DOT, PUSD, 50, 40).0.debt_offset, 50);
+		assert_eq!(simulate_offset(DOT, PUSD, 50, 40).0, 50);
 
 		// The scale-0 deposit realizes across the boundary:
 		// compounded = floor(1e13 * 5e15 / (1e18 * 1e9)) = 50;
@@ -132,8 +132,8 @@ fn deposit_two_scales_behind_realizes_through_the_squared_divisor() {
 
 		// Leaving 5 of 1e19 is a survival ratio of 5e-19 < 1e-18: two
 		// crossings in one offset, P = floor(1e36 * 5 / 1e19) = 5e17 (0.5).
-		let (result, _) = simulate_offset(DOT, PUSD, unit - 5, 8_000_000_000_000_000_000);
-		assert_eq!(result.debt_offset, unit - 5);
+		let (debt_offset, _) = simulate_offset(DOT, PUSD, unit - 5, 8_000_000_000_000_000_000);
+		assert_eq!(debt_offset, unit - 5);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.coords.scale, 2);
 		assert_eq!(state.coords.p, FixedU128::from_rational(1, 2));
@@ -165,9 +165,8 @@ fn offset_beyond_supported_precision_steps_aside_untouched() {
 		// A survival ratio of 1e-28 needs more than two crossings:
 		// floor(1e36 * 1 / 1e28) = 1e8 < p_min even at the cap. The pool
 		// declines the offset and returns the whole credit.
-		let (result, leftover) = simulate_offset(DOT, PUSD, unit - 1, unit);
-		assert_eq!(result.debt_offset, 0);
-		assert_eq!(result.collateral_to_pool, 0);
+		let (debt_offset, leftover) = simulate_offset(DOT, PUSD, unit - 1, unit);
+		assert_eq!(debt_offset, 0);
 		assert_eq!(leftover, unit);
 
 		// The plan failed before any value moved: nothing to roll back.

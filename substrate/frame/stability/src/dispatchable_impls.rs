@@ -7,7 +7,7 @@ use crate::{
 	pending,
 	types::{
 		Accumulators, Deposit, DepositSnapshot, PUpdate, PendingDeposit, PendingOffsetResult,
-		PoolOffsetResult, PoolSums, RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
+		PoolSums, RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
 	},
 };
 use frame::{
@@ -191,9 +191,13 @@ impl<T: Config> Pallet<T> {
 		payment: StableCreditOf<T>,
 	) -> Result<(BalanceOf<T>, StableCreditOf<T>), DispatchError> {
 		let amount = payment.peek();
-		let (result, change) =
-			T::RecoveryOffsets::execute_recovery_offset(collateral_id, payment, pool_account)?;
-		let outcome = match result {
+		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
+			collateral_id,
+			stable_id,
+			payment,
+			pool_account,
+		)?;
+		let collateral_out = match result {
 			RecoveryOffsetResult::NoTarget => {
 				debug_assert_eq!(change.peek(), amount);
 				return Ok((BalanceOf::<T>::zero(), change));
@@ -202,7 +206,7 @@ impl<T: Config> Pallet<T> {
 				// The dropped change unwinds with the failing extrinsic.
 				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
 			},
-			RecoveryOffsetResult::Applied(outcome) => outcome,
+			RecoveryOffsetResult::Applied { collateral_out } => collateral_out,
 		};
 		// Conservation by construction: the settlement can only have burned
 		// value the credit carried.
@@ -210,17 +214,17 @@ impl<T: Config> Pallet<T> {
 
 		deposit.claimable_collateral = deposit
 			.claimable_collateral
-			.checked_add(&outcome.collateral_out)
+			.checked_add(&collateral_out)
 			.ok_or(ArithmeticError::Overflow)?;
 		state.total_collateral_gains_unclaimed = state
 			.total_collateral_gains_unclaimed
-			.checked_add(&outcome.collateral_out)
+			.checked_add(&collateral_out)
 			.ok_or(ArithmeticError::Overflow)?;
 		Self::deposit_event(Event::RecoveryOffsetApplied {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
 			debt_burned: used_for_recovery,
-			collateral_gain: outcome.collateral_out,
+			collateral_gain: collateral_out,
 			source: RecoveryOffsetSource::IncomingDeposit,
 		});
 		Ok((used_for_recovery, change))
@@ -263,9 +267,13 @@ impl<T: Config> Pallet<T> {
 			preservation,
 			Fortitude::Polite,
 		)?;
-		let (result, change) =
-			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
-		let outcome = match result {
+		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
+			&collateral_id,
+			&stable_id,
+			payment,
+			&pool_account,
+		)?;
+		let collateral_out = match result {
 			// The dropped change unwinds with the failing extrinsic.
 			RecoveryOffsetResult::NoTarget => {
 				return Err(Error::<T>::RecoveryVaultNotFound.into());
@@ -273,7 +281,7 @@ impl<T: Config> Pallet<T> {
 			RecoveryOffsetResult::BelowPar => {
 				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
 			},
-			RecoveryOffsetResult::Applied(outcome) => outcome,
+			RecoveryOffsetResult::Applied { collateral_out } => collateral_out,
 		};
 		// Conservation by construction: the settlement can only have burned
 		// value the credit carried.
@@ -301,14 +309,14 @@ impl<T: Config> Pallet<T> {
 			&stable_id,
 			&mut pool,
 			debt_cancelled,
-			outcome.collateral_out,
+			collateral_out,
 		)?;
 		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(Event::RecoveryOffsetApplied {
 			collateral_id,
 			stable_id,
 			debt_burned: debt_cancelled,
-			collateral_gain: outcome.collateral_out,
+			collateral_gain: collateral_out,
 			source: RecoveryOffsetSource::ActivePool,
 		});
 		Ok(())
@@ -546,17 +554,17 @@ impl<T: Config> Pallet<T> {
 		stable_id: &T::StableAssetId,
 		max_debt_to_offset: BalanceOf<T>,
 		collateral: CollateralCreditOf<T>,
-	) -> (PoolOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
+	) -> (BalanceOf<T>, CollateralCreditOf<T>) {
 		if collateral.asset() != *collateral_id {
-			return (PoolOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		}
 		let Ok(mut pool) = Self::load_pool(collateral_id, stable_id) else {
-			return (PoolOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		};
 		// Defense in depth: the vault engine already refuses to liquidate
 		// on a frozen branch.
 		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
-			return (PoolOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		}
 
 		let accounting_cap = math::clamp_offset_debt(
@@ -565,7 +573,7 @@ impl<T: Config> Pallet<T> {
 			pool.config.minimum_active_pool_balance,
 		);
 		if accounting_cap.is_zero() {
-			return (PoolOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		}
 		// The burnable amount caps the accounting: a minimum-balance dead
 		// zone rounds the offset down instead of dusting the pool account.
@@ -573,7 +581,7 @@ impl<T: Config> Pallet<T> {
 		let (sp_offset_debt, preservation) =
 			reducible_debit::<T::StableAssets, _>(stable_id.clone(), &pool_account, accounting_cap);
 		if sp_offset_debt.is_zero() {
-			return (PoolOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		}
 		let sp_offset_collateral =
 			math::pro_rata_floor(collateral.peek(), sp_offset_debt, max_debt_to_offset);
@@ -586,7 +594,7 @@ impl<T: Config> Pallet<T> {
 		) else {
 			// Beyond supported precision (§6.4): the pool steps aside and
 			// the debt continues to the caller's next stage.
-			return (PoolOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		};
 
 		let remainder = match Self::resolve_and_burn(
@@ -599,7 +607,7 @@ impl<T: Config> Pallet<T> {
 			collateral,
 		) {
 			Ok(remainder) => remainder,
-			Err(remainder) => return (PoolOffsetResult::zero(), remainder),
+			Err(remainder) => return (BalanceOf::<T>::zero(), remainder),
 		};
 
 		Self::commit_active_offset(collateral_id, stable_id, &mut pool.state, plan);
@@ -612,13 +620,7 @@ impl<T: Config> Pallet<T> {
 			scale: pool.state.coords.scale,
 		});
 		Pools::<T>::insert(collateral_id, stable_id, pool);
-		(
-			PoolOffsetResult {
-				debt_offset: sp_offset_debt,
-				collateral_to_pool: sp_offset_collateral,
-			},
-			remainder,
-		)
+		(sp_offset_debt, remainder)
 	}
 
 	/// SPEC.md §7.2 / §6.8: the last-resort backstop — consume pending
@@ -631,24 +633,24 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn do_offset_pending_liquidation(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
-		remaining_debt: BalanceOf<T>,
+		max_debt_to_offset: BalanceOf<T>,
 		max_pending_iterations: u32,
 		mut collateral: CollateralCreditOf<T>,
 	) -> (PendingOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
 		if collateral.asset() != *collateral_id {
-			return (PendingOffsetResult::zero(remaining_debt), collateral);
+			return (PendingOffsetResult::zero(), collateral);
 		}
 		let Some(mut pool) = Pools::<T>::get(collateral_id, stable_id) else {
-			return (PendingOffsetResult::zero(remaining_debt), collateral);
+			return (PendingOffsetResult::zero(), collateral);
 		};
 		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
-			return (PendingOffsetResult::zero(remaining_debt), collateral);
+			return (PendingOffsetResult::zero(), collateral);
 		}
 		let fifo = pending::list_id::<T>(collateral_id, stable_id);
 		let pool_account = Self::pool_account(collateral_id, stable_id);
 		let cap = max_pending_iterations.min(T::MaxPendingOffsetIterations::get());
 
-		let mut debt_left = remaining_debt;
+		let mut debt_left = max_debt_to_offset;
 		let mut debt_burned = BalanceOf::<T>::zero();
 		let mut collateral_credited = BalanceOf::<T>::zero();
 		let mut iterations: u32 = 0;
@@ -696,15 +698,7 @@ impl<T: Config> Pallet<T> {
 				iterations,
 			});
 		}
-		(
-			PendingOffsetResult {
-				debt_offset: debt_burned,
-				collateral_to_pool: collateral_credited,
-				remaining_debt: debt_left,
-				iterations_used: iterations,
-			},
-			collateral,
-		)
+		(PendingOffsetResult { debt_offset: debt_burned, iterations_used: iterations }, collateral)
 	}
 
 	/// One §6.8 backstop step against the FIFO's `oldest` member: price the
