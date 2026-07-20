@@ -55,7 +55,7 @@ pub mod pallet {
 	};
 	use pusd_primitives::{
 		debit_preservation, recovery_pricing, reducible_debit, ProvidePrice,
-		RecoveryOffsetInterface, RecoveryOffsetResult, RedemptionAllocation,
+		RecoveryOffsetInterface, RecoveryOffsetResult, RedemptionSettlement,
 		RedemptionStepSnapshot, VaultInterface,
 	};
 
@@ -78,8 +78,9 @@ pub mod pallet {
 
 	pub type SnapshotOf<T> = RedemptionStepSnapshot<BalanceOf<T>>;
 
-	/// One priced step: the vault-facing allocation plus the loop-facing outcome it implies.
-	type StepDecision<T> = (Option<RedemptionAllocation<BalanceOf<T>>>, StepOutcome<BalanceOf<T>>);
+	/// One priced step: the vault-facing settlement plus the loop-facing outcome it implies.
+	type StepDecision<T> =
+		(Option<RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>>, StepOutcome<BalanceOf<T>>);
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
@@ -516,8 +517,8 @@ pub mod pallet {
 		}
 
 		/// Classify, price, and fund one step from inside the vault-side
-		/// `redeem_step` closure. Returns the loop outcome plus the allocation for
-		/// the vault; a `None` allocation persists the touch without redeeming.
+		/// `redeem_step` closure. Returns the loop outcome plus the settlement for
+		/// the vault; a `None` settlement persists the touch without redeeming.
 		fn execute_step(
 			stable_id: &T::StableAssetId,
 			redeemer: &T::AccountId,
@@ -547,18 +548,18 @@ pub mod pallet {
 					}
 					let total_in = step.debt.saturating_add(step.fee);
 					debug_assert!(total_in <= funded);
-					Self::burn_redeemer_pusd(
+					let debt_payment = Self::fund_redemption(
 						stable_id,
 						redeemer,
 						step.debt,
 						total_in,
 						preservation,
 					)?;
-					let allocation = RedemptionAllocation {
-						debt_to_cancel: step.debt,
+					let settlement = RedemptionSettlement {
+						debt_payment,
 						collateral_to_recipient: step.collateral_out,
 					};
-					Ok((Some(allocation), StepOutcome::Redeemed(step)))
+					Ok((Some(settlement), StepOutcome::Redeemed(step)))
 				},
 				StepAction::Recovery => {
 					Self::recovery_decision(stable_id, redeemer, snap, price, budget, config)
@@ -730,33 +731,31 @@ pub mod pallet {
 					debt == split.market_cancel_debt && !split.effective_cover.is_zero(),
 				),
 			};
-			Self::burn_redeemer_pusd(stable_id, redeemer, debt, debt, preservation)?;
+			let debt_payment =
+				Self::fund_redemption(stable_id, redeemer, debt, debt, preservation)?;
 			let step = RecoveryStep {
 				burned: debt,
 				collateral_out: pricing.collateral_out(),
 				debt_settled: debt,
 				regime,
 			};
-			let allocation = RedemptionAllocation {
-				debt_to_cancel: debt,
+			let settlement = RedemptionSettlement {
+				debt_payment,
 				collateral_to_recipient: pricing.collateral_out(),
 			};
-			Ok((Some(allocation), StepOutcome::Recovery { step, settle_residual }))
+			Ok((Some(settlement), StepOutcome::Recovery { step, settle_residual }))
 		}
 
-		/// Withdraw `total_in` pUSD from the redeemer with the preservation
-		/// sized by [`Self::fundable_budget`], burn the `debt` portion (dropping
-		/// the credit is the debt-cancelling burn), and route the rest as the
-		/// fee — so issuance only falls by cancelled debt. The vault-side debt
-		/// cancel happens in the surrounding `redeem_step`, atomically with
-		/// this burn.
-		fn burn_redeemer_pusd(
+		/// Withdraw `total_in` pUSD from the redeemer with the preservation sized
+		/// by [`Self::fundable_budget`], return the debt payment to the vault step,
+		/// and route the rest as the fee.
+		fn fund_redemption(
 			stable_id: &T::StableAssetId,
 			redeemer: &T::AccountId,
 			debt: BalanceOf<T>,
 			total_in: BalanceOf<T>,
 			preservation: Preservation,
-		) -> DispatchResult {
+		) -> Result<StableCreditOf<T>, DispatchError> {
 			debug_assert!(debt <= total_in);
 			let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
 				stable_id.clone(),
@@ -768,9 +767,8 @@ pub mod pallet {
 			)?;
 			debug_assert_eq!(credit.peek(), total_in);
 			let (debt_credit, fee_credit) = credit.split(debt);
-			drop(debt_credit);
 			T::FeeHandler::on_unbalanced(fee_credit);
-			Ok(())
+			Ok(debt_credit)
 		}
 
 		/// The shortfall cover the fund can pay without dusting itself. Cover
@@ -1173,10 +1171,12 @@ pub mod pallet {
 			let budget = payment.peek();
 
 			with_transaction(|| {
-				// The pricing closure only decides; the credit stays out here.
-				// `NoTarget` unless the closure refuses with something more
-				// specific — an echoed allocation means the step applied.
+				let mut payment = payment;
+				// `NoTarget` unless the closure refuses with something more specific.
+				// A successful settlement records its collateral result here while the
+				// remaining payment credit becomes the caller's change.
 				let mut refusal = RecoveryOffsetResult::NoTarget;
+				let mut applied_collateral = None;
 				let step = T::Vaults::redeem_step(
 					collateral_id,
 					stable_id,
@@ -1192,8 +1192,11 @@ pub mod pallet {
 								Ok(None)
 							},
 							OffsetDecision::Cancellable { debt, collateral_out } => {
-								Ok(Some(RedemptionAllocation {
-									debt_to_cancel: debt,
+								let debt_payment = payment.extract(debt);
+								debug_assert_eq!(debt_payment.peek(), debt);
+								applied_collateral = Some(collateral_out);
+								Ok(Some(RedemptionSettlement {
+									debt_payment,
 									collateral_to_recipient: collateral_out,
 								}))
 							},
@@ -1202,25 +1205,13 @@ pub mod pallet {
 				);
 				match step {
 					Err(error) => TransactionOutcome::Rollback(Err(error)),
-					// The step applied and echoed its allocation: dropping the
-					// consumed slice is the debt-cancelling burn — fee-free
-					// settlement, the same as a recovery redemption with a
-					// zero fee portion. Infallible, so it needs no place
-					// inside the vault step; the surrounding transaction is
-					// the atomicity boundary. A drained head flips to Dormant
-					// inside the vault step itself.
-					Ok(Some(allocation)) => {
-						debug_assert!(allocation.debt_to_cancel <= payment.peek());
-						let (burn, change) = payment.split(allocation.debt_to_cancel);
-						drop(burn);
-						TransactionOutcome::Commit(Ok((
-							RecoveryOffsetResult::Applied {
-								collateral_out: allocation.collateral_to_recipient,
-							},
-							change,
-						)))
+					Ok(()) => match applied_collateral {
+						Some(collateral_out) => TransactionOutcome::Commit(Ok((
+							RecoveryOffsetResult::Applied { collateral_out },
+							payment,
+						))),
+						None => TransactionOutcome::Rollback(Ok((refusal, payment))),
 					},
-					Ok(None) => TransactionOutcome::Rollback(Ok((refusal, payment))),
 				}
 			})
 		}
