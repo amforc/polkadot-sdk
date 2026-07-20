@@ -113,7 +113,7 @@ pub mod pallet {
 			StableId = Self::StableAssetId,
 			AccountId = Self::AccountId,
 			Balance = BalanceOf<Self>,
-			Credit = StableCreditOf<Self>,
+			StableCredit = StableCreditOf<Self>,
 		>;
 
 		/// Maps each stablecoin to the account holding its insurance cover.
