@@ -556,3 +556,89 @@ mod impl_hold_mutate {
 		});
 	}
 }
+
+mod impl_balanced_hold {
+	use super::*;
+	use frame_support::traits::tokens::fungibles::{Balanced, BalancedHold};
+
+	const OTHER: AccountId = 2;
+
+	fn new_test_ext() -> sp_io::TestExternalities {
+		super::new_test_ext(|| {
+			assert_ok!(AssetsHolder::hold(ASSET_ID, &DummyHoldReason::Governance, &WHO, 30));
+			assert_ok!(AssetsHolder::hold(ASSET_ID, &DummyHoldReason::Staking, &WHO, 20));
+		})
+	}
+
+	#[test]
+	fn slash_works() {
+		new_test_ext().execute_with(|| {
+			// Slashing part of the amount on hold captures exactly that amount into a credit.
+			let (credit, shortfall) =
+				AssetsHolder::slash(ASSET_ID, &DummyHoldReason::Governance, &WHO, 10);
+			assert_eq!(credit.peek(), 10);
+			assert_eq!(shortfall, 0);
+			// The slashed amount leaves the hold and WHO's total balance, while the balance not
+			// on hold and the `Staking` hold are untouched.
+			assert_eq!(
+				<AssetsHolder as InspectHold<_>>::balance_on_hold(
+					ASSET_ID,
+					&DummyHoldReason::Governance,
+					&WHO
+				),
+				20
+			);
+			assert_eq!(AssetsHolder::total_balance_on_hold(ASSET_ID, &WHO), 40);
+			assert_eq!(Assets::balance(ASSET_ID, WHO), 50);
+			assert_eq!(Assets::total_balance(ASSET_ID, &WHO), 90);
+			// Issuance is unchanged while the credit is outstanding.
+			assert_eq!(Assets::total_issuance(ASSET_ID), 100);
+			assert_ok!(AssetsHolder::do_try_state());
+			// Resolving the credit moves the slashed funds to OTHER; issuance is preserved.
+			assert_ok!(AssetsHolder::resolve(&OTHER, credit).map_err(|_| "unresolved credit"));
+			assert_eq!(Assets::balance(ASSET_ID, OTHER), 10);
+			assert_eq!(Assets::total_balance(ASSET_ID, &WHO), 90);
+			assert_eq!(Assets::total_issuance(ASSET_ID), 100);
+			System::assert_has_event(
+				pallet_assets::Event::<Test>::Deposited {
+					asset_id: ASSET_ID,
+					who: OTHER,
+					amount: 10,
+				}
+				.into(),
+			);
+		});
+	}
+
+	#[test]
+	fn slash_beyond_hold_returns_shortfall() {
+		new_test_ext().execute_with(|| {
+			let (credit, shortfall) =
+				AssetsHolder::slash(ASSET_ID, &DummyHoldReason::Governance, &WHO, 31);
+			assert_eq!(credit.peek(), 30);
+			assert_eq!(shortfall, 1);
+			// The whole `Governance` hold is consumed; the balance not on hold and the `Staking`
+			// hold are not touched to cover the shortfall.
+			assert_eq!(
+				<AssetsHolder as InspectHold<_>>::balance_on_hold(
+					ASSET_ID,
+					&DummyHoldReason::Governance,
+					&WHO
+				),
+				0
+			);
+			assert_eq!(AssetsHolder::total_balance_on_hold(ASSET_ID, &WHO), 20);
+			assert_eq!(Assets::balance(ASSET_ID, WHO), 50);
+			assert_eq!(Assets::total_balance(ASSET_ID, &WHO), 70);
+			assert_eq!(Assets::total_issuance(ASSET_ID), 100);
+			assert_ok!(AssetsHolder::do_try_state());
+			// Dropping the slash-generated credit burns exactly the amount consumed from the hold.
+			drop(credit);
+			assert_eq!(Assets::total_issuance(ASSET_ID), 70);
+			System::assert_has_event(
+				pallet_assets::Event::<Test>::BurnedCredit { asset_id: ASSET_ID, amount: 30 }
+					.into(),
+			);
+		});
+	}
+}

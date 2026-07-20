@@ -18,7 +18,10 @@
 use super::*;
 
 use frame_support::traits::{
-	fungibles::{Dust, Inspect, InspectHold, MutateHold, Unbalanced, UnbalancedHold},
+	fungibles::{
+		hold::DoneSlash, Balanced, BalancedHold, Dust, Inspect, InspectHold, MutateHold,
+		Unbalanced, UnbalancedHold,
+	},
 	tokens::{
 		DepositConsequence, Fortitude, Precision, Preservation, Provenance, WithdrawConsequence,
 	},
@@ -179,6 +182,36 @@ impl<T: Config<I>, I: 'static> Unbalanced<T::AccountId> for Pallet<T, I> {
 		pallet_assets::Pallet::<T, I>::increase_balance(asset, who, amount, precision)
 	}
 }
+
+impl<T: Config<I>, I: 'static> Balanced<T::AccountId> for Pallet<T, I> {
+	type OnDropDebt = <pallet_assets::Pallet<T, I> as Balanced<T::AccountId>>::OnDropDebt;
+	type OnDropCredit = <pallet_assets::Pallet<T, I> as Balanced<T::AccountId>>::OnDropCredit;
+
+	fn done_rescind(asset_id: Self::AssetId, amount: Self::Balance) {
+		pallet_assets::Pallet::<T, I>::done_rescind(asset_id, amount)
+	}
+
+	fn done_issue(asset_id: Self::AssetId, amount: Self::Balance) {
+		pallet_assets::Pallet::<T, I>::done_issue(asset_id, amount)
+	}
+
+	fn done_deposit(asset_id: Self::AssetId, who: &T::AccountId, amount: Self::Balance) {
+		pallet_assets::Pallet::<T, I>::done_deposit(asset_id, who, amount)
+	}
+
+	fn done_withdraw(asset_id: Self::AssetId, who: &T::AccountId, amount: Self::Balance) {
+		pallet_assets::Pallet::<T, I>::done_withdraw(asset_id, who, amount)
+	}
+}
+
+impl<T: Config<I>, I: 'static, AssetId>
+	DoneSlash<AssetId, T::RuntimeHoldReason, T::AccountId, T::Balance> for Pallet<T, I>
+{
+}
+
+// Provides `slash` for funds on hold, using the default implementation, which is backed by
+// [`UnbalancedHold`].
+impl<T: Config<I>, I: 'static> BalancedHold<T::AccountId> for Pallet<T, I> {}
 
 impl<T: Config<I>, I: 'static> UnbalancedHold<T::AccountId> for Pallet<T, I> {
 	fn set_balance_on_hold(
