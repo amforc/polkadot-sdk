@@ -237,10 +237,11 @@ pub mod pallet {
 		#[pallet::constant]
 		type MaxBranches: Get<u32>;
 
-		/// Maximum vaults the `on_idle` cursor refreshes per block; the cap on
-		/// the idle walk's touch budget.
+		/// Maximum weight the `on_idle` refresh walk may consume out of a
+		/// block's leftover weight. `None` skips the walk entirely; vaults
+		/// then refresh only when an extrinsic touches them.
 		#[pallet::constant]
-		type MaxOnIdleVaultRefresh: Get<u32>;
+		type IdleMaxRefreshWeight: Get<Option<Weight>>;
 
 		/// Weight metadata.
 		type WeightInfo: weights::WeightInfo;
