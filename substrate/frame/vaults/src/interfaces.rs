@@ -2,18 +2,28 @@
 
 use crate::{
 	context::{OpContext, TcrGate, VaultOp},
-	pallet::{BalanceOf, Branches, Config, Error, Event, HoldReason, Pallet, StableCreditOf},
+	pallet::{
+		BalanceOf, Branches, CollateralCreditOf, Config, Error, Event, HoldReason, Pallet,
+		StableCreditOf,
+	},
 	recovery,
 	types::VaultStatus,
 };
 use frame::{
 	deps::frame_support::transactional,
 	prelude::*,
-	traits::{fungibles::MutateHold as FungiblesMutateHold, tokens::Restriction, Time},
+	traits::{
+		fungibles::{
+			Balanced as FungiblesBalanced, BalancedHold as FungiblesBalancedHold,
+			MutateHold as FungiblesMutateHold,
+		},
+		tokens::Restriction,
+		Time,
+	},
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
-	BranchMode, BranchModeProvider, LiquidationAllocation, LiquidationSnapshot,
+	BranchMode, BranchModeProvider, LiquidationSettlement, LiquidationSnapshot,
 	RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
 
@@ -31,17 +41,19 @@ impl<T: Config> VaultInterface for Pallet<T> {
 	type StableId = T::StableAssetId;
 	type AccountId = T::AccountId;
 	type Balance = BalanceOf<T>;
-	type Credit = StableCreditOf<T>;
+	type StableCredit = StableCreditOf<T>;
+	type CollateralCredit = CollateralCreditOf<T>;
 
 	#[transactional]
 	fn execute_liquidation(
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		owner: &T::AccountId,
-		build_allocation: impl FnOnce(
+		build_settlement: impl FnOnce(
 			LiquidationSnapshot<BalanceOf<T>>,
+			CollateralCreditOf<T>,
 		) -> Result<
-			LiquidationAllocation<T::AccountId, BalanceOf<T>>,
+			LiquidationSettlement<CollateralCreditOf<T>, BalanceOf<T>>,
 			DispatchError,
 		>,
 	) -> DispatchResult {
@@ -64,34 +76,43 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			Error::<T>::LastVaultCannotBeLiquidated
 		);
 
-		let allocation =
-			build_allocation(LiquidationSnapshot { debt: post_touch_debt, collateral: held })?;
-		ensure!(
-			allocation.offset.debt <= post_touch_debt,
-			Error::<T>::InvalidLiquidationAllocation
+		// Turn the exact vault hold into the one collateral budget external
+		// liquidation paths partition.
+		let (collateral, shortfall) = T::CollateralAssets::slash(
+			op.ctx.collateral_id.clone(),
+			&HoldReason::VaultCollateral.into(),
+			owner,
+			held,
 		);
-		let total_paid_out = allocation
-			.offset
-			.collateral
-			.saturating_add(allocation.redistribution_collateral)
-			.saturating_add(allocation.keeper.collateral);
-		ensure!(total_paid_out <= held, Error::<T>::InvalidLiquidationAllocation);
+		ensure!(shortfall.is_zero(), Error::<T>::InvalidLiquidationSettlement);
+		let settlement =
+			build_settlement(LiquidationSnapshot { debt: post_touch_debt }, collateral)?;
+		let LiquidationSettlement { debt_offset, redistribution_collateral, owner_surplus } =
+			settlement;
+		ensure!(debt_offset <= post_touch_debt, Error::<T>::InvalidLiquidationSettlement);
+		ensure!(
+			owner_surplus.asset() == *collateral_id &&
+				redistribution_collateral.asset() == *collateral_id,
+			Error::<T>::InvalidLiquidationSettlement
+		);
+		let owner_surplus_amount = owner_surplus.peek();
+		let redistribution_amount = redistribution_collateral.peek();
+		let returned = owner_surplus_amount
+			.checked_add(&redistribution_amount)
+			.ok_or(ArithmeticError::Overflow)?;
+		ensure!(returned <= held, Error::<T>::InvalidLiquidationSettlement);
 
-		let redistributed_debt = post_touch_debt.saturating_sub(allocation.offset.debt);
+		let redistributed_debt = post_touch_debt.saturating_sub(debt_offset);
 		op.ctx.branch.state.detach_vault(&op.vault);
 		op.ctx.branch.state.release_dormant_target(owner);
 		// Redistributed collateral stays branch-owned until recipient touch.
-		let non_redistribution_out = held.saturating_sub(allocation.redistribution_collateral);
+		let non_redistribution_out = held.saturating_sub(redistribution_amount);
 		op.ctx.branch.state.remove_collateral(non_redistribution_out);
-		if !redistributed_debt.is_zero() || !allocation.redistribution_collateral.is_zero() {
+		if !redistributed_debt.is_zero() || !redistribution_amount.is_zero() {
 			op.ctx
 				.branch
 				.state
-				.record_redistribution(
-					redistributed_debt,
-					allocation.redistribution_collateral,
-					op.ctx.now,
-				)
+				.record_redistribution(redistributed_debt, redistribution_amount, op.ctx.now)
 				.ok_or(Error::<T>::RedistributionWouldOverflow)?;
 		}
 
@@ -100,56 +121,26 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			Err(_) => return Err(Error::<T>::RateIndexInvariantBroken.into()),
 		}
 
-		if !allocation.redistribution_collateral.is_zero() {
-			T::CollateralAssets::transfer_on_hold(
+		if !redistribution_amount.is_zero() {
+			let redistribution_account =
+				Pallet::<T>::redistribution_account(&op.ctx.collateral_id, &op.ctx.stable_id);
+			resolve_collateral_credit::<T>(&redistribution_account, redistribution_collateral)?;
+			T::CollateralAssets::hold(
 				op.ctx.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
-				owner,
-				&Pallet::<T>::redistribution_account(&op.ctx.collateral_id, &op.ctx.stable_id),
-				allocation.redistribution_collateral,
-				Precision::Exact,
-				Restriction::OnHold,
-				Fortitude::Polite,
+				&redistribution_account,
+				redistribution_amount,
 			)?;
+		} else {
+			drop(redistribution_collateral);
 		}
 
-		if !allocation.offset.collateral.is_zero() {
-			T::CollateralAssets::transfer_on_hold(
-				op.ctx.collateral_id.clone(),
-				&HoldReason::VaultCollateral.into(),
-				owner,
-				&allocation.offset.collateral_recipient,
-				allocation.offset.collateral,
-				Precision::Exact,
-				Restriction::Free,
-				Fortitude::Polite,
-			)?;
-		}
-
-		if !allocation.keeper.collateral.is_zero() {
-			T::CollateralAssets::transfer_on_hold(
-				op.ctx.collateral_id.clone(),
-				&HoldReason::VaultCollateral.into(),
-				owner,
-				&allocation.keeper.recipient,
-				allocation.keeper.collateral,
-				Precision::Exact,
-				Restriction::Free,
-				Fortitude::Polite,
-			)?;
-		}
-
-		// Release only this market's residual. The owner's hold may also back
-		// other markets' collateral on the same asset, which must stay locked.
-		let leftover = held.saturating_sub(total_paid_out);
-		if !leftover.is_zero() {
-			T::CollateralAssets::release(
-				op.ctx.collateral_id.clone(),
-				&HoldReason::VaultCollateral.into(),
-				owner,
-				leftover,
-				Precision::Exact,
-			)?;
+		// Whatever external offsets, JIT, and the keeper did not consume is the
+		// liquidated owner's surplus.
+		if !owner_surplus_amount.is_zero() {
+			resolve_collateral_credit::<T>(owner, owner_surplus)?;
+		} else {
+			drop(owner_surplus);
 		}
 
 		// Liquidation eligibility is MCR-gated above; the mode rules do not apply.
@@ -391,6 +382,18 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		});
 		Ok(surplus)
 	}
+}
+
+fn resolve_collateral_credit<T: Config>(
+	recipient: &T::AccountId,
+	credit: CollateralCreditOf<T>,
+) -> DispatchResult {
+	T::CollateralAssets::resolve(recipient, credit).map_err(|credit| {
+		// The surrounding liquidation transaction restores both the original
+		// hold and issuance after this credit is dropped.
+		drop(credit);
+		TokenError::CannotCreate.into()
+	})
 }
 
 /// Update rate/FIFO membership after redemption.

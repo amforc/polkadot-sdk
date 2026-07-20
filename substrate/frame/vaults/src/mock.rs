@@ -11,7 +11,7 @@
 
 use crate as pallet_vaults;
 pub use crate::{
-	pallet::{BalanceOf, StableCreditOf},
+	pallet::{BalanceOf, CollateralCreditOf, StableCreditOf},
 	types::BranchAdmins,
 	BranchConfig, BranchMode, Error, Event, HoldReason, Pallet,
 };
@@ -34,10 +34,7 @@ use frame::{
 	},
 };
 pub use pallet_linked_list::Position;
-use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, RedemptionSettlement,
-	VaultInterface,
-};
+use pusd_primitives::{LiquidationSettlement, RedemptionSettlement, VaultInterface};
 
 pub type AccountId = u64;
 pub type Balance = u128;
@@ -46,6 +43,26 @@ pub type AssetIdForAssets = u32;
 pub type AssetId = NativeOrWithId<AssetIdForAssets>;
 /// Stablecoin asset id: a plain `pallet-assets` id.
 pub type StableId = AssetIdForAssets;
+
+/// Balance-shaped liquidation plan used only by the Vaults test harness. The
+/// production boundary converts the vault hold to one collateral credit and
+/// returns the redistribution and owner-surplus credits to Vaults.
+pub struct OffsetAllocation<AccountId, Balance> {
+	pub collateral_recipient: AccountId,
+	pub debt: Balance,
+	pub collateral: Balance,
+}
+
+pub struct KeeperCompensation<AccountId, Balance> {
+	pub recipient: AccountId,
+	pub collateral: Balance,
+}
+
+pub struct LiquidationAllocation<AccountId, Balance> {
+	pub offset: OffsetAllocation<AccountId, Balance>,
+	pub redistribution_collateral: Balance,
+	pub keeper: KeeperCompensation<AccountId, Balance>,
+}
 pub type Block = MockBlock<Test>;
 pub type VaultList = pallet_vaults::VaultListId<AssetId, StableId>;
 pub type Moment = u64;
@@ -621,7 +638,54 @@ pub fn liquidate_with(
 		&collateral,
 		&stable,
 		&owner,
-		|snapshot| Ok(build(snapshot.debt)),
+		|snapshot, mut collateral_credit| {
+			let allocation = build(snapshot.debt);
+			let total = allocation
+				.offset
+				.collateral
+				.saturating_add(allocation.redistribution_collateral)
+				.saturating_add(allocation.keeper.collateral);
+			ensure!(
+				total <= collateral_credit.peek(),
+				crate::Error::<Test>::InvalidLiquidationSettlement
+			);
+
+			resolve_test_collateral(
+				&mut collateral_credit,
+				allocation.offset.collateral,
+				&allocation.offset.collateral_recipient,
+			)?;
+			resolve_test_collateral(
+				&mut collateral_credit,
+				allocation.keeper.collateral,
+				&allocation.keeper.recipient,
+			)?;
+			let redistribution_collateral =
+				collateral_credit.extract(allocation.redistribution_collateral);
+			Ok(LiquidationSettlement {
+				debt_offset: allocation.offset.debt,
+				redistribution_collateral,
+				owner_surplus: collateral_credit,
+			})
+		},
+	)
+}
+
+fn resolve_test_collateral(
+	collateral: &mut CollateralCreditOf<Test>,
+	amount: Balance,
+	recipient: &AccountId,
+) -> DispatchResult {
+	if amount.is_zero() {
+		return Ok(());
+	}
+	let credit = collateral.extract(amount);
+	debug_assert_eq!(credit.peek(), amount);
+	<VaultCollateralAssets as FungiblesBalanced<AccountId>>::resolve(recipient, credit).map_err(
+		|credit| {
+			drop(credit);
+			TokenError::CannotCreate.into()
+		},
 	)
 }
 
