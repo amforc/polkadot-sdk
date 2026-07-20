@@ -107,6 +107,8 @@ pub mod pallet {
 
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
+	pub type CollateralCreditOf<T> =
+		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::CollateralAssets>;
 
 	/// The [`Branches`] record, instantiated for the runtime.
 	pub type BranchOf<T> = crate::types::Branch<
@@ -147,11 +149,11 @@ pub mod pallet {
 		/// [`FixedPointOperand`] so the pallet's `FixedU128`-based math can
 		/// operate on it directly without round-tripping through `u128`.
 		type CollateralAssets: FungiblesMutateHold<
-			Self::AccountId,
-			AssetId = Self::CollateralAssetId,
-			Balance: FixedPointOperand,
-			Reason = Self::RuntimeHoldReason,
-		>;
+				Self::AccountId,
+				AssetId = Self::CollateralAssetId,
+				Balance: FixedPointOperand,
+				Reason = Self::RuntimeHoldReason,
+			> + fungibles::BalancedHold<Self::AccountId>;
 
 		/// Multi-asset stable issuance, so one instance can mint several coins.
 		/// Shares its `Balance` type with the collateral surface.
@@ -515,9 +517,9 @@ pub mod pallet {
 		/// An `Emergency`-tier admin tried a parameter change in the
 		/// non-defensive (risk-increasing) direction.
 		DefensiveActionNotDefensive,
-		/// The liquidation allocation pays out more collateral than held or
+		/// The liquidation settlement returns invalid collateral credits or
 		/// offsets more debt than outstanding.
-		InvalidLiquidationAllocation,
+		InvalidLiquidationSettlement,
 		/// The redemption settlement pays zero or in the wrong coin, cancels
 		/// more debt than outstanding, or takes more collateral than held.
 		InvalidRedemptionSettlement,

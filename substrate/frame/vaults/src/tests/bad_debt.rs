@@ -1,9 +1,7 @@
 //! Bad-debt healing through `VaultInterface::heal`.
 
 use crate::{mock::*, tests::rate_pct};
-use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, VaultInterface,
-};
+use pusd_primitives::VaultInterface;
 
 /// Seed recorded bad debt directly: recording only ever happens inside the
 /// vault pallet (recovery settlement / orphan-debt sweeps).

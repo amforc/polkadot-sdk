@@ -10,9 +10,7 @@ use crate::{mock::*, tests::rate_pct};
 use frame::{
 	arithmetic::Permill, prelude::TokenError, traits::fungibles::Mutate as FungiblesMutate,
 };
-use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, MILLIS_PER_YEAR,
-};
+use pusd_primitives::MILLIS_PER_YEAR;
 
 fn vault(owner: AccountId) -> crate::types::Vault<Balance> {
 	crate::pallet::Vaults::<Test>::get((XBT, USDX, owner)).expect("vault")
@@ -184,7 +182,7 @@ fn sub_ed_fee_residual_is_dropped_without_prefund() {
 
 // A keeper leg below the collateral's ED to a fresh keeper reverts the whole
 // transactional liquidation — the orchestrator must size non-zero legs to at
-// least the collateral's minimum balance (see `LiquidationAllocation` docs).
+// least the collateral asset's minimum balance.
 #[test]
 fn liquidation_reverts_on_sub_ed_keeper_leg() {
 	build_and_execute(|| {

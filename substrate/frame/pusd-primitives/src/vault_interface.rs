@@ -35,56 +35,31 @@ pub struct RedemptionStepSnapshot<Balance> {
 	pub redistribution_penalty: Permill,
 }
 
-/// Debt cancelled by external pUSD (Stability Pool + JIT combined) and the
-/// matching vault-held collateral paid to the external offset path.
-///
-/// `collateral_recipient` is the account that receives `collateral` from the
-/// vault pallet during [`VaultInterface::execute_liquidation`]. For Stability
-/// Pool offsets this must correspond to collateral already consumed through
-/// `StabilityPoolOffsetApi` as a real `CollateralCredit`; for JIT it is the
-/// JIT settlement recipient.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct OffsetAllocation<AccountId, Balance> {
-	pub collateral_recipient: AccountId,
-	pub debt: Balance,
-	pub collateral: Balance,
+/// Result of the external liquidation work consumed by
+/// [`VaultInterface::execute_liquidation`]. External offset paths burn their
+/// stablecoin internally, so `debt_offset` remains a balance. Both collateral
+/// remainders return as credits because Vaults owns their final destinations:
+/// its redistribution account and the liquidated owner.
+#[must_use = "the settlement must be returned to VaultInterface::execute_liquidation"]
+pub struct LiquidationSettlement<CollateralCredit, Balance> {
+	pub debt_offset: Balance,
+	pub redistribution_collateral: CollateralCredit,
+	pub owner_surplus: CollateralCredit,
 }
 
-/// Compensation paid to the liquidation keeper.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct KeeperCompensation<AccountId, Balance> {
-	pub recipient: AccountId,
-	pub collateral: Balance,
-}
-
-/// Allocation produced by the liquidation orchestrator and applied by
-/// [`VaultInterface::execute_liquidation`].
-///
-/// Redistributed debt is derived inside `execute_liquidation` as
-/// `snapshot.debt - offset.debt`, so the orchestrator only needs to specify
-/// the collateral split.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct LiquidationAllocation<AccountId, Balance> {
-	pub offset: OffsetAllocation<AccountId, Balance>,
-	pub redistribution_collateral: Balance,
-	pub keeper: KeeperCompensation<AccountId, Balance>,
-}
-
-/// Fully-accrued vault figures handed to the allocation builder. These are the
-/// post-touch numbers the orchestrator must size its allocation against.
+/// Fully-accrued vault figures handed to the settlement builder. These are the
+/// post-touch numbers the orchestrator must size its settlement against.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LiquidationSnapshot<Balance> {
 	/// Post-touch total debt to settle.
 	pub debt: Balance,
-	/// Collateral currently held against the vault.
-	pub collateral: Balance,
 }
 
 /// Everything an orchestrator drives on the vault pallet. Reads are
 /// authoritative current state; writes re-shape the priority queue.
 ///
 /// The builder closures make each step atomic: the orchestrator sizes its
-/// settlement or allocation against a post-touch snapshot inside the same
+/// settlement against a post-touch snapshot inside the same
 /// call that applies it, and returning `Err` (or producing an invalid one)
 /// rolls the whole step back, so a rejected step never leaves partial state.
 ///
@@ -97,7 +72,8 @@ pub trait VaultInterface {
 	type StableId;
 	type AccountId;
 	type Balance;
-	type Credit;
+	type StableCredit;
+	type CollateralCredit;
 
 	/// The highest-priority redemption target and its lifecycle status:
 	/// `FinalRecovery` FIFO head first, then the dormant redemption target,
@@ -124,7 +100,7 @@ pub trait VaultInterface {
 		build_settlement: impl FnOnce(
 			RedemptionStepSnapshot<Self::Balance>,
 		) -> Result<
-			Option<RedemptionSettlement<Self::Credit, Self::Balance>>,
+			Option<RedemptionSettlement<Self::StableCredit, Self::Balance>>,
 			DispatchError,
 		>,
 	) -> DispatchResult;
@@ -143,16 +119,20 @@ pub trait VaultInterface {
 	fn branch_debt(collateral_id: &Self::CollateralId, stable_id: &Self::StableId)
 		-> Self::Balance;
 
-	/// Liquidate `owner`'s below-MCR vault with the collateral/debt split the
-	/// orchestrator computes from the post-touch snapshot.
+	/// Liquidate `owner`'s below-MCR vault. Vaults turns the fully-accrued
+	/// collateral hold into one credit and transfers ownership to the
+	/// orchestrator. After consuming external offsets and keeper compensation,
+	/// the orchestrator returns the redistribution and owner-surplus credits in
+	/// the settlement. Vaults owns both final destinations.
 	fn execute_liquidation(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,
 		owner: &Self::AccountId,
-		build_allocation: impl FnOnce(
+		build_settlement: impl FnOnce(
 			LiquidationSnapshot<Self::Balance>,
+			Self::CollateralCredit,
 		) -> Result<
-			LiquidationAllocation<Self::AccountId, Self::Balance>,
+			LiquidationSettlement<Self::CollateralCredit, Self::Balance>,
 			DispatchError,
 		>,
 	) -> DispatchResult;
@@ -164,6 +144,6 @@ pub trait VaultInterface {
 	fn heal(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,
-		credit: Self::Credit,
-	) -> Result<Self::Credit, DispatchError>;
+		credit: Self::StableCredit,
+	) -> Result<Self::StableCredit, DispatchError>;
 }

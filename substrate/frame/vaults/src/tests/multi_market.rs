@@ -7,9 +7,7 @@
 
 use crate::{mock::*, pallet::Vaults, tests::rate_pct};
 use frame::traits::fungibles::{Balanced, Mutate};
-use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, VaultInterface,
-};
+use pusd_primitives::VaultInterface;
 
 const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
 
