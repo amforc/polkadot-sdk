@@ -66,12 +66,12 @@ impl WeightInfo for () {
 		Weight::zero()
 	}
 	fn refresh_branch() -> Weight {
-		Weight::zero()
+		Weight::from_parts(3, 3)
 	}
 	fn clear_governance_frozen_mode() -> Weight {
 		Weight::zero()
 	}
 	fn on_idle_one_vault() -> Weight {
-		Weight::zero()
+		Weight::from_parts(10, 10)
 	}
 }

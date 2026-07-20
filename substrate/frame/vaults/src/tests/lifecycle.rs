@@ -403,26 +403,48 @@ fn frozen_poke_pins_interest_time_without_minting() {
 	});
 }
 
-// The flat idle walk: a first pass exhausts its budget mid-map and parks the
-// cursor; the second pass finishes the map, wraps by clearing the cursor, and
-// every vault has been refreshed exactly once across the two passes.
+// The flat idle walk: a first pass drains its weight meter mid-map and parks
+// the cursor; a starved pass leaves the cursor alone; the final pass finishes
+// the map, wraps by clearing the cursor, and every vault has been refreshed
+// exactly once across the two full passes.
 #[test]
 fn on_idle_walk_budgets_touches_and_wraps_the_cursor() {
+	use crate::weights::WeightInfo;
+
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		// One more vault than `MaxOnIdleVaultRefresh` (4 in the mock).
 		for owner in 1..=5u64 {
 			assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		}
 		advance_time(365 * 24 * 3_600 * 1_000);
 
-		// Placeholder weights are zero, so only the count cap binds.
-		let _ = crate::Pallet::<Test>::on_idle_walk(frame::prelude::Weight::MAX);
+		// One branch refresh plus four of the five vaults; the fifth vault
+		// does not fit the meter.
+		let per_branch = <Test as crate::Config>::WeightInfo::refresh_branch();
+		let per_vault = <Test as crate::Config>::WeightInfo::on_idle_one_vault();
+		let budget = per_branch.saturating_add(per_vault.saturating_mul(4));
+		let spent = crate::Pallet::<Test>::on_idle_walk(budget);
+		assert_eq!(spent, budget, "first pass consumes the whole meter");
 		assert!(
 			crate::pallet::IdleCursor::<Test>::get().is_some(),
-			"budget exhausted mid-map parks the cursor"
+			"meter drained mid-map parks the cursor"
 		);
-		let _ = crate::Pallet::<Test>::on_idle_walk(frame::prelude::Weight::MAX);
+
+		// A budget covering the branch pass but not one vault refreshes the
+		// branch and leaves the parked cursor untouched.
+		let spent = crate::Pallet::<Test>::on_idle_walk(per_branch);
+		assert_eq!(spent, per_branch, "starved pass still reconciles the branch");
+		assert!(
+			crate::pallet::IdleCursor::<Test>::get().is_some(),
+			"starved pass leaves the parked cursor untouched"
+		);
+
+		let spent = crate::Pallet::<Test>::on_idle_walk(budget);
+		assert_eq!(
+			spent,
+			per_branch.saturating_add(per_vault),
+			"final pass: one branch, the one remaining vault"
+		);
 		assert!(
 			crate::pallet::IdleCursor::<Test>::get().is_none(),
 			"draining the map wraps by clearing the cursor"
