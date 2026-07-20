@@ -13,7 +13,6 @@ use crate::{
 	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
-use pusd_primitives::{KeeperCompensation, LiquidationAllocation, OffsetAllocation};
 
 const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
 
@@ -287,8 +286,8 @@ fn final_recovery_exit_requires_explicit_hint() {
 	});
 }
 
-// `OffsetAllocation` carries a `collateral_recipient` AccountId, and
-// `execute_liquidation` moves `offset.collateral` to that recipient.
+// The mock orchestrator resolves the offset credit to its recipient before it
+// returns the redistribution and owner-surplus credits to Vaults.
 #[test]
 fn execute_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 	build_and_execute(|| {
