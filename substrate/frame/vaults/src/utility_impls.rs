@@ -13,7 +13,7 @@ use crate::{
 	weights::WeightInfo,
 };
 use frame::{
-	deps::frame_support::storage::with_storage_layer,
+	deps::frame_support::{storage::with_storage_layer, weights::WeightMeter},
 	prelude::*,
 	traits::{fungibles::Balanced as FungiblesBalanced, OriginTrait, Time},
 };
@@ -623,31 +623,42 @@ impl<T: Config> Pallet<T> {
 		Some((branch.config, branch.state, vault))
 	}
 
-	/// Refresh vaults with the block's leftover weight: reconcile the
-	/// branches' oracle-frozen state, then resume the flat [`IdleCursor`]
-	/// walk over the [`Vaults`] map,
-	/// touching up to the budget. Map order visits every row eventually —
-	/// dormant husks and mid-FIFO `FinalRecovery` vaults included, which the
-	/// old per-branch rate-index cursor never reached.
+	/// Refresh vaults with the block's leftover weight, clamped to
+	/// [`Config::IdleMaxRefreshWeight`]: reconcile the branches'
+	/// oracle-frozen state, then resume the flat [`IdleCursor`] walk over the
+	/// [`Vaults`] map until the meter drains. Map order visits every row
+	/// eventually — dormant husks and mid-FIFO `FinalRecovery` vaults
+	/// included, which the old per-branch rate-index cursor never reached.
 	pub(crate) fn on_idle_walk(remaining: Weight) -> Weight {
-		let per_call = T::WeightInfo::on_idle_one_vault();
-		// `checked_div_per_component` is `None` only when every `per_call`
-		// component is zero — weight then does not constrain the walk (the
-		// placeholder `()` weights do exactly this) and only the count cap binds.
-		let by_weight = remaining.checked_div_per_component(&per_call).unwrap_or(u64::MAX);
-		let budget = u64::from(T::MaxOnIdleVaultRefresh::get()).min(by_weight);
-		if budget == 0 {
-			return Weight::zero();
-		}
+		let Some(limit) = T::IdleMaxRefreshWeight::get() else { return Weight::zero() };
+		let mut meter = WeightMeter::with_limit(remaining.min(limit));
 
-		// Bounded by `MaxBranches` and, under real weights, by the same
-		// remaining-weight quotient as the vault walk. Like the old per-branch
-		// walk, the reconciliation itself is not charged to the returned weight.
-		let refresh_bound = usize::try_from(by_weight).unwrap_or(usize::MAX);
-		for (collateral_id, stable_id) in Branches::<T>::iter_keys().take(refresh_bound) {
+		// Bounded by `MaxBranches`: branch registration caps the map's size.
+		let per_branch = T::WeightInfo::refresh_branch();
+		for (collateral_id, stable_id) in Branches::<T>::iter_keys() {
+			if !meter.can_consume(per_branch) {
+				return meter.consumed();
+			}
+			meter.consume(per_branch);
 			let _ = with_storage_layer::<(), DispatchError, _>(|| {
 				Self::do_refresh_branch(&collateral_id, &stable_id)
 			});
+		}
+
+		// A zero per-vault weight cannot bound the walk, so it disables it;
+		// configure `IdleMaxRefreshWeight = None` instead of zero weights to
+		// express that intent without tripping the defence.
+		let per_vault = T::WeightInfo::on_idle_one_vault();
+		defensive_assert!(
+			per_vault != Weight::zero(),
+			"zero vault-refresh weight disables the idle vault walk"
+		);
+		if per_vault == Weight::zero() {
+			return meter.consumed();
+		}
+		// Cannot afford a single vault: leave the parked cursor untouched.
+		if !meter.can_consume(per_vault) {
+			return meter.consumed();
 		}
 
 		let mut iter = match IdleCursor::<T>::get() {
@@ -656,9 +667,8 @@ impl<T: Config> Pallet<T> {
 			),
 			None => Vaults::<T>::iter(),
 		};
-		// Bounded by `budget >= 1`: every iteration increments `touched` and
-		// the loop breaks at the budget, or earlier when the map drains.
-		let mut touched: u64 = 0;
+		// Bounded: every iteration consumes the non-zero `per_vault` from the
+		// finite meter, or breaks when the map drains.
 		let cursor = loop {
 			// Iterator drained: clear the cursor so the next idle block wraps
 			// around to the front of the map.
@@ -667,15 +677,15 @@ impl<T: Config> Pallet<T> {
 			let _ = with_storage_layer::<(), DispatchError, _>(|| {
 				OpContext::<T>::refresh(collateral_id.clone(), stable_id.clone(), &owner)
 			});
-			touched = touched.saturating_add(1);
-			if touched >= budget {
-				// Clear instead of park when the budget ran out exactly at the
+			meter.consume(per_vault);
+			if !meter.can_consume(per_vault) {
+				// Clear instead of park when the meter ran dry exactly at the
 				// map's end, so the next pass starts at the front rather than
 				// burning a block discovering the drain.
 				break iter.next().is_some().then_some((collateral_id, stable_id, owner));
 			}
 		};
 		IdleCursor::<T>::set(cursor);
-		per_call.saturating_mul(touched)
+		meter.consumed()
 	}
 }
