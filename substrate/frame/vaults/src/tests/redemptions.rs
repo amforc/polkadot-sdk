@@ -4,9 +4,7 @@ use crate::{
 	tests::{rate_pct, vault_status},
 };
 use pallet_linked_list::SortedListInterface;
-use pusd_primitives::{
-	KeeperCompensation, LiquidationAllocation, OffsetAllocation, RedemptionSettlement,
-};
+use pusd_primitives::RedemptionSettlement;
 
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 

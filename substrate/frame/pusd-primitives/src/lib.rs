@@ -34,8 +34,8 @@ pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetResult};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
 pub use vault_interface::{
-	KeeperCompensation, LiquidationAllocation, LiquidationSnapshot, OffsetAllocation,
-	RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
+	LiquidationSettlement, LiquidationSnapshot, RedemptionSettlement, RedemptionStepSnapshot,
+	VaultInterface,
 };
 pub use yield_routing::OnBranchYield;
 

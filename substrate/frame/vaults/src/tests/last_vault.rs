@@ -1,5 +1,6 @@
 use crate::{mock::*, tests::rate_pct};
-use pusd_primitives::{KeeperCompensation, LiquidationAllocation, OffsetAllocation};
+use frame::traits::fungibles::Balanced;
+use pusd_primitives::{LiquidationSettlement, VaultInterface};
 
 #[test]
 fn liquidate_only_vault_returns_last_vault_error() {
@@ -69,10 +70,9 @@ fn execute_liquidation_rejects_frozen_branch() {
 	});
 }
 
-// The `LiquidationAllocation` split is computed by the liquidation
-// orchestrator, never by users; these two tests defensively pin the
-// `VaultInterface` boundary — an inconsistent allocation is rejected and rolls
-// back atomically, so a follow-up valid allocation still succeeds.
+// The mock plan stands in for the future liquidation orchestrator. These tests
+// pin the production `VaultInterface` boundary: an inconsistent settlement is
+// rejected atomically, so a follow-up valid settlement still succeeds.
 #[test]
 fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 	build_and_execute(|| {
@@ -91,7 +91,7 @@ fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 				redistribution_collateral: 0,
 				keeper: KeeperCompensation { recipient: 10, collateral: 0 },
 			}),
-			crate::Error::<Test>::InvalidLiquidationAllocation
+			crate::Error::<Test>::InvalidLiquidationSettlement
 		);
 		assert!(crate::pallet::Vaults::<Test>::contains_key((DOT, PUSD, 1)));
 
@@ -103,7 +103,7 @@ fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 	});
 }
 
-// An allocation paying out more collateral than is held is rejected and rolls
+// A settlement paying out more collateral than is held is rejected and rolls
 // back atomically.
 #[test]
 fn execute_liquidation_rejects_collateral_payout_above_held() {
@@ -112,19 +112,22 @@ fn execute_liquidation_rejects_collateral_payout_above_held() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		let held = held(DOT, 1);
-
 		assert_noop!(
-			liquidate_with(DOT, PUSD, 1, |_post_touch| LiquidationAllocation {
-				offset: OffsetAllocation {
-					collateral_recipient: 10,
-					debt: 0,
-					collateral: held + 1
+			<Pallet<Test> as VaultInterface>::execute_liquidation(
+				&DOT,
+				&PUSD,
+				&1,
+				|_snapshot, owner_surplus| {
+					let redistribution_collateral =
+						<VaultCollateralAssets as Balanced<AccountId>>::issue(DOT, 1);
+					Ok(LiquidationSettlement {
+						debt_offset: 0,
+						redistribution_collateral,
+						owner_surplus,
+					})
 				},
-				redistribution_collateral: 0,
-				keeper: KeeperCompensation { recipient: 10, collateral: 0 },
-			}),
-			crate::Error::<Test>::InvalidLiquidationAllocation
+			),
+			crate::Error::<Test>::InvalidLiquidationSettlement
 		);
 		assert!(crate::pallet::Vaults::<Test>::contains_key((DOT, PUSD, 1)));
 	});
