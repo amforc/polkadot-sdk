@@ -31,8 +31,7 @@ impl<T: Config> Pallet<T> {
 		config: &BranchConfig<BalanceOf<T>>,
 		vault: &Vault<BalanceOf<T>>,
 		amount: BalanceOf<T>,
-		annual_rate: FixedU128,
-		rate_change_fee_base: BalanceOf<T>,
+		new_rate: FixedU128,
 		price: FixedU128,
 	) -> Result<BalanceOf<T>, DispatchError> {
 		Self::ratchet_ceiling(&mut op.branch.state, config, op.now);
@@ -44,14 +43,8 @@ impl<T: Config> Pallet<T> {
 				Error::<T>::DebtCeilingExceeded
 			);
 		}
-		let upfront_fee = Self::apply_borrow(
-			&mut op.branch.state,
-			config,
-			vault,
-			amount,
-			annual_rate,
-			rate_change_fee_base,
-		);
+		let upfront_fee =
+			Self::apply_borrow(&mut op.branch.state, config, vault, amount, new_rate, op.now);
 		op.ensure_global_ceiling(price)?;
 		Ok(upfront_fee)
 	}
@@ -83,15 +76,8 @@ impl<T: Config> Pallet<T> {
 
 		let mut vault =
 			Self::open_scratch_row(&op.branch.state, annual_rate, initial_collateral, op.now);
-		let upfront_fee = Self::apply_borrow_checked(
-			&mut op,
-			&config,
-			&vault,
-			initial_debt,
-			annual_rate,
-			Zero::zero(),
-			price,
-		)?;
+		let upfront_fee =
+			Self::apply_borrow_checked(&mut op, &config, &vault, initial_debt, annual_rate, price)?;
 		vault.debt = VaultDebt { principal: initial_debt, interest: upfront_fee };
 
 		let total_debt = initial_debt.saturating_add(upfront_fee);
@@ -250,17 +236,8 @@ impl<T: Config> Pallet<T> {
 		Self::validate_rate(&config, new_rate)?;
 
 		let new_ib_debt = op.vault.debt.principal.saturating_add(amount);
-		let cooldown_elapsed = op.vault.cooldown_elapsed(&config, op.ctx.now);
-		let rate_change_fee_base = op.vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
-		let upfront_fee = Self::apply_borrow_checked(
-			&mut op.ctx,
-			&config,
-			&op.vault,
-			amount,
-			new_rate,
-			rate_change_fee_base,
-			price,
-		)?;
+		let upfront_fee =
+			Self::apply_borrow_checked(&mut op.ctx, &config, &op.vault, amount, new_rate, price)?;
 
 		let dormant_to_active = op.status.is_dormant() && new_ib_debt >= config.minimum_debt;
 		op.vault.debt.principal = new_ib_debt;
@@ -403,13 +380,12 @@ impl<T: Config> Pallet<T> {
 		let config = op.ctx.config();
 		Self::validate_rate(&config, new_rate)?;
 
-		let cooldown_elapsed = op.vault.cooldown_elapsed(&config, op.ctx.now);
 		let upfront_fee = Self::apply_rate_change(
 			&mut op.ctx.branch.state,
 			&config,
 			&op.vault,
 			new_rate,
-			cooldown_elapsed,
+			op.ctx.now,
 		);
 
 		let price = op.ctx.price()?;
