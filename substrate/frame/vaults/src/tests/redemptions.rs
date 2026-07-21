@@ -99,10 +99,11 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		// A frozen branch must reject settlement, like every other price-dependent
 		// path; the gate fires before any vault is touched or priced.
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		assert_noop!(
 			redeem_step(DOT, PUSD, 1, 3, |_| panic!("closure must not run")),

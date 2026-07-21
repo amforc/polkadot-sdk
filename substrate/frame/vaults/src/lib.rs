@@ -30,8 +30,6 @@ pub mod mock;
 #[cfg(test)]
 mod tests;
 
-use frame::traits::ContainsPair;
-
 pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
@@ -40,16 +38,6 @@ pub use types::{
 };
 pub use weights::WeightInfo;
 
-/// [`ContainsPair`] adapter for [`Config::SameAsset`] covering the usual
-/// runtime layout where the stable-id namespace embeds into the collateral-id
-/// namespace via `Into`.
-pub struct SameAssetViaInto;
-impl<C: PartialEq, S: Clone + Into<C>> ContainsPair<C, S> for SameAssetViaInto {
-	fn contains(collateral_id: &C, stable_id: &S) -> bool {
-		*collateral_id == stable_id.clone().into()
-	}
-}
-
 /// Runtime-supplied benchmark hooks. The pallet's `Config` only exposes
 /// oracle reads (`ProvidePrice`), clock reads (`Time`), and hold-only
 /// collateral mutation; the helper fills the write side. The hint-repair
@@ -57,22 +45,13 @@ impl<C: PartialEq, S: Clone + Into<C>> ContainsPair<C, S> for SameAssetViaInto {
 /// never drift from what the linked-list pallet enforces.
 #[cfg(feature = "runtime-benchmarks")]
 pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
-	/// Must be hold-capable for [`HoldReason::VaultCollateral`].
 	fn collateral_asset_id() -> CollateralId;
-	/// The coin the benchmark market mints. Must be owner-mintable by the
-	/// pallet (the runtime grants the pallet issuer rights).
 	fn stable_asset_id() -> StableId;
 	fn mint_collateral(collateral_id: CollateralId, who: &AccountId, amount: Balance);
 	fn mint_stable(stable_id: StableId, who: &AccountId, amount: Balance);
-	fn set_oracle_price(
-		collateral_id: CollateralId,
-		stable_id: StableId,
-		price: frame::arithmetic::FixedU128,
-	);
+	fn set_oracle_price(collateral_id: CollateralId, price: frame::arithmetic::FixedU128);
+	fn clear_oracle_price(collateral_id: CollateralId);
 	fn advance_time(ms: u64);
-	/// A distinct synthetic `(collateral, stable)` market for prefilling the
-	/// branch registry up to `MaxBranches`.
-	fn synth_market(seed: u32) -> (CollateralId, StableId);
 }
 
 #[frame::pallet]
@@ -81,7 +60,7 @@ pub mod pallet {
 	use crate::{
 		context::OpContext,
 		recovery,
-		types::{AdminLevel, BranchAdmins, BranchConfigGuard},
+		types::{AdminLevel, AssetRoleUsage, BranchAdmins, BranchConfigGuard},
 	};
 	use frame::{
 		prelude::*,
@@ -90,7 +69,7 @@ pub mod pallet {
 				Balanced as FungiblesBalanced, Inspect as FungiblesInspect,
 				Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold,
 			},
-			Consideration, ContainsPair, EnsureOriginWithArg, Footprint, OriginTrait, Time,
+			Consideration, EnsureOriginWithArg, Footprint, OriginTrait, Time,
 		},
 	};
 	use pallet_linked_list::{Position, PriorityProvider, SortedListInterface};
@@ -99,6 +78,16 @@ pub mod pallet {
 	pub type BalanceOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
 		<T as frame_system::Config>::AccountId,
 	>>::Balance;
+
+	/// Collateral identifier exposed by [`Config::CollateralAssets`].
+	pub type CollateralIdOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
+		<T as frame_system::Config>::AccountId,
+	>>::AssetId;
+
+	/// Stablecoin identifier exposed by [`Config::StableAssets`].
+	pub type StableIdOf<T> = <<T as Config>::StableAssets as FungiblesInspect<
+		<T as frame_system::Config>::AccountId,
+	>>::AssetId;
 
 	/// Protocol time unit: UNIX milliseconds. All vault accounting is done in
 	/// concrete `u64` milliseconds rather than a generic `Moment`; the time
@@ -135,22 +124,12 @@ pub mod pallet {
 		/// [`HoldReason`] enum so we can hold collateral on user accounts.
 		type RuntimeHoldReason: From<HoldReason>;
 
-		/// Identifier for collateral assets.
-		type CollateralAssetId: Parameter + Member + Ord + MaxEncodedLen;
-
-		/// Identifier for stable assets.
-		type StableAssetId: Parameter + Member + Ord + MaxEncodedLen;
-
-		/// Whether a collateral id and a stable id denote the same underlying
-		/// asset.
-		type SameAsset: ContainsPair<Self::CollateralAssetId, Self::StableAssetId>;
-
 		/// Multi-asset collateral implementation. Balance must be a
 		/// [`FixedPointOperand`] so the pallet's `FixedU128`-based math can
 		/// operate on it directly without round-tripping through `u128`.
 		type CollateralAssets: FungiblesMutateHold<
 				Self::AccountId,
-				AssetId = Self::CollateralAssetId,
+				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance: FixedPointOperand,
 				Reason = Self::RuntimeHoldReason,
 			> + fungibles::BalancedHold<Self::AccountId>;
@@ -159,15 +138,21 @@ pub mod pallet {
 		/// Shares its `Balance` type with the collateral surface.
 		type StableAssets: FungiblesMutate<
 				Self::AccountId,
-				AssetId = Self::StableAssetId,
+				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance = BalanceOf<Self>,
 			> + FungiblesBalanced<Self::AccountId>;
+
+		/// Converts a stable-asset id into the collateral-id namespace. The
+		/// converted id is the canonical key under which [`AssetRoles`] tracks
+		/// the coin, so a stablecoin can never be trusted as collateral (and vice
+		/// versa) anywhere in the registry.
+		type StableToCollateralId: Convert<StableIdOf<Self>, CollateralIdOf<Self>>;
 
 		/// The oracle pricing each collateral asset in the protocol's common
 		/// numéraire (USD). Issued coins are treated as $1-pegged at par, so the
 		/// price is keyed by collateral alone, not by the `(collateral, stable)`
 		/// market: every coin backed by a given collateral reads the same feed.
-		type Oracle: ProvidePrice<AssetId = Self::CollateralAssetId>;
+		type Oracle: ProvidePrice<AssetId = CollateralIdOf<Self>>;
 
 		/// Destination for minted pUSD fees (branch interest and upfront fees).
 		/// The credit carries the coin (`Credit::asset()`), so a runtime can
@@ -179,16 +164,12 @@ pub mod pallet {
 		/// engine mints for a market (branch interest and upfront fees); the
 		/// remainder goes to [`Config::FeeHandler`]. Runtimes without a pool
 		/// use `()`.
-		type YieldHook: OnBranchYield<
-			Self::CollateralAssetId,
-			Self::StableAssetId,
-			StableCreditOf<Self>,
-		>;
+		type YieldHook: OnBranchYield<CollateralIdOf<Self>, StableIdOf<Self>, StableCreditOf<Self>>;
 
 		/// Market lifecycle hook: `register_branch` calls `on_registered` so
 		/// siblings seed their own per-market rows, and `remove_branch` calls
 		/// `on_deregistered` so they tear those rows down again.
-		type OnBranchLifecycle: OnBranchLifecycle<Self::CollateralAssetId, Self::StableAssetId>;
+		type OnBranchLifecycle: OnBranchLifecycle<CollateralIdOf<Self>, StableIdOf<Self>>;
 
 		/// Time provider for fee accrual. Its `Moment` is pinned to [`Millis`].
 		type TimeProvider: Time<Moment = Millis>;
@@ -200,7 +181,7 @@ pub mod pallet {
 		/// because a market can `mint_into` that coin, bypassing its issuer check.
 		type CreateOrigin: EnsureOriginWithArg<
 			Self::RuntimeOrigin,
-			Self::StableAssetId,
+			StableIdOf<Self>,
 			Success = Option<Self::AccountId>,
 		>;
 
@@ -212,18 +193,18 @@ pub mod pallet {
 		type BranchConfigGuard: Get<BranchConfigGuard<BalanceOf<Self>>>;
 
 		/// Governance origin owning the systemic per-collateral limits
-		/// ([`GlobalDebtCeiling`]) and able to freeze or remove any market via
-		/// `enable_frozen_mode`/`remove_branch`, bypassing its admins — the
+		/// ([`CollateralRisks`]) and able to freeze or remove any market via
+		/// `set_governance_frozen`/`remove_branch`, bypassing its admins — the
 		/// hard backstop beneath the permissionless per-market ceilings,
 		/// distinct from any per-market admin.
 		type GlobalManagerOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
 		/// Sorted-DLL backing the per-market rate index and FinalRecovery FIFO.
 		/// Configured by the runtime to point at `pallet-linked-list` with
-		/// `ListId = VaultListId<Self::CollateralAssetId, Self::StableAssetId>`,
+		/// `ListId = VaultListId<CollateralIdOf<Self>, StableIdOf<Self>>`,
 		/// `ItemId = Self::AccountId`, `Priority = FixedU128`.
 		type VaultLists: SortedListInterface<
-			VaultListId<Self::CollateralAssetId, Self::StableAssetId>,
+			VaultListId<CollateralIdOf<Self>, StableIdOf<Self>>,
 			Self::AccountId,
 			Priority = FixedU128,
 		>;
@@ -232,10 +213,6 @@ pub mod pallet {
 		/// during liquidation handoff).
 		#[pallet::constant]
 		type PalletId: Get<PalletId>;
-
-		/// Maximum registered collateral branches.
-		#[pallet::constant]
-		type MaxBranches: Get<u32>;
 
 		/// Maximum weight the `on_idle` refresh walk may consume out of a
 		/// block's leftover weight. `None` skips the walk entirely; vaults
@@ -249,8 +226,8 @@ pub mod pallet {
 		/// See [`crate::BenchmarkHelper`].
 		#[cfg(feature = "runtime-benchmarks")]
 		type BenchmarkHelper: crate::BenchmarkHelper<
-			Self::CollateralAssetId,
-			Self::StableAssetId,
+			CollateralIdOf<Self>,
+			StableIdOf<Self>,
 			Self::AccountId,
 			BalanceOf<Self>,
 		>;
@@ -272,164 +249,185 @@ pub mod pallet {
 	pub type Vaults<T: Config> = StorageNMap<
 		_,
 		(
-			NMapKey<Twox64Concat, T::CollateralAssetId>,
-			NMapKey<Twox64Concat, T::StableAssetId>,
+			NMapKey<Twox64Concat, CollateralIdOf<T>>,
+			NMapKey<Twox64Concat, StableIdOf<T>>,
 			NMapKey<Blake2_128Concat, T::AccountId>,
 		),
 		Vault<BalanceOf<T>>,
 		OptionQuery,
 	>;
 
-	/// The registered `(collateral, stable)` markets: config, hot state,
-	/// admins, and creation deposit in one record, so the pieces can never
-	/// partially exist. The collateral-major key lets the per-collateral risk
-	/// fold prefix-iterate one collateral's markets, and its leading columns
-	/// match [`Vaults`]' first two keys.
+	/// The authoritative market registry: the `(collateral, stable)` markets'
+	/// config, hot state, admins, and creation deposit.
 	#[pallet::storage]
-	pub type Branches<T: Config> = StorageNMap<
+	pub type Branches<T: Config> = StorageDoubleMap<
 		_,
-		(NMapKey<Twox64Concat, T::CollateralAssetId>, NMapKey<Twox64Concat, T::StableAssetId>),
+		Twox64Concat,
+		CollateralIdOf<T>,
+		Twox64Concat,
+		StableIdOf<T>,
 		BranchOf<T>,
 		OptionQuery,
 	>;
 
-	/// Governance-set hard cap on total debt per collateral asset, in the
-	/// collateral's own unit. Markets sharing a collateral share its
-	/// concentration risk, so this caps the sum across them; a single market's
-	/// per-branch ceiling cannot. The default of `0` doubles as the collateral
-	/// allow-list: a collateral can host markets but cannot be borrowed against
-	/// until [`Config::GlobalManagerOrigin`] sets a non-zero ceiling.
+	/// Which side of a market each asset is used on, reference-counted per
+	/// registered market.
 	#[pallet::storage]
-	pub type GlobalDebtCeiling<T: Config> =
-		StorageMap<_, Twox64Concat, T::CollateralAssetId, BalanceOf<T>, ValueQuery>;
+	pub type AssetRoles<T: Config> =
+		StorageMap<_, Twox64Concat, CollateralIdOf<T>, AssetRoleUsage, OptionQuery>;
+
+	/// Per-collateral systemic risk record: the [`Config::GlobalManagerOrigin`]-set
+	/// hard cap on total debt across the collateral's markets, and the stored
+	/// aggregate of that debt (`Σ BranchDebt::outstanding()`). Markets sharing a
+	/// collateral share its concentration risk, so the cap binds their sum; a
+	/// single market's per-branch ceiling cannot. The `outstanding` side is a
+	/// derived index over [`Branches`], not a second ledger: maintained by
+	/// the audited `commit_branch` boundary, default records removed,
+	/// recomputed in full by `try_state`. Summing raw units across
+	/// stablecoins assumes $1 par — see the TODO on `ensure_global_ceiling`.
+	#[pallet::storage]
+	pub type CollateralRisks<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		CollateralIdOf<T>,
+		crate::types::CollateralRisk<BalanceOf<T>>,
+		ValueQuery,
+	>;
 
 	/// Cursor of the `on_idle` refresh walk over [`Vaults`]: the key of the
 	/// last row touched, resumed after on the next idle block. `None` restarts
 	/// from the front of the map.
 	#[pallet::storage]
 	pub type IdleCursor<T: Config> =
-		StorageValue<_, (T::CollateralAssetId, T::StableAssetId, T::AccountId), OptionQuery>;
+		StorageValue<_, (CollateralIdOf<T>, StableIdOf<T>, T::AccountId), OptionQuery>;
+
+	/// Cursor of the `on_idle` refresh walk over [`Branches`]: the key of the
+	/// last market reconciled, resumed after on the next idle block. `None`
+	/// restarts from the front of the map.
+	#[pallet::storage]
+	pub type BranchIdleCursor<T: Config> =
+		StorageValue<_, (CollateralIdOf<T>, StableIdOf<T>), OptionQuery>;
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		/// A new vault was opened on the market.
 		VaultOpened {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 		},
 		/// A vault moved between `Active`, `Dormant`, and `FinalRecovery`.
 		VaultStatusChanged {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			old_status: VaultStatus,
 			new_status: VaultStatus,
 		},
 		/// Unbacked circulating debt was recorded against the market ledger.
 		BadDebtRecorded {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 		},
 		/// Recorded bad debt was burned away by an insurance credit.
 		BadDebtHealed {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 		},
 		/// Collateral moved from `from` onto the vault's hold.
 		CollateralDeposited {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			from: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// Collateral left the vault's hold for `recipient`.
 		CollateralWithdrawn {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// New pUSD was minted to `recipient` against the vault.
 		Borrowed {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// `from` burned pUSD against the vault's debt (capped at outstanding).
 		Repaid {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			from: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// The vault row was removed; remaining collateral went to `recipient`.
 		VaultClosed {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			recipient: T::AccountId,
 		},
 		/// A touch folded pending interest into the vault's stored debt.
 		InterestAccrued {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// An open / borrow / rate-change charged its upfront fee.
 		UpfrontFeeCharged {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// The vault's annual borrow rate was re-set (rate index re-sorted).
 		BorrowRateChanged {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			old_rate: FixedU128,
 			new_rate: FixedU128,
 		},
 		/// The market entered or left `Frozen` mode.
 		ModeChanged {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			old_mode: BranchMode,
 			new_mode: BranchMode,
 		},
 		/// Governance updated one branch-config parameter.
 		ParameterUpdated {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			update: BranchConfigUpdate<BalanceOf<T>>,
 		},
 		/// A new `(collateral, stable)` market was registered.
-		BranchRegistered { collateral_id: T::CollateralAssetId, stable_id: T::StableAssetId },
+		BranchRegistered { collateral_id: CollateralIdOf<T>, stable_id: StableIdOf<T> },
 		/// Governance set the per-collateral global debt ceiling.
-		GlobalDebtCeilingSet { collateral_id: T::CollateralAssetId, ceiling: BalanceOf<T> },
+		GlobalDebtCeilingSet { collateral_id: CollateralIdOf<T>, ceiling: BalanceOf<T> },
 		/// An empty market was removed; the creation deposit was refunded.
-		BranchRemoved { collateral_id: T::CollateralAssetId, stable_id: T::StableAssetId },
+		BranchRemoved { collateral_id: CollateralIdOf<T>, stable_id: StableIdOf<T> },
 		/// A market's admin (`full` or `emergency`) was reassigned.
 		BranchAdminChanged {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			full_admin: PalletsOriginOf<T>,
 			emergency_admin: PalletsOriginOf<T>,
 		},
 		/// A redemption cancelled vault debt in exchange for collateral.
 		VaultRedeemed {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			recipient: T::AccountId,
 			debt_cancelled: BalanceOf<T>,
@@ -458,8 +456,6 @@ pub mod pallet {
 		StableCollateralCollision,
 		/// A branch for this collateral asset already exists.
 		BranchAlreadyRegistered,
-		/// Registering would exceed `MaxBranches`.
-		TooManyBranches,
 		/// The resulting debt would be non-zero but below `minimum_debt`.
 		DebtBelowMinimum,
 		/// The repayment would leave a non-zero remainder below
@@ -468,8 +464,9 @@ pub mod pallet {
 		/// The borrow would push branch principal above `debt_ceiling`.
 		DebtCeilingExceeded,
 		/// The borrow would push the collateral's total debt (summed across its
-		/// markets, valued in the collateral unit) above `GlobalDebtCeiling`. A
-		/// collateral with the default `0` ceiling cannot be borrowed against.
+		/// markets, valued in the collateral unit) above the
+		/// [`CollateralRisks`] ceiling. A collateral with the default `0`
+		/// ceiling cannot be borrowed against.
 		GlobalDebtCeilingExceeded,
 		/// The caller is not a (sufficiently-privileged) admin of this market.
 		NotBranchAdmin,
@@ -540,10 +537,6 @@ pub mod pallet {
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
-		fn integrity_test() {
-			assert!(T::MaxBranches::get() > 0, "`MaxBranches` must be > 0");
-		}
-
 		fn on_idle(_block: BlockNumberFor<T>, remaining: Weight) -> Weight {
 			Self::on_idle_walk(remaining)
 		}
@@ -559,12 +552,12 @@ pub mod pallet {
 	impl<T: Config> Pallet<T> {
 		/// Fully-accrued collateralization ratio of the vault.
 		pub fn vault_cr(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 		) -> Option<FixedU128> {
 			let vault = Vaults::<T>::get((&collateral_id, &stable_id, &owner))?;
-			let state = Branches::<T>::get((&collateral_id, &stable_id))?.state;
+			let state = Branches::<T>::get(&collateral_id, &stable_id)?.state;
 			let now = T::TimeProvider::now();
 			let price = T::Oracle::provide_price(&collateral_id).ok()?;
 			let pending = Self::pending_touch_for(&vault, &state, now);
@@ -575,8 +568,8 @@ pub mod pallet {
 
 		/// Derived lifecycle status of the vault.
 		pub fn vault_status(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 		) -> Option<VaultStatus> {
 			Vaults::<T>::contains_key((&collateral_id, &stable_id, &owner))
@@ -587,26 +580,21 @@ pub mod pallet {
 		/// update so off-chain observers see the value the runtime would
 		/// compute on the next write.
 		pub fn branch_tcr(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 		) -> Option<FixedU128> {
-			let state = Branches::<T>::get((&collateral_id, &stable_id))?.state;
+			let state = Branches::<T>::get(&collateral_id, &stable_id)?.state;
 			let price = T::Oracle::provide_price(&collateral_id).ok()?;
 			let now = T::TimeProvider::now();
 			Self::compute_tcr(&state, price, now).ok()
-		}
-
-		/// Registered `(collateral, stable)` markets.
-		pub fn branches() -> alloc::vec::Vec<(T::CollateralAssetId, T::StableAssetId)> {
-			Branches::<T>::iter_keys().collect()
 		}
 
 		/// First `n` vault owners in actual redemption order: `FinalRecovery`
 		/// FIFO first, then `dormant_redemption_target`, then the rate index
 		/// tail-first.
 		pub fn redemption_queue_head(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			n: u32,
 		) -> alloc::vec::Vec<T::AccountId> {
 			Self::redemption_targets(&collateral_id, &stable_id)
@@ -617,8 +605,8 @@ pub mod pallet {
 
 		/// First `n` `FinalRecovery` owners in FIFO order.
 		pub fn final_recovery_queue_head(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			n: u32,
 		) -> alloc::vec::Vec<T::AccountId> {
 			recovery::queue_head::<T>(&collateral_id, &stable_id, n)
@@ -626,8 +614,8 @@ pub mod pallet {
 
 		/// Rate-index insert hint for `rate` on the market.
 		pub fn find_rate_position(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			rate: FixedU128,
 		) -> Position<T::AccountId> {
 			T::VaultLists::find_position(&VaultListId::Rate(collateral_id, stable_id), rate)
@@ -636,8 +624,8 @@ pub mod pallet {
 		/// Rate-index re-insert hint for moving the vault to `new_rate`. `None`
 		/// if the vault is not in the rate index.
 		pub fn find_re_insert_position(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			new_rate: FixedU128,
 		) -> Option<Position<T::AccountId>> {
@@ -651,8 +639,8 @@ pub mod pallet {
 		/// Steps the on-chain repair walk would take for `(rate, hint)` on the
 		/// market.
 		pub fn repair_steps_needed(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			rate: FixedU128,
 			hint: Position<T::AccountId>,
 		) -> u32 {
@@ -666,8 +654,8 @@ pub mod pallet {
 		/// Current rate-index neighbors of the vault. `None` when the vault is
 		/// not in the rate index.
 		pub fn vault_rate_index_neighbors(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 		) -> Option<Position<T::AccountId>> {
 			T::VaultLists::neighbors(&VaultListId::Rate(collateral_id, stable_id), &owner)
@@ -680,13 +668,13 @@ pub mod pallet {
 		/// the dormant target counts as one — and returns the partial sum if
 		/// the cap stops the walk.
 		pub fn debt_in_front(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			rate: FixedU128,
 			max_steps: u32,
 		) -> BalanceOf<T> {
 			let mut total = BalanceOf::<T>::zero();
-			let Some(branch) = Branches::<T>::get((&collateral_id, &stable_id)) else {
+			let Some(branch) = Branches::<T>::get(&collateral_id, &stable_id) else {
 				return total;
 			};
 			let now = T::TimeProvider::now();
@@ -723,12 +711,12 @@ pub mod pallet {
 		/// Predict the upfront fee `open_vault` would charge for
 		/// `(initial_debt, annual_rate)` against the current market state.
 		pub fn predict_open_upfront_fee(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			initial_debt: BalanceOf<T>,
 			annual_rate: FixedU128,
 		) -> BalanceOf<T> {
-			let Some(branch) = Branches::<T>::get((&collateral_id, &stable_id)) else {
+			let Some(branch) = Branches::<T>::get(&collateral_id, &stable_id) else {
 				return BalanceOf::<T>::zero();
 			};
 			let (config, mut state) = (branch.config, branch.state);
@@ -746,8 +734,8 @@ pub mod pallet {
 
 		/// Predict the upfront fee `borrow` would charge.
 		pub fn predict_borrow_upfront_fee(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			debt_increase: BalanceOf<T>,
 			maybe_new_rate: Option<FixedU128>,
@@ -774,8 +762,8 @@ pub mod pallet {
 		/// Predict the upfront fee `change_rate` would charge — `0` when the
 		/// cooldown has elapsed.
 		pub fn predict_rate_change_upfront_fee(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			new_rate: FixedU128,
 		) -> BalanceOf<T> {
@@ -797,8 +785,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::open_vault())]
 		pub fn open_vault(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			initial_collateral: BalanceOf<T>,
 			initial_debt: BalanceOf<T>,
 			annual_rate: FixedU128,
@@ -822,8 +810,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::deposit_collateral_for())]
 		pub fn deposit_collateral_for(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
@@ -838,8 +826,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::withdraw_collateral())]
 		pub fn withdraw_collateral(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
@@ -855,8 +843,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::borrow())]
 		pub fn borrow(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 			maybe_new_rate: Option<FixedU128>,
 			recipient: Option<T::AccountId>,
@@ -875,8 +863,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::repay_for())]
 		pub fn repay_for(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
@@ -889,8 +877,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::change_rate())]
 		pub fn change_rate(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			new_rate: FixedU128,
 			hint: Position<T::AccountId>,
 		) -> DispatchResult {
@@ -904,8 +892,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::close_vault())]
 		pub fn close_vault(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -918,8 +906,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::poke())]
 		pub fn poke(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
@@ -932,8 +920,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::enter_final_recovery())]
 		pub fn enter_final_recovery(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
@@ -947,8 +935,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::exit_final_recovery())]
 		pub fn exit_final_recovery(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			hint: Position<T::AccountId>,
 		) -> DispatchResult {
@@ -960,11 +948,11 @@ pub mod pallet {
 		/// deposit-free) opens a `(collateral, stable)` market with the given
 		/// `admins` and a config inside the governance envelope.
 		#[pallet::call_index(10)]
-		#[pallet::weight(T::WeightInfo::register_branch())]
+		#[pallet::weight(T::WeightInfo::create_branch())]
 		pub fn create_branch(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			admins: BranchAdmins<PalletsOriginOf<T>>,
 			config: BranchConfig<BalanceOf<T>>,
 		) -> DispatchResult {
@@ -980,69 +968,64 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::set_param())]
 		pub fn set_param(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			update: BranchConfigUpdate<BalanceOf<T>>,
 		) -> DispatchResult {
 			Self::do_set_param(origin, collateral_id, stable_id, update)
 		}
 
-		/// Freeze the market. Either admin tier may issue this — a defensive
-		/// override — and so may [`Config::GlobalManagerOrigin`], as the
+		/// Set (`true`) or clear (`false`) the governance-induced `Frozen`
+		/// state. Freezing is a defensive override: either admin tier may
+		/// issue it, and so may [`Config::GlobalManagerOrigin`] as the
 		/// governance kill switch that bypasses the market's admins.
-		#[pallet::call_index(21)]
-		#[pallet::weight(T::WeightInfo::enable_frozen_mode())]
-		pub fn enable_frozen_mode(
+		/// Unfreezing is `Full`-admin only. No-op when the market is already
+		/// frozen (any reason) on freeze, or not governance-frozen on clear;
+		/// oracle-induced freezes are cleared with `refresh_branch`.
+		#[pallet::call_index(12)]
+		#[pallet::weight(T::WeightInfo::set_governance_frozen())]
+		pub fn set_governance_frozen(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			frozen: bool,
 		) -> DispatchResult {
-			Self::ensure_branch_admin_or_manager(
-				origin,
-				&collateral_id,
-				&stable_id,
-				AdminLevel::Emergency,
-			)?;
-			Self::do_enable_frozen_mode(&collateral_id, &stable_id)
+			if frozen {
+				Self::ensure_branch_admin_or_manager(
+					origin,
+					&collateral_id,
+					&stable_id,
+					AdminLevel::Emergency,
+				)?;
+			} else {
+				Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
+			}
+			Self::do_set_governance_frozen(&collateral_id, &stable_id, frozen)
 		}
 
 		/// Permissionless: clear an oracle-induced `Frozen` state once the
 		/// oracle is healthy again. No-op when the market is not frozen or is
 		/// frozen for a non-oracle reason.
-		#[pallet::call_index(22)]
+		#[pallet::call_index(13)]
 		#[pallet::weight(T::WeightInfo::refresh_branch())]
 		pub fn refresh_branch(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
 			Self::do_refresh_branch(&collateral_id, &stable_id)
 		}
 
-		/// Full-admin: clear a governance-induced `Frozen` state. No-op when the
-		/// market is not frozen or is frozen for a non-governance reason.
-		/// Oracle-induced freezes must be cleared with `refresh_branch`.
-		#[pallet::call_index(23)]
-		#[pallet::weight(T::WeightInfo::clear_governance_frozen_mode())]
-		pub fn clear_governance_frozen_mode(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-		) -> DispatchResult {
-			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
-			Self::do_clear_governance_frozen_mode(&collateral_id, &stable_id)
-		}
-
 		/// Full-admin (or [`Config::GlobalManagerOrigin`], bypassing the market's
 		/// admins): remove an empty market, refunding the creation deposit and
-		/// freeing the `MaxBranches` slot.
-		#[pallet::call_index(24)]
-		#[pallet::weight(T::WeightInfo::register_branch())]
+		/// releasing both assets' role references.
+		#[pallet::call_index(14)]
+		#[pallet::weight(T::WeightInfo::remove_branch())]
 		pub fn remove_branch(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 		) -> DispatchResult {
 			Self::ensure_branch_admin_or_manager(
 				origin,
@@ -1054,18 +1037,19 @@ pub mod pallet {
 		}
 
 		/// Full-admin: reassign the market's admins.
-		#[pallet::call_index(25)]
-		#[pallet::weight(T::WeightInfo::set_param())]
+		#[pallet::call_index(15)]
+		#[pallet::weight(T::WeightInfo::set_branch_admins())]
 		pub fn set_branch_admins(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			admins: BranchAdmins<PalletsOriginOf<T>>,
 		) -> DispatchResult {
 			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
-			Branches::<T>::try_mutate(
-				(&collateral_id, &stable_id),
-				|maybe| -> Result<_, DispatchError> {
+			Branches::<T>::try_mutate_exists(
+				&collateral_id,
+				&stable_id,
+				|maybe| -> Result<(), DispatchError> {
 					let branch = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
 					branch.admins = admins.clone();
 					Ok(())
@@ -1084,12 +1068,12 @@ pub mod pallet {
 		/// Permissionless: revive a `Dormant` vault whose fully-accrued debt is
 		/// back at or above `MinimumDebt`, reinserting it into the rate index at
 		/// the caller-supplied `hint`. Returns `Pays::No` on a successful flip.
-		#[pallet::call_index(28)]
+		#[pallet::call_index(16)]
 		#[pallet::weight(T::WeightInfo::activate_dormant())]
 		pub fn activate_dormant(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			hint: Position<T::AccountId>,
 		) -> DispatchResultWithPostInfo {
@@ -1101,15 +1085,19 @@ pub mod pallet {
 		/// Set the per-collateral global debt ceiling, in the collateral's unit.
 		/// `0` blocks borrowing against the collateral (the allow-list default).
 		/// The systemic backstop beneath the per-market ceilings.
-		#[pallet::call_index(29)]
-		#[pallet::weight(T::WeightInfo::set_param())]
+		#[pallet::call_index(17)]
+		#[pallet::weight(T::WeightInfo::set_global_debt_ceiling())]
 		pub fn set_global_debt_ceiling(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
+			collateral_id: CollateralIdOf<T>,
 			ceiling: BalanceOf<T>,
 		) -> DispatchResult {
 			T::GlobalManagerOrigin::ensure_origin(origin)?;
-			GlobalDebtCeiling::<T>::insert(&collateral_id, ceiling);
+			CollateralRisks::<T>::mutate_exists(&collateral_id, |maybe| {
+				let mut risk = maybe.take().unwrap_or_default();
+				risk.debt_ceiling = ceiling;
+				*maybe = (risk != Default::default()).then_some(risk);
+			});
 			Self::deposit_event(Event::GlobalDebtCeilingSet { collateral_id, ceiling });
 			Ok(())
 		}
@@ -1117,12 +1105,12 @@ pub mod pallet {
 		/// Permissionless: advance a market's autoline ceiling. Increases are gated
 		/// by the configured `ceiling_ttl`; decreases apply immediately. No-op when
 		/// the market's autoline is disabled (`ceiling_gap == 0`).
-		#[pallet::call_index(30)]
-		#[pallet::weight(T::WeightInfo::poke())]
+		#[pallet::call_index(18)]
+		#[pallet::weight(T::WeightInfo::poke_ceiling())]
 		pub fn poke_ceiling(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
 			Self::do_poke_ceiling(collateral_id, stable_id)
@@ -1131,13 +1119,12 @@ pub mod pallet {
 
 	/// `PriorityProvider` so `pallet-linked-list` can read authoritative rates
 	/// from us when relisting a drifted node.
-	impl<T: Config>
-		PriorityProvider<VaultListId<T::CollateralAssetId, T::StableAssetId>, T::AccountId>
+	impl<T: Config> PriorityProvider<VaultListId<CollateralIdOf<T>, StableIdOf<T>>, T::AccountId>
 		for Pallet<T>
 	{
 		type Priority = FixedU128;
 		fn priority(
-			list_id: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
+			list_id: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
 			item: &T::AccountId,
 		) -> Option<FixedU128> {
 			match list_id {
@@ -1158,8 +1145,8 @@ pub mod pallet {
 		/// Per-market account holding that market's redistribution-pending
 		/// collateral.
 		pub fn redistribution_account(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 		) -> T::AccountId {
 			let seed =
 				frame::deps::sp_io::hashing::blake2_256(&(collateral_id, stable_id).encode());

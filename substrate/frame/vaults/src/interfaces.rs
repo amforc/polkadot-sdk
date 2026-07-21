@@ -3,8 +3,8 @@
 use crate::{
 	context::{OpContext, TcrGate, VaultOp},
 	pallet::{
-		BalanceOf, Branches, CollateralCreditOf, Config, Error, Event, HoldReason, Pallet,
-		StableCreditOf,
+		BalanceOf, Branches, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason,
+		Pallet, StableCreditOf, StableIdOf,
 	},
 	recovery,
 	types::VaultStatus,
@@ -27,18 +27,18 @@ use pusd_primitives::{
 	RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
 
-impl<T: Config> BranchModeProvider<T::CollateralAssetId, T::StableAssetId> for Pallet<T> {
+impl<T: Config> BranchModeProvider<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
 	fn branch_mode(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 	) -> Result<BranchMode, DispatchError> {
 		Self::current_mode(collateral_id, stable_id)
 	}
 }
 
 impl<T: Config> VaultInterface for Pallet<T> {
-	type CollateralId = T::CollateralAssetId;
-	type StableId = T::StableAssetId;
+	type CollateralId = CollateralIdOf<T>;
+	type StableId = StableIdOf<T>;
 	type AccountId = T::AccountId;
 	type Balance = BalanceOf<T>;
 	type StableCredit = StableCreditOf<T>;
@@ -46,8 +46,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 	#[transactional]
 	fn execute_liquidation(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 		build_settlement: impl FnOnce(
 			LiquidationSnapshot<BalanceOf<T>>,
@@ -150,8 +150,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 	/// Priority order: `FinalRecovery` FIFO head, then `dormant_redemption_target`,
 	/// then the rate-index tail.
 	fn next_redemption_target(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		after: Option<&T::AccountId>,
 	) -> Option<(T::AccountId, VaultStatus)> {
 		// The priority head (FinalRecovery FIFO, then the dormant slot) is a
@@ -170,8 +170,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 	#[transactional]
 	fn redeem_step(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 		recipient: &T::AccountId,
 		build_settlement: impl FnOnce(
@@ -273,8 +273,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 	#[transactional]
 	fn settle_recovery_residual(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<BalanceOf<T>, DispatchError> {
 		let op = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
@@ -335,13 +335,10 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		Ok(residual)
 	}
 
-	fn branch_debt(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-	) -> BalanceOf<T> {
+	fn branch_debt(collateral_id: &CollateralIdOf<T>, stable_id: &StableIdOf<T>) -> BalanceOf<T> {
 		// Zero for an unregistered branch: this sizes the dynamic redemption
 		// fee, it is not an error surface.
-		let Some(branch) = Branches::<T>::get((collateral_id, stable_id)) else {
+		let Some(branch) = Branches::<T>::get(collateral_id, stable_id) else {
 			return BalanceOf::<T>::zero();
 		};
 		Self::accrued_branch_debt(&branch.state, T::TimeProvider::now())
@@ -349,8 +346,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 	#[transactional]
 	fn heal(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		credit: StableCreditOf<T>,
 	) -> Result<StableCreditOf<T>, DispatchError> {
 		// A credit denominated in another coin cannot heal this market's bad
@@ -358,8 +355,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		if credit.asset() != *stable_id {
 			return Ok(credit);
 		}
-		let state = Self::branch_of(collateral_id, stable_id)?.state;
-		let healable = credit.peek().min(state.debt.bad_debt);
+		let mut branch = Self::branch_of(collateral_id, stable_id)?;
+		let healable = credit.peek().min(branch.state.debt.bad_debt);
 		if healable.is_zero() {
 			// Nothing recorded (or an empty credit) — hand everything back.
 			return Ok(credit);
@@ -367,14 +364,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		let (to_burn, surplus) = credit.split(healable);
 		// Dropping the credit burns the withdrawn stablecoin.
 		drop(to_burn);
-		Branches::<T>::try_mutate(
-			(collateral_id, stable_id),
-			|maybe| -> Result<_, DispatchError> {
-				let state = &mut maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?.state;
-				state.heal_bad_debt(healable);
-				Ok(())
-			},
-		)?;
+		branch.state.heal_bad_debt(healable);
+		Pallet::<T>::commit_branch(collateral_id, stable_id, branch)?;
 		Pallet::<T>::deposit_event(Event::BadDebtHealed {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
