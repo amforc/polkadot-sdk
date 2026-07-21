@@ -76,6 +76,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> Result<(), DispatchError> {
+		ensure!(!amount.is_zero(), Error::<T>::ZeroDepositAmount);
 		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
 		let mut op = op.touch(&owner)?;
 		op.add_collateral(amount)?;
