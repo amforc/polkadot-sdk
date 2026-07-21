@@ -533,6 +533,9 @@ pub mod pallet {
 		/// The branch's single `dormant_redemption_target` slot is already held
 		/// by a different debt-bearing vault.
 		DormantTargetOccupied,
+		/// A borrow must mint a non-zero amount; use `change_rate` to adjust only
+		/// the vault's rate.
+		ZeroBorrowAmount,
 	}
 
 	#[pallet::hooks]
@@ -819,9 +822,10 @@ pub mod pallet {
 			Self::do_withdraw_collateral(who, collateral_id, stable_id, amount, recipient)
 		}
 
-		/// Borrow more pUSD from caller's vault, optionally adjusting the
-		/// rate. May revive a `Dormant` vault. `recipient` of the minted pUSD
-		/// defaults to the caller when `None`.
+		/// Borrow a non-zero amount of pUSD from caller's vault, optionally
+		/// adjusting the rate. Use `change_rate` to adjust the rate without
+		/// borrowing. May revive a `Dormant` vault. `recipient` of the minted
+		/// pUSD defaults to the caller when `None`.
 		#[pallet::call_index(3)]
 		#[pallet::weight(T::WeightInfo::borrow())]
 		pub fn borrow(

@@ -72,10 +72,8 @@ fn withdraw_breaking_cr_reverts() {
 	});
 }
 
-// The per-action dispatchables silently no-op on zero amounts rather than
-// reverting. This pins that behaviour so it can't regress unnoticed: each of
-// `deposit_collateral_for`, `withdraw_collateral`, `borrow`, `repay_for` is
-// called with `amount=0` and must succeed, leaving state unchanged.
+// Collateral and repayment dispatchables silently no-op on zero amounts rather
+// than reverting. They still touch the vault, so pending interest is settled.
 #[test]
 fn zero_amount_ops_are_no_ops() {
 	build_and_execute(|| {
@@ -101,15 +99,6 @@ fn zero_amount_ops_are_no_ops() {
 			0,
 			None
 		));
-		assert_ok!(crate::Pallet::<Test>::borrow(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			0,
-			None,
-			None,
-			Position::endpoints_only()
-		));
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 0));
 
 		let post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
@@ -117,6 +106,30 @@ fn zero_amount_ops_are_no_ops() {
 		assert_eq!(post.debt.interest, pre.debt.interest + 6);
 		assert_eq!(post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
 		assert_eq!(held(DOT, 1), 1_000);
+	});
+}
+
+#[test]
+fn zero_amount_borrow_is_rejected() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
+		let before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		advance_time(86_400_000);
+
+		assert_noop!(
+			crate::Pallet::<Test>::borrow(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				0,
+				Some(rate_pct(10, 100)),
+				None,
+				Position::endpoints_only()
+			),
+			crate::Error::<Test>::ZeroBorrowAmount
+		);
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
 	});
 }
 
