@@ -220,8 +220,10 @@ pub fn mutate_branch_state(
 ) {
 	let mut branch =
 		crate::Pallet::<Test>::branch_of(&collateral, &stable).expect("branch registered");
+	let outstanding_before = branch.state.debt.outstanding();
 	mutate(&mut branch.state);
-	crate::Pallet::<Test>::commit_branch(&collateral, &stable, branch).expect("branch committed");
+	crate::Pallet::<Test>::commit_branch(&collateral, &stable, outstanding_before, branch)
+		.expect("branch committed");
 }
 
 /// Derived branch mode (`None` when the market is unknown or the mode cannot

@@ -90,14 +90,13 @@ impl<T: Config> Pallet<T> {
 			.ok_or_else(|| Error::<T>::UnknownCollateral.into())
 	}
 
-	/// TODO: DOC
+	/// Commit a branch draft and update its collateral-wide outstanding debt.
 	pub(crate) fn commit_branch(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		outstanding_before: BalanceOf<T>,
 		branch: BranchOf<T>,
 	) -> DispatchResult {
-		let outstanding_before =
-			Self::branch_of(collateral_id, stable_id)?.state.debt.outstanding();
 		Self::apply_debt_delta(collateral_id, outstanding_before, branch.state.debt.outstanding())?;
 		Branches::<T>::insert(collateral_id, stable_id, branch);
 		Ok(())
@@ -539,7 +538,7 @@ impl<T: Config> Pallet<T> {
 	///
 	/// A borrow that also changes the rate inside the cooldown charges the
 	/// upfront fee over both the debt increase and the existing principal.
-	pub(crate) fn apply_borrow(
+	pub(crate) fn apply_borrow_unchecked(
 		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		config: &BranchConfig<BalanceOf<T>>,
 		vault: &mut Vault<BalanceOf<T>>,
@@ -572,7 +571,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Apply a rate change's branch-side accounting to `state` and return the
-	/// upfront fee; see [`Self::apply_borrow`] for the caller contract.
+	/// upfront fee; see [`Self::apply_borrow_unchecked`] for the caller contract.
 	pub(crate) fn apply_rate_change(
 		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		config: &BranchConfig<BalanceOf<T>>,

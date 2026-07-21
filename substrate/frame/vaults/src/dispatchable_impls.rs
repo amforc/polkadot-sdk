@@ -544,6 +544,7 @@ impl<T: Config> Pallet<T> {
 	) -> Result<(), DispatchError> {
 		let now = T::TimeProvider::now();
 		let mut branch = Self::branch_of(collateral_id, stable_id)?;
+		let outstanding_before = branch.state.debt.outstanding();
 		let old_mode = Self::mode_of(&branch, collateral_id, now).unwrap_or(BranchMode::Normal);
 		let minted = match (branch.state.frozen, target) {
 			(None, Some(_)) => {
@@ -564,7 +565,7 @@ impl<T: Config> Pallet<T> {
 		};
 		branch.state.frozen = target.map(|reason| FrozenState { reason, entered_at: now });
 		let new_mode = Self::mode_of(&branch, collateral_id, now).unwrap_or(BranchMode::Normal);
-		Self::commit_branch(collateral_id, stable_id, branch)?;
+		Self::commit_branch(collateral_id, stable_id, outstanding_before, branch)?;
 		// Mint only after the state is written, mirroring the operation-context
 		// commit.
 		if !minted.is_zero() {
