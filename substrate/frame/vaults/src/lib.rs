@@ -536,6 +536,8 @@ pub mod pallet {
 		/// A borrow must mint a non-zero amount; use `change_rate` to adjust only
 		/// the vault's rate.
 		ZeroBorrowAmount,
+		/// A collateral deposit must transfer a non-zero amount.
+		ZeroDepositAmount,
 	}
 
 	#[pallet::hooks]
@@ -807,8 +809,8 @@ pub mod pallet {
 			)
 		}
 
-		/// Permissionless deposit-into-vault: caller spends their own
-		/// collateral to deposit into `(collateral_id, owner)`.
+		/// Permissionless deposit-into-vault: caller spends a non-zero amount of
+		/// their own collateral to deposit into `(collateral_id, owner)`.
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::deposit_collateral_for())]
 		pub fn deposit_collateral_for(

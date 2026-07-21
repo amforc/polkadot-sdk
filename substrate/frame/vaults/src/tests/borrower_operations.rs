@@ -72,10 +72,10 @@ fn withdraw_breaking_cr_reverts() {
 	});
 }
 
-// Collateral and repayment dispatchables silently no-op on zero amounts rather
+// Withdrawal and repayment dispatchables silently no-op on zero amounts rather
 // than reverting. They still touch the vault, so pending interest is settled.
 #[test]
-fn zero_amount_ops_are_no_ops() {
+fn zero_amount_withdraw_and_repay_are_no_ops() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Non-trivial principal/rate so a day of interest is observable:
@@ -85,13 +85,6 @@ fn zero_amount_ops_are_no_ops() {
 		advance_time(86_400_000); // one day
 		let now = pallet_timestamp::Pallet::<Test>::get();
 
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			0
-		));
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
 			RuntimeOrigin::signed(1),
 			DOT,
@@ -105,6 +98,29 @@ fn zero_amount_ops_are_no_ops() {
 		assert_eq!(post.debt.principal, pre.debt.principal);
 		assert_eq!(post.debt.interest, pre.debt.interest + 6);
 		assert_eq!(post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
+		assert_eq!(held(DOT, 1), 1_000);
+	});
+}
+
+#[test]
+fn zero_amount_deposit_is_rejected_without_touching_the_vault() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
+		let before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		advance_time(86_400_000);
+
+		assert_noop!(
+			crate::Pallet::<Test>::deposit_collateral_for(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				1,
+				0
+			),
+			crate::Error::<Test>::ZeroDepositAmount
+		);
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
 		assert_eq!(held(DOT, 1), 1_000);
 	});
 }
