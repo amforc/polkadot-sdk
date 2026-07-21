@@ -220,6 +220,7 @@ impl<T: Config> Pallet<T> {
 		recipient: T::AccountId,
 		hint: Position<T::AccountId>,
 	) -> Result<(), DispatchError> {
+		ensure!(!amount.is_zero(), Error::<T>::ZeroBorrowAmount);
 		let op = OpContext::<T>::load(collateral_id, stable_id)?;
 		op.ensure_not_frozen()?;
 		let price = op.price()?;
@@ -244,7 +245,7 @@ impl<T: Config> Pallet<T> {
 		}
 		ensure!(op.vault.debt.principal >= config.minimum_debt, Error::<T>::DebtBelowMinimum);
 
-		let collateral = op.vault.redistribution_stake;
+		let collateral = op.vault.collateral;
 		let total_debt = op.vault.debt.total();
 		Self::ensure_above_icr(collateral, total_debt, price, &config)?;
 
