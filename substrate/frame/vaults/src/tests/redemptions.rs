@@ -462,7 +462,7 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 				1,
 				100
 			),
-			crate::Error::<Test>::DebtBelowMinimum
+			crate::Error::<Test>::InvalidVaultStatus
 		);
 
 		// Borrow across MinimumDebt revives it to Active...
