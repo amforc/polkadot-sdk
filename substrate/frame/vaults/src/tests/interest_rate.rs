@@ -680,7 +680,7 @@ fn accrued_interest_is_path_independent_across_pokes() {
 	});
 }
 
-// The open fee is priced by the same `apply_borrow` path every borrow uses.
+// The open fee is priced by the same checked-borrow path every borrow uses.
 // Pin it against the closed form it must equal: the post-open debt-weighted
 // average rate applied to the new debt over the upfront-fee period.
 #[test]
