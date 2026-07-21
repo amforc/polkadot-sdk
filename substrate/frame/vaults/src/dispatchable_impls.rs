@@ -172,6 +172,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> Result<(), DispatchError> {
+		ensure!(!amount.is_zero(), Error::<T>::ZeroRepayAmount);
 		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
 		let mut op = op.touch(&owner)?;
 		ensure!(!op.status().is_final_recovery(), Error::<T>::VaultInFinalRecovery);
