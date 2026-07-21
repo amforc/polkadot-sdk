@@ -83,7 +83,6 @@ impl<T: Config> Pallet<T> {
 		let total_debt = initial_debt.saturating_add(upfront_fee);
 		Self::ensure_above_icr(initial_collateral, total_debt, price, &config)?;
 
-		op.branch.state.set_vault_stake(&mut vault, initial_collateral);
 		op.branch.state.add_collateral(initial_collateral);
 
 		T::CollateralAssets::hold(
@@ -146,10 +145,7 @@ impl<T: Config> Pallet<T> {
 
 		op.ctx.branch.state.add_collateral(amount);
 		op.vault.collateral = op.vault.collateral.saturating_add(amount);
-		if op.status.is_active() {
-			let new_stake = op.vault.redistribution_stake.saturating_add(amount);
-			op.ctx.branch.state.set_vault_stake(&mut op.vault, new_stake);
-		}
+		op.sync_stake_for(op.status);
 
 		Self::deposit_event(Event::CollateralDeposited {
 			collateral_id: op.ctx.collateral_id.clone(),
@@ -190,7 +186,8 @@ impl<T: Config> Pallet<T> {
 		}
 
 		op.ctx.branch.state.remove_collateral(amount);
-		op.ctx.branch.state.set_vault_stake(&mut op.vault, new_collateral);
+		op.vault.collateral = new_collateral;
+		op.sync_stake_for(op.status);
 
 		T::CollateralAssets::transfer_on_hold(
 			op.ctx.collateral_id.clone(),
@@ -203,7 +200,6 @@ impl<T: Config> Pallet<T> {
 			Fortitude::Polite,
 		)?;
 
-		op.vault.collateral = new_collateral;
 		Self::deposit_event(Event::CollateralWithdrawn {
 			collateral_id: op.ctx.collateral_id.clone(),
 			stable_id: op.ctx.stable_id.clone(),
@@ -521,7 +517,7 @@ impl<T: Config> Pallet<T> {
 
 		T::VaultLists::remove(&op.ctx.rate_list(), &owner)
 			.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
-		op.ctx.branch.state.set_vault_stake(&mut op.vault, BalanceOf::<T>::zero());
+		op.sync_stake_for(VaultStatus::FinalRecovery);
 		recovery::append::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, owner.clone())?;
 
 		Self::deposit_event(Event::VaultStatusChanged {
@@ -556,7 +552,7 @@ impl<T: Config> Pallet<T> {
 		let new_status = if rejoin_active { VaultStatus::Active } else { VaultStatus::Dormant };
 
 		recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, &owner)?;
-		op.ctx.branch.state.set_vault_stake(&mut op.vault, collateral);
+		op.sync_stake_for(new_status);
 		op.vault.redistribution_snapshot = op.ctx.branch.state.redistribution;
 		if !rejoin_active &&
 			!total_debt.is_zero() &&

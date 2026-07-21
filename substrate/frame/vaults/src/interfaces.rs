@@ -234,8 +234,6 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		}
 
 		let new_total = op.vault.debt.total();
-		let stake_changes = matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) &&
-			!collateral_to_recipient.is_zero();
 		op.ctx.branch.state.apply_debt_payment(
 			payment,
 			op.vault.annual_rate,
@@ -243,10 +241,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		);
 		op.ctx.branch.state.remove_collateral(collateral_to_recipient);
 		op.vault.collateral = op.vault.collateral.saturating_sub(collateral_to_recipient);
-		if stake_changes {
-			let new_stake = op.vault.redistribution_stake.saturating_sub(collateral_to_recipient);
-			op.ctx.branch.state.set_vault_stake(&mut op.vault, new_stake);
-		}
+		op.sync_stake_for(op.status);
 		if matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) {
 			if new_total.is_zero() {
 				op.ctx.branch.state.release_dormant_target(owner);
@@ -400,8 +395,7 @@ fn settle_redemption_status<T: Config>(
 		},
 		VaultStatus::FinalRecovery if new_total.is_zero() => {
 			recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, &op.owner)?;
-			let new_stake = op.vault.collateral;
-			op.ctx.branch.state.set_vault_stake(&mut op.vault, new_stake);
+			op.sync_stake_for(VaultStatus::Dormant);
 			op.vault.redistribution_snapshot = op.ctx.branch.state.redistribution;
 			Pallet::<T>::deposit_event(Event::VaultStatusChanged {
 				collateral_id: op.ctx.collateral_id.clone(),
