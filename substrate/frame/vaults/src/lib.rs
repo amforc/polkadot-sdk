@@ -538,6 +538,8 @@ pub mod pallet {
 		ZeroBorrowAmount,
 		/// A collateral deposit must transfer a non-zero amount.
 		ZeroDepositAmount,
+		/// A collateral withdrawal must transfer a non-zero amount.
+		ZeroWithdrawAmount,
 	}
 
 	#[pallet::hooks]
@@ -824,7 +826,7 @@ pub mod pallet {
 			Self::do_deposit_collateral_for(from, owner, collateral_id, stable_id, amount)
 		}
 
-		/// Withdraw collateral from caller's vault on `collateral_id`.
+		/// Withdraw a non-zero amount of collateral from caller's vault on `collateral_id`.
 		/// `recipient` defaults to the caller when `None`. Withdrawing the
 		/// last collateral from a debt-free vault closes it outright.
 		#[pallet::call_index(2)]
