@@ -214,7 +214,7 @@ impl<T: Config> BranchOp<T> {
 			ensure!(principal_after <= state.effective_ceiling, Error::<T>::DebtCeilingExceeded);
 		}
 		let upfront_fee =
-			Pallet::<T>::apply_borrow(state, config, vault, amount, new_rate, self.now);
+			Pallet::<T>::apply_borrow_unchecked(state, config, vault, amount, new_rate, self.now);
 		self.ensure_global_ceiling(price)?;
 		Pallet::<T>::ensure_above_icr(
 			vault.collateral,
@@ -804,7 +804,12 @@ impl<T: Config> VaultOp<T> {
 			Vaults::<T>::remove(key);
 		}
 		let branch = self.ctx.branch;
-		Pallet::<T>::commit_branch(&self.ctx.collateral_id, &self.ctx.stable_id, branch)?;
+		Pallet::<T>::commit_branch(
+			&self.ctx.collateral_id,
+			&self.ctx.stable_id,
+			self.ctx.outstanding_at_load,
+			branch,
+		)?;
 
 		// Mint only after the state is written; the two amounts stay separate
 		// credits so the fee handler's per-credit rounding is unchanged.
