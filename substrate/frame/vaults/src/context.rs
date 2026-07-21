@@ -341,10 +341,10 @@ impl<T: Config> VaultOp<T> {
 		self.ctx.price()
 	}
 
-	/// Validate a requested collateral withdrawal and report whether withdrawing
-	/// the full amount should close the now-empty vault instead.
-	pub(crate) fn withdrawal_closes_vault(
-		&self,
+	/// Validate and apply a collateral withdrawal, returning `true` instead when
+	/// withdrawing the full amount should close the now-empty vault.
+	pub(crate) fn apply_collateral_withdrawal(
+		&mut self,
 		amount: BalanceOf<T>,
 		price: FixedU128,
 	) -> Result<bool, DispatchError> {
@@ -358,7 +358,11 @@ impl<T: Config> VaultOp<T> {
 		if !debt.is_zero() {
 			Pallet::<T>::ensure_above_icr(collateral_after, debt, price, &self.ctx.branch.config)?;
 		}
-		Ok(debt.is_zero() && collateral_after.is_zero())
+		if debt.is_zero() && collateral_after.is_zero() {
+			return Ok(true);
+		}
+		self.apply_collateral_removal(amount, collateral_after)?;
+		Ok(false)
 	}
 
 	pub(crate) fn ensure_liquidatable(&self, price: FixedU128) -> DispatchResult {
@@ -416,6 +420,14 @@ impl<T: Config> VaultOp<T> {
 			.collateral
 			.checked_sub(&amount)
 			.ok_or(Error::<T>::InsufficientCollateral)?;
+		self.apply_collateral_removal(amount, vault_collateral)
+	}
+
+	fn apply_collateral_removal(
+		&mut self,
+		amount: BalanceOf<T>,
+		vault_collateral: BalanceOf<T>,
+	) -> Result<(), DispatchError> {
 		let branch_collateral = self
 			.ctx
 			.branch

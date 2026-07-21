@@ -109,14 +109,13 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 		recipient: T::AccountId,
 	) -> Result<(), DispatchError> {
+		ensure!(!amount.is_zero(), Error::<T>::ZeroWithdrawAmount);
 		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
 		let price = op.price()?;
 		let mut op = op.touch(&owner)?;
-		if op.withdrawal_closes_vault(amount, price)? {
+		if op.apply_collateral_withdrawal(amount, price)? {
 			return Self::close_inner(op, &recipient, price);
 		}
-
-		op.remove_collateral(amount)?;
 
 		T::CollateralAssets::transfer_on_hold(
 			op.collateral_id().clone(),
