@@ -173,7 +173,8 @@ impl<T: Config> BranchOp<T> {
 			initial_collateral,
 			self.now,
 		);
-		let upfront_fee = self.apply_borrow(&mut vault, initial_debt, annual_rate, price)?;
+		let upfront_fee =
+			self.apply_checked_borrow(&mut vault, initial_debt, annual_rate, price)?;
 		self.branch.state.total_collateral = self
 			.branch
 			.state
@@ -186,7 +187,7 @@ impl<T: Config> BranchOp<T> {
 		Ok(self.attach_new(owner, vault))
 	}
 
-	fn apply_borrow(
+	fn apply_checked_borrow(
 		&mut self,
 		vault: &mut Vault<BalanceOf<T>>,
 		amount: BalanceOf<T>,
@@ -452,14 +453,20 @@ impl<T: Config> VaultOp<T> {
 		let old_rate = self.vault.annual_rate;
 		let new_rate = maybe_new_rate.unwrap_or(old_rate);
 		let dormant_to_active = self.status.is_dormant();
-		let upfront_fee = self.ctx.apply_borrow(&mut self.vault, amount, new_rate, price)?;
+		let rate_changed = old_rate != new_rate;
+		let upfront_fee =
+			self.ctx.apply_checked_borrow(&mut self.vault, amount, new_rate, price)?;
 		self.ctx.charge_upfront_fee(&self.owner, upfront_fee);
 		if dormant_to_active {
-			self.activate(hint)?;
-		} else if old_rate != new_rate {
+			debug_assert!(
+				self.vault.debt.total() >= self.ctx.branch.config.minimum_debt,
+				"the checked principal floor implies the total-debt floor"
+			);
+			self.activate_dormant_unchecked(hint)?;
+		} else if rate_changed {
 			self.reindex(hint)?;
 		}
-		if old_rate != new_rate {
+		if rate_changed {
 			Pallet::<T>::deposit_event(Event::BorrowRateChanged {
 				collateral_id: self.ctx.collateral_id.clone(),
 				stable_id: self.ctx.stable_id.clone(),
@@ -532,6 +539,14 @@ impl<T: Config> VaultOp<T> {
 			self.vault.debt.total() >= self.ctx.branch.config.minimum_debt,
 			Error::<T>::DebtBelowMinimum
 		);
+		self.activate_dormant_unchecked(hint)
+	}
+
+	fn activate_dormant_unchecked(
+		&mut self,
+		hint: Position<T::AccountId>,
+	) -> Result<(), DispatchError> {
+		debug_assert!(self.status.is_dormant());
 		T::VaultLists::insert(self.rate_list(), self.owner.clone(), self.vault.annual_rate, hint)
 			.map_err(Pallet::<T>::map_error)?;
 		self.ctx.branch.state.release_dormant_target(&self.owner);
