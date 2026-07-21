@@ -391,7 +391,7 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	pub(crate) fn add_collateral(&mut self, amount: BalanceOf<T>) -> Result<(), DispatchError> {
-		ensure!(!self.status.is_dormant(), Error::<T>::DebtBelowMinimum);
+		ensure!(!self.status.is_dormant(), Error::<T>::InvalidVaultStatus);
 		let vault_collateral = self
 			.vault
 			.collateral
