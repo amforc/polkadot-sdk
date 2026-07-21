@@ -1,12 +1,11 @@
 //! pUSD primitive trait implementations.
 
 use crate::{
-	context::{OpContext, TcrGate, VaultOp},
+	context::BranchOp,
 	pallet::{
 		BalanceOf, Branches, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason,
 		Pallet, StableCreditOf, StableIdOf,
 	},
-	recovery,
 	types::VaultStatus,
 };
 use frame::{
@@ -21,7 +20,6 @@ use frame::{
 		Time,
 	},
 };
-use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{
 	BranchMode, BranchModeProvider, LiquidationSettlement, LiquidationSnapshot,
 	RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
@@ -57,31 +55,19 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			DispatchError,
 		>,
 	) -> DispatchResult {
-		let op = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
-		op.ensure_not_frozen()?;
+		let op = BranchOp::<T>::load_unfrozen(collateral_id.clone(), stable_id.clone())?;
 		let price = op.price()?;
 		let mut op = op.touch(owner)?;
-		ensure!(!op.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
-
-		let post_touch_debt = op.vault.debt.total();
-		let held = op.vault.collateral;
-		let config = op.ctx.config();
-		let cr =
-			pusd_primitives::collateralization_ratio::<BalanceOf<T>>(held, post_touch_debt, price)
-				.ok_or(Error::<T>::VaultNotLiquidatable)?;
-		ensure!(cr < config.minimum_collateralization_ratio, Error::<T>::VaultNotLiquidatable);
-
-		ensure!(
-			op.ctx.branch.state.stakes.total != op.vault.redistribution_stake,
-			Error::<T>::LastVaultCannotBeLiquidated
-		);
+		op.ensure_liquidatable(price)?;
+		let post_touch_debt = op.vault().debt.total();
+		let held = op.vault().collateral;
 
 		// Turn the exact vault hold into the one collateral budget external
 		// liquidation paths partition.
 		let (collateral, shortfall) = T::CollateralAssets::slash(
-			op.ctx.collateral_id.clone(),
+			op.collateral_id().clone(),
 			&HoldReason::VaultCollateral.into(),
-			owner,
+			op.owner(),
 			held,
 		);
 		ensure!(shortfall.is_zero(), Error::<T>::InvalidLiquidationSettlement);
@@ -91,8 +77,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			settlement;
 		ensure!(debt_offset <= post_touch_debt, Error::<T>::InvalidLiquidationSettlement);
 		ensure!(
-			owner_surplus.asset() == *collateral_id &&
-				redistribution_collateral.asset() == *collateral_id,
+			owner_surplus.asset() == *op.collateral_id() &&
+				redistribution_collateral.asset() == *op.collateral_id(),
 			Error::<T>::InvalidLiquidationSettlement
 		);
 		let owner_surplus_amount = owner_surplus.peek();
@@ -102,31 +88,14 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			.ok_or(ArithmeticError::Overflow)?;
 		ensure!(returned <= held, Error::<T>::InvalidLiquidationSettlement);
 
-		let redistributed_debt = post_touch_debt.saturating_sub(debt_offset);
-		op.ctx.branch.state.detach_vault(&op.vault);
-		op.ctx.branch.state.release_dormant_target(owner);
-		// Redistributed collateral stays branch-owned until recipient touch.
-		let non_redistribution_out = held.saturating_sub(redistribution_amount);
-		op.ctx.branch.state.remove_collateral(non_redistribution_out);
-		if !redistributed_debt.is_zero() || !redistribution_amount.is_zero() {
-			op.ctx
-				.branch
-				.state
-				.record_redistribution(redistributed_debt, redistribution_amount, op.ctx.now)
-				.ok_or(Error::<T>::RedistributionWouldOverflow)?;
-		}
-
-		match T::VaultLists::remove(&op.ctx.rate_list(), owner) {
-			Ok(()) | Err(ListError::ItemNotFound) => {},
-			Err(_) => return Err(Error::<T>::RateIndexInvariantBroken.into()),
-		}
+		op.apply_liquidation(debt_offset, redistribution_amount)?;
 
 		if !redistribution_amount.is_zero() {
 			let redistribution_account =
-				Pallet::<T>::redistribution_account(&op.ctx.collateral_id, &op.ctx.stable_id);
+				Pallet::<T>::redistribution_account(op.collateral_id(), op.stable_id());
 			resolve_collateral_credit::<T>(&redistribution_account, redistribution_collateral)?;
 			T::CollateralAssets::hold(
-				op.ctx.collateral_id.clone(),
+				op.collateral_id().clone(),
 				&HoldReason::VaultCollateral.into(),
 				&redistribution_account,
 				redistribution_amount,
@@ -138,13 +107,13 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		// Whatever external offsets, JIT, and the keeper did not consume is the
 		// liquidated owner's surplus.
 		if !owner_surplus_amount.is_zero() {
-			resolve_collateral_credit::<T>(owner, owner_surplus)?;
+			resolve_collateral_credit::<T>(op.owner(), owner_surplus)?;
 		} else {
 			drop(owner_surplus);
 		}
 
 		// Liquidation eligibility is MCR-gated above; the mode rules do not apply.
-		op.commit_removing_vault(TcrGate::Exempt)
+		op.remove_exempt()
 	}
 
 	/// Priority order: `FinalRecovery` FIFO head, then `dormant_redemption_target`,
@@ -181,31 +150,22 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			DispatchError,
 		>,
 	) -> DispatchResult {
-		let op = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
-		op.ensure_not_frozen()?;
+		let op = BranchOp::<T>::load_unfrozen(collateral_id.clone(), stable_id.clone())?;
 		let mut op = op.touch(owner)?;
-		let config = op.ctx.config();
-		let post_touch_debt = op.vault.debt.total();
-		// Collateral lives on the vault row (a shared on-hold balance may back
-		// several markets on the same collateral asset), so read it directly.
-		let held = op.vault.collateral;
-		let snapshot = RedemptionStepSnapshot {
-			status: op.status,
-			debt: post_touch_debt,
-			collateral: held,
-			redistribution_penalty: config.redistribution_penalty,
-		};
+		let snapshot = op.redemption_snapshot();
+		let post_touch_debt = snapshot.debt;
+		let held = snapshot.collateral;
 
 		let Some(settlement) = build_settlement(snapshot)? else {
 			// Skipped target: persist the touch so the accrual it caused is paid for.
-			return op.commit(TcrGate::Exempt);
+			return op.commit_exempt();
 		};
 		let RedemptionSettlement { debt_payment, collateral_to_recipient } = settlement;
 
 		// The payment credit is the sole authority on how much debt this step
 		// cancels. It must carry real value: `Ok(None)` is the touch-only form,
 		// so a zero payment cannot release collateral.
-		ensure!(debt_payment.asset() == *stable_id, Error::<T>::InvalidRedemptionSettlement);
+		ensure!(debt_payment.asset() == *op.stable_id(), Error::<T>::InvalidRedemptionSettlement);
 		let debt_to_cancel = debt_payment.peek();
 		ensure!(
 			!debt_to_cancel.is_zero() &&
@@ -217,14 +177,14 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		// Dropping the credit burns the withdrawn stablecoin.
 		drop(debt_payment);
 
-		let payment = op.vault.debt.cancel(debt_to_cancel);
+		let payment = op.redeem(debt_to_cancel);
 		debug_assert_eq!(payment.total(), debt_to_cancel);
 
 		if !collateral_to_recipient.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
-				op.ctx.collateral_id.clone(),
+				op.collateral_id().clone(),
 				&HoldReason::VaultCollateral.into(),
-				owner,
+				op.owner(),
 				recipient,
 				collateral_to_recipient,
 				Precision::Exact,
@@ -233,37 +193,19 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			)?;
 		}
 
-		let new_total = op.vault.debt.total();
-		op.ctx.branch.state.apply_debt_payment(
-			payment,
-			op.vault.annual_rate,
-			op.vault.debt.principal,
-		);
-		op.ctx.branch.state.remove_collateral(collateral_to_recipient);
-		op.vault.collateral = op.vault.collateral.saturating_sub(collateral_to_recipient);
-		op.sync_stake_for(op.status);
-		if matches!(op.status, VaultStatus::Active | VaultStatus::Dormant) {
-			if new_total.is_zero() {
-				op.ctx.branch.state.release_dormant_target(owner);
-			} else if new_total < config.minimum_debt &&
-				!op.ctx.branch.state.try_park_dormant_target(owner.clone())
-			{
-				return Err(Error::<T>::DormantTargetOccupied.into());
-			}
-		}
-
-		settle_redemption_status::<T>(&mut op, &config)?;
+		op.remove_collateral(collateral_to_recipient)?;
+		op.reconcile_after_debt_reduction()?;
 
 		Pallet::<T>::deposit_event(Event::VaultRedeemed {
-			collateral_id: op.ctx.collateral_id.clone(),
-			stable_id: op.ctx.stable_id.clone(),
-			owner: owner.clone(),
+			collateral_id: op.collateral_id().clone(),
+			stable_id: op.stable_id().clone(),
+			owner: op.owner().clone(),
 			recipient: recipient.clone(),
 			debt_cancelled: debt_to_cancel,
 			collateral_to_recipient,
-			vault_annual_rate: op.vault.annual_rate,
+			vault_annual_rate: op.vault().annual_rate,
 		});
-		op.commit(TcrGate::Exempt)
+		op.commit_exempt()
 	}
 
 	#[transactional]
@@ -272,33 +214,20 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<BalanceOf<T>, DispatchError> {
-		let op = OpContext::<T>::load(collateral_id.clone(), stable_id.clone())?;
-		op.ensure_not_frozen()?;
+		let op = BranchOp::<T>::load_unfrozen(collateral_id.clone(), stable_id.clone())?;
 		let mut op = op.touch(owner)?;
-		ensure!(op.status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
 		// Move the fully-accrued residual debt off the vault and onto the branch
 		// bad-debt ledger; the orchestrator burns it from the Insurance Fund via
 		// `heal`.
-		let residual = op.vault.debt.total();
-		// Collateral lives on the vault row; the leftover here is sub-atom dust.
-		let dust = op.vault.collateral;
-		op.ctx.branch.state.detach_vault(&op.vault);
-		op.ctx.branch.state.record_bad_debt(residual);
-		op.ctx.branch.state.remove_collateral(dust);
-		let swept = if op.ctx.branch.state.is_empty_of_liability() {
-			op.ctx.branch.state.sweep_orphan_debt()
-		} else {
-			BalanceOf::<T>::zero()
-		};
-		recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, owner)?;
+		let (residual, dust, swept) = op.settle_recovery_residual()?;
 
 		// Release only this market's residual dust from the shared hold before the
 		// vault row vanishes; the owner's hold may still back other markets.
 		if !dust.is_zero() {
 			T::CollateralAssets::release(
-				op.ctx.collateral_id.clone(),
+				op.collateral_id().clone(),
 				&HoldReason::VaultCollateral.into(),
-				owner,
+				op.owner(),
 				dust,
 				Precision::Exact,
 			)?;
@@ -306,27 +235,27 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 		if !swept.is_zero() {
 			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id: op.ctx.collateral_id.clone(),
-				stable_id: op.ctx.stable_id.clone(),
+				collateral_id: op.collateral_id().clone(),
+				stable_id: op.stable_id().clone(),
 				amount: swept,
 			});
 		}
 		if !residual.is_zero() {
 			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id: op.ctx.collateral_id.clone(),
-				stable_id: op.ctx.stable_id.clone(),
+				collateral_id: op.collateral_id().clone(),
+				stable_id: op.stable_id().clone(),
 				amount: residual,
 			});
 		}
 		// The owner-naming record of this settlement: the row is removed, so
 		// no status-change event can carry it. The dust went to the owner.
 		Pallet::<T>::deposit_event(Event::VaultClosed {
-			collateral_id: op.ctx.collateral_id.clone(),
-			stable_id: op.ctx.stable_id.clone(),
-			owner: owner.clone(),
-			recipient: owner.clone(),
+			collateral_id: op.collateral_id().clone(),
+			stable_id: op.stable_id().clone(),
+			owner: op.owner().clone(),
+			recipient: op.owner().clone(),
 		});
-		op.commit_removing_vault(TcrGate::Exempt)?;
+		op.remove_exempt()?;
 		Ok(residual)
 	}
 
@@ -380,32 +309,4 @@ fn resolve_collateral_credit<T: Config>(
 		drop(credit);
 		TokenError::CannotCreate.into()
 	})
-}
-
-/// Update rate/FIFO membership after redemption.
-fn settle_redemption_status<T: Config>(
-	op: &mut VaultOp<T>,
-	config: &crate::types::BranchConfig<BalanceOf<T>>,
-) -> DispatchResult {
-	let new_total = op.vault.debt.total();
-	match op.status {
-		VaultStatus::Active if new_total < config.minimum_debt => {
-			T::VaultLists::remove(&op.ctx.rate_list(), &op.owner)
-				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
-		},
-		VaultStatus::FinalRecovery if new_total.is_zero() => {
-			recovery::remove::<T>(&op.ctx.collateral_id, &op.ctx.stable_id, &op.owner)?;
-			op.sync_stake_for(VaultStatus::Dormant);
-			op.vault.redistribution_snapshot = op.ctx.branch.state.redistribution;
-			Pallet::<T>::deposit_event(Event::VaultStatusChanged {
-				collateral_id: op.ctx.collateral_id.clone(),
-				stable_id: op.ctx.stable_id.clone(),
-				owner: op.owner.clone(),
-				old_status: VaultStatus::FinalRecovery,
-				new_status: VaultStatus::Dormant,
-			});
-		},
-		_ => {},
-	}
-	Ok(())
 }
