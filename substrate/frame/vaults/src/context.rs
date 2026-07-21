@@ -216,17 +216,12 @@ impl<T: Config> OpContext<T> {
 		}
 		vault.last_interest_time = self.branch.state.interest_time(self.now);
 
-		// FinalRecovery vaults are not stake-bearing; their stake stays zero while
-		// `collateral` persists on the row.
-		if !status.is_final_recovery() && vault.redistribution_stake != vault.collateral {
-			let new_stake = vault.collateral;
-			self.branch.state.set_vault_stake(&mut vault, new_stake);
-		}
-
 		// A touch preserves the TCR inputs — principal + pending redistribution
 		// move as a sum, collateral only changes hands, and the aggregate accrual
 		// already ran at load — so the load baseline is the post-touch baseline.
-		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, status })
+		let mut op = VaultOp { ctx: self, owner: owner.clone(), vault, status };
+		op.sync_stake_for(status);
+		Ok(op)
 	}
 
 	/// Attach a freshly-built vault row for `owner` — the only path on which a
@@ -234,7 +229,10 @@ impl<T: Config> OpContext<T> {
 	/// fee may already be charged (an open computes its fee before the row
 	/// exists).
 	pub fn attach_new(self, owner: &T::AccountId, vault: Vault<BalanceOf<T>>) -> VaultOp<T> {
-		VaultOp { ctx: self, owner: owner.clone(), vault, status: VaultStatus::Active }
+		let mut op =
+			VaultOp { ctx: self, owner: owner.clone(), vault, status: VaultStatus::Active };
+		op.sync_stake_for(VaultStatus::Active);
+		op
 	}
 
 	fn assert_unclobbered(&self) {
@@ -248,6 +246,17 @@ impl<T: Config> OpContext<T> {
 }
 
 impl<T: Config> VaultOp<T> {
+	/// Synchronize the vault's redistribution stake for `status`. Eligible
+	/// vaults stake their full collateral; `FinalRecovery` vaults stake zero
+	/// while retaining their collateral on the row.
+	pub fn sync_stake_for(&mut self, status: VaultStatus) {
+		let target =
+			if status.is_final_recovery() { BalanceOf::<T>::zero() } else { self.vault.collateral };
+		if self.vault.redistribution_stake != target {
+			self.ctx.branch.state.set_vault_stake(&mut self.vault, target);
+		}
+	}
+
 	/// Write the owned vault row and the branch record, gated by `gate`.
 	pub fn commit(self, gate: TcrGate) -> Result<(), DispatchError> {
 		self.commit_inner(gate, true)
