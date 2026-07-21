@@ -128,25 +128,6 @@ impl<Balance> Vault<Balance> {
 	pub(crate) fn cooldown_elapsed(&self, config: &BranchConfig<Balance>, now: Millis) -> bool {
 		now.saturating_sub(self.last_rate_update) >= config.rate_adjustment_cooldown
 	}
-
-	/// Existing principal the rate-change part of the borrow upfront fee is
-	/// charged against: the current principal when `borrow` also moves the rate
-	/// within the cooldown window, zero otherwise (a pure debt increase, or the
-	/// cooldown has elapsed).
-	pub(crate) fn rate_change_base(
-		&self,
-		maybe_new_rate: Option<FixedU128>,
-		cooldown_elapsed: bool,
-	) -> Balance
-	where
-		Balance: Zero + Copy,
-	{
-		if maybe_new_rate.is_some_and(|rate| rate != self.annual_rate) && !cooldown_elapsed {
-			self.debt.principal
-		} else {
-			Balance::zero()
-		}
-	}
 }
 
 /// Branch governance/risk parameters.
