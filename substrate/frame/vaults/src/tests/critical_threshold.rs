@@ -324,9 +324,7 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 // borrow until enough collateral is deposited to bring the CR back above ICR.
 // The ICR gate is per-vault and mode-independent — borrowing is only ever
 // allowed down to ICR (see `normal_mode_blocks_borrow_when_cr_below_icr` for the
-// Normal-mode case). A zero-amount borrow still triggers the ICR guard, so we
-// use `borrow(+0)` as a CR-gate-only probe that validates CR without changing
-// debt.
+// Normal-mode case).
 #[test]
 fn safety_mode_blocks_borrow_when_cr_below_icr() {
 	build_and_execute(|| {
@@ -341,14 +339,14 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 		// The price drop puts the branch in Safety mode (TCR ≈ 44%, below 130%).
 		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Safety),);
 
-		// borrow(+0) revalidates CR without touching debt, so we use it as a
-		// gate-only probe. CR is below ICR → reverts.
+		// CR is below ICR, so the per-vault guard fires before the Safety-mode
+		// TCR guard.
 		assert_noop!(
 			crate::Pallet::<Test>::borrow(
 				RuntimeOrigin::signed(2),
 				DOT,
 				PUSD,
-				0,
+				1,
 				None,
 				None,
 				Position::endpoints_only()
@@ -365,25 +363,26 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 			2,
 			100
 		));
-		// borrow(+0) now passes the CR gate. The TCR check passes too because
-		// post_TCR == pre_TCR for a zero-amount borrow (Safety-branch allows
-		// equal TCR).
-		assert_ok!(crate::Pallet::<Test>::borrow(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			0,
-			None,
-			None,
-			Position::endpoints_only()
-		));
+		// The same borrow now clears ICR and reaches the branch-level guard;
+		// increasing debt in Safety mode would worsen TCR.
+		assert_noop!(
+			crate::Pallet::<Test>::borrow(
+				RuntimeOrigin::signed(2),
+				DOT,
+				PUSD,
+				1,
+				None,
+				None,
+				Position::endpoints_only()
+			),
+			crate::Error::<Test>::SafetyModeTcrWorsening
+		);
 	});
 }
 
 // The ICR gate is not a Safety-mode rule: borrowing is only ever allowed down to
 // ICR, in Normal mode too. Here a healthy whale keeps the branch TCR well in
-// Normal mode while acct 2's CR sits below ICR — the `borrow(+0)` CR probe still
-// reverts.
+// Normal mode while acct 2's CR sits below ICR — a small borrow still reverts.
 #[test]
 fn normal_mode_blocks_borrow_when_cr_below_icr() {
 	build_and_execute(|| {
@@ -404,7 +403,7 @@ fn normal_mode_blocks_borrow_when_cr_below_icr() {
 				RuntimeOrigin::signed(2),
 				DOT,
 				PUSD,
-				0,
+				1,
 				None,
 				None,
 				Position::endpoints_only()
