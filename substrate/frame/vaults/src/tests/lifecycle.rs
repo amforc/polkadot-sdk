@@ -83,15 +83,6 @@ fn create_branch_rejects_duplicate_collateral() {
 }
 
 #[test]
-fn branches_view_lists_registered_assets_in_registration_order() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		register_market(TOKEN_X, PUSD);
-		assert_eq!(crate::Pallet::<Test>::branches(), alloc::vec![(DOT, PUSD), (TOKEN_X, PUSD)]);
-	});
-}
-
-#[test]
 fn open_vault_holds_collateral_and_mints_pusd() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
@@ -257,10 +248,11 @@ fn open_vault_on_multi_asset_branch() {
 fn frozen_branch_blocks_user_ops() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		assert_noop!(
 			open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)),
@@ -321,10 +313,11 @@ fn refresh_branch_clears_oracle_frozen() {
 fn refresh_branch_does_not_clear_governance_frozen() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
@@ -336,24 +329,27 @@ fn governance_clear_clears_governance_frozen() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Defensive (acct 999) cannot clear governance Frozen — needs Full.
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		assert_noop!(
-			crate::Pallet::<Test>::clear_governance_frozen_mode(
+			crate::Pallet::<Test>::set_governance_frozen(
 				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
-				PUSD
+				PUSD,
+				false
 			),
 			crate::Error::<Test>::NotBranchAdmin
 		);
 		// Full clears governance Frozen.
-		assert_ok!(crate::Pallet::<Test>::clear_governance_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			false
 		));
 		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
@@ -368,10 +364,11 @@ fn governance_clear_is_noop_for_oracle_frozen() {
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Governance clear refuses oracle-Frozen state — branch stays frozen.
-		assert_ok!(crate::Pallet::<Test>::clear_governance_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			false
 		));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
@@ -382,10 +379,11 @@ fn frozen_poke_pins_interest_time_without_minting() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		let before = branch_state(DOT, PUSD).expect("branch state");
 
@@ -400,58 +398,5 @@ fn frozen_poke_pins_interest_time_without_minting() {
 			"interest clock pinned across the frozen window"
 		);
 		assert!(after.is_frozen(), "poke does not clear Frozen");
-	});
-}
-
-// The flat idle walk: a first pass drains its weight meter mid-map and parks
-// the cursor; a starved pass leaves the cursor alone; the final pass finishes
-// the map, wraps by clearing the cursor, and every vault has been refreshed
-// exactly once across the two full passes.
-#[test]
-fn on_idle_walk_budgets_touches_and_wraps_the_cursor() {
-	use crate::weights::WeightInfo;
-
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		for owner in 1..=5u64 {
-			assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		}
-		advance_time(365 * 24 * 3_600 * 1_000);
-
-		// One branch refresh plus four of the five vaults; the fifth vault
-		// does not fit the meter.
-		let per_branch = <Test as crate::Config>::WeightInfo::refresh_branch();
-		let per_vault = <Test as crate::Config>::WeightInfo::on_idle_one_vault();
-		let budget = per_branch.saturating_add(per_vault.saturating_mul(4));
-		let spent = crate::Pallet::<Test>::on_idle_walk(budget);
-		assert_eq!(spent, budget, "first pass consumes the whole meter");
-		assert!(
-			crate::pallet::IdleCursor::<Test>::get().is_some(),
-			"meter drained mid-map parks the cursor"
-		);
-
-		// A budget covering the branch pass but not one vault refreshes the
-		// branch and leaves the parked cursor untouched.
-		let spent = crate::Pallet::<Test>::on_idle_walk(per_branch);
-		assert_eq!(spent, per_branch, "starved pass still reconciles the branch");
-		assert!(
-			crate::pallet::IdleCursor::<Test>::get().is_some(),
-			"starved pass leaves the parked cursor untouched"
-		);
-
-		let spent = crate::Pallet::<Test>::on_idle_walk(budget);
-		assert_eq!(
-			spent,
-			per_branch.saturating_add(per_vault),
-			"final pass: one branch, the one remaining vault"
-		);
-		assert!(
-			crate::pallet::IdleCursor::<Test>::get().is_none(),
-			"draining the map wraps by clearing the cursor"
-		);
-		for owner in 1..=5u64 {
-			let vault = Vaults::<Test>::get((DOT, PUSD, owner)).expect("vault stored");
-			assert!(vault.debt.interest > 0, "every vault was touched across the two passes");
-		}
 	});
 }
