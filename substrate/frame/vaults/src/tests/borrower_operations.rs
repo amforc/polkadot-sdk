@@ -129,6 +129,17 @@ fn zero_amount_borrow_is_rejected() {
 			),
 			crate::Error::<Test>::ZeroBorrowAmount
 		);
+		assert_eq!(
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(
+				DOT,
+				PUSD,
+				1,
+				0,
+				Some(rate_pct(10, 100)),
+			),
+			0,
+			"the quote must reflect that a zero borrow is not executable"
+		);
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
 	});
 }
@@ -164,6 +175,11 @@ fn change_rate_to_same_rate_is_no_op() {
 		let pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		advance_time(86_400_000); // one day of pending interest
 		let now = pallet_timestamp::Pallet::<Test>::get();
+		assert_eq!(
+			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(5, 100),),
+			0,
+			"the quote must reflect that an unchanged rate is a no-op"
+		);
 		assert_ok!(crate::Pallet::<Test>::change_rate(
 			RuntimeOrigin::signed(1),
 			DOT,

@@ -58,7 +58,7 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 pub mod pallet {
 	use super::*;
 	use crate::{
-		context::OpContext,
+		context::BranchOp,
 		recovery,
 		types::{AdminLevel, AssetRoleUsage, BranchAdmins, BranchConfigGuard},
 	};
@@ -724,8 +724,8 @@ pub mod pallet {
 			};
 			let (config, mut state) = (branch.config, branch.state);
 			let now = T::TimeProvider::now();
-			let scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
-			Self::apply_borrow(&mut state, &config, &scratch, initial_debt, annual_rate, now)
+			let mut scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
+			Self::apply_borrow(&mut state, &config, &mut scratch, initial_debt, annual_rate, now)
 		}
 
 		/// Predict the upfront fee `borrow` would charge.
@@ -736,14 +736,17 @@ pub mod pallet {
 			debt_increase: BalanceOf<T>,
 			maybe_new_rate: Option<FixedU128>,
 		) -> BalanceOf<T> {
-			let Some((config, mut state, vault)) =
+			if debt_increase.is_zero() {
+				return BalanceOf::<T>::zero();
+			}
+			let Some((config, mut state, mut vault)) =
 				Self::predict_inputs(&collateral_id, &stable_id, &owner)
 			else {
 				return BalanceOf::<T>::zero();
 			};
 			let new_rate = maybe_new_rate.unwrap_or(vault.annual_rate);
 			let now = T::TimeProvider::now();
-			Self::apply_borrow(&mut state, &config, &vault, debt_increase, new_rate, now)
+			Self::apply_borrow(&mut state, &config, &mut vault, debt_increase, new_rate, now)
 		}
 
 		/// Predict the upfront fee `change_rate` would charge — `0` when the
@@ -754,13 +757,13 @@ pub mod pallet {
 			owner: T::AccountId,
 			new_rate: FixedU128,
 		) -> BalanceOf<T> {
-			let Some((config, mut state, vault)) =
+			let Some((config, mut state, mut vault)) =
 				Self::predict_inputs(&collateral_id, &stable_id, &owner)
 			else {
 				return BalanceOf::<T>::zero();
 			};
 			let now = T::TimeProvider::now();
-			Self::apply_rate_change(&mut state, &config, &vault, new_rate, now)
+			Self::apply_rate_change(&mut state, &config, &mut vault, new_rate, now)
 		}
 	}
 
@@ -898,7 +901,7 @@ pub mod pallet {
 			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			OpContext::<T>::refresh(collateral_id, stable_id, &owner)
+			BranchOp::<T>::refresh(collateral_id, stable_id, &owner)
 		}
 
 		/// Permissionless: move an unsafe last-eligible vault into
