@@ -144,10 +144,11 @@ fn frozen_branch_rejects_enter_final_recovery() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		// The frozen check precedes the CR / last-eligible checks.
 		assert_noop!(
@@ -162,10 +163,11 @@ fn frozen_branch_rejects_exit_final_recovery() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		enter_recovery(1, rate_pct(5, 100));
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(

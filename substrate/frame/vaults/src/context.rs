@@ -9,8 +9,10 @@
 //! naming its TCR stance.
 
 use crate::{
+	math,
 	pallet::{
-		BalanceOf, BranchOf, Branches, Config, Error, Event, HoldReason, Millis, Pallet, Vaults,
+		BalanceOf, BranchOf, CollateralIdOf, CollateralRisks, Config, Error, Event, HoldReason,
+		Millis, Pallet, StableIdOf, Vaults,
 	},
 	types::{BranchConfig, Vault, VaultListId, VaultStatus},
 	utility_impls::TcrInputs,
@@ -41,10 +43,13 @@ pub(crate) enum TcrGate {
 /// Branch-level operation context: one branch-state read threaded through an
 /// operation and committed once.
 pub(crate) struct OpContext<T: Config> {
-	pub collateral_id: T::CollateralAssetId,
-	pub stable_id: T::StableAssetId,
+	pub collateral_id: CollateralIdOf<T>,
+	pub stable_id: StableIdOf<T>,
 	pub now: Millis,
 	pub branch: BranchOf<T>,
+	/// The stored branch's `BranchDebt::outstanding()` captured before the
+	/// in-memory accrual; see [`Self::ensure_global_ceiling`].
+	outstanding_at_load: BalanceOf<T>,
 	pending_interest_mint: BalanceOf<T>,
 	pending_fee: Option<BalanceOf<T>>,
 	/// The post-accrual TCR inputs at load: the "pre" side of the commit's
@@ -70,14 +75,15 @@ pub(crate) struct VaultOp<T: Config> {
 impl<T: Config> OpContext<T> {
 	/// Read the branch state and accrue aggregate interest in memory.
 	pub fn load(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 	) -> Result<Self, DispatchError> {
 		let now = T::TimeProvider::now();
 		let mut branch = Pallet::<T>::branch_of(&collateral_id, &stable_id)?;
 		#[cfg(debug_assertions)]
 		let loaded = branch.clone();
 
+		let outstanding_at_load = branch.state.debt.outstanding();
 		let pending_interest_mint = Pallet::<T>::accrue_aggregate_interest(&mut branch.state, now);
 
 		// The accrual above folded pending aggregate interest into the state,
@@ -92,6 +98,7 @@ impl<T: Config> OpContext<T> {
 			now,
 			tcr_baseline,
 			branch,
+			outstanding_at_load,
 			pending_interest_mint,
 			pending_fee: None,
 			#[cfg(debug_assertions)]
@@ -101,8 +108,8 @@ impl<T: Config> OpContext<T> {
 
 	/// Refresh one vault. This is intentionally allowed while frozen.
 	pub fn refresh(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<(), DispatchError> {
 		let op = Self::load(collateral_id, stable_id)?;
@@ -117,13 +124,33 @@ impl<T: Config> OpContext<T> {
 
 	/// The branch's rate-index list id, derived from the context's own keys so
 	/// it can never drift from `collateral_id`/`stable_id`.
-	pub fn rate_list(&self) -> VaultListId<T::CollateralAssetId, T::StableAssetId> {
+	pub fn rate_list(&self) -> VaultListId<CollateralIdOf<T>, StableIdOf<T>> {
 		VaultListId::Rate(self.collateral_id.clone(), self.stable_id.clone())
 	}
 
 	/// Oracle price for this context's collateral.
 	pub fn price(&self) -> Result<FixedU128, DispatchError> {
 		T::Oracle::provide_price(&self.collateral_id)
+	}
+
+	/// Enforce the per-collateral global debt ceiling.
+	///
+	/// TODO: One known limitation: the aggregate sums
+	/// `outstanding()` in raw units across *different* stable assets before one
+	/// price conversion, which is only correct while every stable shares the
+	/// same unit value ($1 par, same scale). Fix once the oracle is keyed by
+	/// `(collateral, stable)`: convert each market's outstanding at its own
+	/// pair price, then sum in collateral units.
+	pub fn ensure_global_ceiling(&self, price: FixedU128) -> Result<(), DispatchError> {
+		let risk = CollateralRisks::<T>::get(&self.collateral_id);
+		let projected_total = risk
+			.outstanding
+			.saturating_sub(self.outstanding_at_load)
+			.saturating_add(self.branch.state.debt.outstanding());
+		let collateral_debt = math::value_in_collateral::<BalanceOf<T>>(projected_total, price)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		ensure!(collateral_debt <= risk.debt_ceiling, Error::<T>::GlobalDebtCeilingExceeded);
+		Ok(())
 	}
 
 	/// This operation's branch config — a copy of the loaded record's, so no
@@ -213,7 +240,7 @@ impl<T: Config> OpContext<T> {
 	fn assert_unclobbered(&self) {
 		#[cfg(debug_assertions)]
 		debug_assert_eq!(
-			Branches::<T>::get((&self.collateral_id, &self.stable_id)).as_ref(),
+			crate::pallet::Branches::<T>::get(&self.collateral_id, &self.stable_id).as_ref(),
 			Some(&self.loaded),
 			"Branches mutated behind OpContext"
 		);
@@ -240,7 +267,8 @@ impl<T: Config> VaultOp<T> {
 		} else {
 			Vaults::<T>::remove(key);
 		}
-		Branches::<T>::insert((&self.ctx.collateral_id, &self.ctx.stable_id), &self.ctx.branch);
+		let branch = self.ctx.branch;
+		Pallet::<T>::commit_branch(&self.ctx.collateral_id, &self.ctx.stable_id, branch)?;
 
 		// Mint only after the state is written; the two amounts stay separate
 		// credits so the fee handler's per-credit rounding is unchanged.

@@ -6,57 +6,63 @@ use frame::arithmetic::{
 	CheckedAdd, CheckedMul, FixedPointNumber, FixedPointOperand, FixedU128, Permill, Saturating,
 	Zero,
 };
+pub use pusd_primitives::{BranchMode, StableListId as VaultListId, VaultStatus};
 use scale_info::TypeInfo;
 
-pub use pusd_primitives::VaultStatus;
-
-pub use pusd_primitives::BranchMode;
-
 /// Reason the branch was put into `Frozen` mode.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrozenReason {
 	OracleFailure,
 	Governance,
 }
 
 /// Stored `Frozen` state attached to [`BranchState`] while frozen.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FrozenState {
 	pub reason: FrozenReason,
 	pub entered_at: Millis,
 }
 
-/// Logical linked-list partitions, one list per `(collateral_id, stable_id)`
-/// market and per use case.
-pub use pusd_primitives::StableListId as VaultListId;
+/// Side of a market an asset is used on. The pallet mints a market's
+/// stablecoin permissionlessly, so an asset holding the `Stable` role must
+/// never simultaneously be trusted as collateral (in any market), else its
+/// owner could mint unbacked collateral. The two roles are therefore mutually
+/// exclusive for as long as any market references the asset.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Debug)]
+pub enum AssetRole {
+	Collateral,
+	Stable,
+}
+
+/// Reference-counted role record for `AssetRoles`: which side the asset is
+/// used on and how many registered markets currently reference it there. The
+/// entry exists exactly while `markets > 0`, so a role check is one storage
+/// read regardless of how many markets are registered.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Debug)]
+pub struct AssetRoleUsage {
+	pub role: AssetRole,
+	pub markets: u32,
+}
+
+/// Per-collateral systemic risk record: the governance-set hard cap and the
+/// stored debt aggregate it binds, kept in one record so the borrow-path
+/// ceiling check is a single read.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Default)]
+pub struct CollateralRisk<Balance> {
+	/// Hard cap on total debt across the collateral's markets, valued in the
+	/// collateral's own unit. The default `0` doubles as the collateral
+	/// allow-list: a collateral can host markets but cannot be borrowed
+	/// against until governance sets a non-zero ceiling.
+	pub debt_ceiling: Balance,
+	/// `Σ BranchDebt::outstanding()` over the collateral's markets — a
+	/// derived index over the registry, maintained by the audited
+	/// `commit_branch` boundary.
+	pub outstanding: Balance,
+}
 
 /// Debt split by bucket: the state tracked on a vault row, and equally the
 /// shape of a cancelled portion of it (a payment is itself a debt breakdown).
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct VaultDebt<Balance> {
 	pub principal: Balance,
 	pub interest: Balance,
@@ -80,19 +86,7 @@ impl<Balance: Ord + Saturating + Copy> VaultDebt<Balance> {
 
 /// Snapshot of branch redistribution accumulators stamped at vault open and
 /// re-stamped whenever pending redistribution is applied.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RedistributionSnapshot {
 	pub collateral_per_stake: FixedU128,
 	pub debt_per_stake: FixedU128,
@@ -116,9 +110,7 @@ pub struct RedistributionSnapshot {
 /// always after pending redistribution has been applied, so
 /// `BranchStakes.total == Σ vault.redistribution_stake` over the live eligible
 /// set.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct Vault<Balance> {
 	pub collateral: Balance,
 	pub debt: VaultDebt<Balance>,
@@ -181,18 +173,7 @@ pub struct BranchConfig<Balance> {
 }
 
 /// Debt and interest aggregates for one collateral branch.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug, Default)]
 pub struct BranchDebt<Balance> {
 	pub principal: Balance,
 	pub minted_interest: Balance,
@@ -216,27 +197,14 @@ impl<Balance: FixedPointOperand + Saturating> BranchDebt<Balance> {
 }
 
 /// Current-collateral redistribution stake totals for one collateral branch.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug, Default)]
 pub struct BranchStakes<Balance> {
 	pub total: Balance,
 	pub weighted_sum: Balance,
 }
 
 /// Per-branch accounting state.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct BranchState<AccountId, Balance> {
 	pub total_collateral: Balance,
 	pub debt: BranchDebt<Balance>,
@@ -630,12 +598,9 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 ///
 /// Markets sharing a collateral share its risk, so a creator's `Full` autonomy
 /// is bounded by these floors and ceilings — validated at `create_branch` and
-/// on every `set_param` update. The per-collateral `GlobalDebtCeiling[C] > 0`
-/// gate (governance's collateral allow-list) is enforced separately on the
-/// borrow path.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+/// on every `set_param` update. The per-collateral debt-ceiling gate
+/// (governance's collateral allow-list, see [`CollateralRisk`]) is enforced
+/// separately on the borrow path.
 pub struct BranchConfigGuard<Balance> {
 	pub min_minimum_collateralization_ratio: FixedU128,
 	pub min_initial_collateralization_ratio: FixedU128,
@@ -676,18 +641,7 @@ impl<Balance: PartialOrd + Copy + Zero> BranchConfigGuard<Balance> {
 /// remove an empty market. `Emergency` may only take risk-reducing actions:
 /// freeze, raise collateralization thresholds, lower the debt ceiling, or reduce
 /// the max borrow rate.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Clone, Copy)]
 pub enum AdminLevel {
 	Full,
 	Emergency,

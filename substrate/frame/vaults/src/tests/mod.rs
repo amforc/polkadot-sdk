@@ -1,5 +1,6 @@
 //! `pallet-vaults` test suite.
 
+mod asset_roles;
 mod bad_debt;
 mod basic_ops;
 mod borrower_operations;
@@ -9,6 +10,7 @@ mod events;
 mod final_recovery;
 mod governance;
 mod hint_helpers;
+mod idle_walk;
 mod interest_rate;
 mod last_vault;
 mod lifecycle;

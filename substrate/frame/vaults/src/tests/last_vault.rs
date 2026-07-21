@@ -61,10 +61,11 @@ fn execute_liquidation_rejects_frozen_branch() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		assert_noop!(liquidate(DOT, PUSD, 1), crate::Error::<Test>::BranchFrozen);
 	});

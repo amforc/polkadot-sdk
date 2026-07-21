@@ -1,9 +1,6 @@
 use crate::{mock::*, pallet::Vaults, tests::rate_pct, types::BranchConfigUpdate};
 use frame::traits::fungibles::Mutate as FungiblesMutate;
 
-/// PUSD's genesis owner — the signer permitted to open a PUSD market with a
-/// deposit, per the mock's `EnsureAssetOwner`.
-const PUSD_OWNER: AccountId = 1;
 /// Replacement admins used by the reassignment test.
 const NEW_FULL_ADMIN: AccountId = 200;
 const NEW_EMERGENCY_ADMIN: AccountId = 201;
@@ -222,19 +219,20 @@ fn set_branch_admins_reassigns_authority() {
 			PUSD,
 			branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
 		));
-		let info = crate::pallet::Branches::<Test>::get((DOT, PUSD)).expect("admins stored");
+		let info = crate::pallet::Branches::<Test>::get(DOT, PUSD).expect("admins stored");
 		assert_eq!(info.admins.full_admin, admin_caller(NEW_FULL_ADMIN));
 		assert_eq!(info.admins.emergency_admin, admin_caller(NEW_EMERGENCY_ADMIN));
 
 		// The old full admin can no longer act; the new one can.
 		assert_noop!(
-			Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
+			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, PUSD, true),
 			Error::<Test>::NotBranchAdmin
 		);
-		assert_ok!(Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(NEW_FULL_ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
@@ -245,10 +243,11 @@ fn set_branch_admins_reassigns_authority() {
 fn emergency_admin_can_freeze() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(EMERGENCY_ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
@@ -261,8 +260,56 @@ fn governance_can_freeze_bypassing_admins() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Root is not a branch admin, yet the kill switch passes.
-		assert_ok!(Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::root(), DOT, PUSD));
+		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
+	});
+}
+
+// The kill switch is freeze-only: clearing a governance freeze needs the
+// market's Full admin, not the global manager.
+#[test]
+fn governance_cannot_unfreeze() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
+		assert_noop!(
+			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, false),
+			Error::<Test>::NotBranchAdmin
+		);
+		assert_ok!(Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			false
+		));
+		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
+	});
+}
+
+// Registration claims exactly one provider reference on the market's
+// redistribution account and removal releases exactly that one — a reference
+// someone else planted (e.g. by pre-funding the address) is not stolen.
+#[test]
+fn redistribution_account_provider_reference_is_paired() {
+	build_and_execute(|| {
+		let account = Pallet::<Test>::redistribution_account(&DOT, &PUSD);
+		register_market(DOT, PUSD);
+		assert_eq!(System::providers(&account), 1);
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+		assert_eq!(System::providers(&account), 0);
+
+		// A third party provided for the address before the market existed.
+		System::inc_providers(&account);
+		assert_ok!(Pallet::<Test>::create_branch(
+			RuntimeOrigin::root(),
+			DOT,
+			PUSD,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			default_branch_config()
+		));
+		assert_eq!(System::providers(&account), 2);
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+		assert_eq!(System::providers(&account), 1);
 	});
 }
 
@@ -274,7 +321,7 @@ fn freeze_and_remove_reject_unauthorized_signers() {
 		register_market(DOT, PUSD);
 		const NOBODY: AccountId = 999;
 		assert_noop!(
-			Pallet::<Test>::enable_frozen_mode(RuntimeOrigin::signed(NOBODY), DOT, PUSD),
+			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::signed(NOBODY), DOT, PUSD, true),
 			Error::<Test>::NotBranchAdmin
 		);
 		assert_noop!(
@@ -302,59 +349,26 @@ fn governance_remove_bypasses_admins_and_requires_empty() {
 	});
 }
 
-// Filling the registry blocks further creation; removing a market frees its
-// `MaxBranches` slot for the next create.
+// The registry has no global cap: every collateral/stablecoin combination the
+// role rules admit can be registered — here more markets than the old registry
+// cap ever allowed — and a removed market's pair can be re-created.
 #[test]
-fn remove_branch_frees_max_branches_slot() {
+fn registry_has_no_global_cap() {
 	build_and_execute(|| {
-		// Four collaterals against two stablecoins is exactly `MaxBranches`.
-		for collateral in [DOT, TOKEN_X, ETH, COLL_C] {
-			set_price(collateral.clone(), FixedU128::from_rational(10u128, 1u128));
-			for stable in [PUSD, EUSD] {
-				assert_ok!(Pallet::<Test>::create_branch(
-					RuntimeOrigin::root(),
-					collateral.clone(),
-					stable,
-					branch_admins(ADMIN, EMERGENCY_ADMIN),
-					default_branch_config()
-				));
-			}
-		}
-		assert_eq!(
-			u32::try_from(crate::pallet::Branches::<Test>::iter_keys().count()).unwrap(),
-			MaxBranches::get()
-		);
+		register_ten_markets();
+		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 10);
 
-		// The registry is full: a market on the spare collateral is rejected.
-		set_price(COLL_D, FixedU128::from_rational(10u128, 1u128));
-		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				COLL_D,
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config()
-			),
-			Error::<Test>::TooManyBranches
-		);
-
-		// Removing one market frees a slot; the previously-rejected create lands.
+		// Removing a market and re-creating the same pair round-trips.
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert_eq!(
-			u32::try_from(crate::pallet::Branches::<Test>::iter_keys().count()).unwrap(),
-			MaxBranches::get() - 1
-		);
+		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 9);
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
-			COLL_D,
+			DOT,
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
-		assert_eq!(
-			u32::try_from(crate::pallet::Branches::<Test>::iter_keys().count()).unwrap(),
-			MaxBranches::get()
-		);
+		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 10);
 	});
 }
 
@@ -377,9 +391,9 @@ fn create_branch_rejects_unknown_stable() {
 	});
 }
 
-// A market whose stablecoin is also trusted as collateral is rejected — as its
-// own collateral (self), or as a sibling market's collateral (cross-market).
-// Otherwise the freely-minted coin could be posted as backing.
+// A market whose stablecoin is also its own collateral is rejected — otherwise
+// the freely-minted coin could be posted as backing. The cross-market
+// directions live in `tests::asset_roles::cross_role_reuse_rejected_in_both_directions`.
 #[test]
 fn create_branch_rejects_stable_collateral_collision() {
 	build_and_execute(|| {
@@ -389,21 +403,6 @@ fn create_branch_rejects_stable_collateral_collision() {
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				AssetId::WithId(PUSD),
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config()
-			),
-			Error::<Test>::StableCollateralCollision
-		);
-
-		// Cross-market: EUSD is a live market's stablecoin, so a new market may not
-		// trust the EUSD asset as its collateral.
-		register_market(DOT, EUSD);
-		set_price(AssetId::WithId(EUSD), FixedU128::from_rational(10u128, 1u128));
-		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				AssetId::WithId(EUSD),
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config()

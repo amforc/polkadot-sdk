@@ -3246,7 +3246,6 @@ impl pallet_psm::Config for Runtime {
 
 parameter_types! {
 	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
-	pub const VaultsMaxBranches: u32 = 16;
 	/// TODO: Use a proper value
 	pub const VaultsIdleMaxRefreshWeight: Option<Weight> = None;
 	/// Oracle key reserved for the native-token price feed.
@@ -3343,9 +3342,7 @@ impl EnsureOriginWithArg<RuntimeOrigin, VaultsStableId> for VaultsCreateOrigin {
 
 impl pallet_vaults::Config for Runtime {
 	type RuntimeHoldReason = RuntimeHoldReason;
-	type CollateralAssetId = VaultsCollateralId;
-	type StableAssetId = VaultsStableId;
-	type SameAsset = pallet_vaults::SameAssetViaInto;
+	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultsCollateral;
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
@@ -3363,7 +3360,6 @@ impl pallet_vaults::Config for Runtime {
 	type BranchConfigGuard = VaultsBranchConfigGuard;
 	type GlobalManagerOrigin = EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
-	type MaxBranches = VaultsMaxBranches;
 	type IdleMaxRefreshWeight = VaultsIdleMaxRefreshWeight;
 	type VaultLists = LinkedList;
 	type WeightInfo = ();
@@ -3408,11 +3404,7 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountI
 		};
 	}
 
-	fn set_oracle_price(
-		asset_id: VaultsCollateralId,
-		_stable_id: VaultsStableId,
-		price: FixedU128,
-	) {
+	fn set_oracle_price(asset_id: VaultsCollateralId, price: FixedU128) {
 		let timestamp = <pallet_timestamp::Pallet<Runtime>>::get();
 		pallet_oracle::Values::<Runtime>::insert(
 			vaults_oracle_key(&asset_id),
@@ -3420,13 +3412,13 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountI
 		);
 	}
 
+	fn clear_oracle_price(asset_id: VaultsCollateralId) {
+		pallet_oracle::Values::<Runtime>::remove(vaults_oracle_key(&asset_id));
+	}
+
 	fn advance_time(ms: u64) {
 		let now = <pallet_timestamp::Pallet<Runtime>>::get();
 		<pallet_timestamp::Pallet<Runtime>>::set_timestamp(now + ms);
-	}
-
-	fn synth_market(seed: u32) -> (VaultsCollateralId, VaultsStableId) {
-		(VaultsCollateralId::WithId(1_000 + seed), 20_000 + seed)
 	}
 }
 

@@ -245,18 +245,19 @@ fn register_branch_emits_branch_registered() {
 	});
 }
 
-// enable_frozen_mode emits ModeChanged.
+// A governance freeze emits ModeChanged.
 #[test]
-fn enable_frozen_mode_emits_mode_changed() {
+fn set_governance_frozen_emits_mode_changed() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(crate::Pallet::<Test>::enable_frozen_mode(
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD
+			PUSD,
+			true
 		));
 		// Branch starts in Normal mode (no debt yet, TCR is treated as
-		// infinity); after enable_frozen_mode it transitions to Frozen.
+		// infinity); after the governance freeze it transitions to Frozen.
 		let saw = System::events().into_iter().any(|e| {
 			matches!(
 				e.event,

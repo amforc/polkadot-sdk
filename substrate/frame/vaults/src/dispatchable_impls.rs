@@ -1,14 +1,13 @@
 use crate::{
 	context::{OpContext, TcrGate, VaultOp},
-	math,
 	pallet::{
-		BalanceOf, Branches, Config, Error, Event, GlobalDebtCeiling, HoldReason, Pallet,
-		PalletsOriginOf, Vaults,
+		AssetRoles, BalanceOf, Branches, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
+		PalletsOriginOf, StableIdOf, Vaults,
 	},
 	recovery,
 	types::{
-		AdminLevel, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode, BranchState,
-		FrozenReason, FrozenState, VaultDebt, VaultStatus,
+		AdminLevel, AssetRole, AssetRoleUsage, BranchAdmins, BranchConfig, BranchConfigUpdate,
+		BranchMode, BranchState, FrozenReason, FrozenState, Vault, VaultDebt, VaultStatus,
 	},
 };
 use frame::{
@@ -19,88 +18,49 @@ use frame::{
 			MutateHold as FungiblesMutateHold,
 		},
 		tokens::Restriction,
-		Consideration, ContainsPair, Footprint, Time,
+		Consideration, Footprint, Time,
 	},
 };
 use pallet_linked_list::{Position, SortedListInterface};
 use pusd_primitives::{OnBranchLifecycle, ProvidePrice};
 
-/// Inputs to the shared [`Pallet::close_inner`] path beyond the vault
-/// operation itself, which already carries the owner, the row, and its status.
-struct CloseRequest<'a, T: Config> {
-	recipient: &'a T::AccountId,
-	price: FixedU128,
-	/// `Some` when a repay-to-zero closes an empty (no-collateral) vault: the
-	/// payment to fold into the branch aggregates, at the vault's own rate.
-	maybe_payment: Option<VaultDebt<BalanceOf<T>>>,
-}
-
 impl<T: Config> Pallet<T> {
-	/// Enforce the per-collateral global debt ceiling. Every market on the collateral
-	/// contributes its full outstanding stable liability — principal, minted interest,
-	/// pending redistribution principal, and socialized bad debt — except that the
-	/// borrowing market's `principal` is taken at its post-borrow value `principal_after`.
-	/// The total, valued in the collateral's unit at `price`, must not exceed
-	/// `GlobalDebtCeiling[collateral]` — the systemic backstop a single market's
-	/// per-branch ceiling cannot see.
-	///
-	/// TODO: Two known limitations, deferred deliberately.
-	/// (1) The fold sums `outstanding()` in raw units across *different* stable assets before one
-	///     price conversion, which is only correct while every stable shares the same unit value
-	///     ($1 par, same scale). Fix once the oracle is keyed by `(collateral, stable)`: convert
-	///     each market's outstanding at its own pair price, then sum in collateral units.
-	/// (2) The fold is O(markets on the collateral) inside every borrow while the extrinsic weight
-	///     is flat, and market creation is permissionless — spamming markets on a popular
-	///     collateral inflates every borrower's execution cost. Bound markets-per-collateral,
-	///     scale the borrow weight by the fold length, or maintain a per-collateral aggregate.
-	fn ensure_global_ceiling(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		principal_after: BalanceOf<T>,
-		price: FixedU128,
-	) -> Result<(), DispatchError> {
-		let mut total = BalanceOf::<T>::zero();
-		for (s, branch) in Branches::<T>::iter_prefix((collateral_id,)) {
-			total = total.saturating_add(branch.state.debt.outstanding());
-			if &s == stable_id {
-				// The stored principal is pre-borrow; replace it with the post-borrow value.
-				total = total
-					.saturating_sub(branch.state.debt.principal)
-					.saturating_add(principal_after);
-			}
-		}
-		let collateral_debt = math::value_in_collateral::<BalanceOf<T>>(total, price)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		ensure!(
-			collateral_debt <= GlobalDebtCeiling::<T>::get(collateral_id),
-			Error::<T>::GlobalDebtCeilingExceeded
-		);
-		Ok(())
-	}
-
-	/// Enforce every borrow-admissibility ceiling for a market whose principal would
-	/// become `principal_after`: the static per-market `debt_ceiling`, the autoline
-	/// `effective_ceiling` (only when the autoline is enabled), and the
-	/// per-collateral global ceiling. Shared by `do_open_vault` and `do_borrow`.
-	fn ensure_within_ceilings(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		state: &BranchState<T::AccountId, BalanceOf<T>>,
+	/// TODO: DOC
+	fn apply_borrow_checked(
+		op: &mut OpContext<T>,
 		config: &BranchConfig<BalanceOf<T>>,
-		principal_after: BalanceOf<T>,
+		vault: &Vault<BalanceOf<T>>,
+		amount: BalanceOf<T>,
+		annual_rate: FixedU128,
+		rate_change_fee_base: BalanceOf<T>,
 		price: FixedU128,
-	) -> Result<(), DispatchError> {
+	) -> Result<BalanceOf<T>, DispatchError> {
+		Self::ratchet_ceiling(&mut op.branch.state, config, op.now);
+		let principal_after = op.branch.state.debt.principal.saturating_add(amount);
 		ensure!(principal_after <= config.debt_ceiling, Error::<T>::DebtCeilingExceeded);
 		if !config.ceiling_gap.is_zero() {
-			ensure!(principal_after <= state.effective_ceiling, Error::<T>::DebtCeilingExceeded);
+			ensure!(
+				principal_after <= op.branch.state.effective_ceiling,
+				Error::<T>::DebtCeilingExceeded
+			);
 		}
-		Self::ensure_global_ceiling(collateral_id, stable_id, principal_after, price)
+		let upfront_fee = Self::apply_borrow(
+			&mut op.branch.state,
+			config,
+			vault,
+			amount,
+			annual_rate,
+			rate_change_fee_base,
+		);
+		op.ensure_global_ceiling(price)?;
+		Ok(upfront_fee)
 	}
 
+	/// TODO: DOC
 	pub(crate) fn do_open_vault(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		initial_collateral: BalanceOf<T>,
 		initial_debt: BalanceOf<T>,
 		annual_rate: FixedU128,
@@ -121,28 +81,17 @@ impl<T: Config> Pallet<T> {
 		Self::validate_rate(&config, annual_rate)?;
 		let price = op.price()?;
 
-		// Advance the autoline in-band (still ttl-gated), so a borrower with valid
-		// headroom does not need a separate `poke_ceiling` transaction first.
-		Self::ratchet_ceiling(&mut op.branch.state, &config, op.now);
-		Self::ensure_within_ceilings(
-			&op.collateral_id,
-			&op.stable_id,
-			&op.branch.state,
-			&config,
-			op.branch.state.debt.principal.saturating_add(initial_debt),
-			price,
-		)?;
-
 		let mut vault =
 			Self::open_scratch_row(&op.branch.state, annual_rate, initial_collateral, op.now);
-		let upfront_fee = Self::apply_borrow(
-			&mut op.branch.state,
+		let upfront_fee = Self::apply_borrow_checked(
+			&mut op,
 			&config,
 			&vault,
 			initial_debt,
 			annual_rate,
 			Zero::zero(),
-		);
+			price,
+		)?;
 		vault.debt = VaultDebt { principal: initial_debt, interest: upfront_fee };
 
 		let total_debt = initial_debt.saturating_add(upfront_fee);
@@ -189,8 +138,8 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn do_deposit_collateral_for(
 		from: T::AccountId,
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> Result<(), DispatchError> {
 		let op = OpContext::<T>::load(collateral_id, stable_id)?;
@@ -226,10 +175,11 @@ impl<T: Config> Pallet<T> {
 		op.commit(TcrGate::Exempt)
 	}
 
+	/// TODO: DOC
 	pub(crate) fn do_withdraw_collateral(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 		recipient: T::AccountId,
 	) -> Result<(), DispatchError> {
@@ -250,10 +200,7 @@ impl<T: Config> Pallet<T> {
 		}
 
 		if total_debt.is_zero() && new_collateral.is_zero() {
-			return Self::close_inner(
-				op,
-				CloseRequest { recipient: &recipient, price, maybe_payment: None },
-			);
+			return Self::close_inner(op, &recipient, price, None);
 		}
 
 		op.ctx.branch.state.remove_collateral(amount);
@@ -281,10 +228,11 @@ impl<T: Config> Pallet<T> {
 		op.commit(TcrGate::Check { price, settlement: false })
 	}
 
+	/// TODO: DOC
 	pub(crate) fn do_borrow(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 		maybe_new_rate: Option<FixedU128>,
 		recipient: T::AccountId,
@@ -302,27 +250,17 @@ impl<T: Config> Pallet<T> {
 		Self::validate_rate(&config, new_rate)?;
 
 		let new_ib_debt = op.vault.debt.principal.saturating_add(amount);
-		// Advance the autoline in-band (still ttl-gated); see `do_open_vault`.
-		Self::ratchet_ceiling(&mut op.ctx.branch.state, &config, op.ctx.now);
-		Self::ensure_within_ceilings(
-			&op.ctx.collateral_id,
-			&op.ctx.stable_id,
-			&op.ctx.branch.state,
-			&config,
-			op.ctx.branch.state.debt.principal.saturating_add(amount),
-			price,
-		)?;
-
 		let cooldown_elapsed = op.vault.cooldown_elapsed(&config, op.ctx.now);
 		let rate_change_fee_base = op.vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
-		let upfront_fee = Self::apply_borrow(
-			&mut op.ctx.branch.state,
+		let upfront_fee = Self::apply_borrow_checked(
+			&mut op.ctx,
 			&config,
 			&op.vault,
 			amount,
 			new_rate,
 			rate_change_fee_base,
-		);
+			price,
+		)?;
 
 		let dormant_to_active = op.status.is_dormant() && new_ib_debt >= config.minimum_debt;
 		op.vault.debt.principal = new_ib_debt;
@@ -381,8 +319,8 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn do_repay_for(
 		from: T::AccountId,
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> Result<(), DispatchError> {
 		let op = OpContext::<T>::load(collateral_id, stable_id)?;
@@ -424,10 +362,7 @@ impl<T: Config> Pallet<T> {
 		// open for.
 		if new_total.is_zero() && op.vault.collateral.is_zero() {
 			let price = op.ctx.price()?;
-			return Self::close_inner(
-				op,
-				CloseRequest { recipient: &owner, price, maybe_payment: Some(payment) },
-			);
+			return Self::close_inner(op, &owner, price, Some(payment));
 		}
 
 		op.ctx.branch.state.apply_debt_payment(
@@ -451,8 +386,8 @@ impl<T: Config> Pallet<T> {
 
 	pub(crate) fn do_change_rate(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		new_rate: FixedU128,
 		hint: Position<T::AccountId>,
 	) -> Result<(), DispatchError> {
@@ -498,8 +433,8 @@ impl<T: Config> Pallet<T> {
 
 	pub(crate) fn do_close_vault(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		recipient: Option<T::AccountId>,
 	) -> Result<(), DispatchError> {
 		let recipient = recipient.unwrap_or(owner.clone());
@@ -509,12 +444,19 @@ impl<T: Config> Pallet<T> {
 		let op = op.touch(&owner)?;
 		ensure!(op.vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 
-		Self::close_inner(op, CloseRequest { recipient: &recipient, price, maybe_payment: None })
+		Self::close_inner(op, &recipient, price, None)
 	}
 
 	/// Shared close path. Consumes the vault operation at commit.
-	fn close_inner(mut op: VaultOp<T>, request: CloseRequest<'_, T>) -> Result<(), DispatchError> {
-		let CloseRequest { recipient, price, maybe_payment } = request;
+	/// `maybe_payment` is `Some` when a repay-to-zero closes an empty
+	/// (no-collateral) vault: the payment to fold into the branch aggregates,
+	/// at the vault's own rate.
+	fn close_inner(
+		mut op: VaultOp<T>,
+		recipient: &T::AccountId,
+		price: FixedU128,
+		maybe_payment: Option<VaultDebt<BalanceOf<T>>>,
+	) -> Result<(), DispatchError> {
 		// The row tracks this market's collateral in every state, FinalRecovery
 		// included (where the stake is zero but the collateral persists).
 		let collateral = op.vault.collateral;
@@ -582,8 +524,8 @@ impl<T: Config> Pallet<T> {
 
 	pub(crate) fn do_enter_final_recovery(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 	) -> Result<(), DispatchError> {
 		let op = OpContext::<T>::load(collateral_id, stable_id)?;
 		op.ensure_not_frozen()?;
@@ -619,8 +561,8 @@ impl<T: Config> Pallet<T> {
 	/// Explicit `FinalRecovery` exit. Rejoins the rate index only above `MinimumDebt`.
 	pub(crate) fn do_exit_final_recovery(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		hint: Position<T::AccountId>,
 	) -> Result<(), DispatchError> {
 		let op = OpContext::<T>::load(collateral_id, stable_id)?;
@@ -663,8 +605,8 @@ impl<T: Config> Pallet<T> {
 	/// Permissionless Dormant to Active revival.
 	pub(crate) fn do_activate_dormant(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		hint: Position<T::AccountId>,
 	) -> Result<(), DispatchError> {
 		let op = OpContext::<T>::load(collateral_id, stable_id)?;
@@ -688,15 +630,81 @@ impl<T: Config> Pallet<T> {
 		op.commit(TcrGate::Exempt)
 	}
 
-	fn register_branch(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
-		config: BranchConfig<BalanceOf<T>>,
-		admins: BranchAdmins<PalletsOriginOf<T>>,
-		deposit: Option<(T::AccountId, T::Consideration)>,
+	/// Claim one market reference to `asset` in `role`.
+	fn claim_asset_role(asset: &CollateralIdOf<T>, role: AssetRole) -> Result<(), DispatchError> {
+		AssetRoles::<T>::try_mutate(asset, |maybe| match maybe {
+			None => {
+				*maybe = Some(AssetRoleUsage { role, markets: 1 });
+				Ok(())
+			},
+			Some(usage) if usage.role == role => {
+				usage.markets =
+					usage.markets.checked_add(1).ok_or(Error::<T>::ArithmeticOverflow)?;
+				Ok(())
+			},
+			Some(_) => Err(Error::<T>::StableCollateralCollision.into()),
+		})
+	}
+
+	/// Release one market reference to `asset` in `role`, deleting the entry
+	/// when the last reference goes.
+	fn release_asset_role(asset: &CollateralIdOf<T>, role: AssetRole) -> Result<(), DispatchError> {
+		AssetRoles::<T>::try_mutate(asset, |maybe| match maybe {
+			Some(usage) if usage.role == role && usage.markets > 0 => {
+				usage.markets -= 1;
+				if usage.markets == 0 {
+					*maybe = None;
+				}
+				Ok(())
+			},
+			_ => {
+				defensive!("asset role missing, mismatched, or under-counted on release");
+				Err(DispatchError::Corruption)
+			},
+		})
+	}
+
+	/// Claim the two role references a market holds: its collateral as
+	/// `Collateral`, and its stablecoin as `Stable` under the coin's image in
+	/// the collateral-id namespace.
+	fn claim_market_roles(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 	) -> Result<(), DispatchError> {
+		let stable_key = T::StableToCollateralId::convert(stable_id.clone());
+		ensure!(*collateral_id != stable_key, Error::<T>::StableCollateralCollision);
+		Self::claim_asset_role(collateral_id, AssetRole::Collateral)?;
+		Self::claim_asset_role(&stable_key, AssetRole::Stable)
+	}
+
+	/// Release the two role references claimed by [`Self::claim_market_roles`].
+	fn release_market_roles(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> Result<(), DispatchError> {
+		let stable_key = T::StableToCollateralId::convert(stable_id.clone());
+		Self::release_asset_role(collateral_id, AssetRole::Collateral)?;
+		Self::release_asset_role(&stable_key, AssetRole::Stable)
+	}
+
+	/// Permissionless market creation. Validates the config against the governance
+	/// envelope and the oracle, takes the creation deposit, and seeds
+	/// the whole market record. The
+	/// deposit, the role counters, the `Branches` row, the provider reference, and
+	/// every sibling lifecycle row are committed together.
+	pub(crate) fn do_create_branch(
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+		admins: BranchAdmins<PalletsOriginOf<T>>,
+		config: BranchConfig<BalanceOf<T>>,
+		depositor: Option<T::AccountId>,
+	) -> Result<(), DispatchError> {
+		ensure!(T::BranchConfigGuard::get().permits(&config), Error::<T>::ConfigOutsideEnvelope);
+		// A market the oracle cannot price cannot open.
+		T::Oracle::provide_price(&collateral_id)
+			.map_err(|_| Error::<T>::OraclePriceNotAvailable)?;
 		ensure!(
-			!Branches::<T>::contains_key((&collateral_id, &stable_id)),
+			!Branches::<T>::contains_key(&collateral_id, &stable_id),
 			Error::<T>::BranchAlreadyRegistered
 		);
 		ensure!(
@@ -707,30 +715,25 @@ impl<T: Config> Pallet<T> {
 		// The pallet mints a market's stablecoin permissionlessly, so that asset must
 		// never be trusted as collateral — in this market or any sibling — else its
 		// owner could mint unbacked collateral.
-		ensure!(
-			!T::SameAsset::contains(&collateral_id, &stable_id),
-			Error::<T>::StableCollateralCollision
-		);
-		let mut market_count: u32 = 0;
-		for (existing_collateral, existing_stable) in Branches::<T>::iter_keys() {
-			market_count = market_count.saturating_add(1);
-			ensure!(
-				!T::SameAsset::contains(&existing_collateral, &stable_id),
-				Error::<T>::StableCollateralCollision
-			);
-			ensure!(
-				!T::SameAsset::contains(&collateral_id, &existing_stable),
-				Error::<T>::StableCollateralCollision
-			);
-		}
-		ensure!(market_count < T::MaxBranches::get(), Error::<T>::TooManyBranches);
+		Self::claim_market_roles(&collateral_id, &stable_id)?;
+		let deposit = match depositor {
+			Some(who) => {
+				let footprint = Footprint::from_mel::<(
+					crate::pallet::BranchOf<T>,
+					AssetRoleUsage,
+					AssetRoleUsage,
+				)>();
+				let ticket = T::Consideration::new(&who, footprint)?;
+				Some((who, ticket))
+			},
+			None => None,
+		};
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
-		if frame_system::Pallet::<T>::providers(&redistribution_account) == 0 {
-			frame_system::Pallet::<T>::inc_providers(&redistribution_account);
-		}
+		frame_system::Pallet::<T>::inc_providers(&redistribution_account);
 		let now = T::TimeProvider::now();
 		Branches::<T>::insert(
-			(&collateral_id, &stable_id),
+			&collateral_id,
+			&stable_id,
 			crate::types::Branch {
 				state: BranchState::fresh(&config, now),
 				config,
@@ -743,41 +746,12 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Permissionless market creation. Validates the config against the governance
-	/// envelope and the oracle, takes the creation deposit (unless Root), and seeds
-	/// the whole market record.
-	pub(crate) fn do_create_branch(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
-		admins: BranchAdmins<PalletsOriginOf<T>>,
-		config: BranchConfig<BalanceOf<T>>,
-		depositor: Option<T::AccountId>,
-	) -> Result<(), DispatchError> {
-		ensure!(T::BranchConfigGuard::get().permits(&config), Error::<T>::ConfigOutsideEnvelope);
-		// A market the oracle cannot price cannot open.
-		T::Oracle::provide_price(&collateral_id)
-			.map_err(|_| Error::<T>::OraclePriceNotAvailable)?;
-		let deposit = match depositor {
-			Some(who) => {
-				// Sized over the admin payload the depositor adds to the record
-				// (MEL-identical to the pre-merge admin-info row).
-				let footprint = Footprint::from_mel::<(
-					BranchAdmins<PalletsOriginOf<T>>,
-					Option<(T::AccountId, T::Consideration)>,
-				)>();
-				let ticket = T::Consideration::new(&who, footprint)?;
-				Some((who, ticket))
-			},
-			None => None,
-		};
-		Self::register_branch(collateral_id, stable_id, config, admins, deposit)
-	}
-
-	/// Remove an empty market: refund the deposit, release the redistribution-account
-	/// provider, tear down storage, and fire the deregistration hook.
+	/// Remove an empty market: fire the deregistration hook, tear down the
+	/// record, release both assets' role references and the
+	/// redistribution-account provider, and refund the deposit.
 	pub(crate) fn do_remove_branch(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 	) -> Result<(), DispatchError> {
 		let branch = Self::branch_of(&collateral_id, &stable_id)?;
 		ensure!(branch.state.is_removable(), Error::<T>::MarketNotEmpty);
@@ -785,15 +759,22 @@ impl<T: Config> Pallet<T> {
 			Vaults::<T>::iter_prefix((&collateral_id, &stable_id)).next().is_none(),
 			Error::<T>::MarketNotEmpty
 		);
+		T::OnBranchLifecycle::on_deregistered(&collateral_id, &stable_id)?;
+		let removed_outstanding = Branches::<T>::take(&collateral_id, &stable_id)
+			.map(|removed| removed.state.debt.outstanding())
+			.unwrap_or_default();
+		defensive_assert!(
+			removed_outstanding.is_zero(),
+			"market removal must leave the CollateralRisks aggregate untouched"
+		);
+		Self::release_market_roles(&collateral_id, &stable_id)?;
+		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
+		if let Err(err) = frame_system::Pallet::<T>::dec_providers(&redistribution_account) {
+			defensive!("redistribution-account provider reference not released", err);
+		}
 		if let Some((who, ticket)) = branch.deposit {
 			ticket.drop(&who)?;
 		}
-		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
-		if frame_system::Pallet::<T>::providers(&redistribution_account) > 0 {
-			let _ = frame_system::Pallet::<T>::dec_providers(&redistribution_account);
-		}
-		Branches::<T>::remove((&collateral_id, &stable_id));
-		T::OnBranchLifecycle::on_deregistered(&collateral_id, &stable_id)?;
 		Self::deposit_event(Event::BranchRemoved { collateral_id, stable_id });
 		Ok(())
 	}
@@ -809,17 +790,19 @@ impl<T: Config> Pallet<T> {
 	/// applies, keeping envelope enforcement in a single place.
 	pub(crate) fn do_set_param(
 		origin: OriginFor<T>,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		update: BranchConfigUpdate<BalanceOf<T>>,
 	) -> Result<(), DispatchError> {
 		let level =
 			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, update.required_level())?;
 		let guard = T::BranchConfigGuard::get();
-		Branches::<T>::try_mutate(
-			(&collateral_id, &stable_id),
-			|maybe| -> Result<_, DispatchError> {
-				let config = &mut maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?.config;
+		Branches::<T>::try_mutate_exists(
+			&collateral_id,
+			&stable_id,
+			|maybe| -> Result<(), DispatchError> {
+				let branch = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
+				let config = &mut branch.config;
 				if matches!(level, AdminLevel::Emergency) {
 					ensure!(update.is_defensive(config), Error::<T>::DefensiveActionNotDefensive);
 				}
@@ -832,58 +815,67 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	pub(crate) fn do_enable_frozen_mode(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+	/// Set or clear the governance-induced `Frozen` state. No-op when the
+	/// market is already frozen (for any reason) on freeze, or not
+	/// governance-frozen on clear.
+	pub(crate) fn do_set_governance_frozen(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		frozen: bool,
 	) -> Result<(), DispatchError> {
-		if Self::branch_of(collateral_id, stable_id)?.state.is_frozen() {
-			return Ok(());
+		let state = Self::branch_of(collateral_id, stable_id)?.state;
+		match (state.frozen, frozen) {
+			(None, true) => {
+				Self::transition_frozen(collateral_id, stable_id, Some(FrozenReason::Governance))
+			},
+			(Some(current), false) if matches!(current.reason, FrozenReason::Governance) => {
+				Self::transition_frozen(collateral_id, stable_id, None)
+			},
+			_ => Ok(()),
 		}
-		Self::transition_frozen(collateral_id, stable_id, Some(FrozenReason::Governance))
 	}
 
 	/// Move the market's persisted frozen flag to `target`, emitting one
-	/// `ModeChanged` derived symmetrically: mode before the write, mode after
-	/// (`current_mode` short-circuits on the persisted flag, so entering
-	/// reports `Frozen` as `new_mode` and leaving reports it as `old_mode`).
+	/// `ModeChanged` derived symmetrically from the loaded record: mode before
+	/// the flag flips, mode after.
 	///
 	/// Entering flushes pending aggregate interest first so the frozen window
 	/// accrues nothing; leaving folds the completed window into
 	/// `interest_epoch` so `interest_time(now)` stays continuous. Callers gate
 	/// on the current frozen state, so the same-state arms are unreachable.
 	fn transition_frozen(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		target: Option<FrozenReason>,
 	) -> Result<(), DispatchError> {
 		let now = T::TimeProvider::now();
-		let old_mode = Self::current_mode(collateral_id, stable_id).unwrap_or(BranchMode::Normal);
-		Branches::<T>::try_mutate(
-			(collateral_id, stable_id),
-			|maybe| -> Result<_, DispatchError> {
-				let state = &mut maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?.state;
-				match (state.frozen, target) {
-					(None, Some(_)) => {
-						// Flush before freezing so the frozen window accrues nothing.
-						let minted = Self::accrue_aggregate_interest(state, now);
-						if !minted.is_zero() {
-							Self::mint_and_route_yield(collateral_id, stable_id, minted);
-						}
-					},
-					(Some(frozen), None) => {
-						// Keep `interest_time(now)` continuous across the frozen window.
-						let frozen_window = now.saturating_sub(frozen.entered_at);
-						state.interest_epoch = state.interest_epoch.saturating_add(frozen_window);
-					},
-					(None, None) | (Some(_), Some(_)) => {
-						debug_assert!(false, "callers gate on the current frozen state");
-					},
-				}
-				state.frozen = target.map(|reason| FrozenState { reason, entered_at: now });
-				Ok(())
+		let mut branch = Self::branch_of(collateral_id, stable_id)?;
+		let old_mode = Self::mode_of(&branch, collateral_id, now).unwrap_or(BranchMode::Normal);
+		let minted = match (branch.state.frozen, target) {
+			(None, Some(_)) => {
+				// Flush before freezing so the frozen window accrues nothing.
+				Self::accrue_aggregate_interest(&mut branch.state, now)
 			},
-		)?;
-		let new_mode = Self::current_mode(collateral_id, stable_id).unwrap_or(BranchMode::Normal);
+			(Some(frozen), None) => {
+				// Keep `interest_time(now)` continuous across the frozen window.
+				let frozen_window = now.saturating_sub(frozen.entered_at);
+				branch.state.interest_epoch =
+					branch.state.interest_epoch.saturating_add(frozen_window);
+				Zero::zero()
+			},
+			(None, None) | (Some(_), Some(_)) => {
+				debug_assert!(false, "callers gate on the current frozen state");
+				Zero::zero()
+			},
+		};
+		branch.state.frozen = target.map(|reason| FrozenState { reason, entered_at: now });
+		let new_mode = Self::mode_of(&branch, collateral_id, now).unwrap_or(BranchMode::Normal);
+		Self::commit_branch(collateral_id, stable_id, branch)?;
+		// Mint only after the state is written, mirroring the operation-context
+		// commit.
+		if !minted.is_zero() {
+			Self::mint_and_route_yield(collateral_id, stable_id, minted);
+		}
 		Self::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
@@ -895,8 +887,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Reconcile oracle-driven Frozen state with the live oracle.
 	pub(crate) fn do_refresh_branch(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 	) -> Result<(), DispatchError> {
 		let state = Self::branch_of(collateral_id, stable_id)?.state;
 		let oracle_ok = T::Oracle::provide_price(collateral_id).is_ok();
@@ -911,26 +903,11 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Clear a governance-induced Frozen state. No-op when not frozen, or when
-	/// frozen for a non-governance reason.
-	pub(crate) fn do_clear_governance_frozen_mode(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-	) -> Result<(), DispatchError> {
-		let state = Self::branch_of(collateral_id, stable_id)?.state;
-		match state.frozen {
-			Some(state) if matches!(state.reason, FrozenReason::Governance) => {
-				Self::transition_frozen(collateral_id, stable_id, None)
-			},
-			_ => Ok(()),
-		}
-	}
-
 	/// Permissionless: ratchet a market's autoline ceiling. A no-op poke (autoline
 	/// disabled, or the ceiling already at target) writes no storage.
 	pub(crate) fn do_poke_ceiling(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 	) -> Result<(), DispatchError> {
 		let mut branch = Self::branch_of(&collateral_id, &stable_id)?;
 		if branch.config.ceiling_gap.is_zero() {
@@ -938,7 +915,7 @@ impl<T: Config> Pallet<T> {
 		}
 		let now = T::TimeProvider::now();
 		if Self::ratchet_ceiling(&mut branch.state, &branch.config, now) {
-			Branches::<T>::insert((&collateral_id, &stable_id), branch);
+			Branches::<T>::insert(&collateral_id, &stable_id, branch);
 		}
 		Ok(())
 	}

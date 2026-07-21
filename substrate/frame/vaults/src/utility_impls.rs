@@ -4,18 +4,23 @@
 use crate::{
 	context::OpContext,
 	math,
-	pallet::{BalanceOf, BranchOf, Branches, Config, Error, IdleCursor, Millis, Pallet, Vaults},
+	pallet::{
+		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
+		Error, IdleCursor, Millis, Pallet, StableIdOf, Vaults,
+	},
 	recovery,
 	types::{
-		AdminLevel, BranchConfig, BranchMode, BranchState, Vault, VaultDebt, VaultListId,
-		VaultStatus,
+		AdminLevel, BranchConfig, BranchMode, BranchState, CollateralRisk, Vault, VaultDebt,
+		VaultListId, VaultStatus,
 	},
 	weights::WeightInfo,
 };
 use frame::{
 	deps::frame_support::{storage::with_storage_layer, weights::WeightMeter},
 	prelude::*,
-	traits::{fungibles::Balanced as FungiblesBalanced, OriginTrait, Time},
+	traits::{
+		fungibles::Balanced as FungiblesBalanced, Defensive, DefensiveOption, OriginTrait, Time,
+	},
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{OnBranchYield, ProvidePrice};
@@ -47,6 +52,18 @@ impl<Balance: Ord + Saturating + Copy> PendingTouch<Balance> {
 	}
 }
 
+/// How one idle-walk pass ended, deciding the cursor write.
+enum WalkExit<K> {
+	/// Not even one step fit the meter — leave the stored cursor untouched.
+	Untouched,
+	/// The map drained — clear any stored cursor so the next pass wraps to
+	/// the front.
+	Drained,
+	/// The meter ran dry mid-map — park the cursor after the last charged
+	/// step.
+	Parked(K),
+}
+
 impl<T: Config> Pallet<T> {
 	/// Translate a rate-index insert/re-insert failure. A stale user-supplied
 	/// hint surfaces as [`Error::InvalidPositionHints`]; every other kind —
@@ -66,17 +83,51 @@ impl<T: Config> Pallet<T> {
 	/// Read the whole market record, returning `UnknownCollateral` when
 	/// missing.
 	pub(crate) fn branch_of(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 	) -> Result<BranchOf<T>, DispatchError> {
-		Branches::<T>::get((collateral_id, stable_id))
+		Branches::<T>::get(collateral_id, stable_id)
 			.ok_or_else(|| Error::<T>::UnknownCollateral.into())
+	}
+
+	/// TODO: DOC
+	pub(crate) fn commit_branch(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		branch: BranchOf<T>,
+	) -> DispatchResult {
+		let outstanding_before =
+			Self::branch_of(collateral_id, stable_id)?.state.debt.outstanding();
+		Self::apply_debt_delta(collateral_id, outstanding_before, branch.state.debt.outstanding())?;
+		Branches::<T>::insert(collateral_id, stable_id, branch);
+		Ok(())
+	}
+
+	fn apply_debt_delta(
+		collateral_id: &CollateralIdOf<T>,
+		outstanding_before: BalanceOf<T>,
+		outstanding_after: BalanceOf<T>,
+	) -> Result<(), DispatchError> {
+		if outstanding_before == outstanding_after {
+			return Ok(());
+		}
+		CollateralRisks::<T>::try_mutate_exists(collateral_id, |maybe| {
+			let mut risk = maybe.take().unwrap_or_default();
+			risk.outstanding = risk
+				.outstanding
+				.checked_sub(&outstanding_before)
+				.defensive_ok_or(DispatchError::Corruption)?
+				.checked_add(&outstanding_after)
+				.ok_or(Error::<T>::ArithmeticOverflow)?;
+			*maybe = (risk != CollateralRisk::default()).then_some(risk);
+			Ok(())
+		})
 	}
 
 	/// Read a vault row, returning `VaultNotFound` when missing.
 	pub(crate) fn vault_of(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Vault<BalanceOf<T>>, DispatchError> {
 		Vaults::<T>::get((collateral_id, stable_id, owner))
@@ -145,8 +196,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Derive a vault's lifecycle status from queue/index membership.
 	pub(crate) fn vault_status_in(
-		rate_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
-		recovery_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
+		rate_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
+		recovery_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
 		owner: &T::AccountId,
 	) -> VaultStatus {
 		debug_assert!(matches!(rate_list, VaultListId::Rate(..)));
@@ -164,8 +215,8 @@ impl<T: Config> Pallet<T> {
 	/// membership. Status is not stored on the row, and the keys must be
 	/// re-supplied because the row does not carry them.
 	pub(crate) fn vault_status_of(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> VaultStatus {
 		Self::vault_status_in(
@@ -177,10 +228,19 @@ impl<T: Config> Pallet<T> {
 
 	/// Mode is `Frozen` if persisted, otherwise derived from live TCR.
 	pub(crate) fn current_mode(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 	) -> Result<BranchMode, DispatchError> {
 		let branch = Self::branch_of(collateral_id, stable_id)?;
+		Self::mode_of(&branch, collateral_id, T::TimeProvider::now())
+	}
+
+	/// TODO: DOC
+	pub(crate) fn mode_of(
+		branch: &BranchOf<T>,
+		collateral_id: &CollateralIdOf<T>,
+		now: Millis,
+	) -> Result<BranchMode, DispatchError> {
 		if branch.state.is_frozen() {
 			return Ok(BranchMode::Frozen);
 		}
@@ -192,7 +252,6 @@ impl<T: Config> Pallet<T> {
 			Ok(price) => price,
 			Err(_) => return Ok(BranchMode::Frozen),
 		};
-		let now = T::TimeProvider::now();
 		let tcr = Self::compute_tcr(&branch.state, price, now)?;
 		if tcr < branch.config.safety_collateralization_ratio {
 			Ok(BranchMode::Safety)
@@ -275,8 +334,8 @@ impl<T: Config> Pallet<T> {
 	/// hands the origin back on failure, so the admin fallback is lossless.
 	pub(crate) fn ensure_branch_admin_or_manager(
 		origin: OriginFor<T>,
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		required: AdminLevel,
 	) -> Result<(), DispatchError> {
 		let origin = match T::GlobalManagerOrigin::try_origin(origin) {
@@ -291,8 +350,8 @@ impl<T: Config> Pallet<T> {
 	/// `Emergency`.
 	pub(crate) fn ensure_branch_admin(
 		origin: OriginFor<T>,
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		required: AdminLevel,
 	) -> Result<AdminLevel, DispatchError> {
 		let admins = Self::branch_of(collateral_id, stable_id)?.admins;
@@ -387,11 +446,10 @@ impl<T: Config> Pallet<T> {
 	/// fee), let `T::YieldHook` take the Stability-Pool share, and hand the
 	/// remainder to `T::FeeHandler`.
 	pub(crate) fn mint_and_route_yield(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) {
-		// TODO: Check if this is the best/most-idomatic way to split the Credit (I don't think so)
 		let credit = T::StableAssets::issue(stable_id.clone(), amount);
 		let credit = T::YieldHook::distribute_yield(collateral_id, stable_id, credit);
 		T::FeeHandler::on_unbalanced(credit);
@@ -543,7 +601,7 @@ impl<T: Config> Pallet<T> {
 	/// deferred until the iterator advances, so a caller taking only the head pays
 	/// for only the tail read.
 	fn list_from_tail(
-		list: VaultListId<T::CollateralAssetId, T::StableAssetId>,
+		list: VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
 	) -> impl Iterator<Item = T::AccountId> {
 		let mut started = false;
 		let mut cursor: Option<T::AccountId> = None;
@@ -565,13 +623,13 @@ impl<T: Config> Pallet<T> {
 	/// Lazy and allocation-free: `.next()` gives the next target and `take(n)` the
 	/// queue view, reading only the tiers they reach.
 	pub(crate) fn redemption_targets(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 	) -> impl Iterator<Item = (T::AccountId, VaultStatus)> {
 		let priority = recovery::next_target::<T>(collateral_id, stable_id)
 			.map(|owner| (owner, VaultStatus::FinalRecovery))
 			.or_else(|| {
-				Branches::<T>::get((collateral_id, stable_id))
+				Branches::<T>::get(collateral_id, stable_id)
 					.and_then(|branch| branch.state.dormant_redemption_target)
 					.map(|owner| (owner, VaultStatus::Dormant))
 			});
@@ -594,8 +652,8 @@ impl<T: Config> Pallet<T> {
 	/// an orchestrator contract violation, logged-but-tolerated in release so a
 	/// broken cursor reads as an exhausted queue rather than corrupting the walk.
 	pub(crate) fn ordinary_target_after(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Option<T::AccountId> {
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
@@ -610,82 +668,165 @@ impl<T: Config> Pallet<T> {
 	/// Returns `None` if any row is missing — the predict APIs treat that as
 	/// "no fee" rather than an error.
 	pub(crate) fn predict_inputs(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Option<(
 		BranchConfig<BalanceOf<T>>,
 		BranchState<T::AccountId, BalanceOf<T>>,
 		Vault<BalanceOf<T>>,
 	)> {
-		let branch = Branches::<T>::get((collateral_id, stable_id))?;
+		let branch = Branches::<T>::get(collateral_id, stable_id)?;
 		let vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
 		Some((branch.config, branch.state, vault))
 	}
 
-	/// Refresh vaults with the block's leftover weight, clamped to
-	/// [`Config::IdleMaxRefreshWeight`]: reconcile the branches'
-	/// oracle-frozen state, then resume the flat [`IdleCursor`] walk over the
-	/// [`Vaults`] map until the meter drains. Map order visits every row
-	/// eventually — dormant husks and mid-FIFO `FinalRecovery` vaults
-	/// included, which the old per-branch rate-index cursor never reached.
+	/// Refresh markets and vaults with the block's leftover weight, clamped to
+	/// [`Config::IdleMaxRefreshWeight`]: charge the cursor bookkeeping, resume
+	/// the [`BranchIdleCursor`] walk reconciling oracle-frozen state, then
+	/// resume the flat [`IdleCursor`] walk over the [`Vaults`] map until the
+	/// meter drains. Every attempted step — failed transactional attempts
+	/// included — is charged in the returned weight; [`Self::idle_walk_pass`]
+	/// states the exact per-step and terminal-probe accounting.
 	pub(crate) fn on_idle_walk(remaining: Weight) -> Weight {
 		let Some(limit) = T::IdleMaxRefreshWeight::get() else { return Weight::zero() };
 		let mut meter = WeightMeter::with_limit(remaining.min(limit));
 
-		// Bounded by `MaxBranches`: branch registration caps the map's size.
-		let per_branch = T::WeightInfo::refresh_branch();
-		for (collateral_id, stable_id) in Branches::<T>::iter_keys() {
-			if !meter.can_consume(per_branch) {
-				return meter.consumed();
-			}
-			meter.consume(per_branch);
-			let _ = with_storage_layer::<(), DispatchError, _>(|| {
-				Self::do_refresh_branch(&collateral_id, &stable_id)
-			});
+		// The walk's flat cost — the cursor reads/writes, modeled by
+		// `on_idle_base`. If even that does not fit, nothing is read or
+		// written — report zero.
+		if meter.try_consume(T::WeightInfo::on_idle_base()).is_err() {
+			return Weight::zero();
 		}
 
-		// A zero per-vault weight cannot bound the walk, so it disables it;
-		// configure `IdleMaxRefreshWeight = None` instead of zero weights to
-		// express that intent without tripping the defence.
-		let per_vault = T::WeightInfo::on_idle_one_vault();
-		defensive_assert!(
-			per_vault != Weight::zero(),
-			"zero vault-refresh weight disables the idle vault walk"
-		);
-		if per_vault == Weight::zero() {
-			return meter.consumed();
-		}
-		// Cannot afford a single vault: leave the parked cursor untouched.
-		if !meter.can_consume(per_vault) {
-			return meter.consumed();
-		}
+		// The registry is unbounded, so the branch walk gets at most half the
+		// remaining budget — permissionless branch registration can never
+		// starve vault maintenance — and the vault walk inherits whatever the
+		// branch walk leaves unused.
+		let mut branch_budget = WeightMeter::with_limit(meter.remaining().saturating_div(2));
+		Self::idle_branch_walk(&mut branch_budget);
+		meter.consume(branch_budget.consumed());
 
-		let mut iter = match IdleCursor::<T>::get() {
-			Some((collateral_id, stable_id, owner)) => Vaults::<T>::iter_from(
-				Vaults::<T>::hashed_key_for((collateral_id, stable_id, owner)),
-			),
-			None => Vaults::<T>::iter(),
-		};
-		// Bounded: every iteration consumes the non-zero `per_vault` from the
-		// finite meter, or breaks when the map drains.
-		let cursor = loop {
-			// Iterator drained: clear the cursor so the next idle block wraps
-			// around to the front of the map.
-			let Some((key, _vault)) = iter.next() else { break None };
-			let (collateral_id, stable_id, owner) = key;
-			let _ = with_storage_layer::<(), DispatchError, _>(|| {
-				OpContext::<T>::refresh(collateral_id.clone(), stable_id.clone(), &owner)
-			});
-			meter.consume(per_vault);
-			if !meter.can_consume(per_vault) {
-				// Clear instead of park when the meter ran dry exactly at the
-				// map's end, so the next pass starts at the front rather than
-				// burning a block discovering the drain.
-				break iter.next().is_some().then_some((collateral_id, stable_id, owner));
-			}
-		};
-		IdleCursor::<T>::set(cursor);
+		Self::idle_vault_walk(&mut meter);
 		meter.consumed()
+	}
+
+	/// Resume the branch-refresh walk at [`BranchIdleCursor`], reconciling
+	/// oracle-frozen state until `meter` drains.
+	fn idle_branch_walk(meter: &mut WeightMeter) {
+		let cursor = BranchIdleCursor::<T>::get();
+		let iter = match &cursor {
+			Some((collateral_id, stable_id)) => Branches::<T>::iter_keys_from(
+				Branches::<T>::hashed_key_for(collateral_id, stable_id),
+			),
+			None => Branches::<T>::iter_keys(),
+		};
+		let pass = Self::idle_walk_pass(
+			meter,
+			T::WeightInfo::on_idle_one_branch(),
+			iter,
+			|(collateral_id, stable_id)| Self::idle_branch_step(collateral_id, stable_id),
+		);
+		match pass {
+			WalkExit::Untouched => {},
+			// Skip the write when no cursor was stored: the steady state of a
+			// registry that drains within budget every block.
+			WalkExit::Drained => {
+				if cursor.is_some() {
+					BranchIdleCursor::<T>::set(None);
+				}
+			},
+			WalkExit::Parked(key) => BranchIdleCursor::<T>::set(Some(key)),
+		}
+	}
+
+	/// One transactional branch-refresh attempt: the per-key unit of
+	/// [`Self::idle_branch_walk`], and exactly what `on_idle_one_branch`
+	/// measures. Failures roll back and are swallowed — the walk charges
+	/// attempts, not outcomes.
+	pub(crate) fn idle_branch_step(collateral_id: &CollateralIdOf<T>, stable_id: &StableIdOf<T>) {
+		let _ = with_storage_layer::<(), DispatchError, _>(|| {
+			Self::do_refresh_branch(collateral_id, stable_id)
+		});
+	}
+
+	/// Resume the flat vault-refresh walk at [`IdleCursor`] until the meter
+	/// drains. Map order visits every row eventually — dormant husks and
+	/// mid-FIFO `FinalRecovery` vaults included, which a per-branch rate-index
+	/// cursor never reached.
+	fn idle_vault_walk(meter: &mut WeightMeter) {
+		let cursor = IdleCursor::<T>::get();
+		let iter = match &cursor {
+			Some(key) => Vaults::<T>::iter_keys_from(Vaults::<T>::hashed_key_for(key.clone())),
+			None => Vaults::<T>::iter_keys(),
+		};
+		let pass = Self::idle_walk_pass(
+			meter,
+			T::WeightInfo::on_idle_one_vault(),
+			iter,
+			|(collateral_id, stable_id, owner)| {
+				Self::idle_vault_step(collateral_id, stable_id, owner)
+			},
+		);
+		match pass {
+			WalkExit::Untouched => {},
+			// Skip the write when no cursor was stored: the steady state of a
+			// map that drains within budget every block.
+			WalkExit::Drained => {
+				if cursor.is_some() {
+					IdleCursor::<T>::set(None);
+				}
+			},
+			WalkExit::Parked(key) => IdleCursor::<T>::set(Some(key)),
+		}
+	}
+
+	/// One transactional vault-refresh attempt: the per-key unit of
+	/// [`Self::idle_vault_walk`], and exactly what `on_idle_one_vault`
+	/// measures.
+	pub(crate) fn idle_vault_step(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		owner: &T::AccountId,
+	) {
+		let _ = with_storage_layer::<(), DispatchError, _>(|| {
+			OpContext::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
+		});
+	}
+
+	/// TODO: DOC
+	fn idle_walk_pass<K>(
+		meter: &mut WeightMeter,
+		per_step: Weight,
+		mut iter: impl Iterator<Item = K>,
+		mut step: impl FnMut(&K),
+	) -> WalkExit<K> {
+		defensive_assert!(
+			per_step != Weight::zero(),
+			"zero per-step weight disables the idle walk"
+		);
+		if per_step == Weight::zero() {
+			return WalkExit::Untouched;
+		}
+		if !meter.can_consume(per_step) {
+			return WalkExit::Untouched;
+		}
+		// Bounded: every iteration consumes the non-zero `per_step` from the
+		// finite meter, or breaks when the map drains.
+		loop {
+			let Some(key) = iter.next() else { break WalkExit::Drained };
+			step(&key);
+			meter.consume(per_step);
+			if !meter.can_consume(per_step) {
+				// Drained rather than Parked when the meter ran dry exactly
+				// at the map's end, so the next pass starts at the front
+				// instead of burning a block discovering the drain.
+				break if iter.next().is_some() {
+					WalkExit::Parked(key)
+				} else {
+					WalkExit::Drained
+				};
+			}
+		}
 	}
 }
