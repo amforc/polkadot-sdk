@@ -6,7 +6,8 @@
 
 use crate::{
 	pallet::{
-		BalanceOf, Branches, Config, HoldReason, IdleCursor, Pallet, PalletsOriginOf, Vaults,
+		BalanceOf, BranchIdleCursor, Branches, CollateralIdOf, CollateralRisks, Config, HoldReason,
+		IdleCursor, Pallet, PalletsOriginOf, StableIdOf, Vaults,
 	},
 	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
@@ -47,7 +48,7 @@ const REDIST_WEIGHT_PER_STAKE_NUM: u128 = 1;
 const REDIST_WEIGHT_PER_STAKE_DEN: u128 = 10_000;
 const REDIST_PRESTAGE_COLL: u128 = 10_000_000;
 
-fn stable<T: Config>() -> T::StableAssetId {
+fn stable<T: Config>() -> StableIdOf<T> {
 	T::BenchmarkHelper::stable_asset_id()
 }
 
@@ -109,12 +110,11 @@ fn global_manager_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError
 		.map_err(|_| BenchmarkError::Stop("global manager origin unavailable"))
 }
 
-fn register_default_branch<T: Config>() -> Result<T::CollateralAssetId, BenchmarkError> {
+fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkError> {
 	let asset = T::BenchmarkHelper::collateral_asset_id();
 	// `create_branch` validates the oracle price, so set it first.
 	T::BenchmarkHelper::set_oracle_price(
 		asset.clone(),
-		stable::<T>(),
 		FixedU128::saturating_from_integer(ORACLE_PRICE),
 	);
 	Pallet::<T>::create_branch(
@@ -132,10 +132,27 @@ fn register_default_branch<T: Config>() -> Result<T::CollateralAssetId, Benchmar
 	Ok(asset)
 }
 
-fn funded_account<T: Config>(seed: &'static str, asset: &T::CollateralAssetId) -> T::AccountId {
+fn funded_account<T: Config>(seed: &'static str, asset: &CollateralIdOf<T>) -> T::AccountId {
 	let who: T::AccountId = account(seed, 0, 0);
 	T::BenchmarkHelper::mint_collateral(asset.clone(), &who, balance::<T>(ACCOUNT_FUNDING));
 	who
+}
+
+/// Register the default market and open one vault in it. Returns the market's collateral id and the
+/// vault owner.
+fn seed_idle_market<T: Config>() -> Result<(CollateralIdOf<T>, T::AccountId), BenchmarkError> {
+	let asset = register_default_branch::<T>()?;
+	let owner = funded_account::<T>("owner", &asset);
+	Pallet::<T>::open_vault(
+		RawOrigin::Signed(owner.clone()).into(),
+		asset.clone(),
+		stable::<T>(),
+		balance::<T>(SEED_COLL),
+		balance::<T>(SEED_DEBT),
+		rate(5, 100),
+		Position::endpoints_only(),
+	)?;
+	Ok((asset, owner))
 }
 
 /// Runtime-adaptive rate fixture derived from the live branch's borrow-rate
@@ -153,7 +170,7 @@ struct RateBounds {
 	middle: FixedU128,
 }
 
-fn rate_bounds<T: Config>(asset: &T::CollateralAssetId) -> Result<RateBounds, BenchmarkError> {
+fn rate_bounds<T: Config>(asset: &CollateralIdOf<T>) -> Result<RateBounds, BenchmarkError> {
 	let config = Pallet::<T>::branch_of(asset, &stable::<T>())
 		.map_err(|_| BenchmarkError::Stop("missing branch config"))?
 		.config;
@@ -190,7 +207,7 @@ fn rate_bounds<T: Config>(asset: &T::CollateralAssetId) -> Result<RateBounds, Be
 /// `find_position` to keep seeding O(count) — independent of the
 /// hint-repair budget. Returns owners in head→tail order.
 fn seed_worst_case_chain<T: Config>(
-	asset: &T::CollateralAssetId,
+	asset: &CollateralIdOf<T>,
 ) -> Result<Vec<T::AccountId>, BenchmarkError> {
 	let count = T::VaultLists::repair_budget().saturating_add(2);
 	let mut owners = Vec::with_capacity(count as usize);
@@ -233,9 +250,7 @@ fn worst_case_head_hint<T: Config>(
 /// Plant a non-trivial branch redistribution snapshot so every vault touch
 /// enters the `snap != redistribution` branch with non-zero `redistribution_collateral` and
 /// `redistribution_debt_principal`.
-fn seed_pending_redistribution<T: Config>(
-	asset: &T::CollateralAssetId,
-) -> Result<(), BenchmarkError> {
+fn seed_pending_redistribution<T: Config>(asset: &CollateralIdOf<T>) -> Result<(), BenchmarkError> {
 	let per_stake = rate(REDIST_PER_STAKE_NUM, REDIST_PER_STAKE_DEN);
 	let weight_per_stake = rate(REDIST_WEIGHT_PER_STAKE_NUM, REDIST_WEIGHT_PER_STAKE_DEN);
 
@@ -250,16 +265,17 @@ fn seed_pending_redistribution<T: Config>(
 	)
 	.map_err(|_| BenchmarkError::Stop("hold on redistribution account failed"))?;
 
-	Branches::<T>::try_mutate((asset, &stable::<T>()), |maybe| -> Result<(), BenchmarkError> {
-		let state = &mut maybe.as_mut().ok_or(BenchmarkError::Stop("branch missing"))?.state;
-		state.redistribution.debt_per_stake = per_stake;
-		state.redistribution.collateral_per_stake = per_stake;
-		state.redistribution.weight_per_stake = weight_per_stake;
-		state.redistribution.debt_time_per_stake = FixedU128::zero();
-		state.debt.pending_redistribution_principal =
-			per_stake.saturating_mul_int(state.stakes.total);
-		Ok(())
-	})
+	// Seed through the audited boundary so `CollateralRisks` stays true.
+	let mut branch = Pallet::<T>::branch_of(asset, &stable::<T>())
+		.map_err(|_| BenchmarkError::Stop("branch missing"))?;
+	let state = &mut branch.state;
+	state.redistribution.debt_per_stake = per_stake;
+	state.redistribution.collateral_per_stake = per_stake;
+	state.redistribution.weight_per_stake = weight_per_stake;
+	state.redistribution.debt_time_per_stake = FixedU128::zero();
+	state.debt.pending_redistribution_principal = per_stake.saturating_mul_int(state.stakes.total);
+	Pallet::<T>::commit_branch(asset, &stable::<T>(), branch)
+		.map_err(|_| BenchmarkError::Stop("branch commit failed"))
 }
 
 /// Open a fresh "only-eligible" vault, drop the oracle so it qualifies for
@@ -267,7 +283,7 @@ fn seed_pending_redistribution<T: Config>(
 /// then restore the oracle.
 fn recovery_cycle<T: Config>(
 	seed_index: u32,
-	asset: &T::CollateralAssetId,
+	asset: &CollateralIdOf<T>,
 ) -> Result<T::AccountId, BenchmarkError> {
 	let owner: T::AccountId = account("rec", seed_index, 0);
 	T::BenchmarkHelper::mint_collateral(asset.clone(), &owner, balance::<T>(ACCOUNT_FUNDING));
@@ -282,7 +298,6 @@ fn recovery_cycle<T: Config>(
 	)?;
 	T::BenchmarkHelper::set_oracle_price(
 		asset.clone(),
-		stable::<T>(),
 		FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
 	);
 	let keeper: T::AccountId = whitelisted_caller();
@@ -294,29 +309,9 @@ fn recovery_cycle<T: Config>(
 	)?;
 	T::BenchmarkHelper::set_oracle_price(
 		asset.clone(),
-		stable::<T>(),
 		FixedU128::saturating_from_integer(ORACLE_PRICE),
 	);
 	Ok(owner)
-}
-
-fn prefill_branches<T: Config>(count: u32) {
-	// The registry is the `Branches` key set, so each synthetic market seeds a
-	// complete (empty) record.
-	let now = Zero::zero();
-	for seed in 0..count {
-		let (collateral, stable) = T::BenchmarkHelper::synth_market(seed);
-		let config = default_branch_config::<T>();
-		Branches::<T>::insert(
-			(collateral, stable),
-			crate::types::Branch {
-				state: crate::types::BranchState::fresh(&config, now),
-				config,
-				admins: branch_admins::<T>(),
-				deposit: None,
-			},
-		);
-	}
 }
 
 #[benchmarks]
@@ -604,7 +599,6 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 		T::BenchmarkHelper::set_oracle_price(
 			asset.clone(),
-			stable::<T>(),
 			FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
 		);
 		let caller: T::AccountId = whitelisted_caller();
@@ -711,23 +705,146 @@ mod benchmarks {
 	}
 
 	#[benchmark]
-	fn register_branch() -> Result<(), BenchmarkError> {
-		let prefill = <T::MaxBranches as Get<u32>>::get().saturating_sub(1);
-		prefill_branches::<T>(prefill);
+	fn create_branch() -> Result<(), BenchmarkError> {
 		let asset = T::BenchmarkHelper::collateral_asset_id();
 		let config = default_branch_config::<T>();
 		let admins = branch_admins::<T>();
 		T::BenchmarkHelper::set_oracle_price(
 			asset.clone(),
-			stable::<T>(),
 			FixedU128::saturating_from_integer(ORACLE_PRICE),
 		);
 		let origin = create_origin::<T>()?;
 
 		#[extrinsic_call]
-		create_branch(origin, asset.clone(), stable::<T>(), admins, config);
+		_(origin, asset.clone(), stable::<T>(), admins, config);
 
-		assert!(Branches::<T>::contains_key((&asset, &stable::<T>())));
+		assert!(Branches::<T>::contains_key(&asset, &stable::<T>()));
+		Ok(())
+	}
+
+	#[benchmark]
+	fn remove_branch() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		let origin = full_admin_origin::<T>();
+
+		#[extrinsic_call]
+		_(origin, asset.clone(), stable::<T>());
+
+		assert!(!Branches::<T>::contains_key(&asset, &stable::<T>()));
+		Ok(())
+	}
+
+	#[benchmark]
+	fn set_branch_admins() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		let origin = full_admin_origin::<T>();
+		let new_full: T::AccountId = account("new_full_admin", 0, 0);
+		let new_emergency: T::AccountId = account("new_emergency_admin", 0, 0);
+		let admins = BranchAdmins {
+			full_admin: RawOrigin::Signed(new_full).into(),
+			emergency_admin: RawOrigin::Signed(new_emergency).into(),
+		};
+
+		#[extrinsic_call]
+		_(origin, asset.clone(), stable::<T>(), admins.clone());
+
+		let branch =
+			Branches::<T>::get(&asset, &stable::<T>()).expect("branch present after register");
+		assert_eq!(branch.admins, admins);
+		Ok(())
+	}
+
+	#[benchmark]
+	fn set_global_debt_ceiling() -> Result<(), BenchmarkError> {
+		let asset = T::BenchmarkHelper::collateral_asset_id();
+		let origin = global_manager_origin::<T>()?;
+		let ceiling = balance::<T>(GLOBAL_CEILING);
+
+		#[extrinsic_call]
+		_(origin, asset.clone(), ceiling);
+
+		assert_eq!(CollateralRisks::<T>::get(&asset).debt_ceiling, ceiling);
+		Ok(())
+	}
+
+	#[benchmark]
+	fn refresh_branch() -> Result<(), BenchmarkError> {
+		let (asset, _owner) = seed_idle_market::<T>()?;
+		// A year of accrual, then a dead oracle: the refresh takes its
+		// heaviest path — freeze, flush the aggregate interest, mint and
+		// route the yield.
+		T::BenchmarkHelper::advance_time(ONE_HOUR_MS.saturating_mul(24 * 365));
+		T::BenchmarkHelper::clear_oracle_price(asset.clone());
+		let caller: T::AccountId = whitelisted_caller();
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>());
+
+		let branch = Branches::<T>::get(&asset, &stable::<T>()).expect("branch registered above");
+		assert!(branch.state.frozen.is_some(), "oracle failure froze the branch");
+		Ok(())
+	}
+
+	#[benchmark]
+	fn poke_ceiling() -> Result<(), BenchmarkError> {
+		// An autoline-enabled market derived from the guard envelope, so the
+		// worst case — a ratcheting `Branches` write — is constructible on
+		// any runtime. The gap stays below the line max: a gap at the line
+		// max starts the ceiling there and leaves the ratchet nothing to do.
+		let guard = T::BranchConfigGuard::get();
+		let mut config = default_branch_config::<T>();
+		config.ceiling_ttl = guard.min_ceiling_ttl;
+		config.ceiling_gap = {
+			let below_line = balance::<T>(50_000_000);
+			guard.max_ceiling_gap.min(below_line)
+		};
+		if config.ceiling_gap.is_zero() {
+			return Err(BenchmarkError::Stop("guard envelope disables the autoline"));
+		}
+		let asset = T::BenchmarkHelper::collateral_asset_id();
+		T::BenchmarkHelper::set_oracle_price(
+			asset.clone(),
+			FixedU128::saturating_from_integer(ORACLE_PRICE),
+		);
+		Pallet::<T>::create_branch(
+			create_origin::<T>()?,
+			asset.clone(),
+			stable::<T>(),
+			branch_admins::<T>(),
+			config,
+		)?;
+		Pallet::<T>::set_global_debt_ceiling(
+			global_manager_origin::<T>()?,
+			asset.clone(),
+			balance::<T>(GLOBAL_CEILING),
+		)?;
+		let owner = funded_account::<T>("owner", &asset);
+		Pallet::<T>::open_vault(
+			RawOrigin::Signed(owner).into(),
+			asset.clone(),
+			stable::<T>(),
+			balance::<T>(SEED_COLL),
+			balance::<T>(SEED_DEBT),
+			rate(5, 100),
+			Position::endpoints_only(),
+		)?;
+		// Raises are ttl-gated from registration; move past the gate so the
+		// poke performs the write.
+		T::BenchmarkHelper::advance_time(guard.min_ceiling_ttl.saturating_add(1));
+		let before = Branches::<T>::get(&asset, &stable::<T>())
+			.expect("branch registered above")
+			.state
+			.effective_ceiling;
+		let caller: T::AccountId = whitelisted_caller();
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>());
+
+		let after = Branches::<T>::get(&asset, &stable::<T>())
+			.expect("branch registered above")
+			.state
+			.effective_ceiling;
+		assert!(after > before, "the poke ratcheted the ceiling up");
 		Ok(())
 	}
 
@@ -749,42 +866,94 @@ mod benchmarks {
 	}
 
 	#[benchmark]
-	fn enable_frozen_mode() -> Result<(), BenchmarkError> {
+	fn set_governance_frozen() -> Result<(), BenchmarkError> {
 		let asset = register_default_branch::<T>()?;
 		let origin = full_admin_origin::<T>();
 
+		// Freezing is the heavier direction: it flushes pending aggregate
+		// interest and mints/routes the yield.
 		#[extrinsic_call]
-		_(origin, asset.clone(), stable::<T>());
+		_(origin, asset.clone(), stable::<T>(), true);
 
 		let branch =
-			Branches::<T>::get((&asset, &stable::<T>())).expect("branch present after register");
+			Branches::<T>::get(&asset, &stable::<T>()).expect("branch present after register");
 		assert!(branch.state.frozen.is_some());
 		Ok(())
 	}
 
 	#[benchmark]
+	fn on_idle_base() -> Result<(), BenchmarkError> {
+		let (asset, owner) = seed_idle_market::<T>()?;
+		BranchIdleCursor::<T>::put((asset.clone(), stable::<T>()));
+		IdleCursor::<T>::put((asset.clone(), stable::<T>(), owner));
+
+		// The idle walk's flat cost: both cursors' read/write plus one
+		// terminal `next_key` probe per walk — `idle_walk_pass`'s charging
+		// contract.
+		let branch_probe;
+		let vault_probe;
+		#[block]
+		{
+			let branch_cursor = BranchIdleCursor::<T>::get();
+			let vault_cursor = IdleCursor::<T>::get();
+			branch_probe = Branches::<T>::iter_keys().next();
+			vault_probe = Vaults::<T>::iter_keys().next();
+			BranchIdleCursor::<T>::set(branch_cursor);
+			IdleCursor::<T>::set(vault_cursor);
+		}
+
+		assert!(branch_probe.is_some(), "the probe read the registered branch's key");
+		assert!(vault_probe.is_some(), "the probe read the opened vault's key");
+		assert!(BranchIdleCursor::<T>::get().is_some());
+		Ok(())
+	}
+
+	#[benchmark]
+	fn on_idle_one_branch() -> Result<(), BenchmarkError> {
+		let (asset, _owner) = seed_idle_market::<T>()?;
+		// A year of accrual, then a dead oracle: the refresh takes its
+		// heaviest path — freeze, flush the aggregate interest, mint and
+		// route the yield.
+		T::BenchmarkHelper::advance_time(ONE_HOUR_MS.saturating_mul(24 * 365));
+		T::BenchmarkHelper::clear_oracle_price(asset.clone());
+
+		// One `idle_branch_walk` step: the key pull plus the shared step fn.
+		#[block]
+		{
+			let (collateral_id, stable_id) =
+				Branches::<T>::iter_keys().next().expect("branch registered above");
+			Pallet::<T>::idle_branch_step(&collateral_id, &stable_id);
+		}
+
+		let branch = Branches::<T>::get(&asset, &stable::<T>()).expect("branch registered above");
+		assert!(branch.state.frozen.is_some(), "oracle failure froze the branch");
+		assert!(
+			!branch.state.debt.minted_interest.is_zero(),
+			"the freeze flushed accrued aggregate interest"
+		);
+		Ok(())
+	}
+
+	#[benchmark]
 	fn on_idle_one_vault() -> Result<(), BenchmarkError> {
-		let asset = register_default_branch::<T>()?;
-		let owner = funded_account::<T>("owner", &asset);
-		Pallet::<T>::open_vault(
-			RawOrigin::Signed(owner.clone()).into(),
-			asset.clone(),
-			stable::<T>(),
-			balance::<T>(SEED_COLL),
-			balance::<T>(SEED_DEBT),
-			rate(5, 100),
-			Position::endpoints_only(),
-		)?;
+		let (asset, owner) = seed_idle_market::<T>()?;
 		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
+		// One `idle_vault_walk` step: the key pull plus the shared step fn.
 		#[block]
 		{
-			let _ = crate::context::OpContext::<T>::refresh(asset.clone(), stable::<T>(), &owner);
-			IdleCursor::<T>::put((asset.clone(), stable::<T>(), owner.clone()));
+			let (collateral_id, stable_id, walked_owner) =
+				Vaults::<T>::iter_keys().next().expect("vault opened above");
+			Pallet::<T>::idle_vault_step(&collateral_id, &stable_id, &walked_owner);
 		}
 
-		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)));
+		let vault = Vaults::<T>::get((&asset, &stable::<T>(), &owner)).expect("vault opened above");
+		let branch = Branches::<T>::get(&asset, &stable::<T>()).expect("branch registered above");
+		assert_eq!(
+			vault.redistribution_snapshot, branch.state.redistribution,
+			"the refresh caught the vault up to the seeded redistribution"
+		);
 		Ok(())
 	}
 

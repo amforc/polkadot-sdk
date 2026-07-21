@@ -4,23 +4,43 @@
 //! `next_block` and end-to-end by the runtime's pre-upgrade hook.
 
 use crate::{
-	pallet::{BalanceOf, BranchOf, Branches, Config, HoldReason, Pallet, Vaults},
-	types::VaultListId,
+	pallet::{
+		AssetRoles, BalanceOf, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
+		HoldReason, Millis, Pallet, StableIdOf, Vaults,
+	},
+	types::{AssetRole, AssetRoleUsage, CollateralRisk, VaultListId},
 };
 use alloc::collections::BTreeMap;
 use frame::{
-	arithmetic::{FixedPointNumber, FixedU128, One, Saturating, UniqueSaturatedInto, Zero},
-	traits::{fungibles::InspectHold, Time},
+	arithmetic::{
+		CheckedAdd, FixedPointNumber, FixedU128, One, Saturating, UniqueSaturatedInto, Zero,
+	},
+	traits::{fungibles::InspectHold, Convert, Time},
 	try_runtime::TryRuntimeError,
 };
 use pallet_linked_list::SortedListInterface;
 
 pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
+	let now = T::TimeProvider::now();
 	// Owner-hold invariant accumulator: filled per branch inside
 	// `check_branch_identities`' single vault pass, then checked once below.
-	let mut owner_collateral: BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>> =
+	let mut owner_collateral: BTreeMap<(CollateralIdOf<T>, T::AccountId), BalanceOf<T>> =
 		BTreeMap::new();
-	for ((collateral_id, stable_id), branch) in Branches::<T>::iter() {
+	// Derived-index accumulators, recomputed in full from the authoritative
+	// registry and compared against `AssetRoles`/`CollateralRisks` below.
+	let mut roles: BTreeMap<CollateralIdOf<T>, AssetRoleUsage> = BTreeMap::new();
+	let mut outstanding: BTreeMap<CollateralIdOf<T>, BalanceOf<T>> = BTreeMap::new();
+	for (collateral_id, stable_id, branch) in Branches::<T>::iter() {
+		claim_role::<T>(&mut roles, collateral_id.clone(), AssetRole::Collateral)?;
+		claim_role::<T>(
+			&mut roles,
+			T::StableToCollateralId::convert(stable_id.clone()),
+			AssetRole::Stable,
+		)?;
+		let debt_entry = outstanding.entry(collateral_id.clone()).or_default();
+		*debt_entry = debt_entry
+			.checked_add(&branch.state.debt.outstanding())
+			.ok_or("collateral outstanding-debt sum overflow")?;
 		let (collateral_id, stable_id) = (&collateral_id, &stable_id);
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 		let recovery_list = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
@@ -30,20 +50,11 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			&branch,
 			&rate_list,
 			&recovery_list,
+			now,
 			&mut owner_collateral,
 		)?;
-		let state = &branch.state;
-		let tau = state.interest_time(T::TimeProvider::now());
-		if state.debt.last_interest_time > tau {
-			return Err("branch last_interest_time ahead of interest_time(now)".into());
-		}
-		for (_owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
-			if vault.last_interest_time > tau {
-				return Err("vault last_interest_time ahead of interest_time(now)".into());
-			}
-		}
 		// `dormant_redemption_target`, when set, must point at a Dormant vault.
-		if let Some(owner) = state.dormant_redemption_target.clone() {
+		if let Some(owner) = branch.state.dormant_redemption_target.clone() {
 			if !Vaults::<T>::contains_key((collateral_id, stable_id, &owner)) {
 				return Err("dormant_redemption_target points at missing vault".into());
 			}
@@ -54,6 +65,57 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	}
 
 	check_owner_holds::<T>(owner_collateral)?;
+	check_asset_roles::<T>(roles)?;
+	check_collateral_risks::<T>(outstanding)?;
+	Ok(())
+}
+
+/// Accumulate one market reference for `asset` in `role`, rejecting an asset
+/// that appears on both sides of the registry.
+fn claim_role<T: Config>(
+	roles: &mut BTreeMap<CollateralIdOf<T>, AssetRoleUsage>,
+	asset: CollateralIdOf<T>,
+	role: AssetRole,
+) -> Result<(), TryRuntimeError> {
+	let usage = roles.entry(asset).or_insert(AssetRoleUsage { role, markets: 0 });
+	if usage.role != role {
+		return Err("asset used as both collateral and stablecoin across markets".into());
+	}
+	usage.markets = usage.markets.checked_add(1).ok_or("asset role reference count overflow")?;
+	Ok(())
+}
+
+/// `AssetRoles` must equal its full recomputation from `Branches` — same
+/// entries, same roles, same reference counts, nothing extra.
+fn check_asset_roles<T: Config>(
+	roles: BTreeMap<CollateralIdOf<T>, AssetRoleUsage>,
+) -> Result<(), TryRuntimeError> {
+	let stored: BTreeMap<CollateralIdOf<T>, AssetRoleUsage> = AssetRoles::<T>::iter().collect();
+	if stored != roles {
+		return Err("AssetRoles diverges from its recomputation over Branches".into());
+	}
+	Ok(())
+}
+
+/// Every `CollateralRisks` record must carry the recomputed outstanding total
+/// for its collateral, no default records may be stored (the write paths
+/// remove those), and no collateral with outstanding debt may lack a record.
+/// The `debt_ceiling` side is a governance input with no recomputation.
+fn check_collateral_risks<T: Config>(
+	mut outstanding: BTreeMap<CollateralIdOf<T>, BalanceOf<T>>,
+) -> Result<(), TryRuntimeError> {
+	for (collateral_id, risk) in CollateralRisks::<T>::iter() {
+		if risk == CollateralRisk::default() {
+			return Err("default CollateralRisk record stored".into());
+		}
+		let recomputed = outstanding.remove(&collateral_id).unwrap_or_default();
+		if risk.outstanding != recomputed {
+			return Err("CollateralRisks diverges from its recomputation over Branches".into());
+		}
+	}
+	if outstanding.into_values().any(|total| !total.is_zero()) {
+		return Err("collateral with outstanding debt lacks a CollateralRisks record".into());
+	}
 	Ok(())
 }
 
@@ -63,7 +125,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 /// single vault pass; here we only compare it against the on-chain hold. With one
 /// stablecoin per collateral this collapses to a single term.
 fn check_owner_holds<T: Config>(
-	owner_collateral: BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>>,
+	owner_collateral: BTreeMap<(CollateralIdOf<T>, T::AccountId), BalanceOf<T>>,
 ) -> Result<(), TryRuntimeError> {
 	for ((collateral_id, owner), sum) in owner_collateral {
 		let held = T::CollateralAssets::balance_on_hold(
@@ -78,17 +140,24 @@ fn check_owner_holds<T: Config>(
 	Ok(())
 }
 
-/// Single pass over `Vaults::<T>::iter_prefix(c)`: per-vault membership
-/// invariants and redistribution accounting sums.
+/// Single pass over `Vaults::<T>::iter_prefix(c)`: per-vault membership and
+/// interest-clock invariants, and redistribution accounting sums. The sums
+/// are checked, not saturating, so an overflow is diagnosed rather than
+/// silently absorbed into a saturated comparison.
 fn check_branch_identities<T: Config>(
-	collateral_id: &T::CollateralAssetId,
-	stable_id: &T::StableAssetId,
+	collateral_id: &CollateralIdOf<T>,
+	stable_id: &StableIdOf<T>,
 	branch: &BranchOf<T>,
-	rate_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
-	recovery_list: &VaultListId<T::CollateralAssetId, T::StableAssetId>,
-	owner_collateral: &mut BTreeMap<(T::CollateralAssetId, T::AccountId), BalanceOf<T>>,
+	rate_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
+	recovery_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
+	now: Millis,
+	owner_collateral: &mut BTreeMap<(CollateralIdOf<T>, T::AccountId), BalanceOf<T>>,
 ) -> Result<(), TryRuntimeError> {
 	let state = &branch.state;
+	let tau = state.interest_time(now);
+	if state.debt.last_interest_time > tau {
+		return Err("branch last_interest_time ahead of interest_time(now)".into());
+	}
 	let cumul_debt_ps = state.redistribution.debt_per_stake;
 	let cumul_collat_ps = state.redistribution.collateral_per_stake;
 
@@ -102,6 +171,9 @@ fn check_branch_identities<T: Config>(
 	let mut n_live_vaults: u128 = 0;
 
 	for (owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
+		if vault.last_interest_time > tau {
+			return Err("vault last_interest_time ahead of interest_time(now)".into());
+		}
 		let in_rate_index = T::VaultLists::contains(rate_list, &owner);
 		let in_recovery = T::VaultLists::contains(recovery_list, &owner);
 		if in_rate_index && in_recovery {
@@ -112,15 +184,33 @@ fn check_branch_identities<T: Config>(
 		// accumulated here and checked once, globally, in `do_try_state`.
 		let owner_entry =
 			owner_collateral.entry((collateral_id.clone(), owner.clone())).or_default();
-		*owner_entry = owner_entry.saturating_add(vault.collateral);
-		sum_market_collateral = sum_market_collateral.saturating_add(vault.collateral);
+		*owner_entry = owner_entry
+			.checked_add(&vault.collateral)
+			.ok_or("owner collateral sum overflow")?;
+		sum_market_collateral = sum_market_collateral
+			.checked_add(&vault.collateral)
+			.ok_or("market collateral sum overflow")?;
 		// Every row — FinalRecovery included — keeps its debt attached to the
 		// branch aggregates; only the stake is detached while in the FIFO.
-		sum_principal = sum_principal.saturating_add(vault.debt.principal);
+		sum_principal = sum_principal
+			.checked_add(&vault.debt.principal)
+			.ok_or("branch principal sum overflow")?;
 		sum_weighted_principal = sum_weighted_principal
-			.saturating_add(vault.annual_rate.saturating_mul_int(vault.debt.principal));
+			.checked_add(
+				&vault
+					.annual_rate
+					.checked_mul_int(vault.debt.principal)
+					.ok_or("weighted principal term overflow")?,
+			)
+			.ok_or("weighted principal sum overflow")?;
 		sum_weighted_stake = sum_weighted_stake
-			.saturating_add(vault.annual_rate.saturating_mul_int(vault.redistribution_stake));
+			.checked_add(
+				&vault
+					.annual_rate
+					.checked_mul_int(vault.redistribution_stake)
+					.ok_or("weighted stake term overflow")?,
+			)
+			.ok_or("weighted stake sum overflow")?;
 		if in_recovery {
 			if !vault.redistribution_stake.is_zero() {
 				return Err("FinalRecovery vault has non-zero redistribution_stake".into());
@@ -130,7 +220,9 @@ fn check_branch_identities<T: Config>(
 		if vault.redistribution_stake != vault.collateral {
 			return Err("vault.redistribution_stake != vault.collateral".into());
 		}
-		sum_stake = sum_stake.saturating_add(vault.redistribution_stake);
+		sum_stake = sum_stake
+			.checked_add(&vault.redistribution_stake)
+			.ok_or("branch stake sum overflow")?;
 		let snap = vault.redistribution_snapshot;
 		let delta_debt = cumul_debt_ps.saturating_sub(snap.debt_per_stake);
 		sum_pending_debt_share = sum_pending_debt_share
@@ -182,7 +274,9 @@ fn check_branch_identities<T: Config>(
 		&HoldReason::VaultCollateral.into(),
 		&Pallet::<T>::redistribution_account(collateral_id, stable_id),
 	);
-	let physical = sum_market_collateral.saturating_add(held_redistribution);
+	let physical = sum_market_collateral
+		.checked_add(&held_redistribution)
+		.ok_or("physical collateral sum overflow")?;
 	if state.total_collateral != physical {
 		return Err("total_collateral != Σ owner-held + redistribution-account hold".into());
 	}

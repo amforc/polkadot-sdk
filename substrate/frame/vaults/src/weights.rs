@@ -14,11 +14,16 @@ pub trait WeightInfo {
 	fn enter_final_recovery() -> Weight;
 	fn exit_final_recovery() -> Weight;
 	fn activate_dormant() -> Weight;
-	fn register_branch() -> Weight;
+	fn create_branch() -> Weight;
+	fn remove_branch() -> Weight;
 	fn set_param() -> Weight;
-	fn enable_frozen_mode() -> Weight;
+	fn set_branch_admins() -> Weight;
+	fn set_global_debt_ceiling() -> Weight;
+	fn set_governance_frozen() -> Weight;
 	fn refresh_branch() -> Weight;
-	fn clear_governance_frozen_mode() -> Weight;
+	fn poke_ceiling() -> Weight;
+	fn on_idle_base() -> Weight;
+	fn on_idle_one_branch() -> Weight;
 	fn on_idle_one_vault() -> Weight;
 }
 
@@ -56,20 +61,35 @@ impl WeightInfo for () {
 	fn activate_dormant() -> Weight {
 		Weight::zero()
 	}
-	fn register_branch() -> Weight {
+	fn create_branch() -> Weight {
+		Weight::zero()
+	}
+	fn remove_branch() -> Weight {
 		Weight::zero()
 	}
 	fn set_param() -> Weight {
 		Weight::zero()
 	}
-	fn enable_frozen_mode() -> Weight {
+	fn set_branch_admins() -> Weight {
+		Weight::zero()
+	}
+	fn set_global_debt_ceiling() -> Weight {
+		Weight::zero()
+	}
+	fn set_governance_frozen() -> Weight {
 		Weight::zero()
 	}
 	fn refresh_branch() -> Weight {
-		Weight::from_parts(3, 3)
-	}
-	fn clear_governance_frozen_mode() -> Weight {
 		Weight::zero()
+	}
+	fn poke_ceiling() -> Weight {
+		Weight::zero()
+	}
+	fn on_idle_base() -> Weight {
+		Weight::from_parts(1, 1)
+	}
+	fn on_idle_one_branch() -> Weight {
+		Weight::from_parts(3, 3)
 	}
 	fn on_idle_one_vault() -> Weight {
 		Weight::from_parts(10, 10)

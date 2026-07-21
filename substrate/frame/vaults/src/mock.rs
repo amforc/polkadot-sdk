@@ -21,6 +21,7 @@ pub use frame::{
 	testing_prelude::{assert_err, assert_noop, assert_ok},
 };
 use frame::{
+	deps::sp_runtime::traits::ConvertInto,
 	testing_prelude::*,
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
@@ -139,7 +140,6 @@ impl pallet_assets_holder::Config for Test {
 
 parameter_types! {
 	pub const MaxHintRepairSteps: u32 = 16;
-	pub const MaxBranches: u32 = 8;
 	pub const IdleMaxRefreshWeight: Option<Weight> = Some(Weight::MAX);
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
 }
@@ -201,7 +201,7 @@ pub fn branch_state(
 	collateral: AssetId,
 	stable: StableId,
 ) -> Option<pallet_vaults::BranchState<AccountId, Balance>> {
-	crate::pallet::Branches::<Test>::get((collateral, stable)).map(|branch| branch.state)
+	crate::pallet::Branches::<Test>::get(collateral, stable).map(|branch| branch.state)
 }
 
 /// The market's config (`None` when unregistered).
@@ -209,18 +209,19 @@ pub fn branch_config(
 	collateral: AssetId,
 	stable: StableId,
 ) -> Option<pallet_vaults::BranchConfig<Balance>> {
-	crate::pallet::Branches::<Test>::get((collateral, stable)).map(|branch| branch.config)
+	crate::pallet::Branches::<Test>::get(collateral, stable).map(|branch| branch.config)
 }
 
-/// Mutate the market's hot state in place; panics when unregistered.
+/// Mutate the market's hot state through the pallet's write boundary.
 pub fn mutate_branch_state(
 	collateral: AssetId,
 	stable: StableId,
 	mutate: impl FnOnce(&mut pallet_vaults::BranchState<AccountId, Balance>),
 ) {
-	crate::pallet::Branches::<Test>::mutate((collateral, stable), |maybe| {
-		mutate(&mut maybe.as_mut().expect("branch registered").state)
-	});
+	let mut branch =
+		crate::Pallet::<Test>::branch_of(&collateral, &stable).expect("branch registered");
+	mutate(&mut branch.state);
+	crate::Pallet::<Test>::commit_branch(&collateral, &stable, branch).expect("branch committed");
 }
 
 /// Derived branch mode (`None` when the market is unknown or the mode cannot
@@ -258,17 +259,29 @@ impl OnUnbalanced<Credit<AccountId, VaultStableAssets>> for DealWithFees {
 parameter_types! {
 	/// Log of `(collateral, stable, registered?)` lifecycle hook calls.
 	pub static LifecycleLog: alloc::vec::Vec<(AssetId, StableId, bool)> = alloc::vec::Vec::new();
+	/// Make [`RecordingLifecycle::on_registered`] fail.
+	pub static FailOnRegistered: bool = false;
+	/// Make [`RecordingLifecycle::on_deregistered`] fail.
+	pub static FailOnDeregistered: bool = false;
 }
 
-/// Records the market lifecycle hooks so tests can assert they fire.
+/// Records the market lifecycle hooks so tests can assert they fire. The
+/// failure switches exercise transaction rollback when a hook returns an
+/// error.
 pub struct RecordingLifecycle;
 impl pusd_primitives::OnBranchLifecycle<AssetId, StableId> for RecordingLifecycle {
 	fn on_registered(collateral_id: &AssetId, stable_id: &StableId) -> DispatchResult {
 		LifecycleLog::mutate(|l| l.push((collateral_id.clone(), *stable_id, true)));
+		if FailOnRegistered::get() {
+			return Err(DispatchError::Other("on_registered failure"));
+		}
 		Ok(())
 	}
 	fn on_deregistered(collateral_id: &AssetId, stable_id: &StableId) -> DispatchResult {
 		LifecycleLog::mutate(|l| l.push((collateral_id.clone(), *stable_id, false)));
+		if FailOnDeregistered::get() {
+			return Err(DispatchError::Other("on_deregistered failure"));
+		}
 		Ok(())
 	}
 }
@@ -283,6 +296,9 @@ parameter_types! {
 pub const ADMIN: AccountId = 100;
 /// Emergency (tighten-only) admin of every market a test helper registers.
 pub const EMERGENCY_ADMIN: AccountId = 101;
+/// PUSD's genesis owner — the signer permitted to open a PUSD market with a
+/// deposit, per the mock's `EnsureAssetOwner`.
+pub const PUSD_OWNER: AccountId = 1;
 
 /// The origin caller under which `who` administers markets — admins are stored
 /// as origin callers, not accounts.
@@ -346,9 +362,7 @@ parameter_types! {
 
 impl pallet_vaults::Config for Test {
 	type RuntimeHoldReason = RuntimeHoldReason;
-	type CollateralAssetId = AssetId;
-	type StableAssetId = StableId;
-	type SameAsset = pallet_vaults::SameAssetViaInto;
+	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = VaultStableAssets;
 	type Oracle = MockOracle;
@@ -362,7 +376,6 @@ impl pallet_vaults::Config for Test {
 	type GlobalManagerOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
-	type MaxBranches = MaxBranches;
 	type IdleMaxRefreshWeight = IdleMaxRefreshWeight;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
@@ -404,16 +417,18 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId, Balance> for M
 			.expect("mint stable for benchmark account");
 	}
 
-	fn set_oracle_price(collateral_id: AssetId, _stable_id: StableId, price: FixedU128) {
+	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
+	}
+
+	fn clear_oracle_price(collateral_id: AssetId) {
+		MockPrices::mutate(|prices| {
+			prices.remove(&collateral_id);
+		});
 	}
 
 	fn advance_time(ms: u64) {
 		advance_time(ms);
-	}
-
-	fn synth_market(seed: u32) -> (AssetId, StableId) {
-		(AssetId::WithId(10_000 + seed), 20_000 + seed)
 	}
 }
 
@@ -434,9 +449,7 @@ pub const TOKEN_X: AssetId = AssetId::WithId(TOKEN_X_ID);
 pub const ETH_ID: AssetIdForAssets = 2;
 pub const ETH: AssetId = AssetId::WithId(ETH_ID);
 
-/// Third and fourth issued collaterals. Only the registry-capacity test needs
-/// them: with two stablecoins, four collaterals make exactly `MaxBranches`
-/// valid markets, leaving `COLL_D` spare to probe the full-registry rejection.
+/// Third and fourth issued collaterals, for the many-market registry tests.
 pub const COLL_C_ID: AssetIdForAssets = 3;
 pub const COLL_C: AssetId = AssetId::WithId(COLL_C_ID);
 pub const COLL_D_ID: AssetIdForAssets = 4;
@@ -513,6 +526,8 @@ pub fn new_test_ext() -> TestState {
 		MockPrices::set(alloc::collections::BTreeMap::new());
 		MockOracleAvailable::set(true);
 		LifecycleLog::set(alloc::vec::Vec::new());
+		FailOnRegistered::set(false);
+		FailOnDeregistered::set(false);
 	});
 	ext
 }
@@ -551,10 +566,10 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 /// that the global cap never binds unless a test sets a lower one.
 pub const GLOBAL_CEILING: Balance = 1_000_000_000_000_000;
 
-/// Register a `(collateral, stable)` market at an explicit oracle price and
-/// branch config, and grant the collateral a high global debt ceiling so
-/// borrowing is enabled.
-pub fn register_market_with(
+/// Create a `(collateral, stable)` market at an explicit oracle price and
+/// branch config, without granting a global debt ceiling — borrowing stays
+/// disabled until one is set.
+pub fn create_market(
 	collateral: AssetId,
 	stable: StableId,
 	price: FixedU128,
@@ -564,12 +579,24 @@ pub fn register_market_with(
 	set_price(collateral.clone(), price);
 	pallet_vaults::Pallet::<Test>::create_branch(
 		RuntimeOrigin::root(),
-		collateral.clone(),
+		collateral,
 		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
 		config,
 	)
 	.expect("create_branch ok");
+}
+
+/// Register a `(collateral, stable)` market at an explicit oracle price and
+/// branch config, and grant the collateral a high global debt ceiling so
+/// borrowing is enabled.
+pub fn register_market_with(
+	collateral: AssetId,
+	stable: StableId,
+	price: FixedU128,
+	config: BranchConfig<Balance>,
+) {
+	create_market(collateral.clone(), stable, price, config);
 	pallet_vaults::Pallet::<Test>::set_global_debt_ceiling(
 		RuntimeOrigin::root(),
 		collateral,
@@ -587,6 +614,22 @@ pub fn register_market(collateral: AssetId, stable: StableId) {
 		FixedU128::from_rational(10u128, 1u128),
 		default_branch_config(),
 	);
+}
+
+/// Register markets over every mock collateral and both stablecoins — ten,
+/// more than the old registry cap ever allowed — without granting any global
+/// debt ceiling.
+pub fn register_ten_markets() {
+	for collateral in [DOT, TOKEN_X, ETH, COLL_C, COLL_D] {
+		for stable in [PUSD, EUSD] {
+			create_market(
+				collateral.clone(),
+				stable,
+				FixedU128::from_rational(10u128, 1u128),
+				default_branch_config(),
+			);
+		}
+	}
 }
 
 /// Advance `pallet_timestamp` by `ms` milliseconds without touching block #.
