@@ -540,16 +540,15 @@ impl<T: Config> Pallet<T> {
 	/// live path) or discards it (the `predict_*` views, which apply to a
 	/// scratch copy of the state).
 	///
-	/// `rate_change_fee_base` is the existing principal that the rate-change
-	/// component of the upfront fee is charged against (zero when the call is a
-	/// pure debt increase or the cooldown has elapsed).
+	/// A borrow that also changes the rate inside the cooldown charges the
+	/// upfront fee over both the debt increase and the existing principal.
 	pub(crate) fn apply_borrow(
 		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		config: &BranchConfig<BalanceOf<T>>,
 		vault: &Vault<BalanceOf<T>>,
 		debt_increase: BalanceOf<T>,
 		new_rate: FixedU128,
-		rate_change_fee_base: BalanceOf<T>,
+		now: Millis,
 	) -> BalanceOf<T> {
 		// Swap the vault's full aggregate contribution: detach the pre-borrow row
 		// and attach the post-borrow one, so `attach_vault`/`detach_vault` stay
@@ -562,6 +561,12 @@ impl<T: Config> Pallet<T> {
 		state.detach_vault(vault);
 		state.attach_vault(&vault_after);
 		let avg = Self::avg_rate(state);
+		let rate_change_fee_base =
+			if new_rate != vault.annual_rate && !vault.cooldown_elapsed(config, now) {
+				vault.debt.principal
+			} else {
+				BalanceOf::<T>::zero()
+			};
 		let fee = math::simple_interest_ceil(
 			debt_increase.saturating_add(rate_change_fee_base),
 			avg,
@@ -578,7 +583,7 @@ impl<T: Config> Pallet<T> {
 		config: &BranchConfig<BalanceOf<T>>,
 		vault: &Vault<BalanceOf<T>>,
 		new_rate: FixedU128,
-		cooldown_elapsed: bool,
+		now: Millis,
 	) -> BalanceOf<T> {
 		state.change_vault_rate(
 			vault.annual_rate,
@@ -586,7 +591,7 @@ impl<T: Config> Pallet<T> {
 			vault.debt.principal,
 			vault.redistribution_stake,
 		);
-		let fee = if cooldown_elapsed {
+		let fee = if vault.cooldown_elapsed(config, now) {
 			BalanceOf::<T>::zero()
 		} else {
 			let avg = Self::avg_rate(state);

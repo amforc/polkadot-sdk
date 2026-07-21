@@ -722,14 +722,7 @@ pub mod pallet {
 			let (config, mut state) = (branch.config, branch.state);
 			let now = T::TimeProvider::now();
 			let scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
-			Self::apply_borrow(
-				&mut state,
-				&config,
-				&scratch,
-				initial_debt,
-				annual_rate,
-				Zero::zero(),
-			)
+			Self::apply_borrow(&mut state, &config, &scratch, initial_debt, annual_rate, now)
 		}
 
 		/// Predict the upfront fee `borrow` would charge.
@@ -747,16 +740,7 @@ pub mod pallet {
 			};
 			let new_rate = maybe_new_rate.unwrap_or(vault.annual_rate);
 			let now = T::TimeProvider::now();
-			let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
-			let rate_change_fee_base = vault.rate_change_base(maybe_new_rate, cooldown_elapsed);
-			Self::apply_borrow(
-				&mut state,
-				&config,
-				&vault,
-				debt_increase,
-				new_rate,
-				rate_change_fee_base,
-			)
+			Self::apply_borrow(&mut state, &config, &vault, debt_increase, new_rate, now)
 		}
 
 		/// Predict the upfront fee `change_rate` would charge — `0` when the
@@ -773,8 +757,7 @@ pub mod pallet {
 				return BalanceOf::<T>::zero();
 			};
 			let now = T::TimeProvider::now();
-			let cooldown_elapsed = vault.cooldown_elapsed(&config, now);
-			Self::apply_rate_change(&mut state, &config, &vault, new_rate, cooldown_elapsed)
+			Self::apply_rate_change(&mut state, &config, &vault, new_rate, now)
 		}
 	}
 
