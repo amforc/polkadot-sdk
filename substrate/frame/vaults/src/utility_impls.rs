@@ -2,7 +2,7 @@
 //! gates, interest/fee accounting, mode rules, and the `on_idle` refresh walk.
 
 use crate::{
-	context::OpContext,
+	context::BranchOp,
 	math,
 	pallet::{
 		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
@@ -535,44 +535,39 @@ impl<T: Config> Pallet<T> {
 		)
 	}
 
-	/// Apply a borrow's branch-side accounting to `state` and return the
-	/// upfront fee. `vault` is the pre-borrow row; the caller stamps it (the
-	/// live path) or discards it (the `predict_*` views, which apply to a
-	/// scratch copy of the state).
+	/// Apply a borrow to a branch/vault draft pair and return the upfront fee.
 	///
 	/// A borrow that also changes the rate inside the cooldown charges the
 	/// upfront fee over both the debt increase and the existing principal.
 	pub(crate) fn apply_borrow(
 		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		config: &BranchConfig<BalanceOf<T>>,
-		vault: &Vault<BalanceOf<T>>,
+		vault: &mut Vault<BalanceOf<T>>,
 		debt_increase: BalanceOf<T>,
 		new_rate: FixedU128,
 		now: Millis,
 	) -> BalanceOf<T> {
-		// Swap the vault's full aggregate contribution: detach the pre-borrow row
-		// and attach the post-borrow one, so `attach_vault`/`detach_vault` stay
-		// the only writers of the weighted sums. The fee is not stamped on
-		// `vault_after` — attach would then double-count it against the explicit
-		// `minted_interest` add below (the caller stamps the vault row).
-		let mut vault_after = vault.clone();
-		vault_after.debt.principal = vault.debt.principal.saturating_add(debt_increase);
-		vault_after.annual_rate = new_rate;
+		let old_rate = vault.annual_rate;
+		let rate_change_fee_base = if new_rate != old_rate && !vault.cooldown_elapsed(config, now) {
+			vault.debt.principal
+		} else {
+			BalanceOf::<T>::zero()
+		};
 		state.detach_vault(vault);
-		state.attach_vault(&vault_after);
+		vault.debt.principal = vault.debt.principal.saturating_add(debt_increase);
+		vault.annual_rate = new_rate;
+		if new_rate != old_rate {
+			vault.last_rate_update = now;
+		}
+		state.attach_vault(vault);
 		let avg = Self::avg_rate(state);
-		let rate_change_fee_base =
-			if new_rate != vault.annual_rate && !vault.cooldown_elapsed(config, now) {
-				vault.debt.principal
-			} else {
-				BalanceOf::<T>::zero()
-			};
 		let fee = math::simple_interest_ceil(
 			debt_increase.saturating_add(rate_change_fee_base),
 			avg,
 			config.upfront_fee_period,
 		);
 		state.debt.minted_interest = state.debt.minted_interest.saturating_add(fee);
+		vault.debt.interest = vault.debt.interest.saturating_add(fee);
 		fee
 	}
 
@@ -581,12 +576,16 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn apply_rate_change(
 		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		config: &BranchConfig<BalanceOf<T>>,
-		vault: &Vault<BalanceOf<T>>,
+		vault: &mut Vault<BalanceOf<T>>,
 		new_rate: FixedU128,
 		now: Millis,
 	) -> BalanceOf<T> {
+		let old_rate = vault.annual_rate;
+		if new_rate == old_rate {
+			return BalanceOf::<T>::zero();
+		}
 		state.change_vault_rate(
-			vault.annual_rate,
+			old_rate,
 			new_rate,
 			vault.debt.principal,
 			vault.redistribution_stake,
@@ -598,6 +597,9 @@ impl<T: Config> Pallet<T> {
 			math::simple_interest_ceil(vault.debt.principal, avg, config.upfront_fee_period)
 		};
 		state.debt.minted_interest = state.debt.minted_interest.saturating_add(fee);
+		vault.annual_rate = new_rate;
+		vault.last_rate_update = now;
+		vault.debt.interest = vault.debt.interest.saturating_add(fee);
 		fee
 	}
 
@@ -795,7 +797,7 @@ impl<T: Config> Pallet<T> {
 		owner: &T::AccountId,
 	) {
 		let _ = with_storage_layer::<(), DispatchError, _>(|| {
-			OpContext::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
+			BranchOp::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
 		});
 	}
 
