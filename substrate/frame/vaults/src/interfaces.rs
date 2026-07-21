@@ -280,6 +280,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			return Ok(credit);
 		}
 		let mut branch = Self::branch_of(collateral_id, stable_id)?;
+		let outstanding_before = branch.state.debt.outstanding();
 		let healable = credit.peek().min(branch.state.debt.bad_debt);
 		if healable.is_zero() {
 			// Nothing recorded (or an empty credit) — hand everything back.
@@ -289,7 +290,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		// Dropping the credit burns the withdrawn stablecoin.
 		drop(to_burn);
 		branch.state.heal_bad_debt(healable);
-		Pallet::<T>::commit_branch(collateral_id, stable_id, branch)?;
+		Pallet::<T>::commit_branch(collateral_id, stable_id, outstanding_before, branch)?;
 		Pallet::<T>::deposit_event(Event::BadDebtHealed {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
