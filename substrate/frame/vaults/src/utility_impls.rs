@@ -505,8 +505,8 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// A zero-debt, zero-stake vault row: the pre-borrow shape an open feeds
-	/// to [`Self::apply_borrow`], so the open fee is priced by the same code
-	/// path as every borrow. The stake MUST be zero here — `apply_borrow`
+	/// to [`Self::apply_borrow_unchecked`], so the open fee is priced by the same
+	/// code path as every borrow. The stake MUST be zero here — the borrow update
 	/// swaps the row's full aggregate contribution, and the open's stake
 	/// enters the aggregates via `set_vault_stake` after the borrow is
 	/// applied. The caller stamps the returned fee onto the row's debt.
@@ -547,7 +547,8 @@ impl<T: Config> Pallet<T> {
 		now: Millis,
 	) -> BalanceOf<T> {
 		let old_rate = vault.annual_rate;
-		let rate_change_fee_base = if new_rate != old_rate && !vault.cooldown_elapsed(config, now) {
+		let rate_changed = new_rate != old_rate;
+		let rate_change_fee_base = if rate_changed && !vault.cooldown_elapsed(config, now) {
 			vault.debt.principal
 		} else {
 			BalanceOf::<T>::zero()
@@ -555,7 +556,7 @@ impl<T: Config> Pallet<T> {
 		state.detach_vault(vault);
 		vault.debt.principal = vault.debt.principal.saturating_add(debt_increase);
 		vault.annual_rate = new_rate;
-		if new_rate != old_rate {
+		if rate_changed {
 			vault.last_rate_update = now;
 		}
 		state.attach_vault(vault);
