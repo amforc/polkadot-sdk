@@ -540,6 +540,8 @@ pub mod pallet {
 		ZeroDepositAmount,
 		/// A collateral withdrawal must transfer a non-zero amount.
 		ZeroWithdrawAmount,
+		/// A repayment request must specify a non-zero amount.
+		ZeroRepayAmount,
 	}
 
 	#[pallet::hooks]
@@ -863,7 +865,7 @@ pub mod pallet {
 			Self::do_borrow(who, collateral_id, stable_id, amount, maybe_new_rate, recipient, hint)
 		}
 
-		/// Permissionless repay-into-vault. `amount` is capped at the
+		/// Permissionless repay-into-vault. `amount` must be non-zero and is capped at the
 		/// outstanding debt. Repaying it all clears the debt but keeps the vault
 		/// open as a zero-debt Dormant husk (call `close_vault` to reclaim the
 		/// collateral); a husk with no collateral left is closed outright.

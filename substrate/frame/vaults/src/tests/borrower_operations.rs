@@ -72,25 +72,19 @@ fn withdraw_breaking_cr_reverts() {
 	});
 }
 
-// Repayment silently no-ops on a zero amount rather than reverting. It still
-// touches the vault, so pending interest is settled.
 #[test]
-fn zero_amount_repay_is_a_no_op() {
+fn zero_amount_repay_is_rejected_without_touching_the_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		// Non-trivial principal/rate so a day of interest is observable:
-		// floor(5_000 * 0.5 * 1day / year) = 6.
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		let pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
-		advance_time(86_400_000); // one day
-		let now = pallet_timestamp::Pallet::<Test>::get();
+		let before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		advance_time(86_400_000);
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 0));
-
-		let post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
-		assert_eq!(post.debt.principal, pre.debt.principal);
-		assert_eq!(post.debt.interest, pre.debt.interest + 6);
-		assert_eq!(post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
+		assert_noop!(
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 0),
+			crate::Error::<Test>::ZeroRepayAmount
+		);
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
 		assert_eq!(held(DOT, 1), 1_000);
 	});
 }
