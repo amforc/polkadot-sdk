@@ -8,7 +8,7 @@ use crate::{
 		AssetRoles, BalanceOf, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
 		HoldReason, Millis, Pallet, StableIdOf, Vaults,
 	},
-	types::{AssetRole, AssetRoleUsage, CollateralRisk, VaultListId},
+	types::{AssetRole, AssetRoleUsage, VaultListId},
 };
 use alloc::collections::BTreeMap;
 use frame::{

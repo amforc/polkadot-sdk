@@ -509,7 +509,7 @@ mod benchmarks {
 		// gate on residual aggregate-interest drift.
 		let background = funded_account::<T>("background", &asset);
 		Pallet::<T>::open_vault(
-			RawOrigin::Signed(background.clone()).into(),
+			RawOrigin::Signed(background).into(),
 			asset.clone(),
 			stable::<T>(),
 			balance::<T>(SEED_COLL),
@@ -747,7 +747,7 @@ mod benchmarks {
 		};
 
 		#[extrinsic_call]
-		_(origin, asset.clone(), stable::<T>(), admins.clone());
+		_(origin, asset.clone(), stable::<T>(), admins);
 
 		let branch =
 			Branches::<T>::get(&asset, &stable::<T>()).expect("branch present after register");
@@ -889,7 +889,7 @@ mod benchmarks {
 	fn on_idle_base() -> Result<(), BenchmarkError> {
 		let (asset, owner) = seed_idle_market::<T>()?;
 		BranchIdleCursor::<T>::put((asset.clone(), stable::<T>()));
-		IdleCursor::<T>::put((asset.clone(), stable::<T>(), owner));
+		IdleCursor::<T>::put((asset, stable::<T>(), owner));
 
 		// The idle walk's flat cost: both cursors' read/write plus one
 		// terminal `next_key` probe per walk — `idle_walk_pass`'s charging
