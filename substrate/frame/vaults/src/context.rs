@@ -17,7 +17,7 @@ use frame::{
 	prelude::*,
 	traits::{fungibles::MutateHold as FungiblesMutateHold, tokens::Restriction, Time},
 };
-use pallet_linked_list::{Position, SortedListInterface};
+use linked_list_interface::{Position, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, ProvidePrice, RedemptionStepSnapshot};
 
 /// State for one market operation, loaded and committed once.
