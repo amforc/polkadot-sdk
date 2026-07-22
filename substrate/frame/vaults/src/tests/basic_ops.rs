@@ -398,6 +398,9 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 
 		// Closing the last husk empties the branch and sweeps the drift. This
 		// terminal close was previously rejected with `WouldEnterSafetyMode`.
+		// A maximal price would overflow its pre-close TCR; settlement bypasses
+		// ratio math entirely and must still complete.
+		set_price(DOT, FixedU128::from_inner(u128::MAX));
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
 		assert!(Vaults::<Test>::get((DOT, PUSD, 1)).is_none(), "last husk closed");
 
