@@ -17,6 +17,7 @@ pub use frame::{
 	testing_prelude::{assert_noop, assert_ok, BadOrigin},
 };
 use frame::{
+	deps::sp_runtime::traits::ConvertInto,
 	testing_prelude::*,
 	traits::{
 		fungible::{HoldConsideration, NativeFromLeft, NativeOrWithId},
@@ -123,8 +124,7 @@ impl pallet_assets_holder::Config for Test {
 
 parameter_types! {
 	pub const MaxHintRepairSteps: u32 = 16;
-	pub const MaxBranches: u32 = 8;
-	pub const MaxOnIdleVaultRefresh: u32 = 4;
+	pub const IdleMaxRefreshWeight: Option<Weight> = Some(Weight::MAX);
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
 	pub const StabilityPalletId: PalletId = PalletId(*b"pusd/stb");
 }
@@ -194,11 +194,8 @@ pub const EMERGENCY_ADMIN: AccountId = 101;
 pub fn branch_admins(
 	full: AccountId,
 	emergency: AccountId,
-) -> pallet_vaults::types::BranchAdmins<OriginCaller> {
-	pallet_vaults::types::BranchAdmins {
-		full_admin: frame_system::RawOrigin::Signed(full).into(),
-		emergency_admin: frame_system::RawOrigin::Signed(emergency).into(),
-	}
+) -> pallet_vaults::types::BranchAdmins<AccountId> {
+	pallet_vaults::types::BranchAdmins { full_admin: full, emergency_admin: emergency }
 }
 
 /// `CreateOrigin`: Root creates deposit-free (`None`); the stable asset's owner
@@ -252,9 +249,7 @@ parameter_types! {
 
 impl pallet_vaults::Config for Test {
 	type RuntimeHoldReason = RuntimeHoldReason;
-	type CollateralAssetId = AssetId;
-	type StableAssetId = StableId;
-	type SameAsset = pallet_vaults::SameAssetViaInto;
+	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
@@ -270,11 +265,10 @@ impl pallet_vaults::Config for Test {
 	type CreateOrigin = EnsureAssetOwner;
 	type Consideration = VaultsConsideration;
 	type BranchConfigGuard = TestBranchConfigGuard;
-	type GlobalManagerOrigin = frame_system::EnsureRoot<AccountId>;
+	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
-	type MaxBranches = MaxBranches;
-	type MaxOnIdleVaultRefresh = MaxOnIdleVaultRefresh;
+	type IdleMaxRefreshWeight = IdleMaxRefreshWeight;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = VaultsBenchHelper;
