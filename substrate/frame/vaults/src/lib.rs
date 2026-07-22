@@ -73,7 +73,9 @@ pub mod pallet {
 		},
 	};
 	use pallet_linked_list::{Position, PriorityProvider, SortedListInterface};
-	use pusd_primitives::{OnBranchLifecycle, OnBranchYield, ProvidePrice};
+	use pusd_primitives::{
+		collateralization_ratio, OnBranchLifecycle, OnBranchYield, ProvidePrice,
+	};
 
 	pub type BalanceOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
 		<T as frame_system::Config>::AccountId,
@@ -574,7 +576,7 @@ pub mod pallet {
 			let pending = Self::pending_touch_for(&vault, &state, now);
 			let total_coll = vault.collateral.saturating_add(pending.collateral);
 			let total_debt = pending.total_debt(&vault.debt);
-			pusd_primitives::collateralization_ratio::<BalanceOf<T>>(total_coll, total_debt, price)
+			collateralization_ratio::<BalanceOf<T>>(total_coll, total_debt, price)
 		}
 
 		/// Derived lifecycle status of the vault.
