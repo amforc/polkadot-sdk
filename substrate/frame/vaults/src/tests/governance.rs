@@ -197,7 +197,7 @@ fn remove_branch_requires_empty_market() {
 }
 
 // Reassigning admins moves authority: the old full admin loses it, the new one
-// gains it. Only the full admin may reassign.
+// gains it. The emergency admin may not reassign.
 #[test]
 fn set_branch_admins_reassigns_authority() {
 	build_and_execute(|| {
@@ -235,6 +235,31 @@ fn set_branch_admins_reassigns_authority() {
 			true
 		));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
+	});
+}
+
+// Governance can replace an unreachable full admin and restore ordinary
+// per-market administration.
+#[test]
+fn global_manager_can_reassign_branch_admins() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(Pallet::<Test>::set_branch_admins(
+			RuntimeOrigin::root(),
+			DOT,
+			PUSD,
+			branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
+		));
+
+		let info = crate::pallet::Branches::<Test>::get(DOT, PUSD).expect("admins stored");
+		assert_eq!(info.admins.full_admin, admin_caller(NEW_FULL_ADMIN));
+		assert_eq!(info.admins.emergency_admin, admin_caller(NEW_EMERGENCY_ADMIN));
+		assert_ok!(Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::signed(NEW_FULL_ADMIN),
+			DOT,
+			PUSD,
+			true,
+		));
 	});
 }
 
