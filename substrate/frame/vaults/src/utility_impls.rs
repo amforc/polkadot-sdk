@@ -23,7 +23,7 @@ use frame::{
 	},
 };
 use pallet_linked_list::{ListError, SortedListInterface};
-use pusd_primitives::{OnBranchYield, ProvidePrice};
+use pusd_primitives::{collateralization_ratio, OnBranchYield, ProvidePrice};
 
 /// The two numbers a branch TCR depends on. [`Pallet::compute_tcr`] derives
 /// them from live state; the operation context captures them once at load as
@@ -133,15 +133,6 @@ impl<T: Config> Pallet<T> {
 			.ok_or_else(|| Error::<T>::VaultNotFound.into())
 	}
 
-	fn ratio(
-		collateral: BalanceOf<T>,
-		debt: BalanceOf<T>,
-		price: FixedU128,
-	) -> Result<FixedU128, Error<T>> {
-		pusd_primitives::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
-			.ok_or(Error::<T>::UnsafeCollateralizationRatio)
-	}
-
 	/// Ensure a vault's collateralization ratio is at or above the branch ICR.
 	/// Used by the open/borrow/withdraw safety gates. A `None` ratio (zero debt)
 	/// and a below-ICR ratio both surface as `UnsafeCollateralizationRatio`.
@@ -151,7 +142,8 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> Result<(), DispatchError> {
-		let cr = Self::ratio(collateral, debt, price)?;
+		let cr = collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+			.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
 		ensure!(
 			cr >= config.initial_collateralization_ratio,
 			Error::<T>::UnsafeCollateralizationRatio
@@ -168,7 +160,7 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> Result<(), DispatchError> {
-		let cr = pusd_primitives::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+		let cr = collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
 			.ok_or(Error::<T>::CollateralizationRatioTooHealthy)?;
 		ensure!(
 			cr < config.minimum_collateralization_ratio,
@@ -185,7 +177,7 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> Result<(), DispatchError> {
-		let cr = pusd_primitives::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+		let cr = collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
 			.ok_or(Error::<T>::CollateralizationRatioTooLow)?;
 		ensure!(
 			cr >= config.minimum_collateralization_ratio,

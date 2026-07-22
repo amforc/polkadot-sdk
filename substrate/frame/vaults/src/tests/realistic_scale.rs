@@ -10,7 +10,7 @@ use crate::{mock::*, tests::rate_pct};
 use frame::{
 	arithmetic::Permill, prelude::TokenError, traits::fungibles::Mutate as FungiblesMutate,
 };
-use pusd_primitives::MILLIS_PER_YEAR;
+use pusd_primitives::{collateralization_ratio, MILLIS_PER_YEAR};
 
 fn vault(owner: AccountId) -> crate::types::Vault<Balance> {
 	crate::pallet::Vaults::<Test>::get((XBT, USDX, owner)).expect("vault")
@@ -50,7 +50,7 @@ fn lifecycle_exact_at_realistic_scale() {
 		let fee = vault(1).debt.interest;
 		assert!(fee > 0, "upfront fee recorded as interest");
 		let cr = crate::Pallet::<Test>::vault_cr(XBT, USDX, 1).expect("cr");
-		let expected = pusd_primitives::collateralization_ratio(
+		let expected = collateralization_ratio(
 			1_000 * XBT_UNIT,
 			5_000 * USD + fee,
 			FixedU128::from_rational(1u128, 1_000u128),

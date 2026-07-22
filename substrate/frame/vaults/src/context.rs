@@ -21,7 +21,7 @@ use frame::{
 	traits::{fungibles::MutateHold as FungiblesMutateHold, tokens::Restriction, Time},
 };
 use pallet_linked_list::{Position, SortedListInterface};
-use pusd_primitives::{ProvidePrice, RedemptionStepSnapshot};
+use pusd_primitives::{collateralization_ratio, ProvidePrice, RedemptionStepSnapshot};
 
 /// Branch-level operation context: one branch-state read threaded through an
 /// operation and committed once.
@@ -382,7 +382,7 @@ impl<T: Config> VaultOp<T> {
 
 	pub(crate) fn ensure_liquidatable(&self, price: FixedU128) -> DispatchResult {
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
-		let cr = pusd_primitives::collateralization_ratio::<BalanceOf<T>>(
+		let cr = collateralization_ratio::<BalanceOf<T>>(
 			self.vault.collateral,
 			self.vault.debt.total(),
 			price,
