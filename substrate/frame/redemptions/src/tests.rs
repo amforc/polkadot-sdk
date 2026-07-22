@@ -1,12 +1,14 @@
 use crate::{
 	mock::*,
-	types::{RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, WalkControl},
+	types::{
+		Accumulators, RecoveryOffsetQuote, RecoveryRegime, RedeemMode, RedemptionConfig, WalkResult,
+	},
 	weights::WeightInfo,
 	Error, Event,
 };
 use pusd_primitives::{
-	collateralization_ratio, recovery_pricing, reducible_debit, RecoveryOffsetInterface,
-	RecoveryOffsetResult, VaultStatus,
+	collateralization_ratio, recovery_pricing, reducible_debit, ProvidePrice,
+	RecoveryOffsetInterface, RecoveryOffsetResult, VaultStatus,
 };
 
 const HOUR_MS: Moment = 3_600 * 1_000;
@@ -208,31 +210,57 @@ fn caller_max_steps_caps_the_loop() {
 	});
 }
 
+/// Run the shared redemption loop in `Simulate` mode inside a rolled-back
+/// transaction, returning only the walk bookkeeping under test.
+fn simulated_walk(step_cap: u32, budget: Balance) -> WalkResult<Balance> {
+	use frame::deps::frame_support::storage::{with_transaction, TransactionOutcome};
+	with_transaction(|| {
+		let config = crate::RedemptionConfigs::<Test>::get(DOT, PUSD).expect("config seeded");
+		let price = MockOracle::provide_price(&DOT).expect("price set");
+		let mut acc = Accumulators::default();
+		let result = crate::Pallet::<Test>::run_loop(
+			&RedeemMode::Simulate,
+			&DOT,
+			&PUSD,
+			price,
+			FixedU128::zero(),
+			step_cap,
+			budget,
+			&config,
+			&mut acc,
+		);
+		TransactionOutcome::Rollback(result)
+	})
+	.expect("walk succeeds")
+}
+
 #[test]
 fn walk_reports_only_cap_exhaustion_as_truncated() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 
-		let barrier = Redemptions::walk_targets(&DOT, &PUSD, 1, 200, |_, _| {
-			Ok(WalkControl::Stop { spent: 0 })
-		})
-		.expect("walk succeeds");
-		assert_eq!(barrier.steps, 1);
-		assert!(!barrier.truncated, "a counted barrier, not the cap, ended the walk");
-
-		let failed_touch =
-			Redemptions::walk_targets(&DOT, &PUSD, 1, 200, |_, _| Ok(WalkControl::NotVisited))
-				.expect("walk succeeds");
-		assert_eq!(failed_touch.steps, 0);
-		assert!(!failed_touch.truncated);
-
-		let capped = Redemptions::walk_targets(&DOT, &PUSD, 1, 200, |_, _| {
-			Ok(WalkControl::ContinueFromCursor { spent: 0 })
-		})
-		.expect("walk succeeds");
+		// A one-step cap with budget and a second target to spare: only the
+		// cap guard reports truncation.
+		let capped = simulated_walk(1, 100_000);
 		assert_eq!(capped.steps, 1);
 		assert!(capped.truncated, "the cap guard ended the walk");
+
+		// Budget exhaustion inside the cap is a complete walk, not truncation.
+		let filled = simulated_walk(20, 200);
+		assert_eq!(filled.steps, 1);
+		assert!(!filled.truncated);
+
+		// Park a Dormant husk at the priority slot and sink the price: the
+		// underwater Dormant head is a barrier — counted, but not truncation.
+		mint_stable(PUSD, 3, 1_000);
+		assert_ok!(redeem(3, DOT, PUSD, 360, 0, 4, 0));
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		set_price(DOT, FixedU128::from_rational(1, 10));
+		let barrier = simulated_walk(20, 100_000);
+		assert_eq!(barrier.steps, 1);
+		assert!(!barrier.truncated, "a counted barrier, not the cap, ended the walk");
 	});
 }
 
