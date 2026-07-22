@@ -125,17 +125,38 @@ pub struct RedemptionPreview<AccountId, Balance> {
 	pub truncated: bool,
 }
 
+/// Consumer mode for the shared redemption core. `Execute` withdraws real
+/// funds from the redeemer and pays the caller's recipient; `Simulate` issues
+/// unbacked stable credit instead and is only sound inside a transaction the
+/// caller always rolls back.
+pub(crate) enum RedeemMode<'a, AccountId> {
+	Execute { redeemer: &'a AccountId, recipient: &'a AccountId },
+	Simulate,
+}
+
+impl<'a, AccountId> RedeemMode<'a, AccountId> {
+	/// The account a step pays collateral to. Simulation pays the vault owner:
+	/// the vault hold lives on the owner's collateral account, so it exists and
+	/// the rolled-back transfer cannot fail for account-existence reasons.
+	pub(crate) fn step_recipient(&'a self, owner: &'a AccountId) -> &'a AccountId {
+		match self {
+			Self::Execute { recipient, .. } => recipient,
+			Self::Simulate => owner,
+		}
+	}
+}
+
 pub(crate) struct OrdinaryStep<Balance> {
+	pub(crate) status: VaultStatus,
 	pub(crate) debt: Balance,
 	pub(crate) collateral_out: Balance,
 	pub(crate) fee: Balance,
 }
 
 pub(crate) struct RecoveryStep<Balance> {
+	pub(crate) status: VaultStatus,
 	pub(crate) burned: Balance,
 	pub(crate) collateral_out: Balance,
-	// Insurance Fund residuals settle debt without redeemer pUSD.
-	pub(crate) debt_settled: Balance,
 	pub(crate) regime: RecoveryRegime,
 }
 
@@ -253,16 +274,6 @@ pub(crate) enum StepOutcome<Balance> {
 	Stopped,
 }
 
-/// Mode-specific result of visiting one target. The shared walker owns the
-/// mechanical loop state; execution and preview only state how the visit
-/// changes the budget and where the next lookup resumes.
-pub(crate) enum WalkControl<Balance> {
-	NotVisited,
-	Stop { spent: Balance },
-	ContinueFromCursor { spent: Balance },
-	ContinueAfterTarget { spent: Balance },
-}
-
 pub(crate) struct WalkResult<Balance> {
 	pub(crate) remaining: Balance,
 	pub(crate) steps: u32,
@@ -278,6 +289,8 @@ pub(crate) struct Accumulators<Balance, AccountId> {
 	pub(crate) recovery_collateral: Balance,
 	// Recovery stops after one FIFO head, so one owner/regime is enough.
 	pub(crate) recovery_owner: Option<(AccountId, RecoveryRegime)>,
+	/// Per-step detail sink; `Some` only when simulating a preview.
+	pub(crate) detail: Option<Vec<RedemptionPreviewStep<AccountId, Balance>>>,
 }
 
 impl<Balance: Zero, AccountId> Default for Accumulators<Balance, AccountId> {
@@ -290,6 +303,7 @@ impl<Balance: Zero, AccountId> Default for Accumulators<Balance, AccountId> {
 			recovery_burned: Balance::zero(),
 			recovery_collateral: Balance::zero(),
 			recovery_owner: None,
+			detail: None,
 		}
 	}
 }
@@ -297,16 +311,27 @@ impl<Balance: Zero, AccountId> Default for Accumulators<Balance, AccountId> {
 impl<Balance, AccountId> Accumulators<Balance, AccountId>
 where
 	Balance: Zero + Saturating + Copy,
+	AccountId: Clone,
 {
 	pub(crate) fn collateral_out(&self) -> Balance {
 		self.ordinary_collateral.saturating_add(self.recovery_collateral)
 	}
 
-	pub(crate) fn apply_ordinary(&mut self, step: &OrdinaryStep<Balance>) {
+	pub(crate) fn apply_ordinary(&mut self, owner: &AccountId, step: &OrdinaryStep<Balance>) {
 		self.debt_settled = self.debt_settled.saturating_add(step.debt);
 		self.ordinary_debt = self.ordinary_debt.saturating_add(step.debt);
 		self.ordinary_collateral = self.ordinary_collateral.saturating_add(step.collateral_out);
 		self.ordinary_fee = self.ordinary_fee.saturating_add(step.fee);
+		if let Some(detail) = self.detail.as_mut() {
+			detail.push(RedemptionPreviewStep {
+				target: owner.clone(),
+				status: step.status,
+				debt_cancellable: step.debt,
+				collateral_out: step.collateral_out,
+				fee_pusd: step.fee,
+				pusd_in: step.debt.saturating_add(step.fee),
+			});
+		}
 	}
 
 	/// `residual` is the Insurance-Fund-settled debt the loop obtained after
@@ -317,10 +342,19 @@ where
 		step: &RecoveryStep<Balance>,
 		residual: Balance,
 	) {
-		self.debt_settled =
-			self.debt_settled.saturating_add(step.debt_settled).saturating_add(residual);
+		self.debt_settled = self.debt_settled.saturating_add(step.burned).saturating_add(residual);
 		self.recovery_burned = self.recovery_burned.saturating_add(step.burned);
 		self.recovery_collateral = self.recovery_collateral.saturating_add(step.collateral_out);
+		if let Some(detail) = self.detail.as_mut() {
+			detail.push(RedemptionPreviewStep {
+				target: owner.clone(),
+				status: step.status,
+				debt_cancellable: step.burned,
+				collateral_out: step.collateral_out,
+				fee_pusd: Balance::zero(),
+				pusd_in: step.burned,
+			});
+		}
 		self.recovery_owner = Some((owner, step.regime));
 	}
 }
