@@ -6,8 +6,8 @@
 
 use crate::{
 	pallet::{
-		BalanceOf, BranchIdleCursor, Branches, CollateralIdOf, CollateralRisks, Config, HoldReason,
-		IdleCursor, Pallet, PalletsOriginOf, StableIdOf, Vaults,
+		AccountIdLookupOf, BalanceOf, BranchIdleCursor, Branches, CollateralIdOf, CollateralRisks,
+		Config, HoldReason, IdleCursor, Pallet, StableIdOf, Vaults,
 	},
 	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
@@ -85,11 +85,11 @@ fn branch_admin_accounts<T: Config>() -> (T::AccountId, T::AccountId) {
 }
 
 /// The admin bundle every benchmarked market is created with.
-fn branch_admins<T: Config>() -> BranchAdmins<PalletsOriginOf<T>> {
+fn branch_admins<T: Config>() -> BranchAdmins<AccountIdLookupOf<T>> {
 	let (full_admin, emergency_admin) = branch_admin_accounts::<T>();
 	BranchAdmins {
-		full_admin: RawOrigin::Signed(full_admin).into(),
-		emergency_admin: RawOrigin::Signed(emergency_admin).into(),
+		full_admin: T::Lookup::unlookup(full_admin),
+		emergency_admin: T::Lookup::unlookup(emergency_admin),
 	}
 }
 
@@ -105,9 +105,9 @@ fn full_admin_origin<T: Config>() -> T::RuntimeOrigin {
 	RawOrigin::Signed(branch_admin_accounts::<T>().0).into()
 }
 
-fn global_manager_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {
-	T::GlobalManagerOrigin::try_successful_origin()
-		.map_err(|_| BenchmarkError::Stop("global manager origin unavailable"))
+fn force_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {
+	T::ForceOrigin::try_successful_origin()
+		.map_err(|_| BenchmarkError::Stop("force origin unavailable"))
 }
 
 fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkError> {
@@ -125,7 +125,7 @@ fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkEr
 		default_branch_config::<T>(),
 	)?;
 	Pallet::<T>::set_global_debt_ceiling(
-		global_manager_origin::<T>()?,
+		force_origin::<T>()?,
 		asset.clone(),
 		balance::<T>(GLOBAL_CEILING),
 	)?;
@@ -742,8 +742,8 @@ mod benchmarks {
 		let new_full: T::AccountId = account("new_full_admin", 0, 0);
 		let new_emergency: T::AccountId = account("new_emergency_admin", 0, 0);
 		let admins = BranchAdmins {
-			full_admin: RawOrigin::Signed(new_full).into(),
-			emergency_admin: RawOrigin::Signed(new_emergency).into(),
+			full_admin: T::Lookup::unlookup(new_full.clone()),
+			emergency_admin: T::Lookup::unlookup(new_emergency.clone()),
 		};
 
 		#[extrinsic_call]
@@ -751,14 +751,17 @@ mod benchmarks {
 
 		let branch =
 			Branches::<T>::get(&asset, &stable::<T>()).expect("branch present after register");
-		assert_eq!(branch.admins, admins);
+		assert_eq!(
+			branch.admins,
+			BranchAdmins { full_admin: new_full, emergency_admin: new_emergency }
+		);
 		Ok(())
 	}
 
 	#[benchmark]
 	fn set_global_debt_ceiling() -> Result<(), BenchmarkError> {
 		let asset = T::BenchmarkHelper::collateral_asset_id();
-		let origin = global_manager_origin::<T>()?;
+		let origin = force_origin::<T>()?;
 		let ceiling = balance::<T>(GLOBAL_CEILING);
 
 		#[extrinsic_call]
@@ -815,7 +818,7 @@ mod benchmarks {
 			config,
 		)?;
 		Pallet::<T>::set_global_debt_ceiling(
-			global_manager_origin::<T>()?,
+			force_origin::<T>()?,
 			asset.clone(),
 			balance::<T>(GLOBAL_CEILING),
 		)?;

@@ -10,17 +10,15 @@ use crate::{
 	},
 	recovery,
 	types::{
-		AdminLevel, BranchConfig, BranchMode, BranchState, CollateralRisk, Vault, VaultDebt,
-		VaultListId, VaultStatus,
+		AdminLevel, BranchConfig, BranchMode, BranchState, Vault, VaultDebt, VaultListId,
+		VaultStatus,
 	},
 	weights::WeightInfo,
 };
 use frame::{
 	deps::frame_support::{storage::with_storage_layer, weights::WeightMeter},
 	prelude::*,
-	traits::{
-		fungibles::Balanced as FungiblesBalanced, Defensive, DefensiveOption, OriginTrait, Time,
-	},
+	traits::{fungibles::Balanced as FungiblesBalanced, Defensive, DefensiveOption, Time},
 };
 use pallet_linked_list::{ListError, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, OnBranchYield, ProvidePrice};
@@ -111,14 +109,16 @@ impl<T: Config> Pallet<T> {
 			return Ok(());
 		}
 		CollateralRisks::<T>::try_mutate_exists(collateral_id, |maybe| {
-			let mut risk = maybe.take().unwrap_or_default();
+			let risk = maybe.get_or_insert_default();
 			risk.outstanding = risk
 				.outstanding
 				.checked_sub(&outstanding_before)
 				.defensive_ok_or(DispatchError::Corruption)?
 				.checked_add(&outstanding_after)
 				.ok_or(Error::<T>::ArithmeticOverflow)?;
-			*maybe = (risk != CollateralRisk::default()).then_some(risk);
+			if risk.is_empty() {
+				maybe.take();
+			}
 			Ok(())
 		})
 	}
@@ -316,38 +316,37 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Authorize a call [`Config::GlobalManagerOrigin`] may force and a market
-	/// admin of `required` tier may issue: governance can always do what a
-	/// market admin can do here. Governance is checked first; `try_origin`
+	/// Authorize a call [`Config::ForceOrigin`] may force and a market
+	/// admin of `required` tier may issue: the force origin can always do what a
+	/// market admin can do here. It is checked first; `try_origin`
 	/// hands the origin back on failure, so the admin fallback is lossless.
-	pub(crate) fn ensure_branch_admin_or_manager(
+	pub(crate) fn ensure_force_or_branch_admin(
 		origin: OriginFor<T>,
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		required: AdminLevel,
 	) -> Result<(), DispatchError> {
-		let origin = match T::GlobalManagerOrigin::try_origin(origin) {
-			Ok(_) => return Ok(()),
-			Err(origin) => origin,
-		};
-		Self::ensure_branch_admin(origin, collateral_id, stable_id, required).map(|_| ())
+		if let Err(origin) = T::ForceOrigin::try_origin(origin) {
+			let who = ensure_signed(origin)?;
+			Self::ensure_branch_admin(&who, collateral_id, stable_id, required)?;
+		}
+		Ok(())
 	}
 
-	/// Authorize a per-market admin call, returning the caller's [`AdminLevel`].
+	/// Authorize a per-market admin account, returning its [`AdminLevel`].
 	/// `full_admin` satisfies any `required`; `emergency_admin` satisfies only
 	/// `Emergency`.
 	pub(crate) fn ensure_branch_admin(
-		origin: OriginFor<T>,
+		who: &T::AccountId,
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		required: AdminLevel,
 	) -> Result<AdminLevel, DispatchError> {
 		let admins = Self::branch_of(collateral_id, stable_id)?.admins;
-		let caller = origin.into_caller();
-		if caller == admins.full_admin {
+		if who == &admins.full_admin {
 			return Ok(AdminLevel::Full);
 		}
-		if matches!(required, AdminLevel::Emergency) && caller == admins.emergency_admin {
+		if matches!(required, AdminLevel::Emergency) && who == &admins.emergency_admin {
 			return Ok(AdminLevel::Emergency);
 		}
 		Err(Error::<T>::NotBranchAdmin.into())
