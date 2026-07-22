@@ -45,10 +45,14 @@ extern crate alloc;
 
 use frame::prelude::*;
 
+// Re-exported so existing `pallet_linked_list::*` paths keep working; new
+// consumers should depend on `linked-list-interface` directly.
+pub use linked_list_interface::{
+	fifo_append, ListError, Outcome, Position, PriorityProvider, SortedListInterface,
+};
 pub use list::Node;
 pub use pallet::*;
-pub use sorted_list_interface::{fifo_append, PriorityProvider, SortedListInterface};
-pub use types::{ListError, ListMeta, Outcome, Position};
+pub use types::ListMeta;
 
 mod dispatchables;
 mod list;
