@@ -1,4 +1,4 @@
-//! pUSD primitive trait implementations.
+//! Implementations of vault interfaces used by other pallets.
 
 use crate::{
 	context::BranchOp,
@@ -62,8 +62,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		let post_touch_debt = op.vault().debt.total();
 		let held = op.vault().collateral;
 
-		// Turn the exact vault hold into the one collateral budget external
-		// liquidation paths partition.
+		// Turn this vault's exact collateral into one credit for settlement.
 		let (collateral, shortfall) = T::CollateralAssets::slash(
 			op.collateral_id().clone(),
 			&HoldReason::VaultCollateral.into(),
@@ -90,7 +89,9 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 		op.apply_liquidation(debt_offset, redistribution_amount)?;
 
-		if !redistribution_amount.is_zero() {
+		if redistribution_amount.is_zero() {
+			drop(redistribution_collateral);
+		} else {
 			let redistribution_account =
 				Pallet::<T>::redistribution_account(op.collateral_id(), op.stable_id());
 			resolve_collateral_credit::<T>(&redistribution_account, redistribution_collateral)?;
@@ -100,33 +101,28 @@ impl<T: Config> VaultInterface for Pallet<T> {
 				&redistribution_account,
 				redistribution_amount,
 			)?;
-		} else {
-			drop(redistribution_collateral);
 		}
 
-		// Whatever external offsets, JIT, and the keeper did not consume is the
-		// liquidated owner's surplus.
-		if !owner_surplus_amount.is_zero() {
-			resolve_collateral_credit::<T>(op.owner(), owner_surplus)?;
-		} else {
+		// Return unused collateral to the vault owner.
+		if owner_surplus_amount.is_zero() {
 			drop(owner_surplus);
+		} else {
+			resolve_collateral_credit::<T>(op.owner(), owner_surplus)?;
 		}
 
-		// Liquidation eligibility is MCR-gated above; the mode rules do not apply.
+		// The ratio check above applies; market mode rules do not.
 		op.remove_exempt()
 	}
 
-	/// Priority order: `FinalRecovery` FIFO head, then `dormant_redemption_target`,
-	/// then the rate-index tail.
+	/// Returns the next redemption target.
+	///
+	/// Final recovery comes first, then the dormant target, then the lowest-rate vault.
 	fn next_redemption_target(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		after: Option<&T::AccountId>,
 	) -> Option<(T::AccountId, VaultStatus)> {
-		// The priority head (FinalRecovery FIFO, then the dormant slot) is a
-		// barrier that preempts any carried rate-index cursor: the previous step
-		// may have created one. Re-check it regardless of `after`; the cursor
-		// only resolves the rate-index tail position when no barrier gates.
+		// A previous step may create a priority target. Check for one before using the cursor.
 		match Self::redemption_targets(collateral_id, stable_id).next() {
 			Some((owner, status)) if !status.is_active() => Some((owner, status)),
 			head => match after {
@@ -157,14 +153,12 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		let held = snapshot.collateral;
 
 		let Some(settlement) = build_settlement(snapshot)? else {
-			// Skipped target: persist the touch so the accrual it caused is paid for.
+			// Keep interest applied by the touch even when this target is skipped.
 			return op.commit_exempt();
 		};
 		let RedemptionSettlement { debt_payment, collateral_to_recipient } = settlement;
 
-		// The payment credit is the sole authority on how much debt this step
-		// cancels. It must carry real value: `Ok(None)` is the touch-only form,
-		// so a zero payment cannot release collateral.
+		// Only the credit amount sets how much debt is cancelled. Use `None` to skip the target.
 		ensure!(debt_payment.asset() == *op.stable_id(), Error::<T>::InvalidRedemptionSettlement);
 		let debt_to_cancel = debt_payment.peek();
 		ensure!(
@@ -174,7 +168,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			Error::<T>::InvalidRedemptionSettlement
 		);
 
-		// Dropping the credit burns the withdrawn stablecoin.
+		// Burn the stable asset used for payment.
 		drop(debt_payment);
 
 		let payment = op.redeem(debt_to_cancel);
@@ -216,13 +210,11 @@ impl<T: Config> VaultInterface for Pallet<T> {
 	) -> Result<BalanceOf<T>, DispatchError> {
 		let op = BranchOp::<T>::load_unfrozen(collateral_id.clone(), stable_id.clone())?;
 		let mut op = op.touch(owner)?;
-		// Move the fully-accrued residual debt off the vault and onto the branch
-		// bad-debt ledger; the orchestrator burns it from the Insurance Fund via
-		// `heal`.
+		// Move the remaining vault debt to market bad debt. The caller heals it with insurance
+		// funds.
 		let (residual, dust, swept) = op.settle_recovery_residual()?;
 
-		// Release only this market's residual dust from the shared hold before the
-		// vault row vanishes; the owner's hold may still back other markets.
+		// Release only this market's dust. The same hold may back other markets.
 		if !dust.is_zero() {
 			T::CollateralAssets::release(
 				op.collateral_id().clone(),
@@ -247,8 +239,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 				amount: residual,
 			});
 		}
-		// The owner-naming record of this settlement: the row is removed, so
-		// no status-change event can carry it. The dust went to the owner.
+		// Emit a closure event because the removed vault cannot carry a status change.
 		Pallet::<T>::deposit_event(Event::VaultClosed {
 			collateral_id: op.collateral_id().clone(),
 			stable_id: op.stable_id().clone(),
@@ -260,8 +251,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 	}
 
 	fn branch_debt(collateral_id: &CollateralIdOf<T>, stable_id: &StableIdOf<T>) -> BalanceOf<T> {
-		// Zero for an unregistered branch: this sizes the dynamic redemption
-		// fee, it is not an error surface.
+		// An unknown market has no debt for redemption fee calculations.
 		let Some(branch) = Branches::<T>::get(collateral_id, stable_id) else {
 			return BalanceOf::<T>::zero();
 		};
@@ -274,8 +264,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		credit: StableCreditOf<T>,
 	) -> Result<StableCreditOf<T>, DispatchError> {
-		// A credit denominated in another coin cannot heal this market's bad
-		// debt — hand it straight back.
+		// Return credit for a different stable asset unchanged.
 		if credit.asset() != *stable_id {
 			return Ok(credit);
 		}
@@ -283,11 +272,11 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		let outstanding_before = branch.state.debt.outstanding();
 		let healable = credit.peek().min(branch.state.debt.bad_debt);
 		if healable.is_zero() {
-			// Nothing recorded (or an empty credit) — hand everything back.
+			// Return the full credit when there is nothing to heal.
 			return Ok(credit);
 		}
 		let (to_burn, surplus) = credit.split(healable);
-		// Dropping the credit burns the withdrawn stablecoin.
+		// Burn the stable asset used to heal the debt.
 		drop(to_burn);
 		branch.state.heal_bad_debt(healable);
 		Pallet::<T>::commit_branch(collateral_id, stable_id, outstanding_before, branch)?;
@@ -305,8 +294,7 @@ fn resolve_collateral_credit<T: Config>(
 	credit: CollateralCreditOf<T>,
 ) -> DispatchResult {
 	T::CollateralAssets::resolve(recipient, credit).map_err(|credit| {
-		// The surrounding liquidation transaction restores both the original
-		// hold and issuance after this credit is dropped.
+		// The liquidation transaction restores the hold and issuance on failure.
 		drop(credit);
 		TokenError::CannotCreate.into()
 	})
