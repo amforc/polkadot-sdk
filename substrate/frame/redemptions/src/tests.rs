@@ -354,9 +354,9 @@ fn underwater_prefix_skipped_once_while_healthy_vaults_redeem() {
 		let expected_collateral = v3_before * 10 / 9 + v4_before * 10 / 9;
 		assert_eq!(collateral_balance(DOT, 6) - recipient_before, expected_collateral);
 		// Both adapters consume the same shared walk decisions.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), preview.total_pusd_in);
-		assert_eq!(collateral_balance(DOT, 6) - recipient_before, preview.total_collateral_out);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.total_fee_pusd);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), preview.total_stable_in());
+		assert_eq!(collateral_balance(DOT, 6) - recipient_before, preview.total_collateral_out());
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.total_fee());
 		// Issuance falls by exactly the debt burned; fees are routed, not burned.
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), v3_before + v4_before);
 	});
@@ -927,15 +927,14 @@ fn preview_redeem_reports_path_without_side_effects() {
 		let preview = Redemptions::preview_redeem(DOT, PUSD, 201).expect("preview");
 		assert_eq!(preview.steps, 1);
 		assert!(!preview.truncated);
-		assert_eq!(preview.total_pusd_in, 201);
-		assert_eq!(preview.total_collateral_out, 160);
-		assert_eq!(preview.total_fee_pusd, 1);
+		assert_eq!(preview.total_stable_in(), 201);
+		assert_eq!(preview.total_collateral_out(), 160);
+		assert_eq!(preview.total_fee(), 1);
 		let step = &preview.steps_detail[0];
 		assert_eq!(step.target, 1);
 		assert_eq!(step.debt_cancellable, 200);
 		assert_eq!(step.collateral_out, 160);
 		assert_eq!(step.fee_pusd, 1);
-		assert_eq!(step.pusd_in, 201);
 		// Preview prepares snapshots inside a rollback-only transaction.
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
 	});
@@ -1289,9 +1288,9 @@ fn preview_matches_execution_for_partial_fill() {
 		assert_ok!(redeem(3, DOT, PUSD, budget, 0, 4, 0));
 
 		// Execution reproduces the quote exactly across every dimension.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), preview.total_pusd_in);
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before, preview.total_collateral_out);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.total_fee_pusd);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), preview.total_stable_in());
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, preview.total_collateral_out());
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.total_fee());
 		assert_eq!(v1_before - vault_debt(DOT, PUSD, 1), preview.steps_detail[0].debt_cancellable);
 	});
 }
