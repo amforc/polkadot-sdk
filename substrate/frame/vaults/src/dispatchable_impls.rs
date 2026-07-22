@@ -473,6 +473,34 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
+	/// Reassign a market's admins. The global manager bypass lets governance
+	/// recover a market whose full-admin origin is no longer reachable.
+	pub(crate) fn do_set_branch_admins(
+		origin: OriginFor<T>,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+		admins: BranchAdmins<PalletsOriginOf<T>>,
+	) -> Result<(), DispatchError> {
+		Self::ensure_branch_admin_or_manager(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
+		Branches::<T>::try_mutate_exists(
+			&collateral_id,
+			&stable_id,
+			|maybe| -> Result<(), DispatchError> {
+				let branch = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
+				branch.admins = admins.clone();
+				Ok(())
+			},
+		)?;
+		let BranchAdmins { full_admin, emergency_admin } = admins;
+		Self::deposit_event(Event::BranchAdminChanged {
+			collateral_id,
+			stable_id,
+			full_admin,
+			emergency_admin,
+		});
+		Ok(())
+	}
+
 	/// Authorize, validate, and apply a single-field config update, emitting
 	/// `ParameterUpdated`. The required admin tier, the `Emergency`-only "must be
 	/// defensive" rule, and the governance-envelope check are all derived from the
