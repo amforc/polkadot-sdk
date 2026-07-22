@@ -104,7 +104,7 @@ impl<T: Config> BranchOp<T> {
 	}
 
 	/// Refresh one vault. This is intentionally allowed while frozen.
-	pub(crate) fn refresh(
+	pub(crate) fn refresh_vault(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
