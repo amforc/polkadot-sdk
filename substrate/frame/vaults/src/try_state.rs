@@ -105,7 +105,7 @@ fn check_collateral_risks<T: Config>(
 	mut outstanding: BTreeMap<CollateralIdOf<T>, BalanceOf<T>>,
 ) -> Result<(), TryRuntimeError> {
 	for (collateral_id, risk) in CollateralRisks::<T>::iter() {
-		if risk == CollateralRisk::default() {
+		if risk.is_empty() {
 			return Err("default CollateralRisk record stored".into());
 		}
 		let recomputed = outstanding.remove(&collateral_id).unwrap_or_default();

@@ -60,6 +60,13 @@ pub struct CollateralRisk<Balance> {
 	pub outstanding: Balance,
 }
 
+impl<Balance: Zero> CollateralRisk<Balance> {
+	/// Whether this record carries neither a governance ceiling nor outstanding debt.
+	pub fn is_empty(&self) -> bool {
+		self.debt_ceiling.is_zero() && self.outstanding.is_zero()
+	}
+}
+
 /// Debt split by bucket: the state tracked on a vault row, and equally the
 /// shape of a cancelled portion of it (a payment is itself a debt breakdown).
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
@@ -629,16 +636,28 @@ pub enum AdminLevel {
 }
 
 /// The two admins of a market, bundled so the same-typed `full_admin` and
-/// `emergency_admin` cannot be silently swapped at a call site — end to end,
-/// from the `create_branch`/`set_branch_admins` call arguments into storage.
+/// `emergency_admin` cannot be silently swapped at a call site.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct BranchAdmins<PalletsOrigin> {
+pub struct BranchAdmins<AccountId> {
 	/// May move any param within the envelope and remove an empty market.
-	pub full_admin: PalletsOrigin,
+	pub full_admin: AccountId,
 	/// May only take risk-reducing actions (freeze, tighten).
-	pub emergency_admin: PalletsOrigin,
+	pub emergency_admin: AccountId,
+}
+
+impl<AccountId> BranchAdmins<AccountId> {
+	/// Resolve both admins through `f`, preserving the full/emergency pairing.
+	pub fn try_map<Target, E>(
+		self,
+		f: impl Fn(AccountId) -> Result<Target, E>,
+	) -> Result<BranchAdmins<Target>, E> {
+		Ok(BranchAdmins {
+			full_admin: f(self.full_admin)?,
+			emergency_admin: f(self.emergency_admin)?,
+		})
+	}
 }
 
 /// Everything a registered `(collateral, stable)` market carries, in one
@@ -647,12 +666,12 @@ pub struct BranchAdmins<PalletsOrigin> {
 /// deposit stays keyed by the depositor *account* regardless of who admins
 /// the market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
-pub struct Branch<PalletsOrigin, AccountId, Balance, Consideration> {
+pub struct Branch<AccountId, Balance, Consideration> {
 	/// Governance/risk parameters, moved only through `set_param`.
 	pub config: BranchConfig<Balance>,
 	/// Hot accounting state, rewritten by every vault operation.
 	pub state: BranchState<AccountId, Balance>,
-	pub admins: BranchAdmins<PalletsOrigin>,
+	pub admins: BranchAdmins<AccountId>,
 	pub deposit: Option<(AccountId, Consideration)>,
 }
 

@@ -3328,7 +3328,7 @@ impl pallet_vaults::Config for Runtime {
 		ConstantStoragePrice<VaultsMarketCreationDeposit, Balance>,
 	>;
 	type BranchConfigGuard = VaultsBranchConfigGuard;
-	type GlobalManagerOrigin = EnsureRoot<AccountId>;
+	type ForceOrigin = EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type IdleMaxRefreshWeight = VaultsIdleMaxRefreshWeight;
 	type VaultLists = LinkedList;

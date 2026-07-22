@@ -302,15 +302,9 @@ pub const EMERGENCY_ADMIN: AccountId = 101;
 /// deposit, per the mock's `EnsureAssetOwner`.
 pub const PUSD_OWNER: AccountId = 1;
 
-/// The origin caller under which `who` administers markets — admins are stored
-/// as origin callers, not accounts.
-pub fn admin_caller(who: AccountId) -> OriginCaller {
-	frame_system::RawOrigin::Signed(who).into()
-}
-
 /// The admin bundle `create_branch`/`set_branch_admins` take.
-pub fn branch_admins(full: AccountId, emergency: AccountId) -> BranchAdmins<OriginCaller> {
-	BranchAdmins { full_admin: admin_caller(full), emergency_admin: admin_caller(emergency) }
+pub fn branch_admins(full: AccountId, emergency: AccountId) -> BranchAdmins<AccountId> {
+	BranchAdmins { full_admin: full, emergency_admin: emergency }
 }
 
 /// `CreateOrigin`: Root creates deposit-free (`None`); the stable asset's owner
@@ -375,7 +369,7 @@ impl pallet_vaults::Config for Test {
 	type CreateOrigin = EnsureAssetOwner;
 	type Consideration = VaultsConsideration;
 	type BranchConfigGuard = TestBranchConfigGuard;
-	type GlobalManagerOrigin = frame_system::EnsureRoot<AccountId>;
+	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
 	type IdleMaxRefreshWeight = IdleMaxRefreshWeight;
