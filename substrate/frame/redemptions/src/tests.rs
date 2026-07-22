@@ -741,7 +741,7 @@ fn set_redemption_config_updates_and_validates() {
 		);
 
 		// One mutation per invalid-config axis `validate` guards.
-		let invalid: [fn(&mut RedemptionConfig<Balance, Moment>); 5] = [
+		let invalid: [fn(&mut RedemptionConfig<Balance>); 5] = [
 			// `dynamic_fee_floor` above `dynamic_fee_ceiling`.
 			|c| {
 				c.dynamic_fee_floor = FixedU128::one();
@@ -1637,7 +1637,7 @@ fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_not_coins() {
 
 /// The default config with every fee component zeroed, so a step's payment
 /// need equals its budget exactly and dead-zone arithmetic stays readable.
-fn zero_fee_redemption_config() -> RedemptionConfig<Balance, Moment> {
+fn zero_fee_redemption_config() -> RedemptionConfig<Balance> {
 	RedemptionConfig {
 		dynamic_fee_floor: FixedU128::zero(),
 		dynamic_fee_ceiling: FixedU128::zero(),
