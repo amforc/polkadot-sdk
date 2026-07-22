@@ -989,9 +989,24 @@ pub mod pallet {
 			})
 		}
 
+		/// Touch-only `redeem_step`: capture the post-touch snapshot, apply
+		/// nothing, so the recipient (never paid) is irrelevant and `owner`
+		/// stands in. Callers roll the touch back via a surrounding transaction.
+		fn touch_snapshot(
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
+			owner: &T::AccountId,
+		) -> Result<Option<SnapshotOf<T>>, DispatchError> {
+			let mut captured = None;
+			T::Vaults::redeem_step(collateral_id, stable_id, owner, owner, |snap| {
+				captured = Some(snap);
+				Ok(None)
+			})?;
+			Ok(captured)
+		}
+
 		/// Preview adapter for the shared target walker. Touches are rolled back by
-		/// [`Self::simulate`]'s caller; the adapter models whether an applied step
-		/// would remove the target because it cannot apply a real settlement.
+		/// [`Self::simulate`]'s caller.
 		fn simulate_walk(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
@@ -1008,59 +1023,68 @@ pub mod pallet {
 				cap,
 				max_pusd_in,
 				|owner, remaining| {
-					// A touch-only step: capture the post-touch snapshot, apply nothing,
-					// so the recipient (never paid) is irrelevant and `owner` stands in.
-					// The preview's surrounding transaction rolls the touch back.
-					let mut captured = None;
-					let touch =
-						T::Vaults::redeem_step(collateral_id, stable_id, owner, owner, |snap| {
-							captured = Some(snap);
-							Ok(None)
-						});
-					if touch.is_err() {
-						return Ok(WalkControl::NotVisited);
-					}
-					let Some(snap) = captured else {
+					let Ok(Some(snap)) = Self::touch_snapshot(collateral_id, stable_id, owner)
+					else {
 						return Ok(WalkControl::NotVisited);
 					};
-					Ok(match Self::classify(&snap, price) {
-						StepAction::Recovery => {
-							if let Some(step) = Self::preview_recovery_step(
-								stable_id, config, owner, &snap, price, remaining,
-							) {
-								let spent = step.pusd_in;
-								detail.push(step);
-								// Recovery is a counted stop: a later head may price differently.
-								WalkControl::Stop { spent }
-							} else {
-								WalkControl::Stop { spent: Zero::zero() }
-							}
-						},
-						StepAction::Stop => WalkControl::Stop { spent: Zero::zero() },
-						StepAction::Skip => {
-							WalkControl::ContinueAfterTarget { spent: Zero::zero() }
-						},
-						StepAction::Redeem => {
-							let Some(step) =
-								Self::preview_ordinary_step(owner, &snap, price, rate, remaining)
-							else {
-								return Ok(WalkControl::Stop { spent: Zero::zero() });
-							};
-							let drained = step.debt_cancellable >= snap.debt;
-							let spent = step.pusd_in;
-							detail.push(step);
-							// A drained Dormant is a barrier the preview cannot cross (it does not
-							// mutate to remove it), so stop rather than re-walking it.
-							if !drained || snap.status.is_dormant() {
-								WalkControl::Stop { spent }
-							} else {
-								WalkControl::ContinueAfterTarget { spent }
-							}
-						},
-					})
+					let (step, control) = Self::preview_step_control(
+						stable_id, config, owner, &snap, price, rate, remaining,
+					);
+					if let Some(step) = step {
+						detail.push(step);
+					}
+					Ok(control)
 				},
 			)?;
 			Ok((detail, result.steps, result.truncated))
+		}
+
+		/// Map one previewed snapshot to its step detail and walk control. The
+		/// adapter models whether an applied step would remove the target,
+		/// because a rolled-back preview cannot apply a real settlement.
+		fn preview_step_control(
+			stable_id: &StableIdOf<T>,
+			config: &RedemptionConfigOf<T>,
+			owner: &T::AccountId,
+			snap: &SnapshotOf<T>,
+			price: FixedU128,
+			rate: FixedU128,
+			budget: BalanceOf<T>,
+		) -> (Option<RedemptionPreviewStepOf<T>>, WalkControl<BalanceOf<T>>) {
+			match Self::classify(snap, price) {
+				StepAction::Recovery => {
+					match Self::preview_recovery_step(stable_id, config, owner, snap, price, budget)
+					{
+						Some(step) => {
+							let spent = step.pusd_in;
+							// Recovery is a counted stop: a later head may price differently.
+							(Some(step), WalkControl::Stop { spent })
+						},
+						None => (None, WalkControl::Stop { spent: Zero::zero() }),
+					}
+				},
+				StepAction::Stop => (None, WalkControl::Stop { spent: Zero::zero() }),
+				StepAction::Skip => {
+					(None, WalkControl::ContinueAfterTarget { spent: Zero::zero() })
+				},
+				StepAction::Redeem => {
+					match Self::preview_ordinary_step(owner, snap, price, rate, budget) {
+						None => (None, WalkControl::Stop { spent: Zero::zero() }),
+						Some(step) => {
+							let drained = step.debt_cancellable >= snap.debt;
+							let spent = step.pusd_in;
+							// A drained Dormant is a barrier the preview cannot cross (it does
+							// not mutate to remove it), so stop rather than re-walking it.
+							let control = if !drained || snap.status.is_dormant() {
+								WalkControl::Stop { spent }
+							} else {
+								WalkControl::ContinueAfterTarget { spent }
+							};
+							(Some(step), control)
+						},
+					}
+				},
+			}
 		}
 
 		fn preview_ordinary_step(
@@ -1116,6 +1140,18 @@ pub mod pallet {
 			Ok((config, price))
 		}
 
+		/// The queued priority head, only when it is a `FinalRecovery` vault.
+		/// Shared by the offset quote and execution so the head gate cannot
+		/// diverge.
+		fn final_recovery_head(
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
+		) -> Option<T::AccountId> {
+			let (owner, status) =
+				T::Vaults::next_redemption_target(collateral_id, stable_id, None)?;
+			status.is_final_recovery().then_some(owner)
+		}
+
 		/// Size a recovery offset against the FIFO head via a touch-only
 		/// `redeem_step`; the caller wraps this in a rolled-back transaction.
 		/// Prices through [`Self::price_recovery`], the same function that
@@ -1128,23 +1164,11 @@ pub mod pallet {
 			// Target first, preamble second: the dominant path (no
 			// `FinalRecovery` head queued) then skips the config and oracle
 			// reads entirely.
-			let Some((owner, status)) =
-				T::Vaults::next_redemption_target(collateral_id, stable_id, None)
-			else {
+			let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
 				return Ok(RecoveryOffsetQuote::NoTarget);
 			};
-			if !status.is_final_recovery() {
-				return Ok(RecoveryOffsetQuote::NoTarget);
-			}
 			let (config, price) = Self::offset_preamble(collateral_id, stable_id)?;
-			// Touch-only, so the recipient (never paid) is irrelevant and `owner`
-			// stands in.
-			let mut captured = None;
-			T::Vaults::redeem_step(collateral_id, stable_id, &owner, &owner, |snap| {
-				captured = Some(snap);
-				Ok(None)
-			})?;
-			let Some(snap) = captured else {
+			let Some(snap) = Self::touch_snapshot(collateral_id, stable_id, &owner)? else {
 				return Ok(RecoveryOffsetQuote::NoTarget);
 			};
 			let pricing =
@@ -1209,14 +1233,9 @@ pub mod pallet {
 			// instead of settling in whatever market the coin names. The
 			// caller's rollback unwinds the dropped payment.
 			ensure!(payment.asset() == *stable_id, Error::<T>::RecoveryOffsetCoinMismatch);
-			let Some((owner, status)) =
-				T::Vaults::next_redemption_target(collateral_id, stable_id, None)
-			else {
+			let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
 				return Ok((RecoveryOffsetResult::NoTarget, payment));
 			};
-			if !status.is_final_recovery() {
-				return Ok((RecoveryOffsetResult::NoTarget, payment));
-			}
 			let (config, price) = Self::offset_preamble(collateral_id, stable_id)?;
 			// The credit is the budget: the burn can never exceed what the
 			// caller funded, so no payer sizing happens on this side.
