@@ -278,13 +278,9 @@ impl<T: Config> Pallet<T> {
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		pre_tcr: FixedU128,
 		post_tcr: FixedU128,
-		is_settlement: bool,
 	) -> Result<(), DispatchError> {
 		if state.is_frozen() {
 			return Err(Error::<T>::BranchFrozen.into());
-		}
-		if is_settlement {
-			return Ok(());
 		}
 		if pre_tcr < config.safety_collateralization_ratio {
 			ensure!(post_tcr >= pre_tcr, Error::<T>::SafetyModeTcrWorsening);
