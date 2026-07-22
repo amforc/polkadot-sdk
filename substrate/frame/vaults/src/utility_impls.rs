@@ -793,7 +793,7 @@ impl<T: Config> Pallet<T> {
 		owner: &T::AccountId,
 	) {
 		let _ = with_storage_layer::<(), DispatchError, _>(|| {
-			BranchOp::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
+			BranchOp::<T>::refresh_vault(collateral_id.clone(), stable_id.clone(), owner)
 		});
 	}
 
