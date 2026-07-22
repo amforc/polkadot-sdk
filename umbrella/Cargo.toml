@@ -52,6 +52,7 @@ std = [
 	"frame-system-rpc-runtime-api?/std",
 	"frame-system?/std",
 	"frame-try-runtime?/std",
+	"linked-list-interface?/std",
 	"pallet-accumulate-and-forward?/std",
 	"pallet-alliance?/std",
 	"pallet-asset-conversion-ops?/std",
@@ -265,6 +266,7 @@ runtime-benchmarks = [
 	"frame-support?/runtime-benchmarks",
 	"frame-system-benchmarking?/runtime-benchmarks",
 	"frame-system?/runtime-benchmarks",
+	"linked-list-interface?/runtime-benchmarks",
 	"pallet-accumulate-and-forward?/runtime-benchmarks",
 	"pallet-alliance?/runtime-benchmarks",
 	"pallet-asset-conversion-ops?/runtime-benchmarks",
@@ -411,6 +413,7 @@ try-runtime = [
 	"frame-support?/try-runtime",
 	"frame-system?/try-runtime",
 	"frame-try-runtime/try-runtime",
+	"linked-list-interface?/try-runtime",
 	"pallet-accumulate-and-forward?/try-runtime",
 	"pallet-alliance?/try-runtime",
 	"pallet-asset-conversion-ops?/try-runtime",
@@ -628,6 +631,7 @@ runtime-full = [
 	"frame-system-benchmarking",
 	"frame-system-rpc-runtime-api",
 	"frame-try-runtime",
+	"linked-list-interface",
 	"pallet-accumulate-and-forward",
 	"pallet-alliance",
 	"pallet-asset-conversion",
@@ -1284,6 +1288,11 @@ path = "../substrate/frame/system/rpc/runtime-api"
 default-features = false
 optional = true
 path = "../substrate/frame/try-runtime"
+
+[dependencies.linked-list-interface]
+default-features = false
+optional = true
+path = "../substrate/frame/linked-list/interface"
 
 [dependencies.pallet-accumulate-and-forward]
 default-features = false

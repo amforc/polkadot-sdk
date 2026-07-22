@@ -305,6 +305,10 @@ pub use mmr_gadget;
 #[cfg(feature = "mmr-rpc")]
 pub use mmr_rpc;
 
+/// Consumer-facing interface of the FRAME linked-list pallet.
+#[cfg(feature = "linked-list-interface")]
+pub use linked_list_interface;
+
 /// FRAME pallet for periodic accumulation and forwarding of native token funds.
 #[cfg(feature = "pallet-accumulate-and-forward")]
 pub use pallet_accumulate_and_forward;

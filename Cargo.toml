@@ -395,6 +395,7 @@ members = [
 	"substrate/frame/indices",
 	"substrate/frame/insecure-randomness-collective-flip",
 	"substrate/frame/linked-list",
+	"substrate/frame/linked-list/interface",
 	"substrate/frame/lottery",
 	"substrate/frame/membership",
 	"substrate/frame/merkle-mountain-range",
@@ -923,6 +924,7 @@ libp2p-kad = { version = "0.46.2", default-features = false }
 libsecp256k1 = { version = "0.7.0", default-features = false }
 libsqlite3-sys = { version = "0.30", default-features = false }
 linked-hash-map = { version = "0.5.4" }
+linked-list-interface = { path = "substrate/frame/linked-list/interface", default-features = false }
 linked_hash_set = { version = "0.1.4" }
 linregress = { version = "0.5.1" }
 lite-json = { version = "0.2.0", default-features = false }

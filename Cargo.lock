@@ -10726,6 +10726,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
+name = "linked-list-interface"
+version = "0.1.0"
+dependencies = [
+ "parity-scale-codec",
+ "polkadot-sdk-frame",
+ "scale-info",
+]
+
+[[package]]
 name = "linked_hash_set"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13685,6 +13694,7 @@ dependencies = [
 name = "pallet-linked-list"
 version = "0.1.0"
 dependencies = [
+ "linked-list-interface",
  "parity-scale-codec",
  "polkadot-sdk-frame",
  "scale-info",
@@ -17623,6 +17633,7 @@ dependencies = [
  "frame-system-rpc-runtime-api",
  "frame-try-runtime",
  "generate-bags",
+ "linked-list-interface",
  "mmr-gadget",
  "mmr-rpc",
  "pallet-accumulate-and-forward",
