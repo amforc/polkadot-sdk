@@ -33,7 +33,12 @@ pub mod pallet {
 	};
 	use frame::{
 		deps::frame_support::{
-			traits::{fungibles, EnsureOriginWithArg, Time},
+			traits::{
+				fungibles,
+				fungibles::{Balanced as _, Inspect as _},
+				tokens::{Fortitude, Precision, Preservation},
+				EnsureOriginWithArg, OnUnbalanced, Time,
+			},
 			PalletId,
 		},
 		prelude::*,
@@ -113,6 +118,12 @@ pub mod pallet {
 			Credit = StableCreditOf<Self>,
 		>;
 
+		/// TODO: Doc
+		type StableDustHandler: OnUnbalanced<StableCreditOf<Self>>;
+
+		/// TODO: Doc
+		type CollateralDustHandler: OnUnbalanced<CollateralCreditOf<Self>>;
+
 		/// Backing store for the per-branch pending-deposit FIFO: the
 		/// runtime's shared `pallet-linked-list` instance, addressed through
 		/// the `StableListId::StabilityPending` variant.
@@ -161,6 +172,11 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
+	/// TODO: Doc
+	#[pallet::storage]
+	pub type ActivationCursor<T: Config> =
+		StorageValue<_, (T::CollateralAssetId, T::StableAssetId, T::AccountId), OptionQuery>;
+
 	/// The registered markets' pools: governance parameters and hot
 	/// accounting state in one record, so the pieces can never partially
 	/// exist. Existence of the row is what "registered" means.
@@ -205,14 +221,15 @@ pub mod pallet {
 			used_for_recovery: BalanceOf<T>,
 			pending_amount: BalanceOf<T>,
 		},
-		/// A pending deposit passed its entry delay and became active.
+		/// A pending deposit passed its entry delay and became active on the
+		/// next touch of its row.
 		PendingDepositActivated {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// A withdrawal request was created or replaced (SPEC.md §6.9).
+		/// A Safety-Mode withdrawal request was created or replaced.
 		WithdrawalRequested {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
@@ -294,6 +311,14 @@ pub mod pallet {
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 		},
+		/// Market teardown swept the pool account's residual dust to
+		/// [`Config::StableDustHandler`] / [`Config::CollateralDustHandler`].
+		DustSwept {
+			collateral_id: T::CollateralAssetId,
+			stable_id: T::StableAssetId,
+			stable_amount: BalanceOf<T>,
+			collateral_amount: BalanceOf<T>,
+		},
 	}
 
 	#[pallet::error]
@@ -304,12 +329,10 @@ pub mod pallet {
 		DepositTooSmall,
 		/// The caller has no deposit row on this market.
 		DepositNotFound,
-		/// The deposit row has no pending amount to activate.
-		NoPendingDeposit,
-		/// The pending deposit has not passed its entry delay yet.
-		PendingDepositNotMatured,
-		/// The operation would withdraw zero stablecoin: a zero amount, an
-		/// exhausted request, or no active deposit to draw from.
+		/// The requested amount is zero.
+		ZeroAmount,
+		/// The withdrawal resolved to zero stablecoin: an exhausted request,
+		/// or no active deposit to draw from.
 		NoActiveDeposit,
 		/// Safety Mode withdrawals need a prior [`Pallet::request_withdraw`].
 		WithdrawalRequestMissing,
@@ -367,6 +390,10 @@ pub mod pallet {
 			);
 		}
 
+		fn on_idle(_block: BlockNumberFor<T>, remaining: Weight) -> Weight {
+			Self::on_idle_activation_walk(remaining)
+		}
+
 		#[cfg(feature = "try-runtime")]
 		fn try_state(_: BlockNumberFor<T>) -> Result<(), frame::try_runtime::TryRuntimeError> {
 			crate::try_state::do_try_state::<T>()
@@ -376,10 +403,10 @@ pub mod pallet {
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		/// Supply `amount` stablecoin to the market's stability pool. The
-		/// funds queue as a pending deposit until `entry_delay` has
-		/// passed, then activate on the next touch (or via
-		/// [`Pallet::activate_deposit`]). A second deposit merges into the
-		/// existing pending amount and restarts its delay.
+		/// funds queue as a pending deposit until `entry_delay` has passed,
+		/// then activate automatically on the next touch of the row. A second
+		/// deposit merges into the existing pending amount and restarts its
+		/// delay.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::deposit())]
 		pub fn deposit(
@@ -392,24 +419,10 @@ pub mod pallet {
 			Self::do_deposit(who, collateral_id, stable_id, amount)
 		}
 
-		/// Activate the caller's matured pending deposit, making it
-		/// offsettable and yield-earning.
+		/// Safety Mode: create or replace a withdrawal request for up to
+		/// `amount` active stablecoin, executable `safety_withdrawal_delay`
+		/// after the request.
 		#[pallet::call_index(1)]
-		#[pallet::weight(T::WeightInfo::activate_deposit())]
-		pub fn activate_deposit(
-			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-		) -> DispatchResult {
-			let who = ensure_signed(origin)?;
-			Self::do_activate_deposit(who, collateral_id, stable_id)
-		}
-
-		/// Create or replace a withdrawal request for up to `amount` active
-		/// stablecoin. Only load-bearing in Safety Mode, where withdrawals
-		/// must wait `safety_withdrawal_delay` from the request; Normal-Mode
-		/// withdrawals execute directly via [`Pallet::withdraw`].
-		#[pallet::call_index(2)]
 		#[pallet::weight(T::WeightInfo::request_withdraw())]
 		pub fn request_withdraw(
 			origin: OriginFor<T>,
@@ -421,47 +434,53 @@ pub mod pallet {
 			Self::do_request_withdraw(who, collateral_id, stable_id, amount)
 		}
 
-		/// Withdraw up to `amount` active stablecoin to `recipient` —
-		/// immediately in Normal Mode, against a matured withdrawal request
-		/// in Safety Mode. Takes `min(amount, active)` rather than failing
-		/// when the active deposit shrank since the caller last looked.
-		#[pallet::call_index(3)]
+		/// Withdraw up to `amount` active stablecoin — immediately in Normal
+		/// Mode, against a matured withdrawal request in Safety Mode. Takes
+		/// `min(amount, active)` rather than failing when the active deposit
+		/// shrank since the caller last looked. A `None` recipient pays the
+		/// caller.
+		#[pallet::call_index(2)]
 		#[pallet::weight(T::WeightInfo::withdraw())]
 		pub fn withdraw(
 			origin: OriginFor<T>,
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
 			amount: BalanceOf<T>,
-			recipient: T::AccountId,
+			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
+			let recipient = recipient.unwrap_or_else(|| who.clone());
 			Self::do_withdraw(who, collateral_id, stable_id, amount, recipient)
 		}
 
-		/// Pay the caller's realized collateral gains to `recipient`.
-		#[pallet::call_index(4)]
+		/// Pay the caller's realized collateral gains out; a `None` recipient
+		/// pays the caller.
+		#[pallet::call_index(3)]
 		#[pallet::weight(T::WeightInfo::claim_collateral())]
 		pub fn claim_collateral(
 			origin: OriginFor<T>,
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			recipient: T::AccountId,
+			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
+			let recipient = recipient.unwrap_or_else(|| who.clone());
 			Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Collateral)
 		}
 
-		/// Pay the caller's realized stablecoin yield to `recipient`. Yield
-		/// stays claimable — never offsettable — until explicitly compounded.
-		#[pallet::call_index(5)]
+		/// Pay the caller's realized stablecoin yield out; a `None` recipient
+		/// pays the caller. Yield stays claimable — never offsettable — until
+		/// explicitly compounded.
+		#[pallet::call_index(4)]
 		#[pallet::weight(T::WeightInfo::claim_yield())]
 		pub fn claim_yield(
 			origin: OriginFor<T>,
 			collateral_id: T::CollateralAssetId,
 			stable_id: T::StableAssetId,
-			recipient: T::AccountId,
+			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
+			let recipient = recipient.unwrap_or_else(|| who.clone());
 			Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Yield)
 		}
 
@@ -470,7 +489,7 @@ pub mod pallet {
 		/// pricing (SPEC.md §7.3). Active depositors receive the priced
 		/// collateral through `S`, exactly like an ordinary liquidation
 		/// offset. Available whenever the head is at or above par.
-		#[pallet::call_index(7)]
+		#[pallet::call_index(5)]
 		#[pallet::weight(T::WeightInfo::offset_recovery())]
 		pub fn offset_recovery(
 			origin: OriginFor<T>,
@@ -499,9 +518,11 @@ pub mod pallet {
 		}
 
 		/// Permissionlessly realize `owner`'s deposit against the current
-		/// accumulators, without moving value. Never activates a matured
-		/// pending deposit — that choice stays with the owner.
-		#[pallet::call_index(9)]
+		/// accumulators, without moving value, and fold in a matured pending
+		/// deposit. Activation is automatic once the entry delay has passed —
+		/// the owner committed risk capital at deposit time — so any caller
+		/// may complete the move.
+		#[pallet::call_index(7)]
 		#[pallet::weight(T::WeightInfo::poke_deposit())]
 		pub fn poke_deposit(
 			origin: OriginFor<T>,
@@ -543,6 +564,49 @@ pub mod pallet {
 		) -> T::AccountId {
 			pusd_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
 		}
+
+		/// Sweep the pool account's residual balances to the dust handlers,
+		/// returning the swept amounts.
+		///
+		/// Only called with no depositor rows left, so whatever remains is
+		/// unattributable flooring residue. It must not stay behind: the
+		/// balance↔totals invariant holds as an equality, so a re-registered
+		/// pair starting from fresh zero totals would inherit a divergence.
+		fn sweep_dust(
+			collateral_id: &T::CollateralAssetId,
+			stable_id: &T::StableAssetId,
+			pool_account: &T::AccountId,
+		) -> Result<(BalanceOf<T>, BalanceOf<T>), DispatchError> {
+			let stable_dust = T::StableAssets::balance(stable_id.clone(), pool_account);
+			if !stable_dust.is_zero() {
+				let credit = T::StableAssets::withdraw(
+					stable_id.clone(),
+					pool_account,
+					stable_dust,
+					Precision::Exact,
+					Preservation::Expendable,
+					Fortitude::Polite,
+				)?;
+				T::StableDustHandler::on_unbalanced(credit);
+			}
+			let collateral_dust = T::CollateralAssets::balance(collateral_id.clone(), pool_account);
+			if !collateral_dust.is_zero() {
+				let credit = T::CollateralAssets::withdraw(
+					collateral_id.clone(),
+					pool_account,
+					collateral_dust,
+					Precision::Exact,
+					Preservation::Expendable,
+					Fortitude::Polite,
+				)?;
+				T::CollateralDustHandler::on_unbalanced(credit);
+			}
+			debug_assert!(T::StableAssets::balance(stable_id.clone(), pool_account).is_zero());
+			debug_assert!(
+				T::CollateralAssets::balance(collateral_id.clone(), pool_account).is_zero()
+			);
+			Ok((stable_dust, collateral_dust))
+		}
 	}
 
 	impl<T: Config> OnBranchLifecycle<T::CollateralAssetId, T::StableAssetId> for Pallet<T> {
@@ -572,8 +636,8 @@ pub mod pallet {
 			// claimable value all live on them. Vaults rolls the whole
 			// `remove_branch` back on this error, so a market admin cannot
 			// strand depositor funds. With no rows left, any residual pool
-			// totals are unattributable flooring dust; it stays in the
-			// (henceforth unreferenced) pool account.
+			// balance is unattributable flooring dust, swept to the runtime's
+			// dust handlers below.
 			ensure!(
 				Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
 					.next()
@@ -585,6 +649,24 @@ pub mod pallet {
 			// queue of a re-registered branch.
 			let fifo = crate::pending::list_id::<T>(collateral_id, stable_id);
 			ensure!(T::PendingLists::count(&fifo) == 0, Error::<T>::PendingFifoInvariantBroken);
+
+			let pool_account = Self::pool_account(collateral_id, stable_id);
+			let (stable_amount, collateral_amount) =
+				Self::sweep_dust(collateral_id, stable_id, &pool_account)?;
+			if !stable_amount.is_zero() || !collateral_amount.is_zero() {
+				Self::deposit_event(Event::DustSwept {
+					collateral_id: collateral_id.clone(),
+					stable_id: stable_id.clone(),
+					stable_amount,
+					collateral_amount,
+				});
+			}
+
+			if ActivationCursor::<T>::get().is_some_and(|(cursor_collateral, cursor_stable, _)| {
+				cursor_collateral == *collateral_id && cursor_stable == *stable_id
+			}) {
+				ActivationCursor::<T>::kill();
+			}
 			Pools::<T>::remove(collateral_id, stable_id);
 			// Safe to clear wholesale: without deposit rows, no snapshot can
 			// reference a sums row.
@@ -595,10 +677,10 @@ pub mod pallet {
 			);
 			debug_assert!(removal.maybe_cursor.is_none());
 
-			let pool_account = Self::pool_account(collateral_id, stable_id);
 			if frame_system::Pallet::<T>::providers(&pool_account) > 0 {
-				// May refuse while dust keeps consumer references alive;
-				// the account then just stays around, which is harmless.
+				// The sweep zeroed the market's own assets, but unrelated
+				// tokens a third party parked here may still hold consumer
+				// references; the account then just stays, which is harmless.
 				let _ = frame_system::Pallet::<T>::dec_providers(&pool_account);
 			}
 			Ok(())
