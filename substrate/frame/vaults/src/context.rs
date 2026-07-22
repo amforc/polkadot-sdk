@@ -57,7 +57,7 @@ enum RowAction {
 enum TcrCheck {
 	Exempt,
 	Operation(FixedU128),
-	Settlement(FixedU128),
+	Settlement,
 }
 
 impl<T: Config> BranchOp<T> {
@@ -807,8 +807,8 @@ impl<T: Config> VaultOp<T> {
 		self.commit_inner(RowAction::Remove, TcrCheck::Operation(price))
 	}
 
-	pub(crate) fn remove_settlement(self, price: FixedU128) -> Result<(), DispatchError> {
-		self.commit_inner(RowAction::Remove, TcrCheck::Settlement(price))
+	pub(crate) fn remove_settlement(self) -> Result<(), DispatchError> {
+		self.commit_inner(RowAction::Remove, TcrCheck::Settlement)
 	}
 
 	fn commit_inner(self, row_action: RowAction, tcr_check: TcrCheck) -> Result<(), DispatchError> {
@@ -818,20 +818,13 @@ impl<T: Config> VaultOp<T> {
 		}
 		match tcr_check {
 			TcrCheck::Exempt => {},
-			TcrCheck::Operation(price) => enforce_tcr_check::<T>(
+			TcrCheck::Operation(price) => enforce_operation_tcr::<T>(
 				&self.ctx.tcr_baseline,
 				&self.ctx.branch,
 				self.ctx.now,
 				price,
-				false,
 			)?,
-			TcrCheck::Settlement(price) => enforce_tcr_check::<T>(
-				&self.ctx.tcr_baseline,
-				&self.ctx.branch,
-				self.ctx.now,
-				price,
-				true,
-			)?,
+			TcrCheck::Settlement => self.ctx.ensure_not_frozen()?,
 		}
 		self.ctx.assert_unclobbered();
 		let key = (&self.ctx.collateral_id, &self.ctx.stable_id, &self.owner);
@@ -866,14 +859,13 @@ impl<T: Config> VaultOp<T> {
 
 /// Check one operation's baseline-to-committed branch change against the
 /// operation's own loaded config.
-fn enforce_tcr_check<T: Config>(
+fn enforce_operation_tcr<T: Config>(
 	baseline: &TcrInputs<BalanceOf<T>>,
 	branch: &BranchOf<T>,
 	now: Millis,
 	price: FixedU128,
-	settlement: bool,
 ) -> Result<(), DispatchError> {
 	let pre_tcr = Pallet::<T>::tcr_from_inputs(baseline, price)?;
 	let post_tcr = Pallet::<T>::compute_tcr(&branch.state, price, now)?;
-	Pallet::<T>::enforce_mode_rules(&branch.config, &branch.state, pre_tcr, post_tcr, settlement)
+	Pallet::<T>::enforce_mode_rules(&branch.config, &branch.state, pre_tcr, post_tcr)
 }
