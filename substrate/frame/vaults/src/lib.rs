@@ -69,7 +69,7 @@ pub mod pallet {
 				Balanced as FungiblesBalanced, Inspect as FungiblesInspect,
 				Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold,
 			},
-			Consideration, EnsureOriginWithArg, Footprint, OriginTrait, Time,
+			Consideration, EnsureOriginWithArg, Footprint, Time,
 		},
 	};
 	use pallet_linked_list::{Position, PriorityProvider, SortedListInterface};
@@ -91,6 +91,9 @@ pub mod pallet {
 		<T as frame_system::Config>::AccountId,
 	>>::AssetId;
 
+	/// Account lookup source accepted by branch-admin assignment calls.
+	pub type AccountIdLookupOf<T> = <<T as frame_system::Config>::Lookup as StaticLookup>::Source;
+
 	/// Protocol time unit: UNIX milliseconds. All vault accounting is done in
 	/// concrete `u64` milliseconds rather than a generic `Moment`; the time
 	/// provider's `Moment` is pinned to `Millis` via [`Config::TimeProvider`].
@@ -103,16 +106,10 @@ pub mod pallet {
 
 	/// The [`Branches`] record, instantiated for the runtime.
 	pub type BranchOf<T> = crate::types::Branch<
-		PalletsOriginOf<T>,
 		<T as frame_system::Config>::AccountId,
 		BalanceOf<T>,
 		<T as Config>::Consideration,
 	>;
-
-	/// The runtime's origin-caller type. Market admins are stored as origin callers, so a
-	/// governance track or collective can administer a market.
-	pub type PalletsOriginOf<T> =
-		<<T as frame_system::Config>::RuntimeOrigin as OriginTrait>::PalletsOrigin;
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(1);
 
@@ -194,12 +191,11 @@ pub mod pallet {
 		/// Governance envelope bounding every permissionless market's config.
 		type BranchConfigGuard: Get<BranchConfigGuard<BalanceOf<Self>>>;
 
-		/// Governance origin owning the systemic per-collateral limits
-		/// ([`CollateralRisks`]) and able to freeze or remove any market via
-		/// `set_governance_frozen`/`remove_branch`, bypassing its admins — the
-		/// hard backstop beneath the permissionless per-market ceilings,
-		/// distinct from any per-market admin.
-		type GlobalManagerOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+		/// Runtime-wide force origin owning the systemic per-collateral limits
+		/// ([`CollateralRisks`]) and able to freeze, remove, or reassign the
+		/// admins of any market, bypassing its local admins — the hard backstop
+		/// beneath the permissionless per-market ceilings.
+		type ForceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
 		/// Sorted-DLL backing the per-market rate index and FinalRecovery FIFO.
 		/// Configured by the runtime to point at `pallet-linked-list` with
@@ -278,7 +274,7 @@ pub mod pallet {
 	pub type AssetRoles<T: Config> =
 		StorageMap<_, Twox64Concat, CollateralIdOf<T>, AssetRoleUsage, OptionQuery>;
 
-	/// Per-collateral systemic risk record: the [`Config::GlobalManagerOrigin`]-set
+	/// Per-collateral systemic risk record: the [`Config::ForceOrigin`]-set
 	/// hard cap on total debt across the collateral's markets, and the stored
 	/// aggregate of that debt (`Σ BranchDebt::outstanding()`). Markets sharing a
 	/// collateral share its concentration risk, so the cap binds their sum; a
@@ -419,12 +415,12 @@ pub mod pallet {
 		GlobalDebtCeilingSet { collateral_id: CollateralIdOf<T>, ceiling: BalanceOf<T> },
 		/// An empty market was removed; the creation deposit was refunded.
 		BranchRemoved { collateral_id: CollateralIdOf<T>, stable_id: StableIdOf<T> },
-		/// A market's admin (`full` or `emergency`) was reassigned.
-		BranchAdminChanged {
+		/// A market's full and emergency admins were reassigned.
+		BranchAdminsChanged {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			full_admin: PalletsOriginOf<T>,
-			emergency_admin: PalletsOriginOf<T>,
+			full_admin: T::AccountId,
+			emergency_admin: T::AccountId,
 		},
 		/// A redemption cancelled vault debt in exchange for collateral.
 		VaultRedeemed {
@@ -976,10 +972,11 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			admins: BranchAdmins<PalletsOriginOf<T>>,
+			admins: BranchAdmins<AccountIdLookupOf<T>>,
 			config: BranchConfig<BalanceOf<T>>,
 		) -> DispatchResult {
 			let depositor = T::CreateOrigin::ensure_origin(origin, &stable_id)?;
+			let admins = admins.try_map(T::Lookup::lookup)?;
 			Self::do_create_branch(collateral_id, stable_id, admins, config, depositor)
 		}
 
@@ -995,16 +992,28 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			update: BranchConfigUpdate<BalanceOf<T>>,
 		) -> DispatchResult {
-			Self::do_set_param(origin, collateral_id, stable_id, update)
+			let who = ensure_signed(origin)?;
+			let level = Self::ensure_branch_admin(
+				&who,
+				&collateral_id,
+				&stable_id,
+				update.required_level(),
+			)?;
+			Self::do_set_param(collateral_id, stable_id, update, level)
 		}
 
 		/// Set (`true`) or clear (`false`) the governance-induced `Frozen`
 		/// state. Freezing is a defensive override: either admin tier may
-		/// issue it, and so may [`Config::GlobalManagerOrigin`] as the
+		/// issue it, and so may [`Config::ForceOrigin`] as the
 		/// governance kill switch that bypasses the market's admins.
 		/// Unfreezing is `Full`-admin only. No-op when the market is already
 		/// frozen (any reason) on freeze, or not governance-frozen on clear;
 		/// oracle-induced freezes are cleared with `refresh_branch`.
+		///
+		/// Only one frozen reason is stored: a freeze issued while the market
+		/// is oracle-frozen records nothing, so once `refresh_branch` clears
+		/// the oracle freeze the market runs again — re-issue the governance
+		/// freeze after oracle recovery if the intent stands.
 		#[pallet::call_index(12)]
 		#[pallet::weight(T::WeightInfo::set_governance_frozen())]
 		pub fn set_governance_frozen(
@@ -1014,14 +1023,15 @@ pub mod pallet {
 			frozen: bool,
 		) -> DispatchResult {
 			if frozen {
-				Self::ensure_branch_admin_or_manager(
+				Self::ensure_force_or_branch_admin(
 					origin,
 					&collateral_id,
 					&stable_id,
 					AdminLevel::Emergency,
 				)?;
 			} else {
-				Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
+				let who = ensure_signed(origin)?;
+				Self::ensure_branch_admin(&who, &collateral_id, &stable_id, AdminLevel::Full)?;
 			}
 			Self::do_set_governance_frozen(&collateral_id, &stable_id, frozen)
 		}
@@ -1040,7 +1050,7 @@ pub mod pallet {
 			Self::do_refresh_branch(&collateral_id, &stable_id)
 		}
 
-		/// Full-admin (or [`Config::GlobalManagerOrigin`], bypassing the market's
+		/// Full-admin (or [`Config::ForceOrigin`], bypassing the market's
 		/// admins): remove an empty market, refunding the creation deposit and
 		/// releasing both assets' role references.
 		#[pallet::call_index(14)]
@@ -1050,7 +1060,7 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 		) -> DispatchResult {
-			Self::ensure_branch_admin_or_manager(
+			Self::ensure_force_or_branch_admin(
 				origin,
 				&collateral_id,
 				&stable_id,
@@ -1059,7 +1069,7 @@ pub mod pallet {
 			Self::do_remove_branch(collateral_id, stable_id)
 		}
 
-		/// Full-admin (or [`Config::GlobalManagerOrigin`], bypassing the market's
+		/// Full-admin (or [`Config::ForceOrigin`], bypassing the market's
 		/// admins): reassign the market's admins.
 		#[pallet::call_index(15)]
 		#[pallet::weight(T::WeightInfo::set_branch_admins())]
@@ -1067,9 +1077,16 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			admins: BranchAdmins<PalletsOriginOf<T>>,
+			admins: BranchAdmins<AccountIdLookupOf<T>>,
 		) -> DispatchResult {
-			Self::do_set_branch_admins(origin, collateral_id, stable_id, admins)
+			Self::ensure_force_or_branch_admin(
+				origin,
+				&collateral_id,
+				&stable_id,
+				AdminLevel::Full,
+			)?;
+			let admins = admins.try_map(T::Lookup::lookup)?;
+			Self::do_set_branch_admins(collateral_id, stable_id, admins)
 		}
 
 		/// Permissionless: revive a `Dormant` vault whose fully-accrued debt is
@@ -1099,14 +1116,8 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			ceiling: BalanceOf<T>,
 		) -> DispatchResult {
-			T::GlobalManagerOrigin::ensure_origin(origin)?;
-			CollateralRisks::<T>::mutate_exists(&collateral_id, |maybe| {
-				let mut risk = maybe.take().unwrap_or_default();
-				risk.debt_ceiling = ceiling;
-				*maybe = (risk != Default::default()).then_some(risk);
-			});
-			Self::deposit_event(Event::GlobalDebtCeilingSet { collateral_id, ceiling });
-			Ok(())
+			T::ForceOrigin::ensure_origin(origin)?;
+			Self::do_set_global_debt_ceiling(collateral_id, ceiling)
 		}
 
 		/// Permissionless: advance a market's autoline ceiling. Increases are gated

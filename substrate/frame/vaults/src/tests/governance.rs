@@ -1,5 +1,5 @@
 use crate::{mock::*, pallet::Vaults, tests::rate_pct, types::BranchConfigUpdate};
-use frame::traits::fungibles::Mutate as FungiblesMutate;
+use frame::traits::{fungibles::Mutate as FungiblesMutate, BadOrigin};
 
 /// Replacement admins used by the reassignment test.
 const NEW_FULL_ADMIN: AccountId = 200;
@@ -220,8 +220,8 @@ fn set_branch_admins_reassigns_authority() {
 			branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
 		));
 		let info = crate::pallet::Branches::<Test>::get(DOT, PUSD).expect("admins stored");
-		assert_eq!(info.admins.full_admin, admin_caller(NEW_FULL_ADMIN));
-		assert_eq!(info.admins.emergency_admin, admin_caller(NEW_EMERGENCY_ADMIN));
+		assert_eq!(info.admins.full_admin, NEW_FULL_ADMIN);
+		assert_eq!(info.admins.emergency_admin, NEW_EMERGENCY_ADMIN);
 
 		// The old full admin can no longer act; the new one can.
 		assert_noop!(
@@ -241,7 +241,7 @@ fn set_branch_admins_reassigns_authority() {
 // Governance can replace an unreachable full admin and restore ordinary
 // per-market administration.
 #[test]
-fn global_manager_can_reassign_branch_admins() {
+fn force_origin_can_reassign_branch_admins() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(Pallet::<Test>::set_branch_admins(
@@ -252,8 +252,8 @@ fn global_manager_can_reassign_branch_admins() {
 		));
 
 		let info = crate::pallet::Branches::<Test>::get(DOT, PUSD).expect("admins stored");
-		assert_eq!(info.admins.full_admin, admin_caller(NEW_FULL_ADMIN));
-		assert_eq!(info.admins.emergency_admin, admin_caller(NEW_EMERGENCY_ADMIN));
+		assert_eq!(info.admins.full_admin, NEW_FULL_ADMIN);
+		assert_eq!(info.admins.emergency_admin, NEW_EMERGENCY_ADMIN);
 		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(NEW_FULL_ADMIN),
 			DOT,
@@ -278,7 +278,7 @@ fn emergency_admin_can_freeze() {
 	});
 }
 
-// The global manager origin freezes any market through the same extrinsic the
+// The force origin freezes any market through the same extrinsic the
 // admins use, bypassing them.
 #[test]
 fn governance_can_freeze_bypassing_admins() {
@@ -290,16 +290,28 @@ fn governance_can_freeze_bypassing_admins() {
 	});
 }
 
-// The kill switch is freeze-only: clearing a governance freeze needs the
-// market's Full admin, not the global manager.
+// ForceOrigin is not implicitly a branch admin: branch-admin-only parameter
+// updates and unfreezing reject it as a non-signed origin.
 #[test]
-fn governance_cannot_unfreeze() {
+fn force_origin_gets_bad_origin_on_branch_admin_only_calls() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
+		assert_noop!(
+			Pallet::<Test>::set_param(
+				RuntimeOrigin::root(),
+				DOT,
+				PUSD,
+				BranchConfigUpdate::MinimumDebt(200)
+			),
+			BadOrigin
+		);
+
+		// The force origin may set the kill switch, but only the branch's full
+		// admin may clear it.
 		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
 		assert_noop!(
 			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, false),
-			Error::<Test>::NotBranchAdmin
+			BadOrigin
 		);
 		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
@@ -338,7 +350,7 @@ fn redistribution_account_provider_reference_is_paired() {
 	});
 }
 
-// A signer who is neither a branch admin nor the global manager can neither
+// A signer who is neither a branch admin nor the force origin can neither
 // freeze nor remove.
 #[test]
 fn freeze_and_remove_reject_unauthorized_signers() {

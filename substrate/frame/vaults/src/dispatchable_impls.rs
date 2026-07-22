@@ -1,8 +1,8 @@
 use crate::{
 	context::{BranchOp, VaultOp},
 	pallet::{
-		AssetRoles, BalanceOf, Branches, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
-		PalletsOriginOf, StableIdOf, Vaults,
+		AssetRoles, BalanceOf, Branches, CollateralIdOf, CollateralRisks, Config, Error, Event,
+		HoldReason, Pallet, StableIdOf, Vaults,
 	},
 	types::{
 		AdminLevel, AssetRole, AssetRoleUsage, BranchAdmins, BranchConfig, BranchConfigUpdate,
@@ -389,7 +389,7 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn do_create_branch(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
-		admins: BranchAdmins<PalletsOriginOf<T>>,
+		admins: BranchAdmins<T::AccountId>,
 		config: BranchConfig<BalanceOf<T>>,
 		depositor: Option<T::AccountId>,
 	) -> Result<(), DispatchError> {
@@ -473,15 +473,13 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Reassign a market's admins. The global manager bypass lets governance
-	/// recover a market whose full-admin origin is no longer reachable.
+	/// Reassign a market's admins after the dispatchable has authorized and
+	/// resolved the new accounts.
 	pub(crate) fn do_set_branch_admins(
-		origin: OriginFor<T>,
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
-		admins: BranchAdmins<PalletsOriginOf<T>>,
+		admins: BranchAdmins<T::AccountId>,
 	) -> Result<(), DispatchError> {
-		Self::ensure_branch_admin_or_manager(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
 		Branches::<T>::try_mutate_exists(
 			&collateral_id,
 			&stable_id,
@@ -492,7 +490,7 @@ impl<T: Config> Pallet<T> {
 			},
 		)?;
 		let BranchAdmins { full_admin, emergency_admin } = admins;
-		Self::deposit_event(Event::BranchAdminChanged {
+		Self::deposit_event(Event::BranchAdminsChanged {
 			collateral_id,
 			stable_id,
 			full_admin,
@@ -501,23 +499,21 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Authorize, validate, and apply a single-field config update, emitting
-	/// `ParameterUpdated`. The required admin tier, the `Emergency`-only "must be
-	/// defensive" rule, and the governance-envelope check are all derived from the
-	/// `update` itself ([`BranchConfigUpdate::required_level`] /
-	/// [`BranchConfigUpdate::is_defensive`] and
-	/// [`crate::types::BranchConfigGuard::permits`]), so the `set_param`
-	/// dispatchable is a thin wrapper over this one path. The whole post-update
-	/// config is re-validated through the same `permits` gate `create_branch`
-	/// applies, keeping envelope enforcement in a single place.
+	/// Validate and apply an authorized single-field config update, emitting
+	/// `ParameterUpdated`. The `Emergency`-only "must be defensive" rule and the
+	/// governance-envelope check are derived from the update itself
+	/// ([`BranchConfigUpdate::is_defensive`] and
+	/// [`crate::types::BranchConfigGuard::permits`]). The whole post-update config
+	/// is re-validated through the same `permits` gate `create_branch` applies.
+	/// `level` must be the acting caller's tier as returned by
+	/// [`Pallet::ensure_branch_admin`]; passing `Full` by hand skips the
+	/// defensive-direction rule.
 	pub(crate) fn do_set_param(
-		origin: OriginFor<T>,
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 		update: BranchConfigUpdate<BalanceOf<T>>,
+		level: AdminLevel,
 	) -> Result<(), DispatchError> {
-		let level =
-			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, update.required_level())?;
 		let guard = T::BranchConfigGuard::get();
 		Branches::<T>::try_mutate_exists(
 			&collateral_id,
@@ -555,6 +551,23 @@ impl<T: Config> Pallet<T> {
 			},
 			_ => Ok(()),
 		}
+	}
+
+	/// Set the per-collateral global debt ceiling. The record is pruned when it
+	/// is all-default so an untouched collateral stays absent from storage.
+	pub(crate) fn do_set_global_debt_ceiling(
+		collateral_id: CollateralIdOf<T>,
+		ceiling: BalanceOf<T>,
+	) -> Result<(), DispatchError> {
+		CollateralRisks::<T>::mutate_exists(&collateral_id, |maybe| {
+			let risk = maybe.get_or_insert_default();
+			risk.debt_ceiling = ceiling;
+			if risk.is_empty() {
+				maybe.take();
+			}
+		});
+		Self::deposit_event(Event::GlobalDebtCeilingSet { collateral_id, ceiling });
+		Ok(())
 	}
 
 	/// Move the market's persisted frozen flag to `target`, emitting one
