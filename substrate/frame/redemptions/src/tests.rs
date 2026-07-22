@@ -102,7 +102,7 @@ fn redeem_frozen_branch_reverts() {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		mint_stable(PUSD, 3, 1_000);
-		assert_ok!(Vaults::enable_frozen_mode(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, PUSD, true));
 		// Frozen-mode enforcement lives vault-side: the first `redeem_step`
 		// rejects the frozen branch and the whole redemption rolls back.
 		assert_noop!(
@@ -478,7 +478,7 @@ fn dormant_target_is_redeemed_before_rate_index() {
 		assert_ok!(redeem(3, DOT, PUSD, 360, 0, 4, 0));
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
 		assert_eq!(
-			pallet_vaults::Branches::<Test>::get((DOT, PUSD))
+			pallet_vaults::Branches::<Test>::get(DOT, PUSD)
 				.unwrap()
 				.state
 				.dormant_redemption_target,
@@ -1140,7 +1140,7 @@ fn vault_interest_time(who: AccountId) -> Moment {
 
 /// The interest-clock value a `(DOT, PUSD)` poke at `now` writes onto a touched vault.
 fn branch_interest_time(now: Moment) -> Moment {
-	pallet_vaults::Branches::<Test>::get((DOT, PUSD))
+	pallet_vaults::Branches::<Test>::get(DOT, PUSD)
 		.expect("branch")
 		.state
 		.interest_time(now)
@@ -1512,7 +1512,7 @@ fn recovery_offset_frozen_branch_reverts() {
 		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
 		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
 		mint_stable(PUSD, 3, 1_000);
-		assert_ok!(Vaults::enable_frozen_mode(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, PUSD, true));
 
 		// Frozen-mode enforcement lives vault-side: the head is still queued,
 		// so both paths reach `redeem_step` and are rejected there.
