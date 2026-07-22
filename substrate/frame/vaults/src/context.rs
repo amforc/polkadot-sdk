@@ -226,6 +226,20 @@ impl<T: Config> BranchOp<T> {
 		Ok(upfront_fee)
 	}
 
+	fn apply_checked_rate_change(
+		&mut self,
+		vault: &mut Vault<BalanceOf<T>>,
+		new_rate: FixedU128,
+	) -> Result<Option<BalanceOf<T>>, DispatchError> {
+		if vault.annual_rate == new_rate {
+			return Ok(None);
+		}
+		let config = &self.branch.config;
+		let state = &mut self.branch.state;
+		Pallet::<T>::validate_rate(config, new_rate)?;
+		Ok(Some(Pallet::<T>::apply_rate_change(state, config, vault, new_rate, self.now)))
+	}
+
 	/// Charge `owner` the upfront fee: the event is deposited now (reverted
 	/// with the dispatch on error), the mint is deferred until commit so pUSD
 	/// is only issued when the branch state is actually written.
@@ -486,14 +500,10 @@ impl<T: Config> VaultOp<T> {
 	) -> Result<bool, DispatchError> {
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
 		let old_rate = self.vault.annual_rate;
-		if old_rate == new_rate {
+		let Some(upfront_fee) = self.ctx.apply_checked_rate_change(&mut self.vault, new_rate)?
+		else {
 			return Ok(false);
-		}
-		let config = &self.ctx.branch.config;
-		let state = &mut self.ctx.branch.state;
-		Pallet::<T>::validate_rate(config, new_rate)?;
-		let upfront_fee =
-			Pallet::<T>::apply_rate_change(state, config, &mut self.vault, new_rate, self.ctx.now);
+		};
 		self.ctx.charge_upfront_fee(&self.owner, upfront_fee);
 		self.reindex(hint)?;
 		Pallet::<T>::deposit_event(Event::BorrowRateChanged {
