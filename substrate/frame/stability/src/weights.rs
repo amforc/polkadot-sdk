@@ -8,7 +8,6 @@ use frame::prelude::Weight;
 /// Weight functions needed for `pallet_stability`.
 pub trait WeightInfo {
 	fn deposit() -> Weight;
-	fn activate_deposit() -> Weight;
 	fn request_withdraw() -> Weight;
 	fn withdraw() -> Weight;
 	fn claim_collateral() -> Weight;
@@ -17,14 +16,11 @@ pub trait WeightInfo {
 	fn offset_recovery() -> Weight;
 	fn poke_deposit() -> Weight;
 	fn set_stability_pool_config() -> Weight;
+	fn on_idle_one_deposit() -> Weight;
 }
 
 impl WeightInfo for () {
 	fn deposit() -> Weight {
-		Weight::zero()
-	}
-
-	fn activate_deposit() -> Weight {
 		Weight::zero()
 	}
 
@@ -57,6 +53,10 @@ impl WeightInfo for () {
 	}
 
 	fn set_stability_pool_config() -> Weight {
+		Weight::zero()
+	}
+
+	fn on_idle_one_deposit() -> Weight {
 		Weight::zero()
 	}
 }

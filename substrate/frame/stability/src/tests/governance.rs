@@ -34,6 +34,10 @@ fn branch_registration_seeds_pool_rows() {
 		assert_eq!(config, default_pool_config());
 
 		// The provider reference keeps the pool account alive without ED.
+		// Registration spam is not this pallet's concern: rows only appear
+		// through vaults' `create_branch`, which gates on `CreateOrigin` (the
+		// stable asset's owner) and takes a held creation deposit
+		// (`Consideration`), pricing the storage.
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert!(providers(pool) >= 1);
 	});
@@ -85,7 +89,11 @@ fn branch_removal_blocked_while_fifo_nodes_exist() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		// An orphan FIFO node without a deposit row is only reachable through
-		// a bug elsewhere; teardown must still refuse to strand it.
+		// a bug elsewhere; teardown must still refuse to strand it. There is
+		// deliberately no remediation extrinsic: the rows↔FIFO bijection is a
+		// try-state invariant, backstop walks stop on divergence instead of
+		// looping, and an actual occurrence is a bug to fix by storage
+		// migration, not to paper over at runtime.
 		let fifo = pending::list_id::<Test>(&DOT, &PUSD);
 		assert_ok!(pending::append::<Test>(&fifo, 5));
 
@@ -112,6 +120,78 @@ fn branch_removal_tears_down_pool_rows() {
 		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
 		assert!(!crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 0u32, 0u32)));
 		assert_eq!(providers(pool), providers_before - 1);
+		// A never-used pool holds no dust; the zero-dust path stays silent.
+		assert!(!System::events().iter().any(|record| matches!(
+			record.event,
+			RuntimeEvent::Stability(crate::Event::DustSwept { .. })
+		)));
+	});
+}
+
+#[test]
+fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		let pool = Stability::pool_account(&DOT, &PUSD);
+
+		// Two 150-deposits, then amounts indivisible by the two-way split so
+		// per-row flooring strands residue in the pool aggregates.
+		mint_stable(PUSD, 1, 150);
+		mint_stable(PUSD, 2, 150);
+		assert_ok!(deposit(1, DOT, PUSD, 150));
+		assert_ok!(deposit(2, DOT, PUSD, 150));
+		activate_all(&[1, 2]);
+		let leftover = distribute_yield(DOT, PUSD, 101);
+		assert_eq!(leftover.peek(), 0);
+		drop(leftover);
+		let (debt_cancelled, remainder) = simulate_offset(DOT, PUSD, 100, 101);
+		assert_eq!(debt_cancelled, 100);
+		assert_eq!(remainder, 0);
+
+		// Empty every depositor row: full withdrawal plus both claims prune it.
+		for who in [1u128, 2u128] {
+			assert_ok!(withdraw(who, DOT, PUSD, 1_000, who));
+			assert_ok!(claim_collateral(who, DOT, PUSD, who));
+			assert_ok!(claim_yield(who, DOT, PUSD, who));
+			assert!(deposit_row(DOT, PUSD, who).is_none());
+		}
+
+		// The exact residue is accumulator flooring detail; the property under
+		// test is conservation, so snapshot it and require the scenario to
+		// have actually stranded value on both assets.
+		let stable_dust = stable_balance(PUSD, pool);
+		let collateral_dust = collateral_balance(DOT, pool);
+		assert!(stable_dust > 0);
+		assert!(collateral_dust > 0);
+
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
+
+		// The sweep moved every stranded unit to the dust destination.
+		assert_eq!(stable_balance(PUSD, pool), 0);
+		assert_eq!(collateral_balance(DOT, pool), 0);
+		assert_eq!(stable_balance(PUSD, DUST_DEST), stable_dust);
+		assert_eq!(collateral_balance(DOT, DUST_DEST), collateral_dust);
+		System::assert_has_event(
+			crate::Event::DustSwept {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				stable_amount: stable_dust,
+				collateral_amount: collateral_dust,
+			}
+			.into(),
+		);
+
+		// Re-registering the same pair starts from a genuinely clean slate:
+		// zero tracked totals against a zero-balance pool account, so the
+		// balance↔totals equality (try_state, run on exit) holds again.
+		register_branch(DOT, PUSD, default_branch_config());
+		let state = pool_state(DOT, PUSD);
+		assert_eq!(state.total_active_deposits, 0);
+		assert_eq!(state.total_pending_deposits, 0);
+		assert_eq!(state.total_yield_unclaimed, 0);
+		assert_eq!(state.total_collateral_gains_unclaimed, 0);
+		assert_eq!(stable_balance(PUSD, pool), 0);
+		assert_eq!(collateral_balance(DOT, pool), 0);
 	});
 }
 
@@ -233,8 +313,10 @@ fn pool_accounts_are_distinct_across_markets_and_pallets() {
 		assert_ne!(dot_pusd, token_usdx);
 		assert_ne!(dot_pusd, dot_usdx);
 		assert_ne!(token_usdx, dot_usdx);
-		// Distinct from vaults' sub-account for the same market: the two
-		// pallets must never share a balance.
+		// Distinct from vaults' sub-account for the same market — the
+		// redistribution account, which parks the collateral and debt shares
+		// a liquidation redistributes onto surviving vaults. The two pallets
+		// must never share a balance.
 		assert_ne!(dot_pusd, Vaults::redistribution_account(&DOT, &PUSD));
 	});
 }
