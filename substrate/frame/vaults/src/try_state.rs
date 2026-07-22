@@ -18,7 +18,7 @@ use frame::{
 	traits::{fungibles::InspectHold, Convert, Time},
 	try_runtime::TryRuntimeError,
 };
-use pallet_linked_list::SortedListInterface;
+use linked_list_interface::SortedListInterface;
 
 pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	let now = T::TimeProvider::now();

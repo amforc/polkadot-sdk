@@ -10,7 +10,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 use frame::prelude::*;
-use pallet_linked_list::{fifo_append, SortedListInterface};
+use linked_list_interface::{fifo_append, SortedListInterface};
 
 /// The per-branch FIFO list id.
 pub(crate) fn list_id<T: Config>(
