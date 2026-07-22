@@ -1,3 +1,20 @@
+//! # Redemptions Pallet
+//!
+//! Exchanges stable assets for collateral from the lowest-rate eligible vaults.
+//!
+//! ## Pallet API
+//!
+//! See the [`pallet`] module for the pallet's configuration, calls, storage, events, and errors.
+//!
+//! ## Overview
+//!
+//! Redemptions are executed against the ordering and vault state owned by `pallet-vaults`. Ordinary
+//! redemptions walk dormant and active vaults, charge a market fee, and burn the redeemed stable
+//! asset. Final-recovery vaults are settled first using recovery pricing and insurance cover.
+//!
+//! Each market stores its own redemption configuration and dynamic fee state. Market lifecycle is
+//! synchronized through [`pusd_primitives::OnBranchLifecycle`].
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -9,12 +26,17 @@ pub mod weights;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
 
+#[cfg(feature = "try-runtime")]
+mod try_state;
+
 #[cfg(test)]
 mod mock;
+
 #[cfg(test)]
 mod tests;
 
 pub use pallet::*;
+pub use pusd_primitives;
 pub use types::{
 	RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, RedemptionPreview,
 	RedemptionPreviewStep, RedemptionState,
@@ -22,6 +44,15 @@ pub use types::{
 pub use weights::WeightInfo;
 
 pub(crate) const LOG_TARGET: &str = "runtime::redemptions";
+
+/// Runtime-supplied benchmark setup.
+///
+/// Redemptions delegates setup because the pallet cannot create markets or vaults itself.
+#[cfg(feature = "runtime-benchmarks")]
+pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
+	/// Creates a market with `vaults` redeemable vaults and funds a redeemer.
+	fn setup_redeemable_branch(vaults: u32) -> (CollateralId, StableId, AccountId, Balance);
+}
 
 #[frame::pallet]
 pub mod pallet {
@@ -33,25 +64,22 @@ pub mod pallet {
 			RecoveryRegime as Regime, RecoveryStep, RedemptionConfig, RedemptionPreamble,
 			RedemptionPreview, RedemptionPreviewStep, RedemptionState, StepAction, StepOutcome,
 		},
-		weights::WeightInfo,
 	};
 	use alloc::vec::Vec;
 	use frame::{
 		deps::{
-			frame_support::{
-				storage::{with_transaction, TransactionOutcome},
-				traits::{
-					fungibles::{self, Balanced as FungiblesBalanced},
-					tokens::{Fortitude, Precision, Preservation},
-					EnsureOriginWithArg, OnUnbalanced, Time,
-				},
-			},
+			frame_support::storage::{with_transaction, TransactionOutcome},
 			sp_runtime::{
-				traits::{Convert, SaturatedConversion, Saturating, Zero},
+				traits::{Convert, Saturating, Zero},
 				FixedPointNumber, FixedU128,
 			},
 		},
 		prelude::*,
+		traits::{
+			fungibles::{self, Balanced as FungiblesBalanced},
+			tokens::{Fortitude, Precision, Preservation},
+			EnsureOriginWithArg, OnUnbalanced, Time,
+		},
 	};
 	use pusd_primitives::{
 		debit_preservation, recovery_pricing, reducible_debit, ProvidePrice,
@@ -59,23 +87,38 @@ pub mod pallet {
 		RedemptionStepSnapshot, VaultInterface,
 	};
 
+	/// Balance type used by stable assets and vault accounting.
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
 		<T as frame_system::Config>::AccountId,
 	>>::Balance;
 
-	pub type MomentOf<T> = <<T as Config>::TimeProvider as Time>::Moment;
+	/// Collateral identifier exposed by [`Config::Vaults`].
+	pub type CollateralIdOf<T> = <<T as Config>::Vaults as VaultInterface>::CollateralId;
 
+	/// Stable asset identifier exposed by [`Config::StableAssets`].
+	pub type StableIdOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
+		<T as frame_system::Config>::AccountId,
+	>>::AssetId;
+
+	/// UNIX time in milliseconds.
+	pub use pusd_primitives::Millis;
+
+	/// Stable-asset credit consumed by the pallet.
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
 
-	pub type RedemptionConfigOf<T> = RedemptionConfig<BalanceOf<T>, MomentOf<T>>;
+	/// Market redemption configuration used by the runtime.
+	pub type RedemptionConfigOf<T> = RedemptionConfig<BalanceOf<T>>;
 
+	/// Result returned by [`Pallet::preview_redeem`].
 	pub type RedemptionPreviewOf<T> =
 		RedemptionPreview<<T as frame_system::Config>::AccountId, BalanceOf<T>>;
 
+	/// One step returned by [`Pallet::preview_redeem`].
 	pub type RedemptionPreviewStepOf<T> =
 		RedemptionPreviewStep<<T as frame_system::Config>::AccountId, BalanceOf<T>>;
 
+	/// Vault snapshot used to price a redemption step.
 	pub type SnapshotOf<T> = RedemptionStepSnapshot<BalanceOf<T>>;
 
 	/// One priced step: the vault-facing settlement plus the loop-facing outcome it implies.
@@ -90,27 +133,20 @@ pub mod pallet {
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
-		/// The collateral asset a market borrows against; a market is one
-		/// `(collateral, stable)` pair.
-		type CollateralAssetId: Parameter + Member + Ord + MaxEncodedLen;
-
-		/// The stablecoin a market mints; redemptions burn it against collateral.
-		type StableAssetId: Parameter + Member + Ord + MaxEncodedLen;
-
-		/// Pricing math needs a fungibles balance type that can enter fixed-point
-		/// calculations without lossy adapters.
+		/// Multi-asset system used to inspect, withdraw, and burn stable assets.
 		type StableAssets: fungibles::Inspect<
 				Self::AccountId,
-				AssetId = Self::StableAssetId,
+				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance: FixedPointOperand,
 			> + FungiblesBalanced<Self::AccountId>;
 
-		type Oracle: ProvidePrice<AssetId = Self::CollateralAssetId>;
+		/// Provides the value of each collateral asset in stable units.
+		type Oracle: ProvidePrice<AssetId = CollateralIdOf<Self>>;
 
-		/// Vaults owns ordering and state so redemptions cannot fork a local queue.
+		/// Owns market state, vault ordering, and atomic settlement.
 		type Vaults: VaultInterface<
-			CollateralId = Self::CollateralAssetId,
-			StableId = Self::StableAssetId,
+			CollateralId: Parameter + Member + Ord + MaxEncodedLen,
+			StableId = StableIdOf<Self>,
 			AccountId = Self::AccountId,
 			Balance = BalanceOf<Self>,
 			StableCredit = StableCreditOf<Self>,
@@ -120,13 +156,13 @@ pub mod pallet {
 		/// Cover is read at settlement time — nothing is reserved per vault —
 		/// and per-stable accounts keep one coin's cover from settling another
 		/// coin's bad debt.
-		type InsuranceFundAccount: Convert<Self::StableAssetId, Self::AccountId>;
+		type InsuranceFundAccount: Convert<StableIdOf<Self>, Self::AccountId>;
 
 		/// Destination for redemption fees.
 		type FeeHandler: OnUnbalanced<StableCreditOf<Self>>;
 
-		/// Fee decay assumes this moment is expressed in milliseconds.
-		type TimeProvider: Time;
+		/// Provides UNIX time in milliseconds.
+		type TimeProvider: Time<Moment = Millis>;
 
 		/// Authorizes [`Pallet::set_redemption_config`] for the market given
 		/// as argument. Point this at the market's admin authority (e.g.
@@ -134,45 +170,53 @@ pub mod pallet {
 		/// with `EitherOf`.
 		type UpdateOrigin: EnsureOriginWithArg<
 			Self::RuntimeOrigin,
-			(Self::CollateralAssetId, Self::StableAssetId),
+			(CollateralIdOf<Self>, StableIdOf<Self>),
 			Success = (),
 		>;
 
+		/// Redemption configuration seeded when a market is registered.
 		type DefaultRedemptionConfig: Get<RedemptionConfigOf<Self>>;
 
+		/// Maximum number of vaults a redemption may visit.
 		#[pallet::constant]
 		type MaxRedemptionSteps: Get<u32>;
 
-		type WeightInfo: WeightInfo;
+		/// Weights for dispatchable calls.
+		type WeightInfo: weights::WeightInfo;
 
+		/// See [`crate::BenchmarkHelper`].
 		#[cfg(feature = "runtime-benchmarks")]
 		type BenchmarkHelper: crate::BenchmarkHelper<
-			Self::CollateralAssetId,
-			Self::StableAssetId,
+			CollateralIdOf<Self>,
+			StableIdOf<Self>,
 			Self::AccountId,
 			BalanceOf<Self>,
 		>;
 	}
 
+	/// Redemption parameters keyed by collateral and stable asset.
+	///
+	/// A row exists exactly while the corresponding Vaults market is registered.
 	#[pallet::storage]
 	pub type RedemptionConfigs<T: Config> = StorageDoubleMap<
 		_,
 		Twox64Concat,
-		T::CollateralAssetId,
+		CollateralIdOf<T>,
 		Twox64Concat,
-		T::StableAssetId,
+		StableIdOf<T>,
 		RedemptionConfigOf<T>,
 		OptionQuery,
 	>;
 
+	/// Dynamic redemption fee state keyed by collateral and stable asset.
 	#[pallet::storage]
 	pub type RedemptionStates<T: Config> = StorageDoubleMap<
 		_,
 		Twox64Concat,
-		T::CollateralAssetId,
+		CollateralIdOf<T>,
 		Twox64Concat,
-		T::StableAssetId,
-		RedemptionState<MomentOf<T>>,
+		StableIdOf<T>,
+		RedemptionState,
 		ValueQuery,
 	>;
 
@@ -181,35 +225,60 @@ pub mod pallet {
 	pub enum Event<T: Config> {
 		/// One or more ordinary (or dormant-target) vaults were redeemed.
 		OrdinaryRedemptionExecuted {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Account that paid the stable assets.
 			redeemer: T::AccountId,
+			/// Account that received collateral.
 			recipient: T::AccountId,
+			/// Stable assets burned against vault debt.
 			pusd_burned: BalanceOf<T>,
+			/// Collateral paid to the recipient.
 			collateral_out: BalanceOf<T>,
+			/// Stable-asset fee charged to the redeemer.
 			fee_pusd: BalanceOf<T>,
+			/// Number of vaults visited.
 			steps: u32,
 		},
 		/// A `FinalRecovery` vault was (partially) settled.
 		RecoveryRedemptionExecuted {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Account that paid the stable assets.
 			redeemer: T::AccountId,
+			/// Account that received collateral.
 			recipient: T::AccountId,
+			/// Owner of the settled vault.
 			vault_owner: T::AccountId,
+			/// Stable assets burned against vault debt.
 			pusd_burned: BalanceOf<T>,
+			/// Collateral paid to the recipient.
 			collateral_out: BalanceOf<T>,
+			/// Pricing regime applied to the settlement.
 			regime: RecoveryRegime,
 		},
 		/// The branch dynamic fee moved after an ordinary redemption.
 		RedemptionDynamicFeeUpdated {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Dynamic fee before the redemption.
 			old_dynamic_fee: FixedU128,
+			/// Dynamic fee after the redemption.
 			new_dynamic_fee: FixedU128,
 		},
 		/// Governance replaced a market's redemption config.
-		RedemptionConfigUpdated { collateral_id: T::CollateralAssetId, stable_id: T::StableAssetId },
+		RedemptionConfigUpdated {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+		},
 	}
 
 	#[pallet::error]
@@ -253,30 +322,47 @@ pub mod pallet {
 
 		#[cfg(feature = "try-runtime")]
 		fn try_state(_: BlockNumberFor<T>) -> Result<(), frame::try_runtime::TryRuntimeError> {
-			Self::do_try_state()
+			crate::try_state::do_try_state::<T>()
+		}
+	}
+
+	#[pallet::view_functions]
+	impl<T: Config> Pallet<T> {
+		/// Rolled back because preparing an accurate snapshot can touch vault state.
+		pub fn preview_redeem(
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			max_pusd_in: BalanceOf<T>,
+		) -> Option<RedemptionPreviewOf<T>> {
+			with_transaction(|| {
+				let preview = Self::simulate(&collateral_id, &stable_id, max_pusd_in);
+				TransactionOutcome::Rollback(Ok::<_, DispatchError>(preview))
+			})
+			.ok()
+			.flatten()
 		}
 	}
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// Swap up to `max_pusd_in` pUSD for collateral at face value, walking
-		/// redemption targets from the cheapest borrow rate upward.
+		/// Swaps up to `max_pusd_in` stable assets for collateral.
 		///
-		/// `max_steps` caps how many vaults the walk may touch; `0` means the
-		/// runtime's [`Config::MaxRedemptionSteps`] ceiling. Weight is charged
-		/// up front for the whole cap and refunded to the steps actually
-		/// taken, so a small redemption can bound the fee it must be able to
-		/// pre-pay, and a large one can bound how far past the cheapest
-		/// vaults it is willing to sweep.
+		/// ## Dispatch Origin
 		///
-		/// `min_collateral_out` is the redeemer's slippage floor; partial
-		/// fills scale it pro-rata to the pUSD actually spent.
+		/// Must be signed by the redeemer.
+		///
+		/// Redemption targets are visited from the cheapest borrow rate upward. `max_steps` caps
+		/// how many vaults the walk may touch; zero uses [`Config::MaxRedemptionSteps`]. Weight is
+		/// charged for the cap and refunded to the number of steps actually taken.
+		///
+		/// `min_collateral_out` is the redeemer's slippage floor. Partial fills scale it pro-rata
+		/// to the stable assets actually spent.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps)))]
 		pub fn redeem(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			max_pusd_in: BalanceOf<T>,
 			min_collateral_out: BalanceOf<T>,
 			recipient: T::AccountId,
@@ -295,12 +381,17 @@ pub mod pallet {
 			Ok(Some(T::WeightInfo::redeem(steps)).into())
 		}
 
+		/// Replaces a market's redemption configuration.
+		///
+		/// ## Dispatch Origin
+		///
+		/// Must satisfy [`Config::UpdateOrigin`] for the market.
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::set_redemption_config())]
 		pub fn set_redemption_config(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			config: RedemptionConfigOf<T>,
 		) -> DispatchResult {
 			T::UpdateOrigin::ensure_origin(origin, &(collateral_id.clone(), stable_id.clone()))?;
@@ -315,23 +406,6 @@ pub mod pallet {
 		}
 	}
 
-	#[pallet::view_functions]
-	impl<T: Config> Pallet<T> {
-		/// Rolled back because preparing an accurate snapshot can touch vault state.
-		pub fn preview_redeem(
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-			max_pusd_in: BalanceOf<T>,
-		) -> Option<RedemptionPreviewOf<T>> {
-			with_transaction(|| {
-				let preview = Self::simulate(&collateral_id, &stable_id, max_pusd_in);
-				TransactionOutcome::Rollback(Ok::<_, DispatchError>(preview))
-			})
-			.ok()
-			.flatten()
-		}
-	}
-
 	impl<T: Config> Pallet<T> {
 		/// `0` preserves the default "use the runtime ceiling" behavior.
 		pub(crate) fn effective_step_cap(max_steps: u32) -> u32 {
@@ -343,37 +417,14 @@ pub mod pallet {
 			}
 		}
 
-		#[cfg(feature = "try-runtime")]
-		pub(crate) fn do_try_state() -> Result<(), frame::try_runtime::TryRuntimeError> {
-			// Every write path validates before inserting; a stored config
-			// failing here means a path skipped the shared validation.
-			for (_collateral_id, _stable_id, config) in RedemptionConfigs::<T>::iter() {
-				if !config.is_valid() {
-					return Err("stored redemption config fails `is_valid`".into());
-				}
-			}
-			let now = T::TimeProvider::now();
-			for (collateral_id, stable_id, state) in RedemptionStates::<T>::iter() {
-				// Configs are the registration proxy (seeded on registration,
-				// removed on deregistration); fee state must never outlive them.
-				if !RedemptionConfigs::<T>::contains_key(&collateral_id, &stable_id) {
-					return Err("redemption fee state row without a config row".into());
-				}
-				if state.last_fee_operation > now {
-					return Err("`last_fee_operation` is ahead of now".into());
-				}
-			}
-			Ok(())
-		}
-
 		/// Config, price, and decayed-fee-rate setup shared by execution and
 		/// preview, so a new precondition or a fee-formula change cannot land in
 		/// one path without also reaching the other.
 		fn redemption_preamble(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			max_pusd_in: BalanceOf<T>,
-		) -> Result<RedemptionPreamble<BalanceOf<T>, MomentOf<T>>, Error<T>> {
+		) -> Result<RedemptionPreamble<BalanceOf<T>>, Error<T>> {
 			let config = RedemptionConfigs::<T>::get(collateral_id, stable_id)
 				.ok_or(Error::<T>::InvalidBranch)?;
 			ensure!(
@@ -392,8 +443,8 @@ pub mod pallet {
 
 		fn do_redeem(
 			redeemer: &T::AccountId,
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			max_pusd_in: BalanceOf<T>,
 			min_collateral_out: BalanceOf<T>,
 			recipient: &T::AccountId,
@@ -467,8 +518,8 @@ pub mod pallet {
 		/// budget re-visiting the same unredeemable prefix.
 		fn run_loop(
 			redeemer: &T::AccountId,
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			recipient: &T::AccountId,
 			price: FixedU128,
 			fee_rate: FixedU128,
@@ -520,7 +571,7 @@ pub mod pallet {
 		/// `redeem_step` closure. Returns the loop outcome plus the settlement for
 		/// the vault; a `None` settlement persists the touch without redeeming.
 		fn execute_step(
-			stable_id: &T::StableAssetId,
+			stable_id: &StableIdOf<T>,
 			redeemer: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
@@ -587,7 +638,7 @@ pub mod pallet {
 
 		/// Shared by execution and preview to keep recovery pricing identical.
 		fn price_recovery(
-			stable_id: &T::StableAssetId,
+			stable_id: &StableIdOf<T>,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
 			budget: BalanceOf<T>,
@@ -660,7 +711,7 @@ pub mod pallet {
 		/// caller to reprice its step at, once. A debit capped by the payer's
 		/// whole balance is a genuine shortfall, not a dead zone, and errors.
 		fn fundable_budget(
-			stable_id: &T::StableAssetId,
+			stable_id: &StableIdOf<T>,
 			payer: &T::AccountId,
 			need: BalanceOf<T>,
 		) -> Result<(BalanceOf<T>, Preservation), Error<T>> {
@@ -676,7 +727,7 @@ pub mod pallet {
 		}
 
 		fn recovery_decision(
-			stable_id: &T::StableAssetId,
+			stable_id: &StableIdOf<T>,
 			redeemer: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
@@ -714,7 +765,7 @@ pub mod pallet {
 		/// applying nothing — when there is nothing to cancel. The regime and the
 		/// residual-settlement decision both follow from the pricing variant.
 		fn fund_recovery(
-			stable_id: &T::StableAssetId,
+			stable_id: &StableIdOf<T>,
 			redeemer: &T::AccountId,
 			pricing: &RecoveryPricing<BalanceOf<T>>,
 			preservation: Preservation,
@@ -750,7 +801,7 @@ pub mod pallet {
 		/// by [`Self::fundable_budget`], return the debt payment to the vault step,
 		/// and route the rest as the fee.
 		fn fund_redemption(
-			stable_id: &T::StableAssetId,
+			stable_id: &StableIdOf<T>,
 			redeemer: &T::AccountId,
 			debt: BalanceOf<T>,
 			total_in: BalanceOf<T>,
@@ -775,7 +826,7 @@ pub mod pallet {
 		/// is intentionally unreserved, so pricing and settlement read the
 		/// live account.
 		fn insurance_fund_cover(
-			stable_id: &T::StableAssetId,
+			stable_id: &StableIdOf<T>,
 			shortfall: BalanceOf<T>,
 		) -> BalanceOf<T> {
 			reducible_debit::<T::StableAssets, _>(
@@ -788,8 +839,8 @@ pub mod pallet {
 
 		/// Healing verifies the vault residual and IF burn matched.
 		fn settle_residual_via_if(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			owner: &T::AccountId,
 		) -> Result<BalanceOf<T>, DispatchError> {
 			let residual = T::Vaults::settle_recovery_residual(collateral_id, stable_id, owner)
@@ -833,15 +884,15 @@ pub mod pallet {
 		#[allow(clippy::too_many_arguments)]
 		fn finalize(
 			redeemer: &T::AccountId,
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			recipient: &T::AccountId,
 			acc: &Accumulators<BalanceOf<T>, T::AccountId>,
 			steps: u32,
 			decayed: FixedU128,
 			branch_debt_before: BalanceOf<T>,
 			config: &RedemptionConfigOf<T>,
-			now: MomentOf<T>,
+			now: Millis,
 			old_dynamic_fee: FixedU128,
 		) {
 			if !acc.ordinary_debt.is_zero() {
@@ -894,12 +945,12 @@ pub mod pallet {
 		}
 
 		fn decayed_dynamic_fee(
-			state: &RedemptionState<MomentOf<T>>,
+			state: &RedemptionState,
 			config: &RedemptionConfigOf<T>,
-			now: MomentOf<T>,
+			now: Millis,
 		) -> FixedU128 {
-			let elapsed = now.saturating_sub(state.last_fee_operation).saturated_into::<u64>();
-			let period = config.dynamic_fee_decay_period.saturated_into::<u64>();
+			let elapsed = now.saturating_sub(state.last_fee_operation);
+			let period = config.dynamic_fee_decay_period;
 			fees::decay_dynamic_fee(state.dynamic_fee, elapsed, period)
 				.max(config.dynamic_fee_floor)
 				.min(config.dynamic_fee_ceiling)
@@ -907,8 +958,8 @@ pub mod pallet {
 
 		/// Mirrors execution pricing, but lets touched vault snapshots roll back.
 		fn simulate(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			max_pusd_in: BalanceOf<T>,
 		) -> Option<RedemptionPreviewOf<T>> {
 			let RedemptionPreamble { config, price, fee_rate, .. } =
@@ -944,8 +995,8 @@ pub mod pallet {
 
 		/// Mirrors loop barriers so previews cannot suggest an unreachable route.
 		fn simulate_walk(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			config: &RedemptionConfigOf<T>,
 			price: FixedU128,
 			rate: FixedU128,
@@ -1030,7 +1081,7 @@ pub mod pallet {
 		}
 
 		fn preview_recovery_step(
-			stable_id: &T::StableAssetId,
+			stable_id: &StableIdOf<T>,
 			config: &RedemptionConfigOf<T>,
 			owner: &T::AccountId,
 			snap: &SnapshotOf<T>,
@@ -1053,8 +1104,8 @@ pub mod pallet {
 		/// Config + oracle price for the recovery-offset paths. No fee state:
 		/// offsets are fee-free and leave the dynamic fee untouched.
 		fn offset_preamble(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 		) -> Result<(RedemptionConfigOf<T>, FixedU128), DispatchError> {
 			let config = RedemptionConfigs::<T>::get(collateral_id, stable_id)
 				.ok_or(Error::<T>::InvalidBranch)?;
@@ -1069,8 +1120,8 @@ pub mod pallet {
 		/// Prices through [`Self::price_recovery`], the same function that
 		/// prices recovery redemptions, so the two can never diverge.
 		fn quote_recovery_offset(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			max_debt_to_cancel: BalanceOf<T>,
 		) -> Result<RecoveryOffsetQuote<BalanceOf<T>>, DispatchError> {
 			// Target first, preamble second: the dominant path (no
@@ -1128,8 +1179,8 @@ pub mod pallet {
 		/// state changes. A view surface (like [`Pallet::preview_redeem`]),
 		/// not part of the [`RecoveryOffsetInterface`] execution seam.
 		pub fn preview_recovery_offset(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			max_debt_to_cancel: BalanceOf<T>,
 		) -> Result<RecoveryOffsetQuote<BalanceOf<T>>, DispatchError> {
 			with_transaction(|| {
@@ -1141,15 +1192,15 @@ pub mod pallet {
 	}
 
 	impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
-		type CollateralId = T::CollateralAssetId;
-		type StableId = T::StableAssetId;
+		type CollateralId = CollateralIdOf<T>;
+		type StableId = StableIdOf<T>;
 		type AccountId = T::AccountId;
 		type Balance = BalanceOf<T>;
 		type Credit = StableCreditOf<T>;
 
 		fn execute_recovery_offset(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			payment: StableCreditOf<T>,
 			collateral_recipient: &T::AccountId,
 		) -> Result<(RecoveryOffsetResult<BalanceOf<T>>, StableCreditOf<T>), DispatchError> {
@@ -1217,12 +1268,10 @@ pub mod pallet {
 		}
 	}
 
-	impl<T: Config> pusd_primitives::OnBranchLifecycle<T::CollateralAssetId, T::StableAssetId>
-		for Pallet<T>
-	{
+	impl<T: Config> pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
 		fn on_registered(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 		) -> DispatchResult {
 			let config = T::DefaultRedemptionConfig::get();
 			ensure!(config.is_valid(), Error::<T>::InvalidRedemptionConfig);
@@ -1231,17 +1280,12 @@ pub mod pallet {
 		}
 
 		fn on_deregistered(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 		) -> DispatchResult {
 			RedemptionConfigs::<T>::remove(collateral_id, stable_id);
 			RedemptionStates::<T>::remove(collateral_id, stable_id);
 			Ok(())
 		}
 	}
-}
-
-#[cfg(feature = "runtime-benchmarks")]
-pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
-	fn setup_redeemable_branch(vaults: u32) -> (CollateralId, StableId, AccountId, Balance);
 }
