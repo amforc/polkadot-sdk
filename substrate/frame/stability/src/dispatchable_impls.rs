@@ -1,16 +1,19 @@
 use crate::{
 	math,
 	pallet::{
-		BalanceOf, CollateralCreditOf, Config, DepositOf, Deposits, Error, Event, Pallet,
-		PoolStateOf, PoolSumsStore, Pools, StabilityPoolConfigOf, StabilityPoolOf, StableCreditOf,
+		ActivationCursor, BalanceOf, CollateralCreditOf, Config, DepositOf, Deposits, Error, Event,
+		Pallet, PoolStateOf, PoolSumsStore, Pools, StabilityPoolConfigOf, StabilityPoolOf,
+		StableCreditOf,
 	},
 	pending,
 	types::{
 		Accumulators, Deposit, DepositSnapshot, PUpdate, PendingDeposit, PendingOffsetResult,
 		PoolSums, RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
 	},
+	weights::WeightInfo,
 };
 use frame::{
+	deps::frame_support::{storage::with_storage_layer, weights::WeightMeter},
 	prelude::*,
 	traits::{
 		fungibles::{Balanced as _, Inspect as _, Mutate as _},
@@ -322,33 +325,10 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §6.7: explicit activation of a matured pending deposit.
-	pub(crate) fn do_activate_deposit(
-		who: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
-	) -> DispatchResult {
-		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
-		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
-		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
-			.ok_or(Error::<T>::DepositNotFound)?;
-		let pending = deposit.pending_deposit.as_ref().ok_or(Error::<T>::NoPendingDeposit)?;
-		let now = T::TimeProvider::now();
-		ensure!(now >= pending.activatable_at, Error::<T>::PendingDepositNotMatured);
-
-		Self::realize_and_activate(&collateral_id, &stable_id, &who, &mut pool, &mut deposit, now)?;
-		debug_assert!(deposit.pending_deposit.is_none());
-
-		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
-		Pools::<T>::insert(&collateral_id, &stable_id, pool);
-		Ok(())
-	}
-
-	/// SPEC.md §6.9: create or replace the caller's withdrawal request.
-	/// Recorded in every mode with `executable_at` stamped now — a request
-	/// made in Normal Mode therefore already satisfies the Safety delay if
-	/// the branch turns before execution. Normal-mode withdrawals never read
-	/// it, so recording is harmless there.
+	/// SPEC.md §6.9: create or replace the caller's Safety-Mode withdrawal
+	/// request, `executable_at` stamped `safety_withdrawal_delay` from now.
+	/// In Normal Mode a request has no purpose — the exit is immediate — so
+	/// the call forwards to [`Pallet::do_withdraw`] paying the caller.
 	pub(crate) fn do_request_withdraw(
 		who: T::AccountId,
 		collateral_id: T::CollateralAssetId,
@@ -356,10 +336,17 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
-		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
+		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
+		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
+		match mode {
+			BranchMode::Normal => {
+				return Self::do_withdraw(who.clone(), collateral_id, stable_id, amount, who);
+			},
+			BranchMode::Safety => {},
+			BranchMode::Frozen => return Err(Error::<T>::BranchFrozen.into()),
+		}
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
-		ensure!(!amount.is_zero(), Error::<T>::NoActiveDeposit);
 
 		let now = T::TimeProvider::now();
 		let activated = Self::realize_and_activate(
@@ -402,6 +389,7 @@ impl<T: Config> Pallet<T> {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
+		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 
 		let now = T::TimeProvider::now();
 		Self::realize_and_activate(&collateral_id, &stable_id, &who, &mut pool, &mut deposit, now)?;
@@ -1088,22 +1076,125 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Housekeeping (SPEC.md §8.2): permissionlessly realize `owner`'s
-	/// deposit without moving value. Deliberately does NOT activate a matured
-	/// pending deposit: pending capital is only the last-resort liquidation
-	/// backstop, and whether to expose it to ordinary offsets stays the
-	/// owner's call — a third party must not be able to force that right
-	/// before a liquidation.
+	/// deposit without moving value, and fold in a matured pending deposit.
+	/// Activation is automatic after the entry delay — the owner committed
+	/// risk capital at deposit time — so any caller may complete the move.
+	/// A frozen branch skips the activation (it changes offsettable risk,
+	/// which the freeze halts) but still realizes.
 	pub(crate) fn do_poke_deposit(
 		owner: T::AccountId,
 		collateral_id: T::CollateralAssetId,
 		stable_id: T::StableAssetId,
 	) -> DispatchResult {
-		let pool = Self::load_pool(&collateral_id, &stable_id)?;
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &owner))
 			.ok_or(Error::<T>::DepositNotFound)?;
 
 		Self::realize_deposit(&collateral_id, &stable_id, &pool, &mut deposit)?;
+		let activated = if Self::ensure_not_frozen(&collateral_id, &stable_id).is_ok() {
+			Self::activate_matured_pending(
+				&collateral_id,
+				&stable_id,
+				&owner,
+				&mut pool.state,
+				&mut deposit,
+				T::TimeProvider::now(),
+			)?
+		} else {
+			false
+		};
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &owner, deposit);
+		// Realization lives on the row; the pool row only changed if a
+		// pending deposit activated along the way.
+		if activated {
+			Pools::<T>::insert(&collateral_id, &stable_id, pool);
+		}
+		Ok(())
+	}
+
+	/// Best-effort activation of matured pending deposits with the block's
+	/// leftover weight. The flat cursor gives every row eventual service
+	/// without another maturity index; [`Pallet::do_poke_deposit`] remains the
+	/// deterministic path when blocks expose no idle budget.
+	pub(crate) fn on_idle_activation_walk(remaining: Weight) -> Weight {
+		Self::on_idle_activation_walk_with_weight(remaining, T::WeightInfo::on_idle_one_deposit())
+	}
+
+	/// Inner activation walk with its row weight made explicit so metering can
+	/// be tested independently of the runtime's weight provider.
+	pub(crate) fn on_idle_activation_walk_with_weight(
+		remaining: Weight,
+		per_row: Weight,
+	) -> Weight {
+		// A zero placeholder weight would make the meter unable to bound the
+		// walk. Disable automatic activation until the runtime supplies a real
+		// weight; permissionless pokes remain available.
+		if per_row == Weight::zero() {
+			return Weight::zero();
+		}
+		let mut meter = WeightMeter::with_limit(remaining);
+		// Reserve the worst-case row cost before reading the cursor or touching
+		// the iterator. The same unit also covers an end-of-map probe.
+		if meter.try_consume(per_row).is_err() {
+			return meter.consumed();
+		}
+
+		let mut iter = match ActivationCursor::<T>::get() {
+			Some((collateral_id, stable_id, owner)) => Deposits::<T>::iter_from(
+				Deposits::<T>::hashed_key_for((collateral_id, stable_id, owner)),
+			),
+			None => Deposits::<T>::iter(),
+		};
+		let now = T::TimeProvider::now();
+		let cursor = loop {
+			let Some((key, deposit)) = iter.next() else { break None };
+			let (collateral_id, stable_id, owner) = key;
+			// Hooks do not receive the dispatchable transaction layer. Keep one
+			// bad row from leaking a partial activation or stopping the walk.
+			let _ = with_storage_layer::<(), DispatchError, _>(|| {
+				Self::activate_idle_row(&collateral_id, &stable_id, &owner, deposit, now)
+			});
+			if meter.try_consume(per_row).is_err() {
+				break Some((collateral_id, stable_id, owner));
+			}
+		};
+		ActivationCursor::<T>::set(cursor);
+		meter.consumed()
+	}
+
+	/// Activate one row selected by the idle cursor when it is both mature
+	/// and unfrozen. Immature, active-only, and frozen rows are read-only
+	/// no-ops; the cursor still advances past them.
+	fn activate_idle_row(
+		collateral_id: &T::CollateralAssetId,
+		stable_id: &T::StableAssetId,
+		owner: &T::AccountId,
+		mut deposit: DepositOf<T>,
+		now: Millis,
+	) -> DispatchResult {
+		let Some(pending) = deposit.pending_deposit.as_ref() else {
+			return Ok(());
+		};
+		if now < pending.activatable_at {
+			return Ok(());
+		}
+		let mut pool = Self::load_pool(collateral_id, stable_id)?;
+		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
+			return Ok(());
+		}
+
+		Self::realize_deposit(collateral_id, stable_id, &pool, &mut deposit)?;
+		let activated = Self::activate_matured_pending(
+			collateral_id,
+			stable_id,
+			owner,
+			&mut pool.state,
+			&mut deposit,
+			now,
+		)?;
+		debug_assert!(activated, "maturity checked above; activation must occur");
+		Self::store_or_prune_deposit(collateral_id, stable_id, owner, deposit);
+		Pools::<T>::insert(collateral_id, stable_id, pool);
 		Ok(())
 	}
 

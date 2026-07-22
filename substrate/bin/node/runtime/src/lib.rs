@@ -3553,6 +3553,8 @@ impl pallet_stability::Config for Runtime {
 	type TimeProvider = Timestamp;
 	type BranchModes = Vaults;
 	type RecoveryOffsets = Redemptions;
+	type StableDustHandler = ResolveAssetTo<TreasuryAccount, Assets>;
+	type CollateralDustHandler = ResolveAssetTo<TreasuryAccount, StabilityCollateral>;
 	type PendingLists = LinkedList;
 	type UpdateOrigin = EitherOf<
 		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
