@@ -575,3 +575,34 @@ fn remove_branch_rejected_while_collateral_remains() {
 		assert!(!market_exists(DOT, PUSD));
 	});
 }
+
+#[test]
+fn ensure_branch_full_admin_authorizes_only_the_full_admin() {
+	use crate::EnsureBranchFullAdmin;
+	use frame::traits::EnsureOriginWithArg;
+
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		let market = (DOT, PUSD);
+		assert_ok!(EnsureBranchFullAdmin::<Test>::try_origin(
+			RuntimeOrigin::signed(ADMIN),
+			&market
+		));
+		// The full admin authorizes exactly one market; everything below is rejected.
+		assert!(EnsureBranchFullAdmin::<Test>::try_origin(
+			RuntimeOrigin::signed(EMERGENCY_ADMIN),
+			&market
+		)
+		.is_err());
+		assert!(
+			EnsureBranchFullAdmin::<Test>::try_origin(RuntimeOrigin::signed(1), &market).is_err()
+		);
+		assert!(EnsureBranchFullAdmin::<Test>::try_origin(RuntimeOrigin::root(), &market).is_err());
+		// An unregistered market has no admin, so even the admin account fails.
+		assert!(EnsureBranchFullAdmin::<Test>::try_origin(
+			RuntimeOrigin::signed(ADMIN),
+			&(ETH, PUSD)
+		)
+		.is_err());
+	});
+}
