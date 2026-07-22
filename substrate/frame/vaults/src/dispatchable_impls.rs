@@ -239,7 +239,6 @@ impl<T: Config> Pallet<T> {
 		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
 		let price = op.price()?;
 		let op = op.touch(&owner)?;
-		ensure!(op.vault().debt.total().is_zero(), Error::<T>::DebtOutstanding);
 
 		Self::close_inner(op, &recipient, price)
 	}
@@ -280,7 +279,7 @@ impl<T: Config> Pallet<T> {
 		});
 		// A branch-emptying close is a settlement: it may worsen TCR.
 		if branch_empties {
-			op.remove_settlement(price)
+			op.remove_settlement()
 		} else {
 			op.remove_checked(price)
 		}
