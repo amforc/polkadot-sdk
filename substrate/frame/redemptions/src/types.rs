@@ -68,61 +68,64 @@ impl<Balance: Zero> RedemptionConfig<Balance> {
 	}
 }
 
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RedemptionState {
 	pub dynamic_fee: FixedU128,
 	pub last_fee_operation: Millis,
 }
 
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecoveryRegime {
 	RecoveryBonus,
 	InsuranceAdjusted,
 }
 
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct RedemptionPreviewStep<AccountId, Balance> {
 	pub target: AccountId,
 	pub status: VaultStatus,
 	pub debt_cancellable: Balance,
 	pub collateral_out: Balance,
 	pub fee_pusd: Balance,
-	pub pusd_in: Balance,
 }
 
-#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
+impl<AccountId, Balance: Saturating + Copy> RedemptionPreviewStep<AccountId, Balance> {
+	pub fn stable_in(&self) -> Balance {
+		self.debt_cancellable.saturating_add(self.fee_pusd)
+	}
+}
+
+#[derive(Encode, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct RedemptionPreview<AccountId, Balance> {
 	pub steps_detail: Vec<RedemptionPreviewStep<AccountId, Balance>>,
-	pub total_pusd_in: Balance,
-	pub total_collateral_out: Balance,
-	pub total_fee_pusd: Balance,
 	pub steps: u32,
 	pub truncated: bool,
+}
+
+impl<AccountId, Balance: Saturating + Zero + Copy> RedemptionPreview<AccountId, Balance> {
+	/// Total stable the previewed redemption consumes, debt and fees combined.
+	pub fn total_stable_in(&self) -> Balance {
+		self.fold_steps(RedemptionPreviewStep::stable_in)
+	}
+
+	/// Total collateral the previewed redemption pays out.
+	pub fn total_collateral_out(&self) -> Balance {
+		self.fold_steps(|step| step.collateral_out)
+	}
+
+	/// Total fee the previewed redemption charges.
+	pub fn total_fee(&self) -> Balance {
+		self.fold_steps(|step| step.fee_pusd)
+	}
+
+	fn fold_steps(
+		&self,
+		figure: impl Fn(&RedemptionPreviewStep<AccountId, Balance>) -> Balance,
+	) -> Balance {
+		self.steps_detail
+			.iter()
+			.fold(Balance::zero(), |total, step| total.saturating_add(figure(step)))
+	}
 }
 
 /// Consumer mode for the shared redemption core. `Execute` withdraws real
@@ -329,7 +332,6 @@ where
 				debt_cancellable: step.debt,
 				collateral_out: step.collateral_out,
 				fee_pusd: step.fee,
-				pusd_in: step.debt.saturating_add(step.fee),
 			});
 		}
 	}
@@ -352,7 +354,6 @@ where
 				debt_cancellable: step.burned,
 				collateral_out: step.collateral_out,
 				fee_pusd: Balance::zero(),
-				pusd_in: step.burned,
 			});
 		}
 		self.recovery_owner = Some((owner, step.regime));
