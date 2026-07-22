@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	types::{RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig},
+	types::{RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, WalkControl},
 	weights::WeightInfo,
 	Error, Event,
 };
@@ -208,6 +208,34 @@ fn caller_max_steps_caps_the_loop() {
 	});
 }
 
+#[test]
+fn walk_reports_only_cap_exhaustion_as_truncated() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+
+		let barrier = Redemptions::walk_targets(&DOT, &PUSD, 1, 200, |_, _| {
+			Ok(WalkControl::Stop { spent: 0 })
+		})
+		.expect("walk succeeds");
+		assert_eq!(barrier.steps, 1);
+		assert!(!barrier.truncated, "a counted barrier, not the cap, ended the walk");
+
+		let failed_touch =
+			Redemptions::walk_targets(&DOT, &PUSD, 1, 200, |_, _| Ok(WalkControl::NotVisited))
+				.expect("walk succeeds");
+		assert_eq!(failed_touch.steps, 0);
+		assert!(!failed_touch.truncated);
+
+		let capped = Redemptions::walk_targets(&DOT, &PUSD, 1, 200, |_, _| {
+			Ok(WalkControl::ContinueFromCursor { spent: 0 })
+		})
+		.expect("walk succeeds");
+		assert_eq!(capped.steps, 1);
+		assert!(capped.truncated, "the cap guard ended the walk");
+	});
+}
+
 /// `max_steps` exists to bound the pre-paid weight; the dispatch then refunds
 /// down to the steps actually executed.
 #[test]
@@ -274,7 +302,17 @@ fn underwater_prefix_skipped_once_while_healthy_vaults_redeem() {
 		let v2_before = vault_debt(DOT, PUSD, 2);
 		let v3_before = vault_debt(DOT, PUSD, 3);
 		let v4_before = vault_debt(DOT, PUSD, 4);
+		let preview = Redemptions::preview_redeem(DOT, PUSD, 2_000).expect("preview");
+		assert_eq!(preview.steps, 4, "the walk visits the skipped prefix once");
+		assert_eq!(
+			preview.steps_detail.iter().map(|step| step.target).collect::<Vec<_>>(),
+			vec![3, 4]
+		);
+		assert!(!preview.truncated);
+
+		let redeemer_before = Assets::balance(PUSD, 5);
 		let recipient_before = collateral_balance(DOT, 6);
+		let fee_before = Assets::balance(PUSD, FEE_DEST);
 		let issuance_before = Assets::total_supply(PUSD);
 
 		assert_ok!(redeem(5, DOT, PUSD, 2_000, 0, 6, 0));
@@ -287,6 +325,10 @@ fn underwater_prefix_skipped_once_while_healthy_vaults_redeem() {
 		// Collateral is paid at face value, floored per step at price 0.9 (= debt * 10 / 9).
 		let expected_collateral = v3_before * 10 / 9 + v4_before * 10 / 9;
 		assert_eq!(collateral_balance(DOT, 6) - recipient_before, expected_collateral);
+		// Both adapters consume the same shared walk decisions.
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), preview.total_pusd_in);
+		assert_eq!(collateral_balance(DOT, 6) - recipient_before, preview.total_collateral_out);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.total_fee_pusd);
 		// Issuance falls by exactly the debt burned; fees are routed, not burned.
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), v3_before + v4_before);
 	});

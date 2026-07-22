@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::deps::sp_runtime::{
 	traits::{Saturating, Zero},
-	FixedU128, Permill,
+	FixedPointOperand, FixedU128, Permill,
 };
 use scale_info::TypeInfo;
 
@@ -139,8 +139,9 @@ pub(crate) struct RecoveryStep<Balance> {
 	pub(crate) regime: RecoveryRegime,
 }
 
-/// Shared by execution and preview so `FinalRecovery` pricing cannot drift.
-/// The variant is the settlement regime the head's CR selects.
+/// Authoritative priced plan for one `FinalRecovery` head. Execution, preview,
+/// and recovery offsets all consume this type so regime and residual policy
+/// cannot be re-derived independently.
 pub(crate) enum RecoveryPricing<Balance> {
 	/// `CR >= 100%`: face value plus a collateral bonus.
 	RecoveryBonus { debt: Balance, collateral_out: Balance, bonus: FixedU128 },
@@ -163,6 +164,59 @@ impl<Balance: Copy> RecoveryPricing<Balance> {
 		match self {
 			Self::RecoveryBonus { collateral_out, .. } |
 			Self::InsuranceAdjusted { collateral_out, .. } => *collateral_out,
+		}
+	}
+
+	pub(crate) fn regime(&self) -> RecoveryRegime {
+		match self {
+			Self::RecoveryBonus { .. } => RecoveryRegime::RecoveryBonus,
+			Self::InsuranceAdjusted { .. } => RecoveryRegime::InsuranceAdjusted,
+		}
+	}
+}
+
+impl<Balance: FixedPointOperand + Ord> RecoveryPricing<Balance> {
+	/// Resize a priced plan without selecting its regime or Insurance Fund
+	/// split again.
+	pub(crate) fn rebudget(
+		self,
+		vault_debt: Balance,
+		vault_collateral: Balance,
+		price: FixedU128,
+		budget: Balance,
+	) -> Self {
+		match self {
+			Self::RecoveryBonus { bonus, .. } => {
+				let debt = vault_debt.min(budget);
+				let collateral_out =
+					pusd_primitives::recovery_pricing::recovery_bonus_collateral_out(
+						debt, bonus, price,
+					)
+					.min(vault_collateral);
+				Self::RecoveryBonus { debt, collateral_out, bonus }
+			},
+			Self::InsuranceAdjusted { split, .. } => {
+				let debt = split.market_cancel_debt.min(budget);
+				let collateral_out =
+					pusd_primitives::recovery_pricing::recovery_rate_collateral_out(
+						debt,
+						split.recovery_rate,
+						price,
+					)
+					.min(vault_collateral);
+				Self::InsuranceAdjusted { debt, collateral_out, split }
+			},
+		}
+	}
+
+	/// Whether committing this priced step exhausts the externally cancellable
+	/// debt and therefore unlocks the Insurance Fund residual settlement.
+	pub(crate) fn settles_residual(&self) -> bool {
+		match self {
+			Self::RecoveryBonus { .. } => false,
+			Self::InsuranceAdjusted { debt, split, .. } => {
+				*debt == split.market_cancel_debt && !split.effective_cover.is_zero()
+			},
 		}
 	}
 }
@@ -199,8 +253,23 @@ pub(crate) enum StepOutcome<Balance> {
 	Stopped,
 }
 
-pub(crate) struct Accumulators<Balance, AccountId> {
+/// Mode-specific result of visiting one target. The shared walker owns the
+/// mechanical loop state; execution and preview only state how the visit
+/// changes the budget and where the next lookup resumes.
+pub(crate) enum WalkControl<Balance> {
+	NotVisited,
+	Stop { spent: Balance },
+	ContinueFromCursor { spent: Balance },
+	ContinueAfterTarget { spent: Balance },
+}
+
+pub(crate) struct WalkResult<Balance> {
 	pub(crate) remaining: Balance,
+	pub(crate) steps: u32,
+	pub(crate) truncated: bool,
+}
+
+pub(crate) struct Accumulators<Balance, AccountId> {
 	pub(crate) debt_settled: Balance,
 	pub(crate) ordinary_debt: Balance,
 	pub(crate) ordinary_collateral: Balance,
@@ -211,13 +280,9 @@ pub(crate) struct Accumulators<Balance, AccountId> {
 	pub(crate) recovery_owner: Option<(AccountId, RecoveryRegime)>,
 }
 
-impl<Balance, AccountId> Accumulators<Balance, AccountId>
-where
-	Balance: Zero + Saturating + Copy,
-{
-	pub(crate) fn new(max_pusd_in: Balance) -> Self {
+impl<Balance: Zero, AccountId> Default for Accumulators<Balance, AccountId> {
+	fn default() -> Self {
 		Self {
-			remaining: max_pusd_in,
 			debt_settled: Balance::zero(),
 			ordinary_debt: Balance::zero(),
 			ordinary_collateral: Balance::zero(),
@@ -227,13 +292,17 @@ where
 			recovery_owner: None,
 		}
 	}
+}
 
+impl<Balance, AccountId> Accumulators<Balance, AccountId>
+where
+	Balance: Zero + Saturating + Copy,
+{
 	pub(crate) fn collateral_out(&self) -> Balance {
 		self.ordinary_collateral.saturating_add(self.recovery_collateral)
 	}
 
 	pub(crate) fn apply_ordinary(&mut self, step: &OrdinaryStep<Balance>) {
-		self.remaining = self.remaining.saturating_sub(step.debt.saturating_add(step.fee));
 		self.debt_settled = self.debt_settled.saturating_add(step.debt);
 		self.ordinary_debt = self.ordinary_debt.saturating_add(step.debt);
 		self.ordinary_collateral = self.ordinary_collateral.saturating_add(step.collateral_out);
@@ -248,7 +317,6 @@ where
 		step: &RecoveryStep<Balance>,
 		residual: Balance,
 	) {
-		self.remaining = self.remaining.saturating_sub(step.burned);
 		self.debt_settled =
 			self.debt_settled.saturating_add(step.debt_settled).saturating_add(residual);
 		self.recovery_burned = self.recovery_burned.saturating_add(step.burned);
