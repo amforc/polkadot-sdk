@@ -26,7 +26,7 @@ pub fn append<T: Config>(
 	collateral_id: &CollateralIdOf<T>,
 	stable_id: &StableIdOf<T>,
 	owner: T::AccountId,
-) -> Result<(), DispatchError> {
+) -> DispatchResult {
 	fifo_append::<_, _, T::VaultLists>(list_id::<T>(collateral_id, stable_id), owner)
 		.map_err(|_| Error::<T>::FinalRecoveryInvariantBroken)?;
 	Ok(())
@@ -37,7 +37,7 @@ pub fn remove<T: Config>(
 	collateral_id: &CollateralIdOf<T>,
 	stable_id: &StableIdOf<T>,
 	owner: &T::AccountId,
-) -> Result<(), DispatchError> {
+) -> DispatchResult {
 	T::VaultLists::remove(&list_id::<T>(collateral_id, stable_id), owner)
 		.map_err(|_| Error::<T>::FinalRecoveryInvariantBroken)?;
 	Ok(())
