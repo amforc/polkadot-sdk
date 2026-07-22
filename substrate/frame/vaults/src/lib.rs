@@ -921,7 +921,7 @@ pub mod pallet {
 			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			BranchOp::<T>::refresh(collateral_id, stable_id, &owner)
+			BranchOp::<T>::refresh_vault(collateral_id, stable_id, &owner)
 		}
 
 		/// Permissionless: move an unsafe last-eligible vault into
