@@ -66,11 +66,11 @@ fn governance_freeze_gates_and_admin_clear_reopens() {
 	build_and_execute(|| {
 		seed_branch_with_debt();
 
-		assert_ok!(Vaults::enable_frozen_mode(RuntimeOrigin::root(), DOT, PUSD));
+		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
 		assert_noop!(deposit(1, DOT, PUSD, 100), Error::<Test>::BranchFrozen);
 		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::BranchFrozen);
 
-		assert_ok!(Vaults::clear_governance_frozen_mode(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, PUSD, false));
 		assert_ok!(deposit(1, DOT, PUSD, 100));
 	});
 }
