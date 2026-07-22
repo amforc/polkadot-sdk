@@ -1,10 +1,7 @@
-//! Per-dispatch operation contexts with deferred yield minting.
+//! In-memory state for market and vault operations.
 //!
-//! Two phases: [`BranchOp::load`] opens the branch-level draft, and
-//! [`BranchOp::touch`] consumes it into a [`VaultOp`] that owns the touched
-//! vault row, its owner key, and its derived status. A commit consumes the
-//! phase value and writes the row it owns. The protocol is structural: an
-//! operation cannot touch twice or commit a row other than the one it touched.
+//! [`BranchOp`] loads a market. Touching a vault turns it into a [`VaultOp`]. A commit consumes the
+//! operation, so it cannot touch twice or write a different vault.
 
 use crate::{
 	math,
@@ -23,8 +20,7 @@ use frame::{
 use pallet_linked_list::{Position, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, ProvidePrice, RedemptionStepSnapshot};
 
-/// Branch-level operation context: one branch-state read threaded through an
-/// operation and committed once.
+/// State for one market operation, loaded and committed once.
 pub(crate) struct BranchOp<T: Config> {
 	collateral_id: CollateralIdOf<T>,
 	stable_id: StableIdOf<T>,
@@ -38,9 +34,9 @@ pub(crate) struct BranchOp<T: Config> {
 	loaded: BranchOf<T>,
 }
 
-/// Vault-level operation: a [`BranchOp::touch`]ed draft that owns the vault
-/// row it settled. Commits write `vault` under `owner`, so the touched row and
-/// the committed row cannot diverge.
+/// State for one vault operation.
+///
+/// A commit can only write the vault loaded for `owner`.
 pub(crate) struct VaultOp<T: Config> {
 	ctx: BranchOp<T>,
 	owner: T::AccountId,
@@ -61,7 +57,7 @@ enum TcrCheck {
 }
 
 impl<T: Config> BranchOp<T> {
-	/// Read the branch state and accrue aggregate interest in memory.
+	/// Loads a market and applies its pending interest in memory.
 	fn load(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -74,8 +70,7 @@ impl<T: Config> BranchOp<T> {
 		let outstanding_at_load = branch.state.debt.outstanding();
 		let pending_interest_mint = Pallet::<T>::accrue_aggregate_interest(&mut branch.state, now);
 
-		// The accrual above folded pending aggregate interest into the state,
-		// so the baseline debt is exactly the sum `compute_tcr` would see.
+		// Interest is already included, so this matches the debt used by `compute_tcr`.
 		let tcr_baseline = TcrInputs {
 			collateral: branch.state.total_collateral,
 			debt: Pallet::<T>::accrued_branch_debt(&branch.state, now),
@@ -94,6 +89,7 @@ impl<T: Config> BranchOp<T> {
 		})
 	}
 
+	/// Loads a market and rejects it if frozen.
 	pub(crate) fn load_unfrozen(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -103,53 +99,50 @@ impl<T: Config> BranchOp<T> {
 		Ok(op)
 	}
 
-	/// Refresh one vault. This is intentionally allowed while frozen.
+	/// Applies pending changes to one vault, even when the market is frozen.
 	pub(crate) fn refresh_vault(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
-	) -> Result<(), DispatchError> {
+	) -> DispatchResult {
 		let op = Self::load(collateral_id, stable_id)?;
 		let op = op.touch(owner)?;
 		op.commit_exempt()
 	}
 
-	fn ensure_not_frozen(&self) -> Result<(), DispatchError> {
+	fn ensure_not_frozen(&self) -> DispatchResult {
 		ensure!(!self.branch.state.is_frozen(), Error::<T>::BranchFrozen);
 		Ok(())
 	}
 
-	/// The branch's rate-index list id, derived from the context's own keys so
-	/// it can never drift from `collateral_id`/`stable_id`.
+	/// Returns the rate-list ID for this market.
 	fn rate_list(&self) -> VaultListId<CollateralIdOf<T>, StableIdOf<T>> {
 		VaultListId::Rate(self.collateral_id.clone(), self.stable_id.clone())
 	}
 
-	/// Oracle price for this context's collateral.
+	/// Returns the oracle price for this collateral.
 	pub(crate) fn price(&self) -> Result<FixedU128, DispatchError> {
 		T::Oracle::provide_price(&self.collateral_id)
 	}
 
-	/// Enforce the per-collateral global debt ceiling.
+	/// Checks the global debt limit for this collateral.
 	///
-	/// TODO: One known limitation: the aggregate sums
-	/// `outstanding()` in raw units across *different* stable assets before one
-	/// price conversion, which is only correct while every stable shares the
-	/// same unit value ($1 par, same scale). Fix once the oracle is keyed by
-	/// `(collateral, stable)`: convert each market's outstanding at its own
-	/// pair price, then sum in collateral units.
-	fn ensure_global_ceiling(&self, price: FixedU128) -> Result<(), DispatchError> {
+	/// TODO: Debt from different stable assets is added before price conversion. This is correct
+	/// only while they use the same unit value and scale. Once prices are keyed by market, convert
+	/// each market before adding its debt.
+	fn ensure_global_ceiling(&self, price: FixedU128) -> DispatchResult {
 		let risk = CollateralRisks::<T>::get(&self.collateral_id);
 		let projected_total = risk
 			.outstanding
 			.saturating_sub(self.outstanding_at_load)
 			.saturating_add(self.branch.state.debt.outstanding());
-		let collateral_debt = math::value_in_collateral::<BalanceOf<T>>(projected_total, price)
+		let collateral_debt = math::value_in_collateral(projected_total, price)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		ensure!(collateral_debt <= risk.debt_ceiling, Error::<T>::GlobalDebtCeilingExceeded);
 		Ok(())
 	}
 
+	/// Prepares a new vault and updates the market state in memory.
 	pub(crate) fn create_vault(
 		mut self,
 		owner: &T::AccountId,
@@ -240,9 +233,7 @@ impl<T: Config> BranchOp<T> {
 		Ok(Some(Pallet::<T>::apply_rate_change(state, config, vault, new_rate, self.now)))
 	}
 
-	/// Charge `owner` the upfront fee: the event is deposited now (reverted
-	/// with the dispatch on error), the mint is deferred until commit so pUSD
-	/// is only issued when the branch state is actually written.
+	/// Records an upfront fee and defers minting until commit.
 	fn charge_upfront_fee(&mut self, owner: &T::AccountId, amount: BalanceOf<T>) {
 		if amount.is_zero() {
 			return;
@@ -257,8 +248,7 @@ impl<T: Config> BranchOp<T> {
 		});
 	}
 
-	/// Apply pending interest/redistribution to `owner`'s vault row in memory,
-	/// consuming the branch context into a [`VaultOp`] that owns the row.
+	/// Applies pending interest and redistribution to a vault in memory.
 	pub(crate) fn touch(mut self, owner: &T::AccountId) -> Result<VaultOp<T>, DispatchError> {
 		debug_assert!(self.pending_fee.is_none(), "fee charged before touch");
 		let mut vault = Pallet::<T>::vault_of(&self.collateral_id, &self.stable_id, owner)?;
@@ -278,7 +268,7 @@ impl<T: Config> BranchOp<T> {
 			self.branch.state.absorb_redistributed_debt(&mut vault, pending.principal);
 		}
 		if !pending.collateral.is_zero() {
-			// Already counted in `state.total_collateral`; only the hold moves.
+			// This collateral is already in the market total. Only its hold moves.
 			T::CollateralAssets::transfer_on_hold(
 				self.collateral_id.clone(),
 				&HoldReason::VaultCollateral.into(),
@@ -297,18 +287,15 @@ impl<T: Config> BranchOp<T> {
 		}
 		vault.last_interest_time = self.branch.state.interest_time(self.now);
 
-		// A touch preserves the TCR inputs — principal + pending redistribution
-		// move as a sum, collateral only changes hands, and the aggregate accrual
-		// already ran at load — so the load baseline is the post-touch baseline.
+		// Touching only moves existing debt and collateral, so it does not change the TCR.
 		let mut op = VaultOp { ctx: self, owner: owner.clone(), vault, status, removed: false };
 		op.sync_stake();
 		Ok(op)
 	}
 
-	/// Attach a freshly-built vault row for `owner` — the only path on which a
-	/// row enters storage without a touch. Unlike [`Self::touch`], the upfront
-	/// fee may already be charged (an open computes its fee before the row
-	/// exists).
+	/// Attaches a new vault without touching an existing row.
+	///
+	/// Its upfront fee may already be recorded.
 	fn attach_new(self, owner: &T::AccountId, vault: Vault<BalanceOf<T>>) -> VaultOp<T> {
 		let mut op = VaultOp {
 			ctx: self,
@@ -332,32 +319,39 @@ impl<T: Config> BranchOp<T> {
 }
 
 impl<T: Config> VaultOp<T> {
+	/// Returns the collateral asset ID.
 	pub(crate) fn collateral_id(&self) -> &CollateralIdOf<T> {
 		&self.ctx.collateral_id
 	}
 
+	/// Returns the stable asset ID.
 	pub(crate) fn stable_id(&self) -> &StableIdOf<T> {
 		&self.ctx.stable_id
 	}
 
+	/// Returns the vault owner.
 	pub(crate) fn owner(&self) -> &T::AccountId {
 		&self.owner
 	}
 
+	/// Returns the vault status.
 	pub(crate) fn status(&self) -> VaultStatus {
 		self.status
 	}
 
+	/// Returns the current vault state.
 	pub(crate) fn vault(&self) -> &Vault<BalanceOf<T>> {
 		&self.vault
 	}
 
+	/// Returns the oracle price for this collateral.
 	pub(crate) fn price(&self) -> Result<FixedU128, DispatchError> {
 		self.ctx.price()
 	}
 
-	/// Validate and apply a collateral withdrawal, returning `true` instead when
-	/// withdrawing the full amount should close the now-empty vault.
+	/// Applies a collateral withdrawal.
+	///
+	/// Returns `true` when the empty vault should be closed.
 	pub(crate) fn apply_collateral_withdrawal(
 		&mut self,
 		amount: BalanceOf<T>,
@@ -380,14 +374,11 @@ impl<T: Config> VaultOp<T> {
 		Ok(false)
 	}
 
+	/// Checks whether the vault may be liquidated.
 	pub(crate) fn ensure_liquidatable(&self, price: FixedU128) -> DispatchResult {
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
-		let cr = collateralization_ratio::<BalanceOf<T>>(
-			self.vault.collateral,
-			self.vault.debt.total(),
-			price,
-		)
-		.ok_or(Error::<T>::VaultNotLiquidatable)?;
+		let cr = collateralization_ratio(self.vault.collateral, self.vault.debt.total(), price)
+			.ok_or(Error::<T>::VaultNotLiquidatable)?;
 		ensure!(
 			cr < self.ctx.branch.config.minimum_collateralization_ratio,
 			Error::<T>::VaultNotLiquidatable
@@ -396,6 +387,7 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
+	/// Returns the current values needed for one redemption step.
 	pub(crate) fn redemption_snapshot(&self) -> RedemptionStepSnapshot<BalanceOf<T>> {
 		RedemptionStepSnapshot {
 			status: self.status,
@@ -409,7 +401,8 @@ impl<T: Config> VaultOp<T> {
 		self.ctx.rate_list()
 	}
 
-	pub(crate) fn add_collateral(&mut self, amount: BalanceOf<T>) -> Result<(), DispatchError> {
+	/// Adds collateral to the vault and market totals.
+	pub(crate) fn add_collateral(&mut self, amount: BalanceOf<T>) -> DispatchResult {
 		ensure!(!self.status.is_dormant(), Error::<T>::InvalidVaultStatus);
 		let vault_collateral = self
 			.vault
@@ -429,7 +422,8 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
-	pub(crate) fn remove_collateral(&mut self, amount: BalanceOf<T>) -> Result<(), DispatchError> {
+	/// Removes collateral from the vault and market totals.
+	pub(crate) fn remove_collateral(&mut self, amount: BalanceOf<T>) -> DispatchResult {
 		let vault_collateral = self
 			.vault
 			.collateral
@@ -442,7 +436,7 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 		amount: BalanceOf<T>,
 		vault_collateral: BalanceOf<T>,
-	) -> Result<(), DispatchError> {
+	) -> DispatchResult {
 		let branch_collateral = self
 			.ctx
 			.branch
@@ -456,6 +450,7 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
+	/// Adds debt and optionally changes the vault rate.
 	pub(crate) fn borrow(
 		&mut self,
 		amount: BalanceOf<T>,
@@ -492,7 +487,9 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
-	/// Apply and index a real rate change. Returns `false` for an equal-rate no-op.
+	/// Changes the rate and updates the rate list.
+	///
+	/// Returns `false` if the rate did not change.
 	pub(crate) fn change_rate(
 		&mut self,
 		new_rate: FixedU128,
@@ -516,10 +513,14 @@ impl<T: Config> VaultOp<T> {
 		Ok(true)
 	}
 
+	/// Caps a requested repayment at the current vault debt.
 	pub(crate) fn repayment_amount(&self, requested: BalanceOf<T>) -> BalanceOf<T> {
 		requested.min(self.vault.debt.total())
 	}
 
+	/// Repays debt while enforcing the minimum remaining debt.
+	///
+	/// Returns the principal and interest removed.
 	pub(crate) fn repay(
 		&mut self,
 		amount: BalanceOf<T>,
@@ -533,6 +534,9 @@ impl<T: Config> VaultOp<T> {
 		Ok(payment)
 	}
 
+	/// Cancels debt without enforcing the minimum remaining debt.
+	///
+	/// Returns the principal and interest removed.
 	pub(crate) fn redeem(&mut self, amount: BalanceOf<T>) -> VaultDebt<BalanceOf<T>> {
 		let payment = self.vault.debt.cancel(amount.min(self.vault.debt.total()));
 		self.ctx.branch.state.apply_debt_payment(
@@ -543,7 +547,8 @@ impl<T: Config> VaultOp<T> {
 		payment
 	}
 
-	pub(crate) fn activate(&mut self, hint: Position<T::AccountId>) -> Result<(), DispatchError> {
+	/// Moves a dormant vault back to the rate list.
+	pub(crate) fn activate(&mut self, hint: Position<T::AccountId>) -> DispatchResult {
 		ensure!(self.status.is_dormant(), Error::<T>::InvalidVaultStatus);
 		ensure!(
 			self.vault.debt.total() >= self.ctx.branch.config.minimum_debt,
@@ -552,10 +557,7 @@ impl<T: Config> VaultOp<T> {
 		self.activate_dormant_unchecked(hint)
 	}
 
-	fn activate_dormant_unchecked(
-		&mut self,
-		hint: Position<T::AccountId>,
-	) -> Result<(), DispatchError> {
+	fn activate_dormant_unchecked(&mut self, hint: Position<T::AccountId>) -> DispatchResult {
 		debug_assert!(self.status.is_dormant());
 		T::VaultLists::insert(self.rate_list(), self.owner.clone(), self.vault.annual_rate, hint)
 			.map_err(Pallet::<T>::map_error)?;
@@ -571,6 +573,7 @@ impl<T: Config> VaultOp<T> {
 			.map_err(|e| Pallet::<T>::map_error(e).into())
 	}
 
+	/// Moves an unsafe last eligible vault into final recovery.
 	pub(crate) fn enter_final_recovery(&mut self, price: FixedU128) -> DispatchResult {
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
 		Pallet::<T>::ensure_below_mcr(
@@ -587,6 +590,7 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
+	/// Removes a safe vault from final recovery.
 	pub(crate) fn exit_final_recovery(
 		&mut self,
 		price: FixedU128,
@@ -623,6 +627,7 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
+	/// Updates the vault status after its debt falls.
 	pub(crate) fn reconcile_after_debt_reduction(&mut self) -> DispatchResult {
 		let total = self.vault.debt.total();
 		let below_minimum = total < self.ctx.branch.config.minimum_debt;
@@ -672,6 +677,7 @@ impl<T: Config> VaultOp<T> {
 		self.ctx.branch.state.stakes.total == self.vault.redistribution_stake
 	}
 
+	/// Removes a liquidated vault and records its redistribution.
 	pub(crate) fn apply_liquidation(
 		&mut self,
 		debt_offset: BalanceOf<T>,
@@ -710,6 +716,9 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
+	/// Detaches a debt-free vault for closing.
+	///
+	/// Returns its collateral, whether market liability is empty, and any orphan debt.
 	pub(crate) fn detach_for_close(
 		&mut self,
 	) -> Result<(BalanceOf<T>, bool, BalanceOf<T>), DispatchError> {
@@ -735,6 +744,9 @@ impl<T: Config> VaultOp<T> {
 		Ok((collateral, branch_empties, orphan_debt))
 	}
 
+	/// Removes a final-recovery vault and moves its remaining debt to bad debt.
+	///
+	/// Returns its debt, collateral dust, and swept orphan debt.
 	pub(crate) fn settle_recovery_residual(
 		&mut self,
 	) -> Result<(BalanceOf<T>, BalanceOf<T>, BalanceOf<T>), DispatchError> {
@@ -776,8 +788,7 @@ impl<T: Config> VaultOp<T> {
 		});
 	}
 
-	/// Eligible vaults stake their full collateral; `FinalRecovery` vaults do not
-	/// participate in redistribution.
+	/// Uses all vault collateral as redistribution stake, or zero during final recovery.
 	fn sync_stake(&mut self) {
 		let target = if self.status.is_final_recovery() {
 			BalanceOf::<T>::zero()
@@ -789,27 +800,32 @@ impl<T: Config> VaultOp<T> {
 		}
 	}
 
-	pub(crate) fn commit_exempt(self) -> Result<(), DispatchError> {
+	/// Stores the vault without checking the TCR change.
+	pub(crate) fn commit_exempt(self) -> DispatchResult {
 		self.commit_inner(RowAction::Keep, TcrCheck::Exempt)
 	}
 
-	pub(crate) fn commit_checked(self, price: FixedU128) -> Result<(), DispatchError> {
+	/// Stores the vault after checking the TCR change.
+	pub(crate) fn commit_checked(self, price: FixedU128) -> DispatchResult {
 		self.commit_inner(RowAction::Keep, TcrCheck::Operation(price))
 	}
 
-	pub(crate) fn remove_exempt(self) -> Result<(), DispatchError> {
+	/// Removes the vault without checking the TCR change.
+	pub(crate) fn remove_exempt(self) -> DispatchResult {
 		self.commit_inner(RowAction::Remove, TcrCheck::Exempt)
 	}
 
-	pub(crate) fn remove_checked(self, price: FixedU128) -> Result<(), DispatchError> {
+	/// Removes the vault after checking the TCR change.
+	pub(crate) fn remove_checked(self, price: FixedU128) -> DispatchResult {
 		self.commit_inner(RowAction::Remove, TcrCheck::Operation(price))
 	}
 
-	pub(crate) fn remove_settlement(self) -> Result<(), DispatchError> {
+	/// Removes the vault as a settlement from an unfrozen market.
+	pub(crate) fn remove_settlement(self) -> DispatchResult {
 		self.commit_inner(RowAction::Remove, TcrCheck::Settlement)
 	}
 
-	fn commit_inner(self, row_action: RowAction, tcr_check: TcrCheck) -> Result<(), DispatchError> {
+	fn commit_inner(self, row_action: RowAction, tcr_check: TcrCheck) -> DispatchResult {
 		let keep_row = matches!(row_action, RowAction::Keep);
 		if keep_row == self.removed {
 			return Err(DispatchError::Corruption);
@@ -839,8 +855,7 @@ impl<T: Config> VaultOp<T> {
 			branch,
 		)?;
 
-		// Mint only after the state is written; the two amounts stay separate
-		// credits so the fee handler's per-credit rounding is unchanged.
+		// Mint after writing state. Keep both amounts separate to preserve fee rounding.
 		if !self.ctx.pending_interest_mint.is_zero() {
 			Pallet::<T>::mint_and_route_yield(
 				&self.ctx.collateral_id,
@@ -855,14 +870,13 @@ impl<T: Config> VaultOp<T> {
 	}
 }
 
-/// Check one operation's baseline-to-committed branch change against the
-/// operation's own loaded config.
+/// Checks the TCR change against the market mode rules.
 fn enforce_operation_tcr<T: Config>(
 	baseline: &TcrInputs<BalanceOf<T>>,
 	branch: &BranchOf<T>,
 	now: Millis,
 	price: FixedU128,
-) -> Result<(), DispatchError> {
+) -> DispatchResult {
 	let pre_tcr = Pallet::<T>::tcr_from_inputs(baseline, price)?;
 	let post_tcr = Pallet::<T>::compute_tcr(&branch.state, price, now)?;
 	Pallet::<T>::enforce_mode_rules(&branch.config, &branch.state, pre_tcr, post_tcr)
