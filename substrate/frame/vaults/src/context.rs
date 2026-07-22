@@ -620,7 +620,6 @@ impl<T: Config> VaultOp<T> {
 			return Err(Error::<T>::DormantTargetOccupied.into());
 		}
 		self.set_status(new_status);
-		self.vault.redistribution_snapshot = self.ctx.branch.state.redistribution;
 		Ok(())
 	}
 
@@ -651,7 +650,6 @@ impl<T: Config> VaultOp<T> {
 				recovery::remove::<T>(self.collateral_id(), self.stable_id(), &self.owner)?;
 				self.ctx.branch.state.release_dormant_target(&self.owner);
 				self.set_status(VaultStatus::Dormant);
-				self.vault.redistribution_snapshot = self.ctx.branch.state.redistribution;
 			},
 			_ => {},
 		}
