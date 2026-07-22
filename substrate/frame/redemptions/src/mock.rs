@@ -288,16 +288,18 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId, Balance> for V
 			.expect("mint stable for benchmark account");
 	}
 
-	fn set_oracle_price(collateral_id: AssetId, _stable_id: StableId, price: FixedU128) {
+	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
+	}
+
+	fn clear_oracle_price(collateral_id: AssetId) {
+		MockPrices::mutate(|prices| {
+			prices.remove(&collateral_id);
+		});
 	}
 
 	fn advance_time(ms: u64) {
 		advance_time(ms);
-	}
-
-	fn synth_market(seed: u32) -> (AssetId, StableId) {
-		(AssetId::WithId(10_000 + seed), 20_000 + seed)
 	}
 }
 
@@ -330,7 +332,7 @@ pub type RedemptionsUpdateOrigin = EitherOf<
 >;
 
 parameter_types! {
-	pub static DefaultRedemptionConfig: RedemptionConfig<Balance, Moment> = RedemptionConfig {
+	pub static DefaultRedemptionConfig: RedemptionConfig<Balance> = RedemptionConfig {
 		minimum_redemption_amount: 100,
 		dynamic_fee_decay_period: 6 * 3_600 * 1_000,
 		dynamic_fee_floor: FixedU128::zero(),
@@ -343,8 +345,6 @@ parameter_types! {
 }
 
 impl pallet_redemptions::Config for Test {
-	type CollateralAssetId = AssetId;
-	type StableAssetId = StableId;
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
 	type Vaults = Vaults;
@@ -445,7 +445,7 @@ pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
 		#[cfg(feature = "try-runtime")]
-		Redemptions::do_try_state().expect("post-test invariants hold");
+		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 	});
 }
 
