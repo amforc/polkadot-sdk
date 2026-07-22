@@ -964,17 +964,7 @@ pub mod pallet {
 			if steps_detail.is_empty() {
 				return None;
 			}
-			Some(RedemptionPreview {
-				steps_detail,
-				total_pusd_in: acc
-					.ordinary_debt
-					.saturating_add(acc.ordinary_fee)
-					.saturating_add(acc.recovery_burned),
-				total_collateral_out: acc.collateral_out(),
-				total_fee_pusd: acc.ordinary_fee,
-				steps: walk.steps,
-				truncated: walk.truncated,
-			})
+			Some(RedemptionPreview { steps_detail, steps: walk.steps, truncated: walk.truncated })
 		}
 
 		/// Touch-only `redeem_step`: capture the post-touch snapshot, apply
