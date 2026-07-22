@@ -20,7 +20,7 @@ use frame::{
 	prelude::*,
 	traits::{fungibles::Balanced as FungiblesBalanced, Defensive, DefensiveOption, Time},
 };
-use pallet_linked_list::{ListError, SortedListInterface};
+use linked_list_interface::{ListError, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, OnBranchYield, ProvidePrice};
 
 /// The two numbers a branch TCR depends on. [`Pallet::compute_tcr`] derives

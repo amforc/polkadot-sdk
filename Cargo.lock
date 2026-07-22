@@ -15935,6 +15935,7 @@ dependencies = [
 name = "pallet-vaults"
 version = "0.1.0"
 dependencies = [
+ "linked-list-interface",
  "log",
  "pallet-assets",
  "pallet-assets-holder",

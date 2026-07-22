@@ -25,7 +25,7 @@ use frame::{
 	},
 };
 use frame_system::RawOrigin;
-use pallet_linked_list::{Position, SortedListInterface};
+use linked_list_interface::{Position, SortedListInterface};
 use pusd_primitives::{RedemptionSettlement, VaultInterface};
 
 const ORACLE_PRICE: u128 = 10;
