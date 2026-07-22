@@ -61,9 +61,8 @@ pub mod pallet {
 		fees,
 		types::{
 			Accumulators, OffsetDecision, OrdinaryStep, RecoveryOffsetQuote, RecoveryPricing,
-			RecoveryStep, RedemptionConfig, RedemptionPreamble, RedemptionPreview,
-			RedemptionPreviewStep, RedemptionState, StepAction, StepOutcome, WalkControl,
-			WalkResult,
+			RecoveryStep, RedeemMode, RedemptionConfig, RedemptionPreamble, RedemptionPreview,
+			RedemptionPreviewStep, RedemptionState, StepAction, StepOutcome, WalkResult,
 		},
 	};
 	use alloc::vec::Vec;
@@ -329,7 +328,8 @@ pub mod pallet {
 
 	#[pallet::view_functions]
 	impl<T: Config> Pallet<T> {
-		/// Rolled back because preparing an accurate snapshot can touch vault state.
+		/// Runs the real redemption loop against live vault state and rolls
+		/// everything back; see [`Pallet::simulate`] for why that is sound.
 		pub fn preview_redeem(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -458,10 +458,9 @@ pub mod pallet {
 
 			let mut acc = Accumulators::default();
 			let walk = Self::run_loop(
-				redeemer,
+				&RedeemMode::Execute { redeemer, recipient },
 				collateral_id,
 				stable_id,
-				recipient,
 				price,
 				fee_rate,
 				step_cap,
@@ -511,24 +510,29 @@ pub mod pallet {
 			}
 		}
 
-		/// Walk the Vaults-owned redemption ordering once. Callers provide only
-		/// the per-target operation; caps, budget exhaustion, cursor application,
-		/// and the one-recovery-head boundary live here.
+		/// Walk the Vaults-owned redemption ordering once, executing one priced
+		/// step per target. Execution and preview run this same loop —
+		/// [`RedeemMode`] only selects funding and recipients — so the barrier
+		/// ladder, cursor rules, and caps cannot diverge between the two.
 		///
 		/// A skipped underwater target advances the carried cursor. A successful
-		/// execution keeps that cursor because a drained vault leaves the index,
-		/// while a partial fill must be found again. Priority targets always
-		/// preempt the cursor inside [`VaultInterface::next_redemption_target`].
-		pub(crate) fn walk_targets(
+		/// redeem keeps that cursor because a drained vault leaves the index
+		/// (the next lookup advances without bypassing any newly created
+		/// Dormant/FinalRecovery barrier), while a partial fill must be found
+		/// again. Priority targets always preempt the cursor inside
+		/// [`VaultInterface::next_redemption_target`].
+		pub(crate) fn run_loop(
+			mode: &RedeemMode<'_, T::AccountId>,
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
+			price: FixedU128,
+			fee_rate: FixedU128,
 			step_cap: u32,
-			mut remaining: BalanceOf<T>,
-			mut visit: impl FnMut(
-				&T::AccountId,
-				BalanceOf<T>,
-			) -> Result<WalkControl<BalanceOf<T>>, DispatchError>,
+			max_pusd_in: BalanceOf<T>,
+			config: &RedemptionConfigOf<T>,
+			acc: &mut Accumulators<BalanceOf<T>, T::AccountId>,
 		) -> Result<WalkResult<BalanceOf<T>>, DispatchError> {
+			let mut remaining = max_pusd_in;
 			let mut steps = 0u32;
 			let mut cursor: Option<T::AccountId> = None;
 			let mut truncated = false;
@@ -542,83 +546,52 @@ pub mod pallet {
 				else {
 					break;
 				};
-				let control = visit(&owner, remaining)?;
-				match control {
-					WalkControl::NotVisited => break,
-					WalkControl::Stop { spent } => {
-						steps = steps.saturating_add(1);
-						remaining = remaining.saturating_sub(spent);
+				let mut outcome = StepOutcome::Stopped;
+				T::Vaults::redeem_step(
+					collateral_id,
+					stable_id,
+					&owner,
+					mode.step_recipient(&owner),
+					|snap| {
+						let (allocation, decision) = Self::execute_step(
+							mode, stable_id, &snap, price, fee_rate, remaining, config,
+						)?;
+						outcome = decision;
+						Ok(allocation)
+					},
+				)?;
+				// Barrier stops count too: their target was visited and touched.
+				steps = steps.saturating_add(1);
+				match outcome {
+					StepOutcome::Stopped => break,
+					StepOutcome::Skipped => cursor = Some(owner),
+					StepOutcome::Redeemed(step) => {
+						remaining = remaining.saturating_sub(step.debt.saturating_add(step.fee));
+						acc.apply_ordinary(&owner, &step);
+					},
+					StepOutcome::Recovery { step, settle_residual } => {
+						// The residual settlement re-enters the vault pallet, so
+						// it must run after the in-flight step committed.
+						let residual = if settle_residual {
+							Self::settle_residual_via_if(collateral_id, stable_id, &owner)?
+						} else {
+							Zero::zero()
+						};
+						remaining = remaining.saturating_sub(step.burned);
+						acc.apply_recovery(owner, &step, residual);
 						break;
-					},
-					WalkControl::ContinueFromCursor { spent } => {
-						steps = steps.saturating_add(1);
-						remaining = remaining.saturating_sub(spent);
-					},
-					WalkControl::ContinueAfterTarget { spent } => {
-						steps = steps.saturating_add(1);
-						remaining = remaining.saturating_sub(spent);
-						cursor = Some(owner);
 					},
 				}
 			}
 			Ok(WalkResult { remaining, steps, truncated })
 		}
 
-		/// Execution adapter for the shared target walker.
-		fn run_loop(
-			redeemer: &T::AccountId,
-			collateral_id: &CollateralIdOf<T>,
-			stable_id: &StableIdOf<T>,
-			recipient: &T::AccountId,
-			price: FixedU128,
-			fee_rate: FixedU128,
-			step_cap: u32,
-			max_pusd_in: BalanceOf<T>,
-			config: &RedemptionConfigOf<T>,
-			acc: &mut Accumulators<BalanceOf<T>, T::AccountId>,
-		) -> Result<WalkResult<BalanceOf<T>>, DispatchError> {
-			Self::walk_targets(collateral_id, stable_id, step_cap, max_pusd_in, |owner, budget| {
-				let mut outcome = StepOutcome::Stopped;
-				T::Vaults::redeem_step(collateral_id, stable_id, owner, recipient, |snap| {
-					let (allocation, decision) = Self::execute_step(
-						stable_id, redeemer, &snap, price, fee_rate, budget, config,
-					)?;
-					outcome = decision;
-					Ok(allocation)
-				})?;
-				Ok(match outcome {
-					StepOutcome::Stopped => WalkControl::Stop { spent: Zero::zero() },
-					StepOutcome::Skipped => {
-						WalkControl::ContinueAfterTarget { spent: Zero::zero() }
-					},
-					// The cursor is intentionally left as-is on a successful redeem: a
-					// drained vault leaves the rate index, so the next lookup advances
-					// without bypassing any newly created Dormant/FinalRecovery barrier.
-					StepOutcome::Redeemed(step) => {
-						let spent = step.debt.saturating_add(step.fee);
-						acc.apply_ordinary(&step);
-						WalkControl::ContinueFromCursor { spent }
-					},
-					StepOutcome::Recovery { step, settle_residual } => {
-						let residual = if settle_residual {
-							Self::settle_residual_via_if(collateral_id, stable_id, owner)?
-						} else {
-							Zero::zero()
-						};
-						let spent = step.burned;
-						acc.apply_recovery(owner.clone(), &step, residual);
-						WalkControl::Stop { spent }
-					},
-				})
-			})
-		}
-
 		/// Classify, price, and fund one step from inside the vault-side
 		/// `redeem_step` closure. Returns the loop outcome plus the settlement for
 		/// the vault; a `None` settlement persists the touch without redeeming.
 		fn execute_step(
+			mode: &RedeemMode<'_, T::AccountId>,
 			stable_id: &StableIdOf<T>,
-			redeemer: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
 			fee_rate: FixedU128,
@@ -633,7 +606,7 @@ pub mod pallet {
 						return Ok((None, StepOutcome::Stopped));
 					};
 					let need = step.debt.saturating_add(step.fee);
-					let (funded, preservation) = Self::fundable_budget(stable_id, redeemer, need)?;
+					let (funded, preservation) = Self::fundable_budget(mode, stable_id, need)?;
 					if funded < need {
 						// Reprice once at the preserving limit; pricing keeps
 						// the new need at or below the budget it is given.
@@ -645,13 +618,8 @@ pub mod pallet {
 					}
 					let total_in = step.debt.saturating_add(step.fee);
 					debug_assert!(total_in <= funded);
-					let debt_payment = Self::fund_redemption(
-						stable_id,
-						redeemer,
-						step.debt,
-						total_in,
-						preservation,
-					)?;
+					let debt_payment =
+						Self::fund_redemption(mode, stable_id, step.debt, total_in, preservation)?;
 					let settlement = RedemptionSettlement {
 						debt_payment,
 						collateral_to_recipient: step.collateral_out,
@@ -659,7 +627,7 @@ pub mod pallet {
 					Ok((Some(settlement), StepOutcome::Redeemed(step)))
 				},
 				StepAction::Recovery => {
-					Self::recovery_decision(stable_id, redeemer, snap, price, budget, config)
+					Self::recovery_decision(mode, stable_id, snap, price, budget, config)
 				},
 			}
 		}
@@ -679,7 +647,7 @@ pub mod pallet {
 			let collateral_out =
 				recovery_pricing::collateral_for_value(debt, price).min(snap.collateral);
 			let fee = fees::fee_pusd(debt, fee_rate);
-			Some(OrdinaryStep { debt, collateral_out, fee })
+			Some(OrdinaryStep { status: snap.status, debt, collateral_out, fee })
 		}
 
 		/// Shared by execution and preview to keep recovery pricing identical.
@@ -723,17 +691,23 @@ pub mod pallet {
 			Some(RecoveryPricing::InsuranceAdjusted { debt, collateral_out, split })
 		}
 
-		/// The budget `payer` can fund toward a step needing `need`: `need`
-		/// itself when fully fundable, otherwise the preserving limit for the
-		/// caller to reprice its step at, once. A debit capped by the payer's
+		/// The budget the paying side can fund toward a step needing `need`:
+		/// `need` itself when fully fundable, otherwise the preserving limit for
+		/// the caller to reprice its step at, once. A debit capped by the payer's
 		/// whole balance is a genuine shortfall, not a dead zone, and errors.
+		/// Simulation is always fully funded: preview quotes the market side,
+		/// not any particular payer's wallet.
 		fn fundable_budget(
+			mode: &RedeemMode<'_, T::AccountId>,
 			stable_id: &StableIdOf<T>,
-			payer: &T::AccountId,
 			need: BalanceOf<T>,
 		) -> Result<(BalanceOf<T>, Preservation), Error<T>> {
+			let RedeemMode::Execute { redeemer, .. } = mode else {
+				// The preservation is inert: simulation issues, never withdraws.
+				return Ok((need, Preservation::Expendable));
+			};
 			let (funded, preservation) =
-				reducible_debit::<T::StableAssets, _>(stable_id.clone(), payer, need);
+				reducible_debit::<T::StableAssets, _>(stable_id.clone(), redeemer, need);
 			if funded < need {
 				ensure!(
 					preservation == Preservation::Preserve,
@@ -744,8 +718,8 @@ pub mod pallet {
 		}
 
 		fn recovery_decision(
+			mode: &RedeemMode<'_, T::AccountId>,
 			stable_id: &StableIdOf<T>,
-			redeemer: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
 			budget: BalanceOf<T>,
@@ -759,7 +733,7 @@ pub mod pallet {
 				None
 			} else {
 				let (funded, preservation) =
-					Self::fundable_budget(stable_id, redeemer, pricing.debt())?;
+					Self::fundable_budget(mode, stable_id, pricing.debt())?;
 				if funded < pricing.debt() {
 					pricing = pricing.rebudget(snap.debt, snap.collateral, price, funded);
 				}
@@ -775,14 +749,14 @@ pub mod pallet {
 			// still unlocks the post-step residual settlement.
 			let debt_payment = match preservation {
 				Some(preservation) => {
-					Some(Self::fund_redemption(stable_id, redeemer, debt, debt, preservation)?)
+					Some(Self::fund_redemption(mode, stable_id, debt, debt, preservation)?)
 				},
 				None => None,
 			};
 			let step = RecoveryStep {
+				status: snap.status,
 				burned: debt,
 				collateral_out: pricing.collateral_out(),
-				debt_settled: debt,
 				regime: pricing.regime(),
 			};
 			let settlement = debt_payment.map(|debt_payment| RedemptionSettlement {
@@ -792,25 +766,35 @@ pub mod pallet {
 			Ok((settlement, StepOutcome::Recovery { step, settle_residual }))
 		}
 
-		/// Withdraw `total_in` pUSD from the redeemer with the preservation sized
-		/// by [`Self::fundable_budget`], return the debt payment to the vault step,
-		/// and route the rest as the fee.
+		/// Fund `total_in` stable units for one step — withdrawn from the
+		/// redeemer with the preservation sized by [`Self::fundable_budget`], or
+		/// issued unbacked when simulating — return the debt payment to the
+		/// vault step, and route the rest as the fee.
 		fn fund_redemption(
+			mode: &RedeemMode<'_, T::AccountId>,
 			stable_id: &StableIdOf<T>,
-			redeemer: &T::AccountId,
 			debt: BalanceOf<T>,
 			total_in: BalanceOf<T>,
 			preservation: Preservation,
 		) -> Result<StableCreditOf<T>, DispatchError> {
 			debug_assert!(debt <= total_in);
-			let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
-				stable_id.clone(),
-				redeemer,
-				total_in,
-				Precision::Exact,
-				preservation,
-				Fortitude::Polite,
-			)?;
+			let credit = match mode {
+				RedeemMode::Execute { redeemer, .. } => {
+					<T::StableAssets as FungiblesBalanced<_>>::withdraw(
+						stable_id.clone(),
+						redeemer,
+						total_in,
+						Precision::Exact,
+						preservation,
+						Fortitude::Polite,
+					)?
+				},
+				// Unbacked issuance is sound only because `simulate` runs inside
+				// a transaction its caller always rolls back.
+				RedeemMode::Simulate => {
+					<T::StableAssets as FungiblesBalanced<_>>::issue(stable_id.clone(), total_in)
+				},
+			};
 			debug_assert_eq!(credit.peek(), total_in);
 			let (debt_credit, fee_credit) = credit.split(debt);
 			T::FeeHandler::on_unbalanced(fee_credit);
@@ -951,7 +935,10 @@ pub mod pallet {
 				.min(config.dynamic_fee_ceiling)
 		}
 
-		/// Mirrors execution pricing, but lets touched vault snapshots roll back.
+		/// Runs the real execution loop — settlements applied, Insurance-Fund
+		/// residuals settled — with issued (unbacked) credit standing in for the
+		/// redeemer, so preview and execution cannot diverge. Only the caller's
+		/// unconditional rollback makes the issuance and the mutations sound.
 		fn simulate(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
@@ -959,33 +946,34 @@ pub mod pallet {
 		) -> Option<RedemptionPreviewOf<T>> {
 			let RedemptionPreamble { config, price, fee_rate, .. } =
 				Self::redemption_preamble(collateral_id, stable_id, max_pusd_in).ok()?;
-			let (steps_detail, steps, truncated) = Self::simulate_walk(
+			let mut acc = Accumulators::default();
+			acc.detail = Some(Vec::new());
+			let walk = Self::run_loop(
+				&RedeemMode::Simulate,
 				collateral_id,
 				stable_id,
-				&config,
 				price,
 				fee_rate,
+				T::MaxRedemptionSteps::get(),
 				max_pusd_in,
+				&config,
+				&mut acc,
 			)
 			.ok()?;
+			let steps_detail = acc.detail.take().unwrap_or_default();
 			if steps_detail.is_empty() {
 				return None;
 			}
-			let mut total_pusd_in = BalanceOf::<T>::zero();
-			let mut total_collateral_out = BalanceOf::<T>::zero();
-			let mut total_fee_pusd = BalanceOf::<T>::zero();
-			for step in &steps_detail {
-				total_pusd_in = total_pusd_in.saturating_add(step.pusd_in);
-				total_collateral_out = total_collateral_out.saturating_add(step.collateral_out);
-				total_fee_pusd = total_fee_pusd.saturating_add(step.fee_pusd);
-			}
 			Some(RedemptionPreview {
 				steps_detail,
-				total_pusd_in,
-				total_collateral_out,
-				total_fee_pusd,
-				steps,
-				truncated,
+				total_pusd_in: acc
+					.ordinary_debt
+					.saturating_add(acc.ordinary_fee)
+					.saturating_add(acc.recovery_burned),
+				total_collateral_out: acc.collateral_out(),
+				total_fee_pusd: acc.ordinary_fee,
+				steps: walk.steps,
+				truncated: walk.truncated,
 			})
 		}
 
@@ -1003,125 +991,6 @@ pub mod pallet {
 				Ok(None)
 			})?;
 			Ok(captured)
-		}
-
-		/// Preview adapter for the shared target walker. Touches are rolled back by
-		/// [`Self::simulate`]'s caller.
-		fn simulate_walk(
-			collateral_id: &CollateralIdOf<T>,
-			stable_id: &StableIdOf<T>,
-			config: &RedemptionConfigOf<T>,
-			price: FixedU128,
-			rate: FixedU128,
-			max_pusd_in: BalanceOf<T>,
-		) -> Result<(Vec<RedemptionPreviewStepOf<T>>, u32, bool), DispatchError> {
-			let cap = T::MaxRedemptionSteps::get();
-			let mut detail = Vec::new();
-			let result = Self::walk_targets(
-				collateral_id,
-				stable_id,
-				cap,
-				max_pusd_in,
-				|owner, remaining| {
-					let Ok(Some(snap)) = Self::touch_snapshot(collateral_id, stable_id, owner)
-					else {
-						return Ok(WalkControl::NotVisited);
-					};
-					let (step, control) = Self::preview_step_control(
-						stable_id, config, owner, &snap, price, rate, remaining,
-					);
-					if let Some(step) = step {
-						detail.push(step);
-					}
-					Ok(control)
-				},
-			)?;
-			Ok((detail, result.steps, result.truncated))
-		}
-
-		/// Map one previewed snapshot to its step detail and walk control. The
-		/// adapter models whether an applied step would remove the target,
-		/// because a rolled-back preview cannot apply a real settlement.
-		fn preview_step_control(
-			stable_id: &StableIdOf<T>,
-			config: &RedemptionConfigOf<T>,
-			owner: &T::AccountId,
-			snap: &SnapshotOf<T>,
-			price: FixedU128,
-			rate: FixedU128,
-			budget: BalanceOf<T>,
-		) -> (Option<RedemptionPreviewStepOf<T>>, WalkControl<BalanceOf<T>>) {
-			match Self::classify(snap, price) {
-				StepAction::Recovery => {
-					match Self::preview_recovery_step(stable_id, config, owner, snap, price, budget)
-					{
-						Some(step) => {
-							let spent = step.pusd_in;
-							// Recovery is a counted stop: a later head may price differently.
-							(Some(step), WalkControl::Stop { spent })
-						},
-						None => (None, WalkControl::Stop { spent: Zero::zero() }),
-					}
-				},
-				StepAction::Stop => (None, WalkControl::Stop { spent: Zero::zero() }),
-				StepAction::Skip => {
-					(None, WalkControl::ContinueAfterTarget { spent: Zero::zero() })
-				},
-				StepAction::Redeem => {
-					match Self::preview_ordinary_step(owner, snap, price, rate, budget) {
-						None => (None, WalkControl::Stop { spent: Zero::zero() }),
-						Some(step) => {
-							let drained = step.debt_cancellable >= snap.debt;
-							let spent = step.pusd_in;
-							// A drained Dormant is a barrier the preview cannot cross (it does
-							// not mutate to remove it), so stop rather than re-walking it.
-							let control = if !drained || snap.status.is_dormant() {
-								WalkControl::Stop { spent }
-							} else {
-								WalkControl::ContinueAfterTarget { spent }
-							};
-							(Some(step), control)
-						},
-					}
-				},
-			}
-		}
-
-		fn preview_ordinary_step(
-			owner: &T::AccountId,
-			snap: &SnapshotOf<T>,
-			price: FixedU128,
-			rate: FixedU128,
-			budget: BalanceOf<T>,
-		) -> Option<RedemptionPreviewStepOf<T>> {
-			let step = Self::price_ordinary(snap, price, rate, budget)?;
-			Some(RedemptionPreviewStep {
-				target: owner.clone(),
-				status: snap.status,
-				debt_cancellable: step.debt,
-				collateral_out: step.collateral_out,
-				fee_pusd: step.fee,
-				pusd_in: step.debt.saturating_add(step.fee),
-			})
-		}
-
-		fn preview_recovery_step(
-			stable_id: &StableIdOf<T>,
-			config: &RedemptionConfigOf<T>,
-			owner: &T::AccountId,
-			snap: &SnapshotOf<T>,
-			price: FixedU128,
-			budget: BalanceOf<T>,
-		) -> Option<RedemptionPreviewStepOf<T>> {
-			let pricing = Self::price_recovery(stable_id, snap, price, budget, config)?;
-			Some(RedemptionPreviewStep {
-				target: owner.clone(),
-				status: snap.status,
-				debt_cancellable: pricing.debt(),
-				collateral_out: pricing.collateral_out(),
-				fee_pusd: Zero::zero(),
-				pusd_in: pricing.debt(),
-			})
 		}
 	}
 
