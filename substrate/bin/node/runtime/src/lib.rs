@@ -3494,7 +3494,7 @@ impl traits::Convert<VaultsStableId, AccountId> for StableInsuranceAccount {
 
 parameter_types! {
 	/// Redemption parameters seeded on every branch registration.
-	pub RedemptionsDefaultConfig: pallet_redemptions::RedemptionConfig<Balance, Moment> =
+	pub RedemptionsDefaultConfig: pallet_redemptions::RedemptionConfig<Balance> =
 		pallet_redemptions::RedemptionConfig {
 			minimum_redemption_amount: 100_000_000, // 100 pUSD (6 decimals)
 			dynamic_fee_decay_period: 6 * 60 * 60 * 1_000, // 6 hours in ms
@@ -3509,8 +3509,6 @@ parameter_types! {
 }
 
 impl pallet_redemptions::Config for Runtime {
-	type CollateralAssetId = VaultsCollateralId;
-	type StableAssetId = VaultsStableId;
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
 	type Vaults = Vaults;
