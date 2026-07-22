@@ -338,6 +338,14 @@ parameter_types! {
 /// offsets are fee-free, so it only collects from ordinary redemptions.
 pub const FEE_DEST: AccountId = 888;
 
+/// Account market-teardown dust resolves into, standing in for the treasury.
+/// Distinct from [`FEE_DEST`] so tests can tell revenue streams apart.
+pub const DUST_DEST: AccountId = 889;
+
+parameter_types! {
+	pub const DustDestAccount: AccountId = DUST_DEST;
+}
+
 /// Each stablecoin's insurance cover lives at its own account; empty in
 /// these tests, so every below-par head prices as `BelowPar` regardless.
 pub struct InsuranceFundAccounts;
@@ -411,6 +419,8 @@ impl pallet_stability::Config for Test {
 	// The real redemptions pallet prices recovery settlement, so offset
 	// pricing and recovery-redemption pricing share one code path.
 	type RecoveryOffsets = Redemptions;
+	type StableDustHandler = ResolveAssetTo<DustDestAccount, Assets>;
+	type CollateralDustHandler = ResolveAssetTo<DustDestAccount, PoolCollateralAssets>;
 	// The runtime's single linked-list instance, shared with vaults; this
 	// pallet only touches its `StabilityPending` lists.
 	type PendingLists = LinkedList;
@@ -617,10 +627,6 @@ pub fn deposit(
 	Stability::deposit(RuntimeOrigin::signed(who), collateral, stable, amount)
 }
 
-pub fn activate(who: AccountId, collateral: AssetId, stable: StableId) -> DispatchResult {
-	Stability::activate_deposit(RuntimeOrigin::signed(who), collateral, stable)
-}
-
 pub fn request_withdraw(
 	who: AccountId,
 	collateral: AssetId,
@@ -630,8 +636,8 @@ pub fn request_withdraw(
 	Stability::request_withdraw(RuntimeOrigin::signed(who), collateral, stable, amount)
 }
 
-/// Withdraw to `recipient`, mirroring the extrinsic's argument order with
-/// `who` as the signed origin.
+/// Withdraw to an explicit `recipient` (the extrinsic defaults a `None`
+/// recipient to the caller), with `who` as the signed origin.
 pub fn withdraw(
 	who: AccountId,
 	collateral: AssetId,
@@ -639,7 +645,7 @@ pub fn withdraw(
 	amount: Balance,
 	recipient: AccountId,
 ) -> DispatchResult {
-	Stability::withdraw(RuntimeOrigin::signed(who), collateral, stable, amount, recipient)
+	Stability::withdraw(RuntimeOrigin::signed(who), collateral, stable, amount, Some(recipient))
 }
 
 pub fn claim_collateral(
@@ -648,7 +654,7 @@ pub fn claim_collateral(
 	stable: StableId,
 	recipient: AccountId,
 ) -> DispatchResult {
-	Stability::claim_collateral(RuntimeOrigin::signed(who), collateral, stable, recipient)
+	Stability::claim_collateral(RuntimeOrigin::signed(who), collateral, stable, Some(recipient))
 }
 
 pub fn claim_yield(
@@ -657,7 +663,7 @@ pub fn claim_yield(
 	stable: StableId,
 	recipient: AccountId,
 ) -> DispatchResult {
-	Stability::claim_yield(RuntimeOrigin::signed(who), collateral, stable, recipient)
+	Stability::claim_yield(RuntimeOrigin::signed(who), collateral, stable, Some(recipient))
 }
 
 /// Poke `owner`'s deposit, signed by `caller` (permissionless).
@@ -680,30 +686,62 @@ pub fn compound(
 }
 
 /// Mint `amount` for `who` and deposit it into the default (DOT, PUSD) pool;
-/// the deposit stays pending until [`activate_all`] (or an explicit
-/// activation) runs.
+/// the deposit stays pending until [`activate_all`] (or any other touch past
+/// the entry delay) folds it in.
 pub fn seed_deposit(who: AccountId, amount: Balance) {
 	mint_stable(PUSD, who, amount);
 	assert_ok!(deposit(who, DOT, PUSD, amount));
 }
 
-/// Advance past the default entry delay and activate every depositor's
-/// pending deposit on the (DOT, PUSD) pool.
+/// Advance past the default entry delay and fold every listed depositor's
+/// matured pending deposit into the (DOT, PUSD) active pool. Activation is
+/// automatic on any touch; the permissionless poke stands in for one.
 pub fn activate_all(depositors: &[AccountId]) {
 	advance_time(5_000);
 	for who in depositors {
-		assert_ok!(activate(*who, DOT, PUSD));
+		assert_ok!(poke(*who, *who, DOT, PUSD));
 	}
 }
 
 /// The canonical single-depositor fixture: register the default (DOT, PUSD)
 /// market, deposit 400 for user 1 at t = 1_000 (minting 1_000, so 600 stays
-/// in the wallet), and activate at t = 6_000.
+/// in the wallet), active from t = 6_000.
 pub fn seed_active_deposit() {
 	register_branch(DOT, PUSD, default_branch_config());
 	mint_stable(PUSD, 1, 1_000);
 	assert_ok!(deposit(1, DOT, PUSD, 400));
 	activate_all(&[1]);
+}
+
+/// Register the default (DOT, PUSD) market, give it real branch debt (a
+/// 1000-collateral / 500-debt vault: TCR 250% at the 1.25 registration
+/// price), and activate a 400 deposit for user 1 — all still in Normal Mode.
+pub fn seed_branch_with_debt() {
+	register_branch(DOT, PUSD, default_branch_config());
+	mint_collateral(DOT, 5, 2_000);
+	assert_ok!(open_vault(5, DOT, PUSD, 1_000, 500));
+	mint_stable(PUSD, 1, 1_000);
+	assert_ok!(deposit(1, DOT, PUSD, 400));
+	activate_all(&[1]);
+}
+
+/// TCR = 1000 * 0.6 / 500 = 120%: below the 130% Safety threshold, above
+/// the 110% MCR. Needs [`seed_branch_with_debt`]'s vault to bite.
+pub fn enter_safety_mode() {
+	set_price(DOT, FixedU128::from_rational(6u128, 10u128));
+}
+
+/// Restore the 1.25 registration price: TCR back above the Safety threshold.
+pub fn exit_safety_mode() {
+	set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+}
+
+/// Replace the (DOT, PUSD) pool's `minimum_active_pool_balance` (the §6.5
+/// post-offset floor) via governance.
+pub fn set_min_active_pool(min: Balance) {
+	let mut config = default_pool_config();
+	config.minimum_active_pool_balance = min;
+	assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
 }
 
 /// Mint a fresh stablecoin credit (as the vault engine's yield minting does)

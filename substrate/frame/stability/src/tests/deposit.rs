@@ -74,11 +74,10 @@ fn deposit_on_unregistered_branch_reverts() {
 fn deposit_without_funds_reverts() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		assert!(deposit(2, DOT, PUSD, 400).is_err());
-		// Nothing was queued or transferred.
-		assert!(deposit_row(DOT, PUSD, 2).is_none());
-		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 0);
-		assert_eq!(pending_count(DOT, PUSD), 0);
+		// User 2 was never minted any PUSD, so the asset account itself is
+		// missing (a funded-but-short wallet errors `BalanceLow` instead —
+		// see `deposit_in_the_wallet_dead_zone_fails_instead_of_dusting`).
+		assert_noop!(deposit(2, DOT, PUSD, 400), pallet_assets::Error::<Test>::NoAccount);
 	});
 }
 
@@ -95,8 +94,9 @@ fn second_deposit_merges_and_resets_delay() {
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		let pending = row.pending_deposit.expect("still pending");
 		assert_eq!(pending.amount, 700);
-		// The merge restarts the whole amount's delay: t = 3_000 + 5_000.
-		assert_eq!(pending.activatable_at, 8_000);
+		// The merge restarts the whole amount's delay: deposited at 1_000,
+		// topped up 2_000 later, plus the fresh 5_000 delay.
+		assert_eq!(pending.activatable_at, 1_000 + 2_000 + 5_000);
 		// One FIFO slot, not two.
 		assert_eq!(pending_count(DOT, PUSD), 1);
 		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 700);
@@ -152,6 +152,10 @@ fn deposit_auto_activates_matured_pending() {
 	});
 }
 
+// FIFO order is load-bearing in exactly one place: the §7.2 liquidation
+// backstop consumes pending deposits oldest-first (`pending_offsets.rs`).
+// Worth an integration test once the liquidations pallet drives the full
+// waterfall.
 #[test]
 fn fifo_orders_depositors_oldest_first() {
 	build_and_execute(|| {
@@ -164,9 +168,10 @@ fn fifo_orders_depositors_oldest_first() {
 		assert_eq!(pending_oldest(DOT, PUSD), Some(1));
 		assert_eq!(pending_count(DOT, PUSD), 2);
 
-		// The first depositor leaves the queue; the second becomes oldest.
+		// The first depositor's activation removes it from the queue; the
+		// second (matured too, but not yet touched) becomes oldest.
 		advance_time(5_000);
-		assert_ok!(activate(1, DOT, PUSD));
+		assert_ok!(poke(1, 1, DOT, PUSD));
 		assert_eq!(pending_oldest(DOT, PUSD), Some(2));
 		assert_eq!(pending_count(DOT, PUSD), 1);
 	});

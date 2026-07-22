@@ -158,22 +158,40 @@ fn claim_activates_matured_pending() {
 }
 
 #[test]
-fn poke_realizes_but_never_activates() {
+fn poke_activates_matured_pending() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 
-		// Long past maturity, a third party pokes the row: it stays pending.
-		// Activating would expose the owner's capital to ordinary offsets,
-		// and that choice belongs to the owner alone.
+		// Long past maturity, a third party pokes the row: activation is
+		// automatic after the entry delay — the owner committed risk capital
+		// at deposit time — so the poke completes the move.
 		advance_time(49_000);
 		assert_ok!(poke(7, 1, DOT, PUSD));
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
-		assert_eq!(row.active_deposit, 0);
-		assert_eq!(row.pending_deposit.expect("still pending").amount, 400);
-		assert!(pending_contains(DOT, PUSD, 1));
+		assert_eq!(row.active_deposit, 400);
+		assert!(row.pending_deposit.is_none());
+		assert!(!pending_contains(DOT, PUSD, 1));
+		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 400);
+	});
+}
+
+#[test]
+fn claim_recipient_defaults_to_caller() {
+	build_and_execute(|| {
+		seed_active_deposit();
+		seed_claimables(1, 70, 55);
+
+		// A `None` recipient pays the caller on both claim sides.
+		let coll_before = collateral_balance(DOT, 1);
+		assert_ok!(Stability::claim_collateral(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_eq!(collateral_balance(DOT, 1) - coll_before, 70);
+
+		let stable_before = stable_balance(PUSD, 1);
+		assert_ok!(Stability::claim_yield(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_eq!(stable_balance(PUSD, 1) - stable_before, 55);
 	});
 }
 

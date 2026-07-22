@@ -1,3 +1,4 @@
+mod accumulators;
 mod activation;
 mod adversarial;
 mod claimable_accrual;

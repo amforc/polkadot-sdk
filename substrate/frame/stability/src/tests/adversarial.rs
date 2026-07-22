@@ -8,19 +8,6 @@ use frame::traits::{
 };
 use pusd_primitives::{OnBranchYield, StabilityPoolOffsetApi};
 
-fn seed_branch_with_debt() {
-	register_branch(DOT, PUSD, default_branch_config());
-	mint_collateral(DOT, 5, 2_000);
-	assert_ok!(open_vault(5, DOT, PUSD, 1_000, 500));
-	mint_stable(PUSD, 1, 1_000);
-	assert_ok!(deposit(1, DOT, PUSD, 400));
-	activate_all(&[1]);
-}
-
-fn enter_safety_mode() {
-	set_price(DOT, FixedU128::from_rational(6u128, 10u128));
-}
-
 fn burn_stable(stable: StableId, who: AccountId, amount: Balance) {
 	let credit = <Assets as FungiblesBalanced<AccountId>>::withdraw(
 		stable,
@@ -41,7 +28,7 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 		mint_stable(USDX, 1, USDX_MIN_BALANCE);
 		assert_ok!(deposit(1, DOT, USDX, USDX_MIN_BALANCE));
 		advance_time(5_000);
-		assert_ok!(activate(1, DOT, USDX));
+		assert_ok!(poke(1, 1, DOT, USDX));
 
 		let pool = Stability::pool_account(&DOT, &USDX);
 		let state_before = pool_state(DOT, USDX);
@@ -131,7 +118,7 @@ fn stable_withdrawal_failure_returns_the_full_collateral_credit() {
 		mint_stable(PUSD, 1, 400);
 		assert_ok!(deposit(1, TOKEN_X, PUSD, 400));
 		advance_time(5_000);
-		assert_ok!(activate(1, TOKEN_X, PUSD));
+		assert_ok!(poke(1, 1, TOKEN_X, PUSD));
 
 		let pool = Stability::pool_account(&TOKEN_X, &PUSD);
 		// Break the stable-balance identity so the stable withdrawal fails
@@ -163,7 +150,9 @@ fn activation_rejects_pending_row_missing_fifo_slot() {
 		assert_ok!(pending::remove::<Test>(&fifo, &1));
 		assert!(!pending_contains(DOT, PUSD, 1));
 
-		assert_noop!(activate(1, DOT, PUSD), Error::<Test>::PendingFifoInvariantBroken);
+		// Any activating touch trips over the corrupted FIFO; the poke stands
+		// in for one.
+		assert_noop!(poke(1, 1, DOT, PUSD), Error::<Test>::PendingFifoInvariantBroken);
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives failed activation");
 		assert_eq!(row.active_deposit, 0);
 		assert_eq!(row.pending_deposit.expect("pending remains").amount, 400);
@@ -174,7 +163,7 @@ fn activation_rejects_pending_row_missing_fifo_slot() {
 		// Repair the deliberate FIFO corruption and prove the row can still
 		// activate cleanly.
 		assert_ok!(pending::append::<Test>(&fifo, 1));
-		assert_ok!(activate(1, DOT, PUSD));
+		assert_ok!(poke(1, 1, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 1).expect("activated row survives");
 		assert_eq!(row.active_deposit, 400);
 		assert!(row.pending_deposit.is_none());
@@ -185,12 +174,13 @@ fn activation_rejects_pending_row_missing_fifo_slot() {
 fn safety_withdraw_after_offset_cannot_overdraw_stale_request() {
 	build_and_execute(|| {
 		seed_branch_with_debt();
-		assert_ok!(request_withdraw(1, DOT, PUSD, 400));
 		enter_safety_mode();
+		assert_ok!(request_withdraw(1, DOT, PUSD, 400));
 
 		// The request still says 400, but a liquidation offset shrinks the
-		// live active deposit to 100 before the request matures.
-		assert_eq!(simulate_offset(DOT, PUSD, 300, 120).0, 300);
+		// live active deposit to 100 before the request matures. At the 0.6
+		// Safety price, the 300 debt seizes 300 / 0.6 = 500 collateral.
+		assert_eq!(simulate_offset(DOT, PUSD, 300, 500).0, 300);
 		advance_time(600_000);
 
 		assert_ok!(withdraw(1, DOT, PUSD, 400, 1));
@@ -208,12 +198,12 @@ fn safety_withdraw_after_offset_cannot_overdraw_stale_request() {
 
 		let row = deposit_row(DOT, PUSD, 1).expect("claimable keeps row alive");
 		assert_eq!(row.active_deposit, 0);
-		assert_eq!(row.claimable_collateral, 120);
+		assert_eq!(row.claimable_collateral, 500);
 		assert_eq!(row.withdrawal_request.expect("request remainder stays bounded").amount, 300);
 
 		let before = collateral_balance(DOT, 1);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 120);
+		assert_eq!(collateral_balance(DOT, 1) - before, 500);
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 	});
 }

@@ -555,6 +555,35 @@ mod tests {
 	}
 
 	#[test]
+	fn update_p_floor_sizing_rule_needs_ceiling_division() {
+		// The `minimum_active_pool_balance` doc rule: a floor of F raw units
+		// protects pools up to F * scale_factor^2, worst case P = p_min.
+		// At exactly 1e18 a floor of 1 survives: the k=2 candidate is
+		// floor(1e9 * 1e18 * 1 / 1e18) = 1e9 = p_min.
+		let total = 1_000_000_000_000_000_000u128;
+		let got = update_p_after_offset::<u128>(P_MIN, total, total - 1, &PRECISION);
+		assert_eq!(got, Some(PUpdate::Updated { new_p: P_MIN, scales_crossed: 2 }));
+
+		// One raw unit past, the bound is ceil((1e18 + 1) / 1e18) = 2. A
+		// floor of 1 is refused: floor(1e9 * 1e18 * 1 / (1e18 + 1)) =
+		// 999_999_999 < p_min even after both crossings...
+		let total = total + 1;
+		let got = update_p_after_offset::<u128>(P_MIN, total, total - 1, &PRECISION);
+		assert_eq!(got, None);
+
+		// ...while the ceiling floor of 2 is accepted:
+		// floor(1e9 * 1e18 * 2 / (1e18 + 1)) = 1_999_999_999 >= p_min.
+		let got = update_p_after_offset::<u128>(P_MIN, total, total - 2, &PRECISION);
+		assert_eq!(
+			got,
+			Some(PUpdate::Updated {
+				new_p: FixedU128::from_inner(1_999_999_999),
+				scales_crossed: 2
+			})
+		);
+	}
+
+	#[test]
 	fn update_p_full_depletion_and_bad_inputs() {
 		assert_eq!(
 			update_p_after_offset::<u128>(FixedU128::one(), 1_000, 1_000, &PRECISION),
