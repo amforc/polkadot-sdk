@@ -14,6 +14,11 @@ fn seed_active(who: AccountId, amount: Balance) {
 #[test]
 fn distribute_to_empty_or_unknown_pool_returns_the_credit() {
 	build_and_execute(|| {
+		// The returned credit is the caller's to route: in the runtime the
+		// vault engine's `OnBranchYield` plumbing forwards it to the fee
+		// destination (`vault_interest_flows_to_pool_through_the_hook`
+		// exercises that split live). Here the test drops it, rescinding the
+		// issuance.
 		// Unknown branch: nothing to distribute into.
 		let leftover = distribute_yield(DOT, PUSD, 100);
 		assert_eq!(leftover.peek(), 100);
@@ -99,7 +104,7 @@ fn depositors_realize_yield_proportionally() {
 }
 
 #[test]
-fn flooring_dust_strands_in_the_unclaimed_total() {
+fn flooring_dust_accumulates_until_teardown() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_active(1, 600);
@@ -136,6 +141,17 @@ fn flooring_dust_strands_in_the_unclaimed_total() {
 		// 100 - 19 - 79 = 2 units of flooring dust stay pool-owned, keeping
 		// the balance identity exact.
 		assert_eq!(pool_state(DOT, PUSD).total_yield_unclaimed, 2);
+
+		// Live-market interactions do not redistribute the residue: no flow
+		// reads it back, so later distributions add their own remainder.
+		drop(distribute_yield(DOT, PUSD, 100));
+		assert_ok!(claim_yield(1, DOT, PUSD, 1));
+		assert_ok!(claim_yield(2, DOT, PUSD, 2));
+		assert_eq!(pool_state(DOT, PUSD).total_yield_unclaimed, 4);
+		// It backs the pool-balance identity until all depositor rows are gone
+		// and branch teardown sweeps it through `StableDustHandler`. The node
+		// runtime routes that terminal residue to Treasury; governance.rs pins
+		// the sweep and clean re-registration contract.
 	});
 }
 
@@ -152,7 +168,7 @@ fn late_depositor_earns_only_after_their_snapshot() {
 		// User 2 joins at G0 = 0.1.
 		seed_active(2, 400);
 		advance_time(5_000);
-		assert_ok!(activate(2, DOT, PUSD));
+		assert_ok!(poke(2, 2, DOT, PUSD));
 
 		// Second distribution splits over A = 1000: G = 0.1 + 0.1 = 0.2.
 		drop(distribute_yield(DOT, PUSD, 100));
@@ -346,7 +362,7 @@ fn pending_deposits_earn_no_yield() {
 		// 2 snapshots G at deposit time, so nothing accrues to them even
 		// after activation.
 		advance_time(5_000);
-		assert_ok!(activate(2, DOT, PUSD));
+		assert_ok!(poke(2, 2, DOT, PUSD));
 		assert_noop!(claim_yield(2, DOT, PUSD, 2), Error::<Test>::NoClaimableYield);
 
 		assert_ok!(claim_yield(1, DOT, PUSD, 1));

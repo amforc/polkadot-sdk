@@ -114,7 +114,7 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		mint_stable(PUSD, 1, 600);
 		assert_ok!(deposit(1, DOT, PUSD, 600));
 		advance_time(5_000);
-		assert_ok!(activate(1, DOT, PUSD));
+		assert_ok!(poke(1, 1, DOT, PUSD));
 		seed_pending(2, 300);
 		drop(distribute_yield(DOT, PUSD, 60));
 
@@ -157,7 +157,11 @@ fn pending_offset_flooring_credits_zero_and_prunes() {
 		seed_pending(1, 100);
 
 		// floor(1 * 100 / 1000) = 0: the whole pending amount burns for a
-		// zero collateral credit, and the emptied row is pruned.
+		// zero collateral credit, and the emptied row is pruned. The
+		// flooring loss is bounded by one collateral base unit per step and
+		// only visible at all when the credit is nearly worthless relative
+		// to the debt (1 collateral against 1_000 debt here) — in practice
+		// the error is negligible.
 		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 1_000, 1, 5);
 		assert_eq!(result.debt_offset, 100);
 		assert_eq!(leftover, 1);
@@ -210,6 +214,10 @@ fn pending_offset_on_unregistered_branch_noops_and_returns_the_credit() {
 /// redistribution residual. Only the two offset stages are pallet calls; the
 /// keeper JIT and the final redistribution belong to the external liquidation
 /// orchestrator and are modelled here as plain arithmetic between the calls.
+///
+/// Every stage prices at the same credit-wide ratio 1152.845 / 2200
+/// = 0.52402045… DOT per pUSD — each split is pro-rata against the debt
+/// still standing, so stages differ only by flooring.
 #[test]
 fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 	build_and_execute(|| {
@@ -230,7 +238,8 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		let (debt_offset1, leftover1) = simulate_offset(DOT, PUSD, 2_200, c0);
 		assert_eq!(debt_offset1, 1_501);
 		// The pool kept floor(11_528_450_000_000 * 1501 / 2200) =
-		// 7_865_547_022_727 (786.5547022727 DOT) of the credit.
+		// 7_865_547_022_727 (786.5547022727 DOT) of the credit —
+		// 786.5547 / 1501 = 0.52402 DOT per pUSD burned.
 		assert_eq!(leftover1, 3_662_902_977_273); // 366.2902977273 DOT.
 
 		let state = pool_state(DOT, PUSD);
@@ -258,6 +267,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		// share off the remainder before the pending backstop runs.
 		let jit_debt = 300;
 		let jit_collateral = pro_rata_floor(leftover1, jit_debt, 699);
+		// 157.2061 / 300 = 0.52402 DOT per pUSD — the same stage price.
 		assert_eq!(jit_collateral, 1_572_061_363_636); // 157.2061363636 DOT.
 		let after_jit_debt = 699 - jit_debt; // 399 pUSD.
 		let after_jit_collat = leftover1 - jit_collateral; // 2_090_841_613_637 = 209.0841613637 DOT.
@@ -267,6 +277,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		// full, then user 3 (100), each priced against the debt still standing:
 		//   floor(2_090_841_613_637 * 250 / 399) = 1_310_051_136_364
 		//   floor(  780_790_477_273 * 100 / 149) =   524_020_454_545
+		// (131.0051 / 250 and 52.4020 / 100: again 0.52402 DOT per pUSD.)
 		let (r2, leftover2) =
 			simulate_pending_offset(DOT, PUSD, after_jit_debt, after_jit_collat, 8);
 		assert_eq!(r2.debt_offset, 350);

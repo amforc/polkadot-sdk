@@ -24,7 +24,7 @@ fn seed_active_pool() {
 	mint_stable(PUSD, 1, 1_000);
 	assert_ok!(deposit(1, DOT, PUSD, 400));
 	advance_time(5_000);
-	assert_ok!(activate(1, DOT, PUSD));
+	assert_ok!(poke(1, 1, DOT, PUSD));
 }
 
 /// Drop to 0.52 (CR = 104%) and park the vault in `FinalRecovery`.
@@ -219,6 +219,56 @@ fn recovery_offset_with_empty_pool_is_rejected() {
 
 		// A valid head, but no active capital to burn.
 		assert_noop!(offset_recovery(DOT, PUSD, 300), Error::<Test>::NoRecoveryOffsetPerformed);
+	});
+}
+
+#[test]
+fn par_band_head_settles_at_face_value() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		open_standing_vault();
+		seed_active_pool();
+
+		// CR = 1000 * 0.5025 / 500 = 100.5%: at or above par, but inside the
+		// 1% bonus buffer, where the raw excess CR - 100% - buffer would be
+		// negative (-0.5%). The max(0, ·) clamp in `recovery_bonus` settles
+		// at exactly face value instead of ever discounting.
+		set_price(DOT, FixedU128::from_rational(5_025u128, 10_000u128));
+		assert_ok!(enter_final_recovery(DOT, PUSD, 5));
+
+		// collateral_out = floor(200 / 0.5025) = 398 — no bonus, no haircut.
+		assert_ok!(offset_recovery(DOT, PUSD, 200));
+		System::assert_has_event(
+			crate::Event::RecoveryOffsetApplied {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				debt_burned: 200,
+				collateral_gain: 398,
+				source: crate::types::RecoveryOffsetSource::ActivePool,
+			}
+			.into(),
+		);
+		assert_eq!(vault_debt(DOT, PUSD, 5), 300);
+
+		// Incoming deposits are likewise accepted — the head is not below
+		// par — and settle the remaining 300 at face value:
+		// collateral_out = floor(300 / 0.5025) = 597.
+		mint_stable(PUSD, 2, 300);
+		assert_ok!(deposit(2, DOT, PUSD, 300));
+		System::assert_has_event(
+			crate::Event::RecoveryOffsetApplied {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				debt_burned: 300,
+				collateral_gain: 597,
+				source: crate::types::RecoveryOffsetSource::IncomingDeposit,
+			}
+			.into(),
+		);
+		assert_eq!(vault_debt(DOT, PUSD, 5), 0);
+		let row = deposit_row(DOT, PUSD, 2).expect("row created");
+		assert_eq!(row.claimable_collateral, 597);
+		assert!(row.pending_deposit.is_none());
 	});
 }
 

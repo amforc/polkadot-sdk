@@ -1,5 +1,8 @@
 //! `request_withdraw` / `withdraw`: Normal-Mode flow end to end, plus the
-//! amount and timing boundaries of Safety-Mode resolution.
+//! amount and timing boundaries of Safety-Mode resolution. Requests only
+//! exist in Safety Mode (a Normal-Mode request forwards to the direct
+//! withdrawal, `tests/mode.rs`), so the request tests below enter Safety
+//! through the mock's debt fixture first.
 
 use crate::{
 	mock::*,
@@ -62,15 +65,18 @@ fn withdraw_clamps_to_active_deposit() {
 	build_and_execute(|| {
 		seed_active_deposit();
 
-		// Requesting more than the 400 active takes exactly the 400.
-		assert_ok!(withdraw(1, DOT, PUSD, 1_000, 1));
-		assert_eq!(stable_balance(PUSD, 1), 1_000);
+		// Requesting more than the 400 active takes exactly the 400 — paid
+		// to an empty-handed recipient, so the amount is visible on its own
+		// rather than blending into user 1's original mint.
+		assert_ok!(withdraw(1, DOT, PUSD, 1_000, 2));
+		assert_eq!(stable_balance(PUSD, 2), 400);
+		assert_eq!(stable_balance(PUSD, 1), 600);
 		System::assert_last_event(
 			crate::Event::WithdrawalExecuted {
 				collateral_id: DOT,
 				stable_id: PUSD,
 				depositor: 1,
-				recipient: 1,
+				recipient: 2,
 				amount: 400,
 			}
 			.into(),
@@ -136,7 +142,10 @@ fn withdraw_on_unregistered_branch_reverts() {
 #[test]
 fn request_withdraw_records_exact_executable_at() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		// Requests only record in Safety Mode: real branch debt plus the 0.6
+		// price puts the TCR at 120%, under the 130% Safety threshold.
+		seed_branch_with_debt();
+		enter_safety_mode();
 
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 
@@ -162,7 +171,8 @@ fn request_withdraw_records_exact_executable_at() {
 #[test]
 fn new_request_replaces_old() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_branch_with_debt();
+		enter_safety_mode();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 
 		advance_time(4_000);
@@ -179,17 +189,22 @@ fn new_request_replaces_old() {
 }
 
 #[test]
-fn request_zero_amount_reverts() {
+fn zero_amount_requests_and_withdrawals_revert() {
 	build_and_execute(|| {
-		seed_active_deposit();
-		assert_noop!(request_withdraw(1, DOT, PUSD, 0), Error::<Test>::NoActiveDeposit);
+		seed_branch_with_debt();
+		assert_noop!(withdraw(1, DOT, PUSD, 0, 1), Error::<Test>::ZeroAmount);
+		// The request rejects the zero before deciding whether to forward.
+		assert_noop!(request_withdraw(1, DOT, PUSD, 0), Error::<Test>::ZeroAmount);
+		enter_safety_mode();
+		assert_noop!(request_withdraw(1, DOT, PUSD, 0), Error::<Test>::ZeroAmount);
 	});
 }
 
 #[test]
 fn deposit_leaves_request_unchanged() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_branch_with_debt();
+		enter_safety_mode();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 
 		// SPEC.md §6.9: a new deposit leaves the request as it was.
@@ -208,8 +223,12 @@ fn deposit_leaves_request_unchanged() {
 #[test]
 fn normal_withdraw_ignores_request_and_prunes_it_with_the_row() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		// A request recorded in Safety Mode lingers if the branch recovers
+		// before execution.
+		seed_branch_with_debt();
+		enter_safety_mode();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 100));
+		exit_safety_mode();
 
 		// Normal Mode is not bounded by the 100-unit request.
 		assert_ok!(withdraw(1, DOT, PUSD, 400, 1));

@@ -220,9 +220,10 @@ pub struct PendingDeposit<Balance> {
 	pub activatable_at: Millis,
 }
 
-/// Two-step withdrawal state; only load-bearing in Safety Mode (§6.9).
-/// `executable_at` is fixed at request time, so a request made in Normal
-/// Mode keeps its delay if the branch enters Safety before execution.
+/// Two-step Safety-Mode withdrawal state (§6.9). Only recorded in Safety
+/// Mode — a Normal-Mode `request_withdraw` forwards to the direct
+/// withdrawal — and ignored by Normal-Mode withdrawals should the branch
+/// recover before execution.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]

@@ -2,6 +2,9 @@
 //! row's `claimable_*` fields — it never pays them to the wallet, and
 //! never folds yield back into the active deposit. Gains accumulate
 //! across successive touches and a single claim pays the total.
+//!
+//! Offsets here price collateral at the 1.25 registration price: cancelling
+//! debt `D` seizes `D / 1.25 = 0.8 * D` collateral.
 
 use crate::{mock::*, Error};
 
@@ -25,21 +28,22 @@ fn top_up_realizes_offset_gain_into_claimable_not_wallet() {
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_active_with_headroom(1, 1_000, 2_000);
 
-		// Offset halves the pool: P = 500/1000 = 0.5, delta_S =
-		// floor(300 * 1e18 / 1000) = 3e17. The gain stays latent — offsets
-		// never touch the row.
-		assert_eq!(simulate_offset(DOT, PUSD, 500, 300).0, 500);
+		// Offset halves the pool: P = 500/1000 = 0.5, delta_S = C_sp * P/A =
+		// 400 * (1/1000) = 0.4. The gain stays latent — offsets never touch
+		// the row.
+		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
 		assert_eq!(deposit_row(DOT, PUSD, 1).expect("row exists").claimable_collateral, 0);
 
-		// A top-up is the first touch: it realizes the offset gain into
-		// `claimable_collateral` (floor(1000 * 0.3) = 300) and compounds the
-		// deposit to floor(1000 * 0.5) = 500 — but sends nothing to the wallet.
+		// A top-up is the first touch: it realizes the offset gain (§6.2)
+		// gain = (D0/P0) * delta_S = (1000/1) * 0.4 = 400 into
+		// `claimable_collateral` and compounds the deposit to
+		// (D0/P0) * P = 1000 * 0.5 = 500 — but sends nothing to the wallet.
 		let coll_before = collateral_balance(DOT, 1);
 		assert_ok!(deposit(1, DOT, PUSD, 200));
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
 		assert_eq!(row.active_deposit, 500);
-		assert_eq!(row.claimable_collateral, 300);
+		assert_eq!(row.claimable_collateral, 400);
 		assert_eq!(row.pending_deposit.expect("top-up queued").amount, 200);
 		// No collateral moved to the wallet; only the 200 top-up left it.
 		assert_eq!(collateral_balance(DOT, 1), coll_before);
@@ -48,7 +52,7 @@ fn top_up_realizes_offset_gain_into_claimable_not_wallet() {
 		// The claim is what pays the realized gain out (against the same
 		// pre-top-up balance, unchanged above).
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - coll_before, 300);
+		assert_eq!(collateral_balance(DOT, 1) - coll_before, 400);
 	});
 }
 
@@ -56,32 +60,43 @@ fn top_up_realizes_offset_gain_into_claimable_not_wallet() {
 fn sequential_offsets_accumulate_claimable_across_touches() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
+		// Two depositors, so distributed gains actually split: only user 1
+		// is touched below; user 2's share stays latent until the end.
 		seed_active_with_headroom(1, 1_000, 2_000);
+		seed_active(2, 1_000);
 
-		// Offset 1: P = 1 → 0.5, delta_S = floor(300 * 1e18 / 1000) = 3e17.
-		assert_eq!(simulate_offset(DOT, PUSD, 500, 300).0, 500);
-		// A top-up touch realizes gain-1 = floor(1000 * 0.3) = 300 into
-		// claimable and resets the snapshot at P = 0.5, S = 3e17.
+		// Offset 1 over A = 2000: P = 1 -> 0.5, delta_S = 800 * (1/2000) = 0.4.
+		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).0, 1_000);
+		// A top-up touch realizes gain-1 = (1000/1) * 0.4 = 400 into
+		// claimable and sets the snapshot to P = 0.5, S = 0.4.
 		assert_ok!(deposit(1, DOT, PUSD, 400));
-		assert_eq!(deposit_row(DOT, PUSD, 1).expect("row").claimable_collateral, 300);
+		assert_eq!(deposit_row(DOT, PUSD, 1).expect("row").claimable_collateral, 400);
 
-		// Offset 2 against the 500 active: P = 0.5 → 0.25, delta_S =
-		// floor(150 * 0.5 / 500) = 1.5e17, so S = 4.5e17.
-		assert_eq!(simulate_offset(DOT, PUSD, 250, 150).0, 250);
+		// Offset 2 over A = 1000: P = 0.5 -> 0.25,
+		// delta_S = 400 * (0.5/1000) = 0.2, so S = 0.6.
+		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
 
-		// A withdrawal touch realizes gain-2 = floor(500 * (4.5e17 - 3e17) /
-		// 0.5) = floor(500 * 0.3) = 150 and accumulates it: 300 + 150 = 450.
-		// The withdrawal itself takes 100 off the compounded 250.
+		// A withdrawal touch realizes gain-2 = (500/0.5) * (0.6 - 0.4) = 200
+		// against the reset snapshot and accumulates it: 400 + 200 = 600.
+		// The withdrawal itself takes 100 off the compounded
+		// (500/0.5) * 0.25 = 250.
 		assert_ok!(withdraw(1, DOT, PUSD, 100, 1));
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
-		assert_eq!(row.claimable_collateral, 450);
+		assert_eq!(row.claimable_collateral, 600);
 		assert_eq!(row.active_deposit, 150);
 
 		// One claim pays the whole accumulated gain.
 		let before = collateral_balance(DOT, 1);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 450);
+		assert_eq!(collateral_balance(DOT, 1) - before, 600);
 		assert_eq!(deposit_row(DOT, PUSD, 1).expect("row").claimable_collateral, 0);
+
+		// User 2, untouched the whole time, realizes its complement:
+		// gain = (1000/1) * (0.6 - 0) = 600 — together the full 800 + 400.
+		assert_ok!(poke(7, 2, DOT, PUSD));
+		let row = deposit_row(DOT, PUSD, 2).expect("row survives");
+		assert_eq!(row.claimable_collateral, 600);
+		assert_eq!(row.active_deposit, 250);
 	});
 }
 
@@ -91,10 +106,10 @@ fn withdraw_realizes_yield_into_claimable_never_compounds() {
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_active(1, 600);
 
-		// G = 60 / 600 = 0.1.
+		// delta_G = Y * (P/A) = 60 * (1/600) = 0.1.
 		drop(distribute_yield(DOT, PUSD, 60));
 
-		// The withdrawal realizes yield = floor(600 * 0.1) = 60 into
+		// The withdrawal realizes yield = (600/1) * 0.1 = 60 into
 		// `claimable_yield`; the active deposit is only reduced by the 100
 		// withdrawn — the 60 is NOT added to it.
 		assert_ok!(withdraw(1, DOT, PUSD, 100, 1));
@@ -121,8 +136,8 @@ fn claim_after_full_withdrawal_pays_earned_gains() {
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_active(1, 1_000);
 
-		// Offset: P = 500/1000 = 0.5, gain = floor(1000 * floor(400e18/1000) /
-		// 1e18) = 400.
+		// Offset: P = 500/1000 = 0.5, delta_S = 400 * (1/1000) = 0.4;
+		// gain = (D0/P0) * delta_S = (1000/1) * 0.4 = 400.
 		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
 
 		// A full withdrawal realizes the 400 gain and drains the compounded
@@ -149,20 +164,21 @@ fn permissionless_poke_realizes_gain_into_owner_claimable() {
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_active(1, 1_000);
 
-		// P = 0.5, delta_S = floor(200 * 1e18 / 1000) = 2e17.
-		assert_eq!(simulate_offset(DOT, PUSD, 500, 200).0, 500);
+		// P = 0.5, delta_S = 400 * (1/1000) = 0.4.
+		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
 
 		// A third party pokes: realization is permissionless, so gain =
-		// floor(1000 * 0.2) = 200 lands in the owner's claimable and the
+		// (1000/1) * 0.4 = 400 lands in the owner's claimable and the
 		// deposit compounds to 500 — without the owner lifting a finger.
 		assert_ok!(poke(7, 1, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
-		assert_eq!(row.claimable_collateral, 200);
+		assert_eq!(row.claimable_collateral, 400);
 		assert_eq!(row.active_deposit, 500);
 
-		// The owner still owns the payout: only they can claim it out.
+		// The owner still owns the payout: the poker has no row to claim from.
+		assert_noop!(claim_collateral(7, DOT, PUSD, 7), Error::<Test>::DepositNotFound);
 		let before = collateral_balance(DOT, 1);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 200);
+		assert_eq!(collateral_balance(DOT, 1) - before, 400);
 	});
 }
