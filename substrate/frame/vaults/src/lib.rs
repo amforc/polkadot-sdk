@@ -90,7 +90,7 @@ pub mod pallet {
 			Consideration, EnsureOriginWithArg, Footprint, Time,
 		},
 	};
-	use pallet_linked_list::{Position, PriorityProvider, SortedListInterface};
+	use linked_list_interface::{Position, PriorityProvider, SortedListInterface};
 	use pusd_primitives::{
 		collateralization_ratio, OnBranchLifecycle, OnBranchYield, ProvidePrice,
 	};

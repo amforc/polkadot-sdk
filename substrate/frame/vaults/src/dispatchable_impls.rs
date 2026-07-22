@@ -22,7 +22,7 @@ use frame::{
 		Consideration, Footprint, Time,
 	},
 };
-use pallet_linked_list::Position;
+use linked_list_interface::Position;
 use pusd_primitives::{OnBranchLifecycle, ProvidePrice};
 
 impl<T: Config> Pallet<T> {
