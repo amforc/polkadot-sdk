@@ -104,7 +104,7 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		outstanding_before: BalanceOf<T>,
 		outstanding_after: BalanceOf<T>,
-	) -> Result<(), DispatchError> {
+	) -> DispatchResult {
 		if outstanding_before == outstanding_after {
 			return Ok(());
 		}
@@ -141,8 +141,8 @@ impl<T: Config> Pallet<T> {
 		debt: BalanceOf<T>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
-	) -> Result<(), DispatchError> {
-		let cr = collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+	) -> DispatchResult {
+		let cr = collateralization_ratio(collateral, debt, price)
 			.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
 		ensure!(
 			cr >= config.initial_collateralization_ratio,
@@ -159,8 +159,8 @@ impl<T: Config> Pallet<T> {
 		debt: BalanceOf<T>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
-	) -> Result<(), DispatchError> {
-		let cr = collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+	) -> DispatchResult {
+		let cr = collateralization_ratio(collateral, debt, price)
 			.ok_or(Error::<T>::CollateralizationRatioTooHealthy)?;
 		ensure!(
 			cr < config.minimum_collateralization_ratio,
@@ -176,8 +176,8 @@ impl<T: Config> Pallet<T> {
 		debt: BalanceOf<T>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
-	) -> Result<(), DispatchError> {
-		let cr = collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+	) -> DispatchResult {
+		let cr = collateralization_ratio(collateral, debt, price)
 			.ok_or(Error::<T>::CollateralizationRatioTooLow)?;
 		ensure!(
 			cr >= config.minimum_collateralization_ratio,
@@ -240,9 +240,8 @@ impl<T: Config> Pallet<T> {
 		// `Frozen { OracleFailure }`; report `Frozen` to observers even before
 		// that poke lands, rather than defaulting to the most permissive mode
 		// while prices are unknowable.
-		let price = match T::Oracle::provide_price(collateral_id) {
-			Ok(price) => price,
-			Err(_) => return Ok(BranchMode::Frozen),
+		let Ok(price) = T::Oracle::provide_price(collateral_id) else {
+			return Ok(BranchMode::Frozen);
 		};
 		let tcr = Self::compute_tcr(&branch.state, price, now)?;
 		if tcr < branch.config.safety_collateralization_ratio {
@@ -256,7 +255,7 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn validate_rate(
 		config: &BranchConfig<BalanceOf<T>>,
 		rate: FixedU128,
-	) -> Result<(), DispatchError> {
+	) -> DispatchResult {
 		if rate < config.minimum_borrow_rate || rate > config.maximum_borrow_rate {
 			return Err(Error::<T>::RateOutOfBounds.into());
 		}
@@ -271,7 +270,7 @@ impl<T: Config> Pallet<T> {
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		pre_tcr: FixedU128,
 		post_tcr: FixedU128,
-	) -> Result<(), DispatchError> {
+	) -> DispatchResult {
 		if state.is_frozen() {
 			return Err(Error::<T>::BranchFrozen.into());
 		}
@@ -325,7 +324,7 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		required: AdminLevel,
-	) -> Result<(), DispatchError> {
+	) -> DispatchResult {
 		if let Err(origin) = T::ForceOrigin::try_origin(origin) {
 			let who = ensure_signed(origin)?;
 			Self::ensure_branch_admin(&who, collateral_id, stable_id, required)?;
@@ -740,9 +739,7 @@ impl<T: Config> Pallet<T> {
 	/// measures. Failures roll back and are swallowed — the walk charges
 	/// attempts, not outcomes.
 	pub(crate) fn idle_branch_step(collateral_id: &CollateralIdOf<T>, stable_id: &StableIdOf<T>) {
-		let _ = with_storage_layer::<(), DispatchError, _>(|| {
-			Self::do_refresh_branch(collateral_id, stable_id)
-		});
+		let _ = with_storage_layer(|| Self::do_refresh_branch(collateral_id, stable_id));
 	}
 
 	/// Resume the flat vault-refresh walk at [`IdleCursor`] until the meter
@@ -760,7 +757,7 @@ impl<T: Config> Pallet<T> {
 			T::WeightInfo::on_idle_one_vault(),
 			iter,
 			|(collateral_id, stable_id, owner)| {
-				Self::idle_vault_step(collateral_id, stable_id, owner)
+				Self::idle_vault_step(collateral_id, stable_id, owner);
 			},
 		);
 		match pass {
@@ -784,7 +781,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) {
-		let _ = with_storage_layer::<(), DispatchError, _>(|| {
+		let _ = with_storage_layer(|| {
 			BranchOp::<T>::refresh_vault(collateral_id.clone(), stable_id.clone(), owner)
 		});
 	}

@@ -1,4 +1,4 @@
-//! Storage and value types for `pallet-vaults`.
+//! Types stored or exposed by the Vaults pallet.
 
 use crate::{math, Millis};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
@@ -9,54 +9,55 @@ use frame::arithmetic::{
 pub use pusd_primitives::{BranchMode, StableListId as VaultListId, VaultStatus};
 use scale_info::TypeInfo;
 
-/// Reason the branch was put into `Frozen` mode.
+/// Reason a market is frozen.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrozenReason {
+	/// The oracle has no valid price.
 	OracleFailure,
+	/// An authorized origin froze the market.
 	Governance,
 }
 
-/// Stored `Frozen` state attached to [`BranchState`] while frozen.
+/// Stored state for a frozen market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FrozenState {
+	/// Why the market is frozen.
 	pub reason: FrozenReason,
+	/// Time when the freeze began.
 	pub entered_at: Millis,
 }
 
-/// Side of a market an asset is used on. The pallet mints a market's
-/// stablecoin permissionlessly, so an asset holding the `Stable` role must
-/// never simultaneously be trusted as collateral (in any market), else its
-/// owner could mint unbacked collateral. The two roles are therefore mutually
-/// exclusive for as long as any market references the asset.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Debug)]
+/// Role of an asset in registered markets.
+///
+/// An asset cannot be both collateral and stable.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssetRole {
+	/// The asset backs stable debt.
 	Collateral,
+	/// The asset is minted when debt is created.
 	Stable,
 }
 
-/// Reference-counted role record for `AssetRoles`: which side the asset is
-/// used on and how many registered markets currently reference it there. The
-/// entry exists exactly while `markets > 0`, so a role check is one storage
-/// read regardless of how many markets are registered.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Debug)]
+/// Role and market count for an asset.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Eq, Debug)]
 pub struct AssetRoleUsage {
+	/// Role shared by all market references.
 	pub role: AssetRole,
+	/// Number of markets using the asset in this role.
 	pub markets: u32,
 }
 
-/// Per-collateral systemic risk record: the governance-set hard cap and the
-/// stored debt aggregate it binds, kept in one record so the borrow-path
-/// ceiling check is a single read.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Default)]
+/// Global debt state for one collateral asset.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Eq, Default)]
 pub struct CollateralRisk<Balance> {
-	/// Hard cap on total debt across the collateral's markets, valued in the
-	/// collateral's own unit. The default `0` doubles as the collateral
-	/// allow-list: a collateral can host markets but cannot be borrowed
-	/// against until governance sets a non-zero ceiling.
+	/// Maximum debt across all markets using this collateral.
+	///
+	/// The value is measured in collateral units. Zero blocks new debt.
 	pub debt_ceiling: Balance,
-	/// `Σ BranchDebt::outstanding()` over the collateral's markets — a
-	/// derived index over the registry, maintained by the audited
-	/// `commit_branch` boundary.
+	/// Current debt across all markets using this collateral.
+	///
+	/// This value is derived from the market records. Stable assets are counted at the same unit
+	/// value.
 	pub outstanding: Balance,
 }
 
@@ -67,115 +68,135 @@ impl<Balance: Zero> CollateralRisk<Balance> {
 	}
 }
 
-/// Debt split by bucket: the state tracked on a vault row, and equally the
-/// shape of a cancelled portion of it (a payment is itself a debt breakdown).
+/// Principal and interest stored for a vault.
+///
+/// [`Self::cancel`] returns the cancelled amount in the same form.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct VaultDebt<Balance> {
+	/// Borrowed stable assets that have not been repaid.
 	pub principal: Balance,
+	/// Interest and fees that have not been repaid.
 	pub interest: Balance,
 }
 
 impl<Balance: Ord + Saturating + Copy> VaultDebt<Balance> {
+	/// Returns principal plus interest.
 	pub fn total(&self) -> Balance {
 		self.principal.saturating_add(self.interest)
 	}
 
-	/// Cancel up to `amount`, interest first, returning the cancelled split.
+	/// Removes up to `amount`, paying interest before principal.
+	///
+	/// Returns the amount removed from each field.
 	pub fn cancel(&mut self, amount: Balance) -> Self {
 		let interest = core::cmp::min(amount, self.interest);
 		self.interest = self.interest.saturating_sub(interest);
 		let remaining = amount.saturating_sub(interest);
 		let principal = core::cmp::min(remaining, self.principal);
 		self.principal = self.principal.saturating_sub(principal);
-		Self { interest, principal }
+		Self { principal, interest }
 	}
 }
 
-/// Snapshot of branch redistribution accumulators stamped at vault open and
-/// re-stamped whenever pending redistribution is applied.
+/// Snapshot of the market redistribution totals.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RedistributionSnapshot {
+	/// Cumulative collateral assigned per unit of stake.
 	pub collateral_per_stake: FixedU128,
+	/// Cumulative debt assigned per unit of stake.
 	pub debt_per_stake: FixedU128,
+	/// Cumulative market time multiplied by debt per unit of stake.
 	pub debt_time_per_stake: FixedU128,
+	/// Cumulative rate-weighted debt assigned per unit of stake.
 	pub weight_per_stake: FixedU128,
 }
 
-/// Per-vault state.
-///
-/// `collateral` is this market's collateral for the owner: the share of the
-/// owner's `VaultCollateral` hold attributable to this `(collateral, stable)`
-/// market. The owner's hold is shared across every stablecoin they back with
-/// the same collateral asset, so the hold alone cannot represent one market's
-/// collateral — the row carries it. It tracks the collateral in every
-/// lifecycle state, `FinalRecovery` included.
-///
-/// `redistribution_stake` mirrors the vault's *current* eligible collateral:
-/// it equals `collateral` while the vault is `Active` or `Dormant` and is zero
-/// while the vault is in `FinalRecovery` (where `collateral` itself persists).
-/// It is refreshed after every op that changes collateral or eligibility,
-/// always after pending redistribution has been applied, so
-/// `BranchStakes.total == Σ vault.redistribution_stake` over the live eligible
-/// set.
+/// State of one vault.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct Vault<Balance> {
+	/// Collateral assigned to this market.
+	///
+	/// The owner's on-chain hold may also back vaults in other stable-asset markets.
 	pub collateral: Balance,
+	/// Current principal and interest.
 	pub debt: VaultDebt<Balance>,
+	/// Annual interest rate chosen by the owner.
 	pub annual_rate: FixedU128,
+	/// Market interest time of the last vault update.
 	pub last_interest_time: Millis,
+	/// Wall-clock time of the last rate change.
 	pub last_rate_update: Millis,
+	/// Collateral used as redistribution stake.
+	///
+	/// This is zero during final recovery and otherwise equals [`Self::collateral`].
 	pub redistribution_stake: Balance,
+	/// Redistribution totals applied by the last vault update.
 	pub redistribution_snapshot: RedistributionSnapshot,
 }
 
 impl<Balance> Vault<Balance> {
-	/// Whether the rate-adjustment cooldown has elapsed. A rate change is free of
-	/// the upfront fee once `rate_adjustment_cooldown` has passed since the last
-	/// one.
+	/// Returns whether the rate-change cooldown has passed.
 	pub(crate) fn cooldown_elapsed(&self, config: &BranchConfig<Balance>, now: Millis) -> bool {
 		now.saturating_sub(self.last_rate_update) >= config.rate_adjustment_cooldown
 	}
 }
 
-/// Branch governance/risk parameters.
+/// Risk parameters for one market.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct BranchConfig<Balance> {
+	/// Ratio below which a vault may be liquidated or moved into final recovery.
 	pub minimum_collateralization_ratio: FixedU128,
+	/// Minimum vault ratio after borrowing or withdrawing collateral.
 	pub initial_collateralization_ratio: FixedU128,
+	/// Market ratio below which safety mode begins.
 	pub safety_collateralization_ratio: FixedU128,
+	/// Maximum market debt and upper bound for the automatic debt limit.
 	pub debt_ceiling: Balance,
+	/// Minimum debt for an active vault.
 	pub minimum_debt: Balance,
+	/// Minimum collateral required to open a vault.
 	pub minimum_collateral: Balance,
+	/// Lowest annual rate allowed for a vault.
 	pub minimum_borrow_rate: FixedU128,
+	/// Highest annual rate allowed for a vault.
 	pub maximum_borrow_rate: FixedU128,
+	/// Time period used to calculate upfront fees.
 	pub upfront_fee_period: Millis,
+	/// Minimum time between rate changes that do not charge an upfront fee.
 	pub rate_adjustment_cooldown: Millis,
+	/// Collateral penalty applied during liquidation.
 	pub redistribution_penalty: Permill,
-	/// Autoline headroom above current debt. `0` disables the autoline, leaving
-	/// `debt_ceiling` as the static borrow cap.
+	/// Headroom above current debt for the automatic debt limit.
+	///
+	/// Zero disables automatic updates.
 	pub ceiling_gap: Balance,
-	/// Minimum time between autoline ceiling increases (slow-up gate).
+	/// Minimum time between automatic debt-limit increases.
 	pub ceiling_ttl: Millis,
 }
 
-/// Debt and interest aggregates for one collateral branch.
+/// Debt totals for one market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug, Default)]
 pub struct BranchDebt<Balance> {
+	/// Principal stored across all vaults.
 	pub principal: Balance,
+	/// Interest and fees minted by the market and not yet repaid.
 	pub minted_interest: Balance,
+	/// Liquidated principal waiting to be applied to vaults.
 	pub pending_redistribution_principal: Balance,
+	/// Debt that is not backed by a vault.
 	pub bad_debt: Balance,
+	/// Rate-weighted principal used for aggregate interest.
+	///
+	/// This includes pending redistributed debt at the market's average rate.
 	pub weighted_principal_sum: Balance,
+	/// Market interest time of the last aggregate interest update.
 	pub last_interest_time: Millis,
 }
 
 impl<Balance: FixedPointOperand + Saturating> BranchDebt<Balance> {
-	/// Total outstanding stable liability: principal, minted interest, pending
-	/// redistribution principal, and socialized bad debt. The canonical measure
-	/// of a branch's stable exposure, used by the global debt ceiling and the
-	/// market-emptiness check.
+	/// Returns all debt owed by the market.
 	pub fn outstanding(&self) -> Balance {
 		self.principal
 			.saturating_add(self.minted_interest)
@@ -184,46 +205,52 @@ impl<Balance: FixedPointOperand + Saturating> BranchDebt<Balance> {
 	}
 }
 
-/// Current-collateral redistribution stake totals for one collateral branch.
+/// Redistribution stake totals for one market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug, Default)]
 pub struct BranchStakes<Balance> {
+	/// Total stake of eligible vaults.
 	pub total: Balance,
+	/// Sum of each vault's annual rate multiplied by its stake.
 	pub weighted_sum: Balance,
 }
 
-/// Per-branch accounting state.
+/// Accounting state for one market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct BranchState<AccountId, Balance> {
+	/// Total collateral held by vault owners or waiting for redistribution.
 	pub total_collateral: Balance,
+	/// Market debt totals.
 	pub debt: BranchDebt<Balance>,
+	/// Market redistribution stake totals.
 	pub stakes: BranchStakes<Balance>,
-	/// Debt that exists at the branch level but cannot be attributed to any
-	/// specific vault (per-stake flooring residue from a redistribution).
-	/// Swept into `bad_debt` when the branch empties of liability.
+	/// Redistribution debt lost to per-stake rounding.
+	///
+	/// This becomes bad debt when no vault liability remains.
 	pub ownerless_debt: Balance,
-	/// Collateral that sits on the redistribution account but cannot be
-	/// attributed; bookkeeping only, since the physical balance is already
-	/// held there.
+	/// Redistribution collateral lost to per-stake rounding.
 	pub ownerless_collateral: Balance,
+	/// Current redistribution totals.
 	pub redistribution: RedistributionSnapshot,
-	/// Wall-clock origin of the branch's interest timebase, shifted forward by
-	/// every completed frozen window. Interest accrues in `interest_time(now)`
-	/// units rather than raw wall-clock time so that freezing a branch suspends
-	/// accrual without ever rewinding the clock. See [`Self::interest_time`].
+	/// Wall-clock origin used to calculate market interest time.
+	///
+	/// Frozen periods move this value forward so interest does not accrue while frozen.
 	pub interest_epoch: Millis,
+	/// Dormant vault that must be redeemed before the rate list.
 	pub dormant_redemption_target: Option<AccountId>,
+	/// Frozen state, if the market is frozen.
 	pub frozen: Option<FrozenState>,
-	/// Autoline current line — the self-adjusting borrow cap, maintained while
-	/// `ceiling_gap > 0` and bounded above by `debt_ceiling` (the line max).
+	/// Current automatic debt limit.
+	///
+	/// This value cannot exceed [`BranchConfig::debt_ceiling`].
 	pub effective_ceiling: Balance,
-	/// When `effective_ceiling` last increased; gates the slow-up.
+	/// Time when the automatic debt limit last increased.
 	pub ceiling_last_inc: Millis,
 }
 
 impl<AccountId, Balance: Default + Zero + Ord + Copy> BranchState<AccountId, Balance> {
-	/// A fresh market's state at registration time. The autoline starts at its
-	/// headroom (capped by the line max) when enabled, else at the static
-	/// ceiling.
+	/// Creates empty state for a new market.
+	///
+	/// The automatic debt limit starts at its gap or at the market debt limit, whichever is lower.
 	pub fn fresh(config: &BranchConfig<Balance>, now: Millis) -> Self {
 		let effective_ceiling = if config.ceiling_gap.is_zero() {
 			config.debt_ceiling
@@ -247,10 +274,14 @@ impl<AccountId, Balance: Default + Zero + Ord + Copy> BranchState<AccountId, Bal
 }
 
 impl<AccountId, Balance> BranchState<AccountId, Balance> {
+	/// Returns whether the market is frozen.
 	pub fn is_frozen(&self) -> bool {
 		self.frozen.is_some()
 	}
 
+	/// Returns market interest time at `now`.
+	///
+	/// Time before market creation and time spent frozen are excluded.
 	pub fn interest_time(&self, now: Millis) -> Millis {
 		let current_frozen =
 			self.frozen.as_ref().map_or(0, |state| now.saturating_sub(state.entered_at));
@@ -259,16 +290,16 @@ impl<AccountId, Balance> BranchState<AccountId, Balance> {
 }
 
 impl<AccountId: PartialEq, Balance> BranchState<AccountId, Balance> {
-	/// Clear the single dormant redemption slot, but only if it currently points
-	/// at `owner`. No-op otherwise.
+	/// Clears the dormant redemption target if it matches `owner`.
 	pub fn release_dormant_target(&mut self, owner: &AccountId) {
 		if self.dormant_redemption_target.as_ref() == Some(owner) {
 			self.dormant_redemption_target = None;
 		}
 	}
 
-	/// Park `owner` in the dormant redemption slot, returning `false` (without
-	/// mutating) when a *different* debt-bearing vault already holds it.
+	/// Sets `owner` as the dormant redemption target.
+	///
+	/// Returns `false` if another owner already holds the slot.
 	pub fn try_park_dormant_target(&mut self, owner: AccountId) -> bool {
 		match &self.dormant_redemption_target {
 			Some(existing) if existing != &owner => false,
@@ -281,7 +312,7 @@ impl<AccountId: PartialEq, Balance> BranchState<AccountId, Balance> {
 }
 
 impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, Balance> {
-	/// Add a vault's full contribution to branch debt/stake aggregates.
+	/// Adds a vault to the market totals.
 	pub fn attach_vault(&mut self, vault: &Vault<Balance>) {
 		let rate_x_debt = vault.annual_rate.saturating_mul_int(vault.debt.principal);
 		let rate_x_stake = vault.annual_rate.saturating_mul_int(vault.redistribution_stake);
@@ -293,13 +324,9 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 		self.stakes.total = self.stakes.total.saturating_add(vault.redistribution_stake);
 	}
 
-	/// Subtract a vault's full contribution from the branch aggregates.
+	/// Removes a vault from the market totals.
 	///
-	/// Mirrors the addition done at vault open: every writer that mutates
-	/// `(debt.principal, debt.interest, redistribution_stake)` for a vault must
-	/// keep this sum-of-contributions invariant intact, so removal is the
-	/// exact inverse — recompute the same `(rate * debt, rate * stake)`
-	/// products and subtract.
+	/// This is the exact inverse of [`Self::attach_vault`].
 	pub fn detach_vault(&mut self, vault: &Vault<Balance>) {
 		let rate_x_debt = vault.annual_rate.saturating_mul_int(vault.debt.principal);
 		let rate_x_stake = vault.annual_rate.saturating_mul_int(vault.redistribution_stake);
@@ -311,16 +338,19 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 		self.stakes.total = self.stakes.total.saturating_sub(vault.redistribution_stake);
 	}
 
+	/// Adds collateral to the market total.
 	pub fn add_collateral(&mut self, amount: Balance) {
 		self.total_collateral = self.total_collateral.saturating_add(amount);
 	}
 
+	/// Removes collateral from the market total.
 	pub fn remove_collateral(&mut self, amount: Balance) {
 		self.total_collateral = self.total_collateral.saturating_sub(amount);
 	}
 
-	/// Apply a debt payment to the branch aggregates. `principal_after` is the
-	/// paying vault's principal *after* `VaultDebt::cancel` ran.
+	/// Applies a vault payment to the market totals.
+	///
+	/// `principal_after` is the vault principal after [`VaultDebt::cancel`].
 	pub fn apply_debt_payment(
 		&mut self,
 		payment: VaultDebt<Balance>,
@@ -337,6 +367,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 			.saturating_add(rate.saturating_mul_int(principal_after));
 	}
 
+	/// Replaces a vault's rate-weighted debt and stake.
 	pub fn change_vault_rate(
 		&mut self,
 		old_rate: FixedU128,
@@ -356,11 +387,9 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 			.saturating_add(new_rate.saturating_mul_int(stake));
 	}
 
-	/// Set a vault's redistribution stake after collateral or eligibility has
-	/// changed, swapping its contribution in the branch stake aggregates.
-	/// Mutates the row and the aggregates together so
-	/// `stakes.total == Σ vault.redistribution_stake` cannot drift. The vault
-	/// rate is unchanged here; rate moves go through [`Self::change_vault_rate`].
+	/// Sets a vault's redistribution stake and updates the market totals.
+	///
+	/// The vault rate is not changed.
 	pub fn set_vault_stake(&mut self, vault: &mut Vault<Balance>, new_stake: Balance) {
 		let old_stake = vault.redistribution_stake;
 		self.stakes.total = self.stakes.total.saturating_sub(old_stake).saturating_add(new_stake);
@@ -372,14 +401,10 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 		vault.redistribution_stake = new_stake;
 	}
 
-	/// Fold `principal` of pending redistributed debt into `vault` at its own
-	/// rate, mutating the vault row and the branch aggregates together.
+	/// Moves redistributed principal into a vault.
 	///
-	/// Redistribution recorded the debt at the branch-average rate (see
-	/// [`Self::record_redistribution`]); on touch, the receiving vault re-prices
-	/// its share at its own `annual_rate`, so the average-rate weighting
-	/// accumulated since the vault's snapshot (`weight_per_stake` delta) is
-	/// swapped out for the vault's own-rate contribution.
+	/// Redistribution first uses the market's average rate. This method replaces that weighting
+	/// with the receiving vault's rate.
 	pub fn absorb_redistributed_debt(&mut self, vault: &mut Vault<Balance>, principal: Balance) {
 		self.debt.pending_redistribution_principal =
 			self.debt.pending_redistribution_principal.saturating_sub(principal);
@@ -400,40 +425,38 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 			.saturating_add(vault.annual_rate.saturating_mul_int(vault.debt.principal));
 	}
 
-	/// True when no debt-bearing or stake-bearing vault row remains attached
-	/// (branch principal, stake, and pending redistribution all zero). Interest
-	/// drift and bad debt may still remain to be swept, and collateral may still
-	/// sit in the redistribution account; this marks the last-vault *settlement*
-	/// point. For the *removal* precondition use [`Self::is_removable`].
+	/// Returns whether no vault liability remains.
+	///
+	/// Other debt or collateral may still remain. Use [`Self::is_removable`] before removing the
+	/// market.
 	pub fn is_empty_of_liability(&self) -> bool {
 		self.debt.principal.is_zero() &&
 			self.stakes.total.is_zero() &&
 			self.debt.pending_redistribution_principal.is_zero()
 	}
 
-	/// True when the market carries no residual liability at all: no debt
-	/// (principal, minted interest, pending redistribution, or socialized bad
-	/// debt), no stake, and no collateral still locked in the redistribution
-	/// account. The precondition for removing the market.
+	/// Returns whether the market has no debt, stake, or collateral.
 	pub fn is_removable(&self) -> bool {
 		self.debt.outstanding().is_zero() &&
 			self.stakes.total.is_zero() &&
 			self.total_collateral.is_zero()
 	}
 
-	/// Record unbacked circulating debt against the branch ledger.
+	/// Adds bad debt to the market.
 	pub fn record_bad_debt(&mut self, amount: Balance) {
 		self.debt.bad_debt = self.debt.bad_debt.saturating_add(amount);
 	}
 
-	/// Burn recorded bad debt (saturating; callers cap `amount` at
-	/// `debt.bad_debt` where exactness matters).
+	/// Removes bad debt from the market.
+	///
+	/// The subtraction saturates at zero.
 	pub fn heal_bad_debt(&mut self, amount: Balance) {
 		self.debt.bad_debt = self.debt.bad_debt.saturating_sub(amount);
 	}
 
-	/// Sweep the orphan debt counters into `bad_debt`, returning the swept
-	/// amount.
+	/// Moves ownerless debt and remaining interest into bad debt.
+	///
+	/// Returns the amount moved.
 	pub fn sweep_orphan_debt(&mut self) -> Balance {
 		let orphan = self.debt.minted_interest.saturating_add(self.ownerless_debt);
 		self.debt.minted_interest = Balance::zero();
@@ -444,14 +467,10 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 }
 
 impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance> {
-	/// Fold one liquidation's redistribution into the branch accumulators.
+	/// Records debt and collateral redistributed by one liquidation.
 	///
-	/// The redistributed debt is recorded at the branch-average rate (its
-	/// weighting is corrected to each recipient's own rate when the recipient
-	/// absorbs its share, see [`Self::absorb_redistributed_debt`]). Per-stake
-	/// flooring residue lands in the ownerless buckets. Returns `None`
-	/// when a per-stake increment overflows; the accumulators are only written
-	/// once every increment has been validated.
+	/// Debt is first weighted at the market's average rate. Rounding remains in the ownerless
+	/// fields. Returns `None` if an accumulator would overflow.
 	pub fn record_redistribution(
 		&mut self,
 		redistributed_debt: Balance,
@@ -464,7 +483,7 @@ impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance
 			math::redistribution_per_stake(redistributed_collateral, self.stakes.total)?;
 		let weight_per_stake =
 			math::redistribution_weight_per_stake(redistributed_debt, avg_rate, self.stakes.total)?;
-		// Must match `pending_touch_for`'s interest-time origin.
+		// Use the same market clock as `pending_touch_for`.
 		let now_fp = FixedU128::saturating_from_integer(self.interest_time(now));
 		let debt_time_increment = now_fp.checked_mul(&debt_per_stake)?;
 
@@ -500,30 +519,44 @@ impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance
 	}
 }
 
-/// Atomic update to a single field of `BranchConfig`.
+/// Update to one market parameter.
 #[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub enum BranchConfigUpdate<Balance> {
+	/// Sets the liquidation and final recovery ratio.
 	MinimumCollateralizationRatio(FixedU128),
+	/// Sets the ratio required after borrowing or withdrawing collateral.
 	InitialCollateralizationRatio(FixedU128),
+	/// Sets the market safety-mode ratio.
 	SafetyCollateralizationRatio(FixedU128),
+	/// Sets the maximum market debt.
 	DebtCeiling(Balance),
+	/// Sets the minimum debt for an active vault.
 	MinimumDebt(Balance),
+	/// Sets the minimum collateral required to open a vault.
 	MinimumCollateral(Balance),
+	/// Sets the allowed annual rate range.
 	BorrowRateBounds {
+		/// Lowest allowed rate.
 		min: FixedU128,
+		/// Highest allowed rate.
 		max: FixedU128,
 	},
+	/// Sets the period used to calculate upfront fees.
 	UpfrontFeePeriod(Millis),
+	/// Sets the rate-change cooldown.
 	RateAdjustmentCooldown(Millis),
+	/// Sets the collateral penalty applied during liquidation.
 	RedistributionPenalty(Permill),
-	/// Autoline headroom above current debt. `0` disables the autoline,
-	/// pinning the borrow cap to the static `debt_ceiling`.
+	/// Sets headroom for the automatic debt limit.
+	///
+	/// Zero disables automatic updates.
 	CeilingGap(Balance),
-	/// Minimum time between autoline ceiling increases (the slow-up gate).
+	/// Sets the delay between automatic debt-limit increases.
 	CeilingTtl(Millis),
 }
 
 impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
+	/// Applies this update to `config`.
 	pub fn apply_to(self, config: &mut BranchConfig<Balance>) {
 		match self {
 			Self::MinimumCollateralizationRatio(v) => config.minimum_collateralization_ratio = v,
@@ -544,9 +577,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 		}
 	}
 
-	/// Admin tier required to apply this update. The risk parameters an
-	/// `Emergency` admin may tighten are `Emergency`-gated; the rest are
-	/// `Full`-only.
+	/// Returns the administrator role required for this update.
 	pub fn required_level(&self) -> AdminLevel {
 		match self {
 			Self::MinimumCollateralizationRatio(_) |
@@ -564,10 +595,9 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 		}
 	}
 
-	/// Whether applying this update to `config` is risk-reducing: raising a
-	/// collateralization floor, lowering the debt ceiling, or narrowing the rate
-	/// band. Only consulted for `Emergency`-tier callers; `Full`-only variants
-	/// (never reached by an `Emergency` admin) report `true`.
+	/// Returns whether this update only reduces risk.
+	///
+	/// A defensive update raises ratio limits, lowers the debt limit, or narrows the rate range.
 	pub fn is_defensive(&self, config: &BranchConfig<Balance>) -> bool {
 		match self {
 			Self::MinimumCollateralizationRatio(v) => *v >= config.minimum_collateralization_ratio,
@@ -582,34 +612,32 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 	}
 }
 
-/// Governance envelope a permissionless market's config must sit inside.
-///
-/// Markets sharing a collateral share its risk, so a creator's `Full` autonomy
-/// is bounded by these floors and ceilings — validated at `create_branch` and
-/// on every `set_param` update. The per-collateral debt-ceiling gate
-/// (governance's collateral allow-list, see [`CollateralRisk`]) is enforced
-/// separately on the borrow path.
+/// Global limits for market configuration.
 pub struct BranchConfigGuard<Balance> {
+	/// Lowest allowed liquidation and final recovery ratio.
 	pub min_minimum_collateralization_ratio: FixedU128,
+	/// Lowest allowed ratio after borrowing or withdrawing collateral.
 	pub min_initial_collateralization_ratio: FixedU128,
+	/// Lowest allowed market safety-mode ratio.
 	pub min_safety_collateralization_ratio: FixedU128,
+	/// Lowest allowed minimum debt.
 	pub min_minimum_debt: Balance,
+	/// Lowest allowed minimum collateral.
 	pub min_minimum_collateral: Balance,
+	/// Highest allowed annual rate.
 	pub max_borrow_rate: FixedU128,
-	/// Cap on a market's static `debt_ceiling` (the autoline `line_max`).
+	/// Highest allowed market debt limit.
 	pub max_branch_line: Balance,
-	/// Cap on the autoline headroom a market may keep above its current debt.
-	/// Bounds how large a single ceiling step can be.
+	/// Highest allowed headroom for the automatic debt limit.
 	pub max_ceiling_gap: Balance,
-	/// Floor on the minimum time between autoline ceiling increases. Bounds how
-	/// fast a market may ratchet its ceiling up.
+	/// Shortest allowed delay between automatic debt-limit increases.
 	pub min_ceiling_ttl: Millis,
 }
 
 impl<Balance: PartialOrd + Copy + Zero> BranchConfigGuard<Balance> {
-	/// Whether `config` sits within the envelope (ratios at or above the floors,
-	/// rate and line at or below the ceilings). The autoline slow-up floor
-	/// (`min_ceiling_ttl`) only binds when the autoline is enabled (`ceiling_gap > 0`).
+	/// Returns whether `config` is within the global limits.
+	///
+	/// The minimum increase delay applies only when automatic debt-limit updates are enabled.
 	pub fn permits(&self, config: &BranchConfig<Balance>) -> bool {
 		config.minimum_collateralization_ratio >= self.min_minimum_collateralization_ratio &&
 			config.initial_collateralization_ratio >= self.min_initial_collateralization_ratio &&
@@ -623,32 +651,28 @@ impl<Balance: PartialOrd + Copy + Zero> BranchConfigGuard<Balance> {
 	}
 }
 
-/// Per-market admin authorization tier.
-///
-/// `Full` may move any parameter within the [`BranchConfigGuard`] envelope and
-/// remove an empty market. `Emergency` may only take risk-reducing actions:
-/// freeze, raise collateralization thresholds, lower the debt ceiling, or reduce
-/// the max borrow rate.
+/// Administrator role for one market.
 #[derive(Clone, Copy)]
 pub enum AdminLevel {
+	/// May manage all market settings and lifecycle actions.
 	Full,
+	/// May freeze the market or reduce risk.
 	Emergency,
 }
 
-/// The two admins of a market, bundled so the same-typed `full_admin` and
-/// `emergency_admin` cannot be silently swapped at a call site.
+/// Administrator accounts for one market.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct BranchAdmins<AccountId> {
-	/// May move any param within the envelope and remove an empty market.
+	/// Account with full control of the market.
 	pub full_admin: AccountId,
-	/// May only take risk-reducing actions (freeze, tighten).
+	/// Account allowed to freeze the market or reduce risk.
 	pub emergency_admin: AccountId,
 }
 
 impl<AccountId> BranchAdmins<AccountId> {
-	/// Resolve both admins through `f`, preserving the full/emergency pairing.
+	/// Maps both accounts with `f` while preserving their roles.
 	pub fn try_map<Target, E>(
 		self,
 		f: impl Fn(AccountId) -> Result<Target, E>,
@@ -660,18 +684,18 @@ impl<AccountId> BranchAdmins<AccountId> {
 	}
 }
 
-/// Everything a registered `(collateral, stable)` market carries, in one
-/// record: created whole by `create_branch`, torn down whole by
-/// `remove_branch`, so a partially registered market is unrepresentable. The
-/// deposit stays keyed by the depositor *account* regardless of who admins
-/// the market.
+/// Complete record for one registered market.
+///
+/// It is created and removed as one record.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub struct Branch<AccountId, Balance, Consideration> {
-	/// Governance/risk parameters, moved only through `set_param`.
+	/// Market risk parameters.
 	pub config: BranchConfig<Balance>,
-	/// Hot accounting state, rewritten by every vault operation.
+	/// Market accounting state.
 	pub state: BranchState<AccountId, Balance>,
+	/// Market administrator accounts.
 	pub admins: BranchAdmins<AccountId>,
+	/// Creator and refundable deposit, if one was charged.
 	pub deposit: Option<(AccountId, Consideration)>,
 }
 
@@ -704,9 +728,8 @@ mod tests {
 
 	#[test]
 	fn apply_debt_payment_swaps_full_contribution() {
-		// rate = 0.3: floor(0.3 * 10) = 3 and floor(0.3 * 9) = 2. The naive
-		// `floor(rate * delta)` update would subtract floor(0.3 * 1) = 0 and
-		// strand the weighted sum at 3.
+		// The weighted contribution falls from 3 to 2. Subtracting
+		// `floor(rate * payment)` would subtract zero and leave the wrong value.
 		let rate = FixedU128::from_rational(3u128, 10u128);
 		let mut state = make_branch_state(10, 3);
 		state.apply_debt_payment(VaultDebt { interest: 0, principal: 1 }, rate, 9);
@@ -725,10 +748,8 @@ mod tests {
 
 	#[test]
 	fn absorb_redistributed_debt_swaps_avg_rate_weighting_for_own_rate() {
-		// Vault: principal 10 at rate 0.5 → own contribution floor(0.5 · 10) = 5.
-		// Avg-rate weighting accumulated since the snapshot:
-		// (0.3 − 0.1) · stake 10 = 2. Absorbing 3 re-prices the share:
-		// 20 − 2 − 5 + floor(0.5 · 13) = 20 − 2 − 5 + 6 = 19.
+		// Remove 2 of average-rate weight and 5 of old vault weight. Then add 6 for
+		// the new principal: 20 - 2 - 5 + 6 = 19.
 		let rate = FixedU128::from_rational(5u128, 10u128);
 		let mut state = make_branch_state(30, 20);
 		state.debt.pending_redistribution_principal = 6;

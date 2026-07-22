@@ -1,13 +1,9 @@
-//! Pure (storage-free) helpers for the vault math.
+//! Storage-free math helpers for vault accounting.
 //!
-//! All routines round in the protocol's favor unless explicitly stated:
-//! - debt-side accruals round up (`ceil`),
-//! - payouts round down (`floor`).
+//! Aggregate interest and fees round up. Vault interest and redistribution shares round down.
 //!
-//! Overflow paths use the [`Defensive`] family: in `debug_assertions` builds
-//! an overflow panics so it surfaces in tests; in release it logs an error
-//! and saturates. None of the inputs the protocol can produce in practice
-//! drive these intermediates to overflow.
+//! Overflow in non-`Option` helpers triggers a debug failure and saturates in release. `Option`
+//! helpers return `None`.
 
 use frame::{
 	arithmetic::{
@@ -18,10 +14,11 @@ use frame::{
 };
 use pusd_primitives::MILLIS_PER_YEAR;
 
-/// `floor(principal * rate * delta_millis / MILLIS_PER_YEAR)`.
+/// Returns simple interest rounded down.
 ///
-/// Used to attribute simple interest to a vault. See
-/// [`simple_interest_with_rounding`] for the math.
+/// Used for interest assigned to one vault.
+///
+/// The result is `floor(principal * rate * delta_millis / MILLIS_PER_YEAR)`.
 pub fn simple_interest_floor<Balance: FixedPointOperand>(
 	principal: Balance,
 	rate: FixedU128,
@@ -30,10 +27,11 @@ pub fn simple_interest_floor<Balance: FixedPointOperand>(
 	simple_interest_with_rounding(principal, rate, delta_millis, Rounding::Down)
 }
 
-/// `ceil(principal * rate * delta_millis / MILLIS_PER_YEAR)`.
+/// Returns simple interest rounded up.
 ///
-/// Used to mint protocol-favored aggregate interest and upfront fees.
-/// See [`simple_interest_with_rounding`] for the math.
+/// Used for market interest and upfront fees.
+///
+/// The result is `ceil(principal * rate * delta_millis / MILLIS_PER_YEAR)`.
 pub fn simple_interest_ceil<Balance: FixedPointOperand>(
 	principal: Balance,
 	rate: FixedU128,
@@ -42,13 +40,10 @@ pub fn simple_interest_ceil<Balance: FixedPointOperand>(
 	simple_interest_with_rounding(principal, rate, delta_millis, Rounding::Up)
 }
 
-/// Shared back-end for the simple-interest helpers.
+/// Calculates simple interest with the requested rounding.
 ///
-/// Computes `principal * rate * delta_millis / (DIV * MILLIS_PER_YEAR)` in
-/// one shot via [`multiply_by_rational_with_rounding`] — the U256 intermediate
-/// avoids the precision loss of computing `factor = rate * (delta/year)`
-/// first (for typical sub-1.0 rates over short deltas, the intermediate
-/// factor would round to a tiny FixedU128 before we multiplied by principal).
+/// The full formula is evaluated at once. This avoids losing precision in a small intermediate
+/// rate factor.
 fn simple_interest_with_rounding<Balance: FixedPointOperand>(
 	principal: Balance,
 	rate: FixedU128,
@@ -66,10 +61,9 @@ fn simple_interest_with_rounding<Balance: FixedPointOperand>(
 		.defensive_unwrap_or_else(Balance::max_value)
 }
 
-/// Value a stable-denominated `debt` in its collateral's unit: `ceil(debt /
-/// price)`, where `price` follows `ProvidePrice`'s unit contract. Rounds up so the systemic ceiling
-/// never undercounts. Returns `None` on a zero price (undefined) or on
-/// overflow.
+/// Converts stable debt into collateral units, rounded up.
+///
+/// Returns `None` when the price is zero or the result overflows.
 pub fn value_in_collateral<Balance: FixedPointOperand>(
 	debt: Balance,
 	price: FixedU128,
@@ -81,24 +75,15 @@ pub fn value_in_collateral<Balance: FixedPointOperand>(
 		return None;
 	}
 	let d: u128 = debt.unique_saturated_into();
-	// debt / price == debt * DIV / price.into_inner().
+	// Divide by a fixed-point price without losing its scale.
 	multiply_by_rational_with_rounding(d, FixedU128::DIV, price.into_inner(), Rounding::Up)
 		.and_then(|raw| Balance::try_from(raw).ok())
 }
 
-/// `ceil(weighted_sum / total_ib_debt)` reinterpreted as a `FixedU128`
-/// fraction. Returns `One` if `total_ib_debt` is zero, which keeps the
-/// upfront-fee formula safe in branches with no pre-existing debt (the new
-/// vault dominates the post-change average).
+/// Returns the market's average rate, rounded up.
 ///
-/// `weighted_sum = Σ floor(debt_i * rate_i)` and `total_ib_debt = Σ debt_i`.
-/// The honest average rate is therefore `weighted_sum / total_ib_debt`
-/// interpreted as a fraction in `[0, max_rate]`. We compute
-/// `ceil(weighted_sum * 1e18 / total_ib_debt)` via
-/// [`multiply_by_rational_with_rounding`] and reinterpret the result as a
-/// `FixedU128` inner, which (a) avoids the `weighted_sum < total_ib_debt`
-/// integer-truncate trap (typical for sub-1.0 rates), and (b) rounds in the
-/// protocol's favor for the upfront fee.
+/// `weighted_sum` is the sum of each debt multiplied by its rate. Zero debt returns `1.0`, which
+/// keeps the first vault's fee calculation safe.
 pub fn average_branch_rate<Balance: FixedPointOperand>(
 	weighted_sum: Balance,
 	total_ib_debt: Balance,
@@ -113,6 +98,9 @@ pub fn average_branch_rate<Balance: FixedPointOperand>(
 	FixedU128::from_inner(inner)
 }
 
+/// Returns redistributed value per unit of stake, rounded down.
+///
+/// Returns `None` when total stake is zero or the result overflows.
 pub fn redistribution_per_stake<Balance: FixedPointOperand>(
 	num: Balance,
 	denom: Balance,
@@ -120,6 +108,9 @@ pub fn redistribution_per_stake<Balance: FixedPointOperand>(
 	pusd_primitives::mul_div_rate_floor(num, FixedU128::one(), denom)
 }
 
+/// Returns rate-weighted redistributed debt per unit of stake, rounded down.
+///
+/// Returns `None` when total stake is zero or the result overflows.
 pub fn redistribution_weight_per_stake<Balance: FixedPointOperand>(
 	redistributed_debt: Balance,
 	avg_rate: FixedU128,
@@ -142,7 +133,7 @@ mod tests {
 
 	#[test]
 	fn simple_interest_floor_basic() {
-		// principal=1_000_000, rate=10%, delta=full year => 100_000
+		// Ten percent of 1,000,000 over one year is 100,000.
 		let r = FixedU128::saturating_from_rational(10u32, 100u32);
 		let got = simple_interest_floor::<u128>(1_000_000, r, MILLIS_PER_YEAR);
 		assert_eq!(got, 100_000);
@@ -150,29 +141,28 @@ mod tests {
 
 	#[test]
 	fn simple_interest_ceil_rounds_up_on_remainder() {
-		// principal=3, rate=1, delta=1ms — fractional, ceils to 1
+		// A positive fraction rounds up to one.
 		let got = simple_interest_ceil::<u128>(3, FixedU128::one(), 1);
 		assert_eq!(got, 1);
 	}
 
 	#[test]
 	fn average_branch_rate_recovers_rate_fraction() {
-		// Single vault, debt=10_000 at 5% → weighted_sum = 500.
-		// avg_rate = 500 / 10_000 = 0.05.
+		// A weighted value of 500 over 10,000 debt is a 5% rate.
 		let avg = average_branch_rate::<u128>(500, 10_000);
 		assert_eq!(avg, FixedU128::from_rational(5u128, 100u128));
 	}
 
 	#[test]
 	fn average_branch_rate_ceils_in_protocol_favor() {
-		// 700 / 10_000 = 0.07 exactly — no remainder, ceil is the floor.
+		// An exact 7% rate does not need rounding.
 		let avg = average_branch_rate::<u128>(700, 10_000);
 		assert_eq!(avg, FixedU128::from_rational(7u128, 100u128));
 
-		// 1 / 3 has an infinite tail; ceil rounds up by one ULP.
+		// One third rounds up by one smallest fixed-point unit.
 		let avg = average_branch_rate::<u128>(1, 3);
 		assert!(avg > FixedU128::from_rational(1u128, 3u128));
-		// And the over-shoot is bounded by one ULP.
+		// The difference is at most one smallest unit.
 		assert!(
 			avg.saturating_sub(FixedU128::from_rational(1u128, 3u128)) <= FixedU128::from_inner(1)
 		);
@@ -180,15 +170,14 @@ mod tests {
 
 	#[test]
 	fn average_branch_rate_zero_debt_returns_one() {
-		// Empty branch: avg defaults to 1.0 so the upfront-fee formula is
-		// safe for the very first vault.
+		// An empty market uses 1.0 for its first fee calculation.
 		let avg = average_branch_rate::<u128>(0, 0);
 		assert_eq!(avg, FixedU128::one());
 	}
 
 	#[test]
 	fn redistribution_per_stake_round_trips_small_inputs() {
-		// 100 / 1000 = 0.1
+		// 100 divided by 1,000 is 0.1.
 		let got = redistribution_per_stake::<u128>(100, 1_000).expect("fits");
 		assert_eq!(got, FixedU128::from_rational(1u128, 10u128));
 	}
@@ -203,16 +192,14 @@ mod tests {
 	fn redistribution_per_stake_overflow_returns_none() {
 		let got = redistribution_per_stake::<u128>(u128::MAX / 2, 1);
 		assert!(got.is_none());
-		// Just below the overflow threshold still fits.
+		// A value below the overflow limit still fits.
 		let safe = redistribution_per_stake::<u128>(u128::MAX / (FixedU128::DIV * 2), 1);
 		assert!(safe.is_some());
 	}
 
 	#[test]
 	fn redistribution_weight_per_stake_matches_two_step_when_safe() {
-		// redistributed_debt=10_000, avg_rate=0.05, denom=100
-		// → one-shot: floor(10_000 * 0.05_inner / 100) = floor(500 * 1e18 / 100) = 5e18 inner.
-		// Two-step `(10_000 / 100) * 0.05` = 5.0 → inner 5e18. Match.
+		// Both safe calculation paths give 5.0 per unit of stake.
 		let avg = FixedU128::from_rational(5u128, 100u128);
 		let got = redistribution_weight_per_stake::<u128>(10_000, avg, 100).expect("fits");
 		let two_step = FixedU128::from_rational(10_000u128, 100u128).saturating_mul(avg);
@@ -221,12 +208,9 @@ mod tests {
 
 	#[test]
 	fn redistribution_weight_per_stake_avoids_two_step_overflow() {
-		// Pick numbers where the two-step would silently zero via `checked_from_rational`
-		// (num/denom > 3.4e20) but the one-shot stays within u128 because avg_rate
-		// brings the magnitude back down.
-		let avg = FixedU128::from_rational(1u128, u128::from(u64::MAX)); // ~5.4e-20
-																   // redistributed_debt = u128::MAX/4, denom = 1: two-step debt_per_stake would
-																   // overflow. One-shot folds avg_rate (tiny) into the U256 dividend.
+		// The debt-per-stake intermediate would overflow, but the small rate keeps the final value
+		// valid.
+		let avg = FixedU128::from_rational(1u128, u128::from(u64::MAX));
 		let got = redistribution_weight_per_stake::<u128>(u128::MAX / 4, avg, 1);
 		assert!(
 			got.is_some(),
