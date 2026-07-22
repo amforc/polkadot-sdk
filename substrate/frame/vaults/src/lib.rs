@@ -45,8 +45,6 @@ pub mod mock;
 #[cfg(test)]
 mod tests;
 
-use frame::traits::EnsureOriginWithArg;
-
 pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
@@ -55,52 +53,9 @@ pub use types::{
 };
 pub use weights::WeightInfo;
 
-/// [`EnsureOriginWithArg`] recognizing a signed origin of the market's stored
-/// `full_admin` as the authority over the `(collateral_id, stable_id)` argument.
-///
-/// Lets sibling pallets (e.g. redemptions) gate their per-market extrinsics
-/// on the same admin that created the market, without depending on this
-/// pallet's `Config`. Compose a governance override in the runtime via
-/// [`frame::traits::EitherOf`]. Unregistered markets have no admin, so every
-/// origin is rejected for them.
-pub struct EnsureBranchFullAdmin<T>(core::marker::PhantomData<T>);
-impl<T: Config>
-	EnsureOriginWithArg<
-		<T as frame::deps::frame_system::Config>::RuntimeOrigin,
-		(CollateralIdOf<T>, StableIdOf<T>),
-	> for EnsureBranchFullAdmin<T>
-{
-	type Success = ();
-
-	fn try_origin(
-		origin: <T as frame::deps::frame_system::Config>::RuntimeOrigin,
-		(collateral_id, stable_id): &(CollateralIdOf<T>, StableIdOf<T>),
-	) -> Result<Self::Success, <T as frame::deps::frame_system::Config>::RuntimeOrigin> {
-		let Ok(who) = frame::deps::frame_system::ensure_signed(origin.clone()) else {
-			return Err(origin);
-		};
-		Pallet::<T>::ensure_branch_admin(&who, collateral_id, stable_id, types::AdminLevel::Full)
-			.map(|_| ())
-			.map_err(|_| origin)
-	}
-
-	#[cfg(feature = "runtime-benchmarks")]
-	fn try_successful_origin(
-		(collateral_id, stable_id): &(CollateralIdOf<T>, StableIdOf<T>),
-	) -> Result<<T as frame::deps::frame_system::Config>::RuntimeOrigin, ()> {
-		Branches::<T>::get(collateral_id, stable_id)
-			.map(|branch| {
-				frame::deps::frame_system::RawOrigin::Signed(branch.admins.full_admin).into()
-			})
-			.ok_or(())
-	}
-}
-
 /// Runtime-supplied benchmark hooks. The pallet's `Config` only exposes
 /// oracle reads (`ProvidePrice`), clock reads (`Time`), and hold-only
-/// collateral mutation; the helper fills the write side. The hint-repair
-/// budget is read directly from `T::VaultLists::repair_budget()` so it can
-/// never drift from what the linked-list pallet enforces.
+/// collateral mutation; the helper fills the write side.
 #[cfg(feature = "runtime-benchmarks")]
 pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 	/// Returns a collateral asset ID.
@@ -346,6 +301,36 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type BranchIdleCursor<T: Config> =
 		StorageValue<_, (CollateralIdOf<T>, StableIdOf<T>), OptionQuery>;
+
+	/// Accepts a signed origin matching a branch's stored full administrator.
+	///
+	/// Unknown branches and all other origins are rejected. A runtime may compose this with a
+	/// governance origin using [`frame::traits::EitherOf`].
+	pub struct EnsureBranchFullAdmin<T>(core::marker::PhantomData<T>);
+
+	impl<T: Config> EnsureOriginWithArg<OriginFor<T>, (CollateralIdOf<T>, StableIdOf<T>)>
+		for EnsureBranchFullAdmin<T>
+	{
+		type Success = ();
+
+		fn try_origin(
+			origin: OriginFor<T>,
+			(collateral_id, stable_id): &(CollateralIdOf<T>, StableIdOf<T>),
+		) -> Result<Self::Success, OriginFor<T>> {
+			let Ok(who) = ensure_signed(origin.clone()) else { return Err(origin) };
+			Pallet::<T>::ensure_branch_admin(&who, collateral_id, stable_id, AdminLevel::Full)
+				.map(|_| ())
+				.map_err(|_| origin)
+		}
+
+		#[cfg(feature = "runtime-benchmarks")]
+		fn try_successful_origin(
+			(collateral_id, stable_id): &(CollateralIdOf<T>, StableIdOf<T>),
+		) -> Result<OriginFor<T>, ()> {
+			let branch = Branches::<T>::get(collateral_id, stable_id).ok_or(())?;
+			Ok(frame_system::RawOrigin::Signed(branch.admins.full_admin).into())
+		}
+	}
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
