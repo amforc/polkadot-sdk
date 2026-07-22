@@ -6,7 +6,7 @@ use frame::deps::sp_runtime::{
 };
 use scale_info::TypeInfo;
 
-pub use pusd_primitives::VaultStatus;
+pub use pusd_primitives::{Millis, VaultStatus};
 
 /// Head-of-FIFO quote at shared settlement pricing
 /// ([`crate::Pallet::preview_recovery_offset`]).
@@ -32,10 +32,10 @@ pub enum RecoveryOffsetQuote<Balance> {
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
-pub struct RedemptionConfig<Balance, Moment> {
+pub struct RedemptionConfig<Balance> {
 	pub minimum_redemption_amount: Balance,
 	/// Half-life of the decaying dynamic fee.
-	pub dynamic_fee_decay_period: Moment,
+	pub dynamic_fee_decay_period: Millis,
 	pub dynamic_fee_floor: FixedU128,
 	pub dynamic_fee_ceiling: FixedU128,
 	/// Constant fee component every ordinary redemption pays (e.g. 0.5%).
@@ -49,7 +49,7 @@ pub struct RedemptionConfig<Balance, Moment> {
 	pub final_recovery_bonus_buffer: Permill,
 }
 
-impl<Balance: Zero, Moment: Zero> RedemptionConfig<Balance, Moment> {
+impl<Balance: Zero> RedemptionConfig<Balance> {
 	/// Zero thresholds/divisors and inverted ranges break fee and loop semantics.
 	pub fn is_valid(&self) -> bool {
 		if self.minimum_redemption_amount.is_zero() {
@@ -81,9 +81,9 @@ impl<Balance: Zero, Moment: Zero> RedemptionConfig<Balance, Moment> {
 	Debug,
 	Default,
 )]
-pub struct RedemptionState<Moment> {
+pub struct RedemptionState {
 	pub dynamic_fee: FixedU128,
-	pub last_fee_operation: Moment,
+	pub last_fee_operation: Millis,
 }
 
 #[derive(
@@ -260,11 +260,11 @@ where
 /// Shared validation + fee-rate setup for `do_redeem` and `simulate`, so the
 /// preview can never diverge from execution. Execution surfaces the typed
 /// error; preview collapses it to `None`.
-pub(crate) struct RedemptionPreamble<Balance, Moment> {
-	pub(crate) config: RedemptionConfig<Balance, Moment>,
-	pub(crate) state: RedemptionState<Moment>,
+pub(crate) struct RedemptionPreamble<Balance> {
+	pub(crate) config: RedemptionConfig<Balance>,
+	pub(crate) state: RedemptionState,
 	pub(crate) price: FixedU128,
-	pub(crate) now: Moment,
+	pub(crate) now: Millis,
 	pub(crate) decayed: FixedU128,
 	pub(crate) fee_rate: FixedU128,
 }
