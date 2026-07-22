@@ -1059,7 +1059,8 @@ pub mod pallet {
 			Self::do_remove_branch(collateral_id, stable_id)
 		}
 
-		/// Full-admin: reassign the market's admins.
+		/// Full-admin (or [`Config::GlobalManagerOrigin`], bypassing the market's
+		/// admins): reassign the market's admins.
 		#[pallet::call_index(15)]
 		#[pallet::weight(T::WeightInfo::set_branch_admins())]
 		pub fn set_branch_admins(
@@ -1068,24 +1069,7 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			admins: BranchAdmins<PalletsOriginOf<T>>,
 		) -> DispatchResult {
-			Self::ensure_branch_admin(origin, &collateral_id, &stable_id, AdminLevel::Full)?;
-			Branches::<T>::try_mutate_exists(
-				&collateral_id,
-				&stable_id,
-				|maybe| -> Result<(), DispatchError> {
-					let branch = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
-					branch.admins = admins.clone();
-					Ok(())
-				},
-			)?;
-			let BranchAdmins { full_admin, emergency_admin } = admins;
-			Self::deposit_event(Event::BranchAdminChanged {
-				collateral_id,
-				stable_id,
-				full_admin,
-				emergency_admin,
-			});
-			Ok(())
+			Self::do_set_branch_admins(origin, collateral_id, stable_id, admins)
 		}
 
 		/// Permissionless: revive a `Dormant` vault whose fully-accrued debt is
