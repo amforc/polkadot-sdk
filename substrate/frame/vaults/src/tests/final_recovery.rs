@@ -113,7 +113,7 @@ fn exit_final_recovery_rejects_when_cr_still_below_mcr() {
 				1,
 				Position::endpoints_only()
 			),
-			crate::Error::<Test>::UnsafeCollateralizationRatio
+			crate::Error::<Test>::CollateralizationRatioTooLow
 		);
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
 		assert_eq!(crate::Pallet::<Test>::final_recovery_queue_head(DOT, PUSD, 10), alloc::vec![1]);

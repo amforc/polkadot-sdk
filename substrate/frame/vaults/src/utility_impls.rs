@@ -185,10 +185,11 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> Result<(), DispatchError> {
-		let cr = Self::ratio(collateral, debt, price)?;
+		let cr = pusd_primitives::collateralization_ratio::<BalanceOf<T>>(collateral, debt, price)
+			.ok_or(Error::<T>::CollateralizationRatioTooLow)?;
 		ensure!(
 			cr >= config.minimum_collateralization_ratio,
-			Error::<T>::UnsafeCollateralizationRatio
+			Error::<T>::CollateralizationRatioTooLow
 		);
 		Ok(())
 	}

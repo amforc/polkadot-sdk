@@ -477,8 +477,7 @@ pub mod pallet {
 		ConfigOutsideEnvelope,
 		/// The annual rate is outside the branch's configured bounds.
 		RateOutOfBounds,
-		/// The vault's collateralization ratio is too low for this operation
-		/// (below ICR on user ops, below MCR on `exit_final_recovery`).
+		/// The vault's collateralization ratio is below ICR for a user operation.
 		UnsafeCollateralizationRatio,
 		/// The vault's fully-accrued collateralization ratio is at or above
 		/// MCR — too healthy to enter `FinalRecovery`.
@@ -542,6 +541,9 @@ pub mod pallet {
 		ZeroWithdrawAmount,
 		/// A repayment request must specify a non-zero amount.
 		ZeroRepayAmount,
+		/// The vault's fully-accrued collateralization ratio is below MCR, so it
+		/// cannot exit `FinalRecovery` yet.
+		CollateralizationRatioTooLow,
 	}
 
 	#[pallet::hooks]
@@ -815,6 +817,10 @@ pub mod pallet {
 
 		/// Permissionless deposit-into-vault: caller spends a non-zero amount of
 		/// their own collateral to deposit into `(collateral_id, owner)`.
+		///
+		/// Deposits are allowed while the vault is in `FinalRecovery`. To repay
+		/// such a vault, first deposit enough collateral to reach MCR, then call
+		/// `exit_final_recovery`, and finally call `repay_for`.
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::deposit_collateral_for())]
 		pub fn deposit_collateral_for(
@@ -869,6 +875,8 @@ pub mod pallet {
 		/// outstanding debt. Repaying it all clears the debt but keeps the vault
 		/// open as a zero-debt Dormant husk (call `close_vault` to reclaim the
 		/// collateral); a husk with no collateral left is closed outright.
+		/// `FinalRecovery` vaults cannot be repaid directly: deposit collateral to
+		/// reach MCR, exit recovery, then repay.
 		#[pallet::call_index(4)]
 		#[pallet::weight(T::WeightInfo::repay_for())]
 		pub fn repay_for(
@@ -939,8 +947,11 @@ pub mod pallet {
 		}
 
 		/// Permissionless: exit `FinalRecovery` once the fully-accrued vault CR
-		/// is back above `MinimumCollateralizationRatio`. Caller supplies the
-		/// rate-index `hint` used to reinsert in O(1).
+		/// is back at or above `MinimumCollateralizationRatio` (MCR). This is less
+		/// strict than the ICR required by borrow and collateral withdrawal.
+		///
+		/// To rescue with repayment, first deposit enough collateral to reach MCR,
+		/// exit recovery, then call `repay_for`.
 		#[pallet::call_index(9)]
 		#[pallet::weight(T::WeightInfo::exit_final_recovery())]
 		pub fn exit_final_recovery(
