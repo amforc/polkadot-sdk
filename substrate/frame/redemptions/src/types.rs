@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::deps::sp_runtime::{
 	traits::{Saturating, Zero},
@@ -80,90 +79,40 @@ pub enum RecoveryRegime {
 	InsuranceAdjusted,
 }
 
-#[derive(Encode, TypeInfo, Clone, PartialEq, Eq, Debug)]
-pub struct RedemptionPreviewStep<AccountId, Balance> {
-	pub target: AccountId,
-	pub status: VaultStatus,
-	pub debt_cancellable: Balance,
+#[derive(Encode, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RedemptionQuote<Balance> {
+	/// Stable asset consumed, including the redemption fee.
+	pub stable_in: Balance,
+	/// Collateral paid to the recipient.
 	pub collateral_out: Balance,
-	pub fee_pusd: Balance,
-}
-
-impl<AccountId, Balance: Saturating + Copy> RedemptionPreviewStep<AccountId, Balance> {
-	pub fn stable_in(&self) -> Balance {
-		self.debt_cancellable.saturating_add(self.fee_pusd)
-	}
-}
-
-#[derive(Encode, TypeInfo, Clone, PartialEq, Eq, Debug)]
-pub struct RedemptionPreview<AccountId, Balance> {
-	pub steps_detail: Vec<RedemptionPreviewStep<AccountId, Balance>>,
+	/// Portion of `stable_in` routed as the redemption fee.
+	pub fee: Balance,
+	/// Targets inspected, including skipped targets and barriers.
 	pub steps: u32,
+	/// The step cap stopped the quote while budget remained.
 	pub truncated: bool,
 }
 
-impl<AccountId, Balance: Saturating + Zero + Copy> RedemptionPreview<AccountId, Balance> {
-	/// Total stable the previewed redemption consumes, debt and fees combined.
-	pub fn total_stable_in(&self) -> Balance {
-		self.fold_steps(RedemptionPreviewStep::stable_in)
-	}
-
-	/// Total collateral the previewed redemption pays out.
-	pub fn total_collateral_out(&self) -> Balance {
-		self.fold_steps(|step| step.collateral_out)
-	}
-
-	/// Total fee the previewed redemption charges.
-	pub fn total_fee(&self) -> Balance {
-		self.fold_steps(|step| step.fee_pusd)
-	}
-
-	fn fold_steps(
-		&self,
-		figure: impl Fn(&RedemptionPreviewStep<AccountId, Balance>) -> Balance,
-	) -> Balance {
-		self.steps_detail
-			.iter()
-			.fold(Balance::zero(), |total, step| total.saturating_add(figure(step)))
-	}
-}
-
-/// Consumer mode for the shared redemption core. `Execute` withdraws real
-/// funds from the redeemer and pays the caller's recipient; `Simulate` issues
-/// unbacked stable credit instead and is only sound inside a transaction the
-/// caller always rolls back.
-pub(crate) enum RedeemMode<'a, AccountId> {
-	Execute { redeemer: &'a AccountId, recipient: &'a AccountId },
-	Simulate,
-}
-
-impl<'a, AccountId> RedeemMode<'a, AccountId> {
-	/// The account a step pays collateral to. Simulation pays the vault owner:
-	/// the vault hold lives on the owner's collateral account, so it exists and
-	/// the rolled-back transfer cannot fail for account-existence reasons.
-	pub(crate) fn step_recipient(&'a self, owner: &'a AccountId) -> &'a AccountId {
-		match self {
-			Self::Execute { recipient, .. } => recipient,
-			Self::Simulate => owner,
-		}
+impl<Balance: Saturating + Copy> RedemptionQuote<Balance> {
+	/// Stable asset burned against vault debt.
+	pub fn debt_cancelled(&self) -> Balance {
+		self.stable_in.saturating_sub(self.fee)
 	}
 }
 
 pub(crate) struct OrdinaryStep<Balance> {
-	pub(crate) status: VaultStatus,
 	pub(crate) debt: Balance,
 	pub(crate) collateral_out: Balance,
 	pub(crate) fee: Balance,
 }
 
 pub(crate) struct RecoveryStep<Balance> {
-	pub(crate) status: VaultStatus,
 	pub(crate) burned: Balance,
 	pub(crate) collateral_out: Balance,
 	pub(crate) regime: RecoveryRegime,
 }
 
-/// Authoritative priced plan for one `FinalRecovery` head. Execution, preview,
+/// Authoritative priced plan for one `FinalRecovery` head. Execution, quoting,
 /// and recovery offsets all consume this type so regime and residual policy
 /// cannot be re-derived independently.
 pub(crate) enum RecoveryPricing<Balance> {
@@ -245,8 +194,7 @@ impl<Balance: FixedPointOperand + Ord> RecoveryPricing<Balance> {
 	}
 }
 
-/// Per-target loop decision, shared by execution (`run_loop`) and preview
-/// (`simulate_walk`) so the barrier/redeemability ladder lives in one place.
+/// Per-target decision shared by execution and read-only quoting.
 pub(crate) enum StepAction {
 	Recovery,
 	Redeem,
@@ -280,7 +228,6 @@ pub(crate) enum StepOutcome<Balance> {
 pub(crate) struct WalkResult<Balance> {
 	pub(crate) remaining: Balance,
 	pub(crate) steps: u32,
-	pub(crate) truncated: bool,
 }
 
 pub(crate) struct Accumulators<Balance, AccountId> {
@@ -292,8 +239,6 @@ pub(crate) struct Accumulators<Balance, AccountId> {
 	pub(crate) recovery_collateral: Balance,
 	// Recovery stops after one FIFO head, so one owner/regime is enough.
 	pub(crate) recovery_owner: Option<(AccountId, RecoveryRegime)>,
-	/// Per-step detail sink; `Some` only when simulating a preview.
-	pub(crate) detail: Option<Vec<RedemptionPreviewStep<AccountId, Balance>>>,
 }
 
 impl<Balance: Zero, AccountId> Default for Accumulators<Balance, AccountId> {
@@ -306,7 +251,6 @@ impl<Balance: Zero, AccountId> Default for Accumulators<Balance, AccountId> {
 			recovery_burned: Balance::zero(),
 			recovery_collateral: Balance::zero(),
 			recovery_owner: None,
-			detail: None,
 		}
 	}
 }
@@ -314,26 +258,16 @@ impl<Balance: Zero, AccountId> Default for Accumulators<Balance, AccountId> {
 impl<Balance, AccountId> Accumulators<Balance, AccountId>
 where
 	Balance: Zero + Saturating + Copy,
-	AccountId: Clone,
 {
 	pub(crate) fn collateral_out(&self) -> Balance {
 		self.ordinary_collateral.saturating_add(self.recovery_collateral)
 	}
 
-	pub(crate) fn apply_ordinary(&mut self, owner: &AccountId, step: &OrdinaryStep<Balance>) {
+	pub(crate) fn apply_ordinary(&mut self, step: &OrdinaryStep<Balance>) {
 		self.debt_settled = self.debt_settled.saturating_add(step.debt);
 		self.ordinary_debt = self.ordinary_debt.saturating_add(step.debt);
 		self.ordinary_collateral = self.ordinary_collateral.saturating_add(step.collateral_out);
 		self.ordinary_fee = self.ordinary_fee.saturating_add(step.fee);
-		if let Some(detail) = self.detail.as_mut() {
-			detail.push(RedemptionPreviewStep {
-				target: owner.clone(),
-				status: step.status,
-				debt_cancellable: step.debt,
-				collateral_out: step.collateral_out,
-				fee_pusd: step.fee,
-			});
-		}
 	}
 
 	/// `residual` is the Insurance-Fund-settled debt the loop obtained after
@@ -347,22 +281,11 @@ where
 		self.debt_settled = self.debt_settled.saturating_add(step.burned).saturating_add(residual);
 		self.recovery_burned = self.recovery_burned.saturating_add(step.burned);
 		self.recovery_collateral = self.recovery_collateral.saturating_add(step.collateral_out);
-		if let Some(detail) = self.detail.as_mut() {
-			detail.push(RedemptionPreviewStep {
-				target: owner.clone(),
-				status: step.status,
-				debt_cancellable: step.burned,
-				collateral_out: step.collateral_out,
-				fee_pusd: Balance::zero(),
-			});
-		}
 		self.recovery_owner = Some((owner, step.regime));
 	}
 }
 
-/// Shared validation + fee-rate setup for `do_redeem` and `simulate`, so the
-/// preview can never diverge from execution. Execution surfaces the typed
-/// error; preview collapses it to `None`.
+/// Shared validation and fee-rate setup for execution and quoting.
 pub(crate) struct RedemptionPreamble<Balance> {
 	pub(crate) config: RedemptionConfig<Balance>,
 	pub(crate) state: RedemptionState,
