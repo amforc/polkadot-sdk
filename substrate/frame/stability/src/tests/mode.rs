@@ -33,7 +33,7 @@ fn frozen_branch_blocks_every_value_moving_operation() {
 		let (debt_offset, leftover) = simulate_offset(DOT, PUSD, 100, 50);
 		assert_eq!(debt_offset, 0);
 		assert_eq!(leftover, 50);
-		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 100, 50, 5);
+		let (result, leftover) = simulate_pending_offset(DOT, PUSD, 100, 50);
 		assert_eq!(result.debt_offset, 0);
 		assert_eq!(leftover, 50);
 		// Yield routing cannot fail: the frozen pool just takes nothing.

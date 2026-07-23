@@ -789,16 +789,10 @@ pub fn simulate_pending_offset(
 	stable: StableId,
 	max_debt_to_offset: Balance,
 	remaining_collateral: Balance,
-	max_iterations: u32,
 ) -> (crate::types::PendingOffsetResult<Balance>, Balance) {
 	let credit = issue_collateral(collateral.clone(), remaining_collateral);
-	let (result, remainder) = Stability::do_offset_pending_liquidation(
-		&collateral,
-		&stable,
-		max_debt_to_offset,
-		max_iterations,
-		credit,
-	);
+	let (result, remainder) =
+		Stability::do_offset_pending_liquidation(&collateral, &stable, max_debt_to_offset, credit);
 	(result, remainder.peek())
 }
 
