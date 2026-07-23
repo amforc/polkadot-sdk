@@ -1,9 +1,9 @@
 use crate::{
 	math,
 	pallet::{
-		ActivationCursor, BalanceOf, CollateralCreditOf, Config, DepositOf, Deposits, Error, Event,
-		Pallet, PoolStateOf, PoolSumsStore, Pools, StabilityPoolConfigOf, StabilityPoolOf,
-		StableCreditOf,
+		ActivationCursor, BalanceOf, CollateralCreditOf, CollateralIdOf, Config, DepositOf,
+		Deposits, Error, Event, Pallet, PoolStateOf, PoolSumsStore, Pools, StabilityPoolConfigOf,
+		StabilityPoolOf, StableCreditOf, StableIdOf,
 	},
 	pending,
 	types::{
@@ -57,8 +57,8 @@ impl<T: Config> Pallet<T> {
 	/// The shared entry-point prologue: a branch is registered iff its pool
 	/// row exists.
 	fn load_pool(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 	) -> Result<StabilityPoolOf<T>, DispatchError> {
 		let pool =
 			Pools::<T>::get(collateral_id, stable_id).ok_or(Error::<T>::BranchNotRegistered)?;
@@ -70,8 +70,8 @@ impl<T: Config> Pallet<T> {
 	/// pending deposit. Returns whether an activation happened (i.e. whether
 	/// `state` changed).
 	fn realize_and_activate(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		who: &T::AccountId,
 		pool: &mut StabilityPoolOf<T>,
 		deposit: &mut DepositOf<T>,
@@ -86,8 +86,8 @@ impl<T: Config> Pallet<T> {
 	/// settlement did not use behind the entry delay.
 	pub(crate) fn do_deposit(
 		who: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
@@ -186,8 +186,8 @@ impl<T: Config> Pallet<T> {
 	/// change returns to the caller to become the pending deposit. A
 	/// below-par head rejects the whole deposit.
 	fn try_incoming_recovery(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
 		state: &mut PoolStateOf<T>,
 		deposit: &mut DepositOf<T>,
@@ -238,8 +238,8 @@ impl<T: Config> Pallet<T> {
 	/// active-pool accumulator update — the same code path as ordinary
 	/// liquidation offsets (invariant 8 by construction).
 	pub(crate) fn do_offset_recovery(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		max_stable_in: BalanceOf<T>,
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
@@ -331,8 +331,8 @@ impl<T: Config> Pallet<T> {
 	/// the call forwards to [`Pallet::do_withdraw`] paying the caller.
 	pub(crate) fn do_request_withdraw(
 		who: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
@@ -381,8 +381,8 @@ impl<T: Config> Pallet<T> {
 	/// against an executable request in Safety Mode.
 	pub(crate) fn do_withdraw(
 		who: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 		recipient: T::AccountId,
 	) -> DispatchResult {
@@ -438,8 +438,8 @@ impl<T: Config> Pallet<T> {
 	/// the paying asset surface, and the error/event pair.
 	pub(crate) fn do_claim(
 		who: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		recipient: T::AccountId,
 		kind: ClaimKind,
 	) -> DispatchResult {
@@ -538,8 +538,8 @@ impl<T: Config> Pallet<T> {
 	/// (or may not) take comes back as the credit remainder, with the result
 	/// zeroed on a full step-aside.
 	pub(crate) fn do_offset_liquidation(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		max_debt_to_offset: BalanceOf<T>,
 		collateral: CollateralCreditOf<T>,
 	) -> (BalanceOf<T>, CollateralCreditOf<T>) {
@@ -619,8 +619,8 @@ impl<T: Config> Pallet<T> {
 	/// (invariant 11). An empty queue or zero remaining debt no-ops with a
 	/// zeroed result and the untouched credit.
 	pub(crate) fn do_offset_pending_liquidation(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		max_debt_to_offset: BalanceOf<T>,
 		mut collateral: CollateralCreditOf<T>,
 	) -> (PendingOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
@@ -694,9 +694,9 @@ impl<T: Config> Pallet<T> {
 	/// aggregates. `None` stops the walk — a broken invariant or an
 	/// unresolvable collateral slice — with nothing of this step applied.
 	fn offset_pending_step(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
-		fifo: &StableListId<T::CollateralAssetId, T::StableAssetId>,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		fifo: &StableListId<CollateralIdOf<T>, StableIdOf<T>>,
 		pool_account: &T::AccountId,
 		oldest: &T::AccountId,
 		state: &mut PoolStateOf<T>,
@@ -788,8 +788,8 @@ impl<T: Config> Pallet<T> {
 	/// pre-offset totals FIRST, then the `P` shrink. Read-only: the
 	/// caller commits the plan once its value movement is through.
 	fn plan_active_offset(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		pool: &StabilityPoolOf<T>,
 		debt: BalanceOf<T>,
 		collateral: BalanceOf<T>,
@@ -846,8 +846,8 @@ impl<T: Config> Pallet<T> {
 	/// seeding a zero sums row for every new coordinate. Infallible: all
 	/// arithmetic already ran in [`Pallet::plan_active_offset`].
 	fn commit_active_offset(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		state: &mut PoolStateOf<T>,
 		plan: ActiveOffsetPlan<BalanceOf<T>>,
 	) {
@@ -879,8 +879,8 @@ impl<T: Config> Pallet<T> {
 	/// ops. Accounting only: the settlement already moved the stablecoin
 	/// and the collateral.
 	fn apply_active_offset(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		pool: &mut StabilityPoolOf<T>,
 		debt: BalanceOf<T>,
 		collateral: BalanceOf<T>,
@@ -895,8 +895,8 @@ impl<T: Config> Pallet<T> {
 	/// the stable credit is returned and `Err` carries the full collateral
 	/// credit back to the caller.
 	fn resolve_and_burn(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
 		debt: BalanceOf<T>,
 		preservation: Preservation,
@@ -967,8 +967,8 @@ impl<T: Config> Pallet<T> {
 	/// impl (`interfaces.rs`), which loads `pool`, takes the `yield_share`
 	/// cut, and hands the row down so the branch is read once.
 	pub(crate) fn do_distribute_yield(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		mut pool: StabilityPoolOf<T>,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
@@ -1027,8 +1027,8 @@ impl<T: Config> Pallet<T> {
 	/// current accumulators.
 	pub(crate) fn do_compound_yield(
 		who: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
@@ -1082,8 +1082,8 @@ impl<T: Config> Pallet<T> {
 	/// which the freeze halts) but still realizes.
 	pub(crate) fn do_poke_deposit(
 		owner: T::AccountId,
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let mut deposit = Deposits::<T>::get((&collateral_id, &stable_id, &owner))
@@ -1165,8 +1165,8 @@ impl<T: Config> Pallet<T> {
 	/// and unfrozen. Immature, active-only, and frozen rows are read-only
 	/// no-ops; the cursor still advances past them.
 	fn activate_idle_row(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 		mut deposit: DepositOf<T>,
 		now: Millis,
@@ -1233,8 +1233,8 @@ impl<T: Config> Pallet<T> {
 	/// closed). Returns the live mode for operations that differentiate
 	/// Normal from Safety.
 	fn ensure_not_frozen(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 	) -> Result<BranchMode, DispatchError> {
 		let mode = T::BranchModes::branch_mode(collateral_id, stable_id)?;
 		ensure!(mode != BranchMode::Frozen, Error::<T>::BranchFrozen);
@@ -1246,8 +1246,8 @@ impl<T: Config> Pallet<T> {
 	/// touches pool totals: offsets already updated the aggregates when the
 	/// losses happened.
 	fn realize_deposit(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		pool: &StabilityPoolOf<T>,
 		deposit: &mut DepositOf<T>,
 	) -> DispatchResult {
@@ -1293,8 +1293,8 @@ impl<T: Config> Pallet<T> {
 	/// predate its activation. No-op while immature or absent; returns whether
 	/// an activation happened (i.e. whether `state` changed).
 	fn activate_matured_pending(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		who: &T::AccountId,
 		state: &mut PoolStateOf<T>,
 		deposit: &mut DepositOf<T>,
@@ -1336,8 +1336,8 @@ impl<T: Config> Pallet<T> {
 	/// pool's current coordinates (realization on a fresh row is the
 	/// identity).
 	fn load_or_fresh_deposit(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		who: &T::AccountId,
 		state: &PoolStateOf<T>,
 	) -> DepositOf<T> {
@@ -1349,8 +1349,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Validate and store a replacement pool config.
 	pub(crate) fn do_set_stability_pool_config(
-		collateral_id: T::CollateralAssetId,
-		stable_id: T::StableAssetId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
 		config: StabilityPoolConfigOf<T>,
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
@@ -1364,8 +1364,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Write the row back, or remove it once it holds no user value.
 	fn store_or_prune_deposit(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		who: &T::AccountId,
 		deposit: DepositOf<T>,
 	) {
@@ -1379,8 +1379,8 @@ impl<T: Config> Pallet<T> {
 	/// The sums row at `coords`; an absent row reads as zero,
 	/// which floors gains instead of overpaying them.
 	pub(crate) fn sums_at(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		coords: &Accumulators,
 	) -> PoolSums {
 		PoolSumsStore::<T>::get((collateral_id, stable_id, coords.epoch, coords.scale))
@@ -1391,8 +1391,8 @@ impl<T: Config> Pallet<T> {
 	/// contiguously per epoch, so reading stops at the first gap (`try_get`
 	/// keeps absence observable through the `ValueQuery`).
 	pub(crate) fn sums_window(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		snapshot: &DepositSnapshot,
 	) -> SumsWindow {
 		let snap = Self::sums_at(collateral_id, stable_id, &snapshot.coords);
