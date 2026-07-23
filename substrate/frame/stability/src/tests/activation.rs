@@ -164,8 +164,7 @@ fn on_idle_rolls_back_a_broken_fifo_row_and_retries_after_repair() {
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_deposit(1, 100);
 		advance_time(5_000);
-		let fifo = crate::pending::list_id::<Test>(&DOT, &PUSD);
-		assert_ok!(crate::pending::remove::<Test>(&fifo, &1));
+		assert_ok!(pending_remove(DOT, PUSD, 1));
 
 		assert_eq!(run_idle(Weight::MAX), Weight::from_parts(2, 0));
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
@@ -174,7 +173,7 @@ fn on_idle_rolls_back_a_broken_fifo_row_and_retries_after_repair() {
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
 		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 100);
 
-		assert_ok!(crate::pending::append::<Test>(&fifo, 1));
+		assert_ok!(pending_append(DOT, PUSD, 1));
 		assert_eq!(run_idle(Weight::MAX), Weight::from_parts(2, 0));
 		let row = deposit_row(DOT, PUSD, 1).expect("row activates after repair");
 		assert_eq!(row.active_deposit, 100);
