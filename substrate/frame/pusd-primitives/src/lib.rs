@@ -23,6 +23,7 @@ pub mod oracle;
 pub mod recovery_offset;
 pub mod recovery_pricing;
 pub mod registration;
+pub mod stability_pool;
 pub mod vault_interface;
 pub mod yield_routing;
 
@@ -33,6 +34,7 @@ pub use oracle::ProvidePrice;
 pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetResult};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
+pub use stability_pool::StabilityPoolOffsetApi;
 pub use vault_interface::{
 	LiquidationSettlement, LiquidationSnapshot, RedemptionSettlement, RedemptionStepSnapshot,
 	VaultInterface,
