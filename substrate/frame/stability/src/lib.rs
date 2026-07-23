@@ -10,7 +10,6 @@ pub mod weights;
 mod dispatchable_impls;
 mod interfaces;
 mod math;
-mod pending;
 #[cfg(feature = "try-runtime")]
 mod try_state;
 
@@ -43,7 +42,7 @@ pub mod pallet {
 		},
 		prelude::*,
 	};
-	use pallet_linked_list::SortedListInterface;
+	use linked_list_interface::SortedListInterface;
 	use pusd_primitives::{
 		BranchModeProvider, Millis, OnBranchLifecycle, RecoveryOffsetInterface, StableListId,
 	};
@@ -647,7 +646,7 @@ pub mod pallet {
 			// Defense in depth: the rows↔FIFO bijection makes an orphan node
 			// unreachable, but one stranded past teardown would corrupt the
 			// queue of a re-registered branch.
-			let fifo = crate::pending::list_id::<T>(collateral_id, stable_id);
+			let fifo = StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
 			ensure!(T::PendingLists::count(&fifo) == 0, Error::<T>::PendingFifoInvariantBroken);
 
 			let pool_account = Self::pool_account(collateral_id, stable_id);

@@ -14702,6 +14702,7 @@ dependencies = [
 name = "pallet-stability"
 version = "0.1.0"
 dependencies = [
+ "linked-list-interface",
  "pallet-assets",
  "pallet-assets-holder",
  "pallet-balances",
