@@ -219,15 +219,14 @@ fn offset_api_trait_surface_matches_the_engine() {
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 500);
 
 		// An empty pending queue passes the debt and the credit through.
-		let (result, remainder) =
+		let (debt_offset, remainder) =
 			<Api as StabilityPoolOffsetApi<_, _, _, _>>::offset_pending_liquidation(
 				&DOT,
 				&PUSD,
 				100,
-				5,
 				issue_collateral(DOT, 50),
 			);
-		assert_eq!(result.debt_offset, 0);
+		assert_eq!(debt_offset, 0);
 		assert_eq!(remainder.peek(), 50);
 	});
 }

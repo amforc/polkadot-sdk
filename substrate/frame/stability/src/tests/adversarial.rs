@@ -93,14 +93,9 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 		assert_eq!(returned.peek(), 100);
 		drop(returned);
 
-		let (result, returned) = Stability::offset_pending_liquidation(
-			&DOT,
-			&PUSD,
-			200,
-			5,
-			issue_collateral(TOKEN_X, 100),
-		);
-		assert_eq!(result.debt_offset, 0);
+		let (debt_offset, returned) =
+			Stability::offset_pending_liquidation(&DOT, &PUSD, 200, issue_collateral(TOKEN_X, 100));
+		assert_eq!(debt_offset, 0);
 		assert_eq!(returned.asset(), TOKEN_X);
 		assert_eq!(returned.peek(), 100);
 		drop(returned);
