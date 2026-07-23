@@ -333,9 +333,21 @@ impl<Balance: Zero> StabilityPool<Balance> {
 	}
 }
 
-/// The offset result shapes live in `pusd-primitives` beside the
-/// `StabilityPoolOffsetApi` they belong to (SPEC.md §7.1 / §7.2).
-pub use pusd_primitives::PendingOffsetResult;
+/// Result of a pending-deposit backstop offset (SPEC.md §7.2). Internal
+/// shape: the `StabilityPoolOffsetApi` surface reports only the debt offset,
+/// while `iterations_used` feeds this pallet's event and tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PendingOffsetResult<Balance> {
+	pub debt_offset: Balance,
+	pub iterations_used: u32,
+}
+
+impl<Balance: Zero> PendingOffsetResult<Balance> {
+	/// The no-op outcome: nothing consumed.
+	pub fn zero() -> Self {
+		Self { debt_offset: Balance::zero(), iterations_used: 0 }
+	}
+}
 
 /// Which capital funded a recovery offset (SPEC.md §10).
 #[derive(
