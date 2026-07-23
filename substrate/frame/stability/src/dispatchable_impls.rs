@@ -622,7 +622,6 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &T::CollateralAssetId,
 		stable_id: &T::StableAssetId,
 		max_debt_to_offset: BalanceOf<T>,
-		max_pending_iterations: u32,
 		mut collateral: CollateralCreditOf<T>,
 	) -> (PendingOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
 		if collateral.asset() != *collateral_id {
@@ -636,14 +635,14 @@ impl<T: Config> Pallet<T> {
 		}
 		let fifo = pending::list_id::<T>(collateral_id, stable_id);
 		let pool_account = Self::pool_account(collateral_id, stable_id);
-		let cap = max_pending_iterations.min(T::MaxPendingOffsetIterations::get());
+		let cap = T::MaxPendingOffsetIterations::get();
 
 		let mut debt_left = max_debt_to_offset;
 		let mut debt_burned = BalanceOf::<T>::zero();
 		let mut collateral_credited = BalanceOf::<T>::zero();
 		let mut iterations: u32 = 0;
 
-		// Bounded by `cap <= MaxPendingOffsetIterations`.
+		// Bounded by `MaxPendingOffsetIterations`.
 		while iterations < cap {
 			if debt_left.is_zero() {
 				break;
