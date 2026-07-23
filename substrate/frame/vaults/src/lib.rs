@@ -82,6 +82,7 @@ pub mod pallet {
 		recovery,
 		types::{AdminLevel, AssetRoleUsage, BranchAdmins, BranchConfigGuard},
 	};
+	use alloc::{vec, vec::Vec};
 	use frame::{
 		prelude::*,
 		traits::{
@@ -693,25 +694,32 @@ pub mod pallet {
 
 		/// Returns up to `n` owners in redemption order.
 		///
-		/// Final recovery comes first, then the dormant target, then the lowest rates.
-		pub fn redemption_queue_head(
+		/// Tiered with a cutoff: a `FinalRecovery` head (else a dormant target)
+		/// gates the whole rate index, so only the gating target is returned;
+		/// otherwise active vaults from the lowest rate upward.
+		pub fn redemption_queue(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			n: u32,
-		) -> alloc::vec::Vec<T::AccountId> {
-			Self::redemption_targets(&collateral_id, &stable_id)
-				.map(|(owner, _kind)| owner)
-				.take(n as usize)
-				.collect()
+		) -> Vec<T::AccountId> {
+			if n == 0 {
+				return Vec::new();
+			}
+			match Self::priority_redemption_target(&collateral_id, &stable_id) {
+				Some((owner, _)) => vec![owner],
+				None => T::VaultLists::iter_from_tail(VaultListId::Rate(collateral_id, stable_id))
+					.take(n as usize)
+					.collect(),
+			}
 		}
 
 		/// Returns up to `n` final recovery owners, oldest first.
-		pub fn final_recovery_queue_head(
+		pub fn final_recovery_queue(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			n: u32,
-		) -> alloc::vec::Vec<T::AccountId> {
-			recovery::queue_head::<T>(&collateral_id, &stable_id, n)
+		) -> Vec<T::AccountId> {
+			recovery::queue::<T>(&collateral_id, &stable_id, n)
 		}
 
 		/// Returns an insertion hint for an annual rate.

@@ -22,10 +22,7 @@ fn open_orders_dll_by_annual_interest_rate() {
 			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Tail-first walk gives ascending rate. Expect [1, 2, 3, 4, 5].
-		let order = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT, PUSD),
-			10,
-		);
+		let order = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
 		assert_eq!(order, alloc::vec![1, 2, 3, 4, 5]);
 	});
 }
@@ -83,10 +80,7 @@ fn repay_to_zero_drops_vault_from_rate_index() {
 			&3
 		));
 		// Order without acct 3: [1, 2, 4, 5].
-		let order = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT, PUSD),
-			10,
-		);
+		let order = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
 		assert_eq!(order, alloc::vec![1, 2, 4, 5]);
 		// The explicit close removes the row entirely.
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(3), DOT, PUSD, None));
@@ -124,10 +118,7 @@ fn change_rate_re_inserts_in_correct_position() {
 		));
 
 		// Final ascending order: 3 (5%), 2 (20%), 4 (40%), 5 (50%), 1 (60%).
-		let order = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT, PUSD),
-			10,
-		);
+		let order = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
 		assert_eq!(order, alloc::vec![3, 2, 4, 5, 1]);
 	});
 }
