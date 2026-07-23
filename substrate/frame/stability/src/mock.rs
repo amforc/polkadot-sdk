@@ -407,8 +407,6 @@ impl pallet_redemptions::BenchmarkHelper<AssetId, StableId, AccountId, Balance>
 }
 
 impl pallet_stability::Config for Test {
-	type CollateralAssetId = AssetId;
-	type StableAssetId = StableId;
 	type StableAssets = Assets;
 	type CollateralAssets = PoolCollateralAssets;
 	// The real vault pallet derives the mode (persisted freeze, oracle
