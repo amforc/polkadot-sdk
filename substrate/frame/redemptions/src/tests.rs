@@ -1,14 +1,12 @@
 use crate::{
 	mock::*,
-	types::{
-		Accumulators, RecoveryOffsetQuote, RecoveryRegime, RedeemMode, RedemptionConfig, WalkResult,
-	},
+	types::{RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, RedemptionQuote},
 	weights::WeightInfo,
 	Error, Event,
 };
 use pusd_primitives::{
-	collateralization_ratio, recovery_pricing, reducible_debit, ProvidePrice,
-	RecoveryOffsetInterface, RecoveryOffsetResult, VaultStatus,
+	collateralization_ratio, recovery_pricing, reducible_debit, LiquidationSettlement,
+	RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
 };
 
 const HOUR_MS: Moment = 3_600 * 1_000;
@@ -23,12 +21,9 @@ fn branch_tcr(collateral: AssetId, stable: StableId) -> FixedU128 {
 	Vaults::branch_tcr(collateral, stable).expect("branch registered")
 }
 
-/// The fully accrued debt of `who`, read through the pallet's own preview so the
-/// value is exactly what a live redemption would poke and cancel against.
-fn preview_full_debt(who: AccountId) -> Balance {
-	let preview = Redemptions::preview_redeem(DOT, PUSD, 1_000_000_000).expect("preview");
-	assert_eq!(preview.steps_detail[0].target, who);
-	preview.steps_detail[0].debt_cancellable
+/// The fully accrued debt of `who`, read through Vaults' projected snapshot.
+fn projected_full_debt(who: AccountId) -> Balance {
+	Vaults::project_redemption_snapshot(&DOT, &PUSD, &who).expect("snapshot").debt
 }
 
 fn last_recovery_regime() -> Option<RecoveryRegime> {
@@ -210,28 +205,8 @@ fn caller_max_steps_caps_the_loop() {
 	});
 }
 
-/// Run the shared redemption loop in `Simulate` mode inside a rolled-back
-/// transaction, returning only the walk bookkeeping under test.
-fn simulated_walk(step_cap: u32, budget: Balance) -> WalkResult<Balance> {
-	use frame::deps::frame_support::storage::{with_transaction, TransactionOutcome};
-	with_transaction(|| {
-		let config = crate::RedemptionConfigs::<Test>::get(DOT, PUSD).expect("config seeded");
-		let price = MockOracle::provide_price(&DOT).expect("price set");
-		let mut acc = Accumulators::default();
-		let result = crate::Pallet::<Test>::run_loop(
-			&RedeemMode::Simulate,
-			&DOT,
-			&PUSD,
-			price,
-			FixedU128::zero(),
-			step_cap,
-			budget,
-			&config,
-			&mut acc,
-		);
-		TransactionOutcome::Rollback(result)
-	})
-	.expect("walk succeeds")
+fn quoted_walk(step_cap: u32, budget: Balance) -> RedemptionQuote<Balance> {
+	Redemptions::preview_redeem(DOT, PUSD, budget, step_cap).expect("quote")
 }
 
 #[test]
@@ -243,12 +218,12 @@ fn walk_reports_only_cap_exhaustion_as_truncated() {
 
 		// A one-step cap with budget and a second target to spare: only the
 		// cap guard reports truncation.
-		let capped = simulated_walk(1, 100_000);
+		let capped = quoted_walk(1, 100_000);
 		assert_eq!(capped.steps, 1);
 		assert!(capped.truncated, "the cap guard ended the walk");
 
 		// Budget exhaustion inside the cap is a complete walk, not truncation.
-		let filled = simulated_walk(20, 200);
+		let filled = quoted_walk(20, 200);
 		assert_eq!(filled.steps, 1);
 		assert!(!filled.truncated);
 
@@ -258,9 +233,7 @@ fn walk_reports_only_cap_exhaustion_as_truncated() {
 		assert_ok!(redeem(3, DOT, PUSD, 360, 0, 4, 0));
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
 		set_price(DOT, FixedU128::from_rational(1, 10));
-		let barrier = simulated_walk(20, 100_000);
-		assert_eq!(barrier.steps, 1);
-		assert!(!barrier.truncated, "a counted barrier, not the cap, ended the walk");
+		assert!(Redemptions::preview_redeem(DOT, PUSD, 100_000, 20).is_none());
 	});
 }
 
@@ -330,12 +303,9 @@ fn underwater_prefix_skipped_once_while_healthy_vaults_redeem() {
 		let v2_before = vault_debt(DOT, PUSD, 2);
 		let v3_before = vault_debt(DOT, PUSD, 3);
 		let v4_before = vault_debt(DOT, PUSD, 4);
-		let preview = Redemptions::preview_redeem(DOT, PUSD, 2_000).expect("preview");
+		let preview = Redemptions::preview_redeem(DOT, PUSD, 2_000, 0).expect("preview");
 		assert_eq!(preview.steps, 4, "the walk visits the skipped prefix once");
-		assert_eq!(
-			preview.steps_detail.iter().map(|step| step.target).collect::<Vec<_>>(),
-			vec![3, 4]
-		);
+		assert_eq!(preview.debt_cancelled(), v3_before + v4_before);
 		assert!(!preview.truncated);
 
 		let redeemer_before = Assets::balance(PUSD, 5);
@@ -354,9 +324,9 @@ fn underwater_prefix_skipped_once_while_healthy_vaults_redeem() {
 		let expected_collateral = v3_before * 10 / 9 + v4_before * 10 / 9;
 		assert_eq!(collateral_balance(DOT, 6) - recipient_before, expected_collateral);
 		// Both adapters consume the same shared walk decisions.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), preview.total_stable_in());
-		assert_eq!(collateral_balance(DOT, 6) - recipient_before, preview.total_collateral_out());
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.total_fee());
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), preview.stable_in);
+		assert_eq!(collateral_balance(DOT, 6) - recipient_before, preview.collateral_out);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.fee);
 		// Issuance falls by exactly the debt burned; fees are routed, not burned.
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), v3_before + v4_before);
 	});
@@ -514,7 +484,7 @@ fn dynamic_fee_fully_decays_to_the_base_fee_after_long_idle() {
 		let branch_debt_before = branch_debt(DOT, PUSD);
 		// The redemption pokes a year of pending interest onto the vault, so the
 		// pre-poke storage value would understate the debt the cancel lands on.
-		let accrued = preview_full_debt(1);
+		let accrued = projected_full_debt(1);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 		assert_ok!(redeem(3, DOT, PUSD, 201, 0, 4, 0));
 
@@ -570,6 +540,41 @@ fn dormant_target_is_redeemed_before_rate_index() {
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, cancelled * 4 / 5);
 		// Priority: the ordinary vault behind the Dormant slot is untouched.
 		assert_eq!(vault_debt(DOT, PUSD, 2), v2_before);
+	});
+}
+
+#[test]
+fn quote_continues_from_drained_dormant_into_rate_index() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		mint_stable(PUSD, 3, 1_000_000);
+
+		// A sub-minimum residual parks vault 1 as the dormant redemption target.
+		assert_ok!(redeem(3, DOT, PUSD, 360, 0, 4, 0));
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		let v1_residual = vault_debt(DOT, PUSD, 1);
+		let v2_debt = vault_debt(DOT, PUSD, 2);
+
+		// Budget beyond both targets: the quote must drain the dormant slot,
+		// then continue into the rate index rather than stopping at the
+		// priority tier.
+		let quote = Redemptions::preview_redeem(DOT, PUSD, 100_000, 0).expect("quote");
+		assert_eq!(quote.steps, 2);
+		assert!(!quote.truncated);
+		assert_eq!(quote.debt_cancelled(), v1_residual + v2_debt);
+
+		// Execution walks the same two targets and reproduces the quote exactly.
+		let redeemer_before = Assets::balance(PUSD, 3);
+		let recipient_before = collateral_balance(DOT, 4);
+		let fee_before = Assets::balance(PUSD, FEE_DEST);
+		assert_ok!(redeem(3, DOT, PUSD, 100_000, 0, 4, 0));
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), quote.stable_in);
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, quote.collateral_out);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, quote.fee);
+		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
+		assert_eq!(vault_debt(DOT, PUSD, 2), 0);
 	});
 }
 
@@ -692,13 +697,13 @@ fn preview_reports_final_recovery_before_ordinary_targets() {
 		let v1_before = vault_debt(DOT, PUSD, 1);
 		let v2_before = vault_debt(DOT, PUSD, 2);
 
-		let preview = Redemptions::preview_redeem(DOT, PUSD, 200).expect("preview");
+		let preview = Redemptions::preview_redeem(DOT, PUSD, 200, 0).expect("preview");
 
 		assert_eq!(preview.steps, 1);
-		assert_eq!(preview.steps_detail[0].target, 1);
-		assert_eq!(preview.steps_detail[0].status, VaultStatus::FinalRecovery);
-		// Preview is the public path helper: it must expose the priority target
-		// without applying the rolled-back vault touch.
+		assert_eq!(preview.stable_in, 200);
+		assert_eq!(preview.collateral_out, 168);
+		assert_eq!(preview.fee, 0);
+		// Quoting must expose the priority target without touching the vault.
 		assert_eq!(vault_debt(DOT, PUSD, 1), v1_before);
 		assert_eq!(vault_debt(DOT, PUSD, 2), v2_before);
 	});
@@ -913,29 +918,25 @@ fn preview_redeem_below_minimum_amount_returns_none() {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 
-		assert!(Redemptions::preview_redeem(DOT, PUSD, 99).is_none());
+		assert!(Redemptions::preview_redeem(DOT, PUSD, 99, 0).is_none());
 	});
 }
 
 #[test]
-fn preview_redeem_reports_path_without_side_effects() {
+fn preview_redeem_quotes_without_side_effects() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		let debt_before = vault_debt(DOT, PUSD, 1);
 
-		let preview = Redemptions::preview_redeem(DOT, PUSD, 201).expect("preview");
+		let preview = Redemptions::preview_redeem(DOT, PUSD, 201, 0).expect("preview");
 		assert_eq!(preview.steps, 1);
 		assert!(!preview.truncated);
-		assert_eq!(preview.total_stable_in(), 201);
-		assert_eq!(preview.total_collateral_out(), 160);
-		assert_eq!(preview.total_fee(), 1);
-		let step = &preview.steps_detail[0];
-		assert_eq!(step.target, 1);
-		assert_eq!(step.debt_cancellable, 200);
-		assert_eq!(step.collateral_out, 160);
-		assert_eq!(step.fee_pusd, 1);
-		// Preview prepares snapshots inside a rollback-only transaction.
+		assert_eq!(preview.stable_in, 201);
+		assert_eq!(preview.debt_cancelled(), 200);
+		assert_eq!(preview.collateral_out, 160);
+		assert_eq!(preview.fee, 1);
+		// Quoting projects the pending touch without applying it.
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
 	});
 }
@@ -949,12 +950,11 @@ fn preview_redeem_walks_multiple_vaults() {
 		let v1_before = vault_debt(DOT, PUSD, 1);
 		let v2_before = vault_debt(DOT, PUSD, 2);
 
-		let preview = Redemptions::preview_redeem(DOT, PUSD, 100_000).expect("preview");
+		let preview = Redemptions::preview_redeem(DOT, PUSD, 100_000, 0).expect("preview");
 		assert_eq!(preview.steps, 2);
 		assert!(!preview.truncated);
-		assert_eq!(preview.steps_detail[0].target, 1);
-		assert_eq!(preview.steps_detail[1].target, 2);
-		// The rollback must cover every touched vault, not just the first one.
+		assert_eq!(preview.debt_cancelled(), v1_before + v2_before);
+		// Projecting multiple targets leaves every vault untouched.
 		assert_eq!(vault_debt(DOT, PUSD, 1), v1_before);
 		assert_eq!(vault_debt(DOT, PUSD, 2), v2_before);
 	});
@@ -964,7 +964,7 @@ fn preview_redeem_walks_multiple_vaults() {
 fn preview_redeem_none_when_no_target() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		assert!(Redemptions::preview_redeem(DOT, PUSD, 200).is_none());
+		assert!(Redemptions::preview_redeem(DOT, PUSD, 200, 0).is_none());
 	});
 }
 
@@ -1007,7 +1007,7 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 
 		// Both vaults are in the FinalRecovery FIFO, oldest first; only the head
 		// is exposed to redemption.
-		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![1u64, 2u64]);
+		assert_eq!(Vaults::final_recovery_queue(DOT, PUSD, 10), vec![1u64, 2u64]);
 
 		let debt1 = vault_debt(DOT, PUSD, 1);
 		let debt2 = vault_debt(DOT, PUSD, 2);
@@ -1033,7 +1033,7 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		// Head-only: vault 2 is untouched and becomes the new FIFO head.
 		assert_eq!(vault_debt(DOT, PUSD, 2), debt2);
 		assert!(Vaults::vault_status(DOT, PUSD, 2).expect("vault 2").is_final_recovery());
-		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![2u64]);
+		assert_eq!(Vaults::final_recovery_queue(DOT, PUSD, 10), vec![2u64]);
 		// The fund covered vault 1 exactly, so the redeemer paid only the
 		// collateral-backed (recovery_rate == 1.0) portion.
 		let pusd_in_1 = redeemer_before_1 - Assets::balance(PUSD, 3);
@@ -1052,7 +1052,7 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		// is fully cancelled by the redeemer and the vault drops to zero debt (and
 		// leaves the FIFO) rather than being settled-and-removed like vault 1.
 		assert_eq!(vault_debt(DOT, PUSD, 2), 0, "second head fully settled");
-		assert!(Vaults::final_recovery_queue_head(DOT, PUSD, 10).is_empty(), "FIFO drained");
+		assert!(Vaults::final_recovery_queue(DOT, PUSD, 10).is_empty(), "FIFO drained");
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "no fund left to burn");
 		let pusd_in_2 = redeemer_before_2 - Assets::balance(PUSD, 3);
@@ -1227,9 +1227,9 @@ fn ordinary_redemption_accrues_target_interest_before_cancelling() {
 
 		advance_time(ONE_YEAR_MS);
 
-		// The preview pokes in a rolled-back transaction, so it reports the fully
-		// accrued debt the live redemption will operate on.
-		let accrued = preview_full_debt(1);
+		// The projection reports the fully accrued debt the live redemption will
+		// operate on without touching the vault.
+		let accrued = projected_full_debt(1);
 		assert!(accrued > debt_at_open, "a year of interest must grow the debt");
 
 		let redeemer_before = Assets::balance(PUSD, 3);
@@ -1277,7 +1277,7 @@ fn preview_matches_execution_for_partial_fill() {
 		mint_stable(PUSD, 3, 1_000_000);
 
 		let budget = 1_005;
-		let preview = Redemptions::preview_redeem(DOT, PUSD, budget).expect("preview");
+		let preview = Redemptions::preview_redeem(DOT, PUSD, budget, 0).expect("preview");
 		assert_eq!(preview.steps, 1);
 
 		let redeemer_before = Assets::balance(PUSD, 3);
@@ -1288,10 +1288,69 @@ fn preview_matches_execution_for_partial_fill() {
 		assert_ok!(redeem(3, DOT, PUSD, budget, 0, 4, 0));
 
 		// Execution reproduces the quote exactly across every dimension.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), preview.total_stable_in());
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before, preview.total_collateral_out());
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.total_fee());
-		assert_eq!(v1_before - vault_debt(DOT, PUSD, 1), preview.steps_detail[0].debt_cancellable);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), preview.stable_in);
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, preview.collateral_out);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.fee);
+		assert_eq!(v1_before - vault_debt(DOT, PUSD, 1), preview.debt_cancelled());
+	});
+}
+
+/// Fully redistribute `owner`'s vault: no offset, all debt and collateral go
+/// to the surviving vaults.
+fn liquidate_redistribute_all(owner: AccountId) {
+	Vaults::execute_liquidation(&DOT, &PUSD, &owner, |_, mut collateral| {
+		let owner_surplus = collateral.extract(0);
+		Ok(LiquidationSettlement {
+			debt_offset: 0,
+			redistribution_collateral: collateral,
+			owner_surplus,
+		})
+	})
+	.expect("liquidation succeeds");
+}
+
+#[test]
+fn quote_matches_execution_across_redistribution_rounds() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		// Distinct stakes and rates so per-stake redistribution shares floor
+		// non-trivially per recipient.
+		assert_ok!(open(1, DOT, PUSD, 1_100, 300, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_700, 450, rate_pct(2, 100)));
+		assert_ok!(open(3, DOT, PUSD, 2_300, 600, rate_pct(3, 100)));
+		mint_stable(PUSD, 5, 1_000_000);
+
+		// Two full-redistribution rounds with the recipients untouched
+		// throughout: every quoted snapshot projects its share across both
+		// pending rounds against the original branch aggregate, while
+		// execution decrements that aggregate touch by touch.
+		for sacrificial in [9, 10] {
+			assert_ok!(open(sacrificial, DOT, PUSD, 480, 480, rate_pct(4, 100)));
+			set_price(DOT, FixedU128::one());
+			liquidate_redistribute_all(sacrificial);
+			set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+			advance_time(30 * 24 * 3_600 * 1_000);
+		}
+
+		let quote = Redemptions::preview_redeem(DOT, PUSD, 100_000, 0).expect("quote");
+		assert_eq!(quote.steps, 3);
+		assert!(!quote.truncated);
+
+		let redeemer_before = Assets::balance(PUSD, 5);
+		let recipient_before = collateral_balance(DOT, 6);
+		let fee_before = Assets::balance(PUSD, FEE_DEST);
+		let issuance_before = Assets::total_supply(PUSD);
+		assert_ok!(redeem(5, DOT, PUSD, 100_000, 0, 6, 0));
+
+		// Execution reproduces the quote exactly across every dimension,
+		// projected redistribution shares included. Per-stake flooring keeps
+		// each share within the remaining branch aggregate here; the
+		// documented indicative-quote drift needs caps that bind, which
+		// untouched recipients cannot produce.
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), quote.stable_in);
+		assert_eq!(collateral_balance(DOT, 6) - recipient_before, quote.collateral_out);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, quote.fee);
+		assert_eq!(issuance_before - Assets::total_supply(PUSD), quote.debt_cancelled());
 	});
 }
 
@@ -1417,7 +1476,7 @@ fn recovery_offset_settles_fifo_head_and_matches_preview() {
 		// Back at the healthy price both queued vaults sit at CR >= 100%, the
 		// recovery-bonus regime offsets are restricted to.
 		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
-		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![1u64, 2u64]);
+		assert_eq!(Vaults::final_recovery_queue(DOT, PUSD, 10), vec![1u64, 2u64]);
 		let debt1 = vault_debt(DOT, PUSD, 1);
 		// 500 principal + the 1-unit 7-day upfront fee.
 		assert_eq!(debt1, 501);
@@ -1441,7 +1500,7 @@ fn recovery_offset_settles_fifo_head_and_matches_preview() {
 		// head is untouched.
 		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
-		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![2u64]);
+		assert_eq!(Vaults::final_recovery_queue(DOT, PUSD, 10), vec![2u64]);
 		assert_eq!(vault_debt(DOT, PUSD, 2), debt2);
 		// The burn is fee-free, so issuance falls by exactly the cancelled
 		// debt and nothing reaches the fee destination.
@@ -1477,7 +1536,7 @@ fn recovery_offset_partial_fill_keeps_head_queued() {
 		// The partially settled head keeps its place at the FIFO front.
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before - 200);
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
-		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![1u64]);
+		assert_eq!(Vaults::final_recovery_queue(DOT, PUSD, 10), vec![1u64]);
 		assert_eq!(payer_before - Assets::balance(PUSD, 3), 200);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 168);
 	});
@@ -1570,7 +1629,7 @@ fn recovery_offset_underfunded_payment_partially_fills() {
 
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before - 100);
 		assert_eq!(Assets::balance(PUSD, 3), 0);
-		assert_eq!(Vaults::final_recovery_queue_head(DOT, PUSD, 10), vec![1u64]);
+		assert_eq!(Vaults::final_recovery_queue(DOT, PUSD, 10), vec![1u64]);
 	});
 }
 
