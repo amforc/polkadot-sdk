@@ -1,7 +1,7 @@
 //! Adversarial boundaries: stale user intent, corrupted FIFO/storage
 //! disagreement, and failed value movement after planning.
 
-use crate::{mock::*, pending, Error};
+use crate::{mock::*, Error};
 use frame::traits::{
 	fungibles::Balanced as FungiblesBalanced,
 	tokens::{Fortitude, Precision, Preservation},
@@ -141,8 +141,7 @@ fn activation_rejects_pending_row_missing_fifo_slot() {
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 		advance_time(5_000);
 
-		let fifo = pending::list_id::<Test>(&DOT, &PUSD);
-		assert_ok!(pending::remove::<Test>(&fifo, &1));
+		assert_ok!(pending_remove(DOT, PUSD, 1));
 		assert!(!pending_contains(DOT, PUSD, 1));
 
 		// Any activating touch trips over the corrupted FIFO; the poke stands
@@ -157,7 +156,7 @@ fn activation_rejects_pending_row_missing_fifo_slot() {
 
 		// Repair the deliberate FIFO corruption and prove the row can still
 		// activate cleanly.
-		assert_ok!(pending::append::<Test>(&fifo, 1));
+		assert_ok!(pending_append(DOT, PUSD, 1));
 		assert_ok!(poke(1, 1, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 1).expect("activated row survives");
 		assert_eq!(row.active_deposit, 400);
