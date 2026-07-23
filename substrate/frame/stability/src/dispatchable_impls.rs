@@ -5,7 +5,6 @@ use crate::{
 		Deposits, Error, Event, Pallet, PoolStateOf, PoolSumsStore, Pools, StabilityPoolConfigOf,
 		StabilityPoolOf, StableCreditOf, StableIdOf,
 	},
-	pending,
 	types::{
 		Accumulators, Deposit, DepositSnapshot, PUpdate, PendingDeposit, PendingOffsetResult,
 		PoolSums, RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
@@ -21,7 +20,7 @@ use frame::{
 		Defensive, Time,
 	},
 };
-use pallet_linked_list::SortedListInterface;
+use linked_list_interface::{fifo_append, SortedListInterface};
 use pusd_primitives::{
 	debit_preservation, reducible_debit, BranchMode, BranchModeProvider, Millis,
 	RecoveryOffsetInterface, RecoveryOffsetResult, StableListId,
@@ -152,8 +151,10 @@ impl<T: Config> Pallet<T> {
 				None => {
 					deposit.pending_deposit =
 						Some(PendingDeposit { amount: pending_amount, activatable_at });
-					let fifo = pending::list_id::<T>(&collateral_id, &stable_id);
-					pending::append::<T>(&fifo, who.clone())?;
+					let fifo =
+						StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
+					fifo_append::<_, _, T::PendingLists>(fifo, who.clone())
+						.map_err(|_| Error::<T>::PendingFifoInvariantBroken)?;
 				},
 			}
 			pool.state.total_pending_deposits = pool
@@ -633,7 +634,7 @@ impl<T: Config> Pallet<T> {
 		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
 			return (PendingOffsetResult::zero(), collateral);
 		}
-		let fifo = pending::list_id::<T>(collateral_id, stable_id);
+		let fifo = StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
 		let pool_account = Self::pool_account(collateral_id, stable_id);
 		let cap = T::MaxPendingOffsetIterations::get();
 
@@ -761,7 +762,7 @@ impl<T: Config> Pallet<T> {
 		// failure strands an orphan node and the next iteration's row check stops the
 		// walk before it can loop on the same tail.
 		row.pending_deposit = if new_pending_amount.is_zero() {
-			let _ = pending::remove::<T>(fifo, oldest)
+			let _ = T::PendingLists::remove(fifo, oldest)
 				.defensive_proof("pending FIFO diverged from the rows");
 			None
 		} else {
@@ -1320,8 +1321,8 @@ impl<T: Config> Pallet<T> {
 			.total_pending_deposits
 			.checked_sub(&amount)
 			.ok_or(Error::<T>::PendingFifoInvariantBroken)?;
-		let fifo = pending::list_id::<T>(collateral_id, stable_id);
-		pending::remove::<T>(&fifo, who)?;
+		let fifo = StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
+		T::PendingLists::remove(&fifo, who).map_err(|_| Error::<T>::PendingFifoInvariantBroken)?;
 		deposit.pending_deposit = None;
 		Self::deposit_event(Event::PendingDepositActivated {
 			collateral_id: collateral_id.clone(),

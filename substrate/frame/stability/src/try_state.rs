@@ -1,16 +1,14 @@
 //! `try-runtime` invariant checks: the accounting identities of SPEC.md §12
 //! that must hold after every operation.
 
-use crate::{
-	pallet::{BalanceOf, Config, Deposits, Pallet, PoolSumsStore, Pools},
-	pending,
-};
+use crate::pallet::{BalanceOf, Config, Deposits, Pallet, PoolSumsStore, Pools};
 use frame::{
 	arithmetic::{FixedU128, One, Saturating, Zero},
 	deps::frame_support::traits::fungibles::Inspect as _,
 	try_runtime::TryRuntimeError,
 };
-use pallet_linked_list::SortedListInterface;
+use linked_list_interface::SortedListInterface;
+use pusd_primitives::StableListId;
 
 pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	for (collateral_id, stable_id, pool) in Pools::<T>::iter() {
@@ -56,7 +54,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		// pending amount are queued. Alongside, no realized deposit set may
 		// exceed the pool aggregate (flooring keeps compounded values at or
 		// below it; the excess is stranded dust).
-		let fifo = pending::list_id::<T>(&collateral_id, &stable_id);
+		let fifo = StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
 		let mut pending_sum = BalanceOf::<T>::zero();
 		let mut pending_rows: u32 = 0;
 		let mut compounded_sum = BalanceOf::<T>::zero();

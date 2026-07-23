@@ -26,6 +26,7 @@ use frame::{
 		AsEnsureOriginWithArg, Convert, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
+use pallet_linked_list::SortedListInterface;
 use pusd_primitives::ProvidePrice;
 
 // 16 bytes so `into_sub_account_truncating` keeps the pallet id plus part of
@@ -815,6 +816,29 @@ pub fn pending_contains(collateral: AssetId, stable: StableId, who: AccountId) -
 /// The oldest member of the branch's pending-deposit FIFO (the list tail).
 pub fn pending_oldest(collateral: AssetId, stable: StableId) -> Option<AccountId> {
 	LinkedList::tail(pending_list(collateral, stable))
+}
+
+/// Force `who` out of the branch's pending-deposit FIFO without touching its
+/// row, to set up FIFO/row drift.
+pub fn pending_remove(
+	collateral: AssetId,
+	stable: StableId,
+	who: AccountId,
+) -> Result<(), pallet_linked_list::ListError> {
+	<LinkedList as SortedListInterface<VaultList, AccountId>>::remove(
+		&pending_list(collateral, stable),
+		&who,
+	)
+}
+
+/// Force `who` back into the branch's pending-deposit FIFO without touching
+/// its row, undoing [`pending_remove`].
+pub fn pending_append(
+	collateral: AssetId,
+	stable: StableId,
+	who: AccountId,
+) -> Result<(), pallet_linked_list::ListError> {
+	pallet_linked_list::fifo_append::<_, _, LinkedList>(pending_list(collateral, stable), who)
 }
 
 pub fn pending_count(collateral: AssetId, stable: StableId) -> u32 {
