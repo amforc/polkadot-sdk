@@ -37,7 +37,7 @@
 //! - [`SortedListInterface::pop_tail`]: O(1) tail pop for LIFO consumers.
 //! - [`SortedListInterface::re_insert`]: in-place when the existing position still admits the new
 //!   priority, otherwise splice + repair + re-insert.
-//! - [`SortedListInterface::iter_from_tail`]: bounded tail-first iteration.
+//! - [`SortedListInterface::iter_from_tail`]: lazy tail-first iteration.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -249,7 +249,9 @@ pub mod pallet {
 		/// First `n` items of `list_id` walking from the tail. Returns fewer
 		/// than `n` if the list has fewer items.
 		pub fn iter_from_tail(list_id: T::ListId, n: u32) -> alloc::vec::Vec<T::ItemId> {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::iter_from_tail(&list_id, n)
+			<Self as SortedListInterface<T::ListId, T::ItemId>>::iter_from_tail(list_id)
+				.take(n as usize)
+				.collect()
 		}
 
 		/// Insertion [`Position`] for `priority` in `list_id`.

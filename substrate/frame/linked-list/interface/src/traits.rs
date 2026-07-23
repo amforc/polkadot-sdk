@@ -18,7 +18,6 @@
 //! Consumer-facing trait surface for the sorted list.
 
 use crate::{ListError, Outcome, Position};
-use alloc::vec::Vec;
 use frame::arithmetic::{FixedU128, Zero};
 
 /// Authoritative source of the priority for `(list_id, item)`. Consulted by
@@ -186,9 +185,14 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// and [`Self::neighbors`]; prefer it when walking the list.
 	fn node(list_id: &ListId, item: &ItemId) -> Option<(Self::Priority, Position<ItemId>)>;
 
-	/// First `n` items of `list_id` walking from the tail. Returns fewer than
-	/// `n` if the list has fewer items.
-	fn iter_from_tail(list_id: &ListId, n: u32) -> Vec<ItemId>;
+	/// Lazily walk `list_id` from its tail toward the head: the tail is read
+	/// at construction, every further element only when the iterator
+	/// advances, so nothing is materialized up front.
+	fn iter_from_tail(list_id: ListId) -> impl Iterator<Item = ItemId> {
+		core::iter::successors(Self::tail(&list_id), move |current| {
+			Self::neighbors(&list_id, current).and_then(|position| position.prev)
+		})
+	}
 
 	/// Insertion position for `priority` in `list_id`. O(list size); intended
 	/// for hint preparation, not hot paths.

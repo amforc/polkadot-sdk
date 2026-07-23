@@ -19,7 +19,6 @@
 //! `#[pallet::view_functions]` block in `lib.rs`.
 
 use crate::{list, pallet::*, ListError, Outcome, Position, SortedListInterface};
-use alloc::vec::Vec;
 use frame::{
 	deps::frame_support::storage::{
 		transactional::with_transaction_opaque_err, TransactionOutcome,
@@ -31,23 +30,6 @@ use frame::{
 /// `MaxHintRepairSteps`" infeasibility sentinel. Saturates at `u32::MAX`.
 fn infeasible_sentinel<T: Config>() -> u32 {
 	T::MaxHintRepairSteps::get().saturating_add(1)
-}
-
-/// First `n` items walking from the tail of `list_id`. Returns fewer than `n`
-/// if the list has fewer items.
-pub fn iter_from_tail<T: Config>(list_id: &T::ListId, n: u32) -> Vec<T::ItemId> {
-	if n == 0 {
-		return Vec::new();
-	}
-	let (tail, len) = ListMetas::<T>::get(list_id).map_or((None, 0), |m| (m.tail, m.len));
-	let mut out = Vec::with_capacity(n.min(len) as usize);
-	out.extend(
-		core::iter::successors(tail, |item| {
-			ListNodes::<T>::get(list_id, item).and_then(|node| node.prev)
-		})
-		.take(n.min(len) as usize),
-	);
-	out
 }
 
 /// Insert position for `priority` in `list_id`, treating `skip` (if any) as
