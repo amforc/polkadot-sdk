@@ -88,6 +88,33 @@ fn pending_offset_respects_caller_and_pallet_caps() {
 }
 
 #[test]
+fn pending_offset_stops_at_pallet_cap_and_resumes_at_next_entry() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		for who in 1..=9 {
+			seed_pending(who, 100);
+		}
+
+		// The caller permits more work than the configured pallet maximum of
+		// eight iterations. Exactly the oldest eight rows are consumed.
+		let (result, _) = simulate_pending_offset(DOT, PUSD, 1_000, 0, u32::MAX);
+		assert_eq!(result.debt_offset, 800);
+		assert_eq!(result.iterations_used, 8);
+		assert_eq!(pending_count(DOT, PUSD), 1);
+		assert_eq!(pending_oldest(DOT, PUSD), Some(9));
+		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 100);
+
+		// A later call resumes from the first untouched row.
+		let (result, _) = simulate_pending_offset(DOT, PUSD, 200, 0, u32::MAX);
+		assert_eq!(result.debt_offset, 100);
+		assert_eq!(result.iterations_used, 1);
+		assert_eq!(pending_count(DOT, PUSD), 0);
+		assert_eq!(pending_oldest(DOT, PUSD), None);
+		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 0);
+	});
+}
+
+#[test]
 fn pending_offset_noop_cases_pass_remainders_through() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
