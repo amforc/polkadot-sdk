@@ -7,7 +7,6 @@ use frame::traits::{
 	fungible::{Inspect as FungibleInspect, Mutate as FungibleMutate},
 	tokens::Preservation,
 };
-use pallet_linked_list::SortedListInterface;
 
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 
@@ -222,10 +221,7 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 		for (who, pct) in [(1u64, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
 			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
-		let order_before = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT, PUSD),
-			10,
-		);
+		let order_before = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
 			DOT,
@@ -243,10 +239,7 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 			Position::endpoints_only()
 		));
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), DOT, PUSD, 3, 50));
-		let order_after = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT, PUSD),
-			10,
-		);
+		let order_after = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
 		assert_eq!(order_before, order_after);
 	});
 }
@@ -325,10 +318,7 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 		assert_eq!(v_post.last_rate_update, now_before_call);
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted);
-		let order = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT, PUSD),
-			10,
-		);
+		let order = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
 		assert_eq!(order, alloc::vec![1, 2, 3]);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BorrowRateChanged {
 			collateral_id: DOT,
