@@ -22,7 +22,6 @@
 //! pallet's storage.
 
 use crate::{list, pallet::*, view_helpers, ListError, Outcome, Position, SortedListInterface};
-use alloc::vec::Vec;
 use frame::{
 	deps::frame_support::{
 		storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
@@ -204,10 +203,6 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 
 	fn node(list_id: &T::ListId, item: &T::ItemId) -> Option<(T::Priority, Position<T::ItemId>)> {
 		ListNodes::<T>::get(list_id, item).map(|n| (n.priority, n.into_position()))
-	}
-
-	fn iter_from_tail(list_id: &T::ListId, n: u32) -> Vec<T::ItemId> {
-		view_helpers::iter_from_tail::<T>(list_id, n)
 	}
 
 	fn find_position(list_id: &T::ListId, priority: T::Priority) -> Position<T::ItemId> {
