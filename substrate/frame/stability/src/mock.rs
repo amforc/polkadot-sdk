@@ -357,7 +357,7 @@ impl Convert<StableId, AccountId> for InsuranceFundAccounts {
 
 parameter_types! {
 	pub const FeeDestAccount: AccountId = FEE_DEST;
-	pub static DefaultRedemptionConfig: pallet_redemptions::types::RedemptionConfig<Balance, Moment> =
+	pub static DefaultRedemptionConfig: pallet_redemptions::types::RedemptionConfig<Balance> =
 		pallet_redemptions::types::RedemptionConfig {
 			minimum_redemption_amount: 100,
 			dynamic_fee_decay_period: 6 * 3_600 * 1_000,
@@ -371,8 +371,6 @@ parameter_types! {
 }
 
 impl pallet_redemptions::Config for Test {
-	type CollateralAssetId = AssetId;
-	type StableAssetId = StableId;
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
 	type Vaults = Vaults;
