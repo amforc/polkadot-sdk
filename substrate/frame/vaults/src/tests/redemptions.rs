@@ -4,7 +4,7 @@ use crate::{
 	tests::{rate_pct, vault_status},
 };
 use pallet_linked_list::SortedListInterface;
-use pusd_primitives::RedemptionSettlement;
+use pusd_primitives::{RedemptionSettlement, VaultInterface};
 
 const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 
@@ -109,6 +109,46 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 			redeem_step(DOT, PUSD, 1, 3, |_| panic!("closure must not run")),
 			crate::Error::<Test>::BranchFrozen
 		);
+	});
+}
+
+#[test]
+fn projected_redemption_snapshot_matches_post_touch_without_mutating_state() {
+	use frame::deps::frame_support::storage::{with_transaction, TransactionOutcome};
+
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(60, 100)));
+		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+
+		let branch_before = branch_state(DOT, PUSD).expect("branch stored");
+		let vault_before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let held_before = held(DOT, 1);
+		let events_before = System::events();
+
+		let projected =
+			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
+		assert_eq!(branch_state(DOT, PUSD), Some(branch_before.clone()));
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(vault_before.clone()));
+		assert_eq!(held(DOT, 1), held_before);
+		assert_eq!(System::events(), events_before);
+
+		let mut touched = None;
+		with_transaction(|| {
+			let result = redeem_step(DOT, PUSD, 1, 3, |snapshot| {
+				touched = Some(snapshot);
+				Ok(None)
+			});
+			TransactionOutcome::Rollback(result)
+		})
+		.expect("touch succeeds");
+
+		assert_eq!(touched, Some(projected));
+		assert_eq!(branch_state(DOT, PUSD), Some(branch_before));
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(vault_before));
+		assert_eq!(held(DOT, 1), held_before);
+		assert_eq!(System::events(), events_before);
 	});
 }
 

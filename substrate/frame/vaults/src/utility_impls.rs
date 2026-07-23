@@ -590,53 +590,19 @@ impl<T: Config> Pallet<T> {
 		fee
 	}
 
-	/// Lazily walk a vault list from its tail, following `prev` pointers — the same
-	/// order as [`SortedListInterface::iter_from_tail`], but every storage read is
-	/// deferred until the iterator advances, so a caller taking only the head pays
-	/// for only the tail read.
-	fn list_from_tail(
-		list: VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
-	) -> impl Iterator<Item = T::AccountId> {
-		let mut started = false;
-		let mut cursor: Option<T::AccountId> = None;
-		core::iter::from_fn(move || {
-			if !started {
-				started = true;
-				cursor = T::VaultLists::tail(&list);
-			} else if let Some(current) = &cursor {
-				cursor = T::VaultLists::neighbors(&list, current).and_then(|p| p.prev);
-			}
-			cursor.clone()
-		})
-	}
-
-	/// A branch's redemption targets, each tagged with its lifecycle status, in
-	/// priority order: if the `FinalRecovery` FIFO is
-	/// non-empty, yield only its head; else if `dormant_redemption_target` is set,
-	/// yield only that; otherwise yield the rate index tail-first (all `Active`).
-	/// Lazy and allocation-free: `.next()` gives the next target and `take(n)` the
-	/// queue view, reading only the tiers they reach.
-	pub(crate) fn redemption_targets(
+	/// The single target that preempts the rate index, with its status: the
+	/// `FinalRecovery` FIFO head, else the parked dormant redemption target.
+	pub(crate) fn priority_redemption_target(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-	) -> impl Iterator<Item = (T::AccountId, VaultStatus)> {
-		let priority = recovery::next_target::<T>(collateral_id, stable_id)
+	) -> Option<(T::AccountId, VaultStatus)> {
+		recovery::next_target::<T>(collateral_id, stable_id)
 			.map(|owner| (owner, VaultStatus::FinalRecovery))
 			.or_else(|| {
 				Branches::<T>::get(collateral_id, stable_id)
 					.and_then(|branch| branch.state.dormant_redemption_target)
 					.map(|owner| (owner, VaultStatus::Dormant))
-			});
-		// The rate index is walked only when no FinalRecovery/Dormant target gates it.
-		let rate = priority
-			.is_none()
-			.then(|| {
-				Self::list_from_tail(VaultListId::Rate(collateral_id.clone(), stable_id.clone()))
 			})
-			.into_iter()
-			.flatten()
-			.map(|owner| (owner, VaultStatus::Active));
-		priority.into_iter().chain(rate)
 	}
 
 	/// The next ordinary redemption target after `owner` in the rate index: its
@@ -656,6 +622,21 @@ impl<T: Config> Pallet<T> {
 			"redemption after-cursor must be a current rate-index member"
 		);
 		T::VaultLists::neighbors(&rate_list, owner).and_then(|p| p.prev)
+	}
+
+	/// The lowest-rate active vault, or the active vault immediately after
+	/// `after`, without consulting the priority tiers.
+	pub(crate) fn ordinary_redemption_target(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		after: Option<&T::AccountId>,
+	) -> Option<T::AccountId> {
+		match after {
+			Some(owner) => Self::ordinary_target_after(collateral_id, stable_id, owner),
+			None => {
+				T::VaultLists::tail(&VaultListId::Rate(collateral_id.clone(), stable_id.clone()))
+			},
+		}
 	}
 
 	/// Read the `(config, branch state, vault)` triple for a `predict_*` view.

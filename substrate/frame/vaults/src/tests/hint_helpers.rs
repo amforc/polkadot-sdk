@@ -119,10 +119,7 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 		);
 		assert!(vault_status(DOT, PUSD, 21).is_final_recovery());
 		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).unwrap(), vault_pre);
-		assert_eq!(
-			crate::Pallet::<Test>::final_recovery_queue_head(DOT, PUSD, 10),
-			alloc::vec![21]
-		);
+		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), alloc::vec![21]);
 	});
 }
 
@@ -162,10 +159,7 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 		seed_long_rate_index();
 		let vault_pre = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).expect("vault stored");
 		let branch_pre = branch_state(DOT, PUSD).expect("branch state");
-		let order_pre = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT, PUSD),
-			25,
-		);
+		let order_pre = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 25);
 
 		assert_noop!(
 			crate::Pallet::<Test>::change_rate(
@@ -180,10 +174,7 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 
 		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).unwrap(), vault_pre);
 		assert_eq!(branch_state(DOT, PUSD).unwrap(), branch_pre);
-		let order_post = <LinkedList as SortedListInterface<VaultList, u64>>::iter_from_tail(
-			&rate_list(DOT, PUSD),
-			25,
-		);
+		let order_post = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 25);
 		assert_eq!(order_post, order_pre);
 	});
 }

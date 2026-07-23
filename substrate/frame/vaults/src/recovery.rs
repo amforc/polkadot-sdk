@@ -52,10 +52,12 @@ pub fn next_target<T: Config>(
 }
 
 /// First `n` FIFO owners, oldest first.
-pub fn queue_head<T: Config>(
+pub fn queue<T: Config>(
 	collateral_id: &CollateralIdOf<T>,
 	stable_id: &StableIdOf<T>,
 	n: u32,
 ) -> Vec<T::AccountId> {
-	T::VaultLists::iter_from_tail(&list_id::<T>(collateral_id, stable_id), n)
+	T::VaultLists::iter_from_tail(list_id::<T>(collateral_id, stable_id))
+		.take(n as usize)
+		.collect()
 }
