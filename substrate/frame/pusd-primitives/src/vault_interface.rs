@@ -85,6 +85,29 @@ pub trait VaultInterface {
 		after: Option<&Self::AccountId>,
 	) -> Option<(Self::AccountId, VaultStatus)>;
 
+	/// The traversal a read-only redemption quote folds over, read lazily
+	/// from live state: the `FinalRecovery` FIFO head — else the parked
+	/// dormant target — first, then active vaults from the lowest rate
+	/// upward.
+	///
+	/// A quote projection ONLY, not the executable queue: projection never
+	/// reshapes the queue, so a skipped and a drained target both continue at
+	/// the next element. Execution must instead re-read
+	/// [`Self::next_redemption_target`] each step, because settling a step
+	/// can reshape the queue (new priority targets, index departures).
+	fn redemption_quote_targets(
+		collateral_id: &Self::CollateralId,
+		stable_id: &Self::StableId,
+	) -> impl Iterator<Item = Self::AccountId>;
+
+	/// Project the fully-accrued values that [`Self::redeem_step`] would hand
+	/// to its settlement builder, without touching storage or moving assets.
+	fn project_redemption_snapshot(
+		collateral_id: &Self::CollateralId,
+		stable_id: &Self::StableId,
+		owner: &Self::AccountId,
+	) -> Result<RedemptionStepSnapshot<Self::Balance>, DispatchError>;
+
 	/// One redemption step against `owner`'s vault: touch it, hand the caller a
 	/// fully-accrued snapshot, and apply the returned settlement atomically —
 	/// cancel exactly the debt `debt_payment` covers,

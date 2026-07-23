@@ -6,7 +6,7 @@ use crate::{
 		BalanceOf, Branches, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason,
 		Pallet, StableCreditOf, StableIdOf,
 	},
-	types::VaultStatus,
+	types::{VaultListId, VaultStatus},
 };
 use frame::{
 	deps::frame_support::transactional,
@@ -20,6 +20,7 @@ use frame::{
 		Time,
 	},
 };
+use linked_list_interface::SortedListInterface;
 use pusd_primitives::{
 	BranchMode, BranchModeProvider, LiquidationSettlement, LiquidationSnapshot,
 	RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
@@ -122,15 +123,43 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		after: Option<&T::AccountId>,
 	) -> Option<(T::AccountId, VaultStatus)> {
-		// A previous step may create a priority target. Check for one before using the cursor.
-		match Self::redemption_targets(collateral_id, stable_id).next() {
-			Some((owner, status)) if !status.is_active() => Some((owner, status)),
-			head => match after {
-				None => head,
-				Some(owner) => Self::ordinary_target_after(collateral_id, stable_id, owner)
-					.map(|owner| (owner, VaultStatus::Active)),
-			},
-		}
+		// A previous step may create a priority target; it preempts any cursor.
+		Self::priority_redemption_target(collateral_id, stable_id).or_else(|| {
+			Self::ordinary_redemption_target(collateral_id, stable_id, after)
+				.map(|owner| (owner, VaultStatus::Active))
+		})
+	}
+
+	fn redemption_quote_targets(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> impl Iterator<Item = T::AccountId> {
+		let priority =
+			Self::priority_redemption_target(collateral_id, stable_id).map(|(owner, _)| owner);
+		let rate = T::VaultLists::iter_from_tail(VaultListId::Rate(
+			collateral_id.clone(),
+			stable_id.clone(),
+		));
+		priority.into_iter().chain(rate)
+	}
+
+	fn project_redemption_snapshot(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		owner: &T::AccountId,
+	) -> Result<RedemptionStepSnapshot<BalanceOf<T>>, DispatchError> {
+		let now = T::TimeProvider::now();
+		let branch = Self::branch_of(collateral_id, stable_id)?;
+		ensure!(!branch.state.is_frozen(), Error::<T>::BranchFrozen);
+
+		let vault = Self::vault_of(collateral_id, stable_id, owner)?;
+		let pending = Self::pending_touch_for(&vault, &branch.state, now);
+		Ok(RedemptionStepSnapshot {
+			status: Self::vault_status_of(collateral_id, stable_id, owner),
+			debt: pending.total_debt(&vault.debt),
+			collateral: vault.collateral.saturating_add(pending.collateral),
+			redistribution_penalty: branch.config.redistribution_penalty,
+		})
 	}
 
 	#[transactional]
