@@ -3535,8 +3535,6 @@ parameter_types! {
 }
 
 impl pallet_stability::Config for Runtime {
-	type CollateralAssetId = VaultsCollateralId;
-	type StableAssetId = VaultsStableId;
 	type StableAssets = Assets;
 	type CollateralAssets = StabilityCollateral;
 	type TimeProvider = Timestamp;
