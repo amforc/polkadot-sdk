@@ -1,6 +1,6 @@
 //! Branch lifecycle seeding and `set_stability_pool_config` governance.
 
-use crate::{mock::*, pending, types::PoolSums, Error};
+use crate::{mock::*, types::PoolSums, Error};
 
 fn providers(who: AccountId) -> u32 {
 	System::providers(&who)
@@ -94,8 +94,7 @@ fn branch_removal_blocked_while_fifo_nodes_exist() {
 		// try-state invariant, backstop walks stop on divergence instead of
 		// looping, and an actual occurrence is a bug to fix by storage
 		// migration, not to paper over at runtime.
-		let fifo = pending::list_id::<Test>(&DOT, &PUSD);
-		assert_ok!(pending::append::<Test>(&fifo, 5));
+		assert_ok!(pending_append(DOT, PUSD, 5));
 
 		assert_noop!(
 			Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
@@ -103,7 +102,7 @@ fn branch_removal_blocked_while_fifo_nodes_exist() {
 		);
 		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_some());
 
-		assert_ok!(pending::remove::<Test>(&fifo, &5));
+		assert_ok!(pending_remove(DOT, PUSD, 5));
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 	});
 }
