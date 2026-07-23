@@ -1,7 +1,10 @@
 //! pUSD primitive trait implementations: the surfaces sibling pallets drive
 //! on the pool.
 
-use crate::pallet::{BalanceOf, CollateralCreditOf, Config, Pallet, Pools, StableCreditOf};
+use crate::pallet::{
+	BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Pallet, Pools, StableCreditOf,
+	StableIdOf,
+};
 use frame::prelude::*;
 use pusd_primitives::{OnBranchYield, StabilityPoolOffsetApi};
 
@@ -10,12 +13,10 @@ use pusd_primitives::{OnBranchYield, StabilityPoolOffsetApi};
 /// destination. Infallible: whatever cannot be distributed (no pool row, a
 /// zero share, an empty or frozen pool) comes back with the remainder. The
 /// pool row is loaded once and handed down to the distribution engine.
-impl<T: Config> OnBranchYield<T::CollateralAssetId, T::StableAssetId, StableCreditOf<T>>
-	for Pallet<T>
-{
+impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableIdOf<T>, StableCreditOf<T>> for Pallet<T> {
 	fn distribute_yield(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
 		if credit.asset() != *stable_id {
@@ -43,16 +44,12 @@ impl<T: Config> OnBranchYield<T::CollateralAssetId, T::StableAssetId, StableCred
 /// The offset surface the future liquidations pallet drives. Collateral
 /// travels as a `Credit`.
 impl<T: Config>
-	StabilityPoolOffsetApi<
-		T::CollateralAssetId,
-		T::StableAssetId,
-		BalanceOf<T>,
-		CollateralCreditOf<T>,
-	> for Pallet<T>
+	StabilityPoolOffsetApi<CollateralIdOf<T>, StableIdOf<T>, BalanceOf<T>, CollateralCreditOf<T>>
+	for Pallet<T>
 {
 	fn offset_liquidation(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		max_debt_to_offset: BalanceOf<T>,
 		collateral: CollateralCreditOf<T>,
 	) -> (BalanceOf<T>, CollateralCreditOf<T>) {
@@ -60,8 +57,8 @@ impl<T: Config>
 	}
 
 	fn offset_pending_liquidation(
-		collateral_id: &T::CollateralAssetId,
-		stable_id: &T::StableAssetId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
 		max_debt_to_offset: BalanceOf<T>,
 		collateral: CollateralCreditOf<T>,
 	) -> (BalanceOf<T>, CollateralCreditOf<T>) {

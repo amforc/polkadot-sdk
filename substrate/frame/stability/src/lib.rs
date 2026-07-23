@@ -52,6 +52,16 @@ pub mod pallet {
 		<T as frame_system::Config>::AccountId,
 	>>::Balance;
 
+	/// Collateral identifier exposed by [`Config::CollateralAssets`].
+	pub type CollateralIdOf<T> = <<T as Config>::CollateralAssets as fungibles::Inspect<
+		<T as frame_system::Config>::AccountId,
+	>>::AssetId;
+
+	/// Stable asset identifier exposed by [`Config::StableAssets`].
+	pub type StableIdOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
+		<T as frame_system::Config>::AccountId,
+	>>::AssetId;
+
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
 
@@ -74,18 +84,11 @@ pub mod pallet {
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
-		/// The collateral asset a market borrows against; a market is one
-		/// `(collateral, stable)` pair.
-		type CollateralAssetId: Parameter + Member + Ord + MaxEncodedLen;
-
-		/// The stablecoin a market mints; the pool holds and burns it.
-		type StableAssetId: Parameter + Member + Ord + MaxEncodedLen;
-
 		/// Product-sum math needs a fungibles balance type that can enter
 		/// fixed-point calculations without lossy adapters.
 		type StableAssets: fungibles::Inspect<
 				Self::AccountId,
-				AssetId = Self::StableAssetId,
+				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance: FixedPointOperand,
 			> + fungibles::Mutate<Self::AccountId>
 			+ fungibles::Balanced<Self::AccountId>;
@@ -93,7 +96,7 @@ pub mod pallet {
 		/// Collateral surface the pool receives offset gains on and pays depositor claims from.
 		type CollateralAssets: fungibles::Mutate<
 				Self::AccountId,
-				AssetId = Self::CollateralAssetId,
+				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance = BalanceOf<Self>,
 			> + fungibles::Balanced<Self::AccountId>;
 
@@ -104,15 +107,15 @@ pub mod pallet {
 		/// Branch operating-mode source of truth (point it at the vault
 		/// pallet). Frozen branches reject every value-moving pool operation
 		/// (SPEC.md §8.1); Safety Mode turns withdrawals two-step.
-		type BranchModes: BranchModeProvider<Self::CollateralAssetId, Self::StableAssetId>;
+		type BranchModes: BranchModeProvider<CollateralIdOf<Self>, StableIdOf<Self>>;
 
 		/// Shared `FinalRecovery` settlement pricing and execution (point it
 		/// at the redemptions pallet, which owns that pricing) — recovery
 		/// offsets can never diverge from recovery-redemption pricing
 		/// (SPEC.md §12 invariant 9).
 		type RecoveryOffsets: RecoveryOffsetInterface<
-			CollateralId = Self::CollateralAssetId,
-			StableId = Self::StableAssetId,
+			CollateralId = CollateralIdOf<Self>,
+			StableId = StableIdOf<Self>,
 			AccountId = Self::AccountId,
 			Balance = BalanceOf<Self>,
 			Credit = StableCreditOf<Self>,
@@ -128,7 +131,7 @@ pub mod pallet {
 		/// runtime's shared `pallet-linked-list` instance, addressed through
 		/// the `StableListId::StabilityPending` variant.
 		type PendingLists: SortedListInterface<
-			StableListId<Self::CollateralAssetId, Self::StableAssetId>,
+			StableListId<CollateralIdOf<Self>, StableIdOf<Self>>,
 			Self::AccountId,
 			Priority = FixedU128,
 		>;
@@ -139,7 +142,7 @@ pub mod pallet {
 		/// override with `EitherOf`.
 		type UpdateOrigin: EnsureOriginWithArg<
 			Self::RuntimeOrigin,
-			(Self::CollateralAssetId, Self::StableAssetId),
+			(CollateralIdOf<Self>, StableIdOf<Self>),
 			Success = (),
 		>;
 
@@ -164,8 +167,8 @@ pub mod pallet {
 	pub type Deposits<T: Config> = StorageNMap<
 		_,
 		(
-			NMapKey<Twox64Concat, T::CollateralAssetId>,
-			NMapKey<Twox64Concat, T::StableAssetId>,
+			NMapKey<Twox64Concat, CollateralIdOf<T>>,
+			NMapKey<Twox64Concat, StableIdOf<T>>,
 			NMapKey<Blake2_128Concat, T::AccountId>,
 		),
 		DepositOf<T>,
@@ -175,7 +178,7 @@ pub mod pallet {
 	/// TODO: Doc
 	#[pallet::storage]
 	pub type ActivationCursor<T: Config> =
-		StorageValue<_, (T::CollateralAssetId, T::StableAssetId, T::AccountId), OptionQuery>;
+		StorageValue<_, (CollateralIdOf<T>, StableIdOf<T>, T::AccountId), OptionQuery>;
 
 	/// The registered markets' pools: governance parameters and hot
 	/// accounting state in one record, so the pieces can never partially
@@ -184,9 +187,9 @@ pub mod pallet {
 	pub type Pools<T: Config> = StorageDoubleMap<
 		_,
 		Twox64Concat,
-		T::CollateralAssetId,
+		CollateralIdOf<T>,
 		Twox64Concat,
-		T::StableAssetId,
+		StableIdOf<T>,
 		StabilityPoolOf<T>,
 		OptionQuery,
 	>;
@@ -198,8 +201,8 @@ pub mod pallet {
 	pub type PoolSumsStore<T: Config> = StorageNMap<
 		_,
 		(
-			NMapKey<Twox64Concat, T::CollateralAssetId>,
-			NMapKey<Twox64Concat, T::StableAssetId>,
+			NMapKey<Twox64Concat, CollateralIdOf<T>>,
+			NMapKey<Twox64Concat, StableIdOf<T>>,
 			NMapKey<Twox64Concat, u32>,
 			NMapKey<Twox64Concat, u32>,
 		),
@@ -214,8 +217,8 @@ pub mod pallet {
 		/// was burned immediately against a `FinalRecovery` vault;
 		/// `pending_amount` queued behind the entry delay.
 		DepositReceived {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
 			used_for_recovery: BalanceOf<T>,
@@ -224,15 +227,15 @@ pub mod pallet {
 		/// A pending deposit passed its entry delay and became active on the
 		/// next touch of its row.
 		PendingDepositActivated {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// A Safety-Mode withdrawal request was created or replaced.
 		WithdrawalRequested {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
 			executable_at: Millis,
@@ -240,24 +243,24 @@ pub mod pallet {
 		/// Active stablecoin left the pool. `amount` is what was actually
 		/// taken, which may be less than requested.
 		WithdrawalExecuted {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// Realized collateral gains were paid out (SPEC.md §6.10).
 		CollateralClaimed {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// Realized stablecoin yield was paid out (SPEC.md §6.10).
 		YieldClaimed {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
@@ -265,22 +268,22 @@ pub mod pallet {
 		/// Branch yield was distributed to active depositors through `G`
 		/// (SPEC.md §6.3).
 		YieldDistributed {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 		},
 		/// Claimable yield was moved into the active deposit (SPEC.md §6.11).
 		YieldCompounded {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
 		},
 		/// Active-pool stablecoin was burned against liquidation debt
 		/// (SPEC.md §7.1). `epoch`/`scale` are the post-offset coordinates.
 		PoolOffsetApplied {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			debt_burned: BalanceOf<T>,
 			collateral_gain: BalanceOf<T>,
 			epoch: u32,
@@ -289,8 +292,8 @@ pub mod pallet {
 		/// Pending deposits were consumed as the last-resort liquidation
 		/// backstop (SPEC.md §7.2).
 		PendingDepositOffsetApplied {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			debt_burned: BalanceOf<T>,
 			collateral_gain: BalanceOf<T>,
 			iterations: u32,
@@ -300,22 +303,19 @@ pub mod pallet {
 		/// `source` distinguishes active-pool capital (gains through `S`)
 		/// from an incoming deposit (gains credited directly).
 		RecoveryOffsetApplied {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			debt_burned: BalanceOf<T>,
 			collateral_gain: BalanceOf<T>,
 			source: RecoveryOffsetSource,
 		},
 		/// Governance replaced a market's stability-pool config.
-		StabilityPoolConfigUpdated {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
-		},
+		StabilityPoolConfigUpdated { collateral_id: CollateralIdOf<T>, stable_id: StableIdOf<T> },
 		/// Market teardown swept the pool account's residual dust to
 		/// [`Config::StableDustHandler`] / [`Config::CollateralDustHandler`].
 		DustSwept {
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			stable_amount: BalanceOf<T>,
 			collateral_amount: BalanceOf<T>,
 		},
@@ -411,8 +411,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::deposit())]
 		pub fn deposit(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -426,8 +426,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::request_withdraw())]
 		pub fn request_withdraw(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -443,8 +443,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::withdraw())]
 		pub fn withdraw(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
@@ -459,8 +459,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::claim_collateral())]
 		pub fn claim_collateral(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -475,8 +475,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::claim_yield())]
 		pub fn claim_yield(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			recipient: Option<T::AccountId>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -493,8 +493,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::offset_recovery())]
 		pub fn offset_recovery(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			max_stable_in: BalanceOf<T>,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
@@ -509,8 +509,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::compound_yield())]
 		pub fn compound_yield(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
@@ -527,8 +527,8 @@ pub mod pallet {
 		pub fn poke_deposit(
 			origin: OriginFor<T>,
 			owner: T::AccountId,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
 			Self::do_poke_deposit(owner, collateral_id, stable_id)
@@ -545,8 +545,8 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::set_stability_pool_config())]
 		pub fn set_stability_pool_config(
 			origin: OriginFor<T>,
-			collateral_id: T::CollateralAssetId,
-			stable_id: T::StableAssetId,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			config: StabilityPoolConfigOf<T>,
 		) -> DispatchResult {
 			T::UpdateOrigin::ensure_origin(origin, &(collateral_id.clone(), stable_id.clone()))?;
@@ -559,8 +559,8 @@ pub mod pallet {
 		/// pending deposits plus undistributed yield) and collateral
 		/// (unclaimed gains).
 		pub fn pool_account(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 		) -> T::AccountId {
 			pusd_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
 		}
@@ -573,8 +573,8 @@ pub mod pallet {
 		/// balance↔totals invariant holds as an equality, so a re-registered
 		/// pair starting from fresh zero totals would inherit a divergence.
 		fn sweep_dust(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 			pool_account: &T::AccountId,
 		) -> Result<(BalanceOf<T>, BalanceOf<T>), DispatchError> {
 			let stable_dust = T::StableAssets::balance(stable_id.clone(), pool_account);
@@ -609,10 +609,10 @@ pub mod pallet {
 		}
 	}
 
-	impl<T: Config> OnBranchLifecycle<T::CollateralAssetId, T::StableAssetId> for Pallet<T> {
+	impl<T: Config> OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
 		fn on_registered(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 		) -> DispatchResult {
 			let config = T::DefaultStabilityPoolConfig::get();
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
@@ -629,8 +629,8 @@ pub mod pallet {
 		}
 
 		fn on_deregistered(
-			collateral_id: &T::CollateralAssetId,
-			stable_id: &T::StableAssetId,
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
 		) -> DispatchResult {
 			// Depositor rows are the user-funds guard: active, pending, and
 			// claimable value all live on them. Vaults rolls the whole
