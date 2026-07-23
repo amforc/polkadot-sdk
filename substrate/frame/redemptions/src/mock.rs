@@ -606,5 +606,5 @@ pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Bala
 
 /// Fully accrued branch debt: the denominator the dynamic-fee accelerator uses.
 pub fn branch_debt(collateral: AssetId, stable: StableId) -> Balance {
-	<pallet_vaults::Pallet<Test> as VaultInterface>::branch_debt(&collateral, &stable)
+	pallet_vaults::Pallet::<Test>::branch_debt(&collateral, &stable)
 }
