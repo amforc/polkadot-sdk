@@ -1,7 +1,4 @@
 //! Weights for `pallet-stability`.
-//!
-//! Hand-written stub: regenerate with `frame-omni-bencher` once the full
-//! dispatchable surface exists (benchmarking milestone).
 
 use frame::prelude::Weight;
 
@@ -57,6 +54,6 @@ impl WeightInfo for () {
 	}
 
 	fn on_idle_one_deposit() -> Weight {
-		Weight::zero()
+		Weight::from_parts(500_000_000, 100_000)
 	}
 }
