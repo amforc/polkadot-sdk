@@ -88,12 +88,10 @@ fn branch_removal_blocked_while_depositor_rows_exist() {
 fn branch_removal_blocked_while_fifo_nodes_exist() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		// An orphan FIFO node without a deposit row is only reachable through
-		// a bug elsewhere; teardown must still refuse to strand it. There is
-		// deliberately no remediation extrinsic: the rows↔FIFO bijection is a
-		// try-state invariant, backstop walks stop on divergence instead of
-		// looping, and an actual occurrence is a bug to fix by storage
-		// migration, not to paper over at runtime.
+		// An orphan FIFO node (no deposit row) is reachable only through a bug,
+		// and teardown must still refuse to strand it. Deliberately no
+		// remediation extrinsic: try-state pins the rows↔FIFO bijection, and a
+		// real occurrence is a bug to fix by storage migration.
 		assert_ok!(pending_append(DOT, PUSD, 5));
 
 		assert_noop!(
