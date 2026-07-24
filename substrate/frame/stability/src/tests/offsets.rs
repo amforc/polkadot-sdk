@@ -273,13 +273,15 @@ fn compounded_yield_absorbs_offsets() {
 		drop(distribute_yield(DOT, PUSD, 60));
 		assert_ok!(compound(1, DOT, PUSD, 60));
 
-		// The compounded 60 is offsettable: A = 660, and the 627 offset
+		// The compounded 60 is offsettable: A = 660, and the 601 offset
 		// exceeds the original 600 deposit — only possible because the
-		// compounded yield absorbs too. P = 33/660 = 0.05,
-		// compounded = floor(660 * 0.05) = 33.
-		assert_eq!(simulate_offset(DOT, PUSD, 627, 0).0, 627);
+		// compounded yield absorbs too. The survival ratio 59/660 is
+		// 0.089393..., so the 18-decimal P floors and the withdrawal pays
+		// floor(660 * P) = 58; the odd unit strands as pool-owned dust.
+		assert_eq!(simulate_offset(DOT, PUSD, 601, 0).0, 601);
 		assert_ok!(withdraw(1, DOT, PUSD, 1_000, 1));
-		assert_eq!(stable_balance(PUSD, 1), 33);
+		assert_eq!(stable_balance(PUSD, 1), 58);
+		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 1);
 	});
 }
 
