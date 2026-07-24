@@ -169,7 +169,7 @@ fn permissionless_poke_realizes_gain_into_owner_claimable() {
 
 		// A third party pokes: realization is permissionless, so gain =
 		// (1000/1) * 0.4 = 400 lands in the owner's claimable and the
-		// deposit compounds to 500 — without the owner lifting a finger.
+		// deposit compounds to 500.
 		assert_ok!(poke(7, 1, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
 		assert_eq!(row.claimable_collateral, 400);
