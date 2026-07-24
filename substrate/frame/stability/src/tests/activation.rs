@@ -5,8 +5,8 @@
 //! liquidation-only participation, not to give the owner a second decision
 //! point.
 
-use crate::mock::*;
-use frame::prelude::Weight;
+use crate::{mock::*, weights::WeightInfo};
+use frame::{prelude::Weight, traits::Hooks};
 
 fn run_idle(remaining: Weight) -> Weight {
 	Stability::on_idle_activation_walk_with_weight(remaining, Weight::from_parts(1, 0))
@@ -37,16 +37,17 @@ fn offset_with_only_immature_pending_fails() {
 }
 
 #[test]
-fn poke_at_exact_boundary_activates_and_offset_succeeds() {
+fn offset_at_exact_boundary_succeeds() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 
-		// Exactly at t = 6_000 the deposit is mature; any touch folds it in —
-		// here a third-party poke, no owner action involved.
+		// Exactly at t = 6_000 the deposit is mature. The runtime's idle hook
+		// folds it into the active pool without a poke or owner action.
 		advance_time(5_000);
-		assert_ok!(poke(7, 1, DOT, PUSD));
+		let row_weight = <() as WeightInfo>::on_idle_one_deposit();
+		assert_eq!(Stability::on_idle(System::block_number(), row_weight), row_weight);
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		assert_eq!(row.active_deposit, 400);
@@ -77,7 +78,7 @@ fn poke_at_exact_boundary_activates_and_offset_succeeds() {
 			.into(),
 		);
 
-		// The now-active capital absorbs an ordinary offset.
+		// The immediately following ordinary offset succeeds.
 		let (debt_offset, leftover) = simulate_offset(DOT, PUSD, 100, 80);
 		assert_eq!(debt_offset, 100);
 		assert_eq!(leftover, 0);
