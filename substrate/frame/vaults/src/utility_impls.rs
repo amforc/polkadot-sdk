@@ -6,12 +6,12 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
-		Error, IdleCursor, Millis, Pallet, StableIdOf, Vaults,
+		Error, IdleCursor, Millis, Pallet, StableIdOf, StablecoinDebt, Vaults,
 	},
 	recovery,
 	types::{
-		AdminLevel, BranchConfig, BranchMode, BranchState, Vault, VaultDebt, VaultListId,
-		VaultStatus,
+		AdminLevel, BranchConfig, BranchMode, BranchState, PendingInterest, Position,
+		StablecoinDebtState, Vault, VaultDebt, VaultListId, VaultStatus,
 	},
 	weights::WeightInfo,
 };
@@ -22,14 +22,6 @@ use frame::{
 };
 use linked_list_interface::{ListError, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, OnBranchYield, ProvidePrice};
-
-/// The two numbers a branch TCR depends on. [`Pallet::compute_tcr`] derives
-/// them from live state; the operation context captures them once at load as
-/// the structurally immutable "pre" side of its TCR gate.
-pub(crate) struct TcrInputs<Balance> {
-	pub collateral: Balance,
-	pub debt: Balance,
-}
 
 /// Deltas the next vault touch would apply.
 pub(crate) struct PendingTouch<Balance> {
@@ -62,6 +54,13 @@ enum WalkExit<K> {
 	Parked(K),
 }
 
+/// The part of one branch that contributes to derived debt aggregates.
+struct BranchContribution<Balance> {
+	outstanding: Balance,
+	pending_interest: PendingInterest<Balance>,
+	active_weight: Balance,
+}
+
 impl<T: Config> Pallet<T> {
 	/// Translate a rate-index insert/re-insert failure. A stale user-supplied
 	/// hint surfaces as [`Error::InvalidPositionHints`]; every other kind —
@@ -78,29 +77,165 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Read the whole market record, returning `UnknownCollateral` when
-	/// missing.
+	/// Read the whole branch record, returning `BranchNotFound` when missing.
 	pub(crate) fn branch_of(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 	) -> Result<BranchOf<T>, DispatchError> {
 		Branches::<T>::get(collateral_id, stable_id)
-			.ok_or_else(|| Error::<T>::UnknownCollateral.into())
+			.ok_or_else(|| Error::<T>::BranchNotFound.into())
 	}
 
-	/// Commit a branch draft and update its collateral-wide outstanding debt.
+	/// Replace a stored branch and update the debt aggregates derived from its
+	/// old and new runtime state.
 	pub(crate) fn commit_branch(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-		outstanding_before: BalanceOf<T>,
+		now: Millis,
 		branch: BranchOf<T>,
 	) -> DispatchResult {
-		Self::apply_debt_delta(collateral_id, outstanding_before, branch.state.debt.outstanding())?;
-		Branches::<T>::insert(collateral_id, stable_id, branch);
+		Branches::<T>::try_mutate_exists(collateral_id, stable_id, |stored| {
+			let before = Self::branch_contribution(
+				&stored.as_ref().ok_or(Error::<T>::BranchNotFound)?.state,
+				now,
+			)?;
+			Self::update_branch_aggregates(collateral_id, stable_id, now, &before, &branch.state)?;
+			*stored = Some(branch);
+			Ok(())
+		})
+	}
+
+	/// Mutate one branch's runtime state through its FRAME storage entry while
+	/// keeping every derived debt aggregate in step.
+	pub(crate) fn try_mutate_branch_state<R>(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		mutate: impl FnOnce(
+			&BranchConfig<BalanceOf<T>>,
+			&mut BranchState<T::AccountId, BalanceOf<T>>,
+			Millis,
+		) -> Result<R, DispatchError>,
+	) -> Result<R, DispatchError> {
+		let now = T::TimeProvider::now();
+		Branches::<T>::try_mutate_exists(collateral_id, stable_id, |maybe| {
+			let branch = maybe.as_mut().ok_or(Error::<T>::BranchNotFound)?;
+			let before = Self::branch_contribution(&branch.state, now)?;
+			let result = mutate(&branch.config, &mut branch.state, now)?;
+			Self::update_branch_aggregates(collateral_id, stable_id, now, &before, &branch.state)?;
+			Ok(result)
+		})
+	}
+
+	fn update_branch_aggregates(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		now: Millis,
+		before: &BranchContribution<BalanceOf<T>>,
+		after_state: &BranchState<T::AccountId, BalanceOf<T>>,
+	) -> DispatchResult {
+		let after = Self::branch_contribution(after_state, now)?;
+		let stablecoin_debt = Self::updated_stablecoin_debt(stable_id, before, &after, now)?;
+		Self::apply_collateral_debt_delta(collateral_id, before.outstanding, after.outstanding)?;
+		if stablecoin_debt.is_empty() {
+			StablecoinDebt::<T>::remove(stable_id);
+		} else {
+			StablecoinDebt::<T>::insert(stable_id, stablecoin_debt);
+		}
 		Ok(())
 	}
 
-	fn apply_debt_delta(
+	/// Advance the stablecoin-wide debt projection to `now`, then replace one
+	/// market's realized debt, pending interest, and active weight.
+	fn updated_stablecoin_debt(
+		stable_id: &StableIdOf<T>,
+		before: &BranchContribution<BalanceOf<T>>,
+		after: &BranchContribution<BalanceOf<T>>,
+		now: Millis,
+	) -> Result<StablecoinDebtState<BalanceOf<T>>, DispatchError> {
+		let mut total = StablecoinDebt::<T>::get(stable_id);
+		let elapsed = now.saturating_sub(total.last_update);
+		let elapsed_interest =
+			PendingInterest::from_weight_millis(total.active_weighted_principal_sum, elapsed)
+				.ok_or(Error::<T>::ArithmeticOverflow)?;
+		total.pending_interest = total
+			.pending_interest
+			.checked_add(&elapsed_interest)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		total.last_update = now;
+
+		total.pending_interest = total
+			.pending_interest
+			.checked_sub(&before.pending_interest)
+			.defensive_ok_or(DispatchError::Corruption)?
+			.checked_add(&after.pending_interest)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+
+		total.active_weighted_principal_sum = Self::shifted_total(
+			total.active_weighted_principal_sum,
+			before.active_weight,
+			after.active_weight,
+		)?;
+		total.outstanding =
+			Self::shifted_total(total.outstanding, before.outstanding, after.outstanding)?;
+		Ok(total)
+	}
+
+	/// Derive the complete aggregate contribution of one branch at `now`.
+	fn branch_contribution(
+		state: &BranchState<T::AccountId, BalanceOf<T>>,
+		now: Millis,
+	) -> Result<BranchContribution<BalanceOf<T>>, DispatchError> {
+		Ok(BranchContribution {
+			outstanding: state
+				.debt
+				.outstanding()
+				.checked_add(&state.ownerless_debt)
+				.ok_or(Error::<T>::ArithmeticOverflow)?,
+			pending_interest: Self::branch_pending_interest(state, now)?,
+			active_weight: if state.is_frozen() {
+				BalanceOf::<T>::zero()
+			} else {
+				state.debt.weighted_principal_sum
+			},
+		})
+	}
+
+	/// The exact pending-interest numerator one market contributes to its
+	/// stablecoin-wide aggregate, in split form.
+	pub(crate) fn branch_pending_interest(
+		state: &BranchState<T::AccountId, BalanceOf<T>>,
+		now: Millis,
+	) -> Result<PendingInterest<BalanceOf<T>>, DispatchError> {
+		let elapsed = state.interest_time(now).saturating_sub(state.debt.last_interest_time);
+		PendingInterest::from_weight_millis(state.debt.weighted_principal_sum, elapsed)
+			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
+	}
+
+	/// Fully accrued debt across every market issuing `stable_id`.
+	///
+	/// NOTE: This projection rounds pending interest once after aggregating
+	/// the exact branch numerators. Across `N` interest-bearing branches, it can
+	/// therefore be up to `N - 1` base units below the sum obtained by rounding
+	/// every branch separately. Computing that literal sum requires walking or
+	/// hard-bounding the stablecoin's sibling branches.
+	pub(crate) fn accrued_stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {
+		let debt = StablecoinDebt::<T>::get(stable_id);
+		let elapsed = T::TimeProvider::now().saturating_sub(debt.last_update);
+		let Some(elapsed_interest) =
+			PendingInterest::from_weight_millis(debt.active_weighted_principal_sum, elapsed)
+		else {
+			return BalanceOf::<T>::max_value();
+		};
+		let Some(pending) = debt.pending_interest.checked_add(&elapsed_interest) else {
+			return BalanceOf::<T>::max_value();
+		};
+		let Some(accrued) = pending.ceil() else {
+			return BalanceOf::<T>::max_value();
+		};
+		debt.outstanding.saturating_add(accrued)
+	}
+
+	fn apply_collateral_debt_delta(
 		collateral_id: &CollateralIdOf<T>,
 		outstanding_before: BalanceOf<T>,
 		outstanding_after: BalanceOf<T>,
@@ -110,17 +245,28 @@ impl<T: Config> Pallet<T> {
 		}
 		CollateralRisks::<T>::try_mutate_exists(collateral_id, |maybe| {
 			let risk = maybe.get_or_insert_default();
-			risk.outstanding = risk
-				.outstanding
-				.checked_sub(&outstanding_before)
-				.defensive_ok_or(DispatchError::Corruption)?
-				.checked_add(&outstanding_after)
-				.ok_or(Error::<T>::ArithmeticOverflow)?;
+			risk.outstanding =
+				Self::shifted_total(risk.outstanding, outstanding_before, outstanding_after)?;
 			if risk.is_empty() {
 				maybe.take();
 			}
-			Ok(())
+			Ok::<_, DispatchError>(())
 		})
+	}
+
+	/// Move an aggregate from `before` to `after`. Underflow means the aggregate
+	/// had drifted from the markets it sums, so it is corruption rather than a
+	/// user-reachable error.
+	fn shifted_total(
+		total: BalanceOf<T>,
+		before: BalanceOf<T>,
+		after: BalanceOf<T>,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		total
+			.checked_sub(&before)
+			.defensive_ok_or(DispatchError::Corruption)?
+			.checked_add(&after)
+			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 	}
 
 	/// Read a vault row, returning `VaultNotFound` when missing.
@@ -137,12 +283,11 @@ impl<T: Config> Pallet<T> {
 	/// Used by the open/borrow/withdraw safety gates. A `None` ratio (zero debt)
 	/// and a below-ICR ratio both surface as `UnsafeCollateralizationRatio`.
 	pub(crate) fn ensure_above_icr(
-		collateral: BalanceOf<T>,
-		debt: BalanceOf<T>,
+		position: &Position<BalanceOf<T>>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
-		let cr = collateralization_ratio(collateral, debt, price)
+		let cr = collateralization_ratio(position, price)
 			.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
 		ensure!(
 			cr >= config.initial_collateralization_ratio,
@@ -155,12 +300,11 @@ impl<T: Config> Pallet<T> {
 	/// the branch MCR. Used by the enter-final-recovery gate. A `None` ratio
 	/// (zero debt) counts as too healthy.
 	pub(crate) fn ensure_below_mcr(
-		collateral: BalanceOf<T>,
-		debt: BalanceOf<T>,
+		position: &Position<BalanceOf<T>>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
-		let cr = collateralization_ratio(collateral, debt, price)
+		let cr = collateralization_ratio(position, price)
 			.ok_or(Error::<T>::CollateralizationRatioTooHealthy)?;
 		ensure!(
 			cr < config.minimum_collateralization_ratio,
@@ -172,12 +316,11 @@ impl<T: Config> Pallet<T> {
 	/// Ensure a vault's fully-accrued collateralization ratio is at or above the
 	/// branch MCR. Used by the exit-final-recovery gate.
 	pub(crate) fn ensure_at_or_above_mcr(
-		collateral: BalanceOf<T>,
-		debt: BalanceOf<T>,
+		position: &Position<BalanceOf<T>>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
-		let cr = collateralization_ratio(collateral, debt, price)
+		let cr = collateralization_ratio(position, price)
 			.ok_or(Error::<T>::CollateralizationRatioTooLow)?;
 		ensure!(
 			cr >= config.minimum_collateralization_ratio,
@@ -224,16 +367,17 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 	) -> Result<BranchMode, DispatchError> {
 		let branch = Self::branch_of(collateral_id, stable_id)?;
-		Self::mode_of(&branch, collateral_id, T::TimeProvider::now())
+		Self::mode_of(&branch.state, &branch.config, collateral_id, T::TimeProvider::now())
 	}
 
-	/// TODO: DOC
+	/// Derive a branch's current mode from its runtime state and risk config.
 	pub(crate) fn mode_of(
-		branch: &BranchOf<T>,
+		state: &BranchState<T::AccountId, BalanceOf<T>>,
+		config: &BranchConfig<BalanceOf<T>>,
 		collateral_id: &CollateralIdOf<T>,
 		now: Millis,
 	) -> Result<BranchMode, DispatchError> {
-		if branch.state.is_frozen() {
+		if state.is_frozen() {
 			return Ok(BranchMode::Frozen);
 		}
 		// A failing oracle is what `do_refresh_branch` would persist as
@@ -243,8 +387,8 @@ impl<T: Config> Pallet<T> {
 		let Ok(price) = T::Oracle::provide_price(collateral_id) else {
 			return Ok(BranchMode::Frozen);
 		};
-		let tcr = Self::compute_tcr(&branch.state, price, now)?;
-		if tcr < branch.config.safety_collateralization_ratio {
+		let tcr = Self::compute_tcr(state, price, now)?;
+		if tcr < config.safety_collateralization_ratio {
 			Ok(BranchMode::Safety)
 		} else {
 			Ok(BranchMode::Normal)
@@ -353,8 +497,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Fully-accrued total branch debt (the TCR numerator): principal + minted
 	/// interest + pending aggregate interest + pending redistribution principal +
-	/// bad debt + ownerless debt. Single definition shared by [`Self::compute_tcr`]
-	/// and the `branch_debt` redemption-fee accessor so the two cannot diverge.
+	/// bad debt + ownerless debt.
 	pub(crate) fn accrued_branch_debt(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
@@ -381,7 +524,7 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		now: Millis,
 	) -> Result<FixedU128, DispatchError> {
-		let inputs = TcrInputs {
+		let inputs = Position {
 			collateral: state.total_collateral,
 			debt: Self::accrued_branch_debt(state, now),
 		};
@@ -392,17 +535,14 @@ impl<T: Config> Pallet<T> {
 	/// the operation gate's load-time baseline so the pre and post sides of a
 	/// gate cannot diverge.
 	pub(crate) fn tcr_from_inputs(
-		inputs: &TcrInputs<BalanceOf<T>>,
+		inputs: &Position<BalanceOf<T>>,
 		price: FixedU128,
 	) -> Result<FixedU128, DispatchError> {
 		if inputs.debt.is_zero() {
 			// Branch with no debt is treated as "infinitely well-collateralized".
 			return Ok(FixedU128::max_value());
 		}
-		let value =
-			price.checked_mul_int(inputs.collateral).ok_or(Error::<T>::ArithmeticOverflow)?;
-		FixedU128::checked_from_rational(value, inputs.debt)
-			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
+		collateralization_ratio(inputs, price).ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 	}
 
 	/// Accrue aggregate branch interest in memory and return the new amount.

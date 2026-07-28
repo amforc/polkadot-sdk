@@ -266,17 +266,16 @@ fn seed_pending_redistribution<T: Config>(asset: &CollateralIdOf<T>) -> Result<(
 	.map_err(|_| BenchmarkError::Stop("hold on redistribution account failed"))?;
 
 	// Seed through the audited boundary so `CollateralRisks` stays true.
-	let mut branch = Pallet::<T>::branch_of(asset, &stable::<T>())
-		.map_err(|_| BenchmarkError::Stop("branch missing"))?;
-	let outstanding_before = branch.state.debt.outstanding();
-	let state = &mut branch.state;
-	state.redistribution.debt_per_stake = per_stake;
-	state.redistribution.collateral_per_stake = per_stake;
-	state.redistribution.weight_per_stake = weight_per_stake;
-	state.redistribution.debt_time_per_stake = FixedU128::zero();
-	state.debt.pending_redistribution_principal = per_stake.saturating_mul_int(state.stakes.total);
-	Pallet::<T>::commit_branch(asset, &stable::<T>(), outstanding_before, branch)
-		.map_err(|_| BenchmarkError::Stop("branch commit failed"))
+	Pallet::<T>::try_mutate_branch_state(asset, &stable::<T>(), |_, state, _| {
+		state.redistribution.debt_per_stake = per_stake;
+		state.redistribution.collateral_per_stake = per_stake;
+		state.redistribution.weight_per_stake = weight_per_stake;
+		state.redistribution.debt_time_per_stake = FixedU128::zero();
+		state.debt.pending_redistribution_principal =
+			per_stake.saturating_mul_int(state.stakes.total);
+		Ok(())
+	})
+	.map_err(|_| BenchmarkError::Stop("branch commit failed"))
 }
 
 /// Open a fresh "only-eligible" vault, drop the oracle so it qualifies for
