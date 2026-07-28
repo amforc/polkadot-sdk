@@ -48,24 +48,12 @@ impl<T: Config> Pallet<T> {
 			initial_collateral,
 		)?;
 		T::StableAssets::mint_into(op.stable_id().clone(), &owner, initial_debt)?;
-		Self::deposit_event(Event::Borrowed {
-			collateral_id: op.collateral_id().clone(),
-			stable_id: op.stable_id().clone(),
-			owner: owner.clone(),
-			recipient: owner.clone(),
-			amount: initial_debt,
-		});
-		Self::deposit_event(Event::CollateralDeposited {
-			collateral_id: op.collateral_id().clone(),
-			stable_id: op.stable_id().clone(),
-			owner: owner.clone(),
-			from: owner.clone(),
-			amount: initial_collateral,
-		});
 		Self::deposit_event(Event::VaultOpened {
 			collateral_id: op.collateral_id().clone(),
 			stable_id: op.stable_id().clone(),
 			owner,
+			collateral: initial_collateral,
+			debt: initial_debt,
 		});
 		op.commit_checked(price)
 	}
@@ -282,6 +270,7 @@ impl<T: Config> Pallet<T> {
 			stable_id: op.stable_id().clone(),
 			owner: op.owner().clone(),
 			recipient: recipient.clone(),
+			collateral,
 		});
 		// Closing the last liable vault may reduce the TCR.
 		if branch_empties {
