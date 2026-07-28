@@ -77,10 +77,10 @@ fn lifecycle_hooks_fire_on_create_and_remove() {
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
-		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true)]);
+		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true, 1)]);
 
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true), (DOT, PUSD, false)]);
+		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true, 1), (DOT, PUSD, false, 0)]);
 	});
 }
 

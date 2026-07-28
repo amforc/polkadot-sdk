@@ -310,16 +310,16 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Adds one market reference for an asset role.
-	fn claim_asset_role(asset: &CollateralIdOf<T>, role: AssetRole) -> DispatchResult {
+	fn claim_asset_role(asset: &CollateralIdOf<T>, role: AssetRole) -> Result<u32, DispatchError> {
 		AssetRoles::<T>::try_mutate(asset, |maybe| match maybe {
 			None => {
 				*maybe = Some(AssetRoleUsage { role, markets: 1 });
-				Ok(())
+				Ok(1)
 			},
 			Some(usage) if usage.role == role => {
 				usage.markets =
 					usage.markets.checked_add(1).ok_or(Error::<T>::ArithmeticOverflow)?;
-				Ok(())
+				Ok(usage.markets)
 			},
 			Some(_) => Err(Error::<T>::StableCollateralCollision.into()),
 		})
@@ -328,14 +328,18 @@ impl<T: Config> Pallet<T> {
 	/// Removes one market reference for an asset role.
 	///
 	/// The entry is removed with its last reference.
-	fn release_asset_role(asset: &CollateralIdOf<T>, role: AssetRole) -> DispatchResult {
+	fn release_asset_role(
+		asset: &CollateralIdOf<T>,
+		role: AssetRole,
+	) -> Result<u32, DispatchError> {
 		AssetRoles::<T>::try_mutate(asset, |maybe| match maybe {
 			Some(usage) if usage.role == role && usage.markets > 0 => {
 				usage.markets -= 1;
+				let remaining = usage.markets;
 				if usage.markets == 0 {
 					*maybe = None;
 				}
-				Ok(())
+				Ok(remaining)
 			},
 			_ => {
 				defensive!("asset role missing, mismatched, or under-counted on release");
@@ -348,7 +352,7 @@ impl<T: Config> Pallet<T> {
 	fn claim_market_roles(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-	) -> DispatchResult {
+	) -> Result<u32, DispatchError> {
 		let stable_key = T::StableToCollateralId::convert(stable_id.clone());
 		ensure!(*collateral_id != stable_key, Error::<T>::StableCollateralCollision);
 		Self::claim_asset_role(collateral_id, AssetRole::Collateral)?;
@@ -359,7 +363,7 @@ impl<T: Config> Pallet<T> {
 	fn release_market_roles(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-	) -> DispatchResult {
+	) -> Result<u32, DispatchError> {
 		let stable_key = T::StableToCollateralId::convert(stable_id.clone());
 		Self::release_asset_role(collateral_id, AssetRole::Collateral)?;
 		Self::release_asset_role(&stable_key, AssetRole::Stable)
@@ -389,7 +393,7 @@ impl<T: Config> Pallet<T> {
 		);
 		ensure!(T::StableAssets::asset_exists(stable_id.clone()), Error::<T>::UnknownStable);
 		// A stable asset cannot also be collateral, or its issuer could create unbacked collateral.
-		Self::claim_market_roles(&collateral_id, &stable_id)?;
+		let stablecoin_markets = Self::claim_market_roles(&collateral_id, &stable_id)?;
 		let deposit = match depositor {
 			Some(who) => {
 				let footprint = Footprint::from_mel::<(
@@ -415,7 +419,7 @@ impl<T: Config> Pallet<T> {
 				deposit,
 			},
 		);
-		T::OnBranchLifecycle::on_registered(&collateral_id, &stable_id)?;
+		T::OnBranchLifecycle::on_registered(&collateral_id, &stable_id, stablecoin_markets)?;
 		Self::deposit_event(Event::BranchRegistered { collateral_id, stable_id });
 		Ok(())
 	}
@@ -433,7 +437,12 @@ impl<T: Config> Pallet<T> {
 			Vaults::<T>::iter_prefix((&collateral_id, &stable_id)).next().is_none(),
 			Error::<T>::BranchNotEmpty
 		);
-		T::OnBranchLifecycle::on_deregistered(&collateral_id, &stable_id)?;
+		let remaining_stablecoin_markets = Self::release_market_roles(&collateral_id, &stable_id)?;
+		T::OnBranchLifecycle::on_deregistered(
+			&collateral_id,
+			&stable_id,
+			remaining_stablecoin_markets,
+		)?;
 		let removed_outstanding = Branches::<T>::take(&collateral_id, &stable_id)
 			.map(|removed| {
 				removed.state.debt.outstanding().saturating_add(removed.state.ownerless_debt)
@@ -443,7 +452,6 @@ impl<T: Config> Pallet<T> {
 			removed_outstanding.is_zero(),
 			"market removal must leave the CollateralRisks aggregate untouched"
 		);
-		Self::release_market_roles(&collateral_id, &stable_id)?;
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		if let Err(err) = frame_system::Pallet::<T>::dec_providers(&redistribution_account) {
 			defensive!("redistribution-account provider reference not released", err);
