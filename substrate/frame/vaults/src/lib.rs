@@ -656,14 +656,8 @@ pub mod pallet {
 		VaultNotLiquidatable,
 		/// Another dormant vault is already first in the redemption queue.
 		DormantTargetOccupied,
-		/// The borrow amount is zero.
-		ZeroBorrowAmount,
-		/// The deposit amount is zero.
-		ZeroDepositAmount,
-		/// The withdrawal amount is zero.
-		ZeroWithdrawAmount,
-		/// The repayment amount is zero.
-		ZeroRepayAmount,
+		/// The amount is zero.
+		ZeroAmount,
 		/// The vault is below the ratio required to leave final recovery.
 		CollateralizationRatioTooLow,
 	}

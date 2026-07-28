@@ -82,7 +82,7 @@ fn zero_amount_repay_is_rejected_without_touching_the_vault() {
 
 		assert_noop!(
 			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 0),
-			crate::Error::<Test>::ZeroRepayAmount
+			crate::Error::<Test>::ZeroAmount
 		);
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
 		assert_eq!(held(DOT, 1), 1_000);
@@ -106,7 +106,7 @@ fn zero_amount_withdrawal_is_rejected_without_touching_the_vault() {
 				0,
 				None
 			),
-			crate::Error::<Test>::ZeroWithdrawAmount
+			crate::Error::<Test>::ZeroAmount
 		);
 		MockOracleAvailable::set(true);
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
@@ -130,7 +130,7 @@ fn zero_amount_deposit_is_rejected_without_touching_the_vault() {
 				1,
 				0
 			),
-			crate::Error::<Test>::ZeroDepositAmount
+			crate::Error::<Test>::ZeroAmount
 		);
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
 		assert_eq!(held(DOT, 1), 1_000);
@@ -155,7 +155,7 @@ fn zero_amount_borrow_is_rejected() {
 				None,
 				Position::endpoints_only()
 			),
-			crate::Error::<Test>::ZeroBorrowAmount
+			crate::Error::<Test>::ZeroAmount
 		);
 		assert_eq!(
 			crate::Pallet::<Test>::predict_borrow_upfront_fee(
