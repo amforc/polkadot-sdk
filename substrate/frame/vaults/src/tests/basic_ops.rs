@@ -201,6 +201,7 @@ fn repay_for_to_zero_leaves_dormant_husk() {
 			stable_id: PUSD,
 			owner: 1,
 			recipient: 1,
+			collateral: 1_000,
 		}));
 	});
 }

@@ -311,6 +311,7 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 			stable_id: PUSD,
 			owner: 2,
 			recipient: 2,
+			collateral: 1_000,
 		}));
 		// The row is gone, so an explicit close has nothing to act on.
 		assert_noop!(

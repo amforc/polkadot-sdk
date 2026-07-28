@@ -280,6 +280,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			stable_id: op.stable_id().clone(),
 			owner: op.owner().clone(),
 			recipient: op.owner().clone(),
+			collateral: collateral_dust,
 		});
 		op.remove_exempt()?;
 		Ok(residual_debt)
