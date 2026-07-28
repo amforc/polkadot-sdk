@@ -73,9 +73,10 @@ fn redemption_config_outlives_all_but_the_last_market_on_the_coin() {
 			crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee,
 			FixedU128::from_rational(3u128, 100u128)
 		);
+		assert!(crate::RedemptionConfigs::<Test>::contains_key(PUSD));
 
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), TOKEN_X, PUSD));
-		assert!(crate::RedemptionConfigs::<Test>::get(PUSD).is_some());
+		assert!(crate::RedemptionConfigs::<Test>::contains_key(PUSD));
 		assert_eq!(
 			crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee,
 			FixedU128::from_rational(3u128, 100u128)
@@ -125,10 +126,14 @@ fn redeem_below_minimum_amount_reverts() {
 }
 
 #[test]
-fn redeem_unregistered_branch_reverts() {
+fn redeem_and_preview_report_unregistered_stablecoin() {
 	build_and_execute(|| {
 		mint_stable(PUSD, 3, 1_000);
-		assert_noop!(redeem(3, DOT, PUSD, 200, 0, 4, 0), Error::<Test>::InvalidBranch);
+		assert_noop!(redeem(3, DOT, PUSD, 200, 0, 4, 0), Error::<Test>::StablecoinNotRegistered);
+		assert_noop!(
+			Redemptions::preview_redeem(DOT, PUSD, 200, 0),
+			Error::<Test>::StablecoinNotRegistered
+		);
 	});
 }
 
@@ -200,9 +205,9 @@ fn ordinary_redemption_hits_lowest_rate_vault_and_settles_every_dimension() {
 			stable_id: PUSD,
 			redeemer: 3,
 			recipient: 4,
-			pusd_burned: 201,
+			stable_burned: 201,
 			collateral_out: 160,
-			fee_pusd: 22,
+			fee: 22,
 			steps: 1,
 		}));
 	});
@@ -278,7 +283,10 @@ fn walk_reports_only_cap_exhaustion_as_truncated() {
 		assert_ok!(redeem(3, DOT, PUSD, 360, 0, 4, 0));
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
 		set_price(DOT, FixedU128::from_rational(1, 10));
-		assert!(Redemptions::preview_redeem(DOT, PUSD, 100_000, 20).is_none());
+		assert_noop!(
+			Redemptions::preview_redeem(DOT, PUSD, 100_000, 20),
+			Error::<Test>::NoRedeemableVault
+		);
 	});
 }
 
@@ -352,7 +360,7 @@ fn underwater_prefix_skipped_once_while_healthy_vaults_redeem() {
 		let v4_before = vault_debt(DOT, PUSD, 4);
 		let preview = Redemptions::preview_redeem(DOT, PUSD, 2_000, 0).expect("preview");
 		assert_eq!(preview.steps, 4, "the walk visits the skipped prefix once");
-		assert_eq!(preview.debt_cancelled(), v3_before + v4_before);
+		assert_eq!(preview.debt_cancelled, v3_before + v4_before);
 		assert!(!preview.truncated);
 
 		let redeemer_before = Assets::balance(PUSD, 5);
@@ -371,7 +379,7 @@ fn underwater_prefix_skipped_once_while_healthy_vaults_redeem() {
 		let expected_collateral = v3_before * 10 / 9 + v4_before * 10 / 9;
 		assert_eq!(collateral_balance(DOT, 6) - recipient_before, expected_collateral);
 		// Both adapters consume the same shared walk decisions.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), preview.stable_in);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), preview.stable_in());
 		assert_eq!(collateral_balance(DOT, 6) - recipient_before, preview.collateral_out);
 		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.fee);
 		// Issuance falls by exactly the debt burned; fees are routed, not burned.
@@ -427,12 +435,12 @@ fn slippage_floor_scales_to_partial_fill() {
 }
 
 #[test]
-fn insufficient_pusd_balance_reverts() {
+fn insufficient_stable_balance_reverts() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		mint_stable(PUSD, 3, 50);
-		assert_noop!(redeem(3, DOT, PUSD, 201, 0, 4, 0), Error::<Test>::InsufficientPusdBalance);
+		assert_noop!(redeem(3, DOT, PUSD, 201, 0, 4, 0), Error::<Test>::InsufficientStableBalance);
 	});
 }
 
@@ -706,14 +714,14 @@ fn quote_continues_from_drained_dormant_into_rate_index() {
 		let quote = Redemptions::preview_redeem(DOT, PUSD, 100_000, 0).expect("quote");
 		assert_eq!(quote.steps, 2);
 		assert!(!quote.truncated);
-		assert_eq!(quote.debt_cancelled(), v1_residual + v2_debt);
+		assert_eq!(quote.debt_cancelled, v1_residual + v2_debt);
 
 		// Execution walks the same two targets and reproduces the quote exactly.
 		let redeemer_before = Assets::balance(PUSD, 3);
 		let recipient_before = collateral_balance(DOT, 4);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 		assert_ok!(redeem(3, DOT, PUSD, 100_000, 0, 4, 0));
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), quote.stable_in);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), quote.stable_in());
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, quote.collateral_out);
 		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, quote.fee);
 		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
@@ -848,7 +856,7 @@ fn preview_reports_final_recovery_before_ordinary_targets() {
 		let preview = Redemptions::preview_redeem(DOT, PUSD, 200, 0).expect("preview");
 
 		assert_eq!(preview.steps, 1);
-		assert_eq!(preview.stable_in, 200);
+		assert_eq!(preview.stable_in(), 200);
 		assert_eq!(preview.collateral_out, 168);
 		assert_eq!(preview.fee, 0);
 		// Quoting must expose the priority target without touching the vault.
@@ -1041,18 +1049,21 @@ fn set_redemption_config_unregistered_branch_reverts() {
 		let cfg = DefaultRedemptionConfig::get();
 		assert_noop!(
 			Redemptions::set_redemption_config(RuntimeOrigin::root(), PUSD, cfg),
-			Error::<Test>::InvalidBranch
+			Error::<Test>::StablecoinNotRegistered
 		);
 	});
 }
 
 #[test]
-fn preview_redeem_below_minimum_amount_returns_none() {
+fn preview_redeem_reports_below_minimum_amount() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 
-		assert!(Redemptions::preview_redeem(DOT, PUSD, 99, 0).is_none());
+		assert_noop!(
+			Redemptions::preview_redeem(DOT, PUSD, 99, 0),
+			Error::<Test>::BelowMinimumRedemptionAmount
+		);
 	});
 }
 
@@ -1069,8 +1080,8 @@ fn preview_redeem_quotes_without_side_effects() {
 		let preview = Redemptions::preview_redeem(DOT, PUSD, 201, 0).expect("preview");
 		assert_eq!(preview.steps, 1);
 		assert!(!preview.truncated);
-		assert_eq!(preview.stable_in, 243);
-		assert_eq!(preview.debt_cancelled(), 201);
+		assert_eq!(preview.stable_in(), 243);
+		assert_eq!(preview.debt_cancelled, 201);
 		assert_eq!(preview.collateral_out, 160);
 		assert_eq!(preview.fee, 42);
 		// Quoting projects the pending touch without applying it.
@@ -1090,7 +1101,7 @@ fn preview_redeem_walks_multiple_vaults() {
 		let preview = Redemptions::preview_redeem(DOT, PUSD, 100_000, 0).expect("preview");
 		assert_eq!(preview.steps, 2);
 		assert!(!preview.truncated);
-		assert_eq!(preview.debt_cancelled(), v1_before + v2_before);
+		assert_eq!(preview.debt_cancelled, v1_before + v2_before);
 		// Projecting multiple targets leaves every vault untouched.
 		assert_eq!(vault_debt(DOT, PUSD, 1), v1_before);
 		assert_eq!(vault_debt(DOT, PUSD, 2), v2_before);
@@ -1098,10 +1109,13 @@ fn preview_redeem_walks_multiple_vaults() {
 }
 
 #[test]
-fn preview_redeem_none_when_no_target() {
+fn preview_redeem_reports_no_target() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		assert!(Redemptions::preview_redeem(DOT, PUSD, 200, 0).is_none());
+		assert_noop!(
+			Redemptions::preview_redeem(DOT, PUSD, 200, 0),
+			Error::<Test>::NoRedeemableVault
+		);
 	});
 }
 
@@ -1287,15 +1301,15 @@ fn exact_balance_funds_the_full_fee_free_recovery_quote() {
 		register_branch(DOT, PUSD, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
 		let quote = Redemptions::preview_redeem(DOT, PUSD, 200, 0).expect("recovery quote");
-		assert_eq!(quote.stable_in, 200);
+		assert_eq!(quote.stable_in(), 200);
 		assert_eq!(quote.fee, 0);
-		mint_stable(PUSD, 3, quote.stable_in);
+		mint_stable(PUSD, 3, quote.stable_in());
 		let debt_before = vault_debt(DOT, PUSD, 1);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 
 		assert_ok!(redeem(3, DOT, PUSD, 200, 0, 4, 0));
 
-		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), quote.stable_in);
+		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), quote.stable_in());
 		assert_eq!(Assets::balance(PUSD, 3), 0);
 		assert_eq!(Assets::balance(PUSD, FEE_DEST), fee_before);
 	});
@@ -1338,7 +1352,7 @@ fn ordinary_redemption_succeeds_in_safety_mode() {
 }
 
 #[test]
-fn redeem_with_oracle_down_reverts() {
+fn redeem_and_preview_report_oracle_down() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
@@ -1347,11 +1361,15 @@ fn redeem_with_oracle_down_reverts() {
 		// before any vault is touched.
 		MockOracleAvailable::set(false);
 		assert_noop!(redeem(3, DOT, PUSD, 201, 0, 4, 0), Error::<Test>::OracleUnavailable);
+		assert_noop!(
+			Redemptions::preview_redeem(DOT, PUSD, 201, 0),
+			Error::<Test>::OracleUnavailable
+		);
 	});
 }
 
 #[test]
-fn redeem_zero_price_reverts() {
+fn redeem_and_preview_report_zero_price() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
@@ -1361,6 +1379,10 @@ fn redeem_zero_price_reverts() {
 		// explicit zero-price guard must refuse it the same way.
 		set_price(DOT, FixedU128::zero());
 		assert_noop!(redeem(3, DOT, PUSD, 201, 0, 4, 0), Error::<Test>::OracleUnavailable);
+		assert_noop!(
+			Redemptions::preview_redeem(DOT, PUSD, 201, 0),
+			Error::<Test>::OracleUnavailable
+		);
 	});
 }
 
@@ -1454,10 +1476,10 @@ fn preview_matches_execution_for_partial_fill() {
 		assert_ok!(redeem(3, DOT, PUSD, budget, 0, 4, 0));
 
 		// Execution reproduces the quote exactly across every dimension.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), preview.stable_in);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), preview.stable_in());
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, preview.collateral_out);
 		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, preview.fee);
-		assert_eq!(v1_before - vault_debt(DOT, PUSD, 1), preview.debt_cancelled());
+		assert_eq!(v1_before - vault_debt(DOT, PUSD, 1), preview.debt_cancelled);
 	});
 }
 
@@ -1513,10 +1535,10 @@ fn quote_matches_execution_across_redistribution_rounds() {
 		// each share within the remaining branch aggregate here; the
 		// documented indicative-quote drift needs caps that bind, which
 		// untouched recipients cannot produce.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), quote.stable_in);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), quote.stable_in());
 		assert_eq!(collateral_balance(DOT, 6) - recipient_before, quote.collateral_out);
 		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, quote.fee);
-		assert_eq!(issuance_before - Assets::total_supply(PUSD), quote.debt_cancelled());
+		assert_eq!(issuance_before - Assets::total_supply(PUSD), quote.debt_cancelled);
 	});
 }
 
@@ -1762,7 +1784,7 @@ fn recovery_offset_below_par_head_is_refused_in_both_paths() {
 fn recovery_offset_without_recovery_head_is_no_target_in_both_paths() {
 	build_and_execute(|| {
 		// Unregistered market: the target-first fast path answers before the
-		// config lookup could report `InvalidBranch`.
+		// config lookup could report `StablecoinNotRegistered`.
 		assert_eq!(preview_offset(1_000), Ok(RecoveryOffsetQuote::NoTarget));
 		assert_eq!(execute_offset(3, 4, 1_000), Ok(RecoveryOffsetResult::NoTarget));
 

@@ -50,7 +50,7 @@ pub fn fee_rate(dynamic_fee: FixedU128, base_fee: Permill, fee_ceiling: Permill)
 	dynamic_fee.saturating_add(base_fee.into()).min(fee_ceiling.into())
 }
 
-pub fn fee_pusd<Balance: FixedPointOperand>(
+pub fn redemption_fee<Balance: FixedPointOperand>(
 	debt_cancelled: Balance,
 	fee_rate: FixedU128,
 ) -> Balance {
@@ -183,15 +183,15 @@ mod tests {
 	}
 
 	#[test]
-	fn fee_pusd_rounds_up() {
-		assert_eq!(fee_pusd::<u128>(100, FixedU128::from_rational(5, 1000)), 1);
-		assert_eq!(fee_pusd::<u128>(1000, FixedU128::from_rational(5, 1000)), 5);
-		assert_eq!(fee_pusd::<u128>(0, FixedU128::one()), 0);
+	fn redemption_fee_rounds_up() {
+		assert_eq!(redemption_fee::<u128>(100, FixedU128::from_rational(5, 1000)), 1);
+		assert_eq!(redemption_fee::<u128>(1000, FixedU128::from_rational(5, 1000)), 5);
+		assert_eq!(redemption_fee::<u128>(0, FixedU128::one()), 0);
 	}
 
 	#[test]
 	fn max_debt_for_budget_accounts_for_fee() {
-		let at = |rate| move |debt| fee_pusd(debt, rate);
+		let at = |rate| move |debt| redemption_fee(debt, rate);
 		assert_eq!(max_debt_for_budget::<u128>(1000, 1000, at(FixedU128::zero())), 1000);
 		assert_eq!(max_debt_for_budget::<u128>(1000, 1000, at(FixedU128::one())), 500);
 		assert_eq!(
