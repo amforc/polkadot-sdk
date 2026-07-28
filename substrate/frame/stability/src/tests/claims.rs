@@ -127,8 +127,8 @@ fn final_claim_prunes_an_otherwise_empty_row() {
 #[test]
 fn claims_without_row_or_branch_revert() {
 	build_and_execute(|| {
-		assert_noop!(claim_collateral(1, DOT, PUSD, 1), Error::<Test>::BranchNotRegistered);
-		assert_noop!(claim_yield(1, DOT, PUSD, 1), Error::<Test>::BranchNotRegistered);
+		assert_noop!(claim_collateral(1, DOT, PUSD, 1), Error::<Test>::PoolNotRegistered);
+		assert_noop!(claim_yield(1, DOT, PUSD, 1), Error::<Test>::PoolNotRegistered);
 
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_noop!(claim_collateral(1, DOT, PUSD, 1), Error::<Test>::DepositNotFound);
@@ -198,7 +198,7 @@ fn claim_recipient_defaults_to_caller() {
 #[test]
 fn poke_without_row_or_branch_reverts() {
 	build_and_execute(|| {
-		assert_noop!(poke(7, 1, DOT, PUSD), Error::<Test>::BranchNotRegistered);
+		assert_noop!(poke(7, 1, DOT, PUSD), Error::<Test>::PoolNotRegistered);
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_noop!(poke(7, 1, DOT, PUSD), Error::<Test>::DepositNotFound);
 	});

@@ -135,7 +135,7 @@ fn withdraw_without_row_reverts() {
 #[test]
 fn withdraw_on_unregistered_branch_reverts() {
 	build_and_execute(|| {
-		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::BranchNotRegistered);
+		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::PoolNotRegistered);
 	});
 }
 
