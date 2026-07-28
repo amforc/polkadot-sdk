@@ -233,7 +233,7 @@ impl OnUnbalanced<Credit<AccountId, VaultStableAssets>> for DealWithFees {
 
 parameter_types! {
 	/// Recorded market lifecycle calls.
-	pub static LifecycleLog: Vec<(AssetId, StableId, bool)> = Vec::new();
+	pub static LifecycleLog: Vec<(AssetId, StableId, bool, u32)> = Vec::new();
 	/// Makes market registration fail in the lifecycle hook.
 	pub static FailOnRegistered: bool = false;
 	/// Makes market removal fail in the lifecycle hook.
@@ -243,15 +243,27 @@ parameter_types! {
 /// Records market lifecycle calls and supports forced failures.
 pub struct RecordingLifecycle;
 impl pusd_primitives::OnBranchLifecycle<AssetId, StableId> for RecordingLifecycle {
-	fn on_registered(collateral_id: &AssetId, stable_id: &StableId) -> DispatchResult {
-		LifecycleLog::mutate(|l| l.push((collateral_id.clone(), *stable_id, true)));
+	fn on_registered(
+		collateral_id: &AssetId,
+		stable_id: &StableId,
+		stablecoin_markets: u32,
+	) -> DispatchResult {
+		LifecycleLog::mutate(|l| {
+			l.push((collateral_id.clone(), *stable_id, true, stablecoin_markets))
+		});
 		if FailOnRegistered::get() {
 			return Err(DispatchError::Other("on_registered failure"));
 		}
 		Ok(())
 	}
-	fn on_deregistered(collateral_id: &AssetId, stable_id: &StableId) -> DispatchResult {
-		LifecycleLog::mutate(|l| l.push((collateral_id.clone(), *stable_id, false)));
+	fn on_deregistered(
+		collateral_id: &AssetId,
+		stable_id: &StableId,
+		remaining_stablecoin_markets: u32,
+	) -> DispatchResult {
+		LifecycleLog::mutate(|l| {
+			l.push((collateral_id.clone(), *stable_id, false, remaining_stablecoin_markets))
+		});
 		if FailOnDeregistered::get() {
 			return Err(DispatchError::Other("on_deregistered failure"));
 		}
