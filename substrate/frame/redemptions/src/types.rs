@@ -5,6 +5,8 @@ use frame::deps::sp_runtime::{
 };
 use scale_info::TypeInfo;
 
+use pusd_primitives::RedemptionStepSnapshot;
+
 pub use pusd_primitives::{Millis, VaultStatus};
 
 /// Head-of-FIFO quote at shared settlement pricing
@@ -41,8 +43,8 @@ pub struct RedemptionConfig<Balance> {
 	pub base_fee: Permill,
 	/// Cap on the total fee rate, base and dynamic components combined.
 	pub fee_ceiling: Permill,
-	/// Divides the redeemed branch-debt fraction before it raises the
-	/// dynamic fee after an ordinary redemption.
+	/// Divides the redeemed stablecoin-wide debt fraction before it raises
+	/// the dynamic fee after an ordinary redemption.
 	pub dynamic_fee_increase_divisor: FixedU128,
 	/// Prevents the recovery bonus from worsening a `CR >= 100%` recovery vault.
 	pub final_recovery_bonus_buffer: Permill,
@@ -93,6 +95,18 @@ pub struct RedemptionQuote<Balance> {
 	pub truncated: bool,
 }
 
+impl<Balance: Zero> Default for RedemptionQuote<Balance> {
+	fn default() -> Self {
+		Self {
+			stable_in: Balance::zero(),
+			collateral_out: Balance::zero(),
+			fee: Balance::zero(),
+			steps: 0,
+			truncated: false,
+		}
+	}
+}
+
 impl<Balance: Saturating + Copy> RedemptionQuote<Balance> {
 	/// Stable asset burned against vault debt.
 	pub fn debt_cancelled(&self) -> Balance {
@@ -103,7 +117,6 @@ impl<Balance: Saturating + Copy> RedemptionQuote<Balance> {
 pub(crate) struct OrdinaryStep<Balance> {
 	pub(crate) debt: Balance,
 	pub(crate) collateral_out: Balance,
-	pub(crate) fee: Balance,
 }
 
 pub(crate) struct RecoveryStep<Balance> {
@@ -153,19 +166,18 @@ impl<Balance: FixedPointOperand + Ord> RecoveryPricing<Balance> {
 	/// split again.
 	pub(crate) fn rebudget(
 		self,
-		vault_debt: Balance,
-		vault_collateral: Balance,
+		snap: &RedemptionStepSnapshot<Balance>,
 		price: FixedU128,
 		budget: Balance,
 	) -> Self {
 		match self {
 			Self::RecoveryBonus { bonus, .. } => {
-				let debt = vault_debt.min(budget);
+				let debt = snap.debt.min(budget);
 				let collateral_out =
 					pusd_primitives::recovery_pricing::recovery_bonus_collateral_out(
 						debt, bonus, price,
 					)
-					.min(vault_collateral);
+					.min(snap.collateral);
 				Self::RecoveryBonus { debt, collateral_out, bonus }
 			},
 			Self::InsuranceAdjusted { split, .. } => {
@@ -176,7 +188,7 @@ impl<Balance: FixedPointOperand + Ord> RecoveryPricing<Balance> {
 						split.recovery_rate,
 						price,
 					)
-					.min(vault_collateral);
+					.min(snap.collateral);
 				Self::InsuranceAdjusted { debt, collateral_out, split }
 			},
 		}
@@ -199,6 +211,20 @@ pub(crate) enum StepAction {
 	Recovery,
 	Redeem,
 	Skip,
+	Stop,
+}
+
+/// One classified-and-priced step, shared by execution and quoting so the
+/// classify→price ladder cannot drift between them.
+pub(crate) enum PricedStep<Balance> {
+	/// Redeem an ordinary (or dormant-target) vault at face value.
+	Redeem(OrdinaryStep<Balance>),
+	/// Settle the `FinalRecovery` head with this priced plan.
+	Recovery(RecoveryPricing<Balance>),
+	/// Unredeemable target; the walk may skip past it.
+	Skip,
+	/// A barrier, an unpriceable target, or a zero-sized step with no
+	/// residual to settle ends the walk.
 	Stop,
 }
 
@@ -230,27 +256,32 @@ pub(crate) struct WalkResult<Balance> {
 	pub(crate) steps: u32,
 }
 
+/// The one `FinalRecovery` settlement a walk may perform: the walk breaks
+/// after its first recovery step, so at most one record exists.
+pub(crate) struct RecoveryOutcome<Balance, AccountId> {
+	pub(crate) owner: AccountId,
+	pub(crate) regime: RecoveryRegime,
+	/// Redeemer-funded stablecoin burned against the vault debt.
+	pub(crate) burned: Balance,
+	/// Collateral paid to the recipient.
+	pub(crate) collateral_out: Balance,
+	/// Insurance-Fund-settled debt obtained after the step committed; it
+	/// settles debt without consuming redeemer stablecoin.
+	pub(crate) residual: Balance,
+}
+
 pub(crate) struct Accumulators<Balance, AccountId> {
-	pub(crate) debt_settled: Balance,
 	pub(crate) ordinary_debt: Balance,
 	pub(crate) ordinary_collateral: Balance,
-	pub(crate) ordinary_fee: Balance,
-	pub(crate) recovery_burned: Balance,
-	pub(crate) recovery_collateral: Balance,
-	// Recovery stops after one FIFO head, so one owner/regime is enough.
-	pub(crate) recovery_owner: Option<(AccountId, RecoveryRegime)>,
+	pub(crate) recovery: Option<RecoveryOutcome<Balance, AccountId>>,
 }
 
 impl<Balance: Zero, AccountId> Default for Accumulators<Balance, AccountId> {
 	fn default() -> Self {
 		Self {
-			debt_settled: Balance::zero(),
 			ordinary_debt: Balance::zero(),
 			ordinary_collateral: Balance::zero(),
-			ordinary_fee: Balance::zero(),
-			recovery_burned: Balance::zero(),
-			recovery_collateral: Balance::zero(),
-			recovery_owner: None,
+			recovery: None,
 		}
 	}
 }
@@ -259,38 +290,55 @@ impl<Balance, AccountId> Accumulators<Balance, AccountId>
 where
 	Balance: Zero + Saturating + Copy,
 {
+	/// All debt the walk settled: ordinary cancels plus the recovery burn and
+	/// its Insurance-Fund residual.
+	pub(crate) fn debt_settled(&self) -> Balance {
+		let recovery = self
+			.recovery
+			.as_ref()
+			.map_or_else(Balance::zero, |r| r.burned.saturating_add(r.residual));
+		self.ordinary_debt.saturating_add(recovery)
+	}
+
 	pub(crate) fn collateral_out(&self) -> Balance {
-		self.ordinary_collateral.saturating_add(self.recovery_collateral)
+		let recovery = self.recovery.as_ref().map_or_else(Balance::zero, |r| r.collateral_out);
+		self.ordinary_collateral.saturating_add(recovery)
 	}
 
 	pub(crate) fn apply_ordinary(&mut self, step: &OrdinaryStep<Balance>) {
-		self.debt_settled = self.debt_settled.saturating_add(step.debt);
 		self.ordinary_debt = self.ordinary_debt.saturating_add(step.debt);
 		self.ordinary_collateral = self.ordinary_collateral.saturating_add(step.collateral_out);
-		self.ordinary_fee = self.ordinary_fee.saturating_add(step.fee);
 	}
 
 	/// `residual` is the Insurance-Fund-settled debt the loop obtained after
-	/// the step committed; it settles debt without consuming redeemer pUSD.
+	/// the step committed.
 	pub(crate) fn apply_recovery(
 		&mut self,
 		owner: AccountId,
 		step: &RecoveryStep<Balance>,
 		residual: Balance,
 	) {
-		self.debt_settled = self.debt_settled.saturating_add(step.burned).saturating_add(residual);
-		self.recovery_burned = self.recovery_burned.saturating_add(step.burned);
-		self.recovery_collateral = self.recovery_collateral.saturating_add(step.collateral_out);
-		self.recovery_owner = Some((owner, step.regime));
+		debug_assert!(self.recovery.is_none(), "the walk breaks after one recovery step");
+		self.recovery = Some(RecoveryOutcome {
+			owner,
+			regime: step.regime,
+			burned: step.burned,
+			collateral_out: step.collateral_out,
+			residual,
+		});
 	}
 }
 
 /// Shared validation and fee-rate setup for execution and quoting.
+/// The fee rate is deliberately absent: it depends on how much debt the walk
+/// actually cancels, so it is derived from `decayed` once the walk is done.
 pub(crate) struct RedemptionPreamble<Balance> {
 	pub(crate) config: RedemptionConfig<Balance>,
 	pub(crate) state: RedemptionState,
 	pub(crate) price: FixedU128,
 	pub(crate) now: Millis,
 	pub(crate) decayed: FixedU128,
-	pub(crate) fee_rate: FixedU128,
+	/// Fully-accrued stablecoin-wide debt before this redemption; the
+	/// denominator of the dynamic-fee raise.
+	pub(crate) stablecoin_debt: Balance,
 }
