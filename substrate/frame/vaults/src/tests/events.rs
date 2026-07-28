@@ -4,28 +4,19 @@ fn assert_event(event: crate::Event<Test>) {
 	System::assert_has_event(RuntimeEvent::Vaults(event));
 }
 
-// Open emits the canonical opening trio (VaultOpened, plus CollateralDeposited
-// and Borrowed for the inputs, plus UpfrontFeeCharged for the protocol-favored
-// fee).
+// Open emits VaultOpened carrying both inputs, plus UpfrontFeeCharged for the
+// protocol-favored fee.
 #[test]
 fn open_vault_emits_canonical_events() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(10, 100)));
-		assert_event(crate::Event::VaultOpened { collateral_id: DOT, stable_id: PUSD, owner: 1 });
-		assert_event(crate::Event::CollateralDeposited {
+		assert_event(crate::Event::VaultOpened {
 			collateral_id: DOT,
 			stable_id: PUSD,
 			owner: 1,
-			from: 1,
-			amount: 1_000,
-		});
-		assert_event(crate::Event::Borrowed {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			recipient: 1,
-			amount: 2_000,
+			collateral: 1_000,
+			debt: 2_000,
 		});
 		// Upfront fee is non-trivial for these inputs.
 		let predicted_fee =

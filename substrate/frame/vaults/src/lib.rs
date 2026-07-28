@@ -363,6 +363,10 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			/// Vault owner.
 			owner: T::AccountId,
+			/// Collateral held from the owner.
+			collateral: BalanceOf<T>,
+			/// Stable assets minted to the owner.
+			debt: BalanceOf<T>,
 		},
 		/// A vault changed status.
 		VaultStatusChanged {
@@ -457,6 +461,8 @@ pub mod pallet {
 			owner: T::AccountId,
 			/// Account that received the remaining collateral.
 			recipient: T::AccountId,
+			/// Collateral released to the recipient.
+			collateral: BalanceOf<T>,
 		},
 		/// Accrued interest was added to a vault's debt.
 		InterestAccrued {

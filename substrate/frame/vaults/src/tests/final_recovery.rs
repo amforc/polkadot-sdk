@@ -472,11 +472,14 @@ fn settle_recovery_residual_records_bad_debt_and_emits_vault_closed() {
 		assert!(branch_state(DOT, PUSD).unwrap().debt.bad_debt >= residual);
 
 		// Settlement must name the owner (VaultClosed) and record the residual.
+		// The vault entered recovery untouched, so its full 1_000 collateral is
+		// released as dust.
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultClosed {
 			collateral_id: DOT,
 			stable_id: PUSD,
 			owner: 1,
 			recipient: 1,
+			collateral: 1_000,
 		}));
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtRecorded {
 			collateral_id: DOT,
