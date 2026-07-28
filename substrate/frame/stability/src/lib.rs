@@ -612,6 +612,7 @@ pub mod pallet {
 		fn on_registered(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
+			_stablecoin_markets: u32,
 		) -> DispatchResult {
 			let config = T::DefaultStabilityPoolConfig::get();
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
@@ -630,6 +631,7 @@ pub mod pallet {
 		fn on_deregistered(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
+			_remaining_stablecoin_markets: u32,
 		) -> DispatchResult {
 			// Depositor rows are the user-funds guard: active, pending, and
 			// claimable value all live on them. Vaults rolls the whole
