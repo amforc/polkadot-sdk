@@ -66,7 +66,7 @@ fn deposit_below_minimum_reverts_at_minimum_succeeds() {
 fn deposit_on_unregistered_branch_reverts() {
 	build_and_execute(|| {
 		mint_stable(PUSD, 1, 1_000);
-		assert_noop!(deposit(1, DOT, PUSD, 400), Error::<Test>::BranchNotRegistered);
+		assert_noop!(deposit(1, DOT, PUSD, 400), Error::<Test>::PoolNotRegistered);
 	});
 }
 

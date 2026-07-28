@@ -323,7 +323,7 @@ pub mod pallet {
 	#[pallet::error]
 	pub enum Error<T> {
 		/// No stability pool is registered for this market.
-		BranchNotRegistered,
+		PoolNotRegistered,
 		/// The deposit is below the branch `minimum_deposit`.
 		DepositTooSmall,
 		/// The caller has no deposit row on this market.

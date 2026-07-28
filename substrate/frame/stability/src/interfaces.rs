@@ -47,6 +47,15 @@ impl<T: Config>
 	StabilityPoolOffsetApi<CollateralIdOf<T>, StableIdOf<T>, BalanceOf<T>, CollateralCreditOf<T>>
 	for Pallet<T>
 {
+	fn active_offset_capacity(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		max_debt: BalanceOf<T>,
+		reserved: BalanceOf<T>,
+	) -> BalanceOf<T> {
+		Self::active_offset_capacity(collateral_id, stable_id, max_debt, reserved)
+	}
+
 	fn offset_liquidation(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -56,18 +65,26 @@ impl<T: Config>
 		Self::do_offset_liquidation(collateral_id, stable_id, max_debt_to_offset, collateral)
 	}
 
+	fn pending_offset_capacity(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		max_debt: BalanceOf<T>,
+		reserved: BalanceOf<T>,
+	) -> BalanceOf<T> {
+		Self::pending_offset_capacity(collateral_id, stable_id, max_debt, reserved)
+	}
+
 	fn offset_pending_liquidation(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		max_debt_to_offset: BalanceOf<T>,
 		collateral: CollateralCreditOf<T>,
 	) -> (BalanceOf<T>, CollateralCreditOf<T>) {
-		let (result, remainder) = Self::do_offset_pending_liquidation(
+		Self::do_offset_pending_liquidation(
 			collateral_id,
 			stable_id,
 			max_debt_to_offset,
 			collateral,
-		);
-		(result.debt_offset, remainder)
+		)
 	}
 }

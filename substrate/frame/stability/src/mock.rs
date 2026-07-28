@@ -181,7 +181,7 @@ pub fn set_price(collateral: AssetId, price: FixedU128) {
 
 parameter_types! {
 	pub const MarketDepositReason: RuntimeHoldReason =
-		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::MarketCreationDeposit);
+		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
 	pub const MarketDepositBase: Balance = 1_000;
 }
 
@@ -242,7 +242,7 @@ parameter_types! {
 			min_minimum_debt: 100,
 			min_minimum_collateral: 1,
 			max_borrow_rate: FixedU128::from_rational(400u128, 100u128),
-			max_branch_line: 1_000_000_000,
+			max_debt_ceiling: 1_000_000_000_000_000,
 			max_ceiling_gap: 1_000_000_000,
 			min_ceiling_ttl: 24 * 3_600 * 1_000,
 		};
@@ -311,16 +311,18 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId, Balance> for V
 			.expect("mint stable for benchmark account");
 	}
 
-	fn set_oracle_price(collateral_id: AssetId, _stable_id: StableId, price: FixedU128) {
+	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
+	}
+
+	fn clear_oracle_price(collateral_id: AssetId) {
+		MockPrices::mutate(|m| {
+			m.remove(&collateral_id);
+		});
 	}
 
 	fn advance_time(ms: u64) {
 		advance_time(ms);
-	}
-
-	fn synth_market(seed: u32) -> (AssetId, StableId) {
-		(AssetId::WithId(10_000 + seed), 20_000 + seed)
 	}
 }
 
@@ -378,7 +380,7 @@ impl pallet_redemptions::Config for Test {
 	type InsuranceFundAccount = InsuranceFundAccounts;
 	type FeeHandler = ResolveAssetTo<FeeDestAccount, Assets>;
 	type TimeProvider = Timestamp;
-	type UpdateOrigin = StabilityUpdateOrigin;
+	type UpdateOrigin = EnsureAssetOwner;
 	type DefaultRedemptionConfig = DefaultRedemptionConfig;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
@@ -513,7 +515,10 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		minimum_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 		initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
 		safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
-		debt_ceiling: 100_000_000,
+		// Large enough that it never binds unintentionally, including at the
+		// raw-unit scales the `numeric-examples.md` fixtures use. A test that
+		// exercises the ceiling sets its own.
+		debt_ceiling: 1_000_000_000_000,
 		minimum_debt: 200,
 		minimum_collateral: 1,
 		minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
@@ -788,11 +793,11 @@ pub fn simulate_pending_offset(
 	stable: StableId,
 	max_debt_to_offset: Balance,
 	remaining_collateral: Balance,
-) -> (crate::types::PendingOffsetResult<Balance>, Balance) {
+) -> (Balance, Balance) {
 	let credit = issue_collateral(collateral.clone(), remaining_collateral);
-	let (result, remainder) =
+	let (debt_offset, remainder) =
 		Stability::do_offset_pending_liquidation(&collateral, &stable, max_debt_to_offset, credit);
-	(result, remainder.peek())
+	(debt_offset, remainder.peek())
 }
 
 /// The caller's deposit row; `None` when pruned or never created.
