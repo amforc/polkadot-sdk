@@ -6,8 +6,8 @@ use crate::{
 		StabilityPoolOf, StableCreditOf, StableIdOf,
 	},
 	types::{
-		Accumulators, Deposit, DepositSnapshot, PUpdate, PendingDeposit, PendingOffsetResult,
-		PoolSums, RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
+		Accumulators, Deposit, DepositSnapshot, PUpdate, PendingDeposit, PoolSums,
+		RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
 	},
 	weights::WeightInfo,
 };
@@ -60,7 +60,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 	) -> Result<StabilityPoolOf<T>, DispatchError> {
 		let pool =
-			Pools::<T>::get(collateral_id, stable_id).ok_or(Error::<T>::BranchNotRegistered)?;
+			Pools::<T>::get(collateral_id, stable_id).ok_or(Error::<T>::PoolNotRegistered)?;
 		Ok(pool)
 	}
 
@@ -113,7 +113,7 @@ impl<T: Config> Pallet<T> {
 			preservation,
 			Fortitude::Polite,
 		)?;
-		let (used_for_recovery, change) = Self::try_incoming_recovery(
+		let change = Self::try_incoming_recovery(
 			&collateral_id,
 			&stable_id,
 			&pool_account,
@@ -121,8 +121,10 @@ impl<T: Config> Pallet<T> {
 			&mut deposit,
 			payment,
 		)?;
+		// Conservation by construction: the settlement can only have burned
+		// value the credit carried.
 		let pending_amount = change.peek();
-		debug_assert_eq!(pending_amount, amount.saturating_sub(used_for_recovery));
+		let used_for_recovery = amount.saturating_sub(pending_amount);
 
 		if let Err(change) = change.drop_zero() {
 			T::StableAssets::can_deposit(
@@ -185,7 +187,8 @@ impl<T: Config> Pallet<T> {
 	/// directly to the depositor. The used portion never touches the pool's
 	/// stablecoin balance or `P`/`S`/`G` (invariant 7); the unconsumed
 	/// change returns to the caller to become the pending deposit. A
-	/// below-par head rejects the whole deposit.
+	/// below-par head rejects the whole deposit. Returns only the unconsumed
+	/// change; the caller derives what the settlement used from it.
 	fn try_incoming_recovery(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -193,7 +196,7 @@ impl<T: Config> Pallet<T> {
 		state: &mut PoolStateOf<T>,
 		deposit: &mut DepositOf<T>,
 		payment: StableCreditOf<T>,
-	) -> Result<(BalanceOf<T>, StableCreditOf<T>), DispatchError> {
+	) -> Result<StableCreditOf<T>, DispatchError> {
 		let amount = payment.peek();
 		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
 			collateral_id,
@@ -204,7 +207,7 @@ impl<T: Config> Pallet<T> {
 		let collateral_out = match result {
 			RecoveryOffsetResult::NoTarget => {
 				debug_assert_eq!(change.peek(), amount);
-				return Ok((BalanceOf::<T>::zero(), change));
+				return Ok(change);
 			},
 			RecoveryOffsetResult::BelowPar => {
 				// The dropped change unwinds with the failing extrinsic.
@@ -231,7 +234,7 @@ impl<T: Config> Pallet<T> {
 			collateral_gain: collateral_out,
 			source: RecoveryOffsetSource::IncomingDeposit,
 		});
-		Ok((used_for_recovery, change))
+		Ok(change)
 	}
 
 	/// SPEC.md §7.3: burn active pool stablecoin against the `FinalRecovery`
@@ -459,56 +462,32 @@ impl<T: Config> Pallet<T> {
 		)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		// Underflows on the unclaimed totals would mean a claimable exceeding
-		// the tracked aggregate.
 		let amount = match kind {
 			ClaimKind::Collateral => {
-				let amount = deposit.claimable_collateral;
-				ensure!(!amount.is_zero(), Error::<T>::NoClaimableCollateral);
-				deposit.claimable_collateral = BalanceOf::<T>::zero();
-				pool.state.total_collateral_gains_unclaimed = pool
-					.state
-					.total_collateral_gains_unclaimed
-					.checked_sub(&amount)
-					.ok_or(ArithmeticError::Underflow)?;
-				// `Expendable` only on a full drain: the transfer itself then
-				// rejects a dead-zone payout instead of dusting the pool.
-				let preservation = debit_preservation::<T::CollateralAssets, _>(
-					collateral_id.clone(),
-					&pool_account,
-					amount,
-				);
-				T::CollateralAssets::transfer(
+				let amount = Self::take_claim(
+					&mut deposit.claimable_collateral,
+					&mut pool.state.total_collateral_gains_unclaimed,
+					Error::<T>::NoClaimableCollateral,
+				)?;
+				Self::pay_claim::<T::CollateralAssets>(
 					collateral_id.clone(),
 					&pool_account,
 					&recipient,
 					amount,
-					preservation,
 				)?;
 				amount
 			},
 			ClaimKind::Yield => {
-				let amount = deposit.claimable_yield;
-				ensure!(!amount.is_zero(), Error::<T>::NoClaimableYield);
-				deposit.claimable_yield = BalanceOf::<T>::zero();
-				pool.state.total_yield_unclaimed = pool
-					.state
-					.total_yield_unclaimed
-					.checked_sub(&amount)
-					.ok_or(ArithmeticError::Underflow)?;
-				// `Expendable` only on a full drain: the transfer itself then
-				// rejects a dead-zone payout instead of dusting the pool.
-				let preservation = debit_preservation::<T::StableAssets, _>(
-					stable_id.clone(),
-					&pool_account,
-					amount,
-				);
-				T::StableAssets::transfer(
+				let amount = Self::take_claim(
+					&mut deposit.claimable_yield,
+					&mut pool.state.total_yield_unclaimed,
+					Error::<T>::NoClaimableYield,
+				)?;
+				Self::pay_claim::<T::StableAssets>(
 					stable_id.clone(),
 					&pool_account,
 					&recipient,
 					amount,
-					preservation,
 				)?;
 				amount
 			},
@@ -531,13 +510,166 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
+	/// Read-only twin of [`Pallet::do_offset_liquidation`]'s sizing: the debt
+	/// active capital would cancel for `max_debt`. Both run
+	/// [`Pallet::size_active_offset`], so capacity and execution cannot drift.
+	pub(crate) fn active_offset_capacity(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		max_debt: BalanceOf<T>,
+		reserved: BalanceOf<T>,
+	) -> BalanceOf<T> {
+		let Ok(pool) = Self::load_pool(collateral_id, stable_id) else {
+			return BalanceOf::<T>::zero();
+		};
+		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
+			return BalanceOf::<T>::zero();
+		}
+		let pool_account = Self::pool_account(collateral_id, stable_id);
+		Self::size_active_offset(&pool, stable_id, &pool_account, max_debt, reserved)
+			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+	}
+
+	/// The debt an active-pool offset of at most `max_debt` may burn: the
+	/// pool-depth and `minimum_active_pool_balance` clamp (§6.5), the pool
+	/// account's minimum-balance dead zone (with `reserved` set aside for
+	/// another stage of the same transaction), and the `P`-precision guard
+	/// (§6.4). The guard matters on the capacity side too — without it a
+	/// caller could allocate collateral to a stage that then steps aside,
+	/// stranding the slice. The returned `Preservation` sizes the burn debit;
+	/// it is only meaningful when `reserved` is zero.
+	fn size_active_offset(
+		pool: &StabilityPoolOf<T>,
+		stable_id: &StableIdOf<T>,
+		pool_account: &T::AccountId,
+		max_debt: BalanceOf<T>,
+		reserved: BalanceOf<T>,
+	) -> Option<(BalanceOf<T>, Preservation)> {
+		let accounting_cap = math::clamp_offset_debt(
+			max_debt,
+			pool.state.total_active_deposits,
+			pool.config.minimum_active_pool_balance,
+		);
+		if accounting_cap.is_zero() {
+			return None;
+		}
+		// The burnable amount caps the accounting: a minimum-balance dead
+		// zone rounds the offset down instead of dusting the pool account.
+		let (headroom, preservation) = reducible_debit::<T::StableAssets, _>(
+			stable_id.clone(),
+			pool_account,
+			accounting_cap.saturating_add(reserved),
+		);
+		let debt = headroom.saturating_sub(reserved).min(accounting_cap);
+		if debt.is_zero() {
+			return None;
+		}
+		math::update_p_after_offset(
+			pool.state.coords.p,
+			pool.state.total_active_deposits,
+			debt,
+			&pool.config.precision,
+		)?;
+		Some((debt, preservation))
+	}
+
+	/// Read-only twin of [`Pallet::do_offset_pending_liquidation`]'s walk: the
+	/// debt the FIFO would consume for `max_debt` within
+	/// `MaxPendingOffsetIterations`.
+	pub(crate) fn pending_offset_capacity(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		max_debt: BalanceOf<T>,
+		reserved: BalanceOf<T>,
+	) -> BalanceOf<T> {
+		if max_debt.is_zero() || Pools::<T>::get(collateral_id, stable_id).is_none() {
+			return BalanceOf::<T>::zero();
+		}
+		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
+			return BalanceOf::<T>::zero();
+		}
+		let fifo = StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
+		let mut left = max_debt;
+		let mut total = BalanceOf::<T>::zero();
+		// Bounded by `MaxPendingOffsetIterations`, the same budget the walk gets.
+		for oldest in T::PendingLists::iter_from_tail(fifo)
+			.take(T::MaxPendingOffsetIterations::get() as usize)
+		{
+			if left.is_zero() {
+				break;
+			}
+			let Some(pending) = Deposits::<T>::get((collateral_id, stable_id, &oldest))
+				.and_then(|row| row.pending_deposit)
+			else {
+				break;
+			};
+			let step = pending.amount.min(left);
+			if step.is_zero() {
+				break;
+			}
+			total = total.saturating_add(step);
+			left = left.saturating_sub(step);
+		}
+		Self::burnable(stable_id, &Self::pool_account(collateral_id, stable_id), total, reserved)
+	}
+
+	/// How much of `want` the pool account can still burn once `reserved` is set
+	/// aside for another stage of the same transaction. Both offsets draw on one
+	/// account, so its minimum-balance headroom has to be shared rather than
+	/// counted twice.
+	fn burnable(
+		stable_id: &StableIdOf<T>,
+		pool_account: &T::AccountId,
+		want: BalanceOf<T>,
+		reserved: BalanceOf<T>,
+	) -> BalanceOf<T> {
+		let (headroom, _) = reducible_debit::<T::StableAssets, _>(
+			stable_id.clone(),
+			pool_account,
+			want.saturating_add(reserved),
+		);
+		headroom.saturating_sub(reserved).min(want)
+	}
+
+	/// Zero a realized claimable field and remove it from its pool aggregate.
+	/// An underflow on the aggregate would mean a claimable exceeding the
+	/// tracked total.
+	fn take_claim(
+		claimable: &mut BalanceOf<T>,
+		unclaimed_total: &mut BalanceOf<T>,
+		empty_error: Error<T>,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let amount = *claimable;
+		ensure!(!amount.is_zero(), empty_error);
+		*claimable = BalanceOf::<T>::zero();
+		*unclaimed_total =
+			unclaimed_total.checked_sub(&amount).ok_or(ArithmeticError::Underflow)?;
+		Ok(amount)
+	}
+
+	/// Pay a taken claim out of the pool account. `Expendable` only on a full
+	/// drain: the transfer itself then rejects a dead-zone payout instead of
+	/// dusting the pool.
+	fn pay_claim<Assets>(
+		asset_id: Assets::AssetId,
+		pool_account: &T::AccountId,
+		recipient: &T::AccountId,
+		amount: BalanceOf<T>,
+	) -> DispatchResult
+	where
+		Assets: frame::traits::fungibles::Mutate<T::AccountId, Balance = BalanceOf<T>>,
+	{
+		let preservation = debit_preservation::<Assets, _>(asset_id.clone(), pool_account, amount);
+		Assets::transfer(asset_id, pool_account, recipient, amount, preservation)?;
+		Ok(())
+	}
+
 	/// SPEC.md §7.1: burn active-pool stablecoin against ordinary liquidation
 	/// debt, resolving the pro-rata slice of the offered collateral credit
 	/// into the pool account and distributing it to active depositors
-	/// through `S`. The offset is capped by pool depth and the
-	/// `minimum_active_pool_balance` floor (§6.5); whatever the pool cannot
-	/// (or may not) take comes back as the credit remainder, with the result
-	/// zeroed on a full step-aside.
+	/// through `S`. Sized by [`Pallet::size_active_offset`]; whatever the pool
+	/// cannot (or may not) take comes back as the credit remainder, with a
+	/// zero offset on a full step-aside.
 	pub(crate) fn do_offset_liquidation(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -556,22 +688,16 @@ impl<T: Config> Pallet<T> {
 			return (BalanceOf::<T>::zero(), collateral);
 		}
 
-		let accounting_cap = math::clamp_offset_debt(
-			max_debt_to_offset,
-			pool.state.total_active_deposits,
-			pool.config.minimum_active_pool_balance,
-		);
-		if accounting_cap.is_zero() {
-			return (BalanceOf::<T>::zero(), collateral);
-		}
-		// The burnable amount caps the accounting: a minimum-balance dead
-		// zone rounds the offset down instead of dusting the pool account.
 		let pool_account = Self::pool_account(collateral_id, stable_id);
-		let (sp_offset_debt, preservation) =
-			reducible_debit::<T::StableAssets, _>(stable_id.clone(), &pool_account, accounting_cap);
-		if sp_offset_debt.is_zero() {
+		let Some((sp_offset_debt, preservation)) = Self::size_active_offset(
+			&pool,
+			stable_id,
+			&pool_account,
+			max_debt_to_offset,
+			BalanceOf::<T>::zero(),
+		) else {
 			return (BalanceOf::<T>::zero(), collateral);
-		}
+		};
 		let sp_offset_collateral =
 			math::pro_rata_floor(collateral.peek(), sp_offset_debt, max_debt_to_offset);
 		let Ok(plan) = Self::plan_active_offset(
@@ -618,21 +744,21 @@ impl<T: Config> Pallet<T> {
 	/// resolves its collateral slice into the pool account, and credits the
 	/// consumed depositor directly; `P`/`S`/`G` are never touched
 	/// (invariant 11). An empty queue or zero remaining debt no-ops with a
-	/// zeroed result and the untouched credit.
+	/// zero offset and the untouched credit.
 	pub(crate) fn do_offset_pending_liquidation(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		max_debt_to_offset: BalanceOf<T>,
 		mut collateral: CollateralCreditOf<T>,
-	) -> (PendingOffsetResult<BalanceOf<T>>, CollateralCreditOf<T>) {
+	) -> (BalanceOf<T>, CollateralCreditOf<T>) {
 		if collateral.asset() != *collateral_id {
-			return (PendingOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		}
 		let Some(mut pool) = Pools::<T>::get(collateral_id, stable_id) else {
-			return (PendingOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		};
 		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
-			return (PendingOffsetResult::zero(), collateral);
+			return (BalanceOf::<T>::zero(), collateral);
 		}
 		let fifo = StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
 		let pool_account = Self::pool_account(collateral_id, stable_id);
@@ -686,7 +812,7 @@ impl<T: Config> Pallet<T> {
 				iterations,
 			});
 		}
-		(PendingOffsetResult { debt_offset: debt_burned, iterations_used: iterations }, collateral)
+		(debt_burned, collateral)
 	}
 
 	/// One §6.8 backstop step against the FIFO's `oldest` member: price the

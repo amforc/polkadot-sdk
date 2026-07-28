@@ -60,7 +60,7 @@ use frame_support::{
 			GetSalary, PayFromAccount, PayWithFungibles,
 		},
 		AsEnsureOriginWithArg, ConstBool, ConstU128, ConstU16, ConstU32, ConstU64,
-		ConstantStoragePrice, Contains, Currency, EitherOfDiverse, EnsureOriginWithArg,
+		ConstantStoragePrice, Contains, Currency, EitherOf, EitherOfDiverse, EnsureOriginWithArg,
 		EqualPrivilegeOnly, InsideBoth, InstanceFilter, KeyOwnerProofSystem, LinearStoragePrice,
 		LockIdentifier, Nothing, OnUnbalanced, VariantCountOf, WithdrawReasons,
 	},

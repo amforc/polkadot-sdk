@@ -7,6 +7,7 @@ mod deposit;
 mod epoch_scale;
 mod governance;
 mod mode;
+mod numeric_examples;
 mod offsets;
 mod pending_offsets;
 mod recovery;

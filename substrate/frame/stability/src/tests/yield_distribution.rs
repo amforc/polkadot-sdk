@@ -286,7 +286,7 @@ fn compound_with_nothing_claimable_reverts() {
 #[test]
 fn compound_without_row_or_branch_reverts() {
 	build_and_execute(|| {
-		assert_noop!(compound(1, DOT, PUSD, 60), Error::<Test>::BranchNotRegistered);
+		assert_noop!(compound(1, DOT, PUSD, 60), Error::<Test>::PoolNotRegistered);
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_noop!(compound(1, DOT, PUSD, 60), Error::<Test>::DepositNotFound);
 	});

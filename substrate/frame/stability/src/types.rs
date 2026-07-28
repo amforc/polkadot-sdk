@@ -333,22 +333,6 @@ impl<Balance: Zero> StabilityPool<Balance> {
 	}
 }
 
-/// Result of a pending-deposit backstop offset (SPEC.md §7.2). Internal
-/// shape: the `StabilityPoolOffsetApi` surface reports only the debt offset,
-/// while `iterations_used` feeds this pallet's event and tests.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PendingOffsetResult<Balance> {
-	pub debt_offset: Balance,
-	pub iterations_used: u32,
-}
-
-impl<Balance: Zero> PendingOffsetResult<Balance> {
-	/// The no-op outcome: nothing consumed.
-	pub fn zero() -> Self {
-		Self { debt_offset: Balance::zero(), iterations_used: 0 }
-	}
-}
-
 /// Which capital funded a recovery offset (SPEC.md §10).
 #[derive(
 	Encode,
