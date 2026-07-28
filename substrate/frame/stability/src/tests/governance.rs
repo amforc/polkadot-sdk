@@ -236,7 +236,7 @@ fn set_stability_pool_config_requires_registered_branch() {
 				PUSD,
 				default_pool_config()
 			),
-			Error::<Test>::BranchNotRegistered
+			Error::<Test>::PoolNotRegistered
 		);
 	});
 }
