@@ -60,7 +60,7 @@ use frame_support::{
 			GetSalary, PayFromAccount, PayWithFungibles,
 		},
 		AsEnsureOriginWithArg, ConstBool, ConstU128, ConstU16, ConstU32, ConstU64,
-		ConstantStoragePrice, Contains, Currency, EitherOf, EitherOfDiverse, EnsureOriginWithArg,
+		ConstantStoragePrice, Contains, Currency, EitherOfDiverse, EnsureOriginWithArg,
 		EqualPrivilegeOnly, InsideBoth, InstanceFilter, KeyOwnerProofSystem, LinearStoragePrice,
 		LockIdentifier, Nothing, OnUnbalanced, VariantCountOf, WithdrawReasons,
 	},
@@ -3515,10 +3515,7 @@ impl pallet_redemptions::Config for Runtime {
 	type InsuranceFundAccount = StableInsuranceAccount;
 	type FeeHandler = ResolveAssetTo<TreasuryAccount, Assets>;
 	type TimeProvider = Timestamp;
-	type UpdateOrigin = EitherOf<
-		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
-		pallet_vaults::EnsureBranchFullAdmin<Runtime>,
-	>;
+	type UpdateOrigin = VaultsCreateOrigin;
 	type DefaultRedemptionConfig = RedemptionsDefaultConfig;
 	type MaxRedemptionSteps = RedemptionsMaxSteps;
 	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
