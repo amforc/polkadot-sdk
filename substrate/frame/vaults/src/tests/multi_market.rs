@@ -5,7 +5,11 @@
 //! one owner running several markets, markets sharing a collateral, and
 //! in-market isolation of redemption, liquidation, redistribution, and yield.
 
-use crate::{mock::*, pallet::Vaults, tests::rate_pct};
+use crate::{
+	mock::*,
+	pallet::{StablecoinDebt, Vaults},
+	tests::rate_pct,
+};
 use frame::traits::fungibles::{Balanced, Mutate};
 use pusd_primitives::VaultInterface;
 
@@ -89,6 +93,73 @@ fn markets_sharing_a_collateral_share_the_owner_hold() {
 		// Distinct coins minted against the shared collateral.
 		assert_eq!(stable_balance(PUSD, 1), 2_000);
 		assert_eq!(stable_balance(EUSD, 1), 1_000);
+	});
+}
+
+// `StablecoinDebt` sums every collateral market issuing one coin, and stays
+// blind to markets issuing another. Redemptions divides by it to price one
+// stablecoin's dynamic fee across all of its collaterals at once.
+#[test]
+fn stablecoin_debt_sums_the_markets_issuing_that_coin() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		register_market(ETH, PUSD);
+		register_market(ETH, EUSD);
+
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
+		assert_ok!(open(2, ETH, EUSD, 1_000, 4_000, rate_pct(5, 100)));
+
+		let dot_pusd = branch_state(DOT, PUSD).unwrap().debt.outstanding();
+		let eth_pusd = branch_state(ETH, PUSD).unwrap().debt.outstanding();
+		let eth_eusd = branch_state(ETH, EUSD).unwrap().debt.outstanding();
+
+		// Principal plus the upfront fee the open charges into `minted_interest`,
+		// `ceil(drawn * rate * 7 days / year)`: ceil(2_000 * 5% * 7/365) = 2,
+		// ceil(3_000 * 7% * 7/365) = 5, ceil(4_000 * 5% * 7/365) = 4.
+		assert_eq!((dot_pusd, eth_pusd, eth_eusd), (2_002, 3_005, 4_004));
+
+		// Both PUSD markets, and only those, land in the PUSD total.
+		assert_eq!(StablecoinDebt::<Test>::get(PUSD).outstanding, 5_007);
+		assert_eq!(StablecoinDebt::<Test>::get(PUSD).outstanding, dot_pusd + eth_pusd);
+		assert_eq!(StablecoinDebt::<Test>::get(EUSD).outstanding, 4_004);
+
+		// The aggregate tracks debt leaving as well as arriving: repaying 1_000
+		// on one PUSD market drops the shared total by exactly that, and leaves
+		// the other coin's total alone.
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), ETH, PUSD, 1, 1_000));
+		assert_eq!(StablecoinDebt::<Test>::get(PUSD).outstanding, 4_007);
+		assert_eq!(StablecoinDebt::<Test>::get(EUSD).outstanding, 4_004);
+	});
+}
+
+#[test]
+fn stablecoin_debt_projects_interest_across_untouched_markets() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		register_market(ETH, PUSD);
+
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(2, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
+		let stored = StablecoinDebt::<Test>::get(PUSD);
+
+		advance_time(ONE_YEAR_MS);
+		let now = Timestamp::get();
+		let expected = [DOT, ETH]
+			.into_iter()
+			.map(|collateral| {
+				let branch = branch_state(collateral, PUSD).expect("registered branch");
+				crate::Pallet::<Test>::accrued_branch_debt(&branch, now)
+			})
+			.sum();
+
+		assert_eq!(<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD), expected);
+		assert!(expected > stored.outstanding);
+		assert_eq!(
+			StablecoinDebt::<Test>::get(PUSD),
+			stored,
+			"read-only projection must not touch either market"
+		);
 	});
 }
 

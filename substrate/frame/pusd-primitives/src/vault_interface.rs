@@ -2,7 +2,7 @@
 //! sweeps, liquidation execution, and bad-debt healing — keyed by the
 //! `(collateral_id, stable_id)` market.
 
-use crate::VaultStatus;
+use crate::{Position, VaultStatus};
 use frame::deps::{
 	frame_support::pallet_prelude::{DispatchError, DispatchResult},
 	sp_runtime::Permill,
@@ -35,6 +35,13 @@ pub struct RedemptionStepSnapshot<Balance> {
 	pub redistribution_penalty: Permill,
 }
 
+impl<Balance: Copy> RedemptionStepSnapshot<Balance> {
+	/// The debt/collateral pair CR math reads.
+	pub fn position(&self) -> Position<Balance> {
+		Position { debt: self.debt, collateral: self.collateral }
+	}
+}
+
 /// Result of the external liquidation work consumed by
 /// [`VaultInterface::execute_liquidation`]. External offset paths burn their
 /// stablecoin internally, so `debt_offset` remains a balance. Both collateral
@@ -53,6 +60,11 @@ pub struct LiquidationSettlement<CollateralCredit, Balance> {
 pub struct LiquidationSnapshot<Balance> {
 	/// Post-touch total debt to settle.
 	pub debt: Balance,
+	/// Branch redistribution penalty: the premium debt pushed onto other vaults
+	/// carries, above the liquidation penalty an offset pays. Vaults owns it,
+	/// so the orchestrator prices redistribution against this rather than
+	/// against a parameter of its own.
+	pub redistribution_penalty: Permill,
 }
 
 /// Everything an orchestrator drives on the vault pallet. Reads are
@@ -137,10 +149,22 @@ pub trait VaultInterface {
 		owner: &Self::AccountId,
 	) -> Result<Self::Balance, DispatchError>;
 
-	/// Fully-accrued total debt of the market, used to size the dynamic
-	/// redemption fee's redeemed fraction.
-	fn branch_debt(collateral_id: &Self::CollateralId, stable_id: &Self::StableId)
-		-> Self::Balance;
+	/// The market's redistribution penalty, or `None` when it is not
+	/// registered. The same value [`LiquidationSnapshot`] carries, exposed for
+	/// callers that must validate their own penalty against it before a
+	/// liquidation is in flight.
+	fn redistribution_penalty(
+		collateral_id: &Self::CollateralId,
+		stable_id: &Self::StableId,
+	) -> Option<Permill>;
+
+	/// Total debt issued in `stable_id` across every one of its collateral
+	/// markets, the denominator of the dynamic redemption fee's redeemed
+	/// fraction. Stablecoin-wide rather than per-market because the fee nudges
+	/// how much of the coin is redeemed, whichever collateral backs it.
+	///
+	/// Includes aggregate interest accrued since each market was last touched.
+	fn stablecoin_debt(stable_id: &Self::StableId) -> Self::Balance;
 
 	/// Liquidate `owner`'s below-MCR vault. Vaults turns the fully-accrued
 	/// collateral hold into one credit and transfers ownership to the

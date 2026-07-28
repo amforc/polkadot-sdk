@@ -3,10 +3,11 @@
 use crate::{math, Millis};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::arithmetic::{
-	CheckedAdd, CheckedMul, FixedPointNumber, FixedPointOperand, FixedU128, Permill, Saturating,
-	Zero,
+	helpers_128bit::multiply_by_rational_with_rounding, CheckedAdd, CheckedMul, CheckedSub,
+	FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Rounding, Saturating, Zero,
 };
-pub use pusd_primitives::{BranchMode, StableListId as VaultListId, VaultStatus};
+use pusd_primitives::MILLIS_PER_YEAR;
+pub use pusd_primitives::{BranchMode, Position, StableListId as VaultListId, VaultStatus};
 use scale_info::TypeInfo;
 
 /// Reason a market is frozen.
@@ -141,6 +142,13 @@ impl<Balance> Vault<Balance> {
 	}
 }
 
+impl<Balance: Ord + Saturating + Copy> Vault<Balance> {
+	/// The debt/collateral pair the CR gates read.
+	pub fn position(&self) -> Position<Balance> {
+		Position { debt: self.debt.total(), collateral: self.collateral }
+	}
+}
+
 /// Risk parameters for one market.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
@@ -202,6 +210,101 @@ impl<Balance: FixedPointOperand + Saturating> BranchDebt<Balance> {
 			.saturating_add(self.minted_interest)
 			.saturating_add(self.pending_redistribution_principal)
 			.saturating_add(self.bad_debt)
+	}
+}
+
+/// An exact interest amount split at the year boundary.
+///
+/// The represented weight-millis numerator is
+/// `interest * MILLIS_PER_YEAR + remainder`. Splitting keeps both limbs inside
+/// `Balance`/`u64` without a wide integer, while carry/borrow arithmetic stays
+/// exact, so one market's contribution can be subtracted back out of an
+/// aggregate without drift.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug, Default)]
+pub struct PendingInterest<Balance> {
+	/// Whole interest units: `numerator / MILLIS_PER_YEAR`, rounded down.
+	pub interest: Balance,
+	/// Sub-unit residue: `numerator % MILLIS_PER_YEAR`, in weight-millis.
+	pub remainder: u64,
+}
+
+impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> PendingInterest<Balance> {
+	/// The exact `weight * elapsed` numerator, in split form.
+	///
+	/// Returns `None` when the divided product overflows `Balance`.
+	pub fn from_weight_millis(weight: Balance, elapsed: Millis) -> Option<Self> {
+		let weight: u128 = weight.unique_saturated_into();
+		let year = u128::from(MILLIS_PER_YEAR);
+		let divided =
+			multiply_by_rational_with_rounding(weight, u128::from(elapsed), year, Rounding::Down)?;
+		// `(a * b) % m == ((a % m) * (b % m)) % m`; both factors are below
+		// `MILLIS_PER_YEAR`, so the product stays far inside `u128`.
+		let remainder = ((weight % year) * (u128::from(elapsed) % year)) % year;
+		Some(Self {
+			interest: Balance::try_from(divided).ok()?,
+			remainder: u64::try_from(remainder).ok()?,
+		})
+	}
+
+	pub fn checked_add(&self, other: &Self) -> Option<Self> {
+		// Each limb is below `MILLIS_PER_YEAR`, so the sum cannot overflow `u64`.
+		let mut interest = self.interest.checked_add(&other.interest)?;
+		let mut remainder = self.remainder + other.remainder;
+		if remainder >= MILLIS_PER_YEAR {
+			remainder -= MILLIS_PER_YEAR;
+			interest = interest.checked_add(&Balance::one())?;
+		}
+		Some(Self { interest, remainder })
+	}
+
+	pub fn checked_sub(&self, other: &Self) -> Option<Self> {
+		let mut interest = self.interest.checked_sub(&other.interest)?;
+		let remainder = if self.remainder >= other.remainder {
+			self.remainder - other.remainder
+		} else {
+			interest = interest.checked_sub(&Balance::one())?;
+			self.remainder + MILLIS_PER_YEAR - other.remainder
+		};
+		Some(Self { interest, remainder })
+	}
+
+	/// Whole interest units, rounded up. `None` when the round-up overflows.
+	pub fn ceil(&self) -> Option<Balance> {
+		if self.remainder == 0 {
+			Some(self.interest)
+		} else {
+			self.interest.checked_add(&Balance::one())
+		}
+	}
+}
+
+impl<Balance: Zero> PendingInterest<Balance> {
+	pub fn is_zero(&self) -> bool {
+		self.interest.is_zero() && self.remainder == 0
+	}
+}
+
+/// Stablecoin-wide realized debt and projection of unminted aggregate interest.
+///
+/// Kept in step by `commit_branch` so `accrued_stablecoin_debt` is O(1)
+/// instead of a walk over the uncapped market registry.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Eq, Debug, Default)]
+pub struct StablecoinDebtState<Balance> {
+	/// Realized debt summed across every market issuing the stablecoin.
+	pub outstanding: Balance,
+	/// Σ `weighted_principal_sum` over the coin's non-frozen markets.
+	pub active_weighted_principal_sum: Balance,
+	/// Interest accrued up to `last_update` but not yet minted anywhere.
+	pub pending_interest: PendingInterest<Balance>,
+	/// Time the projection was last advanced.
+	pub last_update: Millis,
+}
+
+impl<Balance: Zero> StablecoinDebtState<Balance> {
+	pub fn is_empty(&self) -> bool {
+		self.outstanding.is_zero() &&
+			self.active_weighted_principal_sum.is_zero() &&
+			self.pending_interest.is_zero()
 	}
 }
 
@@ -438,6 +541,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, 
 	/// Returns whether the market has no debt, stake, or collateral.
 	pub fn is_removable(&self) -> bool {
 		self.debt.outstanding().is_zero() &&
+			self.ownerless_debt.is_zero() &&
 			self.stakes.total.is_zero() &&
 			self.total_collateral.is_zero()
 	}
@@ -473,16 +577,15 @@ impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance
 	/// fields. Returns `None` if an accumulator would overflow.
 	pub fn record_redistribution(
 		&mut self,
-		redistributed_debt: Balance,
-		redistributed_collateral: Balance,
+		redistributed: Position<Balance>,
 		now: Millis,
 	) -> Option<()> {
 		let avg_rate = math::average_branch_rate(self.stakes.weighted_sum, self.stakes.total);
-		let debt_per_stake = math::redistribution_per_stake(redistributed_debt, self.stakes.total)?;
+		let debt_per_stake = math::redistribution_per_stake(redistributed.debt, self.stakes.total)?;
 		let collateral_per_stake =
-			math::redistribution_per_stake(redistributed_collateral, self.stakes.total)?;
+			math::redistribution_per_stake(redistributed.collateral, self.stakes.total)?;
 		let weight_per_stake =
-			math::redistribution_weight_per_stake(redistributed_debt, avg_rate, self.stakes.total)?;
+			math::redistribution_weight_per_stake(redistributed.debt, avg_rate, self.stakes.total)?;
 		// Use the same market clock as `pending_touch_for`.
 		let now_fp = FixedU128::saturating_from_integer(self.interest_time(now));
 		let debt_time_increment = now_fp.checked_mul(&debt_per_stake)?;
@@ -509,11 +612,11 @@ impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance
 		self.debt.weighted_principal_sum = self
 			.debt
 			.weighted_principal_sum
-			.saturating_add(avg_rate.saturating_mul_int(redistributed_debt));
-		let debt_dust = redistributed_debt.saturating_sub(distributed_debt);
+			.saturating_add(avg_rate.saturating_mul_int(redistributed.debt));
+		let debt_dust = redistributed.debt.saturating_sub(distributed_debt);
 		self.ownerless_debt = self.ownerless_debt.saturating_add(debt_dust);
 		let distributed_collateral = collateral_per_stake.saturating_mul_int(self.stakes.total);
-		let collateral_dust = redistributed_collateral.saturating_sub(distributed_collateral);
+		let collateral_dust = redistributed.collateral.saturating_sub(distributed_collateral);
 		self.ownerless_collateral = self.ownerless_collateral.saturating_add(collateral_dust);
 		Some(())
 	}
@@ -627,7 +730,7 @@ pub struct BranchConfigGuard<Balance> {
 	/// Highest allowed annual rate.
 	pub max_borrow_rate: FixedU128,
 	/// Highest allowed market debt limit.
-	pub max_branch_line: Balance,
+	pub max_debt_ceiling: Balance,
 	/// Highest allowed headroom for the automatic debt limit.
 	pub max_ceiling_gap: Balance,
 	/// Shortest allowed delay between automatic debt-limit increases.
@@ -645,7 +748,7 @@ impl<Balance: PartialOrd + Copy + Zero> BranchConfigGuard<Balance> {
 			config.minimum_debt >= self.min_minimum_debt &&
 			config.minimum_collateral >= self.min_minimum_collateral &&
 			config.maximum_borrow_rate <= self.max_borrow_rate &&
-			config.debt_ceiling <= self.max_branch_line &&
+			config.debt_ceiling <= self.max_debt_ceiling &&
 			config.ceiling_gap <= self.max_ceiling_gap &&
 			(config.ceiling_gap.is_zero() || config.ceiling_ttl >= self.min_ceiling_ttl)
 	}
@@ -771,5 +874,70 @@ mod tests {
 		assert_eq!(state.debt.principal, 33);
 		assert_eq!(state.debt.pending_redistribution_principal, 3);
 		assert_eq!(state.debt.weighted_principal_sum, 19);
+	}
+
+	const YEAR: u64 = MILLIS_PER_YEAR;
+
+	#[test]
+	fn pending_interest_split_matches_direct_divmod() {
+		// Small enough that `weight * elapsed` fits `u128`, so the split can be
+		// checked against the direct computation.
+		let weight: u128 = 1_000_000_007;
+		let elapsed: u64 = 123_456_789;
+		let numerator = weight * u128::from(elapsed);
+		let split = PendingInterest::from_weight_millis(weight, elapsed).unwrap();
+		assert_eq!(split.interest, numerator / u128::from(YEAR));
+		assert_eq!(u128::from(split.remainder), numerator % u128::from(YEAR));
+	}
+
+	#[test]
+	fn pending_interest_split_exact_beyond_u128_numerator() {
+		// `weight * elapsed` overflows `u128`, but a year-multiple weight pins
+		// the exact split: `interest = k * elapsed`, `remainder = 0`.
+		let k: u128 = u128::MAX / u128::from(YEAR) / 2;
+		let weight = k * u128::from(YEAR);
+		let elapsed: u64 = 400;
+		assert!(weight.checked_mul(u128::from(elapsed)).is_none());
+		let split = PendingInterest::from_weight_millis(weight, elapsed).unwrap();
+		assert_eq!(split.interest, k * u128::from(elapsed));
+		assert_eq!(split.remainder, 0);
+	}
+
+	#[test]
+	fn pending_interest_split_overflowing_interest_is_none() {
+		// The divided product itself exceeds `u128`.
+		let weight = u128::MAX / 2;
+		let elapsed = 4 * YEAR;
+		assert!(PendingInterest::<u128>::from_weight_millis(weight, elapsed).is_none());
+	}
+
+	#[test]
+	fn pending_interest_add_carries_and_sub_borrows() {
+		let a = PendingInterest::<u128> { interest: 5, remainder: YEAR - 1 };
+		let b = PendingInterest::<u128> { interest: 2, remainder: 3 };
+		let sum = a.checked_add(&b).unwrap();
+		assert_eq!(sum, PendingInterest { interest: 8, remainder: 2 });
+		assert_eq!(sum.checked_sub(&b).unwrap(), a);
+		assert_eq!(sum.checked_sub(&a).unwrap(), b);
+	}
+
+	#[test]
+	fn pending_interest_sub_below_zero_is_none() {
+		let a = PendingInterest::<u128> { interest: 1, remainder: 0 };
+		let b = PendingInterest::<u128> { interest: 0, remainder: 1 };
+		// Same total ordering the aggregate relies on: `a - b` borrows into the
+		// interest limb, `b - a` underflows.
+		assert_eq!(
+			a.checked_sub(&b).unwrap(),
+			PendingInterest { interest: 0, remainder: YEAR - 1 }
+		);
+		assert!(b.checked_sub(&a).is_none());
+	}
+
+	#[test]
+	fn pending_interest_ceil_rounds_any_remainder_up() {
+		assert_eq!(PendingInterest::<u128> { interest: 7, remainder: 0 }.ceil().unwrap(), 7);
+		assert_eq!(PendingInterest::<u128> { interest: 7, remainder: 1 }.ceil().unwrap(), 8);
+		assert!(PendingInterest::<u128> { interest: u128::MAX, remainder: 1 }.ceil().is_none());
 	}
 }

@@ -108,12 +108,12 @@ fn create_branch_rejects_config_outside_envelope() {
 	});
 }
 
-// A line above the envelope's `max_branch_line` is rejected at creation.
+// A line above the envelope's `max_debt_ceiling` is rejected at creation.
 #[test]
 fn create_branch_rejects_line_above_envelope() {
 	build_and_execute(|| {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		// One above the guard's `max_branch_line` (10^15).
+		// One above the guard's `max_debt_ceiling` (10^15).
 		let config =
 			BranchConfig { debt_ceiling: 1_000_000_000_000_001, ..default_branch_config() };
 		assert_noop!(
@@ -186,7 +186,7 @@ fn remove_branch_requires_empty_market() {
 		assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
 			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
-			Error::<Test>::MarketNotEmpty
+			Error::<Test>::BranchNotEmpty
 		);
 
 		// Once the sole vault is repaid to zero, the now-empty market is removable.
@@ -377,7 +377,7 @@ fn governance_remove_bypasses_admins_and_requires_empty() {
 		assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(
 			Pallet::<Test>::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
-			Error::<Test>::MarketNotEmpty
+			Error::<Test>::BranchNotEmpty
 		);
 
 		repay_to_close(PUSD_OWNER);
@@ -544,7 +544,7 @@ fn remove_branch_rejected_while_bad_debt_remains() {
 		});
 		assert_noop!(
 			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
-			Error::<Test>::MarketNotEmpty
+			Error::<Test>::BranchNotEmpty
 		);
 		// Once the bad debt is cleared, the empty market is removable.
 		mutate_branch_state(DOT, PUSD, |state| {
@@ -566,7 +566,7 @@ fn remove_branch_rejected_while_collateral_remains() {
 		});
 		assert_noop!(
 			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
-			Error::<Test>::MarketNotEmpty
+			Error::<Test>::BranchNotEmpty
 		);
 		mutate_branch_state(DOT, PUSD, |state| {
 			state.total_collateral = 0;

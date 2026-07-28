@@ -13,6 +13,7 @@ use crate::{
 	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
+use pusd_primitives::VaultInterface;
 
 const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
 
@@ -414,6 +415,8 @@ fn redistribution_residue_lands_in_ownerless_debt() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 999, 500, rate_pct(5, 100)));
 		assert_ok!(open(3, DOT, PUSD, 5_000, 500, rate_pct(5, 100))); // liquidatee
+		let stablecoin_debt_before =
+			<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD);
 
 		let pre_owner = branch_state(DOT, PUSD).unwrap().ownerless_debt;
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
@@ -430,6 +433,11 @@ fn redistribution_residue_lands_in_ownerless_debt() {
 		// (per-stake, then × stake) distributes 500 and strands exactly 1 unit — a tight
 		// bound, not an open `> 0` that would also pass if hundreds were mis-routed.
 		assert_eq!(state.ownerless_debt, pre_owner + 1);
+		assert_eq!(
+			<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD),
+			stablecoin_debt_before,
+			"moving debt into ownerless redistribution dust must not reduce stablecoin debt"
+		);
 	});
 }
 

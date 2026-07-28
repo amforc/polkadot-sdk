@@ -145,9 +145,11 @@ fn open_vault_rate_out_of_bounds_rejected() {
 #[test]
 fn open_vault_exceeds_ceiling_rejected() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		// Own the ceiling under test rather than depend on the mock default.
+		let config = BranchConfig { debt_ceiling: 100_000_000, ..default_branch_config() };
+		register_market_with(DOT, PUSD, FixedU128::from_rational(10, 1), config);
 		assert_noop!(
-			open(1, DOT, PUSD, 100_000_000_000, 200_000_000, rate_pct(5, 100)), // > ceiling 100M
+			open(1, DOT, PUSD, 100_000_000_000, 200_000_000, rate_pct(5, 100)),
 			crate::Error::<Test>::DebtCeilingExceeded
 		);
 	});

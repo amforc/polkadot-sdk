@@ -115,9 +115,15 @@ fn heal_clears_swept_flooring_dust() {
 			10_000
 		));
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		let before_sweep = <crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD);
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
 
 		assert_eq!(bad_debt(), 1, "sweep promoted the flooring residue to bad debt");
+		assert_eq!(
+			<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD),
+			before_sweep,
+			"sweeping ownerless debt into bad debt must not change stablecoin debt"
+		);
 		assert_eq!(heal(1), Ok(0));
 		assert_eq!(bad_debt(), 0);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtHealed {
@@ -136,7 +142,7 @@ fn heal_unknown_branch_errors() {
 		assert_err!(
 			<crate::Pallet<Test> as VaultInterface>::heal(&TOKEN_X, &PUSD, credit)
 				.map(|surplus| surplus.peek()),
-			crate::Error::<Test>::UnknownCollateral
+			crate::Error::<Test>::BranchNotFound
 		);
 	});
 }
