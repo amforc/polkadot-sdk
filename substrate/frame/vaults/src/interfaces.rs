@@ -1,7 +1,7 @@
 //! Implementations of vault interfaces used by other pallets.
 
 use crate::{
-	context::{BranchOp, ResidualSettlement},
+	context::{ResidualSettlement, VaultOp},
 	pallet::{
 		BalanceOf, Branches, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason,
 		Pallet, StableCreditOf, StableIdOf,
@@ -56,10 +56,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			DispatchError,
 		>,
 	) -> DispatchResult {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id.clone(), stable_id.clone())?;
-		let price = op.price()?;
-		let mut op = op.touch(owner)?;
-		op.ensure_liquidatable(price)?;
+		let mut op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), owner)?;
+		op.ensure_liquidatable()?;
 		let liquidation = op.liquidation_snapshot();
 		let post_touch_debt = liquidation.debt;
 		let held = op.vault().collateral;
@@ -117,7 +115,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		}
 
 		// The ratio check above applies; market mode rules do not.
-		op.remove_exempt()
+		op.commit_exempt()
 	}
 
 	/// Returns the next redemption target.
@@ -180,8 +178,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			DispatchError,
 		>,
 	) -> DispatchResult {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id.clone(), stable_id.clone())?;
-		let mut op = op.touch(owner)?;
+		let mut op = VaultOp::<T>::load(collateral_id.clone(), stable_id.clone(), owner)?;
 		let snapshot = op.redemption_snapshot();
 		let post_touch_debt = snapshot.debt;
 		let held = snapshot.collateral;
@@ -242,8 +239,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<BalanceOf<T>, DispatchError> {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id.clone(), stable_id.clone())?;
-		let mut op = op.touch(owner)?;
+		let mut op = VaultOp::<T>::load(collateral_id.clone(), stable_id.clone(), owner)?;
 		// Move the remaining vault debt to market bad debt. The caller heals it with insurance
 		// funds.
 		let ResidualSettlement { residual_debt, collateral_dust, swept_orphan_debt } =
@@ -282,7 +278,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			recipient: op.owner().clone(),
 			collateral: collateral_dust,
 		});
-		op.remove_exempt()?;
+		op.commit_exempt()?;
 		Ok(residual_debt)
 	}
 

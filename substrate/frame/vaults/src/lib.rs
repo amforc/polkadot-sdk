@@ -79,7 +79,7 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 pub mod pallet {
 	use super::*;
 	use crate::{
-		context::BranchOp,
+		context::VaultOp,
 		recovery,
 		types::{AdminLevel, AssetRoleUsage, BranchAdmins, BranchConfigGuard},
 	};
@@ -1087,7 +1087,7 @@ pub mod pallet {
 			owner: T::AccountId,
 		) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
-			BranchOp::<T>::refresh_vault(collateral_id, stable_id, &owner)
+			VaultOp::<T>::refresh(collateral_id, stable_id, &owner)
 		}
 
 		/// Moves the last eligible vault into final recovery.

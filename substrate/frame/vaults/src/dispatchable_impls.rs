@@ -1,7 +1,7 @@
 //! Implementations for pallet extrinsics.
 
 use crate::{
-	context::{BranchOp, CloseOutcome, VaultOp},
+	context::{CloseOutcome, VaultOp},
 	pallet::{
 		AssetRoles, BalanceOf, Branches, CollateralIdOf, CollateralRisks, Config, Error, Event,
 		HoldReason, Pallet, StableIdOf, Vaults,
@@ -36,10 +36,15 @@ impl<T: Config> Pallet<T> {
 		annual_rate: FixedU128,
 		hint: Position<T::AccountId>,
 	) -> DispatchResult {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let price = op.price()?;
-		let op =
-			op.create_vault(&owner, initial_collateral, initial_debt, annual_rate, price, hint)?;
+		let op = VaultOp::<T>::open(
+			collateral_id,
+			stable_id,
+			&owner,
+			initial_collateral,
+			initial_debt,
+			annual_rate,
+			hint,
+		)?;
 
 		T::CollateralAssets::hold(
 			op.collateral_id().clone(),
@@ -55,7 +60,7 @@ impl<T: Config> Pallet<T> {
 			collateral: initial_collateral,
 			debt: initial_debt,
 		});
-		op.commit_checked(price)
+		op.commit_checked()
 	}
 
 	/// Deposits collateral into a vault.
@@ -69,8 +74,7 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let mut op = op.touch(&owner)?;
+		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		op.add_collateral(amount)?;
 		T::CollateralAssets::transfer_and_hold(
 			op.collateral_id().clone(),
@@ -102,11 +106,9 @@ impl<T: Config> Pallet<T> {
 		recipient: T::AccountId,
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let price = op.price()?;
-		let mut op = op.touch(&owner)?;
-		if op.apply_collateral_withdrawal(amount, price)? {
-			return Self::close_inner(op, &recipient, price);
+		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		if op.apply_collateral_withdrawal(amount)? {
+			return Self::close_inner(op, &recipient);
 		}
 
 		T::CollateralAssets::transfer_on_hold(
@@ -127,7 +129,7 @@ impl<T: Config> Pallet<T> {
 			recipient,
 			amount,
 		});
-		op.commit_checked(price)
+		op.commit_checked()
 	}
 
 	/// Borrows stable assets and optionally changes the vault rate.
@@ -141,10 +143,8 @@ impl<T: Config> Pallet<T> {
 		hint: Position<T::AccountId>,
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let price = op.price()?;
-		let mut op = op.touch(&owner)?;
-		op.borrow(amount, maybe_new_rate, price, hint)?;
+		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		op.borrow(amount, maybe_new_rate, hint)?;
 
 		T::StableAssets::mint_into(op.stable_id().clone(), &recipient, amount)?;
 
@@ -155,7 +155,7 @@ impl<T: Config> Pallet<T> {
 			recipient,
 			amount,
 		});
-		op.commit_checked(price)
+		op.commit_checked()
 	}
 
 	/// Repays debt for a vault from another account.
@@ -167,8 +167,7 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let mut op = op.touch(&owner)?;
+		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		ensure!(!op.status().is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		// Never burn more than the current debt.
 		let repay = op.repayment_amount(amount);
@@ -196,8 +195,8 @@ impl<T: Config> Pallet<T> {
 
 		// Close a fully repaid vault when it has no collateral left.
 		if new_total.is_zero() && op.vault().collateral.is_zero() {
-			let price = op.price()?;
-			return Self::close_inner(op, &owner, price);
+			op.load_price()?;
+			return Self::close_inner(op, &owner);
 		}
 
 		op.reconcile_after_debt_reduction()?;
@@ -212,14 +211,13 @@ impl<T: Config> Pallet<T> {
 		new_rate: FixedU128,
 		hint: Position<T::AccountId>,
 	) -> DispatchResult {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let mut op = op.touch(&owner)?;
+		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		if !op.change_rate(new_rate, hint)? {
 			return op.commit_exempt();
 		}
 
-		let price = op.price()?;
-		op.commit_checked(price)
+		op.load_price()?;
+		op.commit_checked()
 	}
 
 	/// Closes a debt-free vault and sends its collateral to the recipient.
@@ -229,20 +227,14 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		recipient: Option<T::AccountId>,
 	) -> DispatchResult {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let price = op.price()?;
-		let op = op.touch(&owner)?;
+		let op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
 		let recipient = recipient.unwrap_or(owner);
 
-		Self::close_inner(op, &recipient, price)
+		Self::close_inner(op, &recipient)
 	}
 
 	/// Closes a vault and returns its collateral.
-	fn close_inner(
-		mut op: VaultOp<T>,
-		recipient: &T::AccountId,
-		price: FixedU128,
-	) -> DispatchResult {
+	fn close_inner(mut op: VaultOp<T>, recipient: &T::AccountId) -> DispatchResult {
 		let CloseOutcome { collateral, branch_empties, orphan_debt } = op.detach_for_close()?;
 
 		if !collateral.is_zero() {
@@ -274,9 +266,9 @@ impl<T: Config> Pallet<T> {
 		});
 		// Closing the last liable vault may reduce the TCR.
 		if branch_empties {
-			op.remove_settlement()
+			op.commit_exempt()
 		} else {
-			op.remove_checked(price)
+			op.commit_checked()
 		}
 	}
 
@@ -286,10 +278,8 @@ impl<T: Config> Pallet<T> {
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 	) -> DispatchResult {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let price = op.price()?;
-		let mut op = op.touch(&owner)?;
-		op.enter_final_recovery(price)?;
+		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		op.enter_final_recovery()?;
 		op.commit_exempt()
 	}
 
@@ -302,10 +292,8 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		hint: Position<T::AccountId>,
 	) -> DispatchResult {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let price = op.price()?;
-		let mut op = op.touch(&owner)?;
-		op.exit_final_recovery(price, hint)?;
+		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		op.exit_final_recovery(hint)?;
 		op.commit_exempt()
 	}
 
@@ -316,8 +304,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		hint: Position<T::AccountId>,
 	) -> DispatchResult {
-		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
-		let mut op = op.touch(&owner)?;
+		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		op.activate(hint)?;
 		op.commit_exempt()
 	}
