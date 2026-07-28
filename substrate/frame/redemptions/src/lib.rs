@@ -12,8 +12,10 @@
 //! redemptions walk dormant and active vaults, charge a market fee, and burn the redeemed stable
 //! asset. Final-recovery vaults are settled first using recovery pricing and insurance cover.
 //!
-//! Each market stores its own redemption configuration and dynamic fee state. Market lifecycle is
-//! synchronized through [`pusd_primitives::OnBranchLifecycle`].
+//! Redemption configuration and dynamic fee state are stored per stablecoin, shared by every
+//! collateral market issuing it: the fee nudges how much of the coin is redeemed, whichever
+//! collateral the redeemer used. Market lifecycle is synchronized through
+//! [`pusd_primitives::OnBranchLifecycle`], which refcounts those rows.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -59,9 +61,9 @@ pub mod pallet {
 	use crate::{
 		fees,
 		types::{
-			Accumulators, OffsetDecision, OrdinaryStep, RecoveryOffsetQuote, RecoveryPricing,
-			RecoveryStep, RedemptionConfig, RedemptionPreamble, RedemptionQuote, RedemptionState,
-			StepAction, StepOutcome, WalkResult,
+			Accumulators, OffsetDecision, OrdinaryStep, PricedStep, RecoveryOffsetQuote,
+			RecoveryPricing, RecoveryStep, RedemptionConfig, RedemptionPreamble, RedemptionQuote,
+			RedemptionState, StepAction, StepOutcome, WalkResult,
 		},
 	};
 	use frame::{
@@ -118,6 +120,16 @@ pub mod pallet {
 	type StepDecision<T> =
 		(Option<RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>>, StepOutcome<BalanceOf<T>>);
 
+	/// The fixed inputs one redemption walk threads through every step.
+	pub(crate) struct WalkContext<'a, T: Config> {
+		pub(crate) redeemer: &'a T::AccountId,
+		pub(crate) collateral_id: &'a CollateralIdOf<T>,
+		pub(crate) stable_id: &'a StableIdOf<T>,
+		pub(crate) recipient: &'a T::AccountId,
+		pub(crate) price: FixedU128,
+		pub(crate) config: &'a RedemptionConfigOf<T>,
+	}
+
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
 	#[pallet::pallet]
@@ -157,15 +169,11 @@ pub mod pallet {
 		/// Provides UNIX time in milliseconds.
 		type TimeProvider: Time<Moment = Millis>;
 
-		/// Authorizes [`Pallet::set_redemption_config`] for the market given
-		/// as argument. Point this at the market's admin authority (e.g.
-		/// vaults' `EnsureBranchFullAdmin`) and compose a governance override
-		/// with `EitherOf`.
-		type UpdateOrigin: EnsureOriginWithArg<
-			Self::RuntimeOrigin,
-			(CollateralIdOf<Self>, StableIdOf<Self>),
-			Success = (),
-		>;
+		/// Authorizes [`Pallet::set_redemption_config`] for the stablecoin given
+		/// as argument. One config governs every collateral market issuing that
+		/// coin, so this must be the coin's own authority (e.g. whatever vaults
+		/// accepts as its `CreateOrigin`) rather than any single market's admin.
+		type UpdateOrigin: EnsureOriginWithArg<Self::RuntimeOrigin, StableIdOf<Self>>;
 
 		/// Redemption configuration seeded when a market is registered.
 		type DefaultRedemptionConfig: Get<RedemptionConfigOf<Self>>;
@@ -187,31 +195,29 @@ pub mod pallet {
 		>;
 	}
 
-	/// Redemption parameters keyed by collateral and stable asset.
+	/// Redemption parameters keyed by stable asset.
 	///
-	/// A row exists exactly while the corresponding Vaults market is registered.
+	/// One config governs every collateral market issuing the coin: the fee
+	/// nudges how much of the coin is redeemed, whichever collateral backs it.
+	/// A row exists exactly while at least one Vaults market issues it.
 	#[pallet::storage]
-	pub type RedemptionConfigs<T: Config> = StorageDoubleMap<
-		_,
-		Twox64Concat,
-		CollateralIdOf<T>,
-		Twox64Concat,
-		StableIdOf<T>,
-		RedemptionConfigOf<T>,
-		OptionQuery,
-	>;
+	pub type RedemptionConfigs<T: Config> =
+		StorageMap<_, Twox64Concat, StableIdOf<T>, RedemptionConfigOf<T>, OptionQuery>;
 
-	/// Dynamic redemption fee state keyed by collateral and stable asset.
+	/// Dynamic redemption fee state keyed by stable asset. Shared with
+	/// [`RedemptionConfigs`], so redeeming against one collateral raises the fee
+	/// on every other collateral issuing the same coin.
 	#[pallet::storage]
-	pub type RedemptionStates<T: Config> = StorageDoubleMap<
-		_,
-		Twox64Concat,
-		CollateralIdOf<T>,
-		Twox64Concat,
-		StableIdOf<T>,
-		RedemptionState,
-		ValueQuery,
-	>;
+	pub type RedemptionStates<T: Config> =
+		StorageMap<_, Twox64Concat, StableIdOf<T>, RedemptionState, ValueQuery>;
+
+	/// Number of registered Vaults markets issuing each stable asset.
+	///
+	/// [`RedemptionConfigs`] is seeded when this reaches one and removed when it
+	/// falls back to zero, so a market leaving never wipes fee state its
+	/// siblings are still using.
+	#[pallet::storage]
+	pub type MarketCounts<T: Config> = StorageMap<_, Twox64Concat, StableIdOf<T>, u32, ValueQuery>;
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -254,10 +260,8 @@ pub mod pallet {
 			/// Pricing regime applied to the settlement.
 			regime: RecoveryRegime,
 		},
-		/// The branch dynamic fee moved after an ordinary redemption.
+		/// The stablecoin's dynamic fee moved after an ordinary redemption.
 		RedemptionDynamicFeeUpdated {
-			/// Collateral asset ID.
-			collateral_id: CollateralIdOf<T>,
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
 			/// Dynamic fee before the redemption.
@@ -265,10 +269,8 @@ pub mod pallet {
 			/// Dynamic fee after the redemption.
 			new_dynamic_fee: FixedU128,
 		},
-		/// Governance replaced a market's redemption config.
+		/// Governance replaced a stablecoin's redemption config.
 		RedemptionConfigUpdated {
-			/// Collateral asset ID.
-			collateral_id: CollateralIdOf<T>,
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
 		},
@@ -276,7 +278,7 @@ pub mod pallet {
 
 	#[pallet::error]
 	pub enum Error<T> {
-		/// `max_pusd_in` is below the branch `minimum_redemption_amount`.
+		/// `max_stable_in` is below the branch `minimum_redemption_amount`.
 		BelowMinimumRedemptionAmount,
 		/// No redeemable vault made any progress.
 		NoRedeemableVault,
@@ -321,44 +323,57 @@ pub mod pallet {
 
 	#[pallet::view_functions]
 	impl<T: Config> Pallet<T> {
-		/// Quotes the market-side result of redeeming up to `max_pusd_in`.
+		/// Quotes the market-side result of cancelling up to `max_stable_in` of debt.
+		///
+		/// `max_stable_in` and the fee have the same meaning as in
+		/// [`Pallet::redeem`]: the quote's `stable_in` is the debt it would
+		/// cancel plus the fee that much redemption would raise the rate to.
 		///
 		/// `max_steps` has the same meaning as in [`Pallet::redeem`]: zero uses
 		/// [`Config::MaxRedemptionSteps`]. The quote projects pending vault
 		/// updates without applying them and does not inspect a redeemer's
-		/// wallet. Use `min_collateral_out` on execution to protect against
-		/// state changes after the quote.
+		/// wallet, so execution against a wallet that cannot cover
+		/// `stable_in` fills less. Use `min_collateral_out` on execution to
+		/// protect against state changes after the quote.
 		pub fn preview_redeem(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			max_pusd_in: BalanceOf<T>,
+			max_stable_in: BalanceOf<T>,
 			max_steps: u32,
 		) -> Option<RedemptionQuoteOf<T>> {
-			Self::quote_redeem(&collateral_id, &stable_id, max_pusd_in, max_steps)
+			Self::quote_redeem(&collateral_id, &stable_id, max_stable_in, max_steps)
 		}
 	}
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// Swaps up to `max_pusd_in` stable assets for collateral.
+		/// Cancels up to `max_stable_in` of vault debt, paying the redeemer collateral for it.
 		///
 		/// ## Dispatch Origin
 		///
 		/// Must be signed by the redeemer.
+		///
+		/// `max_stable_in` is the debt the redeemer is willing to cancel, **not** its total spend:
+		/// the redemption fee is charged on top, so the redeemer needs `max_stable_in` plus the fee
+		/// and the walk is bounded by what its balance covers at both.
+		///
+		/// The fee is charged once for the whole redemption, at the rate this redemption itself
+		/// raises the dynamic accelerator to — a large redemption after a quiet period pays the
+		/// rate it causes, not the decayed one it arrived at.
 		///
 		/// Redemption targets are visited from the cheapest borrow rate upward. `max_steps` caps
 		/// how many vaults the walk may touch; zero uses [`Config::MaxRedemptionSteps`]. Weight is
 		/// charged for the cap and refunded to the number of steps actually taken.
 		///
 		/// `min_collateral_out` is the redeemer's slippage floor. Partial fills scale it pro-rata
-		/// to the stable assets actually spent.
+		/// to the debt actually cancelled.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps)))]
 		pub fn redeem(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			max_pusd_in: BalanceOf<T>,
+			max_stable_in: BalanceOf<T>,
 			min_collateral_out: BalanceOf<T>,
 			recipient: T::AccountId,
 			max_steps: u32,
@@ -368,7 +383,7 @@ pub mod pallet {
 				&who,
 				&collateral_id,
 				&stable_id,
-				max_pusd_in,
+				max_stable_in,
 				min_collateral_out,
 				&recipient,
 				max_steps,
@@ -376,27 +391,24 @@ pub mod pallet {
 			Ok(Some(T::WeightInfo::redeem(steps)).into())
 		}
 
-		/// Replaces a market's redemption configuration.
+		/// Replaces a stablecoin's redemption configuration, for every collateral
+		/// market issuing it.
 		///
 		/// ## Dispatch Origin
 		///
-		/// Must satisfy [`Config::UpdateOrigin`] for the market.
+		/// Must satisfy [`Config::UpdateOrigin`] for the stablecoin.
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::set_redemption_config())]
 		pub fn set_redemption_config(
 			origin: OriginFor<T>,
-			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			config: RedemptionConfigOf<T>,
 		) -> DispatchResult {
-			T::UpdateOrigin::ensure_origin(origin, &(collateral_id.clone(), stable_id.clone()))?;
-			ensure!(
-				RedemptionConfigs::<T>::contains_key(&collateral_id, &stable_id),
-				Error::<T>::InvalidBranch
-			);
+			T::UpdateOrigin::ensure_origin(origin, &stable_id)?;
+			ensure!(RedemptionConfigs::<T>::contains_key(&stable_id), Error::<T>::InvalidBranch);
 			ensure!(config.is_valid(), Error::<T>::InvalidRedemptionConfig);
-			RedemptionConfigs::<T>::insert(&collateral_id, &stable_id, config);
-			Self::deposit_event(Event::RedemptionConfigUpdated { collateral_id, stable_id });
+			RedemptionConfigs::<T>::insert(&stable_id, config);
+			Self::deposit_event(Event::RedemptionConfigUpdated { stable_id });
 			Ok(())
 		}
 	}
@@ -418,71 +430,151 @@ pub mod pallet {
 		fn redemption_preamble(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
-			max_pusd_in: BalanceOf<T>,
+			max_stable_in: BalanceOf<T>,
 		) -> Result<RedemptionPreamble<BalanceOf<T>>, Error<T>> {
-			let config = RedemptionConfigs::<T>::get(collateral_id, stable_id)
-				.ok_or(Error::<T>::InvalidBranch)?;
+			let config = RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::InvalidBranch)?;
 			ensure!(
-				max_pusd_in >= config.minimum_redemption_amount,
+				max_stable_in >= config.minimum_redemption_amount,
 				Error::<T>::BelowMinimumRedemptionAmount
 			);
 			let price = T::Oracle::provide_price(collateral_id)
 				.map_err(|_| Error::<T>::OracleUnavailable)?;
 			ensure!(!price.is_zero(), Error::<T>::OracleUnavailable);
 			let now = T::TimeProvider::now();
-			let state = RedemptionStates::<T>::get(collateral_id, stable_id);
+			let state = RedemptionStates::<T>::get(stable_id);
 			let decayed = Self::decayed_dynamic_fee(&state, &config, now);
-			let fee_rate = fees::fee_rate(decayed, config.base_fee, config.fee_ceiling);
-			Ok(RedemptionPreamble { config, state, price, now, decayed, fee_rate })
+			let stablecoin_debt = T::Vaults::stablecoin_debt(stable_id);
+			Ok(RedemptionPreamble { config, state, price, now, decayed, stablecoin_debt })
+		}
+
+		/// The rate charged on a redemption that cancels `redeemed` debt: the
+		/// accelerator is raised first, and the redemption then pays the rate it
+		/// caused. Shared by the funding bound, the charge, and the quote so no
+		/// two of them can price differently.
+		fn charged_fee_rate(
+			preamble: &RedemptionPreamble<BalanceOf<T>>,
+			redeemed: BalanceOf<T>,
+		) -> FixedU128 {
+			let raised = Self::raised_dynamic_fee(preamble, redeemed);
+			fees::fee_rate(raised, preamble.config.base_fee, preamble.config.fee_ceiling)
 		}
 
 		fn do_redeem(
 			redeemer: &T::AccountId,
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
-			max_pusd_in: BalanceOf<T>,
+			max_stable_in: BalanceOf<T>,
 			min_collateral_out: BalanceOf<T>,
 			recipient: &T::AccountId,
 			max_steps: u32,
 		) -> Result<u32, DispatchError> {
-			let RedemptionPreamble { config, state, price, now, decayed, fee_rate } =
-				Self::redemption_preamble(collateral_id, stable_id, max_pusd_in)?;
-			let branch_debt_before = T::Vaults::branch_debt(collateral_id, stable_id);
+			let preamble = Self::redemption_preamble(collateral_id, stable_id, max_stable_in)?;
 			let step_cap = Self::effective_step_cap(max_steps);
+			let ctx = WalkContext {
+				redeemer,
+				collateral_id,
+				stable_id,
+				recipient,
+				price: preamble.price,
+				config: &preamble.config,
+			};
+
+			let first_target = T::Vaults::next_redemption_target(collateral_id, stable_id, None);
+			ensure!(first_target.is_some(), Error::<T>::NoRedeemableVault);
+			let recovery_first =
+				matches!(&first_target, Some((_, status)) if status.is_final_recovery());
+			let spendable = Self::spendable_stable(stable_id, redeemer);
+			let debt_budget = if recovery_first {
+				// Recovery is fee-free and ends the walk, so every spendable
+				// unit may cancel debt.
+				max_stable_in.min(spendable)
+			} else {
+				Self::ordinary_debt_budget(&preamble, max_stable_in, spendable)
+			};
+			// A wallet that cannot fund the market's own minimum, fee included,
+			// has no redemption to make. Saying so beats bounding the walk to
+			// nothing and reporting it as an empty queue.
+			if !recovery_first {
+				ensure!(
+					debt_budget >= preamble.config.minimum_redemption_amount,
+					Error::<T>::InsufficientPusdBalance
+				);
+			}
 
 			let mut acc = Accumulators::default();
-			let walk = Self::run_loop(
-				redeemer,
-				collateral_id,
-				stable_id,
-				recipient,
-				price,
-				fee_rate,
-				step_cap,
-				max_pusd_in,
-				&config,
-				&mut acc,
-			)?;
+			let walk = Self::run_loop(&ctx, step_cap, debt_budget, first_target, &mut acc)?;
 
-			ensure!(!acc.debt_settled.is_zero(), Error::<T>::NoRedeemableVault);
-			let spent = max_pusd_in.saturating_sub(walk.remaining);
-			let scaled_min = fees::scale_floor(min_collateral_out, spent, max_pusd_in);
+			ensure!(!acc.debt_settled().is_zero(), Error::<T>::NoRedeemableVault);
+
+			let fee_rate = Self::charged_fee_rate(&preamble, acc.ordinary_debt);
+			let fee = fees::fee_pusd(acc.ordinary_debt, fee_rate);
+			Self::charge_fee(stable_id, redeemer, fee)?;
+
+			// The caller's floor was quoted against the debt it asked to cancel,
+			// so a partial fill scales it by the debt actually cancelled.
+			let redeemed = debt_budget.saturating_sub(walk.remaining);
+			let scaled_min = fees::scale_floor(min_collateral_out, redeemed, max_stable_in);
 			ensure!(acc.collateral_out() >= scaled_min, Error::<T>::SlippageExceeded);
 
-			Self::finalize(
-				redeemer,
-				collateral_id,
-				stable_id,
-				recipient,
-				&acc,
-				walk.steps,
-				decayed,
-				branch_debt_before,
-				&config,
-				now,
-				state.dynamic_fee,
-			);
+			Self::finalize(&ctx, &preamble, &acc, walk.steps, fee);
 			Ok(walk.steps)
+		}
+
+		/// Most debt the wallet can cancel while still paying the post-increase
+		/// fee that same amount induces. `max_stable_in` caps debt, not the fee
+		/// paid on top.
+		fn ordinary_debt_budget(
+			preamble: &RedemptionPreamble<BalanceOf<T>>,
+			max_stable_in: BalanceOf<T>,
+			spendable: BalanceOf<T>,
+		) -> BalanceOf<T> {
+			let max_debt = max_stable_in.min(preamble.stablecoin_debt);
+			fees::max_debt_for_budget(spendable, max_debt, |debt| {
+				fees::fee_pusd(debt, Self::charged_fee_rate(preamble, debt))
+			})
+		}
+
+		/// Everything the redeemer could spend on this redemption, fee included.
+		fn spendable_stable(stable_id: &StableIdOf<T>, redeemer: &T::AccountId) -> BalanceOf<T> {
+			let (spendable, _) = reducible_debit::<T::StableAssets, _>(
+				stable_id.clone(),
+				redeemer,
+				BalanceOf::<T>::max_value(),
+			);
+			spendable
+		}
+
+		/// Take the whole redemption's fee in one debit and route it to the fee
+		/// handler.
+		///
+		/// The budget reserved room for this at a rate at or above the one
+		/// charged, so the balance is there; what it cannot rule out is the fee
+		/// landing in the minimum-balance dead zone, where an exact debit would
+		/// strand a sub-minimum remainder. That case reverts the whole redemption
+		/// rather than mangling the amount, and the redeemer retries with a
+		/// smaller `max_stable_in`.
+		fn charge_fee(
+			stable_id: &StableIdOf<T>,
+			redeemer: &T::AccountId,
+			fee: BalanceOf<T>,
+		) -> DispatchResult {
+			if fee.is_zero() {
+				return Ok(());
+			}
+			let (funded, preservation) =
+				reducible_debit::<T::StableAssets, _>(stable_id.clone(), redeemer, fee);
+			ensure!(funded >= fee, Error::<T>::InsufficientPusdBalance);
+			let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
+				stable_id.clone(),
+				redeemer,
+				fee,
+				Precision::Exact,
+				preservation,
+				Fortitude::Polite,
+			)?;
+			debug_assert_eq!(credit.peek(), fee);
+			T::FeeHandler::on_unbalanced(credit);
+			Ok(())
 		}
 
 		/// Classify a prepared target so the barrier/redeemability ladder is defined
@@ -492,7 +584,7 @@ pub mod pallet {
 				return StepAction::Recovery;
 			}
 			let redeemable = matches!(
-				pusd_primitives::collateralization_ratio(snap.collateral, snap.debt, price),
+				pusd_primitives::collateralization_ratio(&snap.position(), price),
 				Some(cr) if cr >= FixedU128::one()
 			);
 			if redeemable {
@@ -515,51 +607,61 @@ pub mod pallet {
 		/// again. Priority targets always preempt the cursor inside
 		/// [`VaultInterface::next_redemption_target`].
 		pub(crate) fn run_loop(
-			redeemer: &T::AccountId,
-			collateral_id: &CollateralIdOf<T>,
-			stable_id: &StableIdOf<T>,
-			recipient: &T::AccountId,
-			price: FixedU128,
-			fee_rate: FixedU128,
+			ctx: &WalkContext<'_, T>,
 			step_cap: u32,
-			max_pusd_in: BalanceOf<T>,
-			config: &RedemptionConfigOf<T>,
+			debt_budget: BalanceOf<T>,
+			first_target: Option<(T::AccountId, pusd_primitives::VaultStatus)>,
 			acc: &mut Accumulators<BalanceOf<T>, T::AccountId>,
 		) -> Result<WalkResult<BalanceOf<T>>, DispatchError> {
-			let mut remaining = max_pusd_in;
+			let mut remaining = debt_budget;
 			let mut steps = 0u32;
 			let mut cursor: Option<T::AccountId> = None;
-			while !remaining.is_zero() {
+			let mut next = first_target;
+			loop {
 				if steps >= step_cap {
 					break;
 				}
-				let Some((owner, _)) =
-					T::Vaults::next_redemption_target(collateral_id, stable_id, cursor.as_ref())
-				else {
+				let target = next.take().or_else(|| {
+					T::Vaults::next_redemption_target(
+						ctx.collateral_id,
+						ctx.stable_id,
+						cursor.as_ref(),
+					)
+				});
+				let Some((owner, status)) = target else {
 					break;
 				};
+				// A zero-budget recovery can still settle a fully insured
+				// residual. Ordinary targets cannot make progress without debt.
+				if remaining.is_zero() && !status.is_final_recovery() {
+					break;
+				}
 				let mut outcome = StepOutcome::Stopped;
-				T::Vaults::redeem_step(collateral_id, stable_id, &owner, recipient, |snap| {
-					let (allocation, decision) = Self::execute_step(
-						stable_id, redeemer, &snap, price, fee_rate, remaining, config,
-					)?;
-					outcome = decision;
-					Ok(allocation)
-				})?;
+				T::Vaults::redeem_step(
+					ctx.collateral_id,
+					ctx.stable_id,
+					&owner,
+					ctx.recipient,
+					|snap| {
+						let (allocation, decision) = Self::execute_step(ctx, &snap, remaining)?;
+						outcome = decision;
+						Ok(allocation)
+					},
+				)?;
 				// Barrier stops count too: their target was visited and touched.
 				steps = steps.saturating_add(1);
 				match outcome {
 					StepOutcome::Stopped => break,
 					StepOutcome::Skipped => cursor = Some(owner),
 					StepOutcome::Redeemed(step) => {
-						remaining = remaining.saturating_sub(step.debt.saturating_add(step.fee));
+						remaining = remaining.saturating_sub(step.debt);
 						acc.apply_ordinary(&step);
 					},
 					StepOutcome::Recovery { step, settle_residual } => {
 						// The residual settlement re-enters the vault pallet, so
 						// it must run after the in-flight step committed.
 						let residual = if settle_residual {
-							Self::settle_residual_via_if(collateral_id, stable_id, &owner)?
+							Self::settle_residual_via_if(ctx.collateral_id, ctx.stable_id, &owner)?
 						} else {
 							Zero::zero()
 						};
@@ -572,43 +674,66 @@ pub mod pallet {
 			Ok(WalkResult { remaining, steps })
 		}
 
-		/// Classify, price, and fund one step from inside the vault-side
-		/// `redeem_step` closure. Returns the loop outcome plus the settlement for
-		/// the vault; a `None` settlement persists the touch without redeeming.
-		fn execute_step(
+		/// Classify and price one step without funding or moving anything.
+		/// Shared by execution ([`Self::execute_step`]) and quoting
+		/// ([`Self::quote_redeem`]) so the classify→price ladder — including the
+		/// "zero-sized step with nothing to settle" stop — cannot drift between
+		/// them.
+		fn price_step(
 			stable_id: &StableIdOf<T>,
-			redeemer: &T::AccountId,
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
-			fee_rate: FixedU128,
 			budget: BalanceOf<T>,
 			config: &RedemptionConfigOf<T>,
-		) -> Result<StepDecision<T>, DispatchError> {
+		) -> PricedStep<BalanceOf<T>> {
 			match Self::classify(snap, price) {
-				StepAction::Stop => Ok((None, StepOutcome::Stopped)),
-				StepAction::Skip => Ok((None, StepOutcome::Skipped)),
-				StepAction::Redeem => {
-					let Some(mut step) = Self::price_ordinary(snap, price, fee_rate, budget) else {
-						return Ok((None, StepOutcome::Stopped));
+				StepAction::Stop => PricedStep::Stop,
+				StepAction::Skip => PricedStep::Skip,
+				StepAction::Redeem => match Self::price_ordinary(snap, price, budget) {
+					Some(step) => PricedStep::Redeem(step),
+					None => PricedStep::Stop,
+				},
+				StepAction::Recovery => {
+					let Some(pricing) =
+						Self::price_recovery(stable_id, snap, price, budget, config)
+					else {
+						return PricedStep::Stop;
 					};
-					let need = step.debt.saturating_add(step.fee);
-					let (funded, preservation) = Self::fundable_budget(stable_id, redeemer, need)?;
-					if funded < need {
+					if pricing.debt().is_zero() && !pricing.settles_residual() {
+						return PricedStep::Stop;
+					}
+					PricedStep::Recovery(pricing)
+				},
+			}
+		}
+
+		/// Fund one priced step from inside the vault-side `redeem_step`
+		/// closure. Returns the loop outcome plus the settlement for the vault;
+		/// a `None` settlement persists the touch without redeeming.
+		fn execute_step(
+			ctx: &WalkContext<'_, T>,
+			snap: &SnapshotOf<T>,
+			budget: BalanceOf<T>,
+		) -> Result<StepDecision<T>, DispatchError> {
+			match Self::price_step(ctx.stable_id, snap, ctx.price, budget, ctx.config) {
+				PricedStep::Stop => Ok((None, StepOutcome::Stopped)),
+				PricedStep::Skip => Ok((None, StepOutcome::Skipped)),
+				PricedStep::Redeem(mut step) => {
+					let (funded, preservation) =
+						Self::fundable_budget(ctx.stable_id, ctx.redeemer, step.debt)?;
+					if funded < step.debt {
 						// Reprice once at the preserving limit; pricing keeps
-						// the new need at or below the budget it is given.
-						let Some(repriced) = Self::price_ordinary(snap, price, fee_rate, funded)
-						else {
+						// the new debt at or below the budget it is given.
+						let Some(repriced) = Self::price_ordinary(snap, ctx.price, funded) else {
 							return Ok((None, StepOutcome::Stopped));
 						};
 						step = repriced;
 					}
-					let total_in = step.debt.saturating_add(step.fee);
-					debug_assert!(total_in <= funded);
+					debug_assert!(step.debt <= funded);
 					let debt_payment = Self::fund_redemption(
-						stable_id,
-						redeemer,
+						ctx.stable_id,
+						ctx.redeemer,
 						step.debt,
-						total_in,
 						preservation,
 					)?;
 					let settlement = RedemptionSettlement {
@@ -617,28 +742,26 @@ pub mod pallet {
 					};
 					Ok((Some(settlement), StepOutcome::Redeemed(step)))
 				},
-				StepAction::Recovery => {
-					Self::recovery_decision(stable_id, redeemer, snap, price, budget, config)
-				},
+				PricedStep::Recovery(pricing) => Self::recovery_decision(ctx, snap, pricing),
 			}
 		}
 
 		/// Shared by execution and quoting to keep ordinary pricing identical
 		/// (mirrors [`Self::price_recovery`]).
+		/// `budget` is debt the step may cancel, not stable the redeemer may
+		/// spend: the fee rides on top and is charged once for the whole walk.
 		fn price_ordinary(
 			snap: &SnapshotOf<T>,
 			price: FixedU128,
-			fee_rate: FixedU128,
 			budget: BalanceOf<T>,
 		) -> Option<OrdinaryStep<BalanceOf<T>>> {
-			let debt = snap.debt.min(fees::max_debt_for_budget(budget, fee_rate));
+			let debt = snap.debt.min(budget);
 			if debt.is_zero() {
 				return None;
 			}
 			let collateral_out =
 				recovery_pricing::collateral_for_value(debt, price).min(snap.collateral);
-			let fee = fees::fee_pusd(debt, fee_rate);
-			Some(OrdinaryStep { debt, collateral_out, fee })
+			Some(OrdinaryStep { debt, collateral_out })
 		}
 
 		/// Shared by execution and quoting to keep recovery pricing identical.
@@ -655,7 +778,7 @@ pub mod pallet {
 				return None;
 			}
 			let redistribution_penalty = snap.redistribution_penalty;
-			let cr = pusd_primitives::collateralization_ratio(snap.collateral, snap.debt, price)?;
+			let cr = pusd_primitives::collateralization_ratio(&snap.position(), price)?;
 			if cr >= FixedU128::one() {
 				let bonus = recovery_pricing::recovery_bonus(
 					cr,
@@ -702,25 +825,20 @@ pub mod pallet {
 			Ok((funded, preservation))
 		}
 
+		/// Fund a priced `FinalRecovery` step, repricing once if the redeemer
+		/// cannot cover it in full.
 		fn recovery_decision(
-			stable_id: &StableIdOf<T>,
-			redeemer: &T::AccountId,
+			ctx: &WalkContext<'_, T>,
 			snap: &SnapshotOf<T>,
-			price: FixedU128,
-			budget: BalanceOf<T>,
-			config: &RedemptionConfigOf<T>,
+			mut pricing: RecoveryPricing<BalanceOf<T>>,
 		) -> Result<StepDecision<T>, DispatchError> {
-			let Some(mut pricing) = Self::price_recovery(stable_id, snap, price, budget, config)
-			else {
-				return Ok((None, StepOutcome::Stopped));
-			};
 			let preservation = if pricing.debt().is_zero() {
 				None
 			} else {
 				let (funded, preservation) =
-					Self::fundable_budget(stable_id, redeemer, pricing.debt())?;
+					Self::fundable_budget(ctx.stable_id, ctx.redeemer, pricing.debt())?;
 				if funded < pricing.debt() {
-					pricing = pricing.rebudget(snap.debt, snap.collateral, price, funded);
+					pricing = pricing.rebudget(snap, ctx.price, funded);
 				}
 				debug_assert!(pricing.debt() <= funded);
 				Some(preservation)
@@ -734,7 +852,7 @@ pub mod pallet {
 			// still unlocks the post-step residual settlement.
 			let debt_payment = match preservation {
 				Some(preservation) => {
-					Some(Self::fund_redemption(stable_id, redeemer, debt, debt, preservation)?)
+					Some(Self::fund_redemption(ctx.stable_id, ctx.redeemer, debt, preservation)?)
 				},
 				None => None,
 			};
@@ -750,28 +868,25 @@ pub mod pallet {
 			Ok((settlement, StepOutcome::Recovery { step, settle_residual }))
 		}
 
-		/// Withdraw `total_in` stable units from the redeemer, return the debt
-		/// payment to the vault step, and route the rest as the fee.
+		/// Withdraw one step's debt payment from the redeemer. The fee is not
+		/// taken here: it is a function of the whole walk's redeemed debt, so
+		/// [`Self::charge_fee`] takes it once at the end.
 		fn fund_redemption(
 			stable_id: &StableIdOf<T>,
 			redeemer: &T::AccountId,
 			debt: BalanceOf<T>,
-			total_in: BalanceOf<T>,
 			preservation: Preservation,
 		) -> Result<StableCreditOf<T>, DispatchError> {
-			debug_assert!(debt <= total_in);
 			let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
 				stable_id.clone(),
 				redeemer,
-				total_in,
+				debt,
 				Precision::Exact,
 				preservation,
 				Fortitude::Polite,
 			)?;
-			debug_assert_eq!(credit.peek(), total_in);
-			let (debt_credit, fee_credit) = credit.split(debt);
-			T::FeeHandler::on_unbalanced(fee_credit);
-			Ok(debt_credit)
+			debug_assert_eq!(credit.peek(), debt);
+			Ok(credit)
 		}
 
 		/// The shortfall cover the fund can pay without dusting itself. Cover
@@ -830,70 +945,72 @@ pub mod pallet {
 			Ok(residual)
 		}
 
-		// Post-loop settlement emits both redemption events and updates the
-		// dynamic fee from the full execution context; the inputs are irreducible
-		// without splitting one atomic finalize into several partial passes.
-		#[allow(clippy::too_many_arguments)]
+		/// Post-loop settlement: emits both redemption events and updates the
+		/// dynamic fee from the walk's outcome.
 		fn finalize(
-			redeemer: &T::AccountId,
-			collateral_id: &CollateralIdOf<T>,
-			stable_id: &StableIdOf<T>,
-			recipient: &T::AccountId,
+			ctx: &WalkContext<'_, T>,
+			preamble: &RedemptionPreamble<BalanceOf<T>>,
 			acc: &Accumulators<BalanceOf<T>, T::AccountId>,
 			steps: u32,
-			decayed: FixedU128,
-			branch_debt_before: BalanceOf<T>,
-			config: &RedemptionConfigOf<T>,
-			now: Millis,
-			old_dynamic_fee: FixedU128,
+			fee: BalanceOf<T>,
 		) {
 			if !acc.ordinary_debt.is_zero() {
-				let fraction =
-					FixedU128::checked_from_rational(acc.ordinary_debt, branch_debt_before)
-						.unwrap_or_else(FixedU128::one);
-				let new_fee = fees::increased_dynamic_fee(
-					decayed,
-					fraction,
-					config.dynamic_fee_increase_divisor,
-					config.dynamic_fee_floor,
-					config.dynamic_fee_ceiling,
-				);
+				let new_fee = Self::raised_dynamic_fee(preamble, acc.ordinary_debt);
 				RedemptionStates::<T>::insert(
-					collateral_id,
-					stable_id,
-					RedemptionState { dynamic_fee: new_fee, last_fee_operation: now },
+					ctx.stable_id,
+					RedemptionState { dynamic_fee: new_fee, last_fee_operation: preamble.now },
 				);
-				if new_fee != old_dynamic_fee {
+				if new_fee != preamble.state.dynamic_fee {
 					Self::deposit_event(Event::RedemptionDynamicFeeUpdated {
-						collateral_id: collateral_id.clone(),
-						stable_id: stable_id.clone(),
-						old_dynamic_fee,
+						stable_id: ctx.stable_id.clone(),
+						old_dynamic_fee: preamble.state.dynamic_fee,
 						new_dynamic_fee: new_fee,
 					});
 				}
 				Self::deposit_event(Event::OrdinaryRedemptionExecuted {
-					collateral_id: collateral_id.clone(),
-					stable_id: stable_id.clone(),
-					redeemer: redeemer.clone(),
-					recipient: recipient.clone(),
+					collateral_id: ctx.collateral_id.clone(),
+					stable_id: ctx.stable_id.clone(),
+					redeemer: ctx.redeemer.clone(),
+					recipient: ctx.recipient.clone(),
 					pusd_burned: acc.ordinary_debt,
 					collateral_out: acc.ordinary_collateral,
-					fee_pusd: acc.ordinary_fee,
+					fee_pusd: fee,
 					steps,
 				});
 			}
-			if let Some((vault_owner, regime)) = acc.recovery_owner.clone() {
+			if let Some(recovery) = &acc.recovery {
 				Self::deposit_event(Event::RecoveryRedemptionExecuted {
-					collateral_id: collateral_id.clone(),
-					stable_id: stable_id.clone(),
-					redeemer: redeemer.clone(),
-					recipient: recipient.clone(),
-					vault_owner,
-					pusd_burned: acc.recovery_burned,
-					collateral_out: acc.recovery_collateral,
-					regime,
+					collateral_id: ctx.collateral_id.clone(),
+					stable_id: ctx.stable_id.clone(),
+					redeemer: ctx.redeemer.clone(),
+					recipient: ctx.recipient.clone(),
+					vault_owner: recovery.owner.clone(),
+					pusd_burned: recovery.burned,
+					collateral_out: recovery.collateral_out,
+					regime: recovery.regime,
 				});
 			}
+		}
+
+		/// The dynamic fee after `redeemed` debt is cancelled against the
+		/// preamble's stablecoin-wide debt. Monotonic in `redeemed`, which is
+		/// what lets the walk bound its funding with the rate for the largest
+		/// redemption it could make.
+		fn raised_dynamic_fee(
+			preamble: &RedemptionPreamble<BalanceOf<T>>,
+			redeemed: BalanceOf<T>,
+		) -> FixedU128 {
+			// Redeeming the whole coin's debt (or a stale-zero denominator)
+			// saturates the fraction rather than dividing by zero.
+			let fraction = FixedU128::checked_from_rational(redeemed, preamble.stablecoin_debt)
+				.unwrap_or_else(FixedU128::one);
+			fees::increased_dynamic_fee(
+				preamble.decayed,
+				fraction,
+				preamble.config.dynamic_fee_increase_divisor,
+				preamble.config.dynamic_fee_floor,
+				preamble.config.dynamic_fee_ceiling,
+			)
 		}
 
 		fn decayed_dynamic_fee(
@@ -912,24 +1029,46 @@ pub mod pallet {
 		fn quote_redeem(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
-			max_pusd_in: BalanceOf<T>,
+			max_stable_in: BalanceOf<T>,
 			max_steps: u32,
 		) -> Option<RedemptionQuoteOf<T>> {
-			let RedemptionPreamble { config, price, fee_rate, .. } =
-				Self::redemption_preamble(collateral_id, stable_id, max_pusd_in).ok()?;
+			let preamble =
+				Self::redemption_preamble(collateral_id, stable_id, max_stable_in).ok()?;
 			let step_cap = Self::effective_step_cap(max_steps);
-			let mut quote: RedemptionQuoteOf<T> = RedemptionQuote {
-				stable_in: Zero::zero(),
-				collateral_out: Zero::zero(),
-				fee: Zero::zero(),
-				steps: 0,
-				truncated: false,
-			};
+			let (mut quote, ordinary_debt, recovered) =
+				Self::quote_walk(collateral_id, stable_id, &preamble, max_stable_in, step_cap)?;
+
+			// Same two-phase pricing as execution: the walk cancels debt, then the
+			// fee is charged once at the rate that much redemption raises.
+			quote.fee =
+				fees::fee_pusd(ordinary_debt, Self::charged_fee_rate(&preamble, ordinary_debt));
+			quote.stable_in = quote.stable_in.saturating_add(quote.fee);
+
+			(recovered || !quote.stable_in.is_zero()).then_some(quote)
+		}
+
+		/// The quote's projection walk: price targets until the budget, the step
+		/// cap, or a barrier stops it. Returns the accumulated quote, the
+		/// ordinary (fee-bearing) debt, and whether a recovery head settled;
+		/// `None` when a target cannot be projected.
+		fn quote_walk(
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
+			preamble: &RedemptionPreamble<BalanceOf<T>>,
+			max_stable_in: BalanceOf<T>,
+			step_cap: u32,
+		) -> Option<(RedemptionQuoteOf<T>, BalanceOf<T>, bool)> {
+			// Debt cancelled by ordinary steps, which is what the fee prices; a
+			// recovery head settles fee-free.
+			let mut ordinary_debt: BalanceOf<T> = Zero::zero();
+			// A fully-covered recovery head is a real quote at zero `stable_in`.
+			let mut recovered = false;
+			let mut quote = RedemptionQuoteOf::<T>::default();
 			let mut targets = T::Vaults::redemption_quote_targets(collateral_id, stable_id);
 			let mut carried: Option<(T::AccountId, SnapshotOf<T>)> = None;
 
 			loop {
-				let remaining = max_pusd_in.saturating_sub(quote.stable_in);
+				let remaining = max_stable_in.saturating_sub(quote.stable_in);
 				if remaining.is_zero() {
 					break;
 				}
@@ -955,54 +1094,61 @@ pub mod pallet {
 				};
 				quote.steps = quote.steps.saturating_add(1);
 
-				match Self::classify(&snap, price) {
-					StepAction::Stop => break,
-					StepAction::Skip => {},
-					StepAction::Recovery => {
-						let Some(pricing) =
-							Self::price_recovery(stable_id, &snap, price, remaining, &config)
-						else {
-							break;
-						};
-						if pricing.debt().is_zero() && !pricing.settles_residual() {
-							break;
-						}
+				match Self::price_step(
+					stable_id,
+					&snap,
+					preamble.price,
+					remaining,
+					&preamble.config,
+				) {
+					PricedStep::Stop => break,
+					PricedStep::Skip => {},
+					PricedStep::Recovery(pricing) => {
 						quote.stable_in = quote.stable_in.saturating_add(pricing.debt());
 						quote.collateral_out =
 							quote.collateral_out.saturating_add(pricing.collateral_out());
 						// Quoted even at zero `stable_in`: a fully-covered head
 						// still settles (the Insurance Fund pays the residual),
 						// so execution succeeds costing and paying the redeemer
-						// nothing.
-						return Some(quote);
+						// nothing. A recovery head always ends the walk.
+						recovered = true;
+						break;
 					},
-					StepAction::Redeem => {
-						let Some(step) = Self::price_ordinary(&snap, price, fee_rate, remaining)
-						else {
-							break;
-						};
-						let spent = step.debt.saturating_add(step.fee);
-						quote.stable_in = quote.stable_in.saturating_add(spent);
-						quote.collateral_out =
-							quote.collateral_out.saturating_add(step.collateral_out);
-						quote.fee = quote.fee.saturating_add(step.fee);
-
-						let debt_left = snap.debt.saturating_sub(step.debt);
-						if !debt_left.is_zero() {
-							carried = Some((
-								owner,
-								RedemptionStepSnapshot {
-									debt: debt_left,
-									collateral: snap.collateral.saturating_sub(step.collateral_out),
-									..snap
-								},
-							));
-						}
+					PricedStep::Redeem(step) => {
+						ordinary_debt = ordinary_debt.saturating_add(step.debt);
+						carried = Self::quote_ordinary_step(&mut quote, owner, &snap, &step);
 					},
 				}
 			}
 
-			(!quote.stable_in.is_zero()).then_some(quote)
+			Some((quote, ordinary_debt, recovered))
+		}
+
+		/// Fold one priced ordinary step into the quote. Returns the carried
+		/// revisit target when the step leaves vault debt behind: a partial fill
+		/// must be priced again against the reduced snapshot before the walk
+		/// moves on.
+		fn quote_ordinary_step(
+			quote: &mut RedemptionQuoteOf<T>,
+			owner: T::AccountId,
+			snap: &SnapshotOf<T>,
+			step: &OrdinaryStep<BalanceOf<T>>,
+		) -> Option<(T::AccountId, SnapshotOf<T>)> {
+			quote.stable_in = quote.stable_in.saturating_add(step.debt);
+			quote.collateral_out = quote.collateral_out.saturating_add(step.collateral_out);
+			let debt_left = snap.debt.saturating_sub(step.debt);
+			if debt_left.is_zero() {
+				return None;
+			}
+			Some((
+				owner,
+				RedemptionStepSnapshot {
+					status: snap.status,
+					debt: debt_left,
+					collateral: snap.collateral.saturating_sub(step.collateral_out),
+					redistribution_penalty: snap.redistribution_penalty,
+				},
+			))
 		}
 	}
 
@@ -1013,8 +1159,7 @@ pub mod pallet {
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 		) -> Result<(RedemptionConfigOf<T>, FixedU128), DispatchError> {
-			let config = RedemptionConfigs::<T>::get(collateral_id, stable_id)
-				.ok_or(Error::<T>::InvalidBranch)?;
+			let config = RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::InvalidBranch)?;
 			let price = T::Oracle::provide_price(collateral_id)
 				.map_err(|_| Error::<T>::OracleUnavailable)?;
 			ensure!(!price.is_zero(), Error::<T>::OracleUnavailable);
@@ -1152,23 +1297,38 @@ pub mod pallet {
 		}
 	}
 
+	/// Config and fee state are per-stablecoin but markets are registered per
+	/// `(collateral, stable)` pair, so both writes are refcounted: the first
+	/// market issuing a coin seeds them, the last one to leave clears them, and
+	/// everything in between leaves a live fee state alone.
 	impl<T: Config> pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
-		fn on_registered(
-			collateral_id: &CollateralIdOf<T>,
-			stable_id: &StableIdOf<T>,
-		) -> DispatchResult {
-			let config = T::DefaultRedemptionConfig::get();
-			ensure!(config.is_valid(), Error::<T>::InvalidRedemptionConfig);
-			RedemptionConfigs::<T>::insert(collateral_id, stable_id, config);
-			Ok(())
+		fn on_registered(_: &CollateralIdOf<T>, stable_id: &StableIdOf<T>) -> DispatchResult {
+			MarketCounts::<T>::try_mutate(stable_id, |count| {
+				// One increment per registered market, so a `u32` cannot wrap.
+				*count = count.saturating_add(1);
+				if *count > 1 {
+					return Ok(());
+				}
+				let config = T::DefaultRedemptionConfig::get();
+				ensure!(config.is_valid(), Error::<T>::InvalidRedemptionConfig);
+				RedemptionConfigs::<T>::insert(stable_id, config);
+				Ok(())
+			})
 		}
 
-		fn on_deregistered(
-			collateral_id: &CollateralIdOf<T>,
-			stable_id: &StableIdOf<T>,
-		) -> DispatchResult {
-			RedemptionConfigs::<T>::remove(collateral_id, stable_id);
-			RedemptionStates::<T>::remove(collateral_id, stable_id);
+		fn on_deregistered(_: &CollateralIdOf<T>, stable_id: &StableIdOf<T>) -> DispatchResult {
+			MarketCounts::<T>::mutate_exists(stable_id, |maybe| {
+				// Vaults only deregisters markets it registered, so the count
+				// cannot already be zero here.
+				let count = maybe.get_or_insert_default();
+				*count = count.saturating_sub(1);
+				if !count.is_zero() {
+					return;
+				}
+				maybe.take();
+				RedemptionConfigs::<T>::remove(stable_id);
+				RedemptionStates::<T>::remove(stable_id);
+			});
 			Ok(())
 		}
 	}

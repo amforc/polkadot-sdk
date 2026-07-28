@@ -38,14 +38,13 @@ mod benchmarks {
 
 	#[benchmark]
 	fn set_redemption_config() -> Result<(), BenchmarkError> {
-		let (collateral_id, stable_id, _, _) = T::BenchmarkHelper::setup_redeemable_branch(1);
+		let (_, stable_id, _, _) = T::BenchmarkHelper::setup_redeemable_branch(1);
 		let config = T::DefaultRedemptionConfig::get();
-		let origin =
-			T::UpdateOrigin::try_successful_origin(&(collateral_id.clone(), stable_id.clone()))
-				.map_err(|_| BenchmarkError::Weightless)?;
+		let origin = T::UpdateOrigin::try_successful_origin(&stable_id)
+			.map_err(|_| BenchmarkError::Weightless)?;
 
 		#[extrinsic_call]
-		_(origin as T::RuntimeOrigin, collateral_id, stable_id, config);
+		_(origin as T::RuntimeOrigin, stable_id, config);
 
 		Ok(())
 	}

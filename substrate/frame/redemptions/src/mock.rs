@@ -166,7 +166,7 @@ pub fn set_price(collateral: AssetId, price: FixedU128) {
 
 parameter_types! {
 	pub const MarketDepositReason: RuntimeHoldReason =
-		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::MarketCreationDeposit);
+		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
 	pub const MarketDepositBase: Balance = 1_000;
 }
 
@@ -226,7 +226,7 @@ parameter_types! {
 			min_minimum_debt: 100,
 			min_minimum_collateral: 1,
 			max_borrow_rate: FixedU128::from_rational(400u128, 100u128),
-			max_branch_line: 1_000_000_000,
+			max_debt_ceiling: 1_000_000_000_000_000,
 			max_ceiling_gap: 1_000_000_000,
 			min_ceiling_ttl: 24 * 3_600 * 1_000,
 		};
@@ -324,12 +324,10 @@ parameter_types! {
 	pub const FeeDestAccount: AccountId = FEE_DEST;
 }
 
-/// Root (the governance override) or the market's stored full admin, the same
-/// composition a production runtime would use.
-pub type RedemptionsUpdateOrigin = EitherOf<
-	AsEnsureOriginWithArg<frame_system::EnsureRoot<AccountId>>,
-	pallet_vaults::EnsureBranchFullAdmin<Test>,
->;
+/// The redemption config is per-stablecoin, so its authority is the coin's, not
+/// any one market's: the same [`EnsureAssetOwner`] vaults takes as
+/// `CreateOrigin`, which already admits Root as the governance override.
+pub type RedemptionsUpdateOrigin = EnsureAssetOwner;
 
 parameter_types! {
 	pub static DefaultRedemptionConfig: RedemptionConfig<Balance> = RedemptionConfig {
@@ -457,7 +455,7 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		minimum_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 		initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
 		safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
-		debt_ceiling: 100_000_000,
+		debt_ceiling: 1_000_000_000_000,
 		minimum_debt: 200,
 		minimum_collateral: 1,
 		minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
@@ -476,7 +474,7 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 pub fn usdx_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	pallet_vaults::BranchConfig {
 		// The largest ceiling the guard envelope admits: 1_000 coins.
-		debt_ceiling: TestBranchConfigGuard::get().max_branch_line,
+		debt_ceiling: TestBranchConfigGuard::get().max_debt_ceiling,
 		minimum_debt: 200 * USDX_UNIT,
 		..default_branch_config()
 	}
@@ -565,16 +563,22 @@ pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
 	<Assets as FungiblesMutate<AccountId>>::mint_into(stable, &who, amount).expect("mint stable");
 }
 
+/// Fund `who` with a `pallet-assets` collateral. Native `DOT` is already funded
+/// in genesis; the others need minting before a vault can be opened.
+pub fn mint_collateral(collateral: AssetIdForAssets, who: AccountId, amount: Balance) {
+	<Assets as FungiblesMutate<AccountId>>::mint_into(collateral, &who, amount)
+		.expect("mint collateral");
+}
+
 /// Advance `pallet_timestamp` by `ms` milliseconds without touching block #.
 pub fn advance_time(ms: Moment) {
 	Timestamp::set_timestamp(Timestamp::get() + ms);
 }
 
-/// Overwrite the market's fee state, anchored at current time so the next
+/// Overwrite the stablecoin's fee state, anchored at current time so the next
 /// redemption observes exactly `rate`.
-pub fn set_dynamic_fee(collateral: AssetId, stable: StableId, rate: FixedU128) {
+pub fn set_dynamic_fee(stable: StableId, rate: FixedU128) {
 	pallet_redemptions::RedemptionStates::<Test>::insert(
-		collateral,
 		stable,
 		pallet_redemptions::RedemptionState {
 			dynamic_fee: rate,
@@ -604,7 +608,14 @@ pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Bala
 		.unwrap_or_default()
 }
 
-/// Fully accrued branch debt: the denominator the dynamic-fee accelerator uses.
-pub fn branch_debt(collateral: AssetId, stable: StableId) -> Balance {
-	pallet_vaults::Pallet::<Test>::branch_debt(&collateral, &stable)
+/// Stablecoin-wide debt: the denominator the dynamic-fee accelerator uses.
+pub fn stablecoin_debt(stable: StableId) -> Balance {
+	pallet_vaults::Pallet::<Test>::stablecoin_debt(&stable)
+}
+
+/// One market's share of that denominator.
+pub fn branch_outstanding(collateral: AssetId, stable: StableId) -> Balance {
+	pallet_vaults::Branches::<Test>::get(collateral, stable)
+		.map(|b| b.state.debt.outstanding())
+		.unwrap_or_default()
 }

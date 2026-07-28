@@ -61,16 +61,30 @@ pub fn fee_pusd<Balance: FixedPointOperand>(
 	mul_ratio_or(a, fee_rate.into_inner(), FixedU128::DIV, Rounding::Up, Balance::max_value)
 }
 
+/// Greatest debt at or below `max_debt` whose debt plus monotonic `fee_for`
+/// fits `budget`.
 pub fn max_debt_for_budget<Balance: FixedPointOperand>(
 	budget: Balance,
-	fee_rate: FixedU128,
+	max_debt: Balance,
+	fee_for: impl Fn(Balance) -> Balance,
 ) -> Balance {
-	if budget.is_zero() {
+	if budget.is_zero() || max_debt.is_zero() {
 		return Balance::zero();
 	}
-	let denom = FixedU128::one().saturating_add(fee_rate);
-	let b: u128 = budget.unique_saturated_into();
-	mul_ratio_or(b, FixedU128::DIV, denom.into_inner(), Rounding::Down, Balance::zero)
+	let budget: u128 = budget.unique_saturated_into();
+	let mut low = 0u128;
+	let mut high = budget.min(max_debt.unique_saturated_into());
+	while low < high {
+		let mid = low.saturating_add(high.saturating_sub(low) / 2).saturating_add(1);
+		let debt = Balance::try_from(mid).ok().defensive_unwrap_or_else(Balance::zero);
+		let fee: u128 = fee_for(debt).unique_saturated_into();
+		if mid.saturating_add(fee) <= budget {
+			low = mid;
+		} else {
+			high = mid.saturating_sub(1);
+		}
+	}
+	Balance::try_from(low).ok().defensive_unwrap_or_else(Balance::zero)
 }
 
 /// Partial fills scale the user's slippage floor to the amount actually spent.
@@ -177,9 +191,14 @@ mod tests {
 
 	#[test]
 	fn max_debt_for_budget_accounts_for_fee() {
-		assert_eq!(max_debt_for_budget::<u128>(1000, FixedU128::zero()), 1000);
-		assert_eq!(max_debt_for_budget::<u128>(1000, FixedU128::one()), 500);
-		assert_eq!(max_debt_for_budget::<u128>(1000, FixedU128::from_rational(5, 1000)), 995);
+		let at = |rate| move |debt| fee_pusd(debt, rate);
+		assert_eq!(max_debt_for_budget::<u128>(1000, 1000, at(FixedU128::zero())), 1000);
+		assert_eq!(max_debt_for_budget::<u128>(1000, 1000, at(FixedU128::one())), 500);
+		assert_eq!(
+			max_debt_for_budget::<u128>(1000, 1000, at(FixedU128::from_rational(5, 1000))),
+			995
+		);
+		assert_eq!(max_debt_for_budget::<u128>(1000, 400, at(FixedU128::zero())), 400);
 	}
 
 	#[test]
