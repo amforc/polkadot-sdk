@@ -43,6 +43,17 @@ fn roles_are_reference_counted_across_shared_markets() {
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, EUSD));
 		assert_eq!(role_of(DOT), None);
 		assert_eq!(role_of(AssetId::WithId(EUSD)), None);
+		assert_eq!(
+			LifecycleLog::get(),
+			alloc::vec![
+				(DOT, PUSD, true, 1),
+				(DOT, EUSD, true, 1),
+				(TOKEN_X, PUSD, true, 2),
+				(DOT, PUSD, false, 1),
+				(TOKEN_X, PUSD, false, 0),
+				(DOT, EUSD, false, 0),
+			]
+		);
 	});
 }
 
