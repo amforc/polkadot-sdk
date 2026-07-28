@@ -567,6 +567,7 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 		amount: BalanceOf<T>,
 	) -> Result<crate::types::VaultDebt<BalanceOf<T>>, DispatchError> {
+		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		let payment = self.redeem(amount);
 		let total_after = self.vault.debt.total();
 		ensure!(
