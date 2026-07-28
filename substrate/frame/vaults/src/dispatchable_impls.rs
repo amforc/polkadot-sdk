@@ -68,7 +68,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
-		ensure!(!amount.is_zero(), Error::<T>::ZeroDepositAmount);
+		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
 		let mut op = op.touch(&owner)?;
 		op.add_collateral(amount)?;
@@ -101,7 +101,7 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 		recipient: T::AccountId,
 	) -> DispatchResult {
-		ensure!(!amount.is_zero(), Error::<T>::ZeroWithdrawAmount);
+		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
 		let price = op.price()?;
 		let mut op = op.touch(&owner)?;
@@ -140,7 +140,7 @@ impl<T: Config> Pallet<T> {
 		recipient: T::AccountId,
 		hint: Position<T::AccountId>,
 	) -> DispatchResult {
-		ensure!(!amount.is_zero(), Error::<T>::ZeroBorrowAmount);
+		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
 		let price = op.price()?;
 		let mut op = op.touch(&owner)?;
@@ -166,7 +166,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
-		ensure!(!amount.is_zero(), Error::<T>::ZeroRepayAmount);
+		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let op = BranchOp::<T>::load_unfrozen(collateral_id, stable_id)?;
 		let mut op = op.touch(&owner)?;
 		ensure!(!op.status().is_final_recovery(), Error::<T>::VaultInFinalRecovery);
