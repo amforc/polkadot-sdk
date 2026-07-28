@@ -91,15 +91,27 @@ impl VaultStatus {
 	}
 }
 
+/// A debt amount paired with the collateral amount tied to it.
+///
+/// The named fields keep two same-typed balances from swapping at call sites:
+/// the CR and TCR gates read them as one position, the liquidation writers as
+/// the amounts one liquidation redistributes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Position<Balance> {
+	/// Debt side of the pair.
+	pub debt: Balance,
+	/// Collateral side of the pair.
+	pub collateral: Balance,
+}
+
 /// `floor(price * collateral / debt)` as a collateralization ratio. `None` when
 /// `debt == 0` (CR undefined) or either step overflows.
 pub fn collateralization_ratio<Balance: FixedPointOperand>(
-	collateral: Balance,
-	debt: Balance,
+	position: &Position<Balance>,
 	price: FixedU128,
 ) -> Option<FixedU128> {
-	let value = price.checked_mul_int(collateral)?;
-	FixedU128::checked_from_rational(value, debt)
+	let value = price.checked_mul_int(position.collateral)?;
+	FixedU128::checked_from_rational(value, position.debt)
 }
 
 /// `floor(value * numerator / denominator)` at `Balance` precision — the

@@ -49,7 +49,8 @@ pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
 	BranchConfig, BranchConfigUpdate, BranchDebt, BranchMode, BranchStakes, BranchState,
-	FrozenReason, FrozenState, RedistributionSnapshot, Vault, VaultDebt, VaultListId, VaultStatus,
+	FrozenReason, FrozenState, RedistributionSnapshot, StablecoinDebtState, Vault, VaultDebt,
+	VaultListId, VaultStatus,
 };
 pub use weights::WeightInfo;
 
@@ -237,7 +238,7 @@ pub mod pallet {
 		/// Collateral held for an open vault.
 		VaultCollateral,
 		/// Refundable deposit held while a market exists.
-		MarketCreationDeposit,
+		BranchCreationDeposit,
 	}
 
 	/// Authoritative vault state keyed by collateral, stable asset, and owner.
@@ -286,6 +287,24 @@ pub mod pallet {
 		Twox64Concat,
 		CollateralIdOf<T>,
 		crate::types::CollateralRisk<BalanceOf<T>>,
+		ValueQuery,
+	>;
+
+	/// Fully accrued debt state across every market issuing one stable asset.
+	///
+	/// Redemptions reads it as the denominator of the redeemed fraction, which
+	/// prices the stablecoin's dynamic fee across all of its collateral markets at once. A zero
+	/// record is not stored.
+	///
+	/// The record combines realized debt with the aggregate projection of
+	/// unminted interest, keeping the fully accrued denominator available in
+	/// O(1) without walking the uncapped market registry.
+	#[pallet::storage]
+	pub type StablecoinDebt<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		StableIdOf<T>,
+		crate::types::StablecoinDebtState<BalanceOf<T>>,
 		ValueQuery,
 	>;
 
@@ -555,8 +574,10 @@ pub mod pallet {
 		InvalidVaultStatus,
 		/// This operation is not allowed during final recovery.
 		VaultInFinalRecovery,
-		/// The collateral asset or market does not exist.
+		/// The collateral asset does not exist.
 		UnknownCollateral,
+		/// No branch is registered for this collateral and stable asset pair.
+		BranchNotFound,
 		/// The stable asset does not exist.
 		UnknownStable,
 		/// An asset would be used as both collateral and stable.
@@ -575,8 +596,8 @@ pub mod pallet {
 		GlobalDebtCeilingExceeded,
 		/// The caller does not have the required market role.
 		NotBranchAdmin,
-		/// The market still has vaults, collateral, or debt.
-		MarketNotEmpty,
+		/// The branch still has vaults, collateral, or debt.
+		BranchNotEmpty,
 		/// The market configuration is outside the allowed limits.
 		ConfigOutsideEnvelope,
 		/// The annual interest rate is outside the market limits.
@@ -666,9 +687,11 @@ pub mod pallet {
 			let now = T::TimeProvider::now();
 			let price = T::Oracle::provide_price(&collateral_id).ok()?;
 			let pending = Self::pending_touch_for(&vault, &state, now);
-			let total_coll = vault.collateral.saturating_add(pending.collateral);
-			let total_debt = pending.total_debt(&vault.debt);
-			collateralization_ratio(total_coll, total_debt, price)
+			let position = crate::types::Position {
+				debt: pending.total_debt(&vault.debt),
+				collateral: vault.collateral.saturating_add(pending.collateral),
+			};
+			collateralization_ratio(&position, price)
 		}
 
 		/// Returns the current vault status.

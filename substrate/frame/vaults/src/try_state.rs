@@ -6,9 +6,9 @@
 use crate::{
 	pallet::{
 		AssetRoles, BalanceOf, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
-		HoldReason, Millis, Pallet, StableIdOf, Vaults,
+		HoldReason, Millis, Pallet, StableIdOf, StablecoinDebt, Vaults,
 	},
-	types::{AssetRole, AssetRoleUsage, VaultListId},
+	types::{AssetRole, AssetRoleUsage, PendingInterest, VaultListId},
 };
 use alloc::collections::BTreeMap;
 use frame::{
@@ -30,6 +30,10 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	// registry and compared against `AssetRoles`/`CollateralRisks` below.
 	let mut roles: BTreeMap<CollateralIdOf<T>, AssetRoleUsage> = BTreeMap::new();
 	let mut outstanding: BTreeMap<CollateralIdOf<T>, BalanceOf<T>> = BTreeMap::new();
+	let mut stablecoin_debt: BTreeMap<
+		StableIdOf<T>,
+		(BalanceOf<T>, BalanceOf<T>, PendingInterest<BalanceOf<T>>),
+	> = BTreeMap::new();
 	for (collateral_id, stable_id, branch) in Branches::<T>::iter() {
 		claim_role::<T>(&mut roles, collateral_id.clone(), AssetRole::Collateral)?;
 		claim_role::<T>(
@@ -37,10 +41,34 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			T::StableToCollateralId::convert(stable_id.clone()),
 			AssetRole::Stable,
 		)?;
+		let branch_outstanding = branch
+			.state
+			.debt
+			.outstanding()
+			.checked_add(&branch.state.ownerless_debt)
+			.ok_or("branch outstanding debt overflow")?;
 		let debt_entry = outstanding.entry(collateral_id.clone()).or_default();
 		*debt_entry = debt_entry
-			.checked_add(&branch.state.debt.outstanding())
+			.checked_add(&branch_outstanding)
 			.ok_or("collateral outstanding-debt sum overflow")?;
+		let stable_entry = stablecoin_debt.entry(stable_id.clone()).or_default();
+		stable_entry.0 = stable_entry
+			.0
+			.checked_add(&branch_outstanding)
+			.ok_or("stablecoin outstanding-debt sum overflow")?;
+		if !branch.state.is_frozen() {
+			stable_entry.1 = stable_entry
+				.1
+				.checked_add(&branch.state.debt.weighted_principal_sum)
+				.ok_or("stablecoin active weighted-principal sum overflow")?;
+		}
+		stable_entry.2 = stable_entry
+			.2
+			.checked_add(
+				&Pallet::<T>::branch_pending_interest(&branch.state, now)
+					.map_err(|_| "branch pending-interest numerator overflow")?,
+			)
+			.ok_or("stablecoin pending-interest numerator overflow")?;
 		let (collateral_id, stable_id) = (&collateral_id, &stable_id);
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 		let recovery_list = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
@@ -67,6 +95,49 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	check_owner_holds::<T>(owner_collateral)?;
 	check_asset_roles::<T>(roles)?;
 	check_collateral_risks::<T>(outstanding)?;
+	check_stablecoin_debt::<T>(stablecoin_debt, now)?;
+	Ok(())
+}
+
+/// `StablecoinDebt` must equal its full recomputation from `Branches`.
+fn check_stablecoin_debt<T: Config>(
+	mut expected: BTreeMap<
+		StableIdOf<T>,
+		(BalanceOf<T>, BalanceOf<T>, PendingInterest<BalanceOf<T>>),
+	>,
+	now: Millis,
+) -> Result<(), TryRuntimeError> {
+	for (stable_id, stored) in StablecoinDebt::<T>::iter() {
+		if stored.is_empty() {
+			return Err("empty StablecoinDebt record stored".into());
+		}
+		if stored.last_update > now {
+			return Err("StablecoinDebt last_update is ahead of now".into());
+		}
+		let elapsed = now.saturating_sub(stored.last_update);
+		let projected = stored
+			.pending_interest
+			.checked_add(
+				&PendingInterest::from_weight_millis(stored.active_weighted_principal_sum, elapsed)
+					.ok_or("StablecoinDebt projection overflow")?,
+			)
+			.ok_or("StablecoinDebt projection overflow")?;
+		let (outstanding, active, pending) = expected.remove(&stable_id).unwrap_or_default();
+		if stored.outstanding != outstanding {
+			return Err("StablecoinDebt outstanding diverges from Branches".into());
+		}
+		if stored.active_weighted_principal_sum != active {
+			return Err("StablecoinDebt active weight diverges from Branches".into());
+		}
+		if projected != pending {
+			return Err("StablecoinDebt numerator diverges from Branches".into());
+		}
+	}
+	if expected.into_values().any(|(outstanding, active, pending)| {
+		!outstanding.is_zero() || !active.is_zero() || !pending.is_zero()
+	}) {
+		return Err("stablecoin with debt lacks a StablecoinDebt record".into());
+	}
 	Ok(())
 }
 
