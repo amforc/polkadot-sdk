@@ -2,7 +2,7 @@
 //! gates, interest/fee accounting, mode rules, and the `on_idle` refresh walk.
 
 use crate::{
-	context::BranchOp,
+	context::VaultOp,
 	math,
 	pallet::{
 		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
@@ -55,7 +55,7 @@ enum WalkExit<K> {
 }
 
 /// The part of one branch that contributes to derived debt aggregates.
-struct BranchContribution<Balance> {
+pub(crate) struct BranchContribution<Balance> {
 	outstanding: Balance,
 	pending_interest: PendingInterest<Balance>,
 	active_weight: Balance,
@@ -86,23 +86,19 @@ impl<T: Config> Pallet<T> {
 			.ok_or_else(|| Error::<T>::BranchNotFound.into())
 	}
 
-	/// Replace a stored branch and update the debt aggregates derived from its
-	/// old and new runtime state.
+	/// Store an updated branch and update debt aggregates from its load-time contribution.
+	///
+	/// The caller owns both values from one load, avoiding a second read of the branch record.
 	pub(crate) fn commit_branch(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		now: Millis,
+		before: BranchContribution<BalanceOf<T>>,
 		branch: BranchOf<T>,
 	) -> DispatchResult {
-		Branches::<T>::try_mutate_exists(collateral_id, stable_id, |stored| {
-			let before = Self::branch_contribution(
-				&stored.as_ref().ok_or(Error::<T>::BranchNotFound)?.state,
-				now,
-			)?;
-			Self::update_branch_aggregates(collateral_id, stable_id, now, &before, &branch.state)?;
-			*stored = Some(branch);
-			Ok(())
-		})
+		Self::update_branch_aggregates(collateral_id, stable_id, now, &before, &branch.state)?;
+		Branches::<T>::insert(collateral_id, stable_id, branch);
+		Ok(())
 	}
 
 	/// Mutate one branch's runtime state through its FRAME storage entry while
@@ -181,7 +177,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Derive the complete aggregate contribution of one branch at `now`.
-	fn branch_contribution(
+	pub(crate) fn branch_contribution(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
 	) -> Result<BranchContribution<BalanceOf<T>>, DispatchError> {
@@ -903,7 +899,7 @@ impl<T: Config> Pallet<T> {
 		owner: &T::AccountId,
 	) {
 		let _ = with_storage_layer(|| {
-			BranchOp::<T>::refresh_vault(collateral_id.clone(), stable_id.clone(), owner)
+			VaultOp::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
 		});
 	}
 
