@@ -287,7 +287,7 @@ impl EnsureOriginWithArg<RuntimeOrigin, StableId> for EnsureAssetOwner {
 
 parameter_types! {
 	pub const MarketDepositReason: RuntimeHoldReason =
-		RuntimeHoldReason::Vaults(HoldReason::MarketCreationDeposit);
+		RuntimeHoldReason::Vaults(HoldReason::BranchCreationDeposit);
 	pub const MarketDepositBase: Balance = 1_000;
 }
 
@@ -310,7 +310,7 @@ parameter_types! {
 		min_minimum_debt: 100,
 		min_minimum_collateral: 1,
 		max_borrow_rate: FixedU128::from_rational(400u128, 100u128),
-		max_branch_line: 1_000_000_000_000_000,
+		max_debt_ceiling: 1_000_000_000_000_000,
 		max_ceiling_gap: 1_000_000_000,
 		min_ceiling_ttl: 24 * 3_600 * 1_000,
 	};
@@ -472,7 +472,7 @@ pub fn default_branch_config() -> BranchConfig<Balance> {
 		minimum_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 		initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
 		safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
-		debt_ceiling: 100_000_000,
+		debt_ceiling: 1_000_000_000_000,
 		minimum_debt: 200,
 		minimum_collateral: 1,
 		minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
@@ -740,11 +740,11 @@ pub fn mutate_branch_state(
 	stable: StableId,
 	mutate: impl FnOnce(&mut BranchState<AccountId, Balance>),
 ) {
-	let mut branch = Vaults::branch_of(&collateral, &stable).expect("branch registered");
-	let outstanding_before = branch.state.debt.outstanding();
-	mutate(&mut branch.state);
-	Vaults::commit_branch(&collateral, &stable, outstanding_before, branch)
-		.expect("branch committed");
+	Vaults::try_mutate_branch_state(&collateral, &stable, |_, state, _| {
+		mutate(state);
+		Ok(())
+	})
+	.expect("branch committed");
 }
 
 /// Returns the current market mode, if it can be calculated.
@@ -785,7 +785,7 @@ pub fn total_stable(stable: StableId) -> Balance {
 pub fn creation_deposit_held(who: AccountId) -> Balance {
 	use frame::traits::fungible::InspectHold;
 	<Balances as InspectHold<AccountId>>::balance_on_hold(
-		&RuntimeHoldReason::Vaults(HoldReason::MarketCreationDeposit),
+		&RuntimeHoldReason::Vaults(HoldReason::BranchCreationDeposit),
 		&who,
 	)
 }

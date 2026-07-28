@@ -1,7 +1,7 @@
 //! Implementations for pallet extrinsics.
 
 use crate::{
-	context::{BranchOp, VaultOp},
+	context::{BranchOp, CloseOutcome, VaultOp},
 	pallet::{
 		AssetRoles, BalanceOf, Branches, CollateralIdOf, CollateralRisks, Config, Error, Event,
 		HoldReason, Pallet, StableIdOf, Vaults,
@@ -255,7 +255,7 @@ impl<T: Config> Pallet<T> {
 		recipient: &T::AccountId,
 		price: FixedU128,
 	) -> DispatchResult {
-		let (collateral, branch_empties, orphan_debt) = op.detach_for_close()?;
+		let CloseOutcome { collateral, branch_empties, orphan_debt } = op.detach_for_close()?;
 
 		if !collateral.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
@@ -452,14 +452,16 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 	) -> DispatchResult {
 		let branch = Self::branch_of(&collateral_id, &stable_id)?;
-		ensure!(branch.state.is_removable(), Error::<T>::MarketNotEmpty);
+		ensure!(branch.state.is_removable(), Error::<T>::BranchNotEmpty);
 		ensure!(
 			Vaults::<T>::iter_prefix((&collateral_id, &stable_id)).next().is_none(),
-			Error::<T>::MarketNotEmpty
+			Error::<T>::BranchNotEmpty
 		);
 		T::OnBranchLifecycle::on_deregistered(&collateral_id, &stable_id)?;
 		let removed_outstanding = Branches::<T>::take(&collateral_id, &stable_id)
-			.map(|removed| removed.state.debt.outstanding())
+			.map(|removed| {
+				removed.state.debt.outstanding().saturating_add(removed.state.ownerless_debt)
+			})
 			.unwrap_or_default();
 		defensive_assert!(
 			removed_outstanding.is_zero(),
@@ -484,7 +486,7 @@ impl<T: Config> Pallet<T> {
 		admins: BranchAdmins<T::AccountId>,
 	) -> DispatchResult {
 		Branches::<T>::try_mutate_exists(&collateral_id, &stable_id, |maybe| -> DispatchResult {
-			let branch = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
+			let branch = maybe.as_mut().ok_or(Error::<T>::BranchNotFound)?;
 			branch.admins = admins.clone();
 			Ok(())
 		})?;
@@ -510,7 +512,14 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let guard = T::BranchConfigGuard::get();
 		Branches::<T>::try_mutate_exists(&collateral_id, &stable_id, |maybe| -> DispatchResult {
-			let branch = maybe.as_mut().ok_or(Error::<T>::UnknownCollateral)?;
+			let branch = maybe.as_mut().ok_or(Error::<T>::BranchNotFound)?;
+			if let BranchConfigUpdate::RedistributionPenalty(penalty) = &update {
+				T::OnBranchLifecycle::validate_redistribution_penalty(
+					&collateral_id,
+					&stable_id,
+					*penalty,
+				)?;
+			}
 			let config = &mut branch.config;
 			if matches!(level, AdminLevel::Emergency) {
 				ensure!(update.is_defensive(config), Error::<T>::DefensiveActionNotDefensive);
@@ -570,30 +579,31 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		target: Option<FrozenReason>,
 	) -> DispatchResult {
-		let now = T::TimeProvider::now();
-		let mut branch = Self::branch_of(collateral_id, stable_id)?;
-		let outstanding_before = branch.state.debt.outstanding();
-		let old_mode = Self::mode_of(&branch, collateral_id, now).unwrap_or(BranchMode::Normal);
-		let minted = match (branch.state.frozen, target) {
-			(None, Some(_)) => {
-				// Apply interest up to the start of the freeze.
-				Self::accrue_aggregate_interest(&mut branch.state, now)
-			},
-			(Some(frozen), None) => {
-				// Remove the frozen period from market interest time.
-				let frozen_window = now.saturating_sub(frozen.entered_at);
-				branch.state.interest_epoch =
-					branch.state.interest_epoch.saturating_add(frozen_window);
-				Zero::zero()
-			},
-			(None, None) | (Some(_), Some(_)) => {
-				debug_assert!(false, "callers gate on the current frozen state");
-				Zero::zero()
-			},
-		};
-		branch.state.frozen = target.map(|reason| FrozenState { reason, entered_at: now });
-		let new_mode = Self::mode_of(&branch, collateral_id, now).unwrap_or(BranchMode::Normal);
-		Self::commit_branch(collateral_id, stable_id, outstanding_before, branch)?;
+		let (minted, old_mode, new_mode) =
+			Self::try_mutate_branch_state(collateral_id, stable_id, |config, state, now| {
+				let old_mode =
+					Self::mode_of(state, config, collateral_id, now).unwrap_or(BranchMode::Normal);
+				let minted = match (state.frozen, target) {
+					(None, Some(_)) => {
+						// Apply interest up to the start of the freeze.
+						Self::accrue_aggregate_interest(state, now)
+					},
+					(Some(frozen), None) => {
+						// Remove the frozen period from market interest time.
+						let frozen_window = now.saturating_sub(frozen.entered_at);
+						state.interest_epoch = state.interest_epoch.saturating_add(frozen_window);
+						Zero::zero()
+					},
+					(None, None) | (Some(_), Some(_)) => {
+						debug_assert!(false, "callers gate on the current frozen state");
+						Zero::zero()
+					},
+				};
+				state.frozen = target.map(|reason| FrozenState { reason, entered_at: now });
+				let new_mode =
+					Self::mode_of(state, config, collateral_id, now).unwrap_or(BranchMode::Normal);
+				Ok((minted, old_mode, new_mode))
+			})?;
 		// Mint interest only after storing the updated market.
 		if !minted.is_zero() {
 			Self::mint_and_route_yield(collateral_id, stable_id, minted);
