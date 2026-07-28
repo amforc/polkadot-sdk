@@ -3223,8 +3223,8 @@ parameter_types! {
 	pub const VaultsOraclePriceMaxAge: Moment =
 		if cfg!(feature = "runtime-benchmarks") { Moment::MAX } else { 60 * 60 * 1_000 };
 	pub const VaultsMarketCreationHoldReason: RuntimeHoldReason =
-		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::MarketCreationDeposit);
-	pub const VaultsMarketCreationDeposit: Balance = 100 * DOLLARS;
+		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
+	pub const VaultsBranchCreationDeposit: Balance = 100 * DOLLARS;
 	/// Governance envelope every permissionlessly-created market config must sit
 	/// inside: floors on the collateralization ratios and minimums, caps on the
 	/// borrow rate and the static debt line.
@@ -3236,7 +3236,7 @@ parameter_types! {
 			min_minimum_debt: 10 * DOLLARS,
 			min_minimum_collateral: 1,
 			max_borrow_rate: FixedU128::from_rational(400, 100),
-			max_branch_line: 1_000_000_000 * DOLLARS,
+			max_debt_ceiling: 1_000_000_000 * DOLLARS,
 			max_ceiling_gap: 100_000_000 * DOLLARS,
 			min_ceiling_ttl: 24 * 60 * 60 * 1_000,
 		};
@@ -3325,7 +3325,7 @@ impl pallet_vaults::Config for Runtime {
 		AccountId,
 		Balances,
 		VaultsMarketCreationHoldReason,
-		ConstantStoragePrice<VaultsMarketCreationDeposit, Balance>,
+		ConstantStoragePrice<VaultsBranchCreationDeposit, Balance>,
 	>;
 	type BranchConfigGuard = VaultsBranchConfigGuard;
 	type ForceOrigin = EnsureRoot<AccountId>;
