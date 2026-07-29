@@ -26,7 +26,6 @@ use frame::{
 		AsEnsureOriginWithArg, Convert, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
-use pallet_linked_list::SortedListInterface;
 use pusd_primitives::ProvidePrice;
 
 // 16 bytes so `into_sub_account_truncating` keeps the pallet id plus part of
@@ -420,13 +419,9 @@ impl pallet_stability::Config for Test {
 	type RecoveryOffsets = Redemptions;
 	type StableDustHandler = ResolveAssetTo<DustDestAccount, Assets>;
 	type CollateralDustHandler = ResolveAssetTo<DustDestAccount, PoolCollateralAssets>;
-	// The runtime's single linked-list instance, shared with vaults; this
-	// pallet only touches its `StabilityPending` lists.
-	type PendingLists = LinkedList;
 	type TimeProvider = Timestamp;
 	type UpdateOrigin = StabilityUpdateOrigin;
 	type DefaultStabilityPoolConfig = DefaultStabilityPoolConfig;
-	type MaxPendingOffsetIterations = ConstU32<8>;
 	type PalletId = StabilityPalletId;
 	type WeightInfo = ();
 }
@@ -809,45 +804,25 @@ pub fn deposit_row(
 	crate::Deposits::<Test>::get((collateral, stable, who))
 }
 
-fn pending_list(collateral: AssetId, stable: StableId) -> VaultList {
-	pusd_primitives::StableListId::StabilityPending(collateral, stable)
-}
-
-/// Whether `who` sits in the branch's pending-deposit FIFO.
-pub fn pending_contains(collateral: AssetId, stable: StableId, who: AccountId) -> bool {
-	LinkedList::contains(pending_list(collateral, stable), who)
-}
-
-/// The oldest member of the branch's pending-deposit FIFO (the list tail).
-pub fn pending_oldest(collateral: AssetId, stable: StableId) -> Option<AccountId> {
-	LinkedList::tail(pending_list(collateral, stable))
-}
-
-/// Force `who` out of the branch's pending-deposit FIFO without touching its
-/// row, to set up FIFO/row drift.
-pub fn pending_remove(
-	collateral: AssetId,
-	stable: StableId,
-	who: AccountId,
-) -> Result<(), pallet_linked_list::ListError> {
-	<LinkedList as SortedListInterface<VaultList, AccountId>>::remove(
-		&pending_list(collateral, stable),
-		&who,
+/// The realized pending amount `who` currently holds: the row's pending leg
+/// settled against the live pending accumulators, without touching storage.
+pub fn realized_pending(collateral: AssetId, stable: StableId, who: AccountId) -> Balance {
+	let Some(pending) =
+		deposit_row(collateral.clone(), stable, who).and_then(|d| d.pending_deposit)
+	else {
+		return 0;
+	};
+	let state = pool_state(collateral.clone(), stable);
+	let window = Stability::pending_sums_window(&collateral, &stable, &pending.snapshot);
+	let config = crate::Pools::<Test>::get(collateral, stable).expect("pool registered").config;
+	crate::math::realize(
+		pending.amount,
+		&pending.snapshot,
+		&state.pending_coords,
+		&window,
+		&config.precision,
 	)
-}
-
-/// Force `who` back into the branch's pending-deposit FIFO without touching
-/// its row, undoing [`pending_remove`].
-pub fn pending_append(
-	collateral: AssetId,
-	stable: StableId,
-	who: AccountId,
-) -> Result<(), pallet_linked_list::ListError> {
-	pallet_linked_list::fifo_append::<_, _, LinkedList>(pending_list(collateral, stable), who)
-}
-
-pub fn pending_count(collateral: AssetId, stable: StableId) -> u32 {
-	LinkedList::count(pending_list(collateral, stable))
+	.compounded
 }
 
 /// The branch's live pool state; panics when the branch is not registered.

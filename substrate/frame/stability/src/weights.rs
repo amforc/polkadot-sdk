@@ -13,7 +13,6 @@ pub trait WeightInfo {
 	fn offset_recovery() -> Weight;
 	fn poke_deposit() -> Weight;
 	fn set_stability_pool_config() -> Weight;
-	fn on_idle_one_deposit() -> Weight;
 }
 
 impl WeightInfo for () {
@@ -51,9 +50,5 @@ impl WeightInfo for () {
 
 	fn set_stability_pool_config() -> Weight {
 		Weight::zero()
-	}
-
-	fn on_idle_one_deposit() -> Weight {
-		Weight::from_parts(500_000_000, 100_000)
 	}
 }
