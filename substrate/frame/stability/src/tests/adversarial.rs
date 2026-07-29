@@ -1,7 +1,7 @@
 //! Adversarial boundaries: stale user intent, corrupted FIFO/storage
 //! disagreement, and failed value movement after planning.
 
-use crate::{mock::*, Error};
+use crate::mock::*;
 use frame::traits::{
 	fungibles::Balanced as FungiblesBalanced,
 	tokens::{Fortitude, Precision, Preservation},
@@ -130,37 +130,6 @@ fn stable_withdrawal_failure_returns_the_full_collateral_credit() {
 
 		// Repair the deliberate corruption before the post-test invariant check.
 		mint_stable(PUSD, pool, 400);
-	});
-}
-
-#[test]
-fn activation_rejects_pending_row_missing_fifo_slot() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		mint_stable(PUSD, 1, 1_000);
-		assert_ok!(deposit(1, DOT, PUSD, 400));
-		advance_time(5_000);
-
-		assert_ok!(pending_remove(DOT, PUSD, 1));
-		assert!(!pending_contains(DOT, PUSD, 1));
-
-		// Any activating touch trips over the corrupted FIFO; the poke stands
-		// in for one.
-		assert_noop!(poke(1, 1, DOT, PUSD), Error::<Test>::PendingFifoInvariantBroken);
-		let row = deposit_row(DOT, PUSD, 1).expect("row survives failed activation");
-		assert_eq!(row.active_deposit, 0);
-		assert_eq!(row.pending_deposit.expect("pending remains").amount, 400);
-		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.total_pending_deposits, 400);
-
-		// Repair the deliberate FIFO corruption and prove the row can still
-		// activate cleanly.
-		assert_ok!(pending_append(DOT, PUSD, 1));
-		assert_ok!(poke(1, 1, DOT, PUSD));
-		let row = deposit_row(DOT, PUSD, 1).expect("activated row survives");
-		assert_eq!(row.active_deposit, 400);
-		assert!(row.pending_deposit.is_none());
 	});
 }
 

@@ -3542,7 +3542,6 @@ parameter_types! {
 			},
 			yield_share: Permill::from_percent(75),
 		};
-	pub const StabilityMaxPendingOffsetIterations: u32 = 8;
 }
 
 impl pallet_stability::Config for Runtime {
@@ -3553,13 +3552,11 @@ impl pallet_stability::Config for Runtime {
 	type RecoveryOffsets = Redemptions;
 	type StableDustHandler = ResolveAssetTo<TreasuryAccount, Assets>;
 	type CollateralDustHandler = ResolveAssetTo<TreasuryAccount, StabilityCollateral>;
-	type PendingLists = LinkedList;
 	type UpdateOrigin = EitherOf<
 		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
 		pallet_vaults::EnsureBranchFullAdmin<Runtime>,
 	>;
 	type DefaultStabilityPoolConfig = StabilityDefaultConfig;
-	type MaxPendingOffsetIterations = StabilityMaxPendingOffsetIterations;
 	type PalletId = StabilityPalletId;
 	type WeightInfo = ();
 }

@@ -42,10 +42,7 @@ pub mod pallet {
 		},
 		prelude::*,
 	};
-	use linked_list_interface::SortedListInterface;
-	use pusd_primitives::{
-		BranchModeProvider, Millis, OnBranchLifecycle, RecoveryOffsetInterface, StableListId,
-	};
+	use pusd_primitives::{BranchModeProvider, Millis, OnBranchLifecycle, RecoveryOffsetInterface};
 
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
 		<T as frame_system::Config>::AccountId,
@@ -126,15 +123,6 @@ pub mod pallet {
 		/// TODO: Doc
 		type CollateralDustHandler: OnUnbalanced<CollateralCreditOf<Self>>;
 
-		/// Backing store for the per-branch pending-deposit FIFO: the
-		/// runtime's shared `pallet-linked-list` instance, addressed through
-		/// the `StableListId::StabilityPending` variant.
-		type PendingLists: SortedListInterface<
-			StableListId<CollateralIdOf<Self>, StableIdOf<Self>>,
-			Self::AccountId,
-			Priority = FixedU128,
-		>;
-
 		/// Authorizes [`Pallet::set_stability_pool_config`] for the market
 		/// given as argument. Point this at the market's admin authority
 		/// (e.g. vaults' `EnsureBranchFullAdmin`) and compose a governance
@@ -147,12 +135,6 @@ pub mod pallet {
 
 		/// Config every newly registered branch starts with.
 		type DefaultStabilityPoolConfig: Get<StabilityPoolConfigOf<Self>>;
-
-		/// Weight-safety bound on pending-deposit FIFO entries one
-		/// liquidation backstop call may consume; not a governance risk
-		/// parameter (SPEC.md §5.3).
-		#[pallet::constant]
-		type MaxPendingOffsetIterations: Get<u32>;
 
 		/// Seed for the per-market pool sub-accounts.
 		#[pallet::constant]
@@ -174,11 +156,6 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// TODO: Doc
-	#[pallet::storage]
-	pub type ActivationCursor<T: Config> =
-		StorageValue<_, (CollateralIdOf<T>, StableIdOf<T>, T::AccountId), OptionQuery>;
-
 	/// The registered markets' pools: governance parameters and hot
 	/// accounting state in one record, so the pieces can never partially
 	/// exist. Existence of the row is what "registered" means.
@@ -198,6 +175,25 @@ pub mod pallet {
 	/// references them.
 	#[pallet::storage]
 	pub type PoolSumsStore<T: Config> = StorageNMap<
+		_,
+		(
+			NMapKey<Twox64Concat, CollateralIdOf<T>>,
+			NMapKey<Twox64Concat, StableIdOf<T>>,
+			NMapKey<Twox64Concat, u32>,
+			NMapKey<Twox64Concat, u32>,
+		),
+		PoolSums,
+		ValueQuery,
+	>;
+
+	/// Pending-side twin of [`PoolSumsStore`], keyed by the PENDING
+	/// accumulators' `(epoch, scale)`: the §6.8 backstop consumes all pending
+	/// deposits pro-rata through a `P`/`S` pair of their own. `g_yield` is structurally zero in
+	/// this domain — pending deposits earn no yield — and only kept so both domains share one
+	/// realization implementation. Rows may be pruned only when no pending
+	/// snapshot references them.
+	#[pallet::storage]
+	pub type PendingSumsStore<T: Config> = StorageNMap<
 		_,
 		(
 			NMapKey<Twox64Concat, CollateralIdOf<T>>,
@@ -288,14 +284,16 @@ pub mod pallet {
 			epoch: u32,
 			scale: u32,
 		},
-		/// Pending deposits were consumed as the last-resort liquidation
-		/// backstop (SPEC.md §7.2).
+		/// Pending deposits were consumed pro-rata as the last-resort
+		/// liquidation backstop (SPEC.md §7.2). `epoch`/`scale` are the
+		/// post-offset PENDING accumulator coordinates.
 		PendingDepositOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			debt_burned: BalanceOf<T>,
 			collateral_gain: BalanceOf<T>,
-			iterations: u32,
+			epoch: u32,
+			scale: u32,
 		},
 		/// Stablecoin was burned against the `FinalRecovery` FIFO head at
 		/// the shared settlement pricing (SPEC.md §7.3 / §7.4). The
@@ -359,9 +357,6 @@ pub mod pallet {
 		/// The recovery offset resolved to zero burnable stablecoin (empty
 		/// active pool, the §6.5 floor, or a zero request).
 		NoRecoveryOffsetPerformed,
-		/// The pending-deposit FIFO and the deposit rows disagree — storage
-		/// corruption, not a user error.
-		PendingFifoInvariantBroken,
 		/// The supplied stability-pool config is internally inconsistent.
 		InvalidStabilityPoolConfig,
 		/// The `precision` pair is frozen at registration: deposits left
@@ -375,22 +370,12 @@ pub mod pallet {
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn integrity_test() {
-			// A zero cap would make the pending-deposit liquidation backstop
-			// a permanent no-op while still advertising the interface.
-			assert!(
-				T::MaxPendingOffsetIterations::get() > 0,
-				"`MaxPendingOffsetIterations` must be > 0"
-			);
 			// An invalid default would reject every market registration at
 			// runtime; under permissionless creation that bricks the pallet.
 			assert!(
 				T::DefaultStabilityPoolConfig::get().is_valid(),
 				"`DefaultStabilityPoolConfig` must satisfy `StabilityPoolConfig::is_valid`"
 			);
-		}
-
-		fn on_idle(_block: BlockNumberFor<T>, remaining: Weight) -> Weight {
-			Self::on_idle_activation_walk(remaining)
 		}
 
 		#[cfg(feature = "try-runtime")]
@@ -618,6 +603,10 @@ pub mod pallet {
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
 			Pools::<T>::insert(collateral_id, stable_id, StabilityPoolOf::<T>::fresh(config));
 			PoolSumsStore::<T>::insert((collateral_id, stable_id, 0u32, 0u32), PoolSums::default());
+			PendingSumsStore::<T>::insert(
+				(collateral_id, stable_id, 0u32, 0u32),
+				PoolSums::default(),
+			);
 
 			// A provider reference keeps the sub-account alive across
 			// zero-balance moments without depositing an existential deposit.
@@ -645,11 +634,6 @@ pub mod pallet {
 					.is_none(),
 				Error::<T>::PoolNotEmpty
 			);
-			// Defense in depth: the rows↔FIFO bijection makes an orphan node
-			// unreachable, but one stranded past teardown would corrupt the
-			// queue of a re-registered branch.
-			let fifo = StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
-			ensure!(T::PendingLists::count(&fifo) == 0, Error::<T>::PendingFifoInvariantBroken);
 
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			let (stable_amount, collateral_amount) =
@@ -663,15 +647,16 @@ pub mod pallet {
 				});
 			}
 
-			if ActivationCursor::<T>::get().is_some_and(|(cursor_collateral, cursor_stable, _)| {
-				cursor_collateral == *collateral_id && cursor_stable == *stable_id
-			}) {
-				ActivationCursor::<T>::kill();
-			}
 			Pools::<T>::remove(collateral_id, stable_id);
 			// Safe to clear wholesale: without deposit rows, no snapshot can
 			// reference a sums row.
 			let removal = PoolSumsStore::<T>::clear_prefix(
+				(collateral_id.clone(), stable_id.clone()),
+				u32::MAX,
+				None,
+			);
+			debug_assert!(removal.maybe_cursor.is_none());
+			let removal = PendingSumsStore::<T>::clear_prefix(
 				(collateral_id.clone(), stable_id.clone()),
 				u32::MAX,
 				None,

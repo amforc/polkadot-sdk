@@ -17,7 +17,6 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dependencies]
 codec = { workspace = true, features = ["derive"] }
 frame = { workspace = true, features = ["runtime"] }
-linked-list-interface = { workspace = true }
 pusd-primitives = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
 
@@ -35,7 +34,6 @@ default = ["std"]
 std = [
 	"codec/std",
 	"frame/std",
-	"linked-list-interface/std",
 	"pallet-assets-holder/std",
 	"pallet-assets/std",
 	"pallet-balances/std",
@@ -48,7 +46,6 @@ std = [
 ]
 runtime-benchmarks = [
 	"frame/runtime-benchmarks",
-	"linked-list-interface/runtime-benchmarks",
 	"pallet-assets-holder/runtime-benchmarks",
 	"pallet-assets/runtime-benchmarks",
 	"pallet-balances/runtime-benchmarks",
@@ -60,7 +57,6 @@ runtime-benchmarks = [
 ]
 try-runtime = [
 	"frame/try-runtime",
-	"linked-list-interface/try-runtime",
 	"pallet-assets-holder/try-runtime",
 	"pallet-assets/try-runtime",
 	"pallet-balances/try-runtime",
