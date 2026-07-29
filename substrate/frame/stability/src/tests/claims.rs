@@ -173,7 +173,6 @@ fn poke_activates_matured_pending() {
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
 		assert_eq!(row.active_deposit, 400);
 		assert!(row.pending_deposit.is_none());
-		assert!(!pending_contains(DOT, PUSD, 1));
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 400);
 	});
 }

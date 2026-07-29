@@ -1,14 +1,12 @@
 //! `try-runtime` invariant checks: the accounting identities of SPEC.md §12
 //! that must hold after every operation.
 
-use crate::pallet::{BalanceOf, Config, Deposits, Pallet, PoolSumsStore, Pools};
+use crate::pallet::{BalanceOf, Config, Deposits, Pallet, PendingSumsStore, PoolSumsStore, Pools};
 use frame::{
 	arithmetic::{FixedU128, One, Saturating, Zero},
 	deps::frame_support::traits::fungibles::Inspect as _,
 	try_runtime::TryRuntimeError,
 };
-use linked_list_interface::SortedListInterface;
-use pusd_primitives::StableListId;
 
 pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	for (collateral_id, stable_id, pool) in Pools::<T>::iter() {
@@ -17,11 +15,13 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if !config.is_valid() {
 			return Err("stored stability-pool config fails `is_valid`".into());
 		}
-		if state.coords.p > FixedU128::one() {
-			return Err("`P` above one".into());
-		}
-		if state.coords.p < config.precision.p_min {
-			return Err("`P` below the configured precision floor".into());
+		for coords in [&state.coords, &state.pending_coords] {
+			if coords.p > FixedU128::one() {
+				return Err("`P` above one".into());
+			}
+			if coords.p < config.precision.p_min {
+				return Err("`P` below the configured precision floor".into());
+			}
 		}
 		if !PoolSumsStore::<T>::contains_key((
 			&collateral_id,
@@ -30,6 +30,24 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			state.coords.scale,
 		)) {
 			return Err("current `(epoch, scale)` has no sums row".into());
+		}
+		if !PendingSumsStore::<T>::contains_key((
+			&collateral_id,
+			&stable_id,
+			state.pending_coords.epoch,
+			state.pending_coords.scale,
+		)) {
+			return Err("current pending `(epoch, scale)` has no sums row".into());
+		}
+		// Pending deposits earn no yield, so the pending domain's `G` leg is
+		// structurally zero — reusing the active-side row type must never
+		// smuggle a yield sum in.
+		for (_, sums) in
+			PendingSumsStore::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
+		{
+			if !sums.g_yield.is_zero() {
+				return Err("pending sums row carries a nonzero `G`".into());
+			}
 		}
 
 		// Invariant 1 holds as an equality: every stablecoin flow into or
@@ -50,23 +68,27 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			return Err("pool collateral balance diverges from tracked totals".into());
 		}
 
-		// The FIFO and the rows must be a bijection: exactly the rows with a
-		// pending amount are queued. Alongside, no realized deposit set may
-		// exceed the pool aggregate (flooring keeps compounded values at or
-		// below it; the excess is stranded dust).
-		let fifo = StableListId::StabilityPending(collateral_id.clone(), stable_id.clone());
+		// No realized deposit set may exceed its pool aggregate — on either
+		// leg. Flooring keeps realized values at or below the aggregate; the
+		// excess is stranded dust that leaves with an epoch reset or the
+		// teardown sweep.
 		let mut pending_sum = BalanceOf::<T>::zero();
-		let mut pending_rows: u32 = 0;
 		let mut compounded_sum = BalanceOf::<T>::zero();
-		for (who, deposit) in Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
-		{
-			let in_fifo = T::PendingLists::contains(&fifo, &who);
-			if deposit.pending_deposit.is_some() != in_fifo {
-				return Err("pending-deposit FIFO membership diverges from the row".into());
-			}
+		for (_, deposit) in Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone())) {
 			if let Some(pending) = &deposit.pending_deposit {
-				pending_sum = pending_sum.saturating_add(pending.amount);
-				pending_rows = pending_rows.saturating_add(1);
+				let window =
+					Pallet::<T>::pending_sums_window(&collateral_id, &stable_id, &pending.snapshot);
+				let realized = crate::math::realize(
+					pending.amount,
+					&pending.snapshot,
+					&state.pending_coords,
+					&window,
+					&config.precision,
+				);
+				if !realized.yield_gain.is_zero() {
+					return Err("pending deposit realized a yield gain".into());
+				}
+				pending_sum = pending_sum.saturating_add(realized.compounded);
 			}
 
 			let window = Pallet::<T>::sums_window(&collateral_id, &stable_id, &deposit.snapshot);
@@ -79,11 +101,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			);
 			compounded_sum = compounded_sum.saturating_add(realized.compounded);
 		}
-		if pending_sum != state.total_pending_deposits {
-			return Err("sum of pending deposits diverges from `total_pending_deposits`".into());
-		}
-		if T::PendingLists::count(&fifo) != pending_rows {
-			return Err("pending-deposit FIFO length diverges from the pending rows".into());
+		if pending_sum > state.total_pending_deposits {
+			return Err("realized pending deposits exceed `total_pending_deposits`".into());
 		}
 		if compounded_sum > state.total_active_deposits {
 			return Err("realized deposits exceed `total_active_deposits`".into());
@@ -111,6 +130,26 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			deposit.snapshot.coords.scale,
 		)) {
 			return Err("deposit snapshot references a pruned sums row".into());
+		}
+
+		let Some(pending) = &deposit.pending_deposit else {
+			continue;
+		};
+		if pending.snapshot.coords.epoch > state.pending_coords.epoch {
+			return Err("pending snapshot epoch ahead of the pending accumulators".into());
+		}
+		if pending.snapshot.coords.epoch == state.pending_coords.epoch {
+			if pending.snapshot.coords.scale > state.pending_coords.scale {
+				return Err("pending snapshot scale ahead of the pending accumulators".into());
+			}
+		}
+		if !PendingSumsStore::<T>::contains_key((
+			&collateral_id,
+			&stable_id,
+			pending.snapshot.coords.epoch,
+			pending.snapshot.coords.scale,
+		)) {
+			return Err("pending snapshot references a pruned sums row".into());
 		}
 	}
 	Ok(())
