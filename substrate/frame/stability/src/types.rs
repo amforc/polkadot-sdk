@@ -210,14 +210,25 @@ impl<Balance: Zero> Deposit<Balance> {
 }
 
 /// Recently supplied stablecoin waiting out the entry delay (SPEC.md §5.1).
-/// Not part of `total_active_deposits`; earns no gains or yield, but may be
-/// consumed by the last-resort liquidation backstop (§6.8).
+/// Not part of `total_active_deposits`; earns no yield, but may be consumed by
+/// the last-resort liquidation backstop (§6.8), which takes from all pending
+/// deposits pro-rata (design decision 2026-07-29, replacing the spec sketch's
+/// oldest-first FIFO). Losses and the direct collateral gains are tracked
+/// lazily through the pool's pending `P`/`S` accumulator pair, exactly like
+/// active-side offsets.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct PendingDeposit<Balance> {
+	/// Amount as of the last realization against `snapshot`; may be stale
+	/// relative to the live pending accumulators.
 	pub amount: Balance,
 	pub activatable_at: Millis,
+	/// Snapshot of the PENDING accumulators (`PoolState::pending_coords` and
+	/// the pending sums row). The `g_yield` leg is structurally zero — pending
+	/// deposits earn no yield; reusing the active-side snapshot type keeps one
+	/// realization implementation for both domains.
+	pub snapshot: DepositSnapshot,
 }
 
 /// Two-step Safety-Mode withdrawal state (§6.9). Only recorded in Safety
@@ -234,9 +245,10 @@ pub struct WithdrawalRequest<Balance> {
 
 /// Branch pool totals and current product-sum coordinates (SPEC.md §5.2).
 ///
-/// Deviations from the spec sketch (design decisions, 2026-07-07):
-/// - no `pending_head`/`pending_tail` fields — the pending-deposit FIFO lives in the runtime's
-///   `pallet-linked-list` instance;
+/// Deviations from the spec sketch (design decisions, 2026-07-07 and
+/// 2026-07-29):
+/// - no pending-deposit FIFO — the §6.8 backstop consumes all pending deposits pro-rata, tracked by
+///   `pending_coords` (a second `P`/`S` accumulator pair) instead of a queue;
 /// - no `*_rounding_surplus` fields — every flooring remainder stays inside the unclaimed totals,
 ///   so the fields would be identically zero. They arrive with their first writer.
 #[derive(
@@ -246,6 +258,7 @@ pub struct PoolState<Balance> {
 	pub total_active_deposits: Balance,
 	pub total_pending_deposits: Balance,
 	pub coords: Accumulators,
+	pub pending_coords: Accumulators,
 	pub total_collateral_gains_unclaimed: Balance,
 	pub total_yield_unclaimed: Balance,
 }
@@ -256,16 +269,23 @@ impl<Balance> PoolState<Balance> {
 	pub fn snapshot(&self, sums: &PoolSums) -> DepositSnapshot {
 		DepositSnapshot { coords: self.coords, sums: *sums }
 	}
+
+	/// The pending-deposit snapshot at the pending accumulators' current
+	/// coordinates; `sums` is the live pending `(epoch, scale)` sums row.
+	pub fn pending_snapshot(&self, sums: &PoolSums) -> DepositSnapshot {
+		DepositSnapshot { coords: self.pending_coords, sums: *sums }
+	}
 }
 
 impl<Balance: Zero> PoolState<Balance> {
 	/// State seeded at branch registration: empty pool at `P = 1`,
-	/// epoch 0, scale 0.
+	/// epoch 0, scale 0 on both accumulator pairs.
 	pub fn fresh() -> Self {
 		Self {
 			total_active_deposits: Balance::zero(),
 			total_pending_deposits: Balance::zero(),
 			coords: Accumulators::fresh(),
+			pending_coords: Accumulators::fresh(),
 			total_collateral_gains_unclaimed: Balance::zero(),
 			total_yield_unclaimed: Balance::zero(),
 		}
@@ -417,7 +437,11 @@ mod tests {
 		deposit.withdrawal_request = Some(WithdrawalRequest { amount: 10, executable_at: 601_000 });
 		assert!(deposit.is_empty());
 
-		deposit.pending_deposit = Some(PendingDeposit { amount: 1, activatable_at: 6_000 });
+		deposit.pending_deposit = Some(PendingDeposit {
+			amount: 1,
+			activatable_at: 6_000,
+			snapshot: DepositSnapshot::fresh(),
+		});
 		assert!(!deposit.is_empty());
 
 		deposit.pending_deposit = None;

@@ -339,7 +339,6 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		let row = deposit_row(DOT, PUSD, 2).expect("row created");
 		assert_eq!(row.claimable_collateral, 990);
 		assert_eq!(row.pending_deposit.expect("leftover queued").amount, 300);
-		assert!(pending_contains(DOT, PUSD, 2));
 		assert_eq!(stable_balance(PUSD, 2), 0);
 
 		// The used portion never entered the pool's stablecoin balance and
@@ -397,7 +396,6 @@ fn incoming_deposit_fully_used_leaves_no_pending() {
 		let row = deposit_row(DOT, PUSD, 2).expect("row created");
 		assert_eq!(row.claimable_collateral, 396);
 		assert!(row.pending_deposit.is_none());
-		assert!(!pending_contains(DOT, PUSD, 2));
 		assert_eq!(stable_balance(PUSD, 2), 0);
 
 		// The head keeps its remaining 300 debt and stays in the FIFO.
