@@ -85,27 +85,6 @@ fn branch_removal_blocked_while_depositor_rows_exist() {
 }
 
 #[test]
-fn branch_removal_blocked_while_fifo_nodes_exist() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		// An orphan FIFO node (no deposit row) is reachable only through a bug,
-		// and teardown must still refuse to strand it. Deliberately no
-		// remediation extrinsic: try-state pins the rows↔FIFO bijection, and a
-		// real occurrence is a bug to fix by storage migration.
-		assert_ok!(pending_append(DOT, PUSD, 5));
-
-		assert_noop!(
-			Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
-			Error::<Test>::PendingFifoInvariantBroken
-		);
-		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_some());
-
-		assert_ok!(pending_remove(DOT, PUSD, 5));
-		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
-	});
-}
-
-#[test]
 fn branch_removal_tears_down_pool_rows() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
