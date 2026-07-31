@@ -63,7 +63,7 @@ fn branch_registration_rejects_invalid_default_config() {
 		);
 		// The whole registration rolled back, vaults side included.
 		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
-		assert!(Vaults::branch_tcr(DOT, PUSD).is_none());
+		assert!(Vaults::branch_tcr(DOT, PUSD).is_err());
 	});
 }
 
