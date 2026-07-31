@@ -1,7 +1,7 @@
 //! # pUSD Primitives
 //!
 //! Shared types and traits for the pUSD protocol pallets (vaults, redemptions,
-//! liquidation, stability pool, ...). Carries no pallet-specific assumptions:
+//! stability pool, ...). Carries no pallet-specific assumptions:
 //! every type is parameterised over the consumer's `AccountId`, `AssetId`,
 //! `Balance`, and credit/debt imbalance shapes.
 
@@ -12,7 +12,11 @@ extern crate alloc;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
 	arithmetic::{helpers_128bit::multiply_by_rational_with_rounding, Rounding, Zero},
-	deps::sp_runtime::{FixedPointNumber, FixedPointOperand, FixedU128},
+	deps::{
+		frame_support::PalletId,
+		sp_io::hashing::blake2_256,
+		sp_runtime::{traits::AccountIdConversion, FixedPointNumber, FixedPointOperand, FixedU128},
+	},
 };
 use scale_info::TypeInfo;
 
@@ -34,7 +38,7 @@ pub use oracle::ProvidePrice;
 pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetResult};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
-pub use stability_pool::StabilityPoolOffsetApi;
+pub use stability_pool::{StabilityOffsetSession, StabilityPoolOffsetApi};
 pub use vault_interface::{
 	LiquidationSettlement, LiquidationSnapshot, RedemptionSettlement, RedemptionStepSnapshot,
 	VaultInterface,
@@ -91,13 +95,23 @@ impl VaultStatus {
 	}
 }
 
-/// A debt amount paired with the collateral amount tied to it.
+/// Debt and its associated collateral.
 ///
-/// The named fields keep two same-typed balances from swapping at call sites:
-/// the CR and TCR gates read them as one position, the liquidation writers as
-/// the amounts one liquidation redistributes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Position<Balance> {
+/// The pair is used both for live positions and for amounts assigned by a
+/// settlement path.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
+pub struct DebtCollateral<Balance> {
 	/// Debt side of the pair.
 	pub debt: Balance,
 	/// Collateral side of the pair.
@@ -107,7 +121,7 @@ pub struct Position<Balance> {
 /// `floor(price * collateral / debt)` as a collateralization ratio. `None` when
 /// `debt == 0` (CR undefined) or either step overflows.
 pub fn collateralization_ratio<Balance: FixedPointOperand>(
-	position: &Position<Balance>,
+	position: &DebtCollateral<Balance>,
 	price: FixedU128,
 ) -> Option<FixedU128> {
 	let value = price.checked_mul_int(position.collateral)?;
@@ -157,4 +171,22 @@ pub fn mul_div_rate_floor<Balance: FixedPointOperand>(
 		Rounding::Down,
 	)
 	.map(FixedU128::from_inner)
+}
+
+/// Per-market pallet sub-account: `pallet_id`'s sub-account for the Blake2
+/// hash of the `(collateral, stable)` pair, truncated to a bounded preimage so
+/// a large asset-id pair cannot overflow the sub-account seed and collide
+/// across markets. Sibling pallets stay distinct through their `PalletId`s.
+pub fn market_sub_account<AccountId, CollateralId, StableId>(
+	pallet_id: PalletId,
+	collateral_id: &CollateralId,
+	stable_id: &StableId,
+) -> AccountId
+where
+	AccountId: Encode + Decode,
+	CollateralId: Encode,
+	StableId: Encode,
+{
+	let seed = blake2_256(&(collateral_id, stable_id).encode());
+	pallet_id.into_sub_account_truncating(&seed[..24])
 }

@@ -13,7 +13,7 @@ use frame::prelude::*;
 use linked_list_interface::{fifo_append, SortedListInterface};
 
 /// The per-branch FIFO list id.
-pub(crate) fn list_id<T: Config>(
+pub fn list_id<T: Config>(
 	collateral_id: &CollateralIdOf<T>,
 	stable_id: &StableIdOf<T>,
 ) -> VaultListId<CollateralIdOf<T>, StableIdOf<T>> {

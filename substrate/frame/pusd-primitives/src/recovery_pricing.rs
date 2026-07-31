@@ -24,6 +24,24 @@ pub fn collateral_for_value<Balance: FixedPointOperand>(
 		.defensive_unwrap_or_else(Balance::zero)
 }
 
+/// `ceil(value / price)`: the collateral units worth `value` stablecoin at
+/// `price` (stablecoin value per collateral unit). The ceil twin of
+/// [`collateral_for_value`], rounding against the debtor. `None` when `price`
+/// is zero or the result exceeds `Balance`, so sizing callers fail loudly
+/// instead of silently under-seizing.
+pub fn collateral_for_value_ceil<Balance: FixedPointOperand>(
+	value: Balance,
+	price: FixedU128,
+) -> Option<Balance> {
+	multiply_by_rational_with_rounding(
+		value.unique_saturated_into(),
+		FixedU128::DIV,
+		price.into_inner(),
+		Rounding::Up,
+	)
+	.and_then(|raw| Balance::try_from(raw).ok())
+}
+
 /// Recovery bonus for a `CR >= 100%` recovery vault:
 /// `min(max(0, cr - 100% - buffer), redistribution_penalty)`.
 ///
@@ -115,6 +133,28 @@ mod tests {
 		assert_eq!(collateral_for_value::<u128>(100, FixedU128::from_rational(1, 2)), 200);
 		assert_eq!(collateral_for_value::<u128>(0, FixedU128::one()), 0);
 		assert_eq!(collateral_for_value::<u128>(100, FixedU128::zero()), 0);
+	}
+
+	#[test]
+	fn collateral_for_value_ceils() {
+		// 100 stable at price 10 → exactly 10 collateral.
+		assert_eq!(
+			collateral_for_value_ceil::<u128>(100, FixedU128::from_rational(10, 1)),
+			Some(10)
+		);
+		// 105 stable at price 10 → ceil(10.5) = 11 (the floor twin gives 10).
+		assert_eq!(
+			collateral_for_value_ceil::<u128>(105, FixedU128::from_rational(10, 1)),
+			Some(11)
+		);
+		// Sub-1.0 price scales up: 100 / 0.9 = 111.1… → 112.
+		assert_eq!(
+			collateral_for_value_ceil::<u128>(100, FixedU128::from_rational(9, 10)),
+			Some(112)
+		);
+		assert_eq!(collateral_for_value_ceil::<u128>(0, FixedU128::one()), Some(0));
+		// A zero price cannot size anything.
+		assert_eq!(collateral_for_value_ceil::<u128>(100, FixedU128::zero()), None);
 	}
 
 	#[test]

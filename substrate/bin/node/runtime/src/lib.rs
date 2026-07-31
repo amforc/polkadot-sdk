@@ -3258,8 +3258,8 @@ parameter_types! {
 	/// Governance envelope every permissionlessly-created market config must sit
 	/// inside: floors on the collateralization ratios and minimums, caps on the
 	/// borrow rate and the static debt line.
-	pub VaultsBranchConfigGuard: pallet_vaults::types::BranchConfigGuard<Balance> =
-		pallet_vaults::types::BranchConfigGuard {
+	pub VaultsBranchConfigBounds: pallet_vaults::types::BranchConfigBounds<Balance> =
+		pallet_vaults::types::BranchConfigBounds {
 			min_minimum_collateralization_ratio: FixedU128::from_rational(105, 100),
 			min_initial_collateralization_ratio: FixedU128::from_rational(110, 100),
 			min_safety_collateralization_ratio: FixedU128::from_rational(120, 100),
@@ -3341,7 +3341,6 @@ impl EnsureOriginWithArg<RuntimeOrigin, VaultsStableId> for VaultsCreateOrigin {
 }
 
 impl pallet_vaults::Config for Runtime {
-	type RuntimeHoldReason = RuntimeHoldReason;
 	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultsCollateral;
 	type StableAssets = Assets;
@@ -3357,7 +3356,7 @@ impl pallet_vaults::Config for Runtime {
 		VaultsMarketCreationHoldReason,
 		ConstantStoragePrice<VaultsBranchCreationDeposit, Balance>,
 	>;
-	type BranchConfigGuard = VaultsBranchConfigGuard;
+	type BranchConfigBounds = VaultsBranchConfigBounds;
 	type ForceOrigin = EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type IdleMaxRefreshWeight = VaultsIdleMaxRefreshWeight;
@@ -3371,37 +3370,13 @@ impl pallet_vaults::Config for Runtime {
 pub struct VaultsBenchmarkHelper;
 
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountId, Balance>
-	for VaultsBenchmarkHelper
-{
+impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for VaultsBenchmarkHelper {
 	fn collateral_asset_id() -> VaultsCollateralId {
 		VaultsCollateralId::Native
 	}
 
 	fn stable_asset_id() -> VaultsStableId {
 		PsmStablecoinAssetId::get()
-	}
-
-	fn mint_stable(stable_id: VaultsStableId, who: &AccountId, amount: Balance) {
-		use frame_support::traits::fungibles::Mutate as FungiblesMutate;
-		<Assets as FungiblesMutate<AccountId>>::mint_into(stable_id, who, amount)
-			.expect("mint stable for benchmark account");
-	}
-
-	fn mint_collateral(asset_id: VaultsCollateralId, who: &AccountId, amount: Balance) {
-		use frame_support::traits::{
-			fungible::Mutate as FungibleMutate, fungibles::Mutate as FungiblesMutate,
-		};
-		match asset_id {
-			VaultsCollateralId::Native => {
-				<Balances as FungibleMutate<AccountId>>::mint_into(who, amount)
-					.expect("mint native collateral for benchmark account");
-			},
-			VaultsCollateralId::WithId(asset_id) => {
-				<Assets as FungiblesMutate<AccountId>>::mint_into(asset_id, who, amount)
-					.expect("mint asset collateral for benchmark account");
-			},
-		};
 	}
 
 	fn set_oracle_price(asset_id: VaultsCollateralId, price: FixedU128) {
