@@ -1,6 +1,6 @@
 //! Market registration / deregistration lifecycle hook.
 
-use frame::deps::{frame_support::pallet_prelude::DispatchResult, sp_runtime::Permill};
+use frame::deps::frame_support::pallet_prelude::DispatchResult;
 
 /// Lifecycle hook for `(collateral_id, stable_id)` markets. A market is one
 /// stablecoin against one collateral. `pallet-vaults` calls [`on_registered`]
@@ -36,19 +36,6 @@ pub trait OnBranchLifecycle<CollateralId, StableId> {
 		let _ = (collateral_id, stable_id, remaining_stablecoin_markets);
 		Ok(())
 	}
-
-	/// Validate a proposed redistribution penalty before Vaults stores it.
-	///
-	/// Pallets whose own market parameters constrain this value can reject the
-	/// change. The default accepts it.
-	fn validate_redistribution_penalty(
-		collateral_id: &CollateralId,
-		stable_id: &StableId,
-		redistribution_penalty: Permill,
-	) -> DispatchResult {
-		let _ = (collateral_id, stable_id, redistribution_penalty);
-		Ok(())
-	}
 }
 
 /// Run each handler in order, short-circuiting on the first error so the caller
@@ -76,21 +63,6 @@ impl<CollateralId, StableId> OnBranchLifecycle<CollateralId, StableId> for Tuple
 				collateral_id,
 				stable_id,
 				remaining_stablecoin_markets,
-			)?;
-		)* );
-		Ok(())
-	}
-
-	fn validate_redistribution_penalty(
-		collateral_id: &CollateralId,
-		stable_id: &StableId,
-		redistribution_penalty: Permill,
-	) -> DispatchResult {
-		for_tuples!( #(
-			Tuple::validate_redistribution_penalty(
-				collateral_id,
-				stable_id,
-				redistribution_penalty,
 			)?;
 		)* );
 		Ok(())

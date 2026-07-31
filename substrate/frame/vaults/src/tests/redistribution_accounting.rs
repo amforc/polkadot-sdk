@@ -32,7 +32,7 @@ fn assert_accounting_identity_holds() {
 	let mut sum_held: Balance = 0;
 	let mut n: u128 = 0;
 	for (owner, vault) in Vaults::<Test>::iter_prefix((DOT, PUSD)) {
-		let snap = vault.redistribution_snapshot;
+		let snap = vault.redistribution_checkpoint;
 		// How much debt-per-stake has accumulated since this vault's snapshot?
 		let delta = cumul.saturating_sub(snap.debt_per_stake);
 		// This vault's pending redistribution share; summed over all vaults it

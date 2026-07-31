@@ -18,7 +18,6 @@ targets = ["x86_64-unknown-linux-gnu"]
 codec = { workspace = true, features = ["derive"] }
 frame = { workspace = true, features = ["runtime"] }
 linked-list-interface = { workspace = true }
-log = { workspace = true }
 pusd-primitives = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
 
@@ -35,7 +34,6 @@ std = [
 	"codec/std",
 	"frame/std",
 	"linked-list-interface/std",
-	"log/std",
 	"pallet-assets-holder/std",
 	"pallet-assets/std",
 	"pallet-balances/std",

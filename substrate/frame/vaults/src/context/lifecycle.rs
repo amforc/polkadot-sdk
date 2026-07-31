@@ -4,7 +4,7 @@ use super::{CloseOutcome, ResidualSettlement, VaultOp};
 use crate::{
 	pallet::{BalanceOf, Config, Error, Event, Pallet},
 	recovery,
-	types::{Position, VaultStatus},
+	types::{DebtCollateral, VaultStatus},
 };
 use frame::prelude::*;
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
@@ -25,20 +25,20 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
+	/// Returns the values needed to settle this liquidation.
+	pub(crate) fn liquidation_snapshot(&self) -> LiquidationSnapshot<BalanceOf<T>> {
+		LiquidationSnapshot {
+			debt: self.vault.debt.total(),
+			redistribution_penalty: self.ctx.branch.config.redistribution_penalty,
+		}
+	}
+
 	/// Returns the current values needed for one redemption step.
 	pub(crate) fn redemption_snapshot(&self) -> RedemptionStepSnapshot<BalanceOf<T>> {
 		RedemptionStepSnapshot {
 			status: self.status,
 			debt: self.vault.debt.total(),
 			collateral: self.vault.collateral,
-			redistribution_penalty: self.ctx.branch.config.redistribution_penalty,
-		}
-	}
-
-	/// Returns the values needed to settle this liquidation.
-	pub(crate) fn liquidation_snapshot(&self) -> LiquidationSnapshot<BalanceOf<T>> {
-		LiquidationSnapshot {
-			debt: self.vault.debt.total(),
 			redistribution_penalty: self.ctx.branch.config.redistribution_penalty,
 		}
 	}
@@ -61,8 +61,7 @@ impl<T: Config> VaultOp<T> {
 		T::VaultLists::insert(self.rate_list(), self.owner.clone(), self.vault.annual_rate, hint)
 			.map_err(Pallet::<T>::map_error)?;
 		self.ctx.branch.state.release_dormant_target(&self.owner);
-		self.set_status(VaultStatus::Active);
-		Ok(())
+		self.set_status(VaultStatus::Active)
 	}
 
 	/// Moves an active vault to its new rate-list position.
@@ -82,8 +81,7 @@ impl<T: Config> VaultOp<T> {
 		T::VaultLists::remove(&self.rate_list(), &self.owner)
 			.map_err(|_| Error::<T>::RateIndexInvariantBroken)?;
 		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
-		self.set_status(VaultStatus::FinalRecovery);
-		Ok(())
+		self.set_status(VaultStatus::FinalRecovery)
 	}
 
 	/// Removes a safe vault from final recovery.
@@ -118,8 +116,7 @@ impl<T: Config> VaultOp<T> {
 		{
 			return Err(Error::<T>::DormantTargetOccupied.into());
 		}
-		self.set_status(new_status);
-		Ok(())
+		self.set_status(new_status)
 	}
 
 	/// Updates the vault status after its debt falls.
@@ -135,7 +132,7 @@ impl<T: Config> VaultOp<T> {
 				} else if !self.ctx.branch.state.try_park_dormant_target(self.owner.clone()) {
 					return Err(Error::<T>::DormantTargetOccupied.into());
 				}
-				self.set_status(VaultStatus::Dormant);
+				self.set_status(VaultStatus::Dormant)?;
 			},
 			VaultStatus::Dormant if total.is_zero() => {
 				self.ctx.branch.state.release_dormant_target(&self.owner);
@@ -149,14 +146,14 @@ impl<T: Config> VaultOp<T> {
 			VaultStatus::FinalRecovery if total.is_zero() => {
 				recovery::remove::<T>(self.collateral_id(), self.stable_id(), &self.owner)?;
 				self.ctx.branch.state.release_dormant_target(&self.owner);
-				self.set_status(VaultStatus::Dormant);
+				self.set_status(VaultStatus::Dormant)?;
 			},
 			_ => {},
 		}
 		Ok(())
 	}
 
-	fn remove_from_lifecycle(&mut self) -> DispatchResult {
+	fn remove_from_lifecycle(&self) -> DispatchResult {
 		match self.status {
 			VaultStatus::Active => T::VaultLists::remove(&self.rate_list(), &self.owner)
 				.map_err(|_| Error::<T>::RateIndexInvariantBroken)?,
@@ -175,7 +172,7 @@ impl<T: Config> VaultOp<T> {
 	/// Removes a liquidated vault and records what its liquidation redistributes.
 	pub(crate) fn apply_liquidation(
 		&mut self,
-		redistribution: Position<BalanceOf<T>>,
+		redistribution: DebtCollateral<BalanceOf<T>>,
 	) -> DispatchResult {
 		ensure!(
 			redistribution.debt <= self.vault.debt.total(),
@@ -188,7 +185,7 @@ impl<T: Config> VaultOp<T> {
 			.ok_or(Error::<T>::InvalidLiquidationSettlement)?;
 
 		self.remove_from_lifecycle()?;
-		self.ctx.branch.state.detach_vault(&self.vault);
+		self.ctx.branch.state.replace_vault(Some(&self.vault), None)?;
 		self.ctx.branch.state.release_dormant_target(&self.owner);
 		let total_collateral = self
 			.ctx
@@ -214,7 +211,7 @@ impl<T: Config> VaultOp<T> {
 		ensure!(self.vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 		let collateral = self.vault.collateral;
 		self.remove_from_lifecycle()?;
-		self.ctx.branch.state.detach_vault(&self.vault);
+		self.ctx.branch.state.replace_vault(Some(&self.vault), None)?;
 		self.ctx.branch.state.release_dormant_target(&self.owner);
 		let total_collateral = self
 			.ctx
@@ -242,7 +239,7 @@ impl<T: Config> VaultOp<T> {
 		let residual_debt = self.vault.debt.total();
 		let collateral_dust = self.vault.collateral;
 		self.remove_from_lifecycle()?;
-		self.ctx.branch.state.detach_vault(&self.vault);
+		self.ctx.branch.state.replace_vault(Some(&self.vault), None)?;
 		self.ctx.branch.state.record_bad_debt(residual_debt);
 		let total_collateral = self
 			.ctx
@@ -261,13 +258,13 @@ impl<T: Config> VaultOp<T> {
 		Ok(ResidualSettlement { residual_debt, collateral_dust, swept_orphan_debt })
 	}
 
-	fn set_status(&mut self, new_status: VaultStatus) {
+	fn set_status(&mut self, new_status: VaultStatus) -> DispatchResult {
 		let old_status = self.status;
 		if old_status == new_status {
-			return;
+			return Ok(());
 		}
 		self.status = new_status;
-		self.sync_stake();
+		self.sync_stake()?;
 		Pallet::<T>::deposit_event(Event::VaultStatusChanged {
 			collateral_id: self.ctx.collateral_id.clone(),
 			stable_id: self.ctx.stable_id.clone(),
@@ -275,17 +272,21 @@ impl<T: Config> VaultOp<T> {
 			old_status,
 			new_status,
 		});
+		Ok(())
 	}
 
 	/// Keeps redistribution stake equal to collateral, except during final recovery.
-	pub(super) fn sync_stake(&mut self) {
+	pub(super) fn sync_stake(&mut self) -> DispatchResult {
 		let target = if self.status.is_final_recovery() {
 			BalanceOf::<T>::zero()
 		} else {
 			self.vault.collateral
 		};
 		if self.vault.redistribution_stake != target {
-			self.ctx.branch.state.set_vault_stake(&mut self.vault, target);
+			let before = self.vault.clone();
+			self.vault.redistribution_stake = target;
+			self.ctx.branch.state.replace_vault(Some(&before), Some(&self.vault))?;
 		}
+		Ok(())
 	}
 }

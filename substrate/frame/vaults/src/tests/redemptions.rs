@@ -227,6 +227,22 @@ fn redeem_step_skip_persists_touch_without_redeeming() {
 	});
 }
 
+#[test]
+fn redeem_step_returns_the_builders_outcome() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+
+		let outcome =
+			<crate::Pallet<Test> as VaultInterface>::redeem_step(&DOT, &PUSD, &1, &3, |snapshot| {
+				Ok((None, snapshot.debt))
+			})
+			.expect("touch-only redemption step succeeds");
+
+		assert_eq!(outcome, Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total());
+	});
+}
+
 // The payment credit is the sole authority on the burn. Withdrawing it from a
 // funded redeemer pins the full
 // settlement chain: the redeemer pays exactly the cancelled debt, total
