@@ -1,4 +1,9 @@
-use crate::{mock::*, pallet::Vaults, tests::rate_pct, types::BranchConfigUpdate};
+use crate::{
+	mock::*,
+	pallet::{AssetRoles, Vaults},
+	tests::rate_pct,
+	types::BranchConfigUpdate,
+};
 use frame::traits::{fungibles::Mutate as FungiblesMutate, BadOrigin};
 
 /// Replacement admins used by the reassignment test.
@@ -31,6 +36,8 @@ fn signed_create_takes_deposit_and_remove_refunds() {
 	build_and_execute(|| {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
+		let payer_before = collateral_balance(DOT, PUSD_OWNER);
+		let redistribution = Pallet::<Test>::redistribution_account(&DOT, &PUSD);
 
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::signed(PUSD_OWNER),
@@ -40,18 +47,26 @@ fn signed_create_takes_deposit_and_remove_refunds() {
 			default_branch_config()
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), MarketDepositBase::get());
+		assert_eq!(collateral_balance(DOT, redistribution), 1, "free custody seed");
+		let branch = crate::pallet::Branches::<Test>::get(DOT, PUSD).expect("branch stored");
+		assert_eq!(branch.redistribution_seed.provider, PUSD_OWNER);
+		assert_eq!(branch.redistribution_seed.amount, 1);
 
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0, "deposit refunded on removal");
+		assert_eq!(collateral_balance(DOT, PUSD_OWNER), payer_before, "seed refunded");
+		assert_eq!(collateral_balance(DOT, redistribution), 0, "custody account drained");
 		assert!(!market_exists(DOT, PUSD));
 	});
 }
 
-// A Root create is deposit-free: no hold is taken.
+// A Root create is storage-deposit-free. Its configured sponsor still funds
+// the refundable collateral seed required by the redistribution account.
 #[test]
 fn root_create_takes_no_deposit() {
 	build_and_execute(|| {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		let sponsor_before = collateral_balance(DOT, ForceBranchSeedProvider::get());
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			DOT,
@@ -60,7 +75,70 @@ fn root_create_takes_no_deposit() {
 			default_branch_config()
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
+		assert_eq!(
+			collateral_balance(DOT, ForceBranchSeedProvider::get()),
+			sponsor_before - 1,
+			"force-origin sponsor funded the seed"
+		);
 		assert!(market_exists(DOT, PUSD));
+	});
+}
+
+// Registration owns the issued-asset account lifecycle: it funds the minimum
+// balance, removal returns it and kills the account, and re-registration can
+// establish the same invariant again.
+#[test]
+fn issued_redistribution_seed_round_trips_and_reregisters() {
+	build_and_execute(|| {
+		set_price(TOKEN_X, FixedU128::from_rational(10u128, 1u128));
+		let sponsor = ForceBranchSeedProvider::get();
+		let sponsor_before = collateral_balance(TOKEN_X, sponsor);
+		let redistribution = Pallet::<Test>::redistribution_account(&TOKEN_X, &PUSD);
+
+		for round in 0..2 {
+			assert_ok!(Pallet::<Test>::create_branch(
+				RuntimeOrigin::root(),
+				TOKEN_X,
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				default_branch_config()
+			));
+			assert_eq!(collateral_balance(TOKEN_X, redistribution), 1, "round {round} seed");
+			assert_eq!(collateral_balance(TOKEN_X, sponsor), sponsor_before - 1);
+
+			assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD));
+			assert_eq!(collateral_balance(TOKEN_X, redistribution), 0);
+			assert_eq!(collateral_balance(TOKEN_X, sponsor), sponsor_before);
+		}
+	});
+}
+
+// A market cannot be registered in a state whose first issued-collateral
+// redistribution would fail. Seed funding failure rolls back roles, provider
+// references, and the branch row.
+#[test]
+fn create_branch_rolls_back_when_seed_provider_lacks_collateral() {
+	const UNFUNDED_ID: AssetIdForAssets = 778;
+	const UNFUNDED: AssetId = AssetId::WithId(UNFUNDED_ID);
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), UNFUNDED_ID, 1, true, 100));
+		set_price(UNFUNDED, FixedU128::from_rational(10u128, 1u128));
+		let redistribution = Pallet::<Test>::redistribution_account(&UNFUNDED, &PUSD);
+
+		assert_noop!(
+			Pallet::<Test>::create_branch(
+				RuntimeOrigin::root(),
+				UNFUNDED,
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				default_branch_config()
+			),
+			crate::Error::<Test>::RedistributionSeedUnavailable
+		);
+		assert!(!market_exists(UNFUNDED, PUSD));
+		assert_eq!(AssetRoles::<Test>::get(UNFUNDED), None);
+		assert_eq!(System::providers(&redistribution), 0);
+		assert_eq!(collateral_balance(UNFUNDED, redistribution), 0);
 	});
 }
 
@@ -323,15 +401,15 @@ fn force_origin_gets_bad_origin_on_branch_admin_only_calls() {
 	});
 }
 
-// Registration claims exactly one provider reference on the market's
-// redistribution account and removal releases exactly that one — a reference
-// someone else planted (e.g. by pre-funding the address) is not stolen.
+// Registration owns both native-account lifecycle inputs: one explicit
+// provider plus the provider created by its refundable native seed. Removal
+// releases both without stealing a reference planted by somebody else.
 #[test]
 fn redistribution_account_provider_reference_is_paired() {
 	build_and_execute(|| {
 		let account = Pallet::<Test>::redistribution_account(&DOT, &PUSD);
 		register_market(DOT, PUSD);
-		assert_eq!(System::providers(&account), 1);
+		assert_eq!(System::providers(&account), 2);
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert_eq!(System::providers(&account), 0);
 
@@ -344,7 +422,7 @@ fn redistribution_account_provider_reference_is_paired() {
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config()
 		));
-		assert_eq!(System::providers(&account), 2);
+		assert_eq!(System::providers(&account), 3);
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert_eq!(System::providers(&account), 1);
 	});
@@ -555,8 +633,9 @@ fn remove_branch_rejected_while_bad_debt_remains() {
 	});
 }
 
-// A market still holding collateral in its redistribution account cannot be
-// removed — the collateral would be stranded with no path left to reach it.
+// A market still holding collateral cannot be removed. The close-path sweep
+// drains the redistribution account when the branch empties, so this guard
+// only trips on corrupted state — removal must still refuse to strand value.
 #[test]
 fn remove_branch_rejected_while_collateral_remains() {
 	build_and_execute(|| {

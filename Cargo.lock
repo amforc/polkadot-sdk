@@ -15352,6 +15352,7 @@ dependencies = [
  "polkadot-sdk-frame",
  "pusd-primitives",
  "scale-info",
+ "sp-tracing 16.0.0",
 ]
 
 [[package]]

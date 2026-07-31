@@ -168,6 +168,7 @@ parameter_types! {
 	pub const MarketDepositReason: RuntimeHoldReason =
 		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
 	pub const MarketDepositBase: Balance = 1_000;
+	pub const ForceBranchSeedProvider: AccountId = 11;
 }
 
 /// Full admin of every market a test helper registers.
@@ -238,12 +239,14 @@ impl pallet_vaults::Config for Test {
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
 	type FeeHandler = ();
+	type OrphanCollateralHandler = ();
 	type YieldHook = ();
 	// Registering a market seeds this pallet's redemption config via `on_registered`.
 	type OnBranchLifecycle = Redemptions;
 	type StabilityPool = ();
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
+	type ForceBranchSeedProvider = ForceBranchSeedProvider;
 	type Consideration = VaultsConsideration;
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
@@ -392,14 +395,14 @@ pub fn new_test_ext() -> TestState {
 				(USDX, 1, true, USDX_MIN_BALANCE),
 			],
 			metadata: vec![(USDX, b"USDX".to_vec(), b"USDX".to_vec(), 6)],
-			accounts: vec![],
+			accounts: vec![(TOKEN_X_ID, ForceBranchSeedProvider::get(), 1_000_000_000_000)],
 			next_asset_id: None,
 			reserves: vec![],
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
 			balances: (1u64..=10u64)
-				.chain([insurance_account(PUSD), FEE_DEST])
+				.chain([insurance_account(PUSD), FEE_DEST, ForceBranchSeedProvider::get()])
 				.map(|i| (i, 1_000_000_000_000))
 				.collect(),
 			..Default::default()
@@ -474,7 +477,6 @@ pub fn register_branch(
 	stable: StableId,
 	config: pallet_vaults::BranchConfig<Balance>,
 ) {
-	use frame::traits::fungible::Mutate as FungibleMutate;
 	// `create_branch` requires a live price, so set it before creating.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
 	Vaults::create_branch(
@@ -487,9 +489,6 @@ pub fn register_branch(
 	.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), collateral.clone(), GLOBAL_CEILING)
 		.expect("set global debt ceiling");
-	// Native ED so the redistribution sub-account can receive funds later.
-	let redistribution: AccountId = Vaults::redistribution_account(&collateral, &stable);
-	let _ = <Balances as FungibleMutate<AccountId>>::mint_into(&redistribution, 1);
 }
 
 /// Open a vault for `who` on the `(collateral, stable)` market with

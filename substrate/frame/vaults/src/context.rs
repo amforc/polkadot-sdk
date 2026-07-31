@@ -58,6 +58,8 @@ pub struct CloseOutcome<Balance> {
 	pub branch_empties: bool,
 	/// Orphan debt swept to bad debt because the branch emptied.
 	pub orphan_debt: Balance,
+	/// Orphan collateral swept off the redistribution account because the branch emptied.
+	pub orphan_collateral: Balance,
 }
 
 impl<T: Config> Context<T> {
@@ -329,6 +331,17 @@ impl<T: Config> VaultOp<T> {
 		Context::<T>::load_unfrozen(collateral_id, stable_id)?.touch(owner)
 	}
 
+	/// Loads an existing vault even when its branch is frozen.
+	///
+	/// Only risk-decreasing operations that need no oracle price may use this.
+	pub(crate) fn load_allow_frozen(
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+		owner: &T::AccountId,
+	) -> Result<Self, DispatchError> {
+		Context::<T>::load(collateral_id, stable_id)?.touch(owner)
+	}
+
 	/// Loads an existing vault, caching its price before touching it.
 	pub(crate) fn load_priced(
 		collateral_id: CollateralIdOf<T>,
@@ -379,6 +392,11 @@ impl<T: Config> VaultOp<T> {
 		&self.owner
 	}
 
+	/// Returns whether the vault's market is frozen.
+	pub(crate) fn is_branch_frozen(&self) -> bool {
+		self.ctx.branch.state.is_frozen()
+	}
+
 	/// Returns the current vault state.
 	pub(crate) const fn vault(&self) -> &Vault<BalanceOf<T>> {
 		&self.vault
@@ -424,7 +442,11 @@ impl<T: Config> VaultOp<T> {
 
 	/// Adds collateral to the vault and market totals.
 	pub(crate) fn add_collateral(&mut self, amount: BalanceOf<T>) -> DispatchResult {
-		ensure!(!self.status.is_dormant(), Error::<T>::InvalidVaultStatus);
+		// A zero-debt dormant husk may not grow; close or reopen it instead. An indebted
+		// dormant vault stays liquidatable, so its owner must be able to defend it.
+		if self.status.is_dormant() {
+			ensure!(!self.vault.debt.total().is_zero(), Error::<T>::InvalidVaultStatus);
+		}
 		let vault_collateral = self
 			.vault
 			.collateral
@@ -546,7 +568,6 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 		amount: BalanceOf<T>,
 	) -> Result<crate::types::DebtBreakdown<BalanceOf<T>>, DispatchError> {
-		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		let payment = self.redeem(amount)?;
 		let total_after = self.vault.debt.total();
 		ensure!(

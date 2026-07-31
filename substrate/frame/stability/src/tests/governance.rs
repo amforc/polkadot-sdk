@@ -54,6 +54,10 @@ fn issued_collateral_account_touch_is_required_and_refunded() {
 		let collateral = AssetId::WithId(77);
 		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
 		let pool = Stability::pool_account(&collateral, &PUSD);
+		// Both creation paths draw the redistribution seed before the registration hook runs, so
+		// fund the sponsor and the signed creator to reach the hook's own checks.
+		mint_collateral(collateral.clone(), ForceBranchSeedProvider::get(), 1_000);
+		mint_collateral(collateral.clone(), 1, 1_000);
 
 		// Governance supplies no market depositor. It must pre-create the issued-asset account or
 		// use a signed creation path rather than registering a pool that can reject dust gains.
@@ -97,6 +101,8 @@ fn branch_registration_rejects_prefunded_pool_account() {
 		let pool = Stability::pool_account(&collateral, &PUSD);
 		mint_collateral(collateral.clone(), pool, 1_000);
 		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+		// Fund the creator's redistribution seed so the registration hook's own check is reached.
+		mint_collateral(collateral.clone(), 1, 1_000);
 
 		assert_noop!(
 			Vaults::create_branch(

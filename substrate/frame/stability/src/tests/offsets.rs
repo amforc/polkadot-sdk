@@ -53,11 +53,9 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 			mint_collateral(collateral.clone(), owner, 5_000);
 			assert_ok!(open_vault(owner, collateral.clone(), PUSD, 3_000, 500));
 		}
-		// Documented runtime duty for issued-asset markets: pre-fund custody
-		// sub-accounts with the asset minimum so holds can take their full
-		// amount (the hold's `Protect` preservation keeps the minimum free).
+		// Registration seeded the redistribution account with the asset minimum, so holds can
+		// take their full amount (the hold's `Protect` preservation keeps the minimum free).
 		let redistribution = Vaults::redistribution_account(&collateral, &PUSD);
-		mint_collateral(collateral.clone(), redistribution, 1_000);
 		mint_stable(PUSD, 3, 100);
 		assert_ok!(deposit(3, collateral.clone(), PUSD, 100));
 		advance_time(5_000);

@@ -447,11 +447,11 @@ fn dormant_borrow_below_min_debt_reverts() {
 
 // Reactivation model, and how it interacts with batching. A Dormant vault is
 // revived only by `borrow` crossing MinimumDebt (or `activate_dormant` once
-// accrued debt has) — never by a collateral deposit, which is rejected while
-// Dormant because it cannot revive the vault. So the batch a user submits to
-// "borrow with a collateral top-up" is `[borrow, deposit]`, borrow first: the
-// borrow revives the vault to Active, after which the deposit is accepted. A
-// `[deposit, borrow]` batch would instead fail at the deposit leg and roll back.
+// accrued debt has) — never by a collateral deposit. An indebted Dormant vault
+// still accepts deposits without reviving: it remains liquidatable, so its
+// owner must be able to defend it, and the deposit widens the headroom the
+// reviving borrow is checked against. A "top-up then borrow" batch therefore
+// works in either order.
 #[test]
 fn dormant_revived_by_borrow_then_accepts_deposit() {
 	build_and_execute(|| {
@@ -467,18 +467,18 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 		));
 		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 
-		// A deposit alone cannot revive a Dormant vault → rejected (so it must not
-		// lead a batch).
-		assert_noop!(
-			crate::Pallet::<Test>::deposit_collateral_for(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				1,
-				100
-			),
-			crate::Error::<Test>::InvalidVaultStatus
-		);
+		// A deposit is accepted while the vault still has debt, and does not revive.
+		let held_before = held(DOT, 1);
+		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			100
+		));
+		assert_eq!(held(DOT, 1), held_before + 100);
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 
 		// Borrow across MinimumDebt revives it to Active...
 		assert_ok!(crate::Pallet::<Test>::borrow(
@@ -498,7 +498,7 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 		));
 		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
 
-		// ...after which the deposit leg of the batch is accepted.
+		// ...after which deposits keep working.
 		let held_before = held(DOT, 1);
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(1),
@@ -508,6 +508,36 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 			100
 		));
 		assert_eq!(held(DOT, 1), held_before + 100);
+	});
+}
+
+// The deposit carve-out is debt-gated: a fully redeemed husk owes nothing and
+// cannot be liquidated, so there is nothing to defend. It may not grow —
+// close it or reopen a vault instead.
+#[test]
+fn zero_debt_dormant_husk_rejects_deposit() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		// The helper caps at the vault debt, so 600 cancels the full 501
+		// (500 borrowed + 1 upfront fee).
+		assert_ok!(redeem(DOT, PUSD, 3, 600));
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total(), 0);
+		// A husk that owes nothing is not a redemption target either.
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
+
+		assert_noop!(
+			crate::Pallet::<Test>::deposit_collateral_for(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				1,
+				100
+			),
+			crate::Error::<Test>::InvalidVaultStatus
+		);
 	});
 }
 

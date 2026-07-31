@@ -112,6 +112,39 @@ fn full_redistribution_without_surplus() {
 	});
 }
 
+// The public liquidation path must preserve the free asset minimum that branch
+// registration placed in issued-collateral redistribution custody. Without
+// that seed, resolving 488 and then holding all 488 fails under `Protect`.
+#[test]
+fn issued_collateral_full_redistribution_preserves_custody_seed() {
+	build_and_execute(|| {
+		register_branch(TOKEN_X, PUSD, liquidation_branch_config());
+		assert_ok!(open(1, TOKEN_X, PUSD, 600, 500, FixedU128::from_rational(1, 1_000)));
+		assert_ok!(open(2, TOKEN_X, PUSD, 2_000, 500, FixedU128::from_rational(2, 1_000)));
+		set_price(TOKEN_X, FixedU128::from_rational(9, 10));
+
+		let redistribution = Vaults::redistribution_account(&TOKEN_X, &PUSD);
+		assert_eq!(collateral_balance(TOKEN_X, redistribution), 1, "free branch seed");
+		assert_eq!(held(TOKEN_X, redistribution), 0);
+
+		assert_ok!(liquidate(KEEPER, TOKEN_X, PUSD, 1, 0, 0));
+
+		assert!(crate::Vaults::<Test>::get((TOKEN_X, PUSD, 1)).is_none());
+		assert_eq!(collateral_balance(TOKEN_X, redistribution), 1, "seed remains free");
+		assert_eq!(held(TOKEN_X, redistribution), 488, "redistribution held above seed");
+		System::assert_has_event(
+			Event::<Test>::VaultLiquidated {
+				collateral_id: TOKEN_X,
+				stable_id: PUSD,
+				owner: 1,
+				keeper: KEEPER,
+				outcome: outcome([0, 0, 0, 500], [0, 0, 0, 488], 112, 0),
+			}
+			.into(),
+		);
+	});
+}
+
 // Equal penalties must produce the same borrower loss for offset and redistributed debt.
 #[test]
 fn full_redistribution_with_surplus() {

@@ -260,6 +260,126 @@ fn frozen_branch_blocks_user_ops() {
 	});
 }
 
+// A frozen market keeps its rescue flows: deposit and repay are price-free and
+// risk-decreasing, so owners can defend their vaults before the market
+// unfreezes and liquidation resumes. Risk-increasing flows stay gated. The
+// freeze window is excised exactly: a year of frozen time accrues nothing
+// (5% on 501 would be 25), so the repay settles at the freeze-entry debt of
+// 501 (500 borrowed + 1 upfront fee).
+#[test]
+fn frozen_branch_allows_repay_and_deposit() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			true
+		));
+		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+
+		let held_before = held(DOT, 1);
+		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			100
+		));
+		assert_eq!(held(DOT, 1), held_before + 100);
+
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 200));
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total(), 301);
+
+		assert_noop!(
+			crate::Pallet::<Test>::borrow(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				100,
+				None,
+				None,
+				Position::endpoints_only()
+			),
+			crate::Error::<Test>::BranchFrozen
+		);
+		assert_noop!(
+			crate::Pallet::<Test>::withdraw_collateral(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				100,
+				None
+			),
+			crate::Error::<Test>::BranchFrozen
+		);
+	});
+}
+
+// The oracle-failure freeze is the case that motivates the carve-out: repay
+// needs no price, so it must not be hostage to a dead oracle.
+#[test]
+fn oracle_frozen_branch_allows_repay() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		MockOracleAvailable::set(false);
+		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
+
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 200));
+		// 301 = 500 borrowed + 1 upfront fee − 200 repaid.
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total(), 301);
+	});
+}
+
+// The one repay a frozen market still rejects: the final repayment of an
+// empty-collateral vault would close it, and closing (a removal that may move
+// value and needs a price for its safety commit) stays gated on an unfrozen
+// market for every freeze reason.
+#[test]
+fn frozen_branch_rejects_closing_repay() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(6, 100)));
+		// A redemption that takes all debt and all collateral leaves a
+		// zero-zero husk that only a closing repay can remove.
+		let snapshot =
+			<crate::Pallet<Test> as pusd_primitives::VaultInterface>::project_redemption_snapshot(
+				&DOT, &PUSD, &1,
+			)
+			.expect("snapshot");
+		assert_ok!(redeem_step(DOT, PUSD, 1, 9, snapshot.debt, snapshot.collateral));
+		let husk = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		assert_eq!(husk.debt.total(), 0);
+		assert_eq!(husk.collateral, 0);
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			true
+		));
+		assert_noop!(
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 5),
+			crate::Error::<Test>::BranchFrozen
+		);
+
+		// Unfrozen, the same call closes the husk.
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			false
+		));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 5));
+		assert!(Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+	});
+}
+
 #[test]
 fn refresh_branch_persists_frozen_on_oracle_failure() {
 	build_and_execute(|| {

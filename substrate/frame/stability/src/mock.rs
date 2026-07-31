@@ -182,6 +182,7 @@ parameter_types! {
 	pub const MarketDepositReason: RuntimeHoldReason =
 		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
 	pub const MarketDepositBase: Balance = 1_000;
+	pub const ForceBranchSeedProvider: AccountId = 11;
 }
 
 /// Full admin of every market a test helper registers.
@@ -253,6 +254,7 @@ impl pallet_vaults::Config for Test {
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
 	type FeeHandler = ResolveAssetTo<FeeDestAccount, Assets>;
+	type OrphanCollateralHandler = ResolveAssetTo<FeeDestAccount, VaultCollateralAssets>;
 	// The pool takes its `yield_share` of every minted branch credit; the
 	// fee destination receives the remainder.
 	type YieldHook = Stability;
@@ -263,6 +265,7 @@ impl pallet_vaults::Config for Test {
 	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
+	type ForceBranchSeedProvider = ForceBranchSeedProvider;
 	type Consideration = VaultsConsideration;
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
@@ -429,13 +432,16 @@ pub fn new_test_ext() -> TestState {
 				(USDX, 1, true, USDX_MIN_BALANCE),
 			],
 			metadata: vec![(USDX, b"USDX".to_vec(), b"USDX".to_vec(), 6)],
-			accounts: vec![],
+			accounts: vec![(TOKEN_X_ID, ForceBranchSeedProvider::get(), 1_000_000_000_000)],
 			next_asset_id: None,
 			reserves: vec![],
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
-			balances: (1u128..=10u128).map(|i| (i, 1_000_000_000_000)).collect(),
+			balances: (1u128..=10u128)
+				.chain([ForceBranchSeedProvider::get()])
+				.map(|i| (i, 1_000_000_000_000))
+				.collect(),
 			..Default::default()
 		},
 	}
@@ -517,10 +523,23 @@ pub fn register_branch(
 	stable: StableId,
 	config: pallet_vaults::BranchConfig<Balance>,
 ) {
+	use frame::traits::fungibles::Inspect as FungiblesInspect;
 	// `create_branch` requires a live price, so set it before creating.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
 	// Account 1 owns every test stable asset. Its refundable market deposit also funds any
-	// collateral-account touch that Stability needs for the pool sub-account.
+	// collateral-account touch that Stability needs for the pool sub-account, and it fronts the
+	// refundable redistribution-account seed. Fund newly-created test assets here so
+	// registration, rather than each liquidation test, owns that setup.
+	let creator: AccountId = 1;
+	let minimum =
+		<VaultCollateralAssets as FungiblesInspect<AccountId>>::minimum_balance(collateral.clone());
+	let free = <VaultCollateralAssets as FungiblesInspect<AccountId>>::balance(
+		collateral.clone(),
+		&creator,
+	);
+	if free < minimum {
+		mint_collateral(collateral.clone(), creator, minimum - free);
+	}
 	Vaults::create_branch(
 		RuntimeOrigin::signed(1),
 		collateral.clone(),
@@ -532,7 +551,9 @@ pub fn register_branch(
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), collateral, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
 	// No collateral pre-fund for the pool sub-account: registration creates a zero-balance asset
-	// account when necessary, so every gain remains tracked pool collateral.
+	// account when necessary, so every gain remains tracked pool collateral. Vaults owns the
+	// redistribution account's refundable free seed; it is separate from both this pool's
+	// custody and branch collateral accounting.
 }
 
 /// Open a vault for `who` on the `(collateral, stable)` market with

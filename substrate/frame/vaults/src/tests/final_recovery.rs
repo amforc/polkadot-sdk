@@ -214,7 +214,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 }
 
 #[test]
-fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
+fn final_recovery_blocks_borrow_withdraw_and_change_rate() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		enter_recovery(1, rate_pct(5, 100));
@@ -229,10 +229,6 @@ fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
 				None,
 				Position::endpoints_only()
 			),
-			crate::Error::<Test>::VaultInFinalRecovery
-		);
-		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 100),
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
@@ -255,6 +251,75 @@ fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
 			),
 			crate::Error::<Test>::InvalidVaultStatus
 		);
+	});
+}
+
+// Repayment is a spec-guaranteed rescue route in final recovery: it reduces
+// debt in place (dust rule still applies), and once fully accrued CR is back
+// at or above MCR the vault may exit. 301 = 500 borrowed + 1 upfront fee
+// − 200 repaid.
+#[test]
+fn final_recovery_partial_repay_reduces_debt_then_exits() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 200));
+		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		assert_eq!(vault.debt.total(), 301);
+		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
+
+		// The universal dust rule holds inside final recovery too: another 200
+		// would leave 101, below MinimumDebt 200.
+		assert_noop!(
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 200),
+			crate::Error::<Test>::DebtWouldBecomeDust
+		);
+
+		// CR is restored (10_000 of collateral value against 301), so the vault
+		// exits to Active and rejoins the rate index.
+		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
+			RuntimeOrigin::signed(99),
+			DOT,
+			PUSD,
+			1,
+			Position::endpoints_only()
+		));
+		assert!(vault_status(DOT, PUSD, 1).is_active());
+	});
+}
+
+// A full repayment pulls the vault out of the FIFO exactly like a zeroing
+// redemption: it settles to Dormant with its stake re-synced, and the owner
+// closes it to recover the collateral.
+#[test]
+fn final_recovery_full_repay_leaves_closeable_dormant_husk() {
+	use frame::traits::fungible::Mutate;
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+
+		// Buffer over the 500 minted at open, for the upfront fee.
+		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 100));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			10_000
+		));
+
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		assert_eq!(vault.debt.total(), 0);
+		assert_eq!(vault.redistribution_stake, held(DOT, 1));
+
+		let free_before = collateral_balance(DOT, 1);
+		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_eq!(collateral_balance(DOT, 1), free_before + 1_000);
 	});
 }
 

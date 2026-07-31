@@ -8,17 +8,19 @@ use crate::{
 	},
 	types::{
 		AdminLevel, AssetRole, AssetRoleUsage, BranchAdmins, BranchConfig, BranchConfigUpdate,
-		BranchMode, BranchState, FrozenReason, FrozenState,
+		BranchMode, BranchState, FrozenReason, FrozenState, RedistributionSeed,
 	},
 };
 use frame::{
+	deps::frame_support::transactional,
 	prelude::*,
 	traits::{
 		fungibles::{
-			Inspect as FungiblesInspect, Mutate as FungiblesMutate,
+			Balanced as FungiblesBalanced, Inspect as FungiblesInspect,
+			InspectHold as FungiblesInspectHold, Mutate as FungiblesMutate,
 			MutateHold as FungiblesMutateHold,
 		},
-		tokens::Restriction,
+		tokens::{Fortitude, Precision, Preservation, Restriction},
 		Consideration, Footprint, Time,
 	},
 };
@@ -65,7 +67,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Deposits collateral into a vault.
 	///
-	/// Dormant vaults cannot receive deposits.
+	/// Zero-debt dormant vaults cannot receive deposits. Deposits stay available while the
+	/// market is frozen so owners can defend their vaults before it unfreezes.
 	pub(crate) fn do_deposit_collateral_for(
 		from: T::AccountId,
 		owner: T::AccountId,
@@ -74,7 +77,7 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
-		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
+		let mut op = VaultOp::<T>::load_allow_frozen(collateral_id, stable_id, &owner)?;
 		op.add_collateral(amount)?;
 		T::CollateralAssets::transfer_and_hold(
 			op.collateral_id().clone(),
@@ -159,6 +162,9 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Repays debt for a vault from another account.
+	///
+	/// Repayments stay available while the market is frozen so owners can defend their vaults
+	/// before it unfreezes.
 	pub(crate) fn do_repay_for(
 		from: T::AccountId,
 		owner: T::AccountId,
@@ -167,7 +173,7 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
-		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
+		let mut op = VaultOp::<T>::load_allow_frozen(collateral_id, stable_id, &owner)?;
 		// Never burn more than the current debt.
 		let repay = op.repayment_amount(amount);
 		T::StableAssets::burn_from(
@@ -192,8 +198,10 @@ impl<T: Config> Pallet<T> {
 			amount: repay,
 		});
 
-		// Close a fully repaid vault when it has no collateral left.
+		// Close a fully repaid vault when it has no collateral left. Closing stays gated on
+		// an unfrozen market for every freeze reason, not just where the price load fails.
 		if new_total.is_zero() && op.vault().collateral.is_zero() {
+			ensure!(!op.is_branch_frozen(), Error::<T>::BranchFrozen);
 			op.load_price()?;
 			return Self::close_inner(op, &owner);
 		}
@@ -234,7 +242,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Closes a vault and returns its collateral.
 	fn close_inner(mut op: VaultOp<T>, recipient: &T::AccountId) -> DispatchResult {
-		let CloseOutcome { collateral, branch_empties, orphan_debt } = op.detach_for_close()?;
+		let CloseOutcome { collateral, branch_empties, orphan_debt, orphan_collateral } =
+			op.detach_for_close()?;
 
 		if !collateral.is_zero() {
 			T::CollateralAssets::transfer_on_hold(
@@ -256,6 +265,11 @@ impl<T: Config> Pallet<T> {
 				amount: orphan_debt,
 			});
 		}
+		Self::slash_and_route_orphan_collateral(
+			op.collateral_id(),
+			op.stable_id(),
+			orphan_collateral,
+		)?;
 		Self::deposit_event(Event::VaultClosed {
 			collateral_id: op.collateral_id().clone(),
 			stable_id: op.stable_id().clone(),
@@ -368,9 +382,72 @@ impl<T: Config> Pallet<T> {
 		Self::release_asset_role(&stable_key, AssetRole::Stable)
 	}
 
+	/// Funds the free minimum balance that lets the redistribution account accept exact holds.
+	fn fund_redistribution_seed(
+		collateral_id: &CollateralIdOf<T>,
+		redistribution_account: &T::AccountId,
+		provider: T::AccountId,
+	) -> Result<RedistributionSeed<T::AccountId, BalanceOf<T>>, DispatchError> {
+		let amount = T::CollateralAssets::minimum_balance(collateral_id.clone());
+		if !amount.is_zero() {
+			let credit = T::CollateralAssets::withdraw(
+				collateral_id.clone(),
+				&provider,
+				amount,
+				Precision::Exact,
+				Preservation::Expendable,
+				Fortitude::Polite,
+			)
+			.map_err(|_| Error::<T>::RedistributionSeedUnavailable)?;
+			T::CollateralAssets::resolve(redistribution_account, credit).map_err(|credit| {
+				drop(credit);
+				Error::<T>::RedistributionSeedUnavailable
+			})?;
+		}
+		Ok(RedistributionSeed { provider, amount })
+	}
+
+	/// Returns a removed market's infrastructure collateral and lets its asset account die.
+	fn refund_redistribution_seed(
+		collateral_id: &CollateralIdOf<T>,
+		redistribution_account: &T::AccountId,
+		seed: &RedistributionSeed<T::AccountId, BalanceOf<T>>,
+	) -> DispatchResult {
+		let held = T::CollateralAssets::total_balance_on_hold(
+			collateral_id.clone(),
+			redistribution_account,
+		);
+		if !held.is_zero() {
+			defensive!("redistribution account still holds collateral at market removal");
+			return Err(DispatchError::Corruption);
+		}
+		let free = T::CollateralAssets::balance(collateral_id.clone(), redistribution_account);
+		if free < seed.amount {
+			defensive!("redistribution-account seed fell below its recorded amount");
+			return Err(DispatchError::Corruption);
+		}
+		if free.is_zero() {
+			return Ok(());
+		}
+		let credit = T::CollateralAssets::withdraw(
+			collateral_id.clone(),
+			redistribution_account,
+			seed.amount,
+			Precision::Exact,
+			Preservation::Expendable,
+			Fortitude::Polite,
+		)
+		.map_err(|_| Error::<T>::RedistributionSeedUnavailable)?;
+		T::CollateralAssets::resolve(&seed.provider, credit).map_err(|credit| {
+			drop(credit);
+			Error::<T>::RedistributionSeedUnavailable.into()
+		})
+	}
+
 	/// Creates a market after checking its limits, assets, and oracle price.
 	///
-	/// The market record, deposit, asset roles, and lifecycle state are created together.
+	/// The market record, deposits, asset roles, and lifecycle state are created together.
+	#[transactional]
 	pub(crate) fn do_create_branch(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -393,6 +470,7 @@ impl<T: Config> Pallet<T> {
 		ensure!(T::StableAssets::asset_exists(stable_id.clone()), Error::<T>::UnknownStable);
 		// A stable asset cannot also be collateral, or its issuer could create unbacked collateral.
 		let stablecoin_markets = Self::claim_market_roles(&collateral_id, &stable_id)?;
+		let seed_provider = depositor.clone().unwrap_or_else(T::ForceBranchSeedProvider::get);
 		let deposit = match depositor {
 			Some(who) => {
 				let footprint = Footprint::from_mel::<(
@@ -408,6 +486,8 @@ impl<T: Config> Pallet<T> {
 		let lifecycle_depositor = deposit.as_ref().map(|(who, _)| who.clone());
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		frame_system::Pallet::<T>::inc_providers(&redistribution_account);
+		let redistribution_seed =
+			Self::fund_redistribution_seed(&collateral_id, &redistribution_account, seed_provider)?;
 		let now = T::TimeProvider::now();
 		Branches::<T>::insert(
 			&collateral_id,
@@ -417,6 +497,7 @@ impl<T: Config> Pallet<T> {
 				config,
 				admins,
 				deposit,
+				redistribution_seed,
 			},
 		);
 		T::OnBranchLifecycle::on_registered(
@@ -431,7 +512,9 @@ impl<T: Config> Pallet<T> {
 
 	/// Removes an empty market and refunds its deposit.
 	///
-	/// This also releases its asset roles and provider reference, and calls the lifecycle hook.
+	/// This also returns its redistribution seed, releases its asset roles and provider reference,
+	/// and calls the lifecycle hook.
+	#[transactional]
 	pub(crate) fn do_remove_branch(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -448,6 +531,12 @@ impl<T: Config> Pallet<T> {
 			&stable_id,
 			remaining_stablecoin_markets,
 		)?;
+		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
+		Self::refund_redistribution_seed(
+			&collateral_id,
+			&redistribution_account,
+			&branch.redistribution_seed,
+		)?;
 		let removed_outstanding = Branches::<T>::take(&collateral_id, &stable_id)
 			.map(|removed| {
 				removed.state.debt.outstanding().saturating_add(removed.state.ownerless_debt)
@@ -457,7 +546,6 @@ impl<T: Config> Pallet<T> {
 			removed_outstanding.is_zero(),
 			"market removal must leave the CollateralRisks aggregate untouched"
 		);
-		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		if let Err(err) = frame_system::Pallet::<T>::dec_providers(&redistribution_account) {
 			defensive!("redistribution-account provider reference not released", err);
 		}

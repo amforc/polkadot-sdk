@@ -217,14 +217,19 @@ impl<T: Config> VaultOp<T> {
 			.checked_sub(&collateral)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		self.ctx.branch.state.total_collateral = total_collateral;
-		let branch_empties = self.ctx.branch.state.is_empty_of_liability();
-		let orphan_debt = if branch_empties {
-			self.ctx.branch.state.sweep_orphan_debt()
-		} else {
-			BalanceOf::<T>::zero()
-		};
+		let settlement = self.ctx.branch.state.take_orphan_settlement();
+		let branch_empties = settlement.is_some();
+		let orphans = settlement.unwrap_or(DebtCollateral {
+			debt: BalanceOf::<T>::zero(),
+			collateral: BalanceOf::<T>::zero(),
+		});
 		self.remove_on_commit = true;
-		Ok(CloseOutcome { collateral, branch_empties, orphan_debt })
+		Ok(CloseOutcome {
+			collateral,
+			branch_empties,
+			orphan_debt: orphans.debt,
+			orphan_collateral: orphans.collateral,
+		})
 	}
 
 	fn set_status(&mut self, new_status: VaultStatus) -> DispatchResult {

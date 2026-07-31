@@ -6,7 +6,7 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
-		Error, IdleCursor, Millis, Pallet, StableIdOf, StablecoinDebt, Vaults,
+		Error, Event, HoldReason, IdleCursor, Millis, Pallet, StableIdOf, StablecoinDebt, Vaults,
 	},
 	recovery,
 	types::{
@@ -20,7 +20,10 @@ use frame::{
 		require_transactional, storage::with_storage_layer, weights::WeightMeter,
 	},
 	prelude::*,
-	traits::{fungibles::Balanced as FungiblesBalanced, Defensive, DefensiveOption, Time},
+	traits::{
+		fungibles::{Balanced as FungiblesBalanced, BalancedHold as FungiblesBalancedHold},
+		Defensive, DefensiveOption, Time,
+	},
 };
 use linked_list_interface::{ListError, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, OnBranchYield, ProvidePrice};
@@ -632,6 +635,40 @@ impl<T: Config> Pallet<T> {
 		let credit = T::StableAssets::issue(stable_id.clone(), amount);
 		let credit = T::YieldHook::distribute_yield(collateral_id, credit);
 		T::FeeHandler::on_unbalanced(credit);
+	}
+
+	/// Slash an emptied market's redistribution-account hold and route the
+	/// collateral to `T::OrphanCollateralHandler`.
+	///
+	/// The debt twin is [`BranchState::sweep_orphan_debt`]; together they keep
+	/// an emptied market removable.
+	pub(crate) fn slash_and_route_orphan_collateral(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		amount: BalanceOf<T>,
+	) -> DispatchResult {
+		if amount.is_zero() {
+			return Ok(());
+		}
+		let redistribution_account = Self::redistribution_account(collateral_id, stable_id);
+		let (credit, shortfall) = T::CollateralAssets::slash(
+			collateral_id.clone(),
+			&HoldReason::VaultCollateral.into(),
+			&redistribution_account,
+			amount,
+		);
+		if !shortfall.is_zero() {
+			defensive!("redistribution-account hold fell short of the swept amount");
+			return Err(DispatchError::Corruption);
+		}
+		debug_assert_eq!(credit.peek(), amount);
+		T::OrphanCollateralHandler::on_unbalanced(credit);
+		Self::deposit_event(Event::OrphanCollateralSwept {
+			collateral_id: collateral_id.clone(),
+			stable_id: stable_id.clone(),
+			amount,
+		});
+		Ok(())
 	}
 
 	/// Project a vault touch without mutating storage.

@@ -101,6 +101,8 @@ fn cross_role_reuse_rejected_in_both_directions() {
 fn failed_registration_hook_rolls_back_everything() {
 	build_and_execute(|| {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		let redistribution = Pallet::<Test>::redistribution_account(&DOT, &PUSD);
+		let payer_before = collateral_balance(DOT, PUSD_OWNER);
 		FailOnRegistered::set(true);
 		assert_noop!(
 			Pallet::<Test>::create_branch(
@@ -116,6 +118,9 @@ fn failed_registration_hook_rolls_back_everything() {
 		assert_eq!(role_of(DOT), None);
 		assert_eq!(role_of(AssetId::WithId(PUSD)), None);
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0, "deposit hold rolled back");
+		assert_eq!(collateral_balance(DOT, PUSD_OWNER), payer_before, "seed funding rolled back");
+		assert_eq!(collateral_balance(DOT, redistribution), 0, "seed custody rolled back");
+		assert_eq!(System::providers(&redistribution), 0, "provider reference rolled back");
 
 		// The same creation lands once the sibling stops failing.
 		FailOnRegistered::set(false);

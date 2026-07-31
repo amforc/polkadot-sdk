@@ -640,12 +640,12 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 
 	/// Returns whether no vault liability remains.
 	///
-	/// Other debt or collateral may still remain. Use [`Self::is_removable`] before removing the
-	/// market.
+	/// Pending redistribution is not consulted: per-vault flooring can leave a residue there,
+	/// and with no principal and no stake left nothing can consume it, so the sweeps take it
+	/// instead. Other debt or collateral may still remain. Use [`Self::is_removable`] before
+	/// removing the market.
 	pub fn is_empty_of_liability(&self) -> bool {
-		self.debt.principal.is_zero() &&
-			self.stakes.total.is_zero() &&
-			self.debt.pending_redistribution_principal.is_zero()
+		self.debt.principal.is_zero() && self.stakes.total.is_zero()
 	}
 
 	/// Returns whether the market has no debt, stake, or collateral.
@@ -663,15 +663,40 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 		self.debt.bad_debt = self.debt.bad_debt.saturating_sub(amount);
 	}
 
-	/// Moves ownerless debt and remaining interest into bad debt.
+	/// Takes every residual that no vault can claim, once no vault liability remains.
 	///
-	/// Returns the amount moved.
-	pub fn sweep_orphan_debt(&mut self) -> Balance {
-		let orphan = self.debt.minted_interest.saturating_add(self.ownerless_debt);
+	/// Returns `None` and changes nothing while liability remains. Otherwise ownerless
+	/// debt, unattributed minted interest, and the unconsumable pending redistribution move
+	/// into bad debt — their stablecoin is still circulating, so only healing may retire
+	/// them — and the stranded interest weight is dropped with them. The returned
+	/// collateral is the redistribution account's whole remainder (per-stake dust plus
+	/// per-vault flooring residue); the caller must slash that hold and route the credit,
+	/// or the market can never be removed.
+	///
+	/// Debt and collateral settle in one operation so no caller can perform half the
+	/// terminal transition.
+	pub(crate) fn take_orphan_settlement(&mut self) -> Option<DebtCollateral<Balance>> {
+		if !self.is_empty_of_liability() {
+			return None;
+		}
+		let debt = self
+			.debt
+			.minted_interest
+			.saturating_add(self.ownerless_debt)
+			.saturating_add(self.debt.pending_redistribution_principal);
 		self.debt.minted_interest = Balance::zero();
 		self.ownerless_debt = Balance::zero();
-		self.debt.bad_debt = self.debt.bad_debt.saturating_add(orphan);
-		orphan
+		self.debt.pending_redistribution_principal = Balance::zero();
+		self.debt.weighted_principal_sum = Balance::zero();
+		self.debt.bad_debt = self.debt.bad_debt.saturating_add(debt);
+
+		let collateral = self.total_collateral;
+		self.ownerless_collateral = Balance::zero();
+		self.total_collateral = Balance::zero();
+
+		debug_assert!(self.ownerless_debt.is_zero());
+		debug_assert!(self.ownerless_collateral.is_zero());
+		Some(DebtCollateral { debt, collateral })
 	}
 }
 
@@ -917,6 +942,20 @@ pub struct Branch<AccountId, Balance, Consideration> {
 	pub admins: BranchAdmins<AccountId>,
 	/// Creator and refundable deposit, if one was charged.
 	pub deposit: Option<(AccountId, Consideration)>,
+	/// Free collateral that keeps the redistribution account able to accept holds.
+	///
+	/// This infrastructure deposit is not borrower collateral and is excluded from
+	/// [`BranchState::total_collateral`]. It is returned to `provider` when the market is removed.
+	pub redistribution_seed: RedistributionSeed<AccountId, Balance>,
+}
+
+/// Refundable infrastructure collateral for one market's redistribution account.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
+pub struct RedistributionSeed<AccountId, Balance> {
+	/// Account that funded the seed and receives it back at market removal.
+	pub provider: AccountId,
+	/// Free collateral deposited at registration.
+	pub amount: Balance,
 }
 
 #[cfg(test)]

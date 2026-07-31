@@ -166,6 +166,11 @@ pub mod pallet {
 		/// Receives stable-asset fees left by [`Config::YieldHook`].
 		type FeeHandler: OnUnbalanced<StableCreditOf<Self>>;
 
+		/// Handles collateral that no vault can claim once a market empties.
+		///
+		/// This is redistribution rounding dust. Sweeping it keeps an emptied market removable.
+		type OrphanCollateralHandler: OnUnbalanced<CollateralCreditOf<Self>>;
+
 		/// Receives the first share of interest and upfront fees.
 		///
 		/// The remaining credit is sent to [`Config::FeeHandler`].
@@ -192,13 +197,21 @@ pub mod pallet {
 
 		/// Origin allowed to create a market for a stable asset.
 		///
-		/// `Some(account)` charges that account the market deposit. `None` creates the market
-		/// without a deposit.
+		/// `Some(account)` charges that account the market deposit and the refundable collateral
+		/// seed. `None` creates the market without a storage deposit and uses
+		/// [`Config::ForceBranchSeedProvider`] for the seed.
 		type CreateOrigin: EnsureOriginWithArg<
 			Self::RuntimeOrigin,
 			StableIdOf<Self>,
 			Success = Option<Self::AccountId>,
 		>;
+
+		/// Funds the redistribution-account seed when [`Config::CreateOrigin`] returns `None`.
+		///
+		/// Force-origin market creation is deposit-free, but it still needs real collateral to
+		/// prepare the market's custody account. The configured account must hold the collateral
+		/// asset's minimum balance before governance creates the market.
+		type ForceBranchSeedProvider: Get<Self::AccountId>;
 
 		/// Refundable deposit charged for creating a market.
 		type Consideration: Consideration<Self::AccountId, Footprint>;
@@ -398,6 +411,15 @@ pub mod pallet {
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
 			/// Bad debt removed.
+			amount: BalanceOf<T>,
+		},
+		/// Unclaimable redistribution collateral left an emptied market.
+		OrphanCollateralSwept {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Collateral routed to [`Config::OrphanCollateralHandler`].
 			amount: BalanceOf<T>,
 		},
 		/// Collateral was added to a vault.
@@ -676,6 +698,9 @@ pub mod pallet {
 		JitSlippageExceeded,
 		/// Collateral could not be delivered during liquidation.
 		CollateralPayoutFailed,
+		/// The redistribution account's refundable collateral seed could not be funded or
+		/// returned.
+		RedistributionSeedUnavailable,
 		/// Another dormant vault is already first in the redemption queue.
 		DormantTargetOccupied,
 		/// The amount is zero.
@@ -1004,7 +1029,8 @@ pub mod pallet {
 		/// Must be signed by the account providing the collateral.
 		///
 		/// Any account may add collateral for a vault owner. The amount must be non-zero. Deposits
-		/// are allowed during final recovery.
+		/// are allowed during final recovery and while the market is frozen, but a dormant vault
+		/// accepts them only while it still has debt.
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::deposit_collateral_for())]
 		pub fn deposit_collateral_for(
@@ -1071,8 +1097,9 @@ pub mod pallet {
 		/// Must be signed by the account paying the stable assets.
 		///
 		/// Any account may repay for a vault owner. The amount must be non-zero and is capped at
-		/// the current debt. A vault in final recovery must leave final recovery before it can be
-		/// repaid.
+		/// the current debt. Repaying is allowed while the market is frozen, except for the final
+		/// repayment that would close the vault. A full repayment moves a final-recovery vault
+		/// out of the recovery queue: it becomes dormant, or closes when no collateral remains.
 		#[pallet::call_index(4)]
 		#[pallet::weight(T::WeightInfo::repay_for())]
 		pub fn repay_for(
@@ -1191,7 +1218,10 @@ pub mod pallet {
 		/// Must pass [`Config::CreateOrigin`] for the stable asset.
 		///
 		/// The assets must exist, the oracle must have a price, and the configuration must be
-		/// allowed. A non-privileged creator pays a refundable deposit.
+		/// allowed. A non-privileged creator pays a refundable storage deposit and funds one
+		/// collateral minimum balance in the redistribution account. A force-origin creation uses
+		/// [`Config::ForceBranchSeedProvider`] instead. The collateral seed stays free, is excluded
+		/// from market accounting, and is refunded when the market is removed.
 		#[pallet::call_index(10)]
 		#[pallet::weight(T::WeightInfo::create_branch())]
 		pub fn create_branch(

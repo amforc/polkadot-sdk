@@ -57,6 +57,8 @@ pub const ADMIN: AccountId = 100;
 pub const EMERGENCY_ADMIN: AccountId = 101;
 /// Account that receives the protocol fee remainder.
 pub const FEE_DEST: AccountId = 200;
+/// Account that receives swept orphan collateral.
+pub const ORPHAN_DEST: AccountId = 201;
 /// Owner allowed to create a PUSD market with a deposit.
 pub const PUSD_OWNER: AccountId = 1;
 /// Account that receives collateral consumed by the mocked Stability Pool.
@@ -222,6 +224,7 @@ impl pusd_primitives::ProvidePrice for MockOracle {
 
 parameter_types! {
 	pub const FeeDestAccount: AccountId = FEE_DEST;
+	pub const OrphanDestAccount: AccountId = ORPHAN_DEST;
 	/// Share of each fee assigned to the Stability Pool.
 	pub static SpFeeShare: Permill = Permill::from_percent(75);
 }
@@ -310,6 +313,7 @@ parameter_types! {
 	pub const MarketDepositReason: RuntimeHoldReason =
 		RuntimeHoldReason::Vaults(HoldReason::BranchCreationDeposit);
 	pub const MarketDepositBase: Balance = 1_000;
+	pub const ForceBranchSeedProvider: AccountId = 11;
 }
 
 /// Refundable 1,000-unit market creation deposit.
@@ -417,11 +421,13 @@ impl pallet_vaults::Config for Test {
 	type StableAssets = VaultStableAssets;
 	type Oracle = MockOracle;
 	type FeeHandler = DealWithFees;
+	type OrphanCollateralHandler = ResolveAssetTo<OrphanDestAccount, VaultCollateralAssets>;
 	type YieldHook = ();
 	type OnBranchLifecycle = RecordingLifecycle;
 	type StabilityPool = MockStabilityPool;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
+	type ForceBranchSeedProvider = ForceBranchSeedProvider;
 	type Consideration = VaultsConsideration;
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
@@ -482,7 +488,10 @@ pub fn new_test_ext() -> TestState {
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
-			balances: (1u64..=10u64).chain([SP_ACCOUNT]).map(|i| (i, 1_000_000_000_000)).collect(),
+			balances: (1u64..=10u64)
+				.chain([SP_ACCOUNT, ForceBranchSeedProvider::get()])
+				.map(|i| (i, 1_000_000_000_000))
+				.collect(),
 			..Default::default()
 		},
 	}
@@ -493,7 +502,7 @@ pub fn new_test_ext() -> TestState {
 		System::set_block_number(1);
 		Timestamp::set_timestamp(1_000);
 		// Native collateral is already funded. Mint the issued assets now.
-		for who in 1u64..=10 {
+		for who in (1u64..=10).chain([ForceBranchSeedProvider::get()]) {
 			for asset in [TOKEN_X_ID, ETH_ID, COLL_C_ID, COLL_D_ID] {
 				<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
 					asset,
@@ -526,6 +535,18 @@ pub fn build_and_execute(test: impl FnOnce()) {
 		test();
 		#[cfg(feature = "try-runtime")]
 		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
+	});
+}
+
+/// Like [`build_and_execute`], for `should_panic` tests of `defensive!` paths:
+/// `defensive!` logs an ERROR before panicking, and the hidden
+/// `construct_runtime` integrity test installs a global stderr subscriber that
+/// leaks that log past libtest's capture even when the test passes. The
+/// capture below keeps it silent on pass, visible on failure. No post-test
+/// invariant check: the panic aborts mid-transition by design.
+pub fn build_and_execute_defensive(test: impl FnOnce()) {
+	sp_tracing::capture_test_logs!(sp_tracing::Level::ERROR, true, {
+		new_test_ext().execute_with(test);
 	});
 }
 
@@ -580,6 +601,35 @@ pub fn create_market(
 	price: FixedU128,
 	config: BranchConfig<Balance>,
 ) {
+	// Root creation draws the refundable minimum-balance seed from the
+	// configured sponsor. Test-created assets fund that sponsor here rather
+	// than bypassing the branch lifecycle by funding its custody account.
+	let sponsor = ForceBranchSeedProvider::get();
+	let minimum =
+		<VaultCollateralAssets as FungiblesInspect<AccountId>>::minimum_balance(collateral.clone());
+	let free = <VaultCollateralAssets as FungiblesInspect<AccountId>>::balance(
+		collateral.clone(),
+		&sponsor,
+	);
+	if free < minimum {
+		use frame::traits::{
+			fungible::Mutate as FungibleMutate, fungibles::Mutate as FungiblesMutate,
+		};
+		match &collateral {
+			AssetId::Native => {
+				<Balances as FungibleMutate<AccountId>>::mint_into(&sponsor, minimum - free)
+					.expect("fund native force-origin branch seed provider");
+			},
+			AssetId::WithId(asset_id) => {
+				<Assets as FungiblesMutate<AccountId>>::mint_into(
+					*asset_id,
+					&sponsor,
+					minimum - free,
+				)
+				.expect("fund issued force-origin branch seed provider");
+			},
+		}
+	}
 	// Market creation requires a collateral price.
 	set_price(collateral.clone(), price);
 	Vaults::create_branch(

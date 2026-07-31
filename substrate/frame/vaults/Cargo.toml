@@ -27,6 +27,7 @@ pallet-assets-holder = { workspace = true, features = ["std"] }
 pallet-balances = { workspace = true, features = ["std"] }
 pallet-linked-list = { workspace = true, features = ["std"] }
 pallet-timestamp = { workspace = true, features = ["std"] }
+sp-tracing = { workspace = true, default-features = true }
 
 [features]
 default = ["std"]

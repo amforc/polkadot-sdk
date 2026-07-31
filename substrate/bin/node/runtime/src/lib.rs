@@ -3326,11 +3326,13 @@ impl pallet_vaults::Config for Runtime {
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
 	type FeeHandler = ResolveAssetTo<TreasuryAccount, Assets>;
+	type OrphanCollateralHandler = ResolveAssetTo<TreasuryAccount, VaultsCollateral>;
 	type YieldHook = Stability;
 	type OnBranchLifecycle = (Redemptions, Stability);
 	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
+	type ForceBranchSeedProvider = TreasuryAccount;
 	type Consideration = HoldConsideration<
 		AccountId,
 		Balances,

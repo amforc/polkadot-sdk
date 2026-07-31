@@ -18,7 +18,7 @@ use frame::{
 	benchmarking::prelude::*,
 	traits::{
 		fungibles::{
-			Balanced as FungiblesBalanced, Mutate as FungiblesMutate,
+			Balanced as FungiblesBalanced, Inspect as FungiblesInspect, Mutate as FungiblesMutate,
 			MutateHold as FungiblesMutateHold,
 		},
 		tokens::Precision,
@@ -125,6 +125,11 @@ fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkEr
 		asset.clone(),
 		FixedU128::saturating_from_integer(ORACLE_PRICE),
 	);
+	fund_collateral::<T>(
+		&asset,
+		&T::ForceBranchSeedProvider::get(),
+		T::CollateralAssets::minimum_balance(asset.clone()),
+	)?;
 	Pallet::<T>::create_branch(
 		create_origin::<T>()?,
 		asset.clone(),
@@ -747,6 +752,11 @@ mod benchmarks {
 			asset.clone(),
 			FixedU128::saturating_from_integer(ORACLE_PRICE),
 		);
+		fund_collateral::<T>(
+			&asset,
+			&T::ForceBranchSeedProvider::get(),
+			T::CollateralAssets::minimum_balance(asset.clone()),
+		)?;
 		let origin = create_origin::<T>()?;
 
 		#[extrinsic_call]

@@ -15,7 +15,10 @@ use frame::{
 	arithmetic::{
 		CheckedAdd, FixedPointNumber, FixedU128, One, Saturating, UniqueSaturatedInto, Zero,
 	},
-	traits::{fungibles::InspectHold, Convert, Time},
+	traits::{
+		fungibles::{Inspect as FungiblesInspect, InspectHold},
+		Convert, Time,
+	},
 	try_runtime::TryRuntimeError,
 };
 use linked_list_interface::SortedListInterface;
@@ -240,8 +243,10 @@ fn check_branch_identities<T: Config>(
 	let mut sum_weighted_principal = BalanceOf::<T>::zero();
 	let mut sum_weighted_stake = BalanceOf::<T>::zero();
 	let mut n_live_vaults: u128 = 0;
+	let mut n_rows: u128 = 0;
 
 	for (owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
+		n_rows = n_rows.saturating_add(1);
 		if vault.last_interest_time > tau {
 			return Err("vault last_interest_time ahead of interest_time(now)".into());
 		}
@@ -340,10 +345,15 @@ fn check_branch_identities<T: Config>(
 		return Err("pending redistribution principal drift exceeds rounding tolerance".into());
 	}
 
+	let redistribution_account = Pallet::<T>::redistribution_account(collateral_id, stable_id);
+	let seed_free = T::CollateralAssets::balance(collateral_id.clone(), &redistribution_account);
+	if seed_free < branch.redistribution_seed.amount {
+		return Err("redistribution-account free balance below its recorded seed".into());
+	}
 	let held_redistribution = T::CollateralAssets::balance_on_hold(
 		collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
-		&Pallet::<T>::redistribution_account(collateral_id, stable_id),
+		&redistribution_account,
 	);
 	let physical = sum_market_collateral
 		.checked_add(&held_redistribution)
@@ -364,6 +374,30 @@ fn check_branch_identities<T: Config>(
 	};
 	if collateral_drift > tolerance {
 		return Err("pending collateral share drift exceeds rounding tolerance".into());
+	}
+
+	// Once the last row leaves, the detach sweeps must have drained every
+	// residual bucket; only healable bad debt may remain, so `remove_branch`
+	// stays reachable.
+	if n_rows == 0 {
+		if !state.total_collateral.is_zero() {
+			return Err("emptied branch retains total_collateral".into());
+		}
+		if !state.ownerless_collateral.is_zero() {
+			return Err("emptied branch retains ownerless_collateral".into());
+		}
+		if !state.ownerless_debt.is_zero() {
+			return Err("emptied branch retains ownerless_debt".into());
+		}
+		if !state.debt.pending_redistribution_principal.is_zero() {
+			return Err("emptied branch retains pending redistribution principal".into());
+		}
+		if !state.debt.minted_interest.is_zero() {
+			return Err("emptied branch retains unattributed interest".into());
+		}
+		if !state.debt.weighted_principal_sum.is_zero() {
+			return Err("emptied branch retains interest weight".into());
+		}
 	}
 	Ok(())
 }
