@@ -144,11 +144,12 @@ fn repaying_frees_global_ceiling_headroom() {
 	});
 }
 
-/// The full recomputation the aggregate mirrors: Σ stored
-/// `outstanding()` over the collateral's markets.
+/// The full recomputation the aggregate mirrors: stored branch debt plus
+/// ownerless redistribution dust over the collateral's markets.
 fn recomputed_collateral_debt(collateral: AssetId) -> Balance {
-	crate::pallet::Branches::<Test>::iter_prefix(collateral)
-		.fold(0, |acc, (_stable, branch)| acc + branch.state.debt.outstanding())
+	crate::pallet::Branches::<Test>::iter_prefix(collateral).fold(0, |acc, (_stable, branch)| {
+		acc + branch.state.debt.outstanding() + branch.state.ownerless_debt
+	})
 }
 
 #[track_caller]
@@ -158,6 +159,8 @@ fn assert_aggregate_matches(collateral: AssetId) {
 		recomputed_collateral_debt(collateral),
 		"CollateralRisks aggregate diverged from the branch recomputation"
 	);
+	#[cfg(feature = "try-runtime")]
+	crate::try_state::do_try_state::<Test>().expect("all aggregate identities hold");
 }
 
 // The projected ceiling check counts the upfront fee, not just the proposed

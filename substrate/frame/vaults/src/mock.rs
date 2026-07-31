@@ -6,14 +6,14 @@
 use alloc::collections::BTreeMap;
 
 use crate as pallet_vaults;
-use crate::{pallet::Branches, types::BranchConfigGuard, BranchState, VaultListId};
+use crate::{pallet::Branches, types::BranchConfigBounds, BranchState, VaultListId};
 pub use crate::{
 	pallet::{BalanceOf, CollateralCreditOf, StableCreditOf},
 	types::BranchAdmins,
 	BranchConfig, BranchMode, Error, Event, HoldReason, Pallet,
 };
 pub use frame::{
-	arithmetic::{FixedPointNumber, FixedU128, Saturating},
+	arithmetic::{FixedPointNumber, FixedU128, Permill, Saturating},
 	prelude::{DispatchError, DispatchResult},
 	testing_prelude::{assert_err, assert_noop, assert_ok},
 };
@@ -315,7 +315,7 @@ parameter_types! {
 	pub const IdleMaxRefreshWeight: Option<Weight> = Some(Weight::MAX);
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
 	/// Global limits for test market settings.
-	pub TestBranchConfigGuard: BranchConfigGuard<Balance> = BranchConfigGuard {
+	pub TestBranchConfigBounds: BranchConfigBounds<Balance> = BranchConfigBounds {
 		min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
 		min_initial_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 		min_safety_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
@@ -329,7 +329,6 @@ parameter_types! {
 }
 
 impl pallet_vaults::Config for Test {
-	type RuntimeHoldReason = RuntimeHoldReason;
 	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = VaultStableAssets;
@@ -340,7 +339,7 @@ impl pallet_vaults::Config for Test {
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type Consideration = VaultsConsideration;
-	type BranchConfigGuard = TestBranchConfigGuard;
+	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
@@ -354,34 +353,13 @@ impl pallet_vaults::Config for Test {
 pub struct MockBenchmarkHelper;
 
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId, Balance> for MockBenchmarkHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for MockBenchmarkHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
 	}
 
 	fn stable_asset_id() -> StableId {
 		PUSD
-	}
-
-	fn mint_collateral(collateral_id: AssetId, who: &AccountId, amount: Balance) {
-		use frame::traits::fungible::Mutate as FungibleMutate;
-		// Fund the native minimum balance before minting collateral.
-		<Balances as FungibleMutate<AccountId>>::mint_into(who, 1).ok();
-		match collateral_id {
-			AssetId::Native => <Balances as FungibleMutate<AccountId>>::mint_into(who, amount)
-				.expect("mint native collateral for benchmark account"),
-			AssetId::WithId(asset_id) => {
-				<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
-					asset_id, who, amount,
-				)
-				.expect("mint asset collateral for benchmark account")
-			},
-		};
-	}
-
-	fn mint_stable(stable_id: StableId, who: &AccountId, amount: Balance) {
-		<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(stable_id, who, amount)
-			.expect("mint stable for benchmark account");
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
@@ -713,13 +691,9 @@ pub fn redeem_step(
 		DispatchError,
 	>,
 ) -> DispatchResult {
-	<Vaults as VaultInterface>::redeem_step(
-		&collateral,
-		&stable,
-		&owner,
-		&recipient,
-		build_settlement,
-	)
+	<Vaults as VaultInterface>::redeem_step(&collateral, &stable, &owner, &recipient, |snapshot| {
+		build_settlement(snapshot).map(|settlement| (settlement, ()))
+	})
 }
 
 /// Builds a redemption settlement with newly issued stable assets.
@@ -786,6 +760,14 @@ pub fn collateral_balance(collateral: AssetId, who: AccountId) -> Balance {
 /// Returns an account's balance of one stable asset.
 pub fn stable_balance(stable: StableId, who: AccountId) -> Balance {
 	<VaultStableAssets as FungiblesInspect<AccountId>>::balance(stable, &who)
+}
+
+/// Mints stable assets for liquidation and repayment tests.
+pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
+	<VaultStableAssets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
+		stable, &who, amount,
+	)
+	.expect("mint stable");
 }
 
 /// Returns the total issuance of one stable asset.

@@ -3,11 +3,12 @@
 use crate::{math, Millis};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::arithmetic::{
-	helpers_128bit::multiply_by_rational_with_rounding, CheckedAdd, CheckedMul, CheckedSub,
-	FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Rounding, Saturating, Zero,
+	helpers_128bit::multiply_by_rational_with_rounding, ArithmeticError, CheckedAdd, CheckedMul,
+	CheckedSub, FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Rounding, Saturating,
+	Zero,
 };
 use pusd_primitives::MILLIS_PER_YEAR;
-pub use pusd_primitives::{BranchMode, Position, StableListId as VaultListId, VaultStatus};
+pub use pusd_primitives::{BranchMode, DebtCollateral, StableListId as VaultListId, VaultStatus};
 use scale_info::TypeInfo;
 
 /// Reason a market is frozen.
@@ -69,18 +70,19 @@ impl<Balance: Zero> CollateralRisk<Balance> {
 	}
 }
 
-/// Principal and interest stored for a vault.
+/// A debt amount split into principal and interest.
 ///
-/// [`Self::cancel`] returns the cancelled amount in the same form.
+/// Vaults store their current debt in this form, and [`Self::cancel`] returns
+/// the cancelled amount in the same form.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
-pub struct VaultDebt<Balance> {
-	/// Borrowed stable assets that have not been repaid.
+pub struct DebtBreakdown<Balance> {
+	/// Principal portion of the debt amount.
 	pub principal: Balance,
-	/// Interest and fees that have not been repaid.
+	/// Interest and fee portion of the debt amount.
 	pub interest: Balance,
 }
 
-impl<Balance: Ord + Saturating + Copy> VaultDebt<Balance> {
+impl<Balance: Ord + Saturating + Copy> DebtBreakdown<Balance> {
 	/// Returns principal plus interest.
 	pub fn total(&self) -> Balance {
 		self.principal.saturating_add(self.interest)
@@ -99,9 +101,9 @@ impl<Balance: Ord + Saturating + Copy> VaultDebt<Balance> {
 	}
 }
 
-/// Snapshot of the market redistribution totals.
+/// Cumulative redistribution amounts per unit of stake.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct RedistributionSnapshot {
+pub struct RedistributionAccumulators {
 	/// Cumulative collateral assigned per unit of stake.
 	pub collateral_per_stake: FixedU128,
 	/// Cumulative debt assigned per unit of stake.
@@ -120,7 +122,7 @@ pub struct Vault<Balance> {
 	/// The owner's on-chain hold may also back vaults in other stable-asset markets.
 	pub collateral: Balance,
 	/// Current principal and interest.
-	pub debt: VaultDebt<Balance>,
+	pub debt: DebtBreakdown<Balance>,
 	/// Annual interest rate chosen by the owner.
 	pub annual_rate: FixedU128,
 	/// Market interest time of the last vault update.
@@ -132,20 +134,67 @@ pub struct Vault<Balance> {
 	/// This is zero during final recovery and otherwise equals [`Self::collateral`].
 	pub redistribution_stake: Balance,
 	/// Redistribution totals applied by the last vault update.
-	pub redistribution_snapshot: RedistributionSnapshot,
+	pub redistribution_checkpoint: RedistributionAccumulators,
+}
+
+/// The part of one vault represented in branch-wide accounting.
+///
+/// Replacing this value is the single ordinary vault-to-branch accounting
+/// primitive. Collateral is intentionally absent: it is managed separately
+/// because redistributed collateral is already included in the branch total.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct VaultContribution<Balance> {
+	principal: Balance,
+	interest: Balance,
+	weighted_principal: Balance,
+	stake: Balance,
+	weighted_stake: Balance,
+}
+
+impl<Balance: FixedPointOperand> VaultContribution<Balance> {
+	fn zero() -> Self {
+		Self {
+			principal: Zero::zero(),
+			interest: Zero::zero(),
+			weighted_principal: Zero::zero(),
+			stake: Zero::zero(),
+			weighted_stake: Zero::zero(),
+		}
+	}
+
+	fn of(vault: Option<&Vault<Balance>>) -> Result<Self, ArithmeticError> {
+		let Some(vault) = vault else { return Ok(Self::zero()) };
+		Ok(Self {
+			principal: vault.debt.principal,
+			interest: vault.debt.interest,
+			weighted_principal: vault
+				.annual_rate
+				.checked_mul_int(vault.debt.principal)
+				.ok_or(ArithmeticError::Overflow)?,
+			stake: vault.redistribution_stake,
+			weighted_stake: vault
+				.annual_rate
+				.checked_mul_int(vault.redistribution_stake)
+				.ok_or(ArithmeticError::Overflow)?,
+		})
+	}
 }
 
 impl<Balance> Vault<Balance> {
 	/// Returns whether the rate-change cooldown has passed.
-	pub(crate) fn cooldown_elapsed(&self, config: &BranchConfig<Balance>, now: Millis) -> bool {
+	pub(crate) const fn cooldown_elapsed(
+		&self,
+		config: &BranchConfig<Balance>,
+		now: Millis,
+	) -> bool {
 		now.saturating_sub(self.last_rate_update) >= config.rate_adjustment_cooldown
 	}
 }
 
 impl<Balance: Ord + Saturating + Copy> Vault<Balance> {
 	/// The debt/collateral pair the CR gates read.
-	pub fn position(&self) -> Position<Balance> {
-		Position { debt: self.debt.total(), collateral: self.collateral }
+	pub fn position(&self) -> DebtCollateral<Balance> {
+		DebtCollateral { debt: self.debt.total(), collateral: self.collateral }
 	}
 }
 
@@ -310,7 +359,7 @@ impl<Balance: Zero> StablecoinDebtState<Balance> {
 
 /// Redistribution stake totals for one market.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug, Default)]
-pub struct BranchStakes<Balance> {
+pub struct RedistributionStakeTotals<Balance> {
 	/// Total stake of eligible vaults.
 	pub total: Balance,
 	/// Sum of each vault's annual rate multiplied by its stake.
@@ -325,7 +374,7 @@ pub struct BranchState<AccountId, Balance> {
 	/// Market debt totals.
 	pub debt: BranchDebt<Balance>,
 	/// Market redistribution stake totals.
-	pub stakes: BranchStakes<Balance>,
+	pub stakes: RedistributionStakeTotals<Balance>,
 	/// Redistribution debt lost to per-stake rounding.
 	///
 	/// This becomes bad debt when no vault liability remains.
@@ -333,7 +382,7 @@ pub struct BranchState<AccountId, Balance> {
 	/// Redistribution collateral lost to per-stake rounding.
 	pub ownerless_collateral: Balance,
 	/// Current redistribution totals.
-	pub redistribution: RedistributionSnapshot,
+	pub redistribution: RedistributionAccumulators,
 	/// Wall-clock origin used to calculate market interest time.
 	///
 	/// Frozen periods move this value forward so interest does not accrue while frozen.
@@ -363,10 +412,10 @@ impl<AccountId, Balance: Default + Zero + Ord + Copy> BranchState<AccountId, Bal
 		Self {
 			total_collateral: Balance::zero(),
 			debt: BranchDebt::default(),
-			stakes: BranchStakes::default(),
+			stakes: RedistributionStakeTotals::default(),
 			ownerless_debt: Balance::zero(),
 			ownerless_collateral: Balance::zero(),
-			redistribution: RedistributionSnapshot::default(),
+			redistribution: RedistributionAccumulators::default(),
 			interest_epoch: now,
 			dormant_redemption_target: None,
 			frozen: None,
@@ -378,7 +427,7 @@ impl<AccountId, Balance: Default + Zero + Ord + Copy> BranchState<AccountId, Bal
 
 impl<AccountId, Balance> BranchState<AccountId, Balance> {
 	/// Returns whether the market is frozen.
-	pub fn is_frozen(&self) -> bool {
+	pub const fn is_frozen(&self) -> bool {
 		self.frozen.is_some()
 	}
 
@@ -414,118 +463,77 @@ impl<AccountId: PartialEq, Balance> BranchState<AccountId, Balance> {
 	}
 }
 
-impl<AccountId, Balance: FixedPointOperand + Saturating> BranchState<AccountId, Balance> {
-	/// Adds a vault to the market totals.
-	pub fn attach_vault(&mut self, vault: &Vault<Balance>) {
-		let rate_x_debt = vault.annual_rate.saturating_mul_int(vault.debt.principal);
-		let rate_x_stake = vault.annual_rate.saturating_mul_int(vault.redistribution_stake);
-		self.debt.principal = self.debt.principal.saturating_add(vault.debt.principal);
-		self.debt.minted_interest = self.debt.minted_interest.saturating_add(vault.debt.interest);
-		self.debt.weighted_principal_sum =
-			self.debt.weighted_principal_sum.saturating_add(rate_x_debt);
-		self.stakes.weighted_sum = self.stakes.weighted_sum.saturating_add(rate_x_stake);
-		self.stakes.total = self.stakes.total.saturating_add(vault.redistribution_stake);
-	}
-
-	/// Removes a vault from the market totals.
+impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSub>
+	BranchState<AccountId, Balance>
+{
+	/// Replace one vault's complete contribution to the market totals.
 	///
-	/// This is the exact inverse of [`Self::attach_vault`].
-	pub fn detach_vault(&mut self, vault: &Vault<Balance>) {
-		let rate_x_debt = vault.annual_rate.saturating_mul_int(vault.debt.principal);
-		let rate_x_stake = vault.annual_rate.saturating_mul_int(vault.redistribution_stake);
-		self.debt.principal = self.debt.principal.saturating_sub(vault.debt.principal);
-		self.debt.minted_interest = self.debt.minted_interest.saturating_sub(vault.debt.interest);
-		self.debt.weighted_principal_sum =
-			self.debt.weighted_principal_sum.saturating_sub(rate_x_debt);
-		self.stakes.weighted_sum = self.stakes.weighted_sum.saturating_sub(rate_x_stake);
-		self.stakes.total = self.stakes.total.saturating_sub(vault.redistribution_stake);
+	/// `None` is the zero contribution, so the same checked primitive handles
+	/// creation, mutation, and removal. Underflow means the branch/vault
+	/// accounting was already inconsistent; it must not be hidden by saturating
+	/// arithmetic.
+	pub(crate) fn replace_vault(
+		&mut self,
+		before: Option<&Vault<Balance>>,
+		after: Option<&Vault<Balance>>,
+	) -> Result<(), ArithmeticError> {
+		let before = VaultContribution::of(before)?;
+		let after = VaultContribution::of(after)?;
+		let shifted = |current: Balance, old: Balance, new: Balance| {
+			current
+				.checked_sub(&old)
+				.ok_or(ArithmeticError::Underflow)?
+				.checked_add(&new)
+				.ok_or(ArithmeticError::Overflow)
+		};
+
+		let principal = shifted(self.debt.principal, before.principal, after.principal)?;
+		let minted_interest = shifted(self.debt.minted_interest, before.interest, after.interest)?;
+		let weighted_principal = shifted(
+			self.debt.weighted_principal_sum,
+			before.weighted_principal,
+			after.weighted_principal,
+		)?;
+		let stake = shifted(self.stakes.total, before.stake, after.stake)?;
+		let weighted_stake =
+			shifted(self.stakes.weighted_sum, before.weighted_stake, after.weighted_stake)?;
+
+		self.debt.principal = principal;
+		self.debt.minted_interest = minted_interest;
+		self.debt.weighted_principal_sum = weighted_principal;
+		self.stakes.total = stake;
+		self.stakes.weighted_sum = weighted_stake;
+		Ok(())
 	}
 
-	/// Adds collateral to the market total.
-	pub fn add_collateral(&mut self, amount: Balance) {
-		self.total_collateral = self.total_collateral.saturating_add(amount);
-	}
-
-	/// Removes collateral from the market total.
-	pub fn remove_collateral(&mut self, amount: Balance) {
-		self.total_collateral = self.total_collateral.saturating_sub(amount);
-	}
-
-	/// Applies a vault payment to the market totals.
+	/// Remove the pending-pool side of principal assigned to a vault.
 	///
-	/// `principal_after` is the vault principal after [`VaultDebt::cancel`].
-	pub fn apply_debt_payment(
+	/// Redistribution initially enters the market at its average rate. The
+	/// caller subsequently adds the principal to the receiving vault through
+	/// [`Self::replace_vault`], which installs that vault's own rate weighting.
+	pub(crate) fn consume_redistributed_debt(
 		&mut self,
-		payment: VaultDebt<Balance>,
-		rate: FixedU128,
-		principal_after: Balance,
-	) {
-		self.debt.principal = self.debt.principal.saturating_sub(payment.principal);
-		self.debt.minted_interest = self.debt.minted_interest.saturating_sub(payment.interest);
-		let principal_before = principal_after.saturating_add(payment.principal);
-		self.debt.weighted_principal_sum = self
-			.debt
-			.weighted_principal_sum
-			.saturating_sub(rate.saturating_mul_int(principal_before))
-			.saturating_add(rate.saturating_mul_int(principal_after));
-	}
-
-	/// Replaces a vault's rate-weighted debt and stake.
-	pub fn change_vault_rate(
-		&mut self,
-		old_rate: FixedU128,
-		new_rate: FixedU128,
+		vault: &Vault<Balance>,
 		principal: Balance,
-		stake: Balance,
-	) {
-		self.debt.weighted_principal_sum = self
+	) -> Result<(), ArithmeticError> {
+		self.debt.pending_redistribution_principal = self
 			.debt
-			.weighted_principal_sum
-			.saturating_sub(old_rate.saturating_mul_int(principal))
-			.saturating_add(new_rate.saturating_mul_int(principal));
-		self.stakes.weighted_sum = self
-			.stakes
-			.weighted_sum
-			.saturating_sub(old_rate.saturating_mul_int(stake))
-			.saturating_add(new_rate.saturating_mul_int(stake));
-	}
-
-	/// Sets a vault's redistribution stake and updates the market totals.
-	///
-	/// The vault rate is not changed.
-	pub fn set_vault_stake(&mut self, vault: &mut Vault<Balance>, new_stake: Balance) {
-		let old_stake = vault.redistribution_stake;
-		self.stakes.total = self.stakes.total.saturating_sub(old_stake).saturating_add(new_stake);
-		self.stakes.weighted_sum = self
-			.stakes
-			.weighted_sum
-			.saturating_sub(vault.annual_rate.saturating_mul_int(old_stake))
-			.saturating_add(vault.annual_rate.saturating_mul_int(new_stake));
-		vault.redistribution_stake = new_stake;
-	}
-
-	/// Moves redistributed principal into a vault.
-	///
-	/// Redistribution first uses the market's average rate. This method replaces that weighting
-	/// with the receiving vault's rate.
-	pub fn absorb_redistributed_debt(&mut self, vault: &mut Vault<Balance>, principal: Balance) {
-		self.debt.pending_redistribution_principal =
-			self.debt.pending_redistribution_principal.saturating_sub(principal);
-		self.debt.principal = self.debt.principal.saturating_add(principal);
+			.pending_redistribution_principal
+			.checked_sub(&principal)
+			.ok_or(ArithmeticError::Underflow)?;
 		let delta_weight_per_stake = self
 			.redistribution
 			.weight_per_stake
-			.saturating_sub(vault.redistribution_snapshot.weight_per_stake);
-		let weight_to_remove =
-			delta_weight_per_stake.saturating_mul_int(vault.redistribution_stake);
-		let principal_before = vault.debt.principal;
-		vault.debt.principal = vault.debt.principal.saturating_add(principal);
+			.saturating_sub(vault.redistribution_checkpoint.weight_per_stake);
+		let weight_to_remove = delta_weight_per_stake
+			.checked_mul_int(vault.redistribution_stake)
+			.ok_or(ArithmeticError::Overflow)?;
 		self.debt.weighted_principal_sum = self
 			.debt
 			.weighted_principal_sum
-			.saturating_sub(weight_to_remove)
-			.saturating_sub(vault.annual_rate.saturating_mul_int(principal_before))
-			.saturating_add(vault.annual_rate.saturating_mul_int(vault.debt.principal));
+			.checked_sub(&weight_to_remove)
+			.ok_or(ArithmeticError::Underflow)?;
+		Ok(())
 	}
 
 	/// Returns whether no vault liability remains.
@@ -577,7 +585,7 @@ impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance
 	/// fields. Returns `None` if an accumulator would overflow.
 	pub fn record_redistribution(
 		&mut self,
-		redistributed: Position<Balance>,
+		redistributed: DebtCollateral<Balance>,
 		now: Millis,
 	) -> Option<()> {
 		let avg_rate = math::average_branch_rate(self.stakes.weighted_sum, self.stakes.total);
@@ -590,7 +598,7 @@ impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance
 		let now_fp = FixedU128::saturating_from_integer(self.interest_time(now));
 		let debt_time_increment = now_fp.checked_mul(&debt_per_stake)?;
 
-		self.redistribution = RedistributionSnapshot {
+		self.redistribution = RedistributionAccumulators {
 			debt_per_stake: self.redistribution.debt_per_stake.checked_add(&debt_per_stake)?,
 			collateral_per_stake: self
 				.redistribution
@@ -660,7 +668,7 @@ pub enum BranchConfigUpdate<Balance> {
 
 impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 	/// Applies this update to `config`.
-	pub fn apply_to(self, config: &mut BranchConfig<Balance>) {
+	pub const fn apply_to(self, config: &mut BranchConfig<Balance>) {
 		match self {
 			Self::MinimumCollateralizationRatio(v) => config.minimum_collateralization_ratio = v,
 			Self::InitialCollateralizationRatio(v) => config.initial_collateralization_ratio = v,
@@ -681,7 +689,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 	}
 
 	/// Returns the administrator role required for this update.
-	pub fn required_level(&self) -> AdminLevel {
+	pub const fn required_level(&self) -> AdminLevel {
 		match self {
 			Self::MinimumCollateralizationRatio(_) |
 			Self::InitialCollateralizationRatio(_) |
@@ -710,13 +718,19 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::BorrowRateBounds { min, max } => {
 				*max <= config.maximum_borrow_rate && *min >= config.minimum_borrow_rate
 			},
-			_ => true,
+			Self::MinimumDebt(_) |
+			Self::MinimumCollateral(_) |
+			Self::UpfrontFeePeriod(_) |
+			Self::RateAdjustmentCooldown(_) |
+			Self::RedistributionPenalty(_) |
+			Self::CeilingGap(_) |
+			Self::CeilingTtl(_) => true,
 		}
 	}
 }
 
 /// Global limits for market configuration.
-pub struct BranchConfigGuard<Balance> {
+pub struct BranchConfigBounds<Balance> {
 	/// Lowest allowed liquidation and final recovery ratio.
 	pub min_minimum_collateralization_ratio: FixedU128,
 	/// Lowest allowed ratio after borrowing or withdrawing collateral.
@@ -737,7 +751,7 @@ pub struct BranchConfigGuard<Balance> {
 	pub min_ceiling_ttl: Millis,
 }
 
-impl<Balance: PartialOrd + Copy + Zero> BranchConfigGuard<Balance> {
+impl<Balance: PartialOrd + Copy + Zero> BranchConfigBounds<Balance> {
 	/// Returns whether `config` is within the global limits.
 	///
 	/// The minimum increase delay applies only when automatic debt-limit updates are enabled.
@@ -817,10 +831,10 @@ mod tests {
 				weighted_principal_sum: weighted,
 				last_interest_time: 0,
 			},
-			stakes: BranchStakes { total: 0, weighted_sum: 0 },
+			stakes: RedistributionStakeTotals { total: 0, weighted_sum: 0 },
 			ownerless_debt: 0,
 			ownerless_collateral: 0,
-			redistribution: RedistributionSnapshot::default(),
+			redistribution: RedistributionAccumulators::default(),
 			interest_epoch: 0,
 			dormant_redemption_target: None,
 			frozen: None,
@@ -830,46 +844,91 @@ mod tests {
 	}
 
 	#[test]
-	fn apply_debt_payment_swaps_full_contribution() {
+	fn replace_vault_swaps_full_contribution() {
 		// The weighted contribution falls from 3 to 2. Subtracting
 		// `floor(rate * payment)` would subtract zero and leave the wrong value.
 		let rate = FixedU128::from_rational(3u128, 10u128);
 		let mut state = make_branch_state(10, 3);
-		state.apply_debt_payment(VaultDebt { interest: 0, principal: 1 }, rate, 9);
+		let before = Vault {
+			collateral: 0,
+			debt: DebtBreakdown { interest: 0, principal: 10 },
+			annual_rate: rate,
+			last_interest_time: 0,
+			last_rate_update: 0,
+			redistribution_stake: 0,
+			redistribution_checkpoint: RedistributionAccumulators::default(),
+		};
+		let mut after = before.clone();
+		after.debt.principal = 9;
+		state.replace_vault(Some(&before), Some(&after)).unwrap();
 		assert_eq!(state.debt.principal, 9);
 		assert_eq!(state.debt.weighted_principal_sum, 2);
 	}
 
 	#[test]
-	fn apply_debt_payment_full_payoff_clears_contribution() {
+	fn replace_vault_full_payoff_clears_contribution() {
 		let rate = FixedU128::from_rational(3u128, 10u128);
 		let mut state = make_branch_state(10, 3);
-		state.apply_debt_payment(VaultDebt { interest: 0, principal: 10 }, rate, 0);
+		let before = Vault {
+			collateral: 0,
+			debt: DebtBreakdown { interest: 0, principal: 10 },
+			annual_rate: rate,
+			last_interest_time: 0,
+			last_rate_update: 0,
+			redistribution_stake: 0,
+			redistribution_checkpoint: RedistributionAccumulators::default(),
+		};
+		let mut after = before.clone();
+		after.debt.principal = 0;
+		state.replace_vault(Some(&before), Some(&after)).unwrap();
 		assert_eq!(state.debt.principal, 0);
 		assert_eq!(state.debt.weighted_principal_sum, 0);
 	}
 
 	#[test]
-	fn absorb_redistributed_debt_swaps_avg_rate_weighting_for_own_rate() {
+	fn replace_vault_rejects_inconsistent_preimage_without_partial_update() {
+		let rate = FixedU128::from_rational(3u128, 10u128);
+		let mut state = make_branch_state(0, 0);
+		let before = Vault {
+			collateral: 0,
+			debt: DebtBreakdown { interest: 0, principal: 1 },
+			annual_rate: rate,
+			last_interest_time: 0,
+			last_rate_update: 0,
+			redistribution_stake: 0,
+			redistribution_checkpoint: RedistributionAccumulators::default(),
+		};
+		let state_before = state.clone();
+
+		assert_eq!(state.replace_vault(Some(&before), None), Err(ArithmeticError::Underflow));
+		assert_eq!(state, state_before);
+	}
+
+	#[test]
+	fn consume_redistributed_debt_swaps_avg_rate_weighting_for_own_rate() {
 		// Remove 2 of average-rate weight and 5 of old vault weight. Then add 6 for
 		// the new principal: 20 - 2 - 5 + 6 = 19.
 		let rate = FixedU128::from_rational(5u128, 10u128);
 		let mut state = make_branch_state(30, 20);
+		state.stakes = RedistributionStakeTotals { total: 10, weighted_sum: 5 };
 		state.debt.pending_redistribution_principal = 6;
 		state.redistribution.weight_per_stake = FixedU128::from_rational(3u128, 10u128);
 		let mut vault = Vault {
 			collateral: 10,
-			debt: VaultDebt { principal: 10, interest: 0 },
+			debt: DebtBreakdown { principal: 10, interest: 0 },
 			annual_rate: rate,
 			last_interest_time: 0,
 			last_rate_update: 0,
 			redistribution_stake: 10,
-			redistribution_snapshot: RedistributionSnapshot {
+			redistribution_checkpoint: RedistributionAccumulators {
 				weight_per_stake: FixedU128::from_rational(1u128, 10u128),
-				..RedistributionSnapshot::default()
+				..RedistributionAccumulators::default()
 			},
 		};
-		state.absorb_redistributed_debt(&mut vault, 3);
+		let before = vault.clone();
+		state.consume_redistributed_debt(&vault, 3).unwrap();
+		vault.debt.principal += 3;
+		state.replace_vault(Some(&before), Some(&vault)).unwrap();
 		assert_eq!(vault.debt.principal, 13);
 		assert_eq!(state.debt.principal, 33);
 		assert_eq!(state.debt.pending_redistribution_principal, 3);

@@ -294,7 +294,7 @@ fn check_branch_identities<T: Config>(
 		sum_stake = sum_stake
 			.checked_add(&vault.redistribution_stake)
 			.ok_or("branch stake sum overflow")?;
-		let snap = vault.redistribution_snapshot;
+		let snap = vault.redistribution_checkpoint;
 		let delta_debt = cumul_debt_ps.saturating_sub(snap.debt_per_stake);
 		sum_pending_debt_share = sum_pending_debt_share
 			.saturating_add(delta_debt.saturating_mul_int(vault.redistribution_stake));
