@@ -1,4 +1,5 @@
 use crate::{
+	interfaces::OffsetReservation,
 	math,
 	pallet::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, DepositOf, Deposits, Error, Event,
@@ -504,26 +505,6 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Read-only twin of [`Pallet::do_offset_liquidation`]'s sizing: the debt
-	/// active capital would cancel for `max_debt`. Both run
-	/// [`Pallet::size_active_offset`], so capacity and execution cannot drift.
-	pub(crate) fn active_offset_capacity(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		max_debt: BalanceOf<T>,
-		reserved: BalanceOf<T>,
-	) -> BalanceOf<T> {
-		let Ok(pool) = Self::load_pool(collateral_id, stable_id) else {
-			return BalanceOf::<T>::zero();
-		};
-		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
-			return BalanceOf::<T>::zero();
-		}
-		let pool_account = Self::pool_account(collateral_id, stable_id);
-		Self::size_active_offset(&pool, stable_id, &pool_account, max_debt, reserved)
-			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
-	}
-
 	/// The debt an active-pool offset of at most `max_debt` may burn: the
 	/// pool-depth and `minimum_active_pool_balance` clamp (§6.5), the pool
 	/// account's minimum-balance dead zone (with `reserved` set aside for
@@ -531,8 +512,10 @@ impl<T: Config> Pallet<T> {
 	/// (§6.4). The guard matters on the capacity side too — without it a
 	/// caller could allocate collateral to a stage that then steps aside,
 	/// stranding the slice. The returned `Preservation` sizes the burn debit;
-	/// it is only meaningful when `reserved` is zero.
-	fn size_active_offset(
+	/// with a non-zero `reserved` it is computed against the combined limit and
+	/// stays valid only if the reserved tranche is debited from the account
+	/// first (the offset session settles active before pending).
+	pub(crate) fn size_active_offset(
 		pool: &StabilityPoolOf<T>,
 		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
@@ -567,32 +550,12 @@ impl<T: Config> Pallet<T> {
 		Some((debt, preservation))
 	}
 
-	/// Read-only twin of [`Pallet::do_offset_pending_liquidation`]'s sizing:
-	/// the debt pending capital would cancel for `max_debt`. Both run
-	/// [`Pallet::size_pending_offset`], so capacity and execution cannot drift.
-	pub(crate) fn pending_offset_capacity(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		max_debt: BalanceOf<T>,
-		reserved: BalanceOf<T>,
-	) -> BalanceOf<T> {
-		let Ok(pool) = Self::load_pool(collateral_id, stable_id) else {
-			return BalanceOf::<T>::zero();
-		};
-		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
-			return BalanceOf::<T>::zero();
-		}
-		let pool_account = Self::pool_account(collateral_id, stable_id);
-		Self::size_pending_offset(&pool, stable_id, &pool_account, max_debt, reserved)
-			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
-	}
-
 	/// Pending-domain twin of [`Pallet::size_active_offset`]: the debt a §6.8
 	/// backstop offset of at most `max_debt` may burn. The
 	/// `minimum_active_pool_balance` floor applies here too — it is what sizes
 	/// the pool against `P`-precision exhaustion, and the pending `P` runs on
 	/// the same precision parameters.
-	fn size_pending_offset(
+	pub(crate) fn size_pending_offset(
 		pool: &StabilityPoolOf<T>,
 		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
@@ -660,147 +623,117 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §7.1: burn active-pool stablecoin against ordinary liquidation
-	/// debt, resolving the pro-rata slice of the offered collateral credit
-	/// into the pool account and distributing it to active depositors
-	/// through `S`. Sized by [`Pallet::size_active_offset`]; whatever the pool
-	/// cannot (or may not) take comes back as the credit remainder, with a
-	/// zero offset on a full step-aside.
-	pub(crate) fn do_offset_liquidation(
+	/// SPEC.md §7.1: settle one previously sized active-pool reservation
+	/// exactly — burn the reserved active-pool stablecoin against liquidation
+	/// debt and resolve the assigned collateral credit into the pool account,
+	/// distributing it to active depositors through `S`. The production
+	/// liquidation contract: the collateral is consumed in full and any
+	/// disagreement with the reservation aborts the transaction.
+	pub(crate) fn settle_active_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-		max_debt_to_offset: BalanceOf<T>,
+		pool_account: &T::AccountId,
+		pool: &mut StabilityPoolOf<T>,
+		reservation: OffsetReservation<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
-	) -> (BalanceOf<T>, CollateralCreditOf<T>) {
-		if collateral.asset() != *collateral_id {
-			return (BalanceOf::<T>::zero(), collateral);
-		}
-		let Ok(mut pool) = Self::load_pool(collateral_id, stable_id) else {
-			return (BalanceOf::<T>::zero(), collateral);
-		};
-		// Defense in depth: the vault engine already refuses to liquidate
-		// on a frozen branch.
-		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
-			return (BalanceOf::<T>::zero(), collateral);
-		}
-
-		let pool_account = Self::pool_account(collateral_id, stable_id);
-		let Some((sp_offset_debt, preservation)) = Self::size_active_offset(
-			&pool,
-			stable_id,
-			&pool_account,
-			max_debt_to_offset,
-			BalanceOf::<T>::zero(),
-		) else {
-			return (BalanceOf::<T>::zero(), collateral);
-		};
-		let sp_offset_collateral =
-			math::pro_rata_floor(collateral.peek(), sp_offset_debt, max_debt_to_offset);
-		let Ok(plan) = Self::plan_active_offset(
+	) -> DispatchResult {
+		ensure!(collateral.asset() == *collateral_id, Error::<T>::OffsetSettlementFailed);
+		let plan = Self::plan_active_offset(
 			collateral_id,
 			stable_id,
-			&pool,
-			sp_offset_debt,
-			sp_offset_collateral,
-		) else {
-			// Beyond supported precision (§6.4): the pool steps aside and
-			// the debt continues to the caller's next stage.
-			return (BalanceOf::<T>::zero(), collateral);
-		};
-
-		let remainder = match Self::resolve_and_burn(
+			pool,
+			reservation.debt,
+			collateral.peek(),
+		)?;
+		let collateral_amount = Self::settle_reservation_exact(
 			collateral_id,
 			stable_id,
-			&pool_account,
-			sp_offset_debt,
-			preservation,
-			sp_offset_collateral,
+			pool_account,
+			reservation,
 			collateral,
-		) {
-			Ok(remainder) => remainder,
-			Err(remainder) => return (BalanceOf::<T>::zero(), remainder),
-		};
-
+		)?;
 		Self::commit_active_offset(collateral_id, stable_id, &mut pool.state, plan);
 		Self::deposit_event(Event::PoolOffsetApplied {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
-			debt_burned: sp_offset_debt,
-			collateral_gain: sp_offset_collateral,
+			debt_burned: reservation.debt,
+			collateral_gain: collateral_amount,
 			epoch: pool.state.coords.epoch,
 			scale: pool.state.coords.scale,
 		});
-		Pools::<T>::insert(collateral_id, stable_id, pool);
-		(sp_offset_debt, remainder)
+		Ok(())
 	}
 
-	/// SPEC.md §7.2 / §6.8: the last-resort backstop — burn pending-deposit
+	/// SPEC.md §7.2 / §6.8: the last-resort backstop — settle one previously
+	/// sized pending-deposit reservation exactly, burning pending-deposit
 	/// stablecoin against liquidation debt that survived the active pool and
-	/// JIT liquidity, taking from ALL pending deposits pro-rata (design
-	/// decision 2026-07-29, replacing the spec sketch's oldest-first FIFO).
-	/// Runs the same plan → resolve → burn → commit shape as the active-pool
-	/// offset, on the pending accumulator pair; the active `P`/`S`/`G` are
-	/// never touched (invariant 11). An empty pending pool or zero remaining
-	/// debt no-ops with a zero offset and the untouched credit.
-	pub(crate) fn do_offset_pending_liquidation(
+	/// JIT liquidity. Takes from ALL pending deposits pro-rata (design
+	/// decision 2026-07-29, replacing the spec sketch's oldest-first FIFO) on
+	/// the pending accumulator pair; the active `P`/`S`/`G` are never touched
+	/// (invariant 11).
+	pub(crate) fn settle_pending_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-		max_debt_to_offset: BalanceOf<T>,
+		pool_account: &T::AccountId,
+		pool: &mut StabilityPoolOf<T>,
+		reservation: OffsetReservation<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
-	) -> (BalanceOf<T>, CollateralCreditOf<T>) {
-		if collateral.asset() != *collateral_id {
-			return (BalanceOf::<T>::zero(), collateral);
-		}
-		let Ok(mut pool) = Self::load_pool(collateral_id, stable_id) else {
-			return (BalanceOf::<T>::zero(), collateral);
-		};
-		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
-			return (BalanceOf::<T>::zero(), collateral);
-		}
-
-		let pool_account = Self::pool_account(collateral_id, stable_id);
-		let Some((debt, preservation)) = Self::size_pending_offset(
-			&pool,
-			stable_id,
-			&pool_account,
-			max_debt_to_offset,
-			BalanceOf::<T>::zero(),
-		) else {
-			return (BalanceOf::<T>::zero(), collateral);
-		};
-		let collateral_slice = math::pro_rata_floor(collateral.peek(), debt, max_debt_to_offset);
-		let Ok(plan) =
-			Self::plan_pending_offset(collateral_id, stable_id, &pool, debt, collateral_slice)
-		else {
-			// Beyond supported precision (§6.4): the backstop steps aside and
-			// the debt continues to redistribution.
-			return (BalanceOf::<T>::zero(), collateral);
-		};
-
-		let remainder = match Self::resolve_and_burn(
+	) -> DispatchResult {
+		ensure!(collateral.asset() == *collateral_id, Error::<T>::OffsetSettlementFailed);
+		let plan = Self::plan_pending_offset(
 			collateral_id,
 			stable_id,
-			&pool_account,
-			debt,
-			preservation,
-			collateral_slice,
+			pool,
+			reservation.debt,
+			collateral.peek(),
+		)?;
+		let collateral_amount = Self::settle_reservation_exact(
+			collateral_id,
+			stable_id,
+			pool_account,
+			reservation,
 			collateral,
-		) {
-			Ok(remainder) => remainder,
-			Err(remainder) => return (BalanceOf::<T>::zero(), remainder),
-		};
-
+		)?;
 		Self::commit_pending_offset(collateral_id, stable_id, &mut pool.state, plan);
 		Self::deposit_event(Event::PendingDepositOffsetApplied {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
-			debt_burned: debt,
-			collateral_gain: collateral_slice,
+			debt_burned: reservation.debt,
+			collateral_gain: collateral_amount,
 			epoch: pool.state.pending_coords.epoch,
 			scale: pool.state.pending_coords.scale,
 		});
-		Pools::<T>::insert(collateral_id, stable_id, pool);
-		(debt, remainder)
+		Ok(())
+	}
+
+	/// The exact-settlement core both accumulator domains share: burn the
+	/// reserved stable debit and resolve the whole collateral credit into the
+	/// pool account, aborting on any shortfall or leftover. Returns the
+	/// collateral amount consumed.
+	fn settle_reservation_exact(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		pool_account: &T::AccountId,
+		reservation: OffsetReservation<BalanceOf<T>>,
+		collateral: CollateralCreditOf<T>,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let collateral_amount = collateral.peek();
+		let remainder = Self::resolve_and_burn(
+			collateral_id,
+			stable_id,
+			pool_account,
+			reservation.debt,
+			reservation.preservation,
+			collateral_amount,
+			collateral,
+		)
+		.map_err(|credit| {
+			drop(credit);
+			Error::<T>::OffsetSettlementFailed
+		})?;
+		ensure!(remainder.peek().is_zero(), Error::<T>::OffsetSettlementFailed);
+		drop(remainder);
+		Ok(collateral_amount)
 	}
 
 	/// The shared active-pool accumulator math for ordinary liquidation and
@@ -1231,7 +1164,7 @@ impl<T: Config> Pallet<T> {
 	/// branch is Frozen (which includes oracle failure — the provider fails
 	/// closed). Returns the live mode for operations that differentiate
 	/// Normal from Safety.
-	fn ensure_not_frozen(
+	pub(crate) fn ensure_not_frozen(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 	) -> Result<BranchMode, DispatchError> {
