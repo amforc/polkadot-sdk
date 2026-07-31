@@ -178,6 +178,7 @@ pub fn clamp_offset_debt<Balance: FixedPointOperand + Ord>(
 /// `floor(amount * numerator / denominator)`: the pro-rata share of `amount`
 /// backing `numerator` out of `denominator`. Requires
 /// `numerator <= denominator`; zero when any input is zero.
+#[cfg(test)]
 pub fn pro_rata_floor<Balance: FixedPointOperand>(
 	amount: Balance,
 	numerator: Balance,
