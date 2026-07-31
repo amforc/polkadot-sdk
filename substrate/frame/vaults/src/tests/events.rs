@@ -20,7 +20,8 @@ fn open_vault_emits_canonical_events() {
 		});
 		// Upfront fee is non-trivial for these inputs.
 		let predicted_fee =
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100));
+			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100))
+				.expect("registered market");
 		assert!(predicted_fee > 0);
 		// The charged fee equals the vault's recorded interest; assert the
 		// event carries that amount.
@@ -157,7 +158,8 @@ fn premature_change_rate_emits_upfront_fee_charged() {
 		advance_time(12 * 3_600 * 1_000);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
 		let predicted =
-			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(7, 100));
+			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(7, 100))
+				.expect("registered market and vault");
 		assert!(predicted > 0);
 		assert_ok!(crate::Pallet::<Test>::change_rate(
 			RuntimeOrigin::signed(1),

@@ -48,25 +48,19 @@ mod tests;
 pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
-	BranchConfig, BranchConfigUpdate, BranchDebt, BranchMode, BranchStakes, BranchState,
-	FrozenReason, FrozenState, RedistributionSnapshot, StablecoinDebtState, Vault, VaultDebt,
-	VaultListId, VaultStatus,
+	BranchConfig, BranchConfigUpdate, BranchDebt, BranchMode, BranchState, DebtBreakdown,
+	DebtCollateral, FrozenReason, FrozenState, RedistributionAccumulators,
+	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultStatus,
 };
 pub use weights::WeightInfo;
 
-/// Runtime-supplied benchmark hooks. The pallet's `Config` only exposes
-/// oracle reads (`ProvidePrice`), clock reads (`Time`), and hold-only
-/// collateral mutation; the helper fills the write side.
+/// Runtime-specific benchmark fixtures and external-state mutation.
 #[cfg(feature = "runtime-benchmarks")]
-pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
+pub trait BenchmarkHelper<CollateralId, StableId> {
 	/// Returns a collateral asset ID.
 	fn collateral_asset_id() -> CollateralId;
 	/// Returns a stable asset ID.
 	fn stable_asset_id() -> StableId;
-	/// Gives collateral to an account.
-	fn mint_collateral(collateral_id: CollateralId, who: &AccountId, amount: Balance);
-	/// Gives stable assets to an account.
-	fn mint_stable(stable_id: StableId, who: &AccountId, amount: Balance);
 	/// Sets the price of a collateral asset.
 	fn set_oracle_price(collateral_id: CollateralId, price: frame::arithmetic::FixedU128);
 	/// Removes the price of a collateral asset.
@@ -81,7 +75,7 @@ pub mod pallet {
 	use crate::{
 		context::VaultOp,
 		recovery,
-		types::{AdminLevel, AssetRoleUsage, BranchAdmins, BranchConfigGuard},
+		types::{AdminLevel, AssetRoleUsage, BranchAdmins, BranchConfigBounds},
 	};
 	use alloc::{vec, vec::Vec};
 	use frame::{
@@ -142,15 +136,12 @@ pub mod pallet {
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
-		/// Runtime hold reason used for vault collateral and market deposits.
-		type RuntimeHoldReason: From<HoldReason>;
-
 		/// Multi-asset system used to hold collateral.
 		type CollateralAssets: FungiblesMutateHold<
 				Self::AccountId,
 				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance: FixedPointOperand,
-				Reason = Self::RuntimeHoldReason,
+				Reason: From<HoldReason>,
 			> + fungibles::BalancedHold<Self::AccountId>;
 
 		/// Multi-asset system used to mint and burn stable assets.
@@ -197,7 +188,7 @@ pub mod pallet {
 		type Consideration: Consideration<Self::AccountId, Footprint>;
 
 		/// Limits the configuration of every market.
-		type BranchConfigGuard: Get<BranchConfigGuard<BalanceOf<Self>>>;
+		type BranchConfigBounds: Get<BranchConfigBounds<BalanceOf<Self>>>;
 
 		/// Origin allowed to manage global limits and override market administrators.
 		type ForceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
@@ -224,12 +215,7 @@ pub mod pallet {
 
 		/// See [`crate::BenchmarkHelper`].
 		#[cfg(feature = "runtime-benchmarks")]
-		type BenchmarkHelper: crate::BenchmarkHelper<
-			CollateralIdOf<Self>,
-			StableIdOf<Self>,
-			Self::AccountId,
-			BalanceOf<Self>,
-		>;
+		type BenchmarkHelper: crate::BenchmarkHelper<CollateralIdOf<Self>, StableIdOf<Self>>;
 	}
 
 	/// Reason for holding funds.
@@ -242,13 +228,12 @@ pub mod pallet {
 	}
 
 	/// Authoritative vault state keyed by collateral, stable asset, and owner.
-	// Twox64Concat supports prefix iteration by market. Blake2_128Concat protects account keys.
 	#[pallet::storage]
 	pub type Vaults<T: Config> = StorageNMap<
 		_,
 		(
-			NMapKey<Twox64Concat, CollateralIdOf<T>>,
-			NMapKey<Twox64Concat, StableIdOf<T>>,
+			NMapKey<Blake2_128Concat, CollateralIdOf<T>>,
+			NMapKey<Blake2_128Concat, StableIdOf<T>>,
 			NMapKey<Blake2_128Concat, T::AccountId>,
 		),
 		Vault<BalanceOf<T>>,
@@ -261,9 +246,9 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type Branches<T: Config> = StorageDoubleMap<
 		_,
-		Twox64Concat,
+		Blake2_128Concat,
 		CollateralIdOf<T>,
-		Twox64Concat,
+		Blake2_128Concat,
 		StableIdOf<T>,
 		BranchOf<T>,
 		OptionQuery,
@@ -275,7 +260,7 @@ pub mod pallet {
 	/// zero.
 	#[pallet::storage]
 	pub type AssetRoles<T: Config> =
-		StorageMap<_, Twox64Concat, CollateralIdOf<T>, AssetRoleUsage, OptionQuery>;
+		StorageMap<_, Blake2_128Concat, CollateralIdOf<T>, AssetRoleUsage, OptionQuery>;
 
 	/// Global debt limit and current debt for each collateral asset.
 	///
@@ -284,7 +269,7 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type CollateralRisks<T: Config> = StorageMap<
 		_,
-		Twox64Concat,
+		Blake2_128Concat,
 		CollateralIdOf<T>,
 		crate::types::CollateralRisk<BalanceOf<T>>,
 		ValueQuery,
@@ -302,7 +287,7 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type StablecoinDebt<T: Config> = StorageMap<
 		_,
-		Twox64Concat,
+		Blake2_128Concat,
 		StableIdOf<T>,
 		crate::types::StablecoinDebtState<BalanceOf<T>>,
 		ValueQuery,
@@ -620,7 +605,7 @@ pub mod pallet {
 		BranchFrozen,
 		/// The oracle has no valid price for this collateral asset.
 		OraclePriceNotAvailable,
-		/// The oracle price is too old.
+		/// The oracle price is too old. Reserved for runtime oracle adapters.
 		OracleStale,
 		/// The rate-list hint is too far from the correct position.
 		///
@@ -677,21 +662,21 @@ pub mod pallet {
 	#[pallet::view_functions]
 	impl<T: Config> Pallet<T> {
 		/// Returns the vault's collateral ratio after pending updates.
+		///
+		/// Missing rows, oracle failure, and arithmetic failure are reported
+		/// explicitly. A debt-free vault has the maximum representable ratio.
 		pub fn vault_cr(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
-		) -> Option<FixedU128> {
-			let vault = Vaults::<T>::get((&collateral_id, &stable_id, &owner))?;
-			let state = Branches::<T>::get(&collateral_id, &stable_id)?.state;
-			let now = T::TimeProvider::now();
-			let price = T::Oracle::provide_price(&collateral_id).ok()?;
-			let pending = Self::pending_touch_for(&vault, &state, now);
-			let position = crate::types::Position {
-				debt: pending.total_debt(&vault.debt),
-				collateral: vault.collateral.saturating_add(pending.collateral),
-			};
-			collateralization_ratio(&position, price)
+		) -> Result<FixedU128, DispatchError> {
+			let draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
+			let price = T::Oracle::provide_price(&collateral_id)?;
+			if draft.vault.debt.total().is_zero() {
+				return Ok(FixedU128::max_value());
+			}
+			collateralization_ratio(&draft.vault.position(), price)
+				.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 		}
 
 		/// Returns the current vault status.
@@ -705,14 +690,17 @@ pub mod pallet {
 		}
 
 		/// Returns the market's total collateral ratio after pending interest.
+		///
+		/// Missing markets, oracle failure, and arithmetic failure are reported
+		/// explicitly.
 		pub fn branch_tcr(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-		) -> Option<FixedU128> {
-			let state = Branches::<T>::get(&collateral_id, &stable_id)?.state;
-			let price = T::Oracle::provide_price(&collateral_id).ok()?;
+		) -> Result<FixedU128, DispatchError> {
+			let state = Self::branch_of(&collateral_id, &stable_id)?.state;
+			let price = T::Oracle::provide_price(&collateral_id)?;
 			let now = T::TimeProvider::now();
-			Self::compute_tcr(&state, price, now).ok()
+			Self::compute_tcr(&state, price, now)
 		}
 
 		/// Returns up to `n` owners in redemption order.
@@ -797,8 +785,9 @@ pub mod pallet {
 
 		/// Returns the debt redeemed before the given annual rate.
 		///
-		/// The dormant target is counted first. The search visits at most `max_steps` vaults and
-		/// may return a partial sum.
+		/// Final recovery vaults are counted first (oldest first), then the dormant target, then
+		/// rate-list vaults below `rate`. The search visits at most `max_steps` vaults and may
+		/// return a partial sum.
 		pub fn debt_in_front(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -811,14 +800,32 @@ pub mod pallet {
 			};
 			let now = T::TimeProvider::now();
 			let mut steps_left = max_steps;
+			let recovery_list = recovery::list_id::<T>(&collateral_id, &stable_id);
+			for owner in T::VaultLists::iter_from_tail(recovery_list).take(steps_left as usize) {
+				steps_left -= 1;
+				if let Some(debt) = Self::projected_vault_debt(
+					&collateral_id,
+					&stable_id,
+					&owner,
+					&branch.state,
+					now,
+				) {
+					total = total.saturating_add(debt);
+				}
+			}
 			if let Some(target) = &branch.state.dormant_redemption_target {
 				if steps_left == 0 {
 					return total;
 				}
 				steps_left -= 1;
-				if let Some(v) = Vaults::<T>::get((&collateral_id, &stable_id, target)) {
-					let pending = Self::pending_touch_for(&v, &branch.state, now);
-					total = total.saturating_add(pending.total_debt(&v.debt));
+				if let Some(debt) = Self::projected_vault_debt(
+					&collateral_id,
+					&stable_id,
+					target,
+					&branch.state,
+					now,
+				) {
+					total = total.saturating_add(debt);
 				}
 			}
 			let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
@@ -831,9 +838,10 @@ pub mod pallet {
 				if priority >= rate {
 					break;
 				}
-				if let Some(v) = Vaults::<T>::get((&collateral_id, &stable_id, &o)) {
-					let pending = Self::pending_touch_for(&v, &branch.state, now);
-					total = total.saturating_add(pending.total_debt(&v.debt));
+				if let Some(debt) =
+					Self::projected_vault_debt(&collateral_id, &stable_id, &o, &branch.state, now)
+				{
+					total = total.saturating_add(debt);
 				}
 				cursor = neighbors.prev;
 			}
@@ -841,17 +849,20 @@ pub mod pallet {
 		}
 
 		/// Estimates the upfront fee for opening a vault.
+		///
+		/// Uses the same accrued branch draft and fee transition as execution.
 		pub fn predict_open_upfront_fee(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			initial_debt: BalanceOf<T>,
 			annual_rate: FixedU128,
-		) -> BalanceOf<T> {
-			let Some(branch) = Branches::<T>::get(&collateral_id, &stable_id) else {
-				return BalanceOf::<T>::zero();
-			};
+		) -> Result<BalanceOf<T>, DispatchError> {
+			let branch = Self::branch_of(&collateral_id, &stable_id)?;
 			let (config, mut state) = (branch.config, branch.state);
+			ensure!(!state.is_frozen(), Error::<T>::BranchFrozen);
+			Self::validate_rate(&config, annual_rate)?;
 			let now = T::TimeProvider::now();
+			Self::accrue_aggregate_interest(&mut state, now)?;
 			let mut scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
 			Self::apply_borrow_unchecked(
 				&mut state,
@@ -864,27 +875,27 @@ pub mod pallet {
 		}
 
 		/// Estimates the upfront fee for borrowing from a vault.
+		///
+		/// Applies the same pending touch as execution before pricing the fee.
 		pub fn predict_borrow_upfront_fee(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			debt_increase: BalanceOf<T>,
 			maybe_new_rate: Option<FixedU128>,
-		) -> BalanceOf<T> {
+		) -> Result<BalanceOf<T>, DispatchError> {
 			if debt_increase.is_zero() {
-				return BalanceOf::<T>::zero();
+				return Ok(BalanceOf::<T>::zero());
 			}
-			let Some((config, mut state, mut vault)) =
-				Self::predict_inputs(&collateral_id, &stable_id, &owner)
-			else {
-				return BalanceOf::<T>::zero();
-			};
-			let new_rate = maybe_new_rate.unwrap_or(vault.annual_rate);
+			let mut draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
+			ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
+			let new_rate = maybe_new_rate.unwrap_or(draft.vault.annual_rate);
+			Self::validate_rate(&draft.config, new_rate)?;
 			let now = T::TimeProvider::now();
 			Self::apply_borrow_unchecked(
-				&mut state,
-				&config,
-				&mut vault,
+				&mut draft.state,
+				&draft.config,
+				&mut draft.vault,
 				debt_increase,
 				new_rate,
 				now,
@@ -893,20 +904,25 @@ pub mod pallet {
 
 		/// Estimates the upfront fee for changing a vault's annual rate.
 		///
-		/// Returns zero when the rate-change cooldown has passed.
+		/// Applies the same pending touch as execution. Returns zero when the
+		/// rate-change cooldown has passed.
 		pub fn predict_rate_change_upfront_fee(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 			new_rate: FixedU128,
-		) -> BalanceOf<T> {
-			let Some((config, mut state, mut vault)) =
-				Self::predict_inputs(&collateral_id, &stable_id, &owner)
-			else {
-				return BalanceOf::<T>::zero();
-			};
+		) -> Result<BalanceOf<T>, DispatchError> {
+			let mut draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
+			ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
+			Self::validate_rate(&draft.config, new_rate)?;
 			let now = T::TimeProvider::now();
-			Self::apply_rate_change(&mut state, &config, &mut vault, new_rate, now)
+			Self::apply_rate_change(
+				&mut draft.state,
+				&draft.config,
+				&mut draft.vault,
+				new_rate,
+				now,
+			)
 		}
 	}
 
@@ -1160,7 +1176,7 @@ pub mod pallet {
 		/// Must be signed by a market administrator with the required role.
 		///
 		/// Emergency administrators may only reduce risk. The full configuration must remain within
-		/// [`Config::BranchConfigGuard`].
+		/// [`Config::BranchConfigBounds`].
 		#[pallet::call_index(11)]
 		#[pallet::weight(T::WeightInfo::set_param())]
 		pub fn set_param(
@@ -1365,9 +1381,7 @@ pub mod pallet {
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 		) -> T::AccountId {
-			let seed =
-				frame::deps::sp_io::hashing::blake2_256(&(collateral_id, stable_id).encode());
-			T::PalletId::get().into_sub_account_truncating(&seed[..24])
+			pusd_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
 		}
 	}
 }

@@ -10,13 +10,15 @@ use crate::{
 	},
 	recovery,
 	types::{
-		AdminLevel, BranchConfig, BranchMode, BranchState, PendingInterest, Position,
-		StablecoinDebtState, Vault, VaultDebt, VaultListId, VaultStatus,
+		AdminLevel, BranchConfig, BranchMode, BranchState, DebtBreakdown, DebtCollateral,
+		PendingInterest, StablecoinDebtState, Vault, VaultListId, VaultStatus,
 	},
 	weights::WeightInfo,
 };
 use frame::{
-	deps::frame_support::{storage::with_storage_layer, weights::WeightMeter},
+	deps::frame_support::{
+		require_transactional, storage::with_storage_layer, weights::WeightMeter,
+	},
 	prelude::*,
 	traits::{fungibles::Balanced as FungiblesBalanced, Defensive, DefensiveOption, Time},
 };
@@ -35,11 +37,12 @@ pub(crate) struct PendingTouch<Balance> {
 	pub interest: Balance,
 }
 
-impl<Balance: Ord + Saturating + Copy> PendingTouch<Balance> {
-	/// Entire debt the vault would have after a touch.
-	pub fn total_debt(&self, debt: &VaultDebt<Balance>) -> Balance {
-		debt.total().saturating_add(self.principal).saturating_add(self.interest)
-	}
+/// One fully touched vault and its isolated branch draft.
+pub(crate) struct TouchedVaultDraft<AccountId, Balance> {
+	pub(crate) config: BranchConfig<Balance>,
+	pub(crate) state: BranchState<AccountId, Balance>,
+	pub(crate) vault: Vault<Balance>,
+	pub(crate) status: VaultStatus,
 }
 
 /// How one idle-walk pass ended, deciding the cursor write.
@@ -55,7 +58,7 @@ enum WalkExit<K> {
 }
 
 /// The part of one branch that contributes to derived debt aggregates.
-pub(crate) struct BranchContribution<Balance> {
+struct BranchContribution<Balance> {
 	outstanding: Balance,
 	pending_interest: PendingInterest<Balance>,
 	active_weight: Balance,
@@ -66,7 +69,7 @@ impl<T: Config> Pallet<T> {
 	/// hint surfaces as [`Error::InvalidPositionHints`]; every other kind —
 	/// index/vault disagreement or the list's internal transactional limit
 	/// ([`ListError::Internal`]).
-	pub(crate) fn map_error(e: ListError) -> Error<T> {
+	pub(crate) const fn map_error(e: ListError) -> Error<T> {
 		match e {
 			ListError::InvalidPositionHints => Error::<T>::InvalidPositionHints,
 			ListError::ItemNotFound |
@@ -75,6 +78,50 @@ impl<T: Config> Pallet<T> {
 			ListError::CorruptList |
 			ListError::Internal => Error::<T>::RateIndexInvariantBroken,
 		}
+	}
+
+	/// Apply one vault touch to in-memory branch and vault drafts.
+	///
+	/// The branch's aggregate interest must already be accrued to `now`.
+	pub(crate) fn apply_vault_touch(
+		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
+		vault: &mut Vault<BalanceOf<T>>,
+		status: VaultStatus,
+		now: Millis,
+	) -> Result<PendingTouch<BalanceOf<T>>, DispatchError> {
+		debug_assert_eq!(state.debt.last_interest_time, state.interest_time(now));
+		let pending = Self::pending_touch_for(vault, state, now);
+
+		if !pending.interest.is_zero() {
+			vault.debt.interest = vault
+				.debt
+				.interest
+				.checked_add(&pending.interest)
+				.ok_or(Error::<T>::ArithmeticOverflow)?;
+		}
+		let accounted_before = vault.clone();
+
+		if !pending.principal.is_zero() {
+			state.consume_redistributed_debt(vault, pending.principal)?;
+			vault.debt.principal = vault
+				.debt
+				.principal
+				.checked_add(&pending.principal)
+				.ok_or(Error::<T>::ArithmeticOverflow)?;
+		}
+		if !pending.collateral.is_zero() {
+			vault.collateral = vault
+				.collateral
+				.checked_add(&pending.collateral)
+				.ok_or(Error::<T>::ArithmeticOverflow)?;
+		}
+		vault.redistribution_checkpoint = state.redistribution;
+		vault.last_interest_time = state.interest_time(now);
+		vault.redistribution_stake =
+			if status.is_final_recovery() { Zero::zero() } else { vault.collateral };
+
+		state.replace_vault(Some(&accounted_before), Some(vault))?;
+		Ok(pending)
 	}
 
 	/// Read the whole branch record, returning `BranchNotFound` when missing.
@@ -86,19 +133,24 @@ impl<T: Config> Pallet<T> {
 			.ok_or_else(|| Error::<T>::BranchNotFound.into())
 	}
 
-	/// Store an updated branch and update debt aggregates from its load-time contribution.
-	///
-	/// The caller owns both values from one load, avoiding a second read of the branch record.
+	/// Replace the stored branch and update derived aggregates from its
+	/// authoritative stored preimage.
+	#[require_transactional]
 	pub(crate) fn commit_branch(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		now: Millis,
-		before: BranchContribution<BalanceOf<T>>,
-		branch: BranchOf<T>,
+		state: BranchState<T::AccountId, BalanceOf<T>>,
 	) -> DispatchResult {
-		Self::update_branch_aggregates(collateral_id, stable_id, now, &before, &branch.state)?;
-		Branches::<T>::insert(collateral_id, stable_id, branch);
-		Ok(())
+		Branches::<T>::try_mutate_exists(collateral_id, stable_id, move |stored| {
+			let before = Self::branch_contribution(
+				&stored.as_ref().ok_or(Error::<T>::BranchNotFound)?.state,
+				now,
+			)?;
+			Self::update_branch_aggregates(collateral_id, stable_id, now, &before, &state)?;
+			stored.as_mut().ok_or(Error::<T>::BranchNotFound)?.state = state;
+			Ok(())
+		})
 	}
 
 	/// Mutate one branch's runtime state through its FRAME storage entry while
@@ -177,7 +229,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Derive the complete aggregate contribution of one branch at `now`.
-	pub(crate) fn branch_contribution(
+	fn branch_contribution(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
 	) -> Result<BranchContribution<BalanceOf<T>>, DispatchError> {
@@ -279,7 +331,7 @@ impl<T: Config> Pallet<T> {
 	/// Used by the open/borrow/withdraw safety gates. A `None` ratio (zero debt)
 	/// and a below-ICR ratio both surface as `UnsafeCollateralizationRatio`.
 	pub(crate) fn ensure_above_icr(
-		position: &Position<BalanceOf<T>>,
+		position: &DebtCollateral<BalanceOf<T>>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
@@ -296,7 +348,7 @@ impl<T: Config> Pallet<T> {
 	/// the branch MCR. Used by the enter-final-recovery gate. A `None` ratio
 	/// (zero debt) counts as too healthy.
 	pub(crate) fn ensure_below_mcr(
-		position: &Position<BalanceOf<T>>,
+		position: &DebtCollateral<BalanceOf<T>>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
@@ -312,7 +364,7 @@ impl<T: Config> Pallet<T> {
 	/// Ensure a vault's fully-accrued collateralization ratio is at or above the
 	/// branch MCR. Used by the exit-final-recovery gate.
 	pub(crate) fn ensure_at_or_above_mcr(
-		position: &Position<BalanceOf<T>>,
+		position: &DebtCollateral<BalanceOf<T>>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
@@ -520,7 +572,7 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		now: Millis,
 	) -> Result<FixedU128, DispatchError> {
-		let inputs = Position {
+		let inputs = DebtCollateral {
 			collateral: state.total_collateral,
 			debt: Self::accrued_branch_debt(state, now),
 		};
@@ -531,7 +583,7 @@ impl<T: Config> Pallet<T> {
 	/// the operation gate's load-time baseline so the pre and post sides of a
 	/// gate cannot diverge.
 	pub(crate) fn tcr_from_inputs(
-		inputs: &Position<BalanceOf<T>>,
+		inputs: &DebtCollateral<BalanceOf<T>>,
 		price: FixedU128,
 	) -> Result<FixedU128, DispatchError> {
 		if inputs.debt.is_zero() {
@@ -542,26 +594,31 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Accrue aggregate branch interest in memory and return the new amount.
+	///
+	/// Returns an error without advancing the aggregate when the realized
+	/// interest does not fit.
 	pub(crate) fn accrue_aggregate_interest(
 		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
-	) -> BalanceOf<T> {
+	) -> Result<BalanceOf<T>, DispatchError> {
 		let tau = state.interest_time(now);
 		let elapsed = tau.saturating_sub(state.debt.last_interest_time);
 		if elapsed == 0 {
-			return BalanceOf::<T>::zero();
+			return Ok(BalanceOf::<T>::zero());
 		}
 		let new_interest = math::simple_interest_ceil(
 			state.debt.weighted_principal_sum,
 			FixedU128::one(),
 			elapsed,
 		);
+		let minted_interest = state
+			.debt
+			.minted_interest
+			.checked_add(&new_interest)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		state.debt.minted_interest = minted_interest;
 		state.debt.last_interest_time = tau;
-		if new_interest.is_zero() {
-			return BalanceOf::<T>::zero();
-		}
-		state.debt.minted_interest = state.debt.minted_interest.saturating_add(new_interest);
-		new_interest
+		Ok(new_interest)
 	}
 
 	/// Issue `amount` of the market's coin (branch interest or an upfront
@@ -589,7 +646,7 @@ impl<T: Config> Pallet<T> {
 			math::simple_interest_floor(vault.debt.principal, vault.annual_rate, elapsed);
 
 		let redistribution = state.redistribution;
-		let snap = vault.redistribution_snapshot;
+		let snap = vault.redistribution_checkpoint;
 		if snap == redistribution {
 			return PendingTouch {
 				principal: BalanceOf::<T>::zero(),
@@ -627,12 +684,29 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
+	/// A vault's fully-accrued debt after its next touch. `None` when the row
+	/// is missing.
+	pub(crate) fn projected_vault_debt(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		owner: &T::AccountId,
+		state: &BranchState<T::AccountId, BalanceOf<T>>,
+		now: Millis,
+	) -> Option<BalanceOf<T>> {
+		let mut state = state.clone();
+		Self::accrue_aggregate_interest(&mut state, now).ok()?;
+		let mut vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
+		let status = Self::vault_status_of(collateral_id, stable_id, owner);
+		Self::apply_vault_touch(&mut state, &mut vault, status, now).ok()?;
+		Some(vault.debt.total())
+	}
+
 	/// A zero-debt, zero-stake vault row: the pre-borrow shape an open feeds
 	/// to [`Self::apply_borrow_unchecked`], so the open fee is priced by the same
 	/// code path as every borrow. The stake MUST be zero here — the borrow update
 	/// swaps the row's full aggregate contribution, and the open's stake
-	/// enters the aggregates via `set_vault_stake` after the borrow is
-	/// applied. The caller stamps the returned fee onto the row's debt.
+	/// enters the aggregates when the operation synchronizes the stake after
+	/// the borrow is applied.
 	pub(crate) fn open_scratch_row(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		annual_rate: FixedU128,
@@ -641,12 +715,12 @@ impl<T: Config> Pallet<T> {
 	) -> Vault<BalanceOf<T>> {
 		Vault {
 			collateral,
-			debt: VaultDebt { principal: Zero::zero(), interest: Zero::zero() },
+			debt: DebtBreakdown { principal: Zero::zero(), interest: Zero::zero() },
 			annual_rate,
 			last_interest_time: state.interest_time(now),
 			last_rate_update: now,
 			redistribution_stake: Zero::zero(),
-			redistribution_snapshot: state.redistribution,
+			redistribution_checkpoint: state.redistribution,
 		}
 	}
 
@@ -668,7 +742,7 @@ impl<T: Config> Pallet<T> {
 		debt_increase: BalanceOf<T>,
 		new_rate: FixedU128,
 		now: Millis,
-	) -> BalanceOf<T> {
+	) -> Result<BalanceOf<T>, DispatchError> {
 		let old_rate = vault.annual_rate;
 		let rate_changed = new_rate != old_rate;
 		let rate_change_fee_base = if rate_changed && !vault.cooldown_elapsed(config, now) {
@@ -676,22 +750,30 @@ impl<T: Config> Pallet<T> {
 		} else {
 			BalanceOf::<T>::zero()
 		};
-		state.detach_vault(vault);
-		vault.debt.principal = vault.debt.principal.saturating_add(debt_increase);
+		let before = vault.clone();
+		vault.debt.principal = vault
+			.debt
+			.principal
+			.checked_add(&debt_increase)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		vault.annual_rate = new_rate;
 		if rate_changed {
 			vault.last_rate_update = now;
 		}
-		state.attach_vault(vault);
+		state.replace_vault(Some(&before), Some(vault))?;
 		let avg = Self::avg_rate(state);
 		let fee = math::simple_interest_ceil(
 			debt_increase.saturating_add(rate_change_fee_base),
 			avg,
 			config.upfront_fee_period,
 		);
-		state.debt.minted_interest = state.debt.minted_interest.saturating_add(fee);
-		vault.debt.interest = vault.debt.interest.saturating_add(fee);
-		fee
+		if !fee.is_zero() {
+			let before_fee = vault.clone();
+			vault.debt.interest =
+				vault.debt.interest.checked_add(&fee).ok_or(Error::<T>::ArithmeticOverflow)?;
+			state.replace_vault(Some(&before_fee), Some(vault))?;
+		}
+		Ok(fee)
 	}
 
 	/// Apply a rate change's branch-side accounting to `state` and return the
@@ -702,28 +784,29 @@ impl<T: Config> Pallet<T> {
 		vault: &mut Vault<BalanceOf<T>>,
 		new_rate: FixedU128,
 		now: Millis,
-	) -> BalanceOf<T> {
+	) -> Result<BalanceOf<T>, DispatchError> {
 		let old_rate = vault.annual_rate;
 		if new_rate == old_rate {
-			return BalanceOf::<T>::zero();
+			return Ok(BalanceOf::<T>::zero());
 		}
-		state.change_vault_rate(
-			old_rate,
-			new_rate,
-			vault.debt.principal,
-			vault.redistribution_stake,
-		);
-		let fee = if vault.cooldown_elapsed(config, now) {
+		let cooldown_elapsed = vault.cooldown_elapsed(config, now);
+		let before = vault.clone();
+		vault.annual_rate = new_rate;
+		vault.last_rate_update = now;
+		state.replace_vault(Some(&before), Some(vault))?;
+		let fee = if cooldown_elapsed {
 			BalanceOf::<T>::zero()
 		} else {
 			let avg = Self::avg_rate(state);
 			math::simple_interest_ceil(vault.debt.principal, avg, config.upfront_fee_period)
 		};
-		state.debt.minted_interest = state.debt.minted_interest.saturating_add(fee);
-		vault.annual_rate = new_rate;
-		vault.last_rate_update = now;
-		vault.debt.interest = vault.debt.interest.saturating_add(fee);
-		fee
+		if !fee.is_zero() {
+			let before_fee = vault.clone();
+			vault.debt.interest =
+				vault.debt.interest.checked_add(&fee).ok_or(Error::<T>::ArithmeticOverflow)?;
+			state.replace_vault(Some(&before_fee), Some(vault))?;
+		}
+		Ok(fee)
 	}
 
 	/// The single target that preempts the rate index, with its status: the
@@ -775,21 +858,23 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Read the `(config, branch state, vault)` triple for a `predict_*` view.
-	/// Returns `None` if any row is missing — the predict APIs treat that as
-	/// "no fee" rather than an error.
-	pub(crate) fn predict_inputs(
+	/// Read and fully touch one vault into an isolated branch draft.
+	///
+	/// Views use the same transition kernel as execution, but the returned
+	/// drafts are never persisted and no collateral hold is moved.
+	pub(crate) fn touched_vault_draft(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
-	) -> Option<(
-		BranchConfig<BalanceOf<T>>,
-		BranchState<T::AccountId, BalanceOf<T>>,
-		Vault<BalanceOf<T>>,
-	)> {
-		let branch = Branches::<T>::get(collateral_id, stable_id)?;
-		let vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
-		Some((branch.config, branch.state, vault))
+	) -> Result<TouchedVaultDraft<T::AccountId, BalanceOf<T>>, DispatchError> {
+		let now = T::TimeProvider::now();
+		let branch = Self::branch_of(collateral_id, stable_id)?;
+		let mut state = branch.state;
+		Self::accrue_aggregate_interest(&mut state, now)?;
+		let mut vault = Self::vault_of(collateral_id, stable_id, owner)?;
+		let status = Self::vault_status_of(collateral_id, stable_id, owner);
+		Self::apply_vault_touch(&mut state, &mut vault, status, now)?;
+		Ok(TouchedVaultDraft { config: branch.config, state, vault, status })
 	}
 
 	/// Refresh markets and vaults with the block's leftover weight, clamped to
@@ -903,7 +988,12 @@ impl<T: Config> Pallet<T> {
 		});
 	}
 
-	/// TODO: DOC
+	/// Drive `step` over `iter`, charging `per_step` from `meter` for every
+	/// attempted step — failures included, since a failed attempt costs the
+	/// same execution. The terminal probe (one uncharged `iter.next()` after
+	/// the meter runs dry) only distinguishes [`WalkExit::Drained`] from
+	/// [`WalkExit::Parked`]; the probed key is re-read as the next pass's
+	/// first charged step.
 	fn idle_walk_pass<K>(
 		meter: &mut WeightMeter,
 		per_step: Weight,

@@ -168,7 +168,6 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
-		ensure!(!op.status().is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		// Never burn more than the current debt.
 		let repay = op.repayment_amount(amount);
 		T::StableAssets::burn_from(
@@ -379,7 +378,7 @@ impl<T: Config> Pallet<T> {
 		config: BranchConfig<BalanceOf<T>>,
 		depositor: Option<T::AccountId>,
 	) -> DispatchResult {
-		ensure!(T::BranchConfigGuard::get().permits(&config), Error::<T>::ConfigOutsideEnvelope);
+		ensure!(T::BranchConfigBounds::get().permits(&config), Error::<T>::ConfigOutsideEnvelope);
 		// A market needs a valid collateral price.
 		T::Oracle::provide_price(&collateral_id)
 			.map_err(|_| Error::<T>::OraclePriceNotAvailable)?;
@@ -494,22 +493,15 @@ impl<T: Config> Pallet<T> {
 		update: BranchConfigUpdate<BalanceOf<T>>,
 		level: AdminLevel,
 	) -> DispatchResult {
-		let guard = T::BranchConfigGuard::get();
+		let bounds = T::BranchConfigBounds::get();
 		Branches::<T>::try_mutate_exists(&collateral_id, &stable_id, |maybe| -> DispatchResult {
 			let branch = maybe.as_mut().ok_or(Error::<T>::BranchNotFound)?;
-			if let BranchConfigUpdate::RedistributionPenalty(penalty) = &update {
-				T::OnBranchLifecycle::validate_redistribution_penalty(
-					&collateral_id,
-					&stable_id,
-					*penalty,
-				)?;
-			}
 			let config = &mut branch.config;
 			if matches!(level, AdminLevel::Emergency) {
 				ensure!(update.is_defensive(config), Error::<T>::DefensiveActionNotDefensive);
 			}
 			update.clone().apply_to(config);
-			ensure!(guard.permits(config), Error::<T>::ConfigOutsideEnvelope);
+			ensure!(bounds.permits(config), Error::<T>::ConfigOutsideEnvelope);
 			Ok(())
 		})?;
 		Self::deposit_event(Event::ParameterUpdated { collateral_id, stable_id, update });
@@ -570,7 +562,7 @@ impl<T: Config> Pallet<T> {
 				let minted = match (state.frozen, target) {
 					(None, Some(_)) => {
 						// Apply interest up to the start of the freeze.
-						Self::accrue_aggregate_interest(state, now)
+						Self::accrue_aggregate_interest(state, now)?
 					},
 					(Some(frozen), None) => {
 						// Remove the frozen period from market interest time.

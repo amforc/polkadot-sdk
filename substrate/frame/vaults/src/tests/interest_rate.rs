@@ -70,6 +70,27 @@ fn open_sets_last_interest_time_to_now() {
 	});
 }
 
+#[test]
+fn aggregate_interest_overflow_is_rejected_without_advancing_state() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(100, 100)));
+		let mut state = branch_state(DOT, PUSD).unwrap();
+		state.debt.minted_interest = Balance::MAX;
+		advance_time(ONE_DAY_MS);
+		let before = state.clone();
+
+		assert_eq!(
+			crate::Pallet::<Test>::accrue_aggregate_interest(
+				&mut state,
+				pallet_timestamp::Pallet::<Test>::get()
+			),
+			Err(crate::Error::<Test>::ArithmeticOverflow.into())
+		);
+		assert_eq!(state, before);
+	});
+}
+
 // A vault is addressed by the `(collateral_id, caller)` storage key, so the
 // caller can only ever reach their own vault; another account simply has no
 // row to mutate. Access control falls out of the storage layout: changing a
@@ -159,7 +180,13 @@ fn change_rate_post_cooldown_full_state() {
 
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 		assert_eq!(
-			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(75, 100)),
+			crate::Pallet::<Test>::predict_rate_change_upfront_fee(
+				DOT,
+				PUSD,
+				1,
+				rate_pct(75, 100),
+			)
+			.expect("registered market and vault"),
 			0,
 			"post-cooldown rate change should quote no upfront fee",
 		);
@@ -197,7 +224,8 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 
 		let predicted =
-			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(75, 100));
+			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(75, 100))
+				.expect("registered market and vault");
 		assert!(predicted > 0, "premature change at debt=2000 must charge a fee");
 
 		assert_ok!(crate::Pallet::<Test>::change_rate(
@@ -262,7 +290,8 @@ fn borrow_full_state_changes() {
 
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		let predicted_fee =
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 500, None);
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 500, None)
+				.expect("registered market and vault");
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 
 		assert_ok!(crate::Pallet::<Test>::borrow(
@@ -299,7 +328,8 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 			1,
 			500,
 			Some(rate_pct(5, 100)),
-		);
+		)
+		.expect("registered market and vault");
 		assert!(predicted > 0);
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 
@@ -371,14 +401,16 @@ fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 		// rate-change fee would still apply if the rate were treated as changed.
 		advance_time(ONE_DAY_MS / 2);
 
-		let fee_pure = crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 500, None);
+		let fee_pure = crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 500, None)
+			.expect("registered market and vault");
 		let fee_same_rate = crate::Pallet::<Test>::predict_borrow_upfront_fee(
 			DOT,
 			PUSD,
 			1,
 			500,
 			Some(rate_pct(20, 100)),
-		);
+		)
+		.expect("registered market and vault");
 		assert_eq!(fee_pure, fee_same_rate, "an unchanged rate must not add a rate-change fee");
 
 		assert_ok!(crate::Pallet::<Test>::borrow(
@@ -580,7 +612,8 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 		register_market(DOT, PUSD);
 		let total_pre = <Pusd as FungibleInspect<AccountId>>::total_issuance();
 		let predicted_fee =
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100));
+			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100))
+				.expect("registered market");
 		assert!(predicted_fee > 0);
 
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(10, 100)));
@@ -692,7 +725,8 @@ fn open_fee_matches_post_open_average_rate_closed_form() {
 		assert!(expected > 0);
 
 		assert_eq!(
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, new_debt, new_rate),
+			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, new_debt, new_rate)
+				.expect("registered market"),
 			expected
 		);
 		assert_ok!(open(2, DOT, PUSD, 20_000, new_debt, new_rate));

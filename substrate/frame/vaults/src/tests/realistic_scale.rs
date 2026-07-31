@@ -51,7 +51,10 @@ fn lifecycle_exact_at_realistic_scale() {
 		assert!(fee > 0, "upfront fee recorded as interest");
 		let cr = crate::Pallet::<Test>::vault_cr(XBT, USDX, 1).expect("cr");
 		let expected = collateralization_ratio(
-			&pusd_primitives::Position { debt: 5_000 * USD + fee, collateral: 1_000 * XBT_UNIT },
+			&pusd_primitives::DebtCollateral {
+				debt: 5_000 * USD + fee,
+				collateral: 1_000 * XBT_UNIT,
+			},
 			FixedU128::from_rational(1u128, 1_000u128),
 		)
 		.expect("cr defined");
