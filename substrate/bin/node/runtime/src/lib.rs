@@ -3371,6 +3371,27 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 	}
 }
 
+#[cfg(feature = "runtime-benchmarks")]
+fn fund_vaults_benchmark_collateral(
+	asset_id: VaultsCollateralId,
+	who: &AccountId,
+	amount: Balance,
+) {
+	use frame_support::traits::{fungibles::Balanced as FungiblesBalanced, tokens::Precision};
+
+	if System::providers(who) == 0 {
+		System::inc_providers(who);
+	}
+	let debt = <VaultsCollateral as FungiblesBalanced<AccountId>>::deposit(
+		asset_id,
+		who,
+		amount,
+		Precision::Exact,
+	)
+	.expect("fund collateral for benchmark account");
+	drop(debt);
+}
+
 parameter_types! {
 	pub const InsurancePalletId: PalletId = PalletId(*b"py/insur");
 }
@@ -3446,7 +3467,6 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		// `create_branch` validates the oracle price, so set it first.
 		VaultsBenchmarkHelper::set_oracle_price(
 			collateral_id.clone(),
-			stable_id,
 			FixedU128::from_rational(10u128, 1u128),
 		);
 		let branch_config = pallet_vaults::BranchConfig {
@@ -3467,8 +3487,8 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		let full_admin: AccountId = frame_benchmarking::account("vaults_admin", 0, 0);
 		let emergency_admin: AccountId = frame_benchmarking::account("vaults_emergency", 0, 0);
 		let admins = pallet_vaults::types::BranchAdmins {
-			full_admin: OriginCaller::from(RawOrigin::Signed(full_admin)),
-			emergency_admin: OriginCaller::from(RawOrigin::Signed(emergency_admin)),
+			full_admin: <Runtime as frame_system::Config>::Lookup::unlookup(full_admin),
+			emergency_admin: <Runtime as frame_system::Config>::Lookup::unlookup(emergency_admin),
 		};
 		pallet_vaults::Pallet::<Runtime>::create_branch(
 			RawOrigin::Root.into(),
@@ -3492,7 +3512,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		let debt: Balance = 20 * DOLLARS; // above the 10-DOLLAR minimum_debt
 		for i in 0..vaults {
 			let owner: AccountId = frame_benchmarking::account("redemption_vault", i, 0);
-			VaultsBenchmarkHelper::mint_collateral(collateral_id.clone(), &owner, funding);
+			fund_vaults_benchmark_collateral(collateral_id.clone(), &owner, funding);
 			let rate = FixedU128::from_rational(u128::from(i) + 1, 1_000u128);
 			pallet_vaults::Pallet::<Runtime>::open_vault(
 				RawOrigin::Signed(owner).into(),
@@ -3509,7 +3529,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		let redeemer: AccountId = frame_benchmarking::account("redeemer", 0, 0);
 		// The redeemer receives collateral onto its free balance, so it must exist
 		// above the existential deposit before the redemption pays out.
-		VaultsBenchmarkHelper::mint_collateral(collateral_id.clone(), &redeemer, funding);
+		fund_vaults_benchmark_collateral(collateral_id.clone(), &redeemer, funding);
 		let budget = debt.saturating_mul(u128::from(vaults).saturating_add(2)).saturating_mul(2);
 		<Assets as FungiblesMutate<AccountId>>::mint_into(
 			stable_id,

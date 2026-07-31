@@ -5,8 +5,8 @@ use crate::{
 	Error, Event,
 };
 use pusd_primitives::{
-	collateralization_ratio, recovery_pricing, reducible_debit, LiquidationSettlement, Position,
-	RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
+	collateralization_ratio, recovery_pricing, reducible_debit, DebtCollateral,
+	LiquidationSettlement, RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
 };
 
 const HOUR_MS: Moment = 3_600 * 1_000;
@@ -108,7 +108,7 @@ fn branch_registration_rejects_invalid_default_redemption_config() {
 			Error::<Test>::InvalidRedemptionConfig
 		);
 		assert!(crate::RedemptionConfigs::<Test>::get(PUSD).is_none());
-		assert!(Vaults::branch_tcr(DOT, PUSD).is_none());
+		assert!(Vaults::branch_tcr(DOT, PUSD).is_err());
 	});
 }
 
@@ -773,7 +773,7 @@ fn recovery_bonus_buffer_keeps_redemption_cr_improving() {
 		mint_stable(PUSD, 3, 1_000_000);
 
 		let cr_before = collateralization_ratio(
-			&Position { debt: vault_debt(DOT, PUSD, 1), collateral: held(DOT, 1) },
+			&DebtCollateral { debt: vault_debt(DOT, PUSD, 1), collateral: held(DOT, 1) },
 			price,
 		)
 		.expect("finite CR");
@@ -793,7 +793,7 @@ fn recovery_bonus_buffer_keeps_redemption_cr_improving() {
 		// The 1% buffer keeps the bonus strictly below CR − 100%, so paying it
 		// must leave the vault's CR strictly better than before the redemption.
 		let cr_after = collateralization_ratio(
-			&Position { debt: vault_debt(DOT, PUSD, 1), collateral: held(DOT, 1) },
+			&DebtCollateral { debt: vault_debt(DOT, PUSD, 1), collateral: held(DOT, 1) },
 			price,
 		)
 		.expect("finite CR");
@@ -819,7 +819,7 @@ fn recovery_has_priority_over_ordinary_vaults() {
 		// which the cap starts binding, so the bonus must come out clamped to
 		// exactly the 5% redistribution penalty rather than the raw excess.
 		let cr = collateralization_ratio(
-			&Position { debt: v1_before, collateral: held(DOT, 1) },
+			&DebtCollateral { debt: v1_before, collateral: held(DOT, 1) },
 			FixedU128::from_rational(5u128, 4u128),
 		)
 		.expect("finite CR");
@@ -1483,8 +1483,6 @@ fn preview_matches_execution_for_partial_fill() {
 	});
 }
 
-/// Fully redistribute `owner`'s vault: no offset, all debt and collateral go
-/// to the surviving vaults.
 fn liquidate_redistribute_all(owner: AccountId) {
 	Vaults::execute_liquidation(&DOT, &PUSD, &owner, |_, mut collateral| {
 		let owner_surplus = collateral.extract(0);
@@ -2126,14 +2124,12 @@ fn example_2_redemption_creates_a_dormant_continuation_vault() {
 #[test]
 fn example_3_final_recovery_redemption_above_par() {
 	build_and_execute(|| {
-		let config = pallet_vaults::BranchConfig {
-			// The example's vault sits at CR 120%, so the MCR must exceed it.
-			minimum_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
-			initial_collateralization_ratio: FixedU128::from_rational(140u128, 100u128),
-			safety_collateralization_ratio: FixedU128::from_rational(150u128, 100u128),
-			redistribution_penalty: Permill::from_percent(10),
-			..example_config()
-		};
+		let mut config = example_config();
+		// The example's vault sits at CR 120%, so the MCR must exceed it.
+		config.minimum_collateralization_ratio = FixedU128::from_rational(130u128, 100u128);
+		config.initial_collateralization_ratio = FixedU128::from_rational(140u128, 100u128);
+		config.safety_collateralization_ratio = FixedU128::from_rational(150u128, 100u128);
+		config.redistribution_penalty = Permill::from_percent(10);
 		register_branch(DOT, PUSD, config);
 
 		// Open above the 140% ICR, then drop to the example's 1 DOT = 2 pUSD,
