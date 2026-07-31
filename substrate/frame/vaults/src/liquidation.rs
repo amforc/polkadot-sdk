@@ -1,8 +1,8 @@
-//! Atomic liquidation planning and settlement.
+//! Plans and settles each liquidation as one atomic transaction.
 //!
-//! Whenever a rounding direction matters, it favors the system: seizure
-//! rounds up against the owner, and offset collateral slices round down
-//! against their recipients.
+//! Seizure rounds up so fractional units cannot decrease the configured borrower loss.
+//! Each initial path share rounds down to prevent collateral over-allocation.
+//! The remainder rule then preserves exact collateral conservation.
 
 use crate::{
 	context::VaultOp,
@@ -77,6 +77,9 @@ struct LiquidationSettlement<Credit, Balance> {
 }
 
 impl<T: Config> Pallet<T> {
+	/// Executes liquidation and commits all custody changes as one transaction.
+	///
+	/// The transaction and offset session revert all changes if a later settlement fails.
 	#[transactional]
 	pub(crate) fn do_liquidate(
 		keeper: T::AccountId,
@@ -123,10 +126,10 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Removes the liquidated vault and settles collateral custody: the
-	/// redistribution credit parks under the market's redistribution-account
-	/// hold, the owner credit resolves free. Shared with the mock's
-	/// redistribution harness so the custody sequence cannot drift.
+	/// Finalizes the vault and transfers the two collateral credits.
+	///
+	/// This shared path keeps production and mock custody rules identical. The redistribution
+	/// account holds its collateral, and the owner receives surplus as free balance.
 	pub(crate) fn settle_liquidation_custody(
 		mut op: VaultOp<T>,
 		redistribution: DebtCollateral<BalanceOf<T>>,
@@ -217,8 +220,8 @@ impl<T: Config> Pallet<T> {
 		Ok(LiquidationSettlement { redistribution_collateral, owner_surplus, outcome })
 	}
 
-	/// Sizes the debt waterfall in resolution order: active pool capital,
-	/// keeper JIT, pending deposits, then redistribution for what remains.
+	// Reserves debt in liquidation priority order: active pool, keeper JIT, pending pool, and
+	// redistribution. A path receives only debt that higher-priority capital did not cover.
 	fn size_debt(
 		keeper: &T::AccountId,
 		stable_id: &StableIdOf<T>,
@@ -241,10 +244,10 @@ impl<T: Config> Pallet<T> {
 		))
 	}
 
-	/// Sizes the keeper's JIT contribution, bounded by the allowance, the
-	/// remaining debt, and the keeper's reducible stablecoin balance. A
-	/// system ask below `minimum_jit_contribution` skips JIT; a nonzero
-	/// keeper-side contribution below it is rejected rather than clamped.
+	// Limits keeper JIT to stablecoin that the keeper can burn. The limit uses residual debt, the
+	// allowance, and reducible balance. The protocol ignores a system ask below the market minimum
+	// because the keeper did not select it. It rejects a smaller keeper-side contribution to
+	// enforce the same minimum.
 	fn size_jit(
 		keeper: &T::AccountId,
 		stable_id: &StableIdOf<T>,
@@ -268,8 +271,8 @@ impl<T: Config> Pallet<T> {
 		Ok((funded, preservation))
 	}
 
-	/// Burns the keeper's JIT stablecoin and pays out its collateral slice.
-	/// The `min_collateral_out` floor applies only to an executed JIT trade.
+	// Burns stablecoin and pays collateral for an executed JIT trade. The output floor protects the
+	// keeper from adverse execution and has no effect when JIT debt is zero.
 	fn apply_jit(
 		keeper: &T::AccountId,
 		stable_id: &StableIdOf<T>,
@@ -311,9 +314,8 @@ impl<T: Config> Pallet<T> {
 	}
 }
 
-/// The stablecoin value a resolution path is entitled to: `debt * (1 +
-/// penalty)`. Rounding up matches the seizure cap, which is the sum of these,
-/// so the cap and the shares that divide it are the same numbers.
+// Returns one path's penalty-adjusted value and rounds it up. Thus, a fractional unit cannot
+// decrease the configured penalty for that path.
 fn penalty_weight<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	debt: Balance,
 	penalty: Permill,
@@ -321,12 +323,9 @@ fn penalty_weight<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	debt.checked_add(&penalty.mul_ceil(debt))
 }
 
-/// The most collateral a liquidation may seize, at the two prices the debt
-/// resolves at: debt an offset cancels carries `offset_penalty`, debt pushed
-/// onto other vaults the harsher `redistribution_penalty`.
-///
-/// `ceil((offset_debt * (1 + λ) + redistributed_debt * (1 + ρ)) / price)`.
-/// The caller clamps to the collateral actually held.
+// Limits borrower loss to the penalty-adjusted value of resolved debt. All offset debt uses
+// `offset_penalty`, while redistributed debt uses `redistribution_penalty`. The caller also limits
+// seizure to the collateral held.
 fn max_seizable_collateral<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	debt: LiquidationSplit<Balance>,
 	price: FixedU128,
@@ -339,9 +338,8 @@ fn max_seizable_collateral<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	collateral_for_value_ceil(value, price)
 }
 
-/// Keeper compensation paid from the seized collateral:
-/// `min(seized, cap, flat + percent)`, with the stablecoin-denominated flat
-/// and cap converted to collateral at the liquidation price.
+// Computes keeper compensation inside the seized collateral. The minimum rule keeps the reward
+// within the configured cap and available collateral.
 fn keeper_reward<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	seized: Balance,
 	price: FixedU128,
@@ -353,10 +351,9 @@ fn keeper_reward<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	Some(seized.min(cap).min(flat.checked_add(&percent)?))
 }
 
-/// One floored pro-rata share of the resolution lot per path, weighted by
-/// penalty-weighted debt. The flooring remainder goes to redistribution when
-/// redistributed debt exists, otherwise to the last non-zero offset path, so
-/// the lot is allocated exactly once.
+// Allocates resolution collateral by penalty-adjusted debt. Floor division prevents
+// over-allocation. If redistributed debt exists, it receives the remainder. Otherwise, the last
+// nonzero offset path receives it. This preserves exact collateral conservation.
 fn allocate_collateral<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	resolution: Balance,
 	debt: LiquidationSplit<Balance>,
@@ -399,10 +396,9 @@ fn allocate_collateral<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	Some(collateral)
 }
 
-/// Sizes one liquidation: seizure clamped to the collateral held, keeper
-/// compensation off the top (the penalties are gross of it), the remainder
-/// allocated by penalty weight, and everything unseized left as owner
-/// surplus.
+// Builds a liquidation plan that conserves collateral. Keeper compensation comes from seized
+// collateral before path allocation, so configured penalties measure total borrower loss. Unseized
+// collateral remains owner surplus.
 fn plan<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	total_collateral: Balance,
 	debt: LiquidationSplit<Balance>,
@@ -434,6 +430,8 @@ mod tests {
 		}
 	}
 
+	// This mixed case protects penalty allocation and conservation when floor division creates a
+	// remainder.
 	#[test]
 	fn mixed_split_is_penalty_weighted_and_allocated_exactly() {
 		let debt = LiquidationSplit {
@@ -442,9 +440,6 @@ mod tests {
 			pending_pool: 100,
 			redistribution: 200,
 		};
-		// The paths weigh 525/210/105/220, so 1_060 of value seizes 530 of the
-		// 600 held at price 2. The floored shares 262/105/52/110 sum to 529;
-		// the 1 remainder follows the redistributed debt.
 		let plan = plan(600, debt, FixedU128::from_rational(2, 1), &config()).unwrap();
 		assert_eq!(plan.seized, 530);
 		assert_eq!(plan.owner_surplus, 70);
@@ -460,6 +455,8 @@ mod tests {
 		assert_eq!(plan.collateral.checked_total(), Some(530));
 	}
 
+	// Keeper compensation must reduce path collateral because it is part of the borrower's total
+	// loss.
 	#[test]
 	fn keeper_reward_is_deducted_before_allocation() {
 		let mut policy = config();
@@ -482,6 +479,8 @@ mod tests {
 		assert_eq!(plan.collateral.active_pool, 373);
 	}
 
+	// Each reward bound must independently cap keeper compensation so it cannot exceed seized
+	// collateral or policy limits.
 	#[test]
 	fn keeper_reward_takes_the_binding_minimum() {
 		let reward = |flat: u128, percent: Permill, cap: u128, seized: u128| {
@@ -501,6 +500,8 @@ mod tests {
 		assert_eq!(reward(100, Permill::from_percent(10), 10_000, 500), Some(150));
 	}
 
+	// Separate penalties must make redistribution harsher than an offset. Zero penalties must
+	// preserve debt-value parity.
 	#[test]
 	fn max_seizable_prices_the_two_debt_kinds_apart() {
 		let seizable = |offset: u128, redistribution: u128, policy: &LiquidationConfig<u128>| {
@@ -523,9 +524,8 @@ mod tests {
 		assert_eq!(seizable(600, 400, &zero), Some(1_000));
 	}
 
-	// Unreachable through the extrinsic — a zero-debt vault has no defined CR
-	// and is never liquidatable — but pins the defensive arm: nothing seized,
-	// the whole lot returned as surplus.
+	// A zero-debt vault cannot reach liquidation, but this defensive case prevents an accidental
+	// collateral seizure.
 	#[test]
 	fn zero_debt_plan_seizes_nothing() {
 		let debt =
