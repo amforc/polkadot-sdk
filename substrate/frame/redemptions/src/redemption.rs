@@ -8,7 +8,7 @@ use crate::{
 		StableIdOf,
 	},
 	recovery::RecoveryPlan,
-	types::RedemptionState,
+	types::{RedemptionState, RedemptionTerms},
 };
 use frame::{
 	deps::sp_runtime::{
@@ -112,66 +112,48 @@ impl<T: Config> Pallet<T> {
 		redeemer: &T::AccountId,
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-		max_stable_in: BalanceOf<T>,
-		min_collateral_out: BalanceOf<T>,
+		terms: RedemptionTerms<BalanceOf<T>>,
 		recipient: &T::AccountId,
 		max_steps: u32,
 	) -> Result<u32, DispatchError> {
-		let inputs = Self::redemption_inputs(collateral_id, stable_id, max_stable_in)?;
+		let inputs = Self::redemption_inputs(collateral_id, stable_id, terms.max_stable_in)?;
 		let first_target = T::Vaults::next_redemption_target(collateral_id, stable_id, None)
 			.ok_or(Error::<T>::NoRedeemableVault)?;
 		let context =
 			WalkContext { redeemer, collateral_id, stable_id, recipient, price: inputs.price };
 
 		if first_target.1.is_final_recovery() {
-			return Self::redeem_recovery(
-				&context,
-				&inputs.config,
-				first_target.0,
-				max_stable_in,
-				min_collateral_out,
-			);
+			return Self::redeem_recovery(&context, &inputs.config, first_target.0, terms);
 		}
 
-		Self::redeem_ordinary(
-			&context,
-			&inputs.config,
-			first_target,
-			max_stable_in,
-			min_collateral_out,
-			max_steps,
-		)
+		Self::redeem_ordinary(&context, &inputs.config, first_target, terms, max_steps)
 	}
 
 	fn redeem_recovery(
 		context: &WalkContext<'_, T>,
 		config: &RedemptionConfigOf<T>,
 		owner: T::AccountId,
-		max_stable_in: BalanceOf<T>,
-		min_collateral_out: BalanceOf<T>,
+		terms: RedemptionTerms<BalanceOf<T>>,
 	) -> Result<u32, DispatchError> {
-		let budget = max_stable_in.min(Self::spendable_stable(context.stable_id, context.redeemer));
-		let mut applied = None;
-		T::Vaults::redeem_step(
+		let budget = terms
+			.max_stable_in
+			.min(Self::spendable_stable(context.stable_id, context.redeemer));
+		let plan = T::Vaults::redeem_step(
 			context.collateral_id,
 			context.stable_id,
 			&owner,
 			context.recipient,
-			|snapshot| {
-				let (settlement, plan) =
-					Self::execute_recovery_step(context, config, &snapshot, budget)?;
-				applied = plan;
-				Ok(settlement)
-			},
-		)?;
-		let plan = applied.ok_or(Error::<T>::NoRedeemableVault)?;
+			|snapshot| Self::execute_recovery_step(context, config, &snapshot, budget),
+		)?
+		.ok_or(Error::<T>::NoRedeemableVault)?;
 		let residual = if plan.settles_residual() {
 			Self::settle_recovery_residual(context.collateral_id, context.stable_id, &owner)?
 		} else {
 			Zero::zero()
 		};
 		ensure!(!plan.debt().is_zero() || !residual.is_zero(), Error::<T>::NoRedeemableVault);
-		let scaled_min = fees::scale_floor(min_collateral_out, plan.debt(), max_stable_in);
+		let scaled_min =
+			fees::scale_floor(terms.min_collateral_out, plan.debt(), terms.max_stable_in);
 		ensure!(plan.collateral() >= scaled_min, Error::<T>::SlippageExceeded);
 
 		Self::deposit_event(Event::RecoveryRedemptionExecuted {
@@ -237,13 +219,13 @@ impl<T: Config> Pallet<T> {
 		context: &WalkContext<'_, T>,
 		config: &RedemptionConfigOf<T>,
 		first_target: (T::AccountId, pusd_primitives::VaultStatus),
-		max_stable_in: BalanceOf<T>,
-		min_collateral_out: BalanceOf<T>,
+		terms: RedemptionTerms<BalanceOf<T>>,
 		max_steps: u32,
 	) -> Result<u32, DispatchError> {
 		let fee_inputs = Self::fee_inputs(context.stable_id, config);
 		let spendable = Self::spendable_stable(context.stable_id, context.redeemer);
-		let debt_budget = Self::ordinary_debt_budget(config, &fee_inputs, max_stable_in, spendable);
+		let debt_budget =
+			Self::ordinary_debt_budget(config, &fee_inputs, terms.max_stable_in, spendable);
 		ensure!(
 			debt_budget >= config.minimum_redemption_amount,
 			Error::<T>::InsufficientStableBalance
@@ -264,7 +246,7 @@ impl<T: Config> Pallet<T> {
 		Self::charge_fee(context.stable_id, context.redeemer, fee)?;
 
 		let redeemed = debt_budget.saturating_sub(result.remaining);
-		let scaled_min = fees::scale_floor(min_collateral_out, redeemed, max_stable_in);
+		let scaled_min = fees::scale_floor(terms.min_collateral_out, redeemed, terms.max_stable_in);
 		ensure!(result.collateral >= scaled_min, Error::<T>::SlippageExceeded);
 
 		Self::finalize_ordinary(context, config, &fee_inputs, &result, fee);
@@ -297,18 +279,12 @@ impl<T: Config> Pallet<T> {
 				break;
 			}
 
-			let mut applied = Step::Stop;
-			T::Vaults::redeem_step(
+			let applied = T::Vaults::redeem_step(
 				context.collateral_id,
 				context.stable_id,
 				&owner,
 				context.recipient,
-				|snapshot| {
-					let (settlement, step) =
-						Self::execute_ordinary_step(context, &snapshot, result.remaining)?;
-					applied = step;
-					Ok(settlement)
-				},
+				|snapshot| Self::execute_ordinary_step(context, &snapshot, result.remaining),
 			)?;
 			result.steps = result.steps.saturating_add(1);
 

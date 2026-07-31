@@ -4,6 +4,7 @@
 
 use crate::{
 	pallet::{BalanceOf, Call, Config, Pallet},
+	types::RedemptionTerms,
 	BenchmarkHelper as _,
 };
 use frame::{
@@ -27,8 +28,7 @@ mod benchmarks {
 			RawOrigin::Signed(redeemer),
 			collateral_id,
 			stable_id,
-			budget,
-			BalanceOf::<T>::zero(),
+			RedemptionTerms { max_stable_in: budget, min_collateral_out: BalanceOf::<T>::zero() },
 			recipient,
 			s,
 		);

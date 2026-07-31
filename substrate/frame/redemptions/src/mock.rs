@@ -218,8 +218,8 @@ pub type VaultsConsideration = HoldConsideration<
 
 parameter_types! {
 	/// Governance envelope the test default config sits comfortably inside.
-	pub TestBranchConfigGuard: pallet_vaults::types::BranchConfigGuard<Balance> =
-		pallet_vaults::types::BranchConfigGuard {
+	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds<Balance> =
+		pallet_vaults::types::BranchConfigBounds {
 			min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
 			min_initial_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 			min_safety_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
@@ -233,7 +233,6 @@ parameter_types! {
 }
 
 impl pallet_vaults::Config for Test {
-	type RuntimeHoldReason = RuntimeHoldReason;
 	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = Assets;
@@ -245,7 +244,7 @@ impl pallet_vaults::Config for Test {
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type Consideration = VaultsConsideration;
-	type BranchConfigGuard = TestBranchConfigGuard;
+	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
@@ -258,34 +257,13 @@ impl pallet_vaults::Config for Test {
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchHelper;
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId, Balance> for VaultsBenchHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
 	}
 
 	fn stable_asset_id() -> StableId {
 		PUSD
-	}
-
-	fn mint_collateral(collateral_id: AssetId, who: &AccountId, amount: Balance) {
-		use frame::traits::fungible::Mutate as FungibleMutate;
-		// Native ED first: fresh accounts need it before any other operation.
-		let _ = <Balances as FungibleMutate<AccountId>>::mint_into(who, 1);
-		match collateral_id {
-			AssetId::Native => {
-				<Balances as FungibleMutate<AccountId>>::mint_into(who, amount)
-					.expect("mint native collateral for benchmark account");
-			},
-			AssetId::WithId(asset_id) => {
-				<Assets as FungiblesMutate<AccountId>>::mint_into(asset_id, who, amount)
-					.expect("mint asset collateral for benchmark account");
-			},
-		};
-	}
-
-	fn mint_stable(stable_id: StableId, who: &AccountId, amount: Balance) {
-		<Assets as FungiblesMutate<AccountId>>::mint_into(stable_id, who, amount)
-			.expect("mint stable for benchmark account");
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
@@ -474,7 +452,7 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 pub fn usdx_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	pallet_vaults::BranchConfig {
 		// The largest ceiling the guard envelope admits: 1_000 coins.
-		debt_ceiling: TestBranchConfigGuard::get().max_debt_ceiling,
+		debt_ceiling: TestBranchConfigBounds::get().max_debt_ceiling,
 		minimum_debt: 200 * USDX_UNIT,
 		..default_branch_config()
 	}
@@ -542,8 +520,7 @@ pub fn redeem(
 		RuntimeOrigin::signed(who),
 		collateral,
 		stable,
-		max_pusd_in,
-		min_collateral_out,
+		crate::RedemptionTerms { max_stable_in: max_pusd_in, min_collateral_out },
 		recipient,
 		max_steps,
 	)
