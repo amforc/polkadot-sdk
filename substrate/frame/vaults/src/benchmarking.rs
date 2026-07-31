@@ -9,7 +9,7 @@ use crate::{
 		AccountIdLookupOf, BalanceOf, BranchIdleCursor, Branches, CollateralIdOf, Config,
 		GlobalDebtCeilings, IdleCursor, Pallet, RegistrationConfigOf, StableIdOf, Vaults,
 	},
-	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
+	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, JitTerms, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
 };
 use alloc::vec::Vec;
@@ -73,7 +73,14 @@ fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
 		maximum_borrow_rate: rate(100, 100),
 		upfront_fee_period: 7 * DAY_MS,
 		rate_adjustment_cooldown: DAY_MS,
-		redistribution_penalty: Permill::from_percent(5),
+		liquidation: crate::LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			keeper_flat_compensation_value: balance::<T>(100),
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: balance::<T>(10_000),
+			minimum_jit_contribution: balance::<T>(100),
+			redistribution_penalty: Permill::from_percent(5),
+		},
 	}
 }
 
@@ -823,6 +830,47 @@ mod benchmarks {
 		let branch =
 			Branches::<T>::get(&asset, &stable::<T>()).expect("branch present after register");
 		assert!(branch.state.frozen.is_some());
+		Ok(())
+	}
+
+	#[benchmark]
+	fn liquidate() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		let owner = funded_account::<T>("liquidatee", &asset)?;
+		let recipient = funded_account::<T>("recipient", &asset)?;
+		for (who, collateral) in [
+			(owner.clone(), balance::<T>(RECOVERY_VAULT_COLL)),
+			(recipient, balance::<T>(SEED_COLL)),
+		] {
+			Pallet::<T>::open_vault(
+				RawOrigin::Signed(who).into(),
+				asset.clone(),
+				stable::<T>(),
+				collateral,
+				balance::<T>(SEED_DEBT),
+				rate(5, 100),
+				Position::endpoints_only(),
+			)?;
+		}
+		T::BenchmarkHelper::set_oracle_price(
+			asset.clone(),
+			FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
+		);
+		let keeper: T::AccountId = whitelisted_caller();
+
+		#[extrinsic_call]
+		_(
+			RawOrigin::Signed(keeper),
+			asset.clone(),
+			stable::<T>(),
+			owner.clone(),
+			JitTerms {
+				max_stable: BalanceOf::<T>::zero(),
+				min_collateral_out: BalanceOf::<T>::zero(),
+			},
+		);
+
+		assert!(!Vaults::<T>::contains_key((&asset, stable::<T>(), owner)));
 		Ok(())
 	}
 

@@ -423,11 +423,7 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
 		// Redistribute vault 3's whole debt across the recipients (no offset).
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
 		assert_eq!(
 			vault(DOT, PUSD, 1).debt.principal,
 			vault_dormant_pre.debt.principal,

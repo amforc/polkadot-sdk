@@ -1,5 +1,5 @@
 //! Tests for the redistribution / aggregate-interest accounting identities and
-//! the FinalRecovery exit / orchestrator-trust hot spots after liquidations.
+//! the FinalRecovery exit and low-level liquidation accounting.
 //!
 //! Conventions:
 //! - Eligible vaults use snapshot-corrected stake. Only `FinalRecovery` vaults have zero stake.
@@ -176,11 +176,7 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_1 = held(DOT, 1);
-		assert_ok!(liquidate_with(DOT, PUSD, 1, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_1,
-			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 1, coll_1));
 
 		let state_pre = branch_state(DOT, PUSD).unwrap();
 		// Both the owned debt and the pending share use the recipient's rate.
@@ -206,11 +202,7 @@ fn mixed_rate_recipients_materialize_at_their_own_rates() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
 
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
@@ -298,13 +290,13 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
+		let interest_before = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest;
+		let predicted_fee =
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 200, None)
+				.expect("touch projection and fee calculation succeed");
 		assert_ok!(crate::Pallet::<Test>::borrow(
 			RuntimeOrigin::signed(1),
 			DOT,
@@ -314,6 +306,11 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 			None,
 			Position::endpoints_only()
 		));
+		assert_eq!(
+			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest,
+			interest_before + predicted_fee,
+			"the prediction and execution paths share the pending-touch kernel",
+		);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
 
 		let state = branch_state(DOT, PUSD).unwrap();
@@ -367,35 +364,35 @@ fn final_recovery_exit_requires_explicit_hint() {
 	});
 }
 
-// The mock orchestrator resolves the offset credit to its recipient before it
-// returns the redistribution and owner-surplus credits to Vaults.
+// The production path resolves active-pool collateral before returning the
+// owner's surplus.
 #[test]
-fn execute_liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
+fn liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
+		ActiveSpCapacity::set(1_000);
 
-		let recipient: AccountId = 999;
-		let pre_recipient = collateral_balance(DOT, recipient);
+		let pool_before = collateral_balance(DOT, SP_ACCOUNT);
+		let owner_before = collateral_balance(DOT, 1);
+		assert_ok!(liquidate(999, DOT, PUSD, 1, 0, 0));
 
-		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| LiquidationAllocation {
-			offset: OffsetAllocation {
-				collateral_recipient: recipient,
-				debt: post_touch,
-				collateral: 500,
-			},
-			redistribution_collateral: 0,
-			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
-		}));
-
-		let post_recipient = collateral_balance(DOT, recipient);
+		let outcome = System::events()
+			.into_iter()
+			.find_map(|record| match record.event {
+				RuntimeEvent::Vaults(crate::Event::VaultLiquidated { outcome, .. }) => {
+					Some(outcome)
+				},
+				_ => None,
+			})
+			.expect("liquidation event");
 		assert_eq!(
-			post_recipient.saturating_sub(pre_recipient),
-			500,
-			"offset.collateral should land on the offset recipient, not the liquidatee",
+			collateral_balance(DOT, SP_ACCOUNT) - pool_before,
+			outcome.active_pool.collateral
 		);
+		assert_eq!(collateral_balance(DOT, 1) - owner_before, outcome.owner_surplus);
 	});
 }
 
@@ -411,11 +408,7 @@ fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
 
 		for liquidatee in [1u64, 2u64] {
 			let collateral = held(DOT, liquidatee);
-			assert_ok!(liquidate_with(DOT, PUSD, liquidatee, |_| LiquidationAllocation {
-				offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-				redistribution_collateral: collateral,
-				keeper: KeeperCompensation { recipient: liquidatee, collateral: 0 },
-			}));
+			assert_ok!(redistribute_for_test(DOT, PUSD, liquidatee, collateral));
 			assert_accounting_identity_holds();
 		}
 	});
@@ -607,11 +600,7 @@ fn vault_cr_projects_lazy_redistribution_before_materialization() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
 		// Restore price so the view's CR is defined for vault 1.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
@@ -682,25 +671,32 @@ fn full_lifecycle_holds_branch_identities() {
 		// A month of accrual so touches materialise real interest.
 		advance_time(30 * 24 * 3_600 * 1_000);
 
-		// Liquidate vault 1 with a genuine three-way split: one third offset,
-		// the rest redistributed, plus keeper compensation.
+		// Liquidate vault 1 through the production three-way path: active
+		// Stability Pool, keeper JIT, then redistribution.
 		set_price(DOT, FixedU128::from_rational(55u128, 100u128));
 		let keeper_8_pre = collateral_balance(DOT, 8);
-		let offset_9_pre = collateral_balance(DOT, 9);
-		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| LiquidationAllocation {
-			offset: OffsetAllocation {
-				collateral_recipient: 9,
-				debt: post_touch / 3,
-				collateral: 100
-			},
-			redistribution_collateral: 500,
-			keeper: KeeperCompensation { recipient: 8, collateral: 10 },
-		}));
+		let pool_pre = collateral_balance(DOT, SP_ACCOUNT);
+		ActiveSpCapacity::set(200);
+		mint_stable(PUSD, 8, 200);
+		assert_ok!(liquidate(8, DOT, PUSD, 1, 200, 0));
 		assert_identities();
-		// Concrete payout legs (asserted even without the try-runtime identities): the
-		// keeper and the offset recipient receive exactly their allocated collateral.
-		assert_eq!(collateral_balance(DOT, 8), keeper_8_pre + 10);
-		assert_eq!(collateral_balance(DOT, 9), offset_9_pre + 100);
+		let outcome = System::events()
+			.into_iter()
+			.find_map(|record| match record.event {
+				RuntimeEvent::Vaults(crate::Event::VaultLiquidated { outcome, .. }) => {
+					Some(outcome)
+				},
+				_ => None,
+			})
+			.expect("liquidation event");
+		assert_ne!(outcome.active_pool.debt, 0);
+		assert_ne!(outcome.keeper_jit.debt, 0);
+		assert_ne!(outcome.redistribution.debt, 0);
+		assert_eq!(collateral_balance(DOT, SP_ACCOUNT) - pool_pre, outcome.active_pool.collateral);
+		assert_eq!(
+			collateral_balance(DOT, 8) - keeper_8_pre,
+			outcome.keeper_reward + outcome.keeper_jit.collateral
+		);
 
 		// The recipient must accrue interest from the redistribution time.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));

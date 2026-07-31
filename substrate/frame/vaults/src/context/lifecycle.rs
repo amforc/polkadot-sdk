@@ -2,9 +2,10 @@
 
 use super::{Commit, VaultOp};
 use crate::{
+	liquidation::LiquidationSnapshot,
 	pallet::{BalanceOf, Config, Error, Event, HoldReason, Pallet},
 	recovery,
-	types::{DebtCollateral, LiquidationSnapshot, Vault, VaultStatus},
+	types::{DebtCollateral, Vault, VaultStatus},
 };
 use frame::{
 	prelude::*,
@@ -22,6 +23,7 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 	) -> Result<LiquidationSnapshot<BalanceOf<T>>, DispatchError> {
 		self.finalize_terminal_interest()?;
+		let price = self.ctx.price()?;
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		let cr = self.ctx.collateralization_ratio(&self.vault.position())?;
 		ensure!(
@@ -31,7 +33,8 @@ impl<T: Config> VaultOp<T> {
 		ensure!(!self.is_only_stake_bearer(), Error::<T>::LastVaultCannotBeLiquidated);
 		Ok(LiquidationSnapshot {
 			debt: self.vault.debt.total(),
-			redistribution_penalty: self.ctx.config.redistribution_penalty,
+			price,
+			config: self.ctx.config.liquidation,
 		})
 	}
 
@@ -179,15 +182,12 @@ impl<T: Config> VaultOp<T> {
 		mut self,
 		redistribution: DebtCollateral<BalanceOf<T>>,
 	) -> DispatchResult {
-		ensure!(
-			redistribution.debt <= self.vault.debt.total(),
-			Error::<T>::InvalidLiquidationSettlement
-		);
+		ensure!(redistribution.debt <= self.vault.debt.total(), Error::<T>::InvalidLiquidationPlan);
 		let collateral_out = self
 			.vault
 			.collateral
 			.checked_sub(&redistribution.collateral)
-			.ok_or(Error::<T>::InvalidLiquidationSettlement)?;
+			.ok_or(Error::<T>::InvalidLiquidationPlan)?;
 		self.detach(collateral_out)?;
 		if !redistribution.debt.is_zero() || !redistribution.collateral.is_zero() {
 			self.ctx

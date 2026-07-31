@@ -29,6 +29,7 @@ extern crate alloc;
 mod context;
 mod dispatchable_impls;
 mod interfaces;
+mod liquidation;
 mod math;
 mod recovery;
 pub mod types;
@@ -52,8 +53,9 @@ pub use pusd_primitives;
 pub use types::{
 	AssetMinimums, BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate,
 	BranchDebt, BranchMode, BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState,
-	LiquidationSettlement, LiquidationSnapshot, RedistributionAccumulators, RedistributionCarry,
-	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
+	JitTerms, LiquidationConfig, LiquidationOutcome, LiquidationSettlement, LiquidationSnapshot,
+	RedistributionAccumulators, RedistributionCarry, RedistributionStakeTotals,
+	StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
 };
 pub use weights::WeightInfo;
 
@@ -78,7 +80,7 @@ pub mod pallet {
 	use crate::{
 		context::VaultOp,
 		recovery,
-		types::{AdminLevel, BranchAdmins, BranchConfigBounds},
+		types::{AdminLevel, BranchAdmins, BranchConfigBounds, JitTerms},
 	};
 	use alloc::{vec, vec::Vec};
 	use frame::{
@@ -94,6 +96,7 @@ pub mod pallet {
 	use linked_list_interface::{Position, PriorityProvider, SortedListInterface};
 	use pusd_primitives::{
 		collateralization_ratio, CollateralRatio, OnBranchLifecycle, OnBranchYield, ProvidePrice,
+		StabilityPoolOffsetApi,
 	};
 
 	/// Balance type used by collateral and stable assets.
@@ -192,6 +195,14 @@ pub mod pallet {
 
 		/// Notifies other pallets when a market is created or removed.
 		type OnBranchLifecycle: OnBranchLifecycle<CollateralIdOf<Self>, StableIdOf<Self>>;
+
+		/// Provides one transaction-local Stability Pool draft to liquidation.
+		type StabilityPool: StabilityPoolOffsetApi<
+			CollateralIdOf<Self>,
+			StableIdOf<Self>,
+			BalanceOf<Self>,
+			CollateralCreditOf<Self>,
+		>;
 
 		/// Provides UNIX time in milliseconds.
 		type TimeProvider: Time<Moment = Millis>;
@@ -589,6 +600,19 @@ pub mod pallet {
 			/// Vault rate used for the redemption fee.
 			vault_annual_rate: FixedU128,
 		},
+		/// An unsafe vault was closed through the liquidation waterfall.
+		VaultLiquidated {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Owner of the liquidated vault.
+			owner: T::AccountId,
+			/// Account that executed the liquidation.
+			keeper: T::AccountId,
+			/// Debt and collateral allocated through the liquidation waterfall.
+			outcome: LiquidationOutcome<BalanceOf<T>>,
+		},
 	}
 
 	#[pallet::error]
@@ -675,8 +699,8 @@ pub mod pallet {
 		ArithmeticOverflow,
 		/// An emergency administrator tried to increase risk.
 		DefensiveActionNotDefensive,
-		/// A liquidation supplied invalid debt or collateral amounts.
-		InvalidLiquidationSettlement,
+		/// Internal liquidation planning produced inconsistent value.
+		InvalidLiquidationPlan,
 		/// A redemption supplied invalid debt or collateral amounts.
 		InvalidRedemptionSettlement,
 		/// The last eligible vault cannot be liquidated.
@@ -687,6 +711,10 @@ pub mod pallet {
 		RedistributionWouldOverflow,
 		/// The vault is not eligible for liquidation.
 		VaultNotLiquidatable,
+		/// A non-zero direct keeper contribution is below the market minimum.
+		JitBelowMinimum,
+		/// Direct-offset collateral fell below the keeper's submitted floor.
+		JitSlippageExceeded,
 		/// Collateral could not be delivered to its recipient.
 		CollateralPayoutFailed,
 		/// Another dormant vault is already first in the redemption queue.
@@ -1389,6 +1417,39 @@ pub mod pallet {
 			let _ = T::CreateOrigin::ensure_origin(origin, &stable_id)?;
 			Self::do_set_global_debt_ceiling(stable_id, ceiling);
 			Ok(())
+		}
+
+		/// Liquidates an unsafe vault.
+		///
+		/// ## Dispatch Origin
+		///
+		/// Must be signed by the keeper executing the liquidation.
+		///
+		/// The vault must be below the market's minimum collateralization ratio and must not be
+		/// the market's last eligible vault.
+		///
+		/// Active Stability Pool capital is used first, followed by the
+		/// keeper's optional direct contribution, pending pool capital, and
+		/// finally redistribution.
+		///
+		/// ## Parameters
+		///
+		/// - `jit.max_stable`: Maximum stable assets the keeper allows the call to burn for a
+		///   direct contribution. Zero disables the contribution.
+		/// - `jit.min_collateral_out`: Minimum collateral allocated to an executed JIT slice,
+		///   excluding the keeper reward. This absolute floor is not scaled down for a partial JIT
+		///   execution, so it should reflect the smallest execution the keeper would accept.
+		#[pallet::call_index(19)]
+		#[pallet::weight(T::WeightInfo::liquidate())]
+		pub fn liquidate(
+			origin: OriginFor<T>,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			owner: T::AccountId,
+			jit: JitTerms<BalanceOf<T>>,
+		) -> DispatchResult {
+			let keeper = ensure_signed(origin)?;
+			Self::do_liquidate(keeper, collateral_id, stable_id, owner, jit)
 		}
 	}
 
