@@ -43,6 +43,7 @@ pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
 	RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, RedemptionQuote, RedemptionState,
+	RedemptionTerms,
 };
 pub use weights::WeightInfo;
 
@@ -60,7 +61,7 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 #[frame::pallet]
 pub mod pallet {
 	use super::*;
-	use crate::types::{RedemptionConfig, RedemptionQuote, RedemptionState};
+	use crate::types::{RedemptionConfig, RedemptionQuote, RedemptionState, RedemptionTerms};
 	use frame::{
 		deps::sp_runtime::{traits::Convert, FixedU128},
 		prelude::*,
@@ -313,15 +314,17 @@ pub mod pallet {
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// Cancels up to `max_stable_in` of vault debt, paying the redeemer collateral for it.
+		/// Cancels up to `terms.max_stable_in` of vault debt, paying the redeemer collateral for
+		/// it.
 		///
 		/// ## Dispatch Origin
 		///
 		/// Must be signed by the redeemer.
 		///
-		/// `max_stable_in` is the debt the redeemer is willing to cancel, **not** its total spend:
-		/// the redemption fee is charged on top, so the redeemer needs `max_stable_in` plus the fee
-		/// and the walk is bounded by what its balance covers at both.
+		/// `terms.max_stable_in` is the debt the redeemer is willing to cancel, **not** its total
+		/// spend: the redemption fee is charged on top, so the redeemer needs
+		/// `terms.max_stable_in` plus the fee and the walk is bounded by what its balance covers at
+		/// both.
 		///
 		/// The fee is charged once for the whole redemption, at the rate this redemption itself
 		/// raises the dynamic accelerator to — a large redemption after a quiet period pays the
@@ -331,29 +334,21 @@ pub mod pallet {
 		/// how many vaults the walk may touch; zero uses [`Config::MaxRedemptionSteps`]. Weight is
 		/// charged for the cap and refunded to the number of steps actually taken.
 		///
-		/// `min_collateral_out` is the redeemer's slippage floor. Partial fills scale it pro-rata
-		/// to the debt actually cancelled.
+		/// `terms.min_collateral_out` is the redeemer's slippage floor. Partial fills scale it
+		/// pro-rata to the debt actually cancelled.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps)))]
 		pub fn redeem(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			max_stable_in: BalanceOf<T>,
-			min_collateral_out: BalanceOf<T>,
+			terms: RedemptionTerms<BalanceOf<T>>,
 			recipient: T::AccountId,
 			max_steps: u32,
 		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
-			let steps = Self::do_redeem(
-				&who,
-				&collateral_id,
-				&stable_id,
-				max_stable_in,
-				min_collateral_out,
-				&recipient,
-				max_steps,
-			)?;
+			let steps =
+				Self::do_redeem(&who, &collateral_id, &stable_id, terms, &recipient, max_steps)?;
 			Ok(Some(T::WeightInfo::redeem(steps)).into())
 		}
 
