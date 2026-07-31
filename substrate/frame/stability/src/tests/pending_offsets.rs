@@ -295,9 +295,9 @@ fn merged_top_up_shares_earlier_backstop_losses() {
 
 /// One liquidation cascading through the full waterfall —
 /// active-pool offset, keeper JIT, the pending-deposit backstop, and the
-/// redistribution residual. Only the two offset stages are pallet calls; the
-/// keeper JIT and the final redistribution belong to the external liquidation
-/// orchestrator and are modelled here as plain arithmetic between the calls.
+/// redistribution residual. This Stability test isolates the two pool stages;
+/// keeper JIT and final redistribution are modelled as the arithmetic Vaults
+/// performs around those calls.
 ///
 /// Every stage prices at the same credit-wide ratio 1152.845 / 2200
 /// = 0.52402045… DOT per pUSD — each split is pro-rata against the debt
@@ -346,7 +346,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 			.into(),
 		);
 
-		// Stage 2 — keeper JIT (external orchestrator, not a pallet call). It
+		// Stage 2 — keeper JIT (performed by Vaults, not a Stability call). It
 		// burns 300 pUSD with keeper liquidity and takes the matching collateral
 		// share off the remainder before the pending backstop runs.
 		let jit_debt = 300;
@@ -367,7 +367,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 			simulate_pending_offset(DOT, PUSD, after_jit_debt, after_jit_collat);
 		assert_eq!(debt_offset2, 350);
 		// The residual — the 49 pUSD debt still standing + this collateral —
-		// is what the orchestrator hands to redistribution (external).
+		// is what Vaults records for redistribution.
 		assert_eq!(leftover2, 256_770_022_728); // 25.6770022728 DOT.
 
 		let state = pool_state(DOT, PUSD);

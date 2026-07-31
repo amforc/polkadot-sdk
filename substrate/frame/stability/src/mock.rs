@@ -26,7 +26,7 @@ use frame::{
 		AsEnsureOriginWithArg, Convert, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
-use pusd_primitives::ProvidePrice;
+use pusd_primitives::{ProvidePrice, StabilityOffsetSession, StabilityPoolOffsetApi};
 
 // 16 bytes so `into_sub_account_truncating` keeps the pallet id plus part of
 // the market seed: a `u64` would truncate every pusd-pallet sub-account to
@@ -233,8 +233,8 @@ pub type VaultsConsideration = HoldConsideration<
 
 parameter_types! {
 	/// Governance envelope the test default config sits comfortably inside.
-	pub TestBranchConfigGuard: pallet_vaults::types::BranchConfigGuard<Balance> =
-		pallet_vaults::types::BranchConfigGuard {
+	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds<Balance> =
+		pallet_vaults::types::BranchConfigBounds {
 			min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
 			min_initial_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 			min_safety_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
@@ -248,7 +248,6 @@ parameter_types! {
 }
 
 impl pallet_vaults::Config for Test {
-	type RuntimeHoldReason = RuntimeHoldReason;
 	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = Assets;
@@ -264,7 +263,7 @@ impl pallet_vaults::Config for Test {
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type Consideration = VaultsConsideration;
-	type BranchConfigGuard = TestBranchConfigGuard;
+	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
@@ -277,37 +276,13 @@ impl pallet_vaults::Config for Test {
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchHelper;
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId, Balance> for VaultsBenchHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
 	}
 
 	fn stable_asset_id() -> StableId {
 		PUSD
-	}
-
-	fn mint_collateral(collateral_id: AssetId, who: &AccountId, amount: Balance) {
-		use frame::traits::{
-			fungible::Mutate as FungibleMutate, fungibles::Mutate as FungiblesMutate,
-		};
-		// Native ED first: fresh accounts need it before any other operation.
-		let _ = <Balances as FungibleMutate<AccountId>>::mint_into(who, 1);
-		match collateral_id {
-			AssetId::Native => {
-				<Balances as FungibleMutate<AccountId>>::mint_into(who, amount)
-					.expect("mint native collateral for benchmark account");
-			},
-			AssetId::WithId(asset_id) => {
-				<Assets as FungiblesMutate<AccountId>>::mint_into(asset_id, who, amount)
-					.expect("mint asset collateral for benchmark account");
-			},
-		};
-	}
-
-	fn mint_stable(stable_id: StableId, who: &AccountId, amount: Balance) {
-		use frame::traits::fungibles::Mutate as FungiblesMutate;
-		<Assets as FungiblesMutate<AccountId>>::mint_into(stable_id, who, amount)
-			.expect("mint stable for benchmark account");
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
@@ -758,9 +733,9 @@ pub fn distribute_yield(
 	Stability::do_distribute_yield(&collateral, &stable, pool, credit)
 }
 
-/// Issue a fresh collateral credit, standing in for the future liquidations
-/// pallet's seized collateral. Dropping it (or a remainder split off it)
-/// only rescinds the issuance created here.
+/// Issue a fresh collateral credit, standing in for liquidation-seized
+/// collateral. Dropping it (or a remainder split off it) only rescinds the
+/// issuance created here.
 pub fn issue_collateral(
 	collateral: AssetId,
 	amount: Balance,
@@ -768,31 +743,55 @@ pub fn issue_collateral(
 	<PoolCollateralAssets as FungiblesBalanced<AccountId>>::issue(collateral, amount)
 }
 
-/// Run an active-pool offset against a freshly issued collateral credit.
-/// Returns the cancelled debt and the unconsumed remainder's amount.
+/// Run an active-pool offset against a freshly issued collateral credit,
+/// reproducing the vault engine's take-at-most stage over the exact session
+/// API: the reservation sizes the take, the pro-rata collateral slice funds
+/// it, and the rest is rescinded. Returns the cancelled debt and the
+/// unconsumed remainder's amount. The credit is issued inside the
+/// transactional session so a settlement refusal (e.g. a sub-minimum first
+/// collateral gain) rolls everything back into a clean step-aside.
 pub fn simulate_offset(
 	collateral: AssetId,
 	stable: StableId,
 	max_debt: Balance,
 	collateral_for_pool: Balance,
 ) -> (Balance, Balance) {
-	let credit = issue_collateral(collateral.clone(), collateral_for_pool);
-	let (result, remainder) =
-		Stability::do_offset_liquidation(&collateral, &stable, max_debt, credit);
-	(result, remainder.peek())
+	Stability::with_offset_session(&collateral, &stable, |session| {
+		let mut credit = issue_collateral(collateral.clone(), collateral_for_pool);
+		let debt = session.reserve_active(max_debt);
+		if debt.is_zero() {
+			return Ok((0, credit.peek()));
+		}
+		let slice =
+			credit.extract(crate::math::pro_rata_floor(collateral_for_pool, debt, max_debt));
+		session.settle_active(slice)?;
+		Ok((debt, credit.peek()))
+	})
+	.unwrap_or((0, collateral_for_pool))
 }
 
-/// Run a pending-deposit backstop offset with the same credit plumbing.
+/// Run a pending-deposit backstop offset with the same session plumbing.
 pub fn simulate_pending_offset(
 	collateral: AssetId,
 	stable: StableId,
 	max_debt_to_offset: Balance,
 	remaining_collateral: Balance,
 ) -> (Balance, Balance) {
-	let credit = issue_collateral(collateral.clone(), remaining_collateral);
-	let (debt_offset, remainder) =
-		Stability::do_offset_pending_liquidation(&collateral, &stable, max_debt_to_offset, credit);
-	(debt_offset, remainder.peek())
+	Stability::with_offset_session(&collateral, &stable, |session| {
+		let mut credit = issue_collateral(collateral.clone(), remaining_collateral);
+		let debt = session.reserve_pending(max_debt_to_offset);
+		if debt.is_zero() {
+			return Ok((0, credit.peek()));
+		}
+		let slice = credit.extract(crate::math::pro_rata_floor(
+			remaining_collateral,
+			debt,
+			max_debt_to_offset,
+		));
+		session.settle_pending(slice)?;
+		Ok((debt, credit.peek()))
+	})
+	.unwrap_or((0, remaining_collateral))
 }
 
 /// The caller's deposit row; `None` when pruned or never created.

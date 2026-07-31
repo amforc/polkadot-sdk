@@ -13,17 +13,16 @@ use crate::{mock::*, Error};
 /// `FinalRecovery` would never admit them. This market's MCR is 130%; vaults
 /// open at a higher price and the price is dropped to the examples' 2.
 fn example_branch_config() -> pallet_vaults::BranchConfig<Balance> {
-	pallet_vaults::BranchConfig {
-		minimum_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
-		initial_collateralization_ratio: FixedU128::from_rational(140u128, 100u128),
-		safety_collateralization_ratio: FixedU128::from_rational(150u128, 100u128),
-		minimum_debt: 100,
-		// The examples carry no upfront fee, so drawn principal is the debt.
-		upfront_fee_period: 0,
-		// Caps the recovery bonus at the examples' 10%.
-		redistribution_penalty: Permill::from_percent(10),
-		..default_branch_config()
-	}
+	let mut config = default_branch_config();
+	config.minimum_collateralization_ratio = FixedU128::from_rational(130u128, 100u128);
+	config.initial_collateralization_ratio = FixedU128::from_rational(140u128, 100u128);
+	config.safety_collateralization_ratio = FixedU128::from_rational(150u128, 100u128);
+	config.minimum_debt = 100;
+	// The examples carry no upfront fee, so drawn principal is the debt.
+	config.upfront_fee_period = 0;
+	// Caps the recovery bonus at the examples' 10%.
+	config.redistribution_penalty = Permill::from_percent(10);
+	config
 }
 
 /// Open `owner`'s vault at a price that clears the 140% ICR, then drop to the
