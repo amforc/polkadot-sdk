@@ -1501,14 +1501,13 @@ fn preview_matches_execution_for_partial_fill() {
 }
 
 fn liquidate_redistribute_all(owner: AccountId) {
-	Vaults::execute_liquidation(&DOT, &PUSD, &owner, |_, mut collateral| {
-		let owner_surplus = collateral.extract(0);
-		Ok(LiquidationSettlement {
-			debt_offset: 0,
-			redistribution_collateral: collateral,
-			owner_surplus,
-		})
-	})
+	Vaults::liquidate(
+		RuntimeOrigin::signed(99),
+		DOT,
+		PUSD,
+		owner,
+		pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
+	)
 	.expect("liquidation succeeds");
 }
 
@@ -2151,7 +2150,7 @@ fn example_3_final_recovery_redemption_above_par() {
 		config.minimum_collateralization_ratio = FixedU128::from_rational(130u128, 100u128);
 		config.initial_collateralization_ratio = FixedU128::from_rational(140u128, 100u128);
 		config.safety_collateralization_ratio = FixedU128::from_rational(150u128, 100u128);
-		config.redistribution_penalty = Permill::from_percent(10);
+		config.liquidation.redistribution_penalty = Permill::from_percent(10);
 		register_branch(DOT, PUSD, config);
 
 		// Open above the 140% ICR, then drop to the example's 1 DOT = 2 pUSD,

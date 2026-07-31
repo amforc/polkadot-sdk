@@ -89,11 +89,7 @@ fn heal_clears_swept_flooring_dust() {
 		assert_ok!(open(3, DOT, PUSD, 5_000, 500, rate_pct(5, 100))); // liquidatee
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: 0,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, 0));
 		assert_eq!(branch_state(DOT, PUSD).unwrap().ownerless_debt, 1);
 
 		// Empty the branch: overpay-repay both recipients, close both husks.

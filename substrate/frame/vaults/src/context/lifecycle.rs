@@ -2,6 +2,7 @@
 
 use super::{CloseOutcome, VaultOp};
 use crate::{
+	liquidation::LiquidationSnapshot,
 	pallet::{BalanceOf, Config, Error, Event, Pallet},
 	recovery,
 	types::{DebtCollateral, LiquidationSnapshot, VaultStatus},
@@ -11,8 +12,10 @@ use linked_list_interface::{Position as ListPosition, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, RedemptionStepSnapshot};
 
 impl<T: Config> VaultOp<T> {
-	/// Checks whether the vault may be liquidated.
-	pub(crate) fn ensure_liquidatable(&self) -> DispatchResult {
+	/// Validates the vault and returns the inputs for one liquidation.
+	pub(crate) fn liquidation_snapshot(
+		&self,
+	) -> Result<LiquidationSnapshot<BalanceOf<T>>, DispatchError> {
 		let price = self.ctx.price()?;
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		let cr = collateralization_ratio(&self.vault.position(), price)
@@ -22,15 +25,11 @@ impl<T: Config> VaultOp<T> {
 			Error::<T>::VaultNotLiquidatable
 		);
 		ensure!(!self.is_only_stake_bearer(), Error::<T>::LastVaultCannotBeLiquidated);
-		Ok(())
-	}
-
-	/// Returns the values needed to settle this liquidation.
-	pub(crate) fn liquidation_snapshot(&self) -> LiquidationSnapshot<BalanceOf<T>> {
-		LiquidationSnapshot {
+		Ok(LiquidationSnapshot {
 			debt: self.vault.debt.total(),
-			redistribution_penalty: self.ctx.branch.config.redistribution_penalty,
-		}
+			price,
+			config: self.ctx.branch.config.liquidation,
+		})
 	}
 
 	/// Returns the current values needed for one redemption step.
@@ -39,7 +38,7 @@ impl<T: Config> VaultOp<T> {
 			status: self.status,
 			debt: self.vault.debt.total(),
 			collateral: self.vault.collateral,
-			redistribution_penalty: self.ctx.branch.config.redistribution_penalty,
+			redistribution_penalty: self.ctx.branch.config.liquidation.redistribution_penalty,
 		}
 	}
 
@@ -174,15 +173,12 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 		redistribution: DebtCollateral<BalanceOf<T>>,
 	) -> DispatchResult {
-		ensure!(
-			redistribution.debt <= self.vault.debt.total(),
-			Error::<T>::InvalidLiquidationSettlement
-		);
+		ensure!(redistribution.debt <= self.vault.debt.total(), Error::<T>::InvalidLiquidationPlan);
 		let collateral_out = self
 			.vault
 			.collateral
 			.checked_sub(&redistribution.collateral)
-			.ok_or(Error::<T>::InvalidLiquidationSettlement)?;
+			.ok_or(Error::<T>::InvalidLiquidationPlan)?;
 
 		self.remove_from_lifecycle()?;
 		self.ctx.branch.state.replace_vault(Some(&self.vault), None)?;

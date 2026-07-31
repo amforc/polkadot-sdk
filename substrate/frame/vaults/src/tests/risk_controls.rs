@@ -262,7 +262,8 @@ fn collateral_debt_aggregate_tracks_every_write() {
 		assert_ok!(open(3, DOT, PUSD, 40, 300, rate_pct(5, 100)));
 		assert_aggregate_matches(DOT);
 		set_price(DOT, FixedU128::from_rational(8u128, 1u128));
-		assert_ok!(liquidate(DOT, PUSD, 3));
+		ActiveSpCapacity::set(1_000);
+		assert_ok!(liquidate(9, DOT, PUSD, 3, 0, 0));
 		assert_aggregate_matches(DOT);
 
 		// Freezing flushes pending aggregate interest into the stored state.

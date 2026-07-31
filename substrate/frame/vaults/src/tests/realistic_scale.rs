@@ -6,9 +6,11 @@
 //! `10^-3` stable-per-collateral minor unit = $10_000; against 5_000 USDX
 //! (5×10^9 minor units) of debt that is a 200% CR.
 
-use crate::{mock::*, tests::rate_pct};
+use crate::{mock::*, tests::rate_pct, types::BranchConfigUpdate, Error, LiquidationConfig};
 use frame::{
-	arithmetic::Permill, prelude::TokenError, traits::fungibles::Mutate as FungiblesMutate,
+	arithmetic::Permill,
+	prelude::TokenError,
+	traits::{fungibles::Mutate as FungiblesMutate, tokens::Preservation},
 };
 use pusd_primitives::{collateralization_ratio, MILLIS_PER_YEAR};
 
@@ -183,7 +185,7 @@ fn sub_ed_fee_residual_is_dropped_without_prefund() {
 }
 
 // A keeper leg below the collateral's ED to a fresh keeper reverts the whole
-// transactional liquidation — the orchestrator must size non-zero legs to at
+// transactional liquidation — the planner must size non-zero legs to at
 // least the collateral asset's minimum balance.
 #[test]
 fn liquidation_reverts_on_sub_ed_keeper_leg() {
@@ -191,25 +193,65 @@ fn liquidation_reverts_on_sub_ed_keeper_leg() {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		// 10^13 × 5×10^-5 = 5×10^8 stable minor units ≪ 110% of the debt.
-		set_price(XBT, FixedU128::from_rational(5u128, 100_000u128));
+		// 10^13 × 10^-5 = 10^8 stable minor units ≪ 110% of the debt.
+		// At this price a flat value of 500 pays 0.005 XBT, below the ED.
+		set_price(XBT, FixedU128::from_rational(1u128, 100_000u128));
 
-		let keeper_leg = |collateral: Balance| {
-			liquidate_with(XBT, USDX, 1, |_| LiquidationAllocation {
-				offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-				redistribution_collateral: 0,
-				keeper: KeeperCompensation { recipient: 998, collateral },
-			})
+		let set_keeper_value = |value| {
+			let defaults = default_branch_config().liquidation;
+			Vaults::set_param(
+				RuntimeOrigin::signed(ADMIN),
+				XBT,
+				USDX,
+				BranchConfigUpdate::Liquidation(LiquidationConfig {
+					keeper_flat_compensation_value: value,
+					keeper_percent_compensation: Permill::zero(),
+					keeper_compensation_cap_value: value,
+					..defaults
+				}),
+			)
 		};
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
-		assert_noop!(keeper_leg(XBT_ED - 1), TokenError::CannotCreate);
+		assert_ok!(set_keeper_value(500));
+		assert_noop!(liquidate(998, XBT, USDX, 1, 0, 0), Error::<Test>::CollateralPayoutFailed);
 		assert!(
 			crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)),
 			"failed liquidation rolled back"
 		);
+	});
+}
 
-		assert_ok!(keeper_leg(XBT_ED));
-		assert_eq!(collateral_balance(XBT, 998), XBT_ED, "ED-sized keeper leg paid");
+// A JIT target inside `(balance - ED, balance)` rounds down to the preserving
+// limit. The exact burn then succeeds under `Preserve` and leaves the keeper's
+// stable account alive at exactly the ED.
+#[test]
+fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
+	build_and_execute(|| {
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(2, XBT, USDX, 2_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		// Vault 1 falls just below par while vault 2 remains healthy.
+		set_price(XBT, FixedU128::from_rational(1u128, 2_000u128));
+
+		let funded = 200 * USD;
+		let keeper_balance = funded + USDX_ED;
+		mint_stable(USDX, 3, keeper_balance);
+		// Settle the remainder through the pending pool so this test isolates
+		// the keeper debit from issued-collateral redistribution custody.
+		PendingSpCapacity::set(10_000 * USD);
+		let issuance_before = total_stable(USDX);
+
+		// `keeper_balance - 1` is above the preserving limit `funded` but below
+		// the full expendable balance, so `reducible_debit` must round it down.
+		assert_eq!(
+			pusd_primitives::reducible_debit::<Assets, _>(USDX, &3, keeper_balance - 1),
+			(funded, Preservation::Preserve)
+		);
+		assert_ok!(liquidate(3, XBT, USDX, 1, keeper_balance - 1, 0));
+
+		assert_eq!(stable_balance(USDX, 3), USDX_ED, "keeper account survives at ED");
+		assert_eq!(issuance_before - total_stable(USDX), funded, "exact rounded burn");
+		assert!(crate::pallet::Vaults::<Test>::get((XBT, USDX, 1)).is_none());
 	});
 }
 

@@ -655,7 +655,7 @@ fn poke_after_liquidation_applies_redistribution_gains() {
 		let v_a_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		let entire_a_pre = v_a_pre.debt.principal + v_a_pre.debt.interest;
 
-		assert_ok!(liquidate(DOT, PUSD, 3));
+		assert_ok!(liquidate(9, DOT, PUSD, 3, 0, 0));
 
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
 		let v_a_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();

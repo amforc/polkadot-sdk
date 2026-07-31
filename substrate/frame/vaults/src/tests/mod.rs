@@ -14,6 +14,7 @@ mod idle_walk;
 mod interest_rate;
 mod last_vault;
 mod lifecycle;
+mod liquidation;
 mod multi_market;
 mod rate_index;
 mod realistic_scale;

@@ -5,6 +5,88 @@ use crate::{mock::*, Error};
 use frame::testing_prelude::hypothetically;
 
 #[test]
+fn vault_liquidation_uses_the_real_stability_pool() {
+	build_and_execute(|| {
+		let mut config = default_branch_config();
+		config.upfront_fee_period = 0;
+		register_branch(DOT, PUSD, config);
+		assert_ok!(open_vault(1, DOT, PUSD, 600, 500));
+		assert_ok!(open_vault(2, DOT, PUSD, 2_000, 500));
+		seed_deposit(3, 500);
+		activate_all(&[3]);
+		set_price(DOT, FixedU128::from_rational(9u128, 10u128));
+
+		let owner_before = collateral_balance(DOT, 1);
+		let keeper_before = collateral_balance(DOT, 4);
+		let pool_account = Stability::pool_account(&DOT, &PUSD);
+		let pool_before = collateral_balance(DOT, pool_account);
+
+		assert_ok!(Vaults::liquidate(
+			RuntimeOrigin::signed(4),
+			DOT,
+			PUSD,
+			1,
+			pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
+		));
+
+		assert!(pallet_vaults::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
+		assert_eq!(collateral_balance(DOT, pool_account) - pool_before, 472);
+		assert_eq!(collateral_balance(DOT, 4) - keeper_before, 112);
+		assert_eq!(collateral_balance(DOT, 1) - owner_before, 16);
+	});
+}
+
+#[test]
+fn reserved_pool_leg_failure_rolls_back_the_liquidation() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		let collateral = AssetId::WithId(77);
+		let mut config = default_branch_config();
+		config.upfront_fee_period = 0;
+		config.liquidation.keeper_flat_compensation_value = 200;
+		register_branch(collateral.clone(), PUSD, config);
+		for owner in [1, 2] {
+			mint_collateral(collateral.clone(), owner, 5_000);
+			assert_ok!(open_vault(owner, collateral.clone(), PUSD, 2_000, 500));
+		}
+		mint_stable(PUSD, 3, 100);
+		assert_ok!(deposit(3, collateral.clone(), PUSD, 100));
+		advance_time(5_000);
+		assert_ok!(poke(3, 3, collateral.clone(), PUSD));
+		set_price(collateral.clone(), FixedU128::from_rational(1u128, 5u128));
+
+		let vault_before =
+			pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 1)).unwrap();
+		let pool_before = pool_state(collateral.clone(), PUSD);
+		let pool_account = Stability::pool_account(&collateral, &PUSD);
+		let stable_before = stable_balance(PUSD, pool_account);
+
+		// The keeper reward clears the asset minimum, while the active pool's
+		// reserved 100-debt leg receives less than 1_000 collateral. Exact
+		// settlement rejects that leg and the outer transaction restores every
+		// earlier liquidation step.
+		assert_noop!(
+			Vaults::liquidate(
+				RuntimeOrigin::signed(4),
+				collateral.clone(),
+				PUSD,
+				1,
+				pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
+			),
+			Error::<Test>::OffsetSettlementFailed
+		);
+		assert_eq!(
+			pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 1)).unwrap(),
+			vault_before
+		);
+		assert_eq!(pool_state(collateral.clone(), PUSD), pool_before);
+		assert_eq!(stable_balance(PUSD, pool_account), stable_before);
+		assert_eq!(collateral_balance(collateral, pool_account), 0);
+	});
+}
+
+#[test]
 fn offset_burns_debt_and_distributes_gains_proportionally() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());

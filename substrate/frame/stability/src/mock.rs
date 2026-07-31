@@ -260,6 +260,7 @@ impl pallet_vaults::Config for Test {
 	// first, so its config (which recovery-offset pricing reads) always
 	// exists whenever the pool rows do.
 	type OnBranchLifecycle = (Redemptions, Stability);
+	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type Consideration = VaultsConsideration;
@@ -495,7 +496,14 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(100u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
-		redistribution_penalty: Permill::from_percent(5),
+		liquidation: pallet_vaults::LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			keeper_flat_compensation_value: 100,
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: 10_000,
+			minimum_jit_contribution: 100,
+			redistribution_penalty: Permill::from_percent(5),
+		},
 		ceiling_gap: 0,
 		ceiling_ttl: 0,
 	}

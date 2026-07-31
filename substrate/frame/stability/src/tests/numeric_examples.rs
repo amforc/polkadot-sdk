@@ -21,7 +21,7 @@ fn example_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	// The examples carry no upfront fee, so drawn principal is the debt.
 	config.upfront_fee_period = 0;
 	// Caps the recovery bonus at the examples' 10%.
-	config.redistribution_penalty = Permill::from_percent(10);
+	config.liquidation.redistribution_penalty = Permill::from_percent(10);
 	config
 }
 

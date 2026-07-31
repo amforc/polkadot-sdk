@@ -22,6 +22,7 @@ pub trait WeightInfo {
 	fn set_governance_frozen() -> Weight;
 	fn refresh_branch() -> Weight;
 	fn poke_ceiling() -> Weight;
+	fn liquidate() -> Weight;
 	fn on_idle_base() -> Weight;
 	fn on_idle_one_branch() -> Weight;
 	fn on_idle_one_vault() -> Weight;
@@ -83,6 +84,9 @@ impl WeightInfo for () {
 		Weight::zero()
 	}
 	fn poke_ceiling() -> Weight {
+		Weight::zero()
+	}
+	fn liquidate() -> Weight {
 		Weight::zero()
 	}
 	fn on_idle_base() -> Weight {

@@ -7,7 +7,8 @@ use alloc::collections::BTreeMap;
 
 use crate as pallet_vaults;
 use crate::{
-	pallet::Branches, types::BranchConfigBounds, BranchState, LiquidationSettlement, VaultListId,
+	context::VaultOp, pallet::Branches, types::BranchConfigBounds, BranchState, LiquidationConfig,
+	VaultListId,
 };
 pub use crate::{
 	pallet::{BalanceOf, CollateralCreditOf, StableCreditOf},
@@ -20,13 +21,14 @@ pub use frame::{
 	testing_prelude::{assert_err, assert_noop, assert_ok},
 };
 use frame::{
-	deps::sp_runtime::traits::ConvertInto,
+	deps::{frame_support::transactional, sp_runtime::traits::ConvertInto},
 	testing_prelude::*,
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
 		fungibles::{
-			roles::Inspect as FungiblesRolesInspect, Balanced as FungiblesBalanced, Credit,
-			Inspect as FungiblesInspect, InspectHold,
+			roles::Inspect as FungiblesRolesInspect, Balanced as FungiblesBalanced,
+			BalancedHold as FungiblesBalancedHold, Credit, Inspect as FungiblesInspect,
+			InspectHold,
 		},
 		tokens::{fungible, imbalance::ResolveAssetTo},
 		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
@@ -34,7 +36,9 @@ use frame::{
 	},
 };
 pub use pallet_linked_list::Position;
-use pusd_primitives::{RedemptionSettlement, VaultInterface};
+use pusd_primitives::{
+	RedemptionSettlement, StabilityOffsetSession, StabilityPoolOffsetApi, VaultInterface,
+};
 
 pub type AccountId = u64;
 pub type Balance = u128;
@@ -55,6 +59,8 @@ pub const EMERGENCY_ADMIN: AccountId = 101;
 pub const FEE_DEST: AccountId = 200;
 /// Owner allowed to create a PUSD market with a deposit.
 pub const PUSD_OWNER: AccountId = 1;
+/// Account that receives collateral consumed by the mocked Stability Pool.
+pub const SP_ACCOUNT: AccountId = 777;
 
 /// Native collateral used by most tests.
 pub const DOT: AssetId = AssetId::Native;
@@ -314,6 +320,8 @@ pub type VaultsConsideration = HoldConsideration<
 >;
 
 parameter_types! {
+	pub static ActiveSpCapacity: Balance = 0;
+	pub static PendingSpCapacity: Balance = 0;
 	pub const IdleMaxRefreshWeight: Option<Weight> = Some(Weight::MAX);
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
 	/// Global limits for test market settings.
@@ -330,6 +338,71 @@ parameter_types! {
 	};
 }
 
+pub struct MockStabilityPool;
+pub struct MockStabilitySession {
+	active: Balance,
+	pending: Balance,
+}
+
+impl MockStabilityPool {
+	fn settle(
+		debt: Balance,
+		collateral: CollateralCreditOf<Test>,
+		capacity: &mut Balance,
+	) -> DispatchResult {
+		ensure!(!debt.is_zero() && debt <= *capacity, Error::<Test>::InvalidLiquidationPlan);
+		let resolved = <VaultCollateralAssets as FungiblesBalanced<AccountId>>::resolve(
+			&SP_ACCOUNT,
+			collateral,
+		);
+		ensure!(resolved.is_ok(), Error::<Test>::CollateralPayoutFailed);
+		*capacity -= debt;
+		Ok(())
+	}
+}
+
+impl StabilityOffsetSession<Balance, CollateralCreditOf<Test>> for MockStabilitySession {
+	fn reserve_active(&mut self, max_debt: Balance) -> Balance {
+		self.active = max_debt.min(ActiveSpCapacity::get());
+		self.active
+	}
+
+	fn reserve_pending(&mut self, max_debt: Balance) -> Balance {
+		self.pending = max_debt.min(PendingSpCapacity::get());
+		self.pending
+	}
+
+	fn settle_active(&mut self, collateral: CollateralCreditOf<Test>) -> DispatchResult {
+		let mut capacity = ActiveSpCapacity::get();
+		MockStabilityPool::settle(self.active, collateral, &mut capacity)?;
+		ActiveSpCapacity::set(capacity);
+		self.active = 0;
+		Ok(())
+	}
+
+	fn settle_pending(&mut self, collateral: CollateralCreditOf<Test>) -> DispatchResult {
+		let mut capacity = PendingSpCapacity::get();
+		MockStabilityPool::settle(self.pending, collateral, &mut capacity)?;
+		PendingSpCapacity::set(capacity);
+		self.pending = 0;
+		Ok(())
+	}
+}
+
+impl StabilityPoolOffsetApi<AssetId, StableId, Balance, CollateralCreditOf<Test>>
+	for MockStabilityPool
+{
+	type Session = MockStabilitySession;
+
+	fn with_offset_session<R>(
+		_: &AssetId,
+		_: &StableId,
+		settle: impl FnOnce(&mut Self::Session) -> Result<R, DispatchError>,
+	) -> Result<R, DispatchError> {
+		settle(&mut MockStabilitySession { active: 0, pending: 0 })
+	}
+}
+
 impl pallet_vaults::Config for Test {
 	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultCollateralAssets;
@@ -338,6 +411,7 @@ impl pallet_vaults::Config for Test {
 	type FeeHandler = DealWithFees;
 	type YieldHook = ();
 	type OnBranchLifecycle = RecordingLifecycle;
+	type StabilityPool = MockStabilityPool;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type Consideration = VaultsConsideration;
@@ -400,7 +474,7 @@ pub fn new_test_ext() -> TestState {
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
-			balances: (1u64..=10u64).map(|i| (i, 1_000_000_000_000)).collect(),
+			balances: (1u64..=10u64).chain([SP_ACCOUNT]).map(|i| (i, 1_000_000_000_000)).collect(),
 			..Default::default()
 		},
 	}
@@ -429,6 +503,8 @@ pub fn new_test_ext() -> TestState {
 		}
 		MockPrices::set(BTreeMap::new());
 		MockOracleAvailable::set(true);
+		ActiveSpCapacity::set(0);
+		PendingSpCapacity::set(0);
 		LifecycleLog::set(Vec::new());
 		FailOnRegistered::set(false);
 		FailOnDeregistered::set(false);
@@ -471,7 +547,14 @@ pub fn default_branch_config() -> BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(400u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
-		redistribution_penalty: Permill::from_percent(5),
+		liquidation: LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			keeper_flat_compensation_value: 100,
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: 10_000,
+			minimum_jit_contribution: 100,
+			redistribution_penalty: Permill::from_percent(5),
+		},
 		ceiling_gap: 0,
 		ceiling_ttl: 0,
 	}
@@ -557,87 +640,56 @@ pub fn open(
 	)
 }
 
-/// Liquidation amounts used by the test helpers.
-///
-/// The real interface uses collateral credits instead.
-pub struct OffsetAllocation<AccountId, Balance> {
-	pub collateral_recipient: AccountId,
-	pub debt: Balance,
-	pub collateral: Balance,
-}
-
-pub struct KeeperCompensation<AccountId, Balance> {
-	pub recipient: AccountId,
-	pub collateral: Balance,
-}
-
-pub struct LiquidationAllocation<AccountId, Balance> {
-	pub offset: OffsetAllocation<AccountId, Balance>,
-	pub redistribution_collateral: Balance,
-	pub keeper: KeeperCompensation<AccountId, Balance>,
-}
-
-/// Liquidates a vault by fully offsetting its current debt.
-pub fn liquidate(collateral: AssetId, stable: StableId, owner: AccountId) -> DispatchResult {
-	liquidate_with(collateral, stable, owner, |post_touch| LiquidationAllocation {
-		offset: OffsetAllocation { collateral_recipient: owner, debt: post_touch, collateral: 0 },
-		redistribution_collateral: 0,
-		keeper: KeeperCompensation { recipient: owner, collateral: 0 },
-	})
-}
-
-/// Liquidates a vault with a caller-built allocation.
-pub fn liquidate_with(
+/// Calls the production liquidation dispatchable.
+pub fn liquidate(
+	keeper: AccountId,
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
-	build: impl FnOnce(Balance) -> LiquidationAllocation<AccountId, Balance>,
+	max_jit_stable: Balance,
+	min_jit_collateral_out: Balance,
 ) -> DispatchResult {
-	Vaults::execute_liquidation(&collateral, &stable, &owner, |snapshot, mut collateral_credit| {
-		let allocation = build(snapshot.debt);
-		let total = allocation
-			.offset
-			.collateral
-			.saturating_add(allocation.redistribution_collateral)
-			.saturating_add(allocation.keeper.collateral);
-		ensure!(total <= collateral_credit.peek(), Error::<Test>::InvalidLiquidationSettlement);
-
-		resolve_test_collateral(
-			&mut collateral_credit,
-			allocation.offset.collateral,
-			&allocation.offset.collateral_recipient,
-		)?;
-		resolve_test_collateral(
-			&mut collateral_credit,
-			allocation.keeper.collateral,
-			&allocation.keeper.recipient,
-		)?;
-		let redistribution_collateral =
-			collateral_credit.extract(allocation.redistribution_collateral);
-		Ok(LiquidationSettlement {
-			debt_offset: allocation.offset.debt,
-			redistribution_collateral,
-			owner_surplus: collateral_credit,
-		})
-	})
+	Vaults::liquidate(
+		RuntimeOrigin::signed(keeper),
+		collateral,
+		stable,
+		owner,
+		crate::JitTerms { max_stable: max_jit_stable, min_collateral_out: min_jit_collateral_out },
+	)
 }
 
-fn resolve_test_collateral(
-	collateral: &mut CollateralCreditOf<Test>,
-	amount: Balance,
-	recipient: &AccountId,
-) -> DispatchResult {
-	if amount.is_zero() {
-		return Ok(());
-	}
-	let credit = collateral.extract(amount);
-	debug_assert_eq!(credit.peek(), amount);
-	<VaultCollateralAssets as FungiblesBalanced<AccountId>>::resolve(recipient, credit).map_err(
-		|credit| {
-			drop(credit);
-			TokenError::CannotCreate.into()
+/// Removes a vault and records its whole debt as redistribution.
+///
+/// This bypasses liquidation pricing only for tests concerned with the
+/// redistribution ledger. Economic and custody tests use [`liquidate`].
+#[transactional]
+pub fn redistribute_for_test(
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+	redistribution_collateral: Balance,
+) -> Result<Balance, DispatchError> {
+	let op = VaultOp::<Test>::load_priced(collateral.clone(), stable, &owner)?;
+	let snapshot = op.liquidation_snapshot()?;
+	let held = op.vault().collateral;
+	let (mut collateral_credit, shortfall) =
+		VaultCollateralAssets::slash(collateral, &HoldReason::VaultCollateral.into(), &owner, held);
+	ensure!(shortfall.is_zero(), Error::<Test>::InvalidLiquidationPlan);
+	ensure!(
+		redistribution_collateral <= collateral_credit.peek(),
+		Error::<Test>::InvalidLiquidationPlan
+	);
+	let redistribution_credit = collateral_credit.extract(redistribution_collateral);
+	Vaults::settle_liquidation_custody(
+		op,
+		pusd_primitives::DebtCollateral {
+			debt: snapshot.debt,
+			collateral: redistribution_collateral,
 		},
-	)
+		redistribution_credit,
+		collateral_credit,
+	)?;
+	Ok(snapshot.debt)
 }
 
 /// Redeems from the next market target at the oracle price.

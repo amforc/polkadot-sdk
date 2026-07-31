@@ -37,33 +37,76 @@ pub enum VaultListId<CollateralId, StableId> {
 	FinalRecovery(CollateralId, StableId),
 }
 
-/// Contains the liquidation result that [`crate::Pallet::execute_liquidation`] consumes.
-///
-/// External offset paths burn stablecoin internally. Thus, `debt_offset` is an amount and not a
-/// credit. The other fields are credits because this pallet controls their final destinations.
-#[must_use = "the settlement must be returned to execute_liquidation"]
-pub struct LiquidationSettlement<CollateralCredit, Balance> {
-	/// Debt that external offset paths burned.
-	pub debt_offset: Balance,
-	/// Collateral credit that the pallet sends to its redistribution account.
-	pub redistribution_collateral: CollateralCredit,
-	/// Collateral credit that the pallet returns to the liquidated owner.
-	pub owner_surplus: CollateralCredit,
+/// Liquidation configuration for one `(collateral, stablecoin)` market.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
+pub struct LiquidationConfig<Balance> {
+	/// Extra collateral value seized for debt cancelled by an offset.
+	pub offset_penalty: Permill,
+	/// Flat keeper compensation, in stablecoin value.
+	pub keeper_flat_compensation_value: Balance,
+	/// Share of seized collateral added to the flat keeper compensation.
+	pub keeper_percent_compensation: Permill,
+	/// Maximum keeper compensation, in stablecoin value.
+	pub keeper_compensation_cap_value: Balance,
+	/// Smallest direct keeper contribution; prevents dust burns.
+	pub minimum_jit_contribution: Balance,
+	/// Extra collateral assigned to redistributed debt.
+	///
+	/// Final recovery also uses this as its bonus cap.
+	pub redistribution_penalty: Permill,
 }
 
-/// Contains the post-touch vault values for a liquidation settlement.
-///
-/// The settlement builder must use these values to size its settlement.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct LiquidationSnapshot<Balance> {
-	/// Total debt after the pallet applies accrued interest.
-	pub debt: Balance,
-	/// Branch penalty for debt that the liquidation redistributes to other vaults.
+/// Keeper-supplied terms for the direct contribution to one liquidation.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
+pub struct JitTerms<Balance> {
+	/// Maximum stable assets the keeper allows the call to burn for a direct contribution.
 	///
-	/// Redistributed debt carries this premium. The premium must be at least the liquidation
-	/// penalty that an offset pays. Vaults controls this parameter, and the settlement builder
-	/// must use it.
-	pub redistribution_penalty: Permill,
+	/// Zero disables the contribution.
+	pub max_stable: Balance,
+	/// Minimum collateral allocated to an executed JIT slice, excluding the keeper reward.
+	///
+	/// This absolute floor is not scaled down for a partial JIT execution. Keepers should set it
+	/// for the smallest execution they would accept.
+	pub min_collateral_out: Balance,
+}
+
+/// Complete observable result of one liquidation.
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
+pub struct LiquidationOutcome<Balance> {
+	/// Debt and collateral settled by the active Stability Pool.
+	pub active_pool: DebtCollateral<Balance>,
+	/// Debt and collateral settled directly by the keeper.
+	pub keeper_jit: DebtCollateral<Balance>,
+	/// Debt and collateral settled by pending Stability deposits.
+	pub pending_pool: DebtCollateral<Balance>,
+	/// Debt and collateral redistributed to surviving vaults.
+	pub redistribution: DebtCollateral<Balance>,
+	/// Collateral paid to the keeper for executing the liquidation.
+	pub keeper_reward: Balance,
+	/// Collateral returned to the liquidated vault's owner.
+	pub owner_surplus: Balance,
 }
 
 /// Reason a market is frozen.
@@ -278,8 +321,8 @@ pub struct BranchConfig<Balance> {
 	pub upfront_fee_period: Millis,
 	/// Minimum time between rate changes that do not charge an upfront fee.
 	pub rate_adjustment_cooldown: Millis,
-	/// Collateral penalty applied during liquidation.
-	pub redistribution_penalty: Permill,
+	/// Penalties, keeper compensation, and direct-JIT limits used during liquidation.
+	pub liquidation: LiquidationConfig<Balance>,
 	/// Headroom above current debt for the automatic debt limit.
 	///
 	/// Zero disables automatic updates.
@@ -706,7 +749,9 @@ pub enum BranchConfigUpdate<Balance> {
 	UpfrontFeePeriod(Millis),
 	/// Sets the rate-change cooldown.
 	RateAdjustmentCooldown(Millis),
-	/// Sets the collateral penalty applied during liquidation.
+	/// Replaces the market's liquidation configuration.
+	Liquidation(LiquidationConfig<Balance>),
+	/// Sets the collateral penalty applied to redistributed debt.
 	RedistributionPenalty(Permill),
 	/// Sets headroom for the automatic debt limit.
 	///
@@ -732,7 +777,8 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			},
 			Self::UpfrontFeePeriod(v) => config.upfront_fee_period = v,
 			Self::RateAdjustmentCooldown(v) => config.rate_adjustment_cooldown = v,
-			Self::RedistributionPenalty(v) => config.redistribution_penalty = v,
+			Self::Liquidation(v) => config.liquidation = v,
+			Self::RedistributionPenalty(v) => config.liquidation.redistribution_penalty = v,
 			Self::CeilingGap(v) => config.ceiling_gap = v,
 			Self::CeilingTtl(v) => config.ceiling_ttl = v,
 		}
@@ -750,6 +796,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::MinimumCollateral(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
+			Self::Liquidation(_) |
 			Self::RedistributionPenalty(_) |
 			Self::CeilingGap(_) |
 			Self::CeilingTtl(_) => AdminLevel::Full,
@@ -772,6 +819,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::MinimumCollateral(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
+			Self::Liquidation(_) |
 			Self::RedistributionPenalty(_) |
 			Self::CeilingGap(_) |
 			Self::CeilingTtl(_) => true,
@@ -813,6 +861,7 @@ impl<Balance: PartialOrd + Copy + Zero> BranchConfigBounds<Balance> {
 			config.minimum_collateral >= self.min_minimum_collateral &&
 			config.maximum_borrow_rate <= self.max_borrow_rate &&
 			config.debt_ceiling <= self.max_debt_ceiling &&
+			config.liquidation.offset_penalty <= config.liquidation.redistribution_penalty &&
 			config.ceiling_gap <= self.max_ceiling_gap &&
 			(config.ceiling_gap.is_zero() || config.ceiling_ttl >= self.min_ceiling_ttl)
 	}
