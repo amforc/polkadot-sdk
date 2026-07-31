@@ -36,7 +36,7 @@ impl<CollateralId: Default, StableId: Default> Default for VaultListId<Collatera
 	}
 }
 
-/// Liquidation configuration for one `(collateral, stablecoin)` market.
+/// Liquidation configuration for one `(collateral, stablecoin)` branch.
 #[derive(
 	Encode,
 	Decode,
@@ -58,7 +58,10 @@ pub struct LiquidationConfig<Balance> {
 	pub keeper_percent_compensation: Permill,
 	/// Maximum keeper compensation, in stablecoin value.
 	pub keeper_compensation_cap_value: Balance,
-	/// Smallest direct keeper contribution; prevents dust burns.
+	/// Smallest keeper allowance or funding accepted for a direct contribution.
+	///
+	/// A smaller keeper-side amount skips JIT without blocking liquidation. The limit does not
+	/// bind the residual the waterfall asks for: a smaller system ask still executes.
 	pub minimum_jit_contribution: Balance,
 	/// Extra collateral assigned to redistributed debt.
 	///
@@ -67,18 +70,7 @@ pub struct LiquidationConfig<Balance> {
 }
 
 /// Keeper-supplied terms for the direct contribution to one liquidation.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct JitTerms<Balance> {
 	/// Maximum stable assets the keeper allows the call to burn for a direct contribution.
 	///
@@ -87,7 +79,8 @@ pub struct JitTerms<Balance> {
 	/// Minimum collateral allocated to an executed JIT slice, excluding the keeper reward.
 	///
 	/// This absolute floor is not scaled down for a partial JIT execution. Keepers should set it
-	/// for the smallest execution they would accept.
+	/// for the smallest execution they would accept. A trade that would pay less is skipped and
+	/// the liquidation proceeds without the contribution.
 	pub min_collateral_out: Balance,
 }
 
@@ -106,6 +99,25 @@ pub struct LiquidationOutcome<Balance> {
 	pub keeper_reward: Balance,
 	/// Collateral returned to the liquidated vault's owner.
 	pub owner_surplus: Balance,
+	/// What loading the vault realized on it before the waterfall ran.
+	pub touch: LiquidationTouch<Balance>,
+}
+
+/// Pending changes a liquidation realized on the vault before splitting its debt.
+///
+/// An ordinary vault update reports these through [`Event::InterestAccrued`] and
+/// [`Event::RedistributionApplied`]. A liquidation reports them here instead, inside
+/// [`Event::VaultLiquidated`], so it emits one event for the vault rather than three.
+///
+/// [`Event::InterestAccrued`]: crate::Event::InterestAccrued
+/// [`Event::RedistributionApplied`]: crate::Event::RedistributionApplied
+/// [`Event::VaultLiquidated`]: crate::Event::VaultLiquidated
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LiquidationTouch<Balance> {
+	/// Accrued interest added to the vault's debt.
+	pub interest: Balance,
+	/// The vault's share of earlier liquidations: principal added and collateral credited.
+	pub redistribution: DebtCollateral<Balance>,
 }
 
 /// Reason a branch is frozen.
@@ -323,6 +335,8 @@ pub struct BranchConfig<Balance> {
 	pub upfront_fee_period: Millis,
 	/// Minimum time between rate changes that do not charge an upfront fee.
 	pub rate_adjustment_cooldown: Millis,
+	/// Minimum time between a paid final-recovery entry and the next paid entry in this branch.
+	pub final_recovery_reward_cooldown: Millis,
 	/// Penalties, keeper compensation, and direct-JIT limits used during liquidation.
 	pub liquidation: LiquidationConfig<Balance>,
 }
@@ -342,6 +356,12 @@ pub enum BranchConfigDefect {
 	/// The debt floor is under the stablecoin's minimum balance, so the smallest vault could
 	/// not be paid what it borrows.
 	MinimumDebtBelowStableMinimum,
+	/// Offsetting costs the borrower more than redistribution, inverting the waterfall order.
+	OffsetPenaltyAboveRedistribution,
+	/// The keeper's share of a seizure outgrows the offset penalty funding it.
+	KeeperPercentExceedsPenalty,
+	/// Keeper compensation is larger than the offset penalty on the smallest vault.
+	KeeperCompensationExceedsPenalty,
 }
 
 impl<Balance: AtLeast32BitUnsigned + Copy> BranchConfig<Balance> {
@@ -371,7 +391,14 @@ impl<Balance: AtLeast32BitUnsigned + Copy> BranchConfig<Balance> {
 			self.minimum_borrow_rate <= self.maximum_borrow_rate,
 			BranchConfigDefect::MinimumBorrowRateAboveMaximum
 		);
-		self.ensure_vault_floors(stable_minimum)
+		self.ensure_vault_floors(stable_minimum)?;
+		// Offsetting must stay the cheaper waterfall step, or liquidators
+		// would prefer redistribution.
+		ensure!(
+			self.liquidation.offset_penalty <= self.liquidation.redistribution_penalty,
+			BranchConfigDefect::OffsetPenaltyAboveRedistribution
+		);
+		self.ensure_keeper_compensation()
 	}
 
 	/// Checks the debt floor describes a vault worth carrying.
@@ -388,6 +415,32 @@ impl<Balance: AtLeast32BitUnsigned + Copy> BranchConfig<Balance> {
 			self.minimum_debt >= stable_minimum,
 			BranchConfigDefect::MinimumDebtBelowStableMinimum
 		);
+		Ok(())
+	}
+
+	/// Checks keeper compensation is not paid out of the pool's principal cover.
+	fn ensure_keeper_compensation(&self) -> Result<(), BranchConfigDefect> {
+		let penalty_rate = FixedU128::from(self.liquidation.offset_penalty);
+		let keeper_rate = FixedU128::from(self.liquidation.keeper_percent_compensation);
+		// Per unit of debt the seizure is `1 + offset_penalty` and the spare part is
+		// `offset_penalty`. Both rates convert exactly, so this holds at every vault size.
+		let seizure_rate = FixedU128::one().saturating_add(penalty_rate);
+		ensure!(
+			keeper_rate.saturating_mul(seizure_rate) <= penalty_rate,
+			BranchConfigDefect::KeeperPercentExceedsPenalty
+		);
+		// Mirrors the rounding the waterfall applies: seizure rounds the penalty up, the
+		// keeper's percentage share rounds down, and the cap applies to their sum. A cap
+		// inside the penalty is what makes the terms payable in full, not what makes them
+		// invalid.
+		let penalty = self.liquidation.offset_penalty.mul_ceil(self.minimum_debt);
+		let seizure = self.minimum_debt.saturating_add(penalty);
+		let take = self
+			.liquidation
+			.keeper_flat_compensation_value
+			.saturating_add(self.liquidation.keeper_percent_compensation.mul_floor(seizure))
+			.min(self.liquidation.keeper_compensation_cap_value);
+		ensure!(take <= penalty, BranchConfigDefect::KeeperCompensationExceedsPenalty);
 		Ok(())
 	}
 }
@@ -533,6 +586,8 @@ pub struct BranchState<AccountId, Balance> {
 	pub interest_epoch: Millis,
 	/// Dormant vault that must be redeemed before the rate list.
 	pub dormant_redemption_target: Option<AccountId>,
+	/// Time of the latest final-recovery entry in this branch.
+	pub last_final_recovery_entry: Option<Millis>,
 	/// Frozen state, if the branch is frozen.
 	pub frozen: Option<FrozenState>,
 }
@@ -548,6 +603,7 @@ impl<AccountId, Balance: Default + Zero> BranchState<AccountId, Balance> {
 			pending_redistribution_collateral: Balance::zero(),
 			interest_epoch: now,
 			dormant_redemption_target: None,
+			last_final_recovery_entry: None,
 			frozen: None,
 		}
 	}
@@ -557,6 +613,20 @@ impl<AccountId, Balance> BranchState<AccountId, Balance> {
 	/// Returns why the branch is frozen, or `None` if it is not.
 	pub fn frozen_reason(&self) -> Option<FrozenReason> {
 		self.frozen.map(|frozen| frozen.reason)
+	}
+
+	/// Returns whether a new final-recovery entry pays its keeper at `now`.
+	pub(crate) const fn final_recovery_reward_due(
+		&self,
+		config: &BranchConfig<Balance>,
+		now: Millis,
+	) -> bool {
+		match self.last_final_recovery_entry {
+			None => true,
+			Some(entered_at) => {
+				now.saturating_sub(entered_at) >= config.final_recovery_reward_cooldown
+			},
+		}
 	}
 
 	/// Returns branch interest time at `now`.
@@ -799,6 +869,18 @@ pub enum BranchConfigUpdate<Balance> {
 	UpfrontFeePeriod(Millis),
 	/// Sets the rate-change cooldown.
 	RateAdjustmentCooldown(Millis),
+	/// Sets the minimum time between a final-recovery entry and the next paid entry.
+	FinalRecoveryRewardCooldown(Millis),
+	/// Sets the extra collateral seized for debt cancelled by an offset.
+	OffsetPenalty(Permill),
+	/// Sets the flat keeper compensation, in stablecoin value.
+	KeeperFlatCompensationValue(Balance),
+	/// Sets the share of seized collateral added to the flat keeper compensation.
+	KeeperPercentCompensation(Permill),
+	/// Sets the maximum keeper compensation, in stablecoin value.
+	KeeperCompensationCapValue(Balance),
+	/// Sets the smallest direct keeper contribution.
+	MinimumJitContribution(Balance),
 	/// Sets the extra collateral assigned to redistributed debt.
 	RedistributionPenalty(Permill),
 }
@@ -818,6 +900,18 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			},
 			Self::UpfrontFeePeriod(v) => config.upfront_fee_period = v,
 			Self::RateAdjustmentCooldown(v) => config.rate_adjustment_cooldown = v,
+			Self::FinalRecoveryRewardCooldown(v) => config.final_recovery_reward_cooldown = v,
+			Self::OffsetPenalty(v) => config.liquidation.offset_penalty = v,
+			Self::KeeperFlatCompensationValue(v) => {
+				config.liquidation.keeper_flat_compensation_value = v
+			},
+			Self::KeeperPercentCompensation(v) => {
+				config.liquidation.keeper_percent_compensation = v
+			},
+			Self::KeeperCompensationCapValue(v) => {
+				config.liquidation.keeper_compensation_cap_value = v
+			},
+			Self::MinimumJitContribution(v) => config.liquidation.minimum_jit_contribution = v,
 			Self::RedistributionPenalty(v) => config.liquidation.redistribution_penalty = v,
 		}
 	}
@@ -826,6 +920,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 	///
 	/// Read before [`Self::apply_to`], this is the value the update replaces.
 	pub(crate) const fn current_in(self, config: &BranchConfig<Balance>) -> Self {
+		let liquidation = &config.liquidation;
 		match self {
 			Self::MinimumCollateralizationRatio(_) => {
 				Self::MinimumCollateralizationRatio(config.minimum_collateralization_ratio)
@@ -846,8 +941,24 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::RateAdjustmentCooldown(_) => {
 				Self::RateAdjustmentCooldown(config.rate_adjustment_cooldown)
 			},
+			Self::FinalRecoveryRewardCooldown(_) => {
+				Self::FinalRecoveryRewardCooldown(config.final_recovery_reward_cooldown)
+			},
+			Self::OffsetPenalty(_) => Self::OffsetPenalty(liquidation.offset_penalty),
+			Self::KeeperFlatCompensationValue(_) => {
+				Self::KeeperFlatCompensationValue(liquidation.keeper_flat_compensation_value)
+			},
+			Self::KeeperPercentCompensation(_) => {
+				Self::KeeperPercentCompensation(liquidation.keeper_percent_compensation)
+			},
+			Self::KeeperCompensationCapValue(_) => {
+				Self::KeeperCompensationCapValue(liquidation.keeper_compensation_cap_value)
+			},
+			Self::MinimumJitContribution(_) => {
+				Self::MinimumJitContribution(liquidation.minimum_jit_contribution)
+			},
 			Self::RedistributionPenalty(_) => {
-				Self::RedistributionPenalty(config.redistribution_penalty)
+				Self::RedistributionPenalty(liquidation.redistribution_penalty)
 			},
 		}
 	}
@@ -863,6 +974,12 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::MinimumDebt(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
+			Self::FinalRecoveryRewardCooldown(_) |
+			Self::OffsetPenalty(_) |
+			Self::KeeperFlatCompensationValue(_) |
+			Self::KeeperPercentCompensation(_) |
+			Self::KeeperCompensationCapValue(_) |
+			Self::MinimumJitContribution(_) |
 			Self::RedistributionPenalty(_) => AdminLevel::Full,
 		}
 	}
@@ -888,6 +1005,12 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::MinimumDebt(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
+			Self::FinalRecoveryRewardCooldown(_) |
+			Self::OffsetPenalty(_) |
+			Self::KeeperFlatCompensationValue(_) |
+			Self::KeeperPercentCompensation(_) |
+			Self::KeeperCompensationCapValue(_) |
+			Self::MinimumJitContribution(_) |
 			Self::RedistributionPenalty(_) => false,
 		}
 	}
