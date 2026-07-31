@@ -61,25 +61,6 @@ fn simple_interest_with_rounding<Balance: FixedPointOperand>(
 		.defensive_unwrap_or_else(Balance::max_value)
 }
 
-/// Converts stable debt into collateral units, rounded up.
-///
-/// Returns `None` when the price is zero or the result overflows.
-pub fn value_in_collateral<Balance: FixedPointOperand>(
-	debt: Balance,
-	price: FixedU128,
-) -> Option<Balance> {
-	if debt.is_zero() {
-		return Some(Balance::zero());
-	}
-	if price.is_zero() {
-		return None;
-	}
-	let d: u128 = debt.unique_saturated_into();
-	// Divide by a fixed-point price without losing its scale.
-	multiply_by_rational_with_rounding(d, FixedU128::DIV, price.into_inner(), Rounding::Up)
-		.and_then(|raw| Balance::try_from(raw).ok())
-}
-
 /// Returns the market's average rate, rounded up.
 ///
 /// `weighted_sum` is the sum of each debt multiplied by its rate. Zero debt returns `1.0`, which

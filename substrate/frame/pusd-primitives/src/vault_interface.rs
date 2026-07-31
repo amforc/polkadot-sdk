@@ -1,8 +1,7 @@
-//! The vault-side surface external orchestrator pallets drive — redemption
-//! sweeps, liquidation execution, and bad-debt healing — keyed by the
-//! `(collateral_id, stable_id)` market.
+//! The vault-side surface external redemption and bad-debt flows drive, keyed
+//! by the `(collateral_id, stable_id)` market.
 
-use crate::{Position, VaultStatus};
+use crate::{DebtCollateral, VaultStatus};
 use frame::deps::{
 	frame_support::pallet_prelude::{DispatchError, DispatchResult},
 	sp_runtime::Permill,
@@ -37,8 +36,8 @@ pub struct RedemptionStepSnapshot<Balance> {
 
 impl<Balance: Copy> RedemptionStepSnapshot<Balance> {
 	/// The debt/collateral pair CR math reads.
-	pub fn position(&self) -> Position<Balance> {
-		Position { debt: self.debt, collateral: self.collateral }
+	pub fn position(&self) -> DebtCollateral<Balance> {
+		DebtCollateral { debt: self.debt, collateral: self.collateral }
 	}
 }
 
@@ -67,10 +66,10 @@ pub struct LiquidationSnapshot<Balance> {
 	pub redistribution_penalty: Permill,
 }
 
-/// Everything an orchestrator drives on the vault pallet. Reads are
-/// authoritative current state; writes re-shape the priority queue.
+/// The vault-side API used by external redemption and bad-debt flows. Reads
+/// are authoritative current state; writes re-shape the priority queue.
 ///
-/// The builder closures make each step atomic: the orchestrator sizes its
+/// The settlement builder makes each redemption step atomic: the caller sizes its
 /// settlement against a post-touch snapshot inside the same
 /// call that applies it, and returning `Err` (or producing an invalid one)
 /// rolls the whole step back, so a rejected step never leaves partial state.
@@ -124,10 +123,12 @@ pub trait VaultInterface {
 	/// fully-accrued snapshot, and apply the returned settlement atomically —
 	/// cancel exactly the debt `debt_payment` covers,
 	/// burn the payment, and pay `collateral_to_recipient` to `recipient`.
-	/// `Ok(None)` from the closure skips the target but persists the touch, so
-	/// build the payment only on the settlement path. Charging the redemption
-	/// fee stays with the caller.
-	fn redeem_step(
+	/// A `None` settlement skips the target but persists the touch, so build the
+	/// payment only on the settlement path. The tuple's `Outcome` is returned
+	/// unchanged after commit, letting the caller carry loop or pricing state
+	/// without a mutable side channel. Charging the redemption fee stays with
+	/// the caller.
+	fn redeem_step<Outcome>(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,
 		owner: &Self::AccountId,
@@ -135,10 +136,10 @@ pub trait VaultInterface {
 		build_settlement: impl FnOnce(
 			RedemptionStepSnapshot<Self::Balance>,
 		) -> Result<
-			Option<RedemptionSettlement<Self::StableCredit, Self::Balance>>,
+			(Option<RedemptionSettlement<Self::StableCredit, Self::Balance>>, Outcome),
 			DispatchError,
 		>,
-	) -> DispatchResult;
+	) -> Result<Outcome, DispatchError>;
 
 	/// Move a `FinalRecovery` vault's fully-accrued residual debt off the row
 	/// and into the branch bad-debt ledger, returning the amount. The caller

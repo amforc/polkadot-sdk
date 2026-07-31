@@ -23,11 +23,11 @@ mod risk_controls;
 
 use crate::mock::{AccountId, AssetId, FixedU128, StableId, Test};
 
-pub(super) fn rate_pct(num: u128, denom: u128) -> FixedU128 {
+pub fn rate_pct(num: u128, denom: u128) -> FixedU128 {
 	FixedU128::from_rational(num, denom)
 }
 
-pub(super) fn vault_status(
+pub fn vault_status(
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,

@@ -6,7 +6,7 @@ use crate::{
 		BalanceOf, Branches, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason,
 		Pallet, StableCreditOf, StableIdOf,
 	},
-	types::{Position, VaultListId, VaultStatus},
+	types::{DebtCollateral, VaultListId, VaultStatus},
 };
 use frame::{
 	deps::frame_support::transactional,
@@ -17,7 +17,6 @@ use frame::{
 			MutateHold as FungiblesMutateHold,
 		},
 		tokens::Restriction,
-		Time,
 	},
 };
 use linked_list_interface::SortedListInterface;
@@ -88,7 +87,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 		// `debt_offset <= post_touch_debt` was checked above, so the
 		// subtraction is exact.
-		op.apply_liquidation(Position {
+		op.apply_liquidation(DebtCollateral {
 			debt: post_touch_debt.saturating_sub(debt_offset),
 			collateral: redistribution_amount,
 		})?;
@@ -151,22 +150,18 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<RedemptionStepSnapshot<BalanceOf<T>>, DispatchError> {
-		let now = T::TimeProvider::now();
-		let branch = Self::branch_of(collateral_id, stable_id)?;
-		ensure!(!branch.state.is_frozen(), Error::<T>::BranchFrozen);
-
-		let vault = Self::vault_of(collateral_id, stable_id, owner)?;
-		let pending = Self::pending_touch_for(&vault, &branch.state, now);
+		let draft = Self::touched_vault_draft(collateral_id, stable_id, owner)?;
+		ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
 		Ok(RedemptionStepSnapshot {
-			status: Self::vault_status_of(collateral_id, stable_id, owner),
-			debt: pending.total_debt(&vault.debt),
-			collateral: vault.collateral.saturating_add(pending.collateral),
-			redistribution_penalty: branch.config.redistribution_penalty,
+			status: draft.status,
+			debt: draft.vault.debt.total(),
+			collateral: draft.vault.collateral,
+			redistribution_penalty: draft.config.redistribution_penalty,
 		})
 	}
 
 	#[transactional]
-	fn redeem_step(
+	fn redeem_step<Outcome>(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
@@ -174,35 +169,34 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		build_settlement: impl FnOnce(
 			RedemptionStepSnapshot<BalanceOf<T>>,
 		) -> Result<
-			Option<RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>>,
+			(Option<RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>>, Outcome),
 			DispatchError,
 		>,
-	) -> DispatchResult {
+	) -> Result<Outcome, DispatchError> {
 		let mut op = VaultOp::<T>::load(collateral_id.clone(), stable_id.clone(), owner)?;
 		let snapshot = op.redemption_snapshot();
 		let post_touch_debt = snapshot.debt;
 		let held = snapshot.collateral;
 
-		let Some(settlement) = build_settlement(snapshot)? else {
+		let (settlement, outcome) = build_settlement(snapshot)?;
+		let Some(settlement) = settlement else {
 			// Keep interest applied by the touch even when this target is skipped.
-			return op.commit_exempt();
+			op.commit_exempt()?;
+			return Ok(outcome);
 		};
 		let RedemptionSettlement { debt_payment, collateral_to_recipient } = settlement;
 
 		// Only the credit amount sets how much debt is cancelled. Use `None` to skip the target.
 		ensure!(debt_payment.asset() == *op.stable_id(), Error::<T>::InvalidRedemptionSettlement);
 		let debt_to_cancel = debt_payment.peek();
-		ensure!(
-			!debt_to_cancel.is_zero() &&
-				debt_to_cancel <= post_touch_debt &&
-				collateral_to_recipient <= held,
-			Error::<T>::InvalidRedemptionSettlement
-		);
+		ensure!(!debt_to_cancel.is_zero(), Error::<T>::InvalidRedemptionSettlement);
+		ensure!(debt_to_cancel <= post_touch_debt, Error::<T>::InvalidRedemptionSettlement);
+		ensure!(collateral_to_recipient <= held, Error::<T>::InvalidRedemptionSettlement);
 
 		// Burn the stable asset used for payment.
 		drop(debt_payment);
 
-		let payment = op.redeem(debt_to_cancel);
+		let payment = op.redeem(debt_to_cancel)?;
 		debug_assert_eq!(payment.total(), debt_to_cancel);
 
 		if !collateral_to_recipient.is_zero() {
@@ -230,7 +224,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			collateral_to_recipient,
 			vault_annual_rate: op.vault().annual_rate,
 		});
-		op.commit_exempt()
+		op.commit_exempt()?;
+		Ok(outcome)
 	}
 
 	#[transactional]

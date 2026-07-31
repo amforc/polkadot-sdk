@@ -112,6 +112,44 @@ fn debt_in_front_includes_dormant_redemption_target() {
 	});
 }
 
+// Final recovery vaults gate every redemption, so their entire debt counts in
+// front of any rate — before the dormant target and the rate index.
+#[test]
+fn debt_in_front_counts_final_recovery_queue_first() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		// The only vault: 70 collateral backing 501 of entire debt (fee 1).
+		assert_ok!(open(1, DOT, PUSD, 70, 500, rate_pct(5, 1000)));
+		// At price 7 its CR is 490/501 < 1.10, and as the last eligible vault it
+		// enters final recovery instead of liquidation.
+		set_price(DOT, FixedU128::from_rational(7, 1));
+		assert_ok!(Vaults::enter_final_recovery(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		set_price(DOT, FixedU128::from_rational(10, 1));
+
+		// Two active vaults join the rate index afterwards.
+		assert_ok!(open(2, DOT, PUSD, 1_000, 700, rate_pct(6, 1000))); // entire debt 701
+		assert_ok!(open(3, DOT, PUSD, 1_000, 900, rate_pct(7, 1000))); // entire debt 901
+
+		let debt_in_front =
+			|rate, steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate, steps);
+
+		// The recovery vault counts at every rate; vault 3 at exactly 0.7% does not.
+		assert_eq!(debt_in_front(rate_pct(7, 1000), u32::MAX), 501 + 701);
+		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), 501 + 701 + 901);
+		// The recovery vault consumes the first walk step.
+		assert_eq!(debt_in_front(rate_pct(1, 100), 1), 501);
+		assert_eq!(debt_in_front(rate_pct(1, 100), 0), 0);
+
+		// Redeeming vault 2 below `MinimumDebt` parks it as the dormant target:
+		// the walk orders recovery (501), then the dormant residual (199), then
+		// the rate index (901).
+		assert_ok!(redeem_from(DOT, PUSD, 2, 4, 502));
+		assert!(vault_status(DOT, PUSD, 2).is_dormant());
+		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), 501 + 199 + 901);
+		assert_eq!(debt_in_front(rate_pct(1, 100), 2), 501 + 199);
+	});
+}
+
 // A zero step budget and an empty rate index both return zero.
 #[test]
 fn debt_in_front_zero_for_no_steps_or_empty_index() {
