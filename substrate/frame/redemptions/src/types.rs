@@ -67,6 +67,28 @@ impl<Balance: Zero> RedemptionConfig<Balance> {
 	}
 }
 
+/// Redeemer-supplied execution terms.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Debug,
+)]
+pub struct RedemptionTerms<Balance> {
+	/// Maximum stable assets whose corresponding vault debt may be cancelled.
+	pub max_stable_in: Balance,
+	/// Collateral floor at a full fill.
+	///
+	/// Partial fills scale this floor pro-rata to the debt actually cancelled.
+	pub min_collateral_out: Balance,
+}
+
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RedemptionState {
 	pub dynamic_fee: FixedU128,

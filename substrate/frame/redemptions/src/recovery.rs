@@ -272,7 +272,6 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 
 		with_transaction(|| {
 			let mut payment = payment;
-			let mut result = RecoveryOffsetResult::NoTarget;
 			let step = T::Vaults::redeem_step(
 				collateral_id,
 				stable_id,
@@ -281,29 +280,28 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 				|snapshot| match Self::offset_decision(Self::price_recovery(
 					stable_id, &snapshot, price, budget, &config,
 				)) {
-					OffsetDecision::NoTarget => Ok(None),
-					OffsetDecision::BelowPar => {
-						result = RecoveryOffsetResult::BelowPar;
-						Ok(None)
-					},
+					OffsetDecision::NoTarget => Ok((None, RecoveryOffsetResult::NoTarget)),
+					OffsetDecision::BelowPar => Ok((None, RecoveryOffsetResult::BelowPar)),
 					OffsetDecision::Available { debt, collateral } => {
 						let debt_payment = payment.extract(debt);
 						debug_assert_eq!(debt_payment.peek(), debt);
-						result = RecoveryOffsetResult::Applied { collateral_out: collateral };
-						Ok(Some(RedemptionSettlement {
-							debt_payment,
-							collateral_to_recipient: collateral,
-						}))
+						Ok((
+							Some(RedemptionSettlement {
+								debt_payment,
+								collateral_to_recipient: collateral,
+							}),
+							RecoveryOffsetResult::Applied { collateral_out: collateral },
+						))
 					},
 				},
 			);
 
-			match (step, result) {
-				(Err(error), _) => TransactionOutcome::Rollback(Err(error)),
-				(Ok(()), RecoveryOffsetResult::Applied { .. }) => {
+			match step {
+				Err(error) => TransactionOutcome::Rollback(Err(error)),
+				Ok(result @ RecoveryOffsetResult::Applied { .. }) => {
 					TransactionOutcome::Commit(Ok((result, payment)))
 				},
-				(Ok(()), _) => TransactionOutcome::Rollback(Ok((result, payment))),
+				Ok(result) => TransactionOutcome::Rollback(Ok((result, payment))),
 			}
 		})
 	}
