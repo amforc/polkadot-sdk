@@ -1066,13 +1066,13 @@ mod tests {
 		// The divided product itself exceeds `u128`.
 		let weight = u128::MAX / 2;
 		let elapsed = 4 * YEAR;
-		assert!(PendingInterest::<u128>::from_weight_millis(weight, elapsed).is_none());
+		assert!(PendingInterest::from_weight_millis(weight, elapsed).is_none());
 	}
 
 	#[test]
 	fn pending_interest_add_carries_and_sub_borrows() {
 		let a = PendingInterest::<u128> { interest: 5, remainder: YEAR - 1 };
-		let b = PendingInterest::<u128> { interest: 2, remainder: 3 };
+		let b = PendingInterest { interest: 2, remainder: 3 };
 		let sum = a.checked_add(&b).unwrap();
 		assert_eq!(sum, PendingInterest { interest: 8, remainder: 2 });
 		assert_eq!(sum.checked_sub(&b).unwrap(), a);
@@ -1082,7 +1082,7 @@ mod tests {
 	#[test]
 	fn pending_interest_sub_below_zero_is_none() {
 		let a = PendingInterest::<u128> { interest: 1, remainder: 0 };
-		let b = PendingInterest::<u128> { interest: 0, remainder: 1 };
+		let b = PendingInterest { interest: 0, remainder: 1 };
 		// Same total ordering the aggregate relies on: `a - b` borrows into the
 		// interest limb, `b - a` underflows.
 		assert_eq!(
@@ -1096,6 +1096,6 @@ mod tests {
 	fn pending_interest_ceil_rounds_any_remainder_up() {
 		assert_eq!(PendingInterest::<u128> { interest: 7, remainder: 0 }.ceil().unwrap(), 7);
 		assert_eq!(PendingInterest::<u128> { interest: 7, remainder: 1 }.ceil().unwrap(), 8);
-		assert!(PendingInterest::<u128> { interest: u128::MAX, remainder: 1 }.ceil().is_none());
+		assert!(PendingInterest { interest: u128::MAX, remainder: 1 }.ceil().is_none());
 	}
 }

@@ -171,10 +171,10 @@ mod tests {
 
 	#[test]
 	fn redistribution_per_stake_overflow_returns_none() {
-		let got = redistribution_per_stake::<u128>(u128::MAX / 2, 1);
+		let got = redistribution_per_stake(u128::MAX / 2, 1);
 		assert!(got.is_none());
 		// A value below the overflow limit still fits.
-		let safe = redistribution_per_stake::<u128>(u128::MAX / (FixedU128::DIV * 2), 1);
+		let safe = redistribution_per_stake(u128::MAX / (FixedU128::DIV * 2), 1);
 		assert!(safe.is_some());
 	}
 
@@ -192,7 +192,7 @@ mod tests {
 		// The debt-per-stake intermediate would overflow, but the small rate keeps the final value
 		// valid.
 		let avg = FixedU128::from_rational(1u128, u128::from(u64::MAX));
-		let got = redistribution_weight_per_stake::<u128>(u128::MAX / 4, avg, 1);
+		let got = redistribution_weight_per_stake(u128::MAX / 4, avg, 1);
 		assert!(
 			got.is_some(),
 			"one-shot weight helper should survive when avg_rate keeps the quotient bounded"
