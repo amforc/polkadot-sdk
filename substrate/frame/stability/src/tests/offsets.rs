@@ -199,35 +199,56 @@ fn offset_preserves_claimable_yield() {
 #[test]
 fn offset_api_trait_surface_matches_the_engine() {
 	build_and_execute(|| {
-		use pusd_primitives::StabilityPoolOffsetApi;
+		use pusd_primitives::{StabilityOffsetSession, StabilityPoolOffsetApi};
 		type Api = Stability;
 
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_deposit(1, 1_000);
 		activate_all(&[1]);
 
-		// The trait methods are thin wrappers over the engine functions.
-		let (debt_offset, remainder) =
-			<Api as StabilityPoolOffsetApi<_, _, _, _>>::offset_liquidation(
-				&DOT,
-				&PUSD,
-				500,
-				issue_collateral(DOT, 400),
-			);
-		assert_eq!(debt_offset, 500);
-		assert_eq!(remainder.peek(), 0);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 500);
+		<Api as StabilityPoolOffsetApi<_, _, _, _>>::with_offset_session(&DOT, &PUSD, |session| {
+			assert_eq!(session.reserve_active(500), 500);
+			session.settle_active(issue_collateral(DOT, 400))?;
 
-		// An empty pending queue passes the debt and the credit through.
-		let (debt_offset, remainder) =
-			<Api as StabilityPoolOffsetApi<_, _, _, _>>::offset_pending_liquidation(
+			// The same in-memory draft serves the pending stage.
+			assert_eq!(session.reserve_pending(100), 0);
+			Ok(())
+		})
+		.unwrap();
+		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 500);
+	});
+}
+
+#[test]
+fn offset_session_rolls_back_every_stage_on_error() {
+	build_and_execute(|| {
+		use pusd_primitives::{StabilityOffsetSession, StabilityPoolOffsetApi};
+		type Api = Stability;
+
+		register_branch(DOT, PUSD, default_branch_config());
+		seed_deposit(1, 1_000);
+		activate_all(&[1]);
+
+		let pool_account = Stability::pool_account(&DOT, &PUSD);
+		let before_pool = pool_state(DOT, PUSD);
+		let before_balance = stable_balance(PUSD, pool_account);
+		let before_sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+
+		let result: Result<(), DispatchError> =
+			<Api as StabilityPoolOffsetApi<_, _, _, _>>::with_offset_session(
 				&DOT,
 				&PUSD,
-				100,
-				issue_collateral(DOT, 50),
+				|session| {
+					assert_eq!(session.reserve_active(500), 500);
+					session.settle_active(issue_collateral(DOT, 0))?;
+					Err(DispatchError::Other("abort liquidation"))
+				},
 			);
-		assert_eq!(debt_offset, 0);
-		assert_eq!(remainder.peek(), 50);
+
+		assert_eq!(result, Err(DispatchError::Other("abort liquidation")));
+		assert_eq!(pool_state(DOT, PUSD), before_pool);
+		assert_eq!(stable_balance(PUSD, pool_account), before_balance);
+		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), before_sums);
 	});
 }
 

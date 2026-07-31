@@ -6,7 +6,7 @@ use frame::traits::{
 	fungibles::Balanced as FungiblesBalanced,
 	tokens::{Fortitude, Precision, Preservation},
 };
-use pusd_primitives::{OnBranchYield, StabilityPoolOffsetApi};
+use pusd_primitives::{OnBranchYield, StabilityOffsetSession, StabilityPoolOffsetApi};
 
 fn burn_stable(stable: StableId, who: AccountId, amount: Balance) {
 	let credit = <Assets as FungiblesBalanced<AccountId>>::withdraw(
@@ -86,19 +86,18 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		let state_before = pool_state(DOT, PUSD);
-		let (debt_offset, returned) =
-			Stability::offset_liquidation(&DOT, &PUSD, 200, issue_collateral(TOKEN_X, 100));
-		assert_eq!(debt_offset, 0);
-		assert_eq!(returned.asset(), TOKEN_X);
-		assert_eq!(returned.peek(), 100);
-		drop(returned);
+		let active = Stability::with_offset_session(&DOT, &PUSD, |session| {
+			assert_eq!(session.reserve_active(200), 200);
+			session.settle_active(issue_collateral(TOKEN_X, 100))
+		});
+		assert_eq!(active, Err(crate::Error::<Test>::OffsetSettlementFailed.into()));
 
-		let (debt_offset, returned) =
-			Stability::offset_pending_liquidation(&DOT, &PUSD, 200, issue_collateral(TOKEN_X, 100));
-		assert_eq!(debt_offset, 0);
-		assert_eq!(returned.asset(), TOKEN_X);
-		assert_eq!(returned.peek(), 100);
-		drop(returned);
+		let pending = Stability::with_offset_session(&DOT, &PUSD, |session| {
+			assert_eq!(session.reserve_active(0), 0);
+			assert_eq!(session.reserve_pending(200), 200);
+			session.settle_pending(issue_collateral(TOKEN_X, 100))
+		});
+		assert_eq!(pending, Err(crate::Error::<Test>::OffsetSettlementFailed.into()));
 
 		assert_eq!(collateral_balance(TOKEN_X, pool), 0);
 		assert_eq!(pool_state(DOT, PUSD), state_before);
@@ -107,7 +106,7 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 }
 
 #[test]
-fn stable_withdrawal_failure_returns_the_full_collateral_credit() {
+fn stable_shortfall_steps_aside_without_consuming_collateral() {
 	build_and_execute(|| {
 		register_branch(TOKEN_X, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 400);
@@ -116,17 +115,13 @@ fn stable_withdrawal_failure_returns_the_full_collateral_credit() {
 		assert_ok!(poke(1, 1, TOKEN_X, PUSD));
 
 		let pool = Stability::pool_account(&TOKEN_X, &PUSD);
-		// Break the stable-balance identity so the stable withdrawal fails
-		// before any part of the collateral credit is consumed.
+		// Break the stable-balance identity so offset sizing finds nothing
+		// burnable and steps aside before any part of the collateral credit
+		// is consumed.
 		burn_stable(PUSD, pool, 400);
 
-		let (debt_offset, returned) =
-			Stability::do_offset_liquidation(&TOKEN_X, &PUSD, 200, issue_collateral(TOKEN_X, 100));
-		assert_eq!(debt_offset, 0);
-		assert_eq!(returned.asset(), TOKEN_X);
-		assert_eq!(returned.peek(), 100);
+		assert_eq!(simulate_offset(TOKEN_X, PUSD, 200, 100), (0, 100));
 		assert_eq!(collateral_balance(TOKEN_X, pool), 0);
-		drop(returned);
 
 		// Repair the deliberate corruption before the post-test invariant check.
 		mint_stable(PUSD, pool, 400);

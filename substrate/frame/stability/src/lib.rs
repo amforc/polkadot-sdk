@@ -348,6 +348,8 @@ pub mod pallet {
 		/// accumulator math; only reachable with a misconfigured
 		/// `minimum_active_pool_balance` on a gigantic pool.
 		UnsupportedOffsetPrecision,
+		/// A debt reservation could not be settled exactly.
+		OffsetSettlementFailed,
 		/// No `FinalRecovery` vault is queued on this market.
 		RecoveryVaultNotFound,
 		/// The `FinalRecovery` head is below par (`CR < 100%`): deposits
