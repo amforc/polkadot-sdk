@@ -238,7 +238,7 @@ fn heal_routes_by_the_credits_coin() {
 
 		// The EUSD credit heals the EUSD market; the PUSD ledger is untouched.
 		let eusd = <VaultStableAssets as Balanced<AccountId>>::issue(EUSD, 1_000);
-		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, eusd).unwrap();
+		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, eusd);
 		assert_eq!(surplus.peek(), 600, "only the 400 recorded EUSD debt is consumed");
 		assert_eq!(surplus.asset(), EUSD);
 		assert_eq!(branch_state(DOT, EUSD).unwrap().debt.bad_debt, 0);
@@ -247,7 +247,7 @@ fn heal_routes_by_the_credits_coin() {
 
 		// The PUSD credit heals the sibling.
 		let pusd = <VaultStableAssets as Balanced<AccountId>>::issue(PUSD, 1_000);
-		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, pusd).unwrap();
+		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, pusd);
 		assert_eq!(surplus.peek(), 0);
 		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.bad_debt, 0);
 	});
