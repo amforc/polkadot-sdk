@@ -287,7 +287,7 @@ fn collateral_debt_aggregate_tracks_every_write() {
 		});
 		assert_aggregate_matches(DOT);
 		let credit = <VaultStableAssets as FungiblesBalanced<AccountId>>::issue(PUSD, 60);
-		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, credit).expect("heal ok");
+		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, credit);
 		drop(surplus);
 		assert_aggregate_matches(DOT);
 	});
