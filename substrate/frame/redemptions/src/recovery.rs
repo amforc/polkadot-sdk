@@ -178,8 +178,7 @@ impl<T: Config> Pallet<T> {
 			Fortitude::Polite,
 		)
 		.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
-		let surplus = T::Vaults::heal(collateral_id, stable_id, credit)
-			.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
+		let surplus = T::Vaults::heal(collateral_id, credit);
 		if !surplus.peek().is_zero() {
 			log::error!(
 				target: crate::LOG_TARGET,
@@ -252,18 +251,18 @@ impl<T: Config> Pallet<T> {
 
 impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 	type CollateralId = CollateralIdOf<T>;
-	type StableId = StableIdOf<T>;
 	type AccountId = T::AccountId;
 	type Balance = BalanceOf<T>;
 	type Credit = StableCreditOf<T>;
 
 	fn execute_recovery_offset(
 		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
 		payment: StableCreditOf<T>,
 		collateral_recipient: &T::AccountId,
 	) -> Result<(RecoveryOffsetResult<BalanceOf<T>>, StableCreditOf<T>), DispatchError> {
-		ensure!(payment.asset() == *stable_id, Error::<T>::RecoveryOffsetCoinMismatch);
+		// The payment's own asset names the market: a coin mismatch is
+		// unrepresentable rather than an error.
+		let stable_id = &payment.asset();
 		let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
 			return Ok((RecoveryOffsetResult::NoTarget, payment));
 		};

@@ -259,9 +259,6 @@ pub mod pallet {
 		InsuranceFundBurnFailed,
 		/// The supplied redemption config is internally inconsistent.
 		InvalidRedemptionConfig,
-		/// A recovery-offset payment is denominated in a coin other than the
-		/// named market's stablecoin.
-		RecoveryOffsetCoinMismatch,
 	}
 
 	#[pallet::hooks]
