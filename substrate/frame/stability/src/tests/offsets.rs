@@ -2,6 +2,7 @@
 //! and the interplay with yield (invariant 12).
 
 use crate::{mock::*, Error};
+use frame::testing_prelude::hypothetically;
 
 #[test]
 fn offset_burns_debt_and_distributes_gains_proportionally() {
@@ -199,56 +200,174 @@ fn offset_preserves_claimable_yield() {
 #[test]
 fn offset_api_trait_surface_matches_the_engine() {
 	build_and_execute(|| {
-		use pusd_primitives::{StabilityOffsetSession, StabilityPoolOffsetApi};
-		type Api = Stability;
+		use pusd_primitives::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
 
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_deposit(1, 1_000);
 		activate_all(&[1]);
 
-		<Api as StabilityPoolOffsetApi<_, _, _, _>>::with_offset_session(&DOT, &PUSD, |session| {
-			assert_eq!(session.reserve_active(500), 500);
-			session.settle_active(issue_collateral(DOT, 400))?;
+		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 500), 500);
+		// Everything is activated: the pending leg sizes to zero even behind
+		// the active reservation.
+		assert_eq!(Stability::reducible_pending(&DOT, &PUSD, 100, 500), 0);
 
-			// The same in-memory draft serves the pending stage.
-			assert_eq!(session.reserve_pending(100), 0);
-			Ok(())
-		})
-		.unwrap();
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 500);
+		// `offset` requires the caller's transaction (`require_transactional`);
+		// the hypothetical supplies it here, standing in for dispatch.
+		hypothetically!({
+			assert_ok!(Stability::offset(
+				&DOT,
+				&PUSD,
+				OffsetLegs { active: 500, pending: 0 },
+				OffsetLegs {
+					active: issue_collateral(DOT, 400),
+					pending: issue_collateral(DOT, 0)
+				},
+			));
+			assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 500);
+		});
 	});
 }
 
 #[test]
-fn offset_session_rolls_back_every_stage_on_error() {
+fn combined_offset_settles_active_then_pending() {
 	build_and_execute(|| {
-		use pusd_primitives::{StabilityOffsetSession, StabilityPoolOffsetApi};
-		type Api = Stability;
+		use pusd_primitives::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
+
+		register_branch(DOT, USDX, default_branch_config());
+		mint_stable(USDX, 1, 60_000);
+		assert_ok!(deposit(1, DOT, USDX, 60_000));
+		advance_time(5_000);
+		assert_ok!(poke(1, 1, DOT, USDX));
+		mint_stable(USDX, 2, 40_000);
+		assert_ok!(deposit(2, DOT, USDX, 40_000));
+
+		assert_eq!(Stability::reducible_active(&DOT, &USDX, 60_000), 60_000);
+		assert_eq!(Stability::reducible_pending(&DOT, &USDX, 40_000, 60_000), 40_000);
+		// USDX has a 10_000-unit minimum. Active first preserves the shared
+		// account at 40_000; pending then performs the full expendable drain.
+		// Reversing the order would leave active unable to drain under the
+		// `Preserve` decision made by its sizing pass.
+		hypothetically!({
+			assert_ok!(Stability::offset(
+				&DOT,
+				&USDX,
+				OffsetLegs { active: 60_000, pending: 40_000 },
+				OffsetLegs {
+					active: issue_collateral(DOT, 240),
+					pending: issue_collateral(DOT, 160),
+				},
+			));
+
+			let pool_account = Stability::pool_account(&DOT, &USDX);
+			let state = pool_state(DOT, USDX);
+			assert_eq!(state.total_active_deposits, 0);
+			assert_eq!(state.total_pending_deposits, 0);
+			assert_eq!(state.total_collateral_gains_unclaimed, 400);
+			assert_eq!(state.coords.epoch, 1);
+			assert_eq!(state.pending_coords.epoch, 1);
+			assert_eq!(state.coords.p, FixedU128::one());
+			assert_eq!(state.pending_coords.p, FixedU128::one());
+			assert_eq!(stable_balance(USDX, pool_account), 0);
+			assert_eq!(collateral_balance(DOT, pool_account), 400);
+			assert_eq!(
+				crate::PoolSumsStore::<Test>::get((DOT, USDX, 0u32, 0u32)).s_collateral,
+				FixedU128::from_rational(1, 250)
+			);
+			assert_eq!(
+				crate::PendingSumsStore::<Test>::get((DOT, USDX, 0u32, 0u32)).s_collateral,
+				FixedU128::from_rational(1, 250)
+			);
+			System::assert_has_event(
+				crate::Event::PoolOffsetApplied {
+					collateral_id: DOT,
+					stable_id: USDX,
+					debt_burned: 60_000,
+					collateral_gain: 240,
+					epoch: 1,
+					scale: 0,
+				}
+				.into(),
+			);
+			System::assert_has_event(
+				crate::Event::PendingDepositOffsetApplied {
+					collateral_id: DOT,
+					stable_id: USDX,
+					debt_burned: 40_000,
+					collateral_gain: 160,
+					epoch: 1,
+					scale: 0,
+				}
+				.into(),
+			);
+		});
+	});
+}
+
+#[test]
+fn combined_offset_rolls_back_active_when_pending_fails() {
+	build_and_execute(|| {
+		use pusd_primitives::{OffsetLegs, StabilityPoolOffset};
 
 		register_branch(DOT, PUSD, default_branch_config());
+		seed_deposit(1, 600);
+		activate_all(&[1]);
+		seed_deposit(2, 400);
+
+		assert_noop!(
+			hypothetically!(Stability::offset(
+				&DOT,
+				&PUSD,
+				OffsetLegs { active: 300, pending: 200 },
+				OffsetLegs {
+					active: issue_collateral(DOT, 240),
+					pending: issue_collateral(TOKEN_X, 160),
+				},
+			)),
+			Error::<Test>::OffsetSettlementFailed,
+		);
+	});
+}
+
+#[test]
+fn offset_refuses_stale_sizing_reads() {
+	build_and_execute(|| {
+		use pusd_primitives::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
+
+		register_branch(DOT, PUSD, default_branch_config());
+		set_min_active_pool(100);
 		seed_deposit(1, 1_000);
 		activate_all(&[1]);
 
-		let pool_account = Stability::pool_account(&DOT, &PUSD);
-		let before_pool = pool_state(DOT, PUSD);
-		let before_balance = stable_balance(PUSD, pool_account);
-		let before_sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
-
-		let result: Result<(), DispatchError> =
-			<Api as StabilityPoolOffsetApi<_, _, _, _>>::with_offset_session(
+		// 950 would strand 50 below the 100 minimum: the read clamps to 900,
+		// and demanding the unclamped 950 anyway fails exactly. The probe
+		// credit is issued inside the rolled-back hypothetical.
+		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 950), 900);
+		assert_noop!(
+			hypothetically!(Stability::offset(
 				&DOT,
 				&PUSD,
-				|session| {
-					assert_eq!(session.reserve_active(500), 500);
-					session.settle_active(issue_collateral(DOT, 0))?;
-					Err(DispatchError::Other("abort liquidation"))
+				OffsetLegs { active: 950, pending: 0 },
+				OffsetLegs {
+					active: issue_collateral(DOT, 400),
+					pending: issue_collateral(DOT, 0)
 				},
-			);
+			)),
+			Error::<Test>::OffsetSettlementFailed,
+		);
 
-		assert_eq!(result, Err(DispatchError::Other("abort liquidation")));
-		assert_eq!(pool_state(DOT, PUSD), before_pool);
-		assert_eq!(stable_balance(PUSD, pool_account), before_balance);
-		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), before_sums);
+		// The clamped amount itself executes exactly.
+		hypothetically!({
+			assert_ok!(Stability::offset(
+				&DOT,
+				&PUSD,
+				OffsetLegs { active: 900, pending: 0 },
+				OffsetLegs {
+					active: issue_collateral(DOT, 400),
+					pending: issue_collateral(DOT, 0)
+				},
+			));
+			assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 100);
+		});
 	});
 }
 

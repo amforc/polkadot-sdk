@@ -26,7 +26,7 @@ use frame::{
 		AsEnsureOriginWithArg, Convert, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
-use pusd_primitives::{ProvidePrice, StabilityOffsetSession, StabilityPoolOffsetApi};
+use pusd_primitives::{OffsetLegs, ProvidePrice, StabilityPoolInspect, StabilityPoolOffset};
 
 // 16 bytes so `into_sub_account_truncating` keeps the pallet id plus part of
 // the market seed: a `u64` would truncate every pusd-pallet sub-account to
@@ -744,53 +744,69 @@ pub fn issue_collateral(
 }
 
 /// Run an active-pool offset against a freshly issued collateral credit,
-/// reproducing the vault engine's take-at-most stage over the exact session
-/// API: the reservation sizes the take, the pro-rata collateral slice funds
-/// it, and the rest is rescinded. Returns the cancelled debt and the
-/// unconsumed remainder's amount. The credit is issued inside the
-/// transactional session so a settlement refusal (e.g. a sub-minimum first
-/// collateral gain) rolls everything back into a clean step-aside.
+/// reproducing the vault engine's take-at-most stage over the exact offset
+/// API: the `reducible_active` read sizes the take, the pro-rata collateral
+/// slice funds it, and the rest is rescinded. Returns the cancelled debt and
+/// the unconsumed remainder's amount. The storage layer stands in for the
+/// transactional dispatch boundary every production extrinsic gets: commit on
+/// success, and on error the caller-side abort the trait contract demands, so
+/// a settlement refusal (e.g. a sub-minimum first collateral gain) rolls
+/// everything back into a clean step-aside.
 pub fn simulate_offset(
 	collateral: AssetId,
 	stable: StableId,
 	max_debt: Balance,
 	collateral_for_pool: Balance,
 ) -> (Balance, Balance) {
-	Stability::with_offset_session(&collateral, &stable, |session| {
-		let mut credit = issue_collateral(collateral.clone(), collateral_for_pool);
-		let debt = session.reserve_active(max_debt);
-		if debt.is_zero() {
-			return Ok((0, credit.peek()));
-		}
-		let slice =
-			credit.extract(crate::math::pro_rata_floor(collateral_for_pool, debt, max_debt));
-		session.settle_active(slice)?;
-		Ok((debt, credit.peek()))
-	})
+	frame::deps::frame_support::storage::with_storage_layer(
+		|| -> Result<(Balance, Balance), DispatchError> {
+			let debt = Stability::reducible_active(&collateral, &stable, max_debt);
+			if debt.is_zero() {
+				return Ok((0, collateral_for_pool));
+			}
+			let mut credit = issue_collateral(collateral.clone(), collateral_for_pool);
+			let slice =
+				credit.extract(crate::math::pro_rata_floor(collateral_for_pool, debt, max_debt));
+			Stability::offset(
+				&collateral,
+				&stable,
+				OffsetLegs { active: debt, pending: 0 },
+				OffsetLegs { active: slice, pending: issue_collateral(collateral.clone(), 0) },
+			)?;
+			Ok((debt, credit.peek()))
+		},
+	)
 	.unwrap_or((0, collateral_for_pool))
 }
 
-/// Run a pending-deposit backstop offset with the same session plumbing.
+/// Run a pending-deposit backstop offset with the same probe plumbing.
 pub fn simulate_pending_offset(
 	collateral: AssetId,
 	stable: StableId,
 	max_debt_to_offset: Balance,
 	remaining_collateral: Balance,
 ) -> (Balance, Balance) {
-	Stability::with_offset_session(&collateral, &stable, |session| {
-		let mut credit = issue_collateral(collateral.clone(), remaining_collateral);
-		let debt = session.reserve_pending(max_debt_to_offset);
-		if debt.is_zero() {
-			return Ok((0, credit.peek()));
-		}
-		let slice = credit.extract(crate::math::pro_rata_floor(
-			remaining_collateral,
-			debt,
-			max_debt_to_offset,
-		));
-		session.settle_pending(slice)?;
-		Ok((debt, credit.peek()))
-	})
+	frame::deps::frame_support::storage::with_storage_layer(
+		|| -> Result<(Balance, Balance), DispatchError> {
+			let debt = Stability::reducible_pending(&collateral, &stable, max_debt_to_offset, 0);
+			if debt.is_zero() {
+				return Ok((0, remaining_collateral));
+			}
+			let mut credit = issue_collateral(collateral.clone(), remaining_collateral);
+			let slice = credit.extract(crate::math::pro_rata_floor(
+				remaining_collateral,
+				debt,
+				max_debt_to_offset,
+			));
+			Stability::offset(
+				&collateral,
+				&stable,
+				OffsetLegs { active: 0, pending: debt },
+				OffsetLegs { active: issue_collateral(collateral.clone(), 0), pending: slice },
+			)?;
+			Ok((debt, credit.peek()))
+		},
+	)
 	.unwrap_or((0, remaining_collateral))
 }
 
