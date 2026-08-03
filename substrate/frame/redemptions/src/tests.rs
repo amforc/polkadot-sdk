@@ -1650,7 +1650,7 @@ fn execute_offset_inner(
 		)?
 	};
 	let (result, change) = <Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
-		&DOT, &PUSD, payment, &recipient,
+		&DOT, payment, &recipient,
 	)?;
 	if let Err(change) = change.drop_zero() {
 		<Assets as FungiblesBalanced<AccountId>>::resolve(&payer, change)
@@ -1842,7 +1842,7 @@ fn recovery_offset_frozen_branch_reverts() {
 }
 
 #[test]
-fn recovery_offset_wrong_coin_payment_is_refused() {
+fn recovery_offset_payment_asset_selects_the_market() {
 	build_and_execute(|| {
 		use frame::traits::{
 			fungibles::Balanced as FungiblesBalanced,
@@ -1863,13 +1863,12 @@ fn recovery_offset_wrong_coin_payment_is_refused() {
 		let pusd_debt_before = vault_debt(DOT, PUSD, 1);
 		let usdx_debt_before = vault_debt(DOT, USDX, 2);
 		mint_stable(USDX, 3, 100 * USDX_UNIT);
-		let payer_before = Assets::balance(USDX, 3);
 		let issuance_before = Assets::total_supply(USDX);
 
-		// Use a real withdrawn payment and the same outer transaction contract
-		// as production callers. The mismatch error must roll the withdrawal
-		// back, not merely avoid touching either recovery head.
-		let result: Result<(), DispatchError> =
+		// The payment's own asset names the market: a USDX payment against
+		// `DOT` collateral settles the (DOT, USDX) head, and a coin mismatch
+		// with some other named market is unrepresentable.
+		let result: Result<RecoveryOffsetResult<Balance>, DispatchError> =
 			frame::deps::frame_support::storage::with_storage_layer(|| {
 				let payment = <Assets as FungiblesBalanced<AccountId>>::withdraw(
 					USDX,
@@ -1879,18 +1878,22 @@ fn recovery_offset_wrong_coin_payment_is_refused() {
 					Preservation::Expendable,
 					Fortitude::Polite,
 				)?;
-				let (_result, change) =
+				let (result, change) =
 					<Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
-						&DOT, &PUSD, payment, &4,
+						&DOT, payment, &4,
 					)?;
-				drop(change);
-				Ok(())
+				change
+					.drop_zero()
+					.map_err(|_| DispatchError::Other("full budget must be consumed"))?;
+				Ok(result)
 			});
-		assert_eq!(result, Err(crate::Error::<Test>::RecoveryOffsetCoinMismatch.into()));
-		assert_eq!(Assets::balance(USDX, 3), payer_before);
-		assert_eq!(Assets::total_supply(USDX), issuance_before);
+		assert!(matches!(result, Ok(RecoveryOffsetResult::Applied { .. })));
+
+		// The USDX head absorbed the full budget; the PUSD market never moved.
+		assert_eq!(vault_debt(DOT, USDX, 2), usdx_debt_before - 100 * USDX_UNIT);
 		assert_eq!(vault_debt(DOT, PUSD, 1), pusd_debt_before);
-		assert_eq!(vault_debt(DOT, USDX, 2), usdx_debt_before);
+		assert_eq!(Assets::balance(USDX, 3), 0);
+		assert_eq!(issuance_before - Assets::total_supply(USDX), 100 * USDX_UNIT);
 	});
 }
 
