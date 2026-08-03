@@ -37,7 +37,7 @@ use frame::{
 };
 pub use pallet_linked_list::Position;
 use pusd_primitives::{
-	RedemptionSettlement, StabilityOffsetSession, StabilityPoolOffsetApi, VaultInterface,
+	OffsetLegs, RedemptionSettlement, StabilityPoolInspect, StabilityPoolOffset, VaultInterface,
 };
 
 pub type AccountId = u64;
@@ -339,13 +339,12 @@ parameter_types! {
 }
 
 pub struct MockStabilityPool;
-pub struct MockStabilitySession {
-	active: Balance,
-	pending: Balance,
-}
 
 impl MockStabilityPool {
-	fn settle(
+	/// Settle one non-zero leg against its capacity knob, mirroring the real
+	/// pallet's exact semantics: the debt must still fit the capacity a
+	/// sizing read reported, or the whole offset fails.
+	fn settle_leg(
 		debt: Balance,
 		collateral: CollateralCreditOf<Test>,
 		capacity: &mut Balance,
@@ -361,45 +360,42 @@ impl MockStabilityPool {
 	}
 }
 
-impl StabilityOffsetSession<Balance, CollateralCreditOf<Test>> for MockStabilitySession {
-	fn reserve_active(&mut self, max_debt: Balance) -> Balance {
-		self.active = max_debt.min(ActiveSpCapacity::get());
-		self.active
+impl StabilityPoolInspect<AssetId, StableId, Balance> for MockStabilityPool {
+	fn reducible_active(_: &AssetId, _: &StableId, max_debt: Balance) -> Balance {
+		max_debt.min(ActiveSpCapacity::get())
 	}
 
-	fn reserve_pending(&mut self, max_debt: Balance) -> Balance {
-		self.pending = max_debt.min(PendingSpCapacity::get());
-		self.pending
-	}
-
-	fn settle_active(&mut self, collateral: CollateralCreditOf<Test>) -> DispatchResult {
-		let mut capacity = ActiveSpCapacity::get();
-		MockStabilityPool::settle(self.active, collateral, &mut capacity)?;
-		ActiveSpCapacity::set(capacity);
-		self.active = 0;
-		Ok(())
-	}
-
-	fn settle_pending(&mut self, collateral: CollateralCreditOf<Test>) -> DispatchResult {
-		let mut capacity = PendingSpCapacity::get();
-		MockStabilityPool::settle(self.pending, collateral, &mut capacity)?;
-		PendingSpCapacity::set(capacity);
-		self.pending = 0;
-		Ok(())
+	fn reducible_pending(_: &AssetId, _: &StableId, max_debt: Balance, _: Balance) -> Balance {
+		max_debt.min(PendingSpCapacity::get())
 	}
 }
 
-impl StabilityPoolOffsetApi<AssetId, StableId, Balance, CollateralCreditOf<Test>>
+impl StabilityPoolOffset<AssetId, StableId, Balance, CollateralCreditOf<Test>>
 	for MockStabilityPool
 {
-	type Session = MockStabilitySession;
-
-	fn with_offset_session<R>(
+	fn offset(
 		_: &AssetId,
 		_: &StableId,
-		settle: impl FnOnce(&mut Self::Session) -> Result<R, DispatchError>,
-	) -> Result<R, DispatchError> {
-		settle(&mut MockStabilitySession { active: 0, pending: 0 })
+		debt: OffsetLegs<Balance>,
+		collateral: OffsetLegs<CollateralCreditOf<Test>>,
+	) -> DispatchResult {
+		if debt.active.is_zero() {
+			ensure!(collateral.active.peek().is_zero(), Error::<Test>::InvalidLiquidationPlan);
+			drop(collateral.active);
+		} else {
+			let mut capacity = ActiveSpCapacity::get();
+			Self::settle_leg(debt.active, collateral.active, &mut capacity)?;
+			ActiveSpCapacity::set(capacity);
+		}
+		if debt.pending.is_zero() {
+			ensure!(collateral.pending.peek().is_zero(), Error::<Test>::InvalidLiquidationPlan);
+			drop(collateral.pending);
+		} else {
+			let mut capacity = PendingSpCapacity::get();
+			Self::settle_leg(debt.pending, collateral.pending, &mut capacity)?;
+			PendingSpCapacity::set(capacity);
+		}
+		Ok(())
 	}
 }
 

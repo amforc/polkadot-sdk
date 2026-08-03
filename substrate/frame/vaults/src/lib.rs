@@ -93,7 +93,7 @@ pub mod pallet {
 	use linked_list_interface::{Position, PriorityProvider, SortedListInterface};
 	use pusd_primitives::{
 		collateralization_ratio, OnBranchLifecycle, OnBranchYield, ProvidePrice,
-		StabilityPoolOffsetApi,
+		StabilityPoolOffset,
 	};
 
 	/// Balance type used by collateral and stable assets.
@@ -174,8 +174,9 @@ pub mod pallet {
 		/// Notifies other pallets when a market is created or removed.
 		type OnBranchLifecycle: OnBranchLifecycle<CollateralIdOf<Self>, StableIdOf<Self>>;
 
-		/// Provides one transaction-local Stability Pool draft to liquidation.
-		type StabilityPool: StabilityPoolOffsetApi<
+		/// Sizes and settles liquidation offsets against the Stability Pool:
+		/// limit-aware capacity reads plus one exact settlement call.
+		type StabilityPool: StabilityPoolOffset<
 			CollateralIdOf<Self>,
 			StableIdOf<Self>,
 			BalanceOf<Self>,
