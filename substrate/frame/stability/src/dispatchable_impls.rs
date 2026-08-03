@@ -514,7 +514,7 @@ impl<T: Config> Pallet<T> {
 	/// stranding the slice. The returned `Preservation` sizes the burn debit;
 	/// with a non-zero `reserved` it is computed against the combined limit and
 	/// stays valid only if the reserved tranche is debited from the account
-	/// first (the offset session settles active before pending).
+	/// first (the exact offset call settles active before pending).
 	pub(crate) fn size_active_offset(
 		pool: &StabilityPoolOf<T>,
 		stable_id: &StableIdOf<T>,
