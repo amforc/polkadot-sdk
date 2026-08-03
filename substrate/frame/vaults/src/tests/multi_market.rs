@@ -221,37 +221,41 @@ fn closing_one_market_leaves_shared_collateral_held() {
 	});
 }
 
-// Bad-debt healing rejects a credit in the wrong coin and accepts the market's
-// own coin. (The "yield mints the right coin" half is enforced suite-wide by the
-// mock's yield sink, which asserts `credit.asset() == stable_id`.)
+// The credit's own coin selects the market a heal settles against: an EUSD
+// credit heals `(DOT, EUSD)` and cannot touch the sibling `(DOT, PUSD)`.
 #[test]
-fn heal_rejects_a_wrong_coin_credit() {
+fn heal_routes_by_the_credits_coin() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
+		register_market(DOT, EUSD);
 		// Bad debt is only ever recorded inside the vault pallet; seed it directly.
 		mutate_branch_state(DOT, PUSD, |state| {
 			state.debt.bad_debt = 1_000;
 		});
+		mutate_branch_state(DOT, EUSD, |state| {
+			state.debt.bad_debt = 400;
+		});
 
-		// A credit in another coin (EUSD) cannot heal the PUSD market.
-		let wrong = <VaultStableAssets as Balanced<AccountId>>::issue(EUSD, 1_000);
-		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, &PUSD, wrong).unwrap();
-		assert_eq!(surplus.peek(), 1_000, "the whole wrong-coin credit is handed back");
+		// The EUSD credit heals the EUSD market; the PUSD ledger is untouched.
+		let eusd = <VaultStableAssets as Balanced<AccountId>>::issue(EUSD, 1_000);
+		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, eusd).unwrap();
+		assert_eq!(surplus.peek(), 600, "only the 400 recorded EUSD debt is consumed");
 		assert_eq!(surplus.asset(), EUSD);
-		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.bad_debt, 1_000, "bad debt is unchanged",);
+		assert_eq!(branch_state(DOT, EUSD).unwrap().debt.bad_debt, 0);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.bad_debt, 1_000, "sibling untouched");
 		drop(surplus);
 
-		// The market's own coin heals it.
-		let right = <VaultStableAssets as Balanced<AccountId>>::issue(PUSD, 1_000);
-		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, &PUSD, right).unwrap();
+		// The PUSD credit heals the sibling.
+		let pusd = <VaultStableAssets as Balanced<AccountId>>::issue(PUSD, 1_000);
+		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, pusd).unwrap();
 		assert_eq!(surplus.peek(), 0);
 		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.bad_debt, 0);
 	});
 }
 
-// Yield (interest) on a market accrues in that market's own coin. The amount of
-// the mint is dropped by the mock sink, but the sink also asserts the coin id, so
-// this guards the accrual path end-to-end.
+// Yield (interest) on a market accrues in that market's own coin. The mock
+// fee sink routes by the credit's own asset, so the balance assertions guard
+// the accrual path end-to-end.
 #[test]
 fn yield_accrues_in_the_markets_own_coin() {
 	build_and_execute(|| {

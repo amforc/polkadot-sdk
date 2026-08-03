@@ -185,13 +185,12 @@ pub trait VaultInterface {
 		>,
 	) -> DispatchResult;
 
-	/// Burn up to the recorded bad debt of the `(collateral_id, stable_id)`
-	/// market from `credit` and return the unconsumed surplus (zero when the
-	/// credit was fully used). The coin to burn comes from `credit.asset()`;
-	/// `stable_id` is the intended market and must match it.
+	/// Burn up to the recorded bad debt of the market named by
+	/// `collateral_id` and the credit's own asset, returning the unconsumed
+	/// surplus (zero when the credit was fully used). A coin with no market
+	/// on `collateral_id` is a wiring error.
 	fn heal(
 		collateral_id: &Self::CollateralId,
-		stable_id: &Self::StableId,
 		credit: Self::StableCredit,
 	) -> Result<Self::StableCredit, DispatchError>;
 }

@@ -22,32 +22,27 @@ pub enum RecoveryOffsetResult<Balance> {
 /// different recovery price.
 pub trait RecoveryOffsetInterface {
 	type CollateralId;
-	type StableId;
 	type AccountId;
 	type Balance;
 	type Credit;
 
-	/// Cancel head debt of the `(collateral_id, stable_id)` market against
-	/// the `payment` credit at the shared settlement pricing — the credit's
+	/// Cancel head debt of the market named by `collateral_id` and the
+	/// payment's own asset, at the shared settlement pricing — the credit's
 	/// value is the budget — and deliver the priced collateral to
 	/// `collateral_recipient`, atomically within the underlying vault step.
 	/// The unconsumed change returns with the result: the whole payment on
 	/// `NoTarget`/`BelowPar`, which are ordinary results rather than errors.
 	/// Fee-free: the redemption dynamic fee is neither charged nor moved.
 	///
-	/// The payment must be denominated in the market's stablecoin; a
-	/// mismatch is a caller wiring bug and fails with `Err` rather than
-	/// settling in whatever market the coin happens to name. Conservation
-	/// is structural — the implementation can only burn value the credit
-	/// carries, so callers derive the cancelled debt as `payment - change`
-	/// instead of trusting a reported figure.
+	/// Conservation is structural — the implementation can only burn value
+	/// the credit carries, so callers derive the cancelled debt as
+	/// `payment - change` instead of trusting a reported figure.
 	///
 	/// On `Err` the payment was consumed in memory while its storage
 	/// effects unwind with the caller's transaction: callers must abort
 	/// the whole extrinsic, never continue past an error.
 	fn execute_recovery_offset(
 		collateral_id: &Self::CollateralId,
-		stable_id: &Self::StableId,
 		payment: Self::Credit,
 		collateral_recipient: &Self::AccountId,
 	) -> Result<(RecoveryOffsetResult<Self::Balance>, Self::Credit), DispatchError>;
