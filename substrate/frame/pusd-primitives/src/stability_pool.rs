@@ -1,71 +1,110 @@
-//! Transaction-local Stability Pool access for liquidation settlement.
+//! Interfaces for Stability Pool offsets in liquidation settlement.
 
-use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::traits::Zero};
+use frame::deps::{
+	frame_support::{
+		pallet_prelude::{DispatchError, DispatchResult},
+		traits::TryDrop,
+	},
+	sp_runtime::traits::Zero,
+};
 
-/// One in-memory view of a market's Stability Pool during a liquidation.
+/// Contains the active and pending values for a Stability Pool offset.
 ///
-/// Vaults reserves both pool legs before pricing collateral. A reservation is
-/// exact: settlement must consume that debt and the collateral assigned to it,
-/// or fail the surrounding liquidation transaction.
-pub trait StabilityOffsetSession<Balance, CollateralCredit> {
-	/// Reserves active-pool debt, without moving value.
-	fn reserve_active(&mut self, max_debt: Balance) -> Balance;
-
-	/// Reserves pending-deposit debt after accounting for the active reservation.
-	fn reserve_pending(&mut self, max_debt: Balance) -> Balance;
-
-	/// Settles the exact active-pool reservation.
-	fn settle_active(&mut self, collateral: CollateralCredit) -> Result<(), DispatchError>;
-
-	/// Settles the exact pending-deposit reservation.
-	fn settle_pending(&mut self, collateral: CollateralCredit) -> Result<(), DispatchError>;
+/// `T` can hold debt amounts or collateral credits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OffsetLegs<T> {
+	/// The value for the active-pool leg.
+	pub active: T,
+	/// The value for the pending-deposit leg.
+	pub pending: T,
 }
 
-/// Runs one liquidation against a single Stability Pool session.
-pub trait StabilityPoolOffsetApi<CollateralId, StableId, Balance, CollateralCredit> {
-	type Session: StabilityOffsetSession<Balance, CollateralCredit>;
-
-	/// Load once, run `settle`, and commit the draft exactly once on success.
-	/// Implementations must make the boundary transactional so an error after
-	/// either value-moving stage cannot leave a partial offset.
-	fn with_offset_session<R>(
+/// Provides read-only offset limits for Stability Pool markets.
+///
+/// Valid offset amounts do not form a contiguous range. Full depletion is always valid.
+/// A partial offset must not leave a remainder below the pool minimum.
+/// It also must not leave the stablecoin account in its minimum-balance dead zone.
+/// Thus, each limit depends on the requested debt.
+pub trait StabilityPoolInspect<CollateralId, StableId, Balance> {
+	/// Returns the active-pool debt that the pool can cancel, up to `max_debt`.
+	///
+	/// The result is a quote, not a reservation. It remains valid while the caller does not change
+	/// the pool.
+	fn reducible_active(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
-		settle: impl FnOnce(&mut Self::Session) -> Result<R, DispatchError>,
-	) -> Result<R, DispatchError>;
+		max_debt: Balance,
+	) -> Balance;
+
+	/// Returns the pending-deposit debt that the pool can cancel, up to `max_debt`.
+	///
+	/// `active_debt` is the active-pool debt for the same offset. Both legs burn stablecoin from
+	/// one custody account.
+	fn reducible_pending(
+		collateral_id: &CollateralId,
+		stable_id: &StableId,
+		max_debt: Balance,
+		active_debt: Balance,
+	) -> Balance;
 }
 
-/// No-pool runtime: reserves no debt, so settlement is unreachable.
-impl<Balance: Zero, CollateralCredit> StabilityOffsetSession<Balance, CollateralCredit> for () {
-	fn reserve_active(&mut self, _: Balance) -> Balance {
-		Balance::zero()
-	}
-
-	fn reserve_pending(&mut self, _: Balance) -> Balance {
-		Balance::zero()
-	}
-
-	fn settle_active(&mut self, collateral: CollateralCredit) -> Result<(), DispatchError> {
-		drop(collateral);
-		Err(DispatchError::Other("active Stability reservation missing"))
-	}
-
-	fn settle_pending(&mut self, collateral: CollateralCredit) -> Result<(), DispatchError> {
-		drop(collateral);
-		Err(DispatchError::Other("pending Stability reservation missing"))
-	}
-}
-
-impl<CollateralId, StableId, Balance: Zero, CollateralCredit>
-	StabilityPoolOffsetApi<CollateralId, StableId, Balance, CollateralCredit> for ()
+/// Applies a liquidation offset to one Stability Pool market.
+pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit>:
+	StabilityPoolInspect<CollateralId, StableId, Balance>
 {
-	type Session = ();
+	/// Cancels `debt` against pool deposits and pays the specified `collateral` to each pool leg.
+	///
+	/// The operation uses exact amounts, similar to `Precision::Exact`. These equalities must hold
+	/// when the operation starts:
+	///
+	/// - `debt.active == Self::reducible_active(collateral_id, stable_id, debt.active)`.
+	/// - `debt.pending == Self::reducible_pending(collateral_id, stable_id, debt.pending,
+	///   debt.active)`.
+	///
+	/// The function returns an error if one equality does not hold. On success, the pool burns the
+	/// specified stablecoin debt. The caller reduces vault debt by the same amounts.
+	fn offset(
+		collateral_id: &CollateralId,
+		stable_id: &StableId,
+		debt: OffsetLegs<Balance>,
+		collateral: OffsetLegs<CollateralCredit>,
+	) -> DispatchResult;
+}
 
-	fn with_offset_session<R>(
+/// Provides empty Stability Pool limits for a runtime without a pool.
+///
+/// No debt is reducible. An offset succeeds only when both debts and both collateral credits are
+/// zero.
+impl<CollateralId, StableId, Balance: Zero> StabilityPoolInspect<CollateralId, StableId, Balance>
+	for ()
+{
+	fn reducible_active(_: &CollateralId, _: &StableId, _: Balance) -> Balance {
+		Balance::zero()
+	}
+
+	fn reducible_pending(_: &CollateralId, _: &StableId, _: Balance, _: Balance) -> Balance {
+		Balance::zero()
+	}
+}
+
+impl<CollateralId, StableId, Balance: Zero, CollateralCredit: TryDrop>
+	StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit> for ()
+{
+	fn offset(
 		_: &CollateralId,
 		_: &StableId,
-		settle: impl FnOnce(&mut Self::Session) -> Result<R, DispatchError>,
-	) -> Result<R, DispatchError> {
-		settle(&mut ())
+		debt: OffsetLegs<Balance>,
+		collateral: OffsetLegs<CollateralCredit>,
+	) -> DispatchResult {
+		let debt_is_zero = debt.active.is_zero() && debt.pending.is_zero();
+		// A successful `TryDrop` proves that a credit is zero. Thus, a nonzero credit cannot
+		// disappear in a successful no-op.
+		let active_is_zero = collateral.active.try_drop().is_ok();
+		let pending_is_zero = collateral.pending.try_drop().is_ok();
+		if debt_is_zero && active_is_zero && pending_is_zero {
+			Ok(())
+		} else {
+			Err(DispatchError::Other("no Stability Pool to offset against"))
+		}
 	}
 }
