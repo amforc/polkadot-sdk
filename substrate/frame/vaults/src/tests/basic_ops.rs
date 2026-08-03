@@ -424,9 +424,8 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 			PUSD,
 			state.debt.bad_debt,
 		);
-		let surplus =
-			<crate::Pallet<Test> as pusd_primitives::VaultInterface>::heal(&DOT, &PUSD, credit)
-				.expect("heal succeeds");
+		let surplus = <crate::Pallet<Test> as pusd_primitives::VaultInterface>::heal(&DOT, credit)
+			.expect("heal succeeds");
 		assert_eq!(surplus.peek(), 0);
 		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.debt.bad_debt, 0, "branch fully settled");
