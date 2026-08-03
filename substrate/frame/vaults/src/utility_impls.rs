@@ -630,7 +630,7 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 	) {
 		let credit = T::StableAssets::issue(stable_id.clone(), amount);
-		let credit = T::YieldHook::distribute_yield(collateral_id, stable_id, credit);
+		let credit = T::YieldHook::distribute_yield(collateral_id, credit);
 		T::FeeHandler::on_unbalanced(credit);
 	}
 

@@ -15,7 +15,7 @@ fn record(amount: Balance) {
 /// handed back (the unconsumed part of the credit).
 fn heal(amount: Balance) -> Result<Balance, DispatchError> {
 	let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, amount);
-	<crate::Pallet<Test> as VaultInterface>::heal(&DOT, &PUSD, credit).map(|surplus| surplus.peek())
+	<crate::Pallet<Test> as VaultInterface>::heal(&DOT, credit).map(|surplus| surplus.peek())
 }
 
 fn bad_debt() -> Balance {
@@ -138,9 +138,17 @@ fn heal_clears_swept_flooring_dust() {
 fn heal_unknown_branch_errors() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
+		// Unknown collateral axis.
 		let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, 10);
 		assert_err!(
-			<crate::Pallet<Test> as VaultInterface>::heal(&TOKEN_X, &PUSD, credit)
+			<crate::Pallet<Test> as VaultInterface>::heal(&TOKEN_X, credit)
+				.map(|surplus| surplus.peek()),
+			crate::Error::<Test>::BranchNotFound
+		);
+		// Unknown stable axis: the credit's coin has no market on `DOT`.
+		let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(EUSD, 10);
+		assert_err!(
+			<crate::Pallet<Test> as VaultInterface>::heal(&DOT, credit)
 				.map(|surplus| surplus.peek()),
 			crate::Error::<Test>::BranchNotFound
 		);

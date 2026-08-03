@@ -166,7 +166,7 @@ pub mod pallet {
 		/// Receives the first share of interest and upfront fees.
 		///
 		/// The remaining credit is sent to [`Config::FeeHandler`].
-		type YieldHook: OnBranchYield<CollateralIdOf<Self>, StableIdOf<Self>, StableCreditOf<Self>>;
+		type YieldHook: OnBranchYield<CollateralIdOf<Self>, StableCreditOf<Self>>;
 
 		/// Notifies other pallets when a market is created or removed.
 		type OnBranchLifecycle: OnBranchLifecycle<CollateralIdOf<Self>, StableIdOf<Self>>;

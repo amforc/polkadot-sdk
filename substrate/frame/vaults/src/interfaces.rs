@@ -291,15 +291,12 @@ impl<T: Config> VaultInterface for Pallet<T> {
 	#[transactional]
 	fn heal(
 		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
 		credit: StableCreditOf<T>,
 	) -> Result<StableCreditOf<T>, DispatchError> {
-		// Return credit for a different stable asset unchanged.
-		if credit.asset() != *stable_id {
-			return Ok(credit);
-		}
+		// The credit's own coin selects the market's stable axis.
+		let stable_id = credit.asset();
 		let (surplus, healable) =
-			Self::try_mutate_branch_state(collateral_id, stable_id, move |_, state, _| {
+			Self::try_mutate_branch_state(collateral_id, &stable_id, move |_, state, _| {
 				let healable = credit.peek().min(state.debt.bad_debt);
 				if healable.is_zero() {
 					return Ok((credit, healable));
@@ -315,7 +312,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		}
 		Pallet::<T>::deposit_event(Event::BadDebtHealed {
 			collateral_id: collateral_id.clone(),
-			stable_id: stable_id.clone(),
+			stable_id,
 			amount: healable,
 		});
 		Ok(surplus)
