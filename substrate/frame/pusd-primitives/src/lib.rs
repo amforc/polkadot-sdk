@@ -38,7 +38,7 @@ pub use oracle::ProvidePrice;
 pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetResult};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
-pub use stability_pool::{StabilityOffsetSession, StabilityPoolOffsetApi};
+pub use stability_pool::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
 pub use vault_interface::{
 	LiquidationSettlement, LiquidationSnapshot, RedemptionSettlement, RedemptionStepSnapshot,
 	VaultInterface,
