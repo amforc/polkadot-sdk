@@ -57,17 +57,20 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 }
 
 #[test]
-fn yield_distribution_rejects_a_credit_for_another_stablecoin() {
+fn yield_distribution_routes_by_the_credits_own_asset() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 400);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 		activate_all(&[1]);
 
+		// The credit's asset names the market: a USDX credit targets the
+		// unregistered (DOT, USDX) pair and comes back whole, while the
+		// funded PUSD pool never sees it.
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		let state_before = pool_state(DOT, PUSD);
 		let credit = <Assets as FungiblesBalanced<AccountId>>::issue(USDX, 20_000);
-		let returned = Stability::distribute_yield(&DOT, &PUSD, credit);
+		let returned = Stability::distribute_yield(&DOT, credit);
 
 		assert_eq!(returned.asset(), USDX);
 		assert_eq!(returned.peek(), 20_000);
