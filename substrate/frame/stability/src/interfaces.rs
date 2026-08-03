@@ -13,15 +13,14 @@ use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, Stability
 /// destination. Infallible: whatever cannot be distributed (no pool row, a
 /// zero share, an empty or frozen pool) comes back with the remainder. The
 /// pool row is loaded once and handed down to the distribution engine.
-impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableIdOf<T>, StableCreditOf<T>> for Pallet<T> {
+impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T> {
 	fn distribute_yield(
 		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
-		if credit.asset() != *stable_id {
-			return credit;
-		}
+		// The credit's own asset names the market; an unregistered pair has
+		// no pool row and the credit comes back whole.
+		let stable_id = &credit.asset();
 		let Some(pool) = Pools::<T>::get(collateral_id, stable_id) else {
 			return credit;
 		};
