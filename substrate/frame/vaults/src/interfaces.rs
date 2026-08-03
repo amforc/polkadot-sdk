@@ -288,34 +288,34 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		Self::accrued_stablecoin_debt(stable_id)
 	}
 
-	#[transactional]
-	fn heal(
-		collateral_id: &CollateralIdOf<T>,
-		credit: StableCreditOf<T>,
-	) -> Result<StableCreditOf<T>, DispatchError> {
+	fn heal(collateral_id: &CollateralIdOf<T>, credit: StableCreditOf<T>) -> StableCreditOf<T> {
 		// The credit's own coin selects the market's stable axis.
 		let stable_id = credit.asset();
-		let (surplus, healable) =
-			Self::try_mutate_branch_state(collateral_id, &stable_id, move |_, state, _| {
-				let healable = credit.peek().min(state.debt.bad_debt);
-				if healable.is_zero() {
-					return Ok((credit, healable));
-				}
-				let (to_burn, surplus) = credit.split(healable);
-				// Burn the stable asset used to heal the debt.
-				drop(to_burn);
-				state.heal_bad_debt(healable);
-				Ok((surplus, healable))
-			})?;
+		let available = credit.peek();
+		let mutated = Self::try_mutate_branch_state(collateral_id, &stable_id, |_, state, _| {
+			let healable = available.min(state.debt.bad_debt);
+			state.heal_bad_debt(healable);
+			Ok(healable)
+		});
+		let healable = match mutated {
+			Ok(healable) => healable,
+			// Unknown market (or defensive aggregate failure): the helper
+			// errors before its first storage write, so nothing happened.
+			Err(_) => return credit,
+		};
 		if healable.is_zero() {
-			return Ok(surplus);
+			return credit;
 		}
+		let (to_burn, surplus) = credit.split(healable);
+		debug_assert_eq!(to_burn.peek(), healable);
+		// Burn the stable asset used to heal the debt.
+		drop(to_burn);
 		Pallet::<T>::deposit_event(Event::BadDebtHealed {
 			collateral_id: collateral_id.clone(),
 			stable_id,
 			amount: healable,
 		});
-		Ok(surplus)
+		surplus
 	}
 }
 
