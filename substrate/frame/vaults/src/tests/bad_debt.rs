@@ -13,9 +13,9 @@ fn record(amount: Balance) {
 
 /// Issue a fresh credit of `amount`, heal with it, and return the surplus
 /// handed back (the unconsumed part of the credit).
-fn heal(amount: Balance) -> Result<Balance, DispatchError> {
+fn heal(amount: Balance) -> Balance {
 	let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, amount);
-	<crate::Pallet<Test> as VaultInterface>::heal(&DOT, credit).map(|surplus| surplus.peek())
+	<crate::Pallet<Test> as VaultInterface>::heal(&DOT, credit).peek()
 }
 
 fn bad_debt() -> Balance {
@@ -30,9 +30,9 @@ fn heal_partial_then_exact_clears_bad_debt() {
 		register_market(DOT, PUSD);
 		record(1_000);
 
-		assert_eq!(heal(400), Ok(0), "fully consumed, no surplus");
+		assert_eq!(heal(400), 0, "fully consumed, no surplus");
 		assert_eq!(bad_debt(), 600);
-		assert_eq!(heal(600), Ok(0));
+		assert_eq!(heal(600), 0);
 		assert_eq!(bad_debt(), 0);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtHealed {
 			collateral_id: DOT,
@@ -50,7 +50,7 @@ fn heal_caps_at_recorded_and_returns_surplus() {
 
 		// Defensive: production heals `min(IF_balance, bad_debt)`, so over-supply
 		// can't happen — the cap returns the surplus rather than trusting the caller.
-		assert_eq!(heal(501), Ok(1));
+		assert_eq!(heal(501), 1);
 		assert_eq!(bad_debt(), 0);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtHealed {
 			collateral_id: DOT,
@@ -70,7 +70,7 @@ fn heal_caps_at_recorded_and_returns_surplus() {
 				.count()
 		};
 		let before = healed_events();
-		assert_eq!(heal(50), Ok(50));
+		assert_eq!(heal(50), 50);
 		assert_eq!(healed_events(), before, "no-op heal emits no BadDebtHealed");
 	});
 }
@@ -124,7 +124,7 @@ fn heal_clears_swept_flooring_dust() {
 			before_sweep,
 			"sweeping ownerless debt into bad debt must not change stablecoin debt"
 		);
-		assert_eq!(heal(1), Ok(0));
+		assert_eq!(heal(1), 0);
 		assert_eq!(bad_debt(), 0);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtHealed {
 			collateral_id: DOT,
@@ -134,23 +134,27 @@ fn heal_clears_swept_flooring_dust() {
 	});
 }
 
+// Heal is infallible: a market unknown on either axis touches no ledger and
+// hands the whole credit back.
 #[test]
-fn heal_unknown_branch_errors() {
+fn heal_unknown_market_returns_the_credit_whole() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
+		record(100);
+
 		// Unknown collateral axis.
 		let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(PUSD, 10);
-		assert_err!(
-			<crate::Pallet<Test> as VaultInterface>::heal(&TOKEN_X, credit)
-				.map(|surplus| surplus.peek()),
-			crate::Error::<Test>::BranchNotFound
-		);
+		let surplus = <crate::Pallet<Test> as VaultInterface>::heal(&TOKEN_X, credit);
+		assert_eq!(surplus.peek(), 10);
+		drop(surplus);
+
 		// Unknown stable axis: the credit's coin has no market on `DOT`.
 		let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(EUSD, 10);
-		assert_err!(
-			<crate::Pallet<Test> as VaultInterface>::heal(&DOT, credit)
-				.map(|surplus| surplus.peek()),
-			crate::Error::<Test>::BranchNotFound
-		);
+		let surplus = <crate::Pallet<Test> as VaultInterface>::heal(&DOT, credit);
+		assert_eq!(surplus.peek(), 10);
+		assert_eq!(surplus.asset(), EUSD);
+		drop(surplus);
+
+		assert_eq!(bad_debt(), 100, "the registered market is untouched");
 	});
 }
