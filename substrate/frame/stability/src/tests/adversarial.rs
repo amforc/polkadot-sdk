@@ -2,11 +2,14 @@
 //! disagreement, and failed value movement after planning.
 
 use crate::mock::*;
-use frame::traits::{
-	fungibles::Balanced as FungiblesBalanced,
-	tokens::{Fortitude, Precision, Preservation},
+use frame::{
+	testing_prelude::hypothetically,
+	traits::{
+		fungibles::Balanced as FungiblesBalanced,
+		tokens::{Fortitude, Precision, Preservation},
+	},
 };
-use pusd_primitives::{OnBranchYield, StabilityOffsetSession, StabilityPoolOffsetApi};
+use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, StabilityPoolOffset};
 
 fn burn_stable(stable: StableId, who: AccountId, amount: Balance) {
 	let credit = <Assets as FungiblesBalanced<AccountId>>::withdraw(
@@ -84,24 +87,33 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 		mint_stable(PUSD, 2, 200);
 		assert_ok!(deposit(2, DOT, PUSD, 200));
 
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		let state_before = pool_state(DOT, PUSD);
-		let active = Stability::with_offset_session(&DOT, &PUSD, |session| {
-			assert_eq!(session.reserve_active(200), 200);
-			session.settle_active(issue_collateral(TOKEN_X, 100))
-		});
-		assert_eq!(active, Err(crate::Error::<Test>::OffsetSettlementFailed.into()));
+		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 200), 200);
+		assert_noop!(
+			hypothetically!(Stability::offset(
+				&DOT,
+				&PUSD,
+				OffsetLegs { active: 200, pending: 0 },
+				OffsetLegs {
+					active: issue_collateral(TOKEN_X, 100),
+					pending: issue_collateral(DOT, 0)
+				},
+			)),
+			crate::Error::<Test>::OffsetSettlementFailed,
+		);
 
-		let pending = Stability::with_offset_session(&DOT, &PUSD, |session| {
-			assert_eq!(session.reserve_active(0), 0);
-			assert_eq!(session.reserve_pending(200), 200);
-			session.settle_pending(issue_collateral(TOKEN_X, 100))
-		});
-		assert_eq!(pending, Err(crate::Error::<Test>::OffsetSettlementFailed.into()));
-
-		assert_eq!(collateral_balance(TOKEN_X, pool), 0);
-		assert_eq!(pool_state(DOT, PUSD), state_before);
-		assert_eq!(deposit_row(DOT, PUSD, 2).unwrap().pending_deposit.unwrap().amount, 200);
+		assert_eq!(Stability::reducible_pending(&DOT, &PUSD, 200, 0), 200);
+		assert_noop!(
+			hypothetically!(Stability::offset(
+				&DOT,
+				&PUSD,
+				OffsetLegs { active: 0, pending: 200 },
+				OffsetLegs {
+					active: issue_collateral(DOT, 0),
+					pending: issue_collateral(TOKEN_X, 100)
+				},
+			)),
+			crate::Error::<Test>::OffsetSettlementFailed,
+		);
 	});
 }
 
