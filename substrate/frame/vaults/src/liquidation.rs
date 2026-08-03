@@ -27,16 +27,9 @@ use frame::{
 	},
 };
 use pusd_primitives::{
-	mul_div_floor, recovery_pricing::collateral_for_value_ceil, reducible_debit,
-	StabilityOffsetSession, StabilityPoolOffsetApi,
+	mul_div_floor, recovery_pricing::collateral_for_value_ceil, reducible_debit, OffsetLegs,
+	StabilityPoolInspect, StabilityPoolOffset,
 };
-
-type StabilitySessionOf<T> = <<T as Config>::StabilityPool as StabilityPoolOffsetApi<
-	CollateralIdOf<T>,
-	StableIdOf<T>,
-	BalanceOf<T>,
-	CollateralCreditOf<T>,
->>::Session;
 
 #[derive(Clone)]
 pub struct LiquidationSnapshot<Balance> {
@@ -79,7 +72,8 @@ struct LiquidationSettlement<Credit, Balance> {
 impl<T: Config> Pallet<T> {
 	/// Executes liquidation and commits all custody changes as one transaction.
 	///
-	/// The transaction and offset session revert all changes if a later settlement fails.
+	/// The transaction reverts all changes — the pool offset included — if a
+	/// later settlement fails.
 	#[transactional]
 	pub(crate) fn do_liquidate(
 		keeper: T::AccountId,
@@ -104,9 +98,7 @@ impl<T: Config> Pallet<T> {
 		}
 
 		let settlement =
-			T::StabilityPool::with_offset_session(&collateral_id, &stable_id, |pool| {
-				Self::settle_with_pool(&keeper, &stable_id, jit, snapshot, collateral, pool)
-			})?;
+			Self::settle_with_pool(&keeper, &collateral_id, &stable_id, jit, snapshot, collateral)?;
 		let LiquidationSettlement { redistribution_collateral, owner_surplus, outcome } =
 			settlement;
 		Self::settle_liquidation_custody(
@@ -159,14 +151,15 @@ impl<T: Config> Pallet<T> {
 
 	fn settle_with_pool(
 		keeper: &T::AccountId,
+		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		jit: JitTerms<BalanceOf<T>>,
 		snapshot: LiquidationSnapshot<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
-		pool: &mut StabilitySessionOf<T>,
 	) -> Result<LiquidationSettlement<CollateralCreditOf<T>, BalanceOf<T>>, DispatchError> {
 		debug_assert!(snapshot.config.offset_penalty <= snapshot.config.redistribution_penalty);
-		let (debt, jit_preservation) = Self::size_debt(keeper, stable_id, &snapshot, jit, pool)?;
+		let (debt, jit_preservation) =
+			Self::size_debt(keeper, collateral_id, stable_id, &snapshot, jit)?;
 		let plan = plan(collateral.peek(), debt, snapshot.price, &snapshot.config)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 
@@ -175,11 +168,7 @@ impl<T: Config> Pallet<T> {
 		let (keeper_reward, mut resolution) = seized.split(plan.keeper_reward);
 		Self::resolve_collateral(keeper, keeper_reward)?;
 
-		if !plan.debt.active_pool.is_zero() {
-			let active_collateral = resolution.extract(plan.collateral.active_pool);
-			pool.settle_active(active_collateral)?;
-		}
-
+		let active_collateral = resolution.extract(plan.collateral.active_pool);
 		Self::apply_jit(
 			keeper,
 			stable_id,
@@ -189,11 +178,24 @@ impl<T: Config> Pallet<T> {
 			plan.collateral.keeper_jit,
 			&mut resolution,
 		)?;
+		let pending_collateral = resolution.extract(plan.collateral.pending_pool);
 
-		if !plan.debt.pending_pool.is_zero() {
-			let pending_collateral = resolution.extract(plan.collateral.pending_pool);
-			pool.settle_pending(pending_collateral)?;
+		// One exact call settles both pool legs. The allocation gives a
+		// zero-debt leg a zero collateral share, which is exactly the shape
+		// `offset` accepts for a leg that sized to nothing (and its all-zero
+		// fast path when the pool covered nothing at all).
+		if plan.debt.active_pool.is_zero() {
+			debug_assert!(active_collateral.peek().is_zero());
 		}
+		if plan.debt.pending_pool.is_zero() {
+			debug_assert!(pending_collateral.peek().is_zero());
+		}
+		T::StabilityPool::offset(
+			collateral_id,
+			stable_id,
+			OffsetLegs { active: plan.debt.active_pool, pending: plan.debt.pending_pool },
+			OffsetLegs { active: active_collateral, pending: pending_collateral },
+		)?;
 
 		debug_assert_eq!(resolution.peek(), plan.collateral.redistribution);
 		let redistribution_collateral = resolution;
@@ -220,22 +222,27 @@ impl<T: Config> Pallet<T> {
 		Ok(LiquidationSettlement { redistribution_collateral, owner_surplus, outcome })
 	}
 
-	// Reserves debt in liquidation priority order: active pool, keeper JIT, pending pool, and
+	// Sizes debt in liquidation priority order: active pool, keeper JIT, pending pool, and
 	// redistribution. A path receives only debt that higher-priority capital did not cover.
+	// The reads are quotes, not reservations: nothing below touches the pool before
+	// `offset` re-validates them exactly, so a stale quote fails the liquidation instead
+	// of over-drawing.
 	fn size_debt(
 		keeper: &T::AccountId,
+		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		snapshot: &LiquidationSnapshot<BalanceOf<T>>,
 		jit: JitTerms<BalanceOf<T>>,
-		pool: &mut StabilitySessionOf<T>,
 	) -> Result<(LiquidationSplit<BalanceOf<T>>, Preservation), DispatchError> {
-		let active_pool = pool.reserve_active(snapshot.debt);
+		let active_pool =
+			T::StabilityPool::reducible_active(collateral_id, stable_id, snapshot.debt);
 		ensure!(active_pool <= snapshot.debt, Error::<T>::InvalidLiquidationPlan);
 		let mut remaining = snapshot.debt.saturating_sub(active_pool);
 		let (keeper_jit, preservation) =
 			Self::size_jit(keeper, stable_id, &snapshot.config, jit, remaining)?;
 		remaining.saturating_reduce(keeper_jit);
-		let pending_pool = pool.reserve_pending(remaining);
+		let pending_pool =
+			T::StabilityPool::reducible_pending(collateral_id, stable_id, remaining, active_pool);
 		ensure!(pending_pool <= remaining, Error::<T>::InvalidLiquidationPlan);
 		remaining.saturating_reduce(pending_pool);
 		Ok((
