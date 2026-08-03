@@ -193,12 +193,8 @@ impl<T: Config> Pallet<T> {
 		payment: StableCreditOf<T>,
 	) -> Result<StableCreditOf<T>, DispatchError> {
 		let amount = payment.peek();
-		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
-			collateral_id,
-			stable_id,
-			payment,
-			pool_account,
-		)?;
+		let (result, change) =
+			T::RecoveryOffsets::execute_recovery_offset(collateral_id, payment, pool_account)?;
 		let collateral_out = match result {
 			RecoveryOffsetResult::NoTarget => {
 				debug_assert_eq!(change.peek(), amount);
@@ -269,12 +265,8 @@ impl<T: Config> Pallet<T> {
 			preservation,
 			Fortitude::Polite,
 		)?;
-		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
-			&collateral_id,
-			&stable_id,
-			payment,
-			&pool_account,
-		)?;
+		let (result, change) =
+			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
 		let collateral_out = match result {
 			// The dropped change unwinds with the failing extrinsic.
 			RecoveryOffsetResult::NoTarget => {
