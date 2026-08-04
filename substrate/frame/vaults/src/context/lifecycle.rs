@@ -5,7 +5,7 @@ use crate::{
 	liquidation::LiquidationSnapshot,
 	pallet::{BalanceOf, Config, Error, Event, Pallet},
 	recovery,
-	types::{DebtCollateral, LiquidationSnapshot, VaultStatus},
+	types::{DebtCollateral, VaultStatus},
 };
 use frame::prelude::*;
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
