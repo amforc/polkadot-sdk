@@ -3,6 +3,7 @@
 use frame::deps::{
 	frame_support::{
 		pallet_prelude::{DispatchError, DispatchResult},
+		require_transactional,
 		traits::TryDrop,
 	},
 	sp_runtime::traits::Zero,
@@ -63,6 +64,10 @@ pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit>
 	///
 	/// The function returns an error if one equality does not hold. On success, the pool burns the
 	/// specified stablecoin debt. The caller reduces vault debt by the same amounts.
+	///
+	/// TODO: The function consumes the collateral credits even when it returns an error, so it must run
+	/// inside a storage transaction that restores them on rollback. Implementations must reject a
+	/// call outside a transactional layer; annotate them with `#[require_transactional]`.
 	fn offset(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
@@ -90,6 +95,7 @@ impl<CollateralId, StableId, Balance: Zero> StabilityPoolInspect<CollateralId, S
 impl<CollateralId, StableId, Balance: Zero, CollateralCredit: TryDrop>
 	StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit> for ()
 {
+	#[require_transactional]
 	fn offset(
 		_: &CollateralId,
 		_: &StableId,

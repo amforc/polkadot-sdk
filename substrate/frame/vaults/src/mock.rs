@@ -6,7 +6,9 @@
 use alloc::collections::BTreeMap;
 
 use crate as pallet_vaults;
-use crate::{pallet::Branches, types::BranchConfigBounds, BranchState, VaultListId};
+use crate::{
+	pallet::Branches, types::BranchConfigBounds, BranchState, LiquidationSettlement, VaultListId,
+};
 pub use crate::{
 	pallet::{BalanceOf, CollateralCreditOf, StableCreditOf},
 	types::BranchAdmins,
@@ -32,7 +34,7 @@ use frame::{
 	},
 };
 pub use pallet_linked_list::Position;
-use pusd_primitives::{LiquidationSettlement, RedemptionSettlement, VaultInterface};
+use pusd_primitives::{RedemptionSettlement, VaultInterface};
 
 pub type AccountId = u64;
 pub type Balance = u128;
@@ -591,38 +593,33 @@ pub fn liquidate_with(
 	owner: AccountId,
 	build: impl FnOnce(Balance) -> LiquidationAllocation<AccountId, Balance>,
 ) -> DispatchResult {
-	<Vaults as VaultInterface>::execute_liquidation(
-		&collateral,
-		&stable,
-		&owner,
-		|snapshot, mut collateral_credit| {
-			let allocation = build(snapshot.debt);
-			let total = allocation
-				.offset
-				.collateral
-				.saturating_add(allocation.redistribution_collateral)
-				.saturating_add(allocation.keeper.collateral);
-			ensure!(total <= collateral_credit.peek(), Error::<Test>::InvalidLiquidationSettlement);
+	Vaults::execute_liquidation(&collateral, &stable, &owner, |snapshot, mut collateral_credit| {
+		let allocation = build(snapshot.debt);
+		let total = allocation
+			.offset
+			.collateral
+			.saturating_add(allocation.redistribution_collateral)
+			.saturating_add(allocation.keeper.collateral);
+		ensure!(total <= collateral_credit.peek(), Error::<Test>::InvalidLiquidationSettlement);
 
-			resolve_test_collateral(
-				&mut collateral_credit,
-				allocation.offset.collateral,
-				&allocation.offset.collateral_recipient,
-			)?;
-			resolve_test_collateral(
-				&mut collateral_credit,
-				allocation.keeper.collateral,
-				&allocation.keeper.recipient,
-			)?;
-			let redistribution_collateral =
-				collateral_credit.extract(allocation.redistribution_collateral);
-			Ok(LiquidationSettlement {
-				debt_offset: allocation.offset.debt,
-				redistribution_collateral,
-				owner_surplus: collateral_credit,
-			})
-		},
-	)
+		resolve_test_collateral(
+			&mut collateral_credit,
+			allocation.offset.collateral,
+			&allocation.offset.collateral_recipient,
+		)?;
+		resolve_test_collateral(
+			&mut collateral_credit,
+			allocation.keeper.collateral,
+			&allocation.keeper.recipient,
+		)?;
+		let redistribution_collateral =
+			collateral_credit.extract(allocation.redistribution_collateral);
+		Ok(LiquidationSettlement {
+			debt_offset: allocation.offset.debt,
+			redistribution_collateral,
+			owner_surplus: collateral_credit,
+		})
+	})
 }
 
 fn resolve_test_collateral(

@@ -1,52 +1,71 @@
-//! Settlement-pricing helpers for `FinalRecovery` vaults.
+//! This module calculates settlement prices for `FinalRecovery` vaults.
+//!
+//! Price-conversion functions return `None` if `price` is zero or a calculation overflows.
+//! [`insurance_adjusted`] returns `None` when the vault is outside its pricing regime. A caller
+//! must treat `None` as an error.
 
 use frame::deps::{
 	frame_support::traits::Defensive,
 	sp_runtime::{
 		helpers_128bit::multiply_by_rational_with_rounding,
-		traits::{One, Saturating, Zero},
+		traits::{CheckedAdd, One, Saturating, Zero},
 		FixedPointNumber, FixedPointOperand, FixedU128, Permill, Rounding,
 	},
 };
 
-/// `floor(value / price)`: collateral units obtained for `value` pUSD at
-/// `price` (pUSD per collateral unit). Zero when `value` or `price` is zero.
-pub fn collateral_for_value<Balance: FixedPointOperand>(
+/// Calculates collateral for a stablecoin `value` at `price`.
+///
+/// `price` is the stablecoin value of one collateral unit. The function divides `value` by `price`
+/// and rounds the result in the specified direction.
+///
+/// Public functions select the rounding direction that is correct for each economic action.
+///
+/// Returns `None` if `price` is zero or if the result does not fit in `Balance`.
+fn collateral_for_value<Balance: FixedPointOperand>(
 	value: Balance,
 	price: FixedU128,
-) -> Balance {
-	if value.is_zero() || price.is_zero() {
-		return Balance::zero();
-	}
-	let v: u128 = value.unique_saturated_into();
-	multiply_by_rational_with_rounding(v, FixedU128::DIV, price.into_inner(), Rounding::Down)
-		.and_then(|raw| Balance::try_from(raw).ok())
-		.defensive_unwrap_or_else(Balance::zero)
-}
-
-/// `ceil(value / price)`: the collateral units worth `value` stablecoin at
-/// `price` (stablecoin value per collateral unit). The ceil twin of
-/// [`collateral_for_value`], rounding against the debtor. `None` when `price`
-/// is zero or the result exceeds `Balance`, so sizing callers fail loudly
-/// instead of silently under-seizing.
-pub fn collateral_for_value_ceil<Balance: FixedPointOperand>(
-	value: Balance,
-	price: FixedU128,
+	rounding: Rounding,
 ) -> Option<Balance> {
 	multiply_by_rational_with_rounding(
 		value.unique_saturated_into(),
 		FixedU128::DIV,
 		price.into_inner(),
-		Rounding::Up,
+		rounding,
 	)
 	.and_then(|raw| Balance::try_from(raw).ok())
 }
 
-/// Recovery bonus for a `CR >= 100%` recovery vault:
+/// Calculates collateral for `value` at `price` and rounds the result down.
+///
+/// The result is `floor(value / price)`.
+///
+/// Returns `None` if `price` is zero or if the result does not fit in `Balance`.
+pub fn collateral_for_value_floor<Balance: FixedPointOperand>(
+	value: Balance,
+	price: FixedU128,
+) -> Option<Balance> {
+	collateral_for_value(value, price, Rounding::Down)
+}
+
+/// Calculates collateral for `value` at `price` and rounds the result up.
+///
+/// The result is `ceil(value / price)`.
+///
+/// Returns `None` if `price` is zero or if the result does not fit in `Balance`.
+pub fn collateral_for_value_ceil<Balance: FixedPointOperand>(
+	value: Balance,
+	price: FixedU128,
+) -> Option<Balance> {
+	collateral_for_value(value, price, Rounding::Up)
+}
+
+/// Calculates the bonus for a recovery vault with `CR >= 100%`.
+///
+/// The function uses this formula:
 /// `min(max(0, cr - 100% - buffer), redistribution_penalty)`.
 ///
-/// The buffer guarantees `bonus <= cr - 1`, so applying it can never lower the
-/// vault's CR below its pre-redemption value.
+/// The `buffer` makes `bonus <= cr - 1`. Thus, the bonus does not decrease the vault CR after a
+/// redemption.
 pub fn recovery_bonus(
 	cr: FixedU128,
 	buffer: FixedU128,
@@ -61,62 +80,81 @@ pub fn recovery_bonus(
 	bonus
 }
 
-/// Collateral paid out in the `CR >= 100%` regime for cancelling `debt_cancelled`
-/// pUSD at face value plus `bonus`: `floor(debt_cancelled * (1 + bonus) / price)`.
+/// Calculates the collateral payout for a recovery settlement with `CR >= 100%`.
+///
+/// The calculation applies `bonus` to `debt_cancelled` stablecoin at face value:
+/// `floor(floor(debt_cancelled * (1 + bonus)) / price)`.
+///
+/// Returns `None` if `price` is zero or if a calculation overflows.
 pub fn recovery_bonus_collateral_out<Balance: FixedPointOperand>(
 	debt_cancelled: Balance,
 	bonus: FixedU128,
 	price: FixedU128,
-) -> Balance {
-	let factor = FixedU128::one().saturating_add(bonus);
-	let value = factor.saturating_mul_int(debt_cancelled);
-	collateral_for_value(value, price)
+) -> Option<Balance> {
+	let value = FixedU128::one().checked_add(&bonus)?.checked_mul_int(debt_cancelled)?;
+	collateral_for_value_floor(value, price)
 }
 
-/// Outcome of the insurance-adjusted settlement split.
+/// Contains an insurance-adjusted settlement split.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct InsuranceAdjusted<Balance> {
-	/// Debt redeemers/offsetters can cancel against this vault's collateral.
+	/// Debt that redeemers and offset providers can cancel against this vault's collateral.
 	pub market_cancel_debt: Balance,
-	/// Debt the Insurance Fund covers once the market portion is exhausted.
+	/// Debt that the Insurance Fund covers.
 	pub effective_cover: Balance,
-	/// pUSD-value paid out per unit of market-cancelled debt (`<= 1`).
+	/// Stablecoin value paid per unit of market-cancelled debt. This value is at most one.
 	pub recovery_rate: FixedU128,
 }
 
-/// Split a sub-100%-CR recovery vault's debt into the market-cancellable
-/// portion and the Insurance-Fund-covered residual, and derive the recovery
-/// rate. `collateral_value` is the held collateral priced in pUSD.
+/// Calculates the insurance-adjusted settlement for a recovery vault with `CR < 100%`.
 ///
-/// `effective_cover = min(insurance_available, max(debt - collateral_value, 0))`,
-/// so the residual is always backed by available insurance and
-/// `recovery_rate = collateral_value / market_cancel_debt <= 1`.
+/// `collateral_value` is the held collateral value in stablecoin units. The function uses these
+/// formulas:
+///
+/// - `effective_cover = min(insurance_available, debt - collateral_value)`.
+/// - `market_cancel_debt = debt - effective_cover`.
+/// - `recovery_rate = collateral_value / market_cancel_debt <= 1`.
+///
+/// The Insurance Fund backs `effective_cover`.
+///
+/// Returns `None` if `collateral_value > debt`. Such a vault is above par and outside this
+/// function's regime. Without this check, `recovery_rate` can exceed one.
 pub fn insurance_adjusted<Balance: FixedPointOperand + Saturating + Ord>(
 	debt: Balance,
 	collateral_value: Balance,
 	insurance_available: Balance,
-) -> InsuranceAdjusted<Balance> {
+) -> Option<InsuranceAdjusted<Balance>> {
+	if collateral_value > debt {
+		return None;
+	}
 	let shortfall = debt.saturating_sub(collateral_value);
 	let effective_cover = core::cmp::min(insurance_available, shortfall);
 	let market_cancel_debt = debt.saturating_sub(effective_cover);
 	let recovery_rate = if market_cancel_debt.is_zero() {
 		FixedU128::zero()
 	} else {
+		// `market_cancel_debt` is not less than `collateral_value`. Thus, the ratio is at most
+		// one. This branch also guarantees that the denominator is not zero.
 		FixedU128::checked_from_rational(collateral_value, market_cancel_debt)
 			.defensive_unwrap_or_else(FixedU128::zero)
 	};
-	InsuranceAdjusted { market_cancel_debt, effective_cover, recovery_rate }
+	debug_assert!(recovery_rate <= FixedU128::one());
+	Some(InsuranceAdjusted { market_cancel_debt, effective_cover, recovery_rate })
 }
 
-/// Collateral paid out in the `CR < 100%` regime for `pusd_in` pUSD:
-/// `floor(floor(pusd_in * recovery_rate) / price)`.
+/// Calculates the collateral payout for a recovery settlement with `CR < 100%`.
+///
+/// The function uses this formula for `stablecoin_in`:
+/// `floor(floor(stablecoin_in * recovery_rate) / price)`.
+///
+/// Returns `None` if `price` is zero or if a calculation overflows.
 pub fn recovery_rate_collateral_out<Balance: FixedPointOperand>(
-	pusd_in: Balance,
+	stablecoin_in: Balance,
 	recovery_rate: FixedU128,
 	price: FixedU128,
-) -> Balance {
-	let value = recovery_rate.saturating_mul_int(pusd_in);
-	collateral_for_value(value, price)
+) -> Option<Balance> {
+	let value = recovery_rate.checked_mul_int(stablecoin_in)?;
+	collateral_for_value_floor(value, price)
 }
 
 #[cfg(test)]
@@ -125,36 +163,44 @@ mod tests {
 
 	#[test]
 	fn collateral_for_value_floors() {
-		// 100 pUSD at price 10 → 10 collateral.
-		assert_eq!(collateral_for_value::<u128>(100, FixedU128::from_rational(10, 1)), 10);
-		// 105 pUSD at price 10 → floor(10.5) = 10.
-		assert_eq!(collateral_for_value::<u128>(105, FixedU128::from_rational(10, 1)), 10);
+		// 100 stablecoin at price 10 → 10 collateral.
+		let price = FixedU128::from_rational(10, 1);
+		assert_eq!(collateral_for_value_floor::<u128>(100, price), Some(10));
+		// 105 stablecoin at price 10 → floor(10.5) = 10.
+		assert_eq!(collateral_for_value_floor::<u128>(105, price), Some(10));
 		// Sub-1.0 price scales up.
-		assert_eq!(collateral_for_value::<u128>(100, FixedU128::from_rational(1, 2)), 200);
-		assert_eq!(collateral_for_value::<u128>(0, FixedU128::one()), 0);
-		assert_eq!(collateral_for_value::<u128>(100, FixedU128::zero()), 0);
+		assert_eq!(
+			collateral_for_value_floor::<u128>(100, FixedU128::from_rational(1, 2)),
+			Some(200)
+		);
+		assert_eq!(collateral_for_value_floor::<u128>(0, FixedU128::one()), Some(0));
 	}
 
 	#[test]
 	fn collateral_for_value_ceils() {
-		// 100 stable at price 10 → exactly 10 collateral.
-		assert_eq!(
-			collateral_for_value_ceil::<u128>(100, FixedU128::from_rational(10, 1)),
-			Some(10)
-		);
-		// 105 stable at price 10 → ceil(10.5) = 11 (the floor twin gives 10).
-		assert_eq!(
-			collateral_for_value_ceil::<u128>(105, FixedU128::from_rational(10, 1)),
-			Some(11)
-		);
+		// 100 stablecoin at price 10 → exactly 10 collateral.
+		let price = FixedU128::from_rational(10, 1);
+		assert_eq!(collateral_for_value_ceil::<u128>(100, price), Some(10));
+		// 105 stablecoin at price 10 → ceil(10.5) = 11 (the floor variant gives 10).
+		assert_eq!(collateral_for_value_ceil::<u128>(105, price), Some(11));
 		// Sub-1.0 price scales up: 100 / 0.9 = 111.1… → 112.
 		assert_eq!(
 			collateral_for_value_ceil::<u128>(100, FixedU128::from_rational(9, 10)),
 			Some(112)
 		);
 		assert_eq!(collateral_for_value_ceil::<u128>(0, FixedU128::one()), Some(0));
-		// A zero price cannot size anything.
+	}
+
+	#[test]
+	fn collateral_for_value_fails_loudly() {
+		// A zero price cannot size anything, in either rounding direction.
+		assert_eq!(collateral_for_value_floor::<u128>(100, FixedU128::zero()), None);
 		assert_eq!(collateral_for_value_ceil::<u128>(100, FixedU128::zero()), None);
+		// A sub-1.0 price doubles the value past u128::MAX.
+		let half = FixedU128::from_rational(1, 2);
+		assert_eq!(collateral_for_value_floor::<u128>(u128::MAX, half), None);
+		// The result fits u128 but not the caller's narrower Balance.
+		assert_eq!(collateral_for_value_floor::<u64>(u64::MAX, half), None);
 	}
 
 	#[test]
@@ -184,26 +230,31 @@ mod tests {
 	#[test]
 	fn recovery_bonus_collateral_out_includes_bonus() {
 		// 100 debt, 5% bonus, price 10 → floor(105 / 10) = 10.
-		let out = recovery_bonus_collateral_out::<u128>(
-			100,
-			FixedU128::from_rational(5, 100),
-			FixedU128::from_rational(10, 1),
-		);
-		assert_eq!(out, 10);
+		let bonus = FixedU128::from_rational(5, 100);
+		let price = FixedU128::from_rational(10, 1);
+		assert_eq!(recovery_bonus_collateral_out::<u128>(100, bonus, price), Some(10));
 		// 200 debt, 5% bonus, price 10 → floor(210 / 10) = 21.
-		let out = recovery_bonus_collateral_out::<u128>(
-			200,
-			FixedU128::from_rational(5, 100),
-			FixedU128::from_rational(10, 1),
-		);
-		assert_eq!(out, 21);
+		assert_eq!(recovery_bonus_collateral_out::<u128>(200, bonus, price), Some(21));
+		// A zero price cannot size a payout.
+		assert_eq!(recovery_bonus_collateral_out::<u128>(100, bonus, FixedU128::zero()), None);
+	}
+
+	#[test]
+	fn insurance_adjusted_rejects_above_par() {
+		// C > D is the `CR > 100%` regime. An unchecked split would price the payout above par.
+		// The boundary C == D stays in range with rate 1.
+		assert_eq!(insurance_adjusted::<u128>(1000, 1001, 0), None);
+		let r = insurance_adjusted::<u128>(1000, 1000, 0).expect("C == D is below-par boundary");
+		assert_eq!(r.effective_cover, 0);
+		assert_eq!(r.market_cancel_debt, 1000);
+		assert_eq!(r.recovery_rate, FixedU128::one());
 	}
 
 	#[test]
 	fn insurance_adjusted_partial_cover() {
 		// D = 1000, C = 800 (shortfall 200), IF = 50.
 		// effective_cover = 50, market_cancel = 950, rate = 800/950 ≈ 0.8421.
-		let r = insurance_adjusted::<u128>(1000, 800, 50);
+		let r = insurance_adjusted::<u128>(1000, 800, 50).expect("below-par split");
 		assert_eq!(r.effective_cover, 50);
 		assert_eq!(r.market_cancel_debt, 950);
 		assert!(r.recovery_rate <= FixedU128::one());
@@ -214,7 +265,7 @@ mod tests {
 	#[test]
 	fn insurance_adjusted_empty_fund_uses_c_over_d() {
 		// IF = 0 → effective_cover = 0, market_cancel = D, rate = C/D.
-		let r = insurance_adjusted::<u128>(1000, 800, 0);
+		let r = insurance_adjusted::<u128>(1000, 800, 0).expect("below-par split");
 		assert_eq!(r.effective_cover, 0);
 		assert_eq!(r.market_cancel_debt, 1000);
 		assert_eq!(r.recovery_rate, FixedU128::from_rational(800, 1000));
@@ -225,7 +276,7 @@ mod tests {
 		// IF covers the whole shortfall and then some: market_cancel = C.
 		// D = 1000, C = 800, IF = 500 → cover = min(500, 200) = 200,
 		// market_cancel = 800, rate = 800/800 = 1.0.
-		let r = insurance_adjusted::<u128>(1000, 800, 500);
+		let r = insurance_adjusted::<u128>(1000, 800, 500).expect("below-par split");
 		assert_eq!(r.effective_cover, 200);
 		assert_eq!(r.market_cancel_debt, 800);
 		assert_eq!(r.recovery_rate, FixedU128::one());
@@ -234,7 +285,7 @@ mod tests {
 	#[test]
 	fn insurance_adjusted_fund_covers_all_debt() {
 		// C = 0 (collateral worthless), IF >= D → market_cancel = 0.
-		let r = insurance_adjusted::<u128>(1000, 0, 1000);
+		let r = insurance_adjusted::<u128>(1000, 0, 1000).expect("below-par split");
 		assert_eq!(r.effective_cover, 1000);
 		assert_eq!(r.market_cancel_debt, 0);
 		assert_eq!(r.recovery_rate, FixedU128::zero());
@@ -244,14 +295,17 @@ mod tests {
 	fn recovery_rate_collateral_out_floors() {
 		// x = 950 at rate 800/950, price 10 → value floor(950 * 0.8421..) = 800,
 		// collateral floor(800/10) = 80.
-		let r = insurance_adjusted::<u128>(1000, 800, 50);
-		let out = recovery_rate_collateral_out::<u128>(
-			950,
-			r.recovery_rate,
-			FixedU128::from_rational(10, 1),
-		);
+		let r = insurance_adjusted::<u128>(1000, 800, 50).expect("below-par split");
+		let price = FixedU128::from_rational(10, 1);
+		let out = recovery_rate_collateral_out::<u128>(950, r.recovery_rate, price)
+			.expect("non-zero price sizes a payout");
 		// Rounding down keeps payout at or just below 80.
 		assert!(out <= 80);
 		assert!(out >= 79);
+		// A zero price cannot size a payout.
+		assert_eq!(
+			recovery_rate_collateral_out::<u128>(950, r.recovery_rate, FixedU128::zero()),
+			None
+		);
 	}
 }
