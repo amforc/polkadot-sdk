@@ -4,7 +4,6 @@ use crate::{
 	weights::WeightInfo,
 	Error, Event,
 };
-use pallet_vaults::LiquidationSettlement;
 use pusd_primitives::{
 	collateralization_ratio, recovery_pricing, reducible_debit, CollateralRatio, DebtCollateral,
 	RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
