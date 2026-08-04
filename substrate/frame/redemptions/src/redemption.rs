@@ -192,7 +192,10 @@ impl<T: Config> Pallet<T> {
 			let (funded, preservation) =
 				Self::fundable_budget(context.stable_id, context.redeemer, plan.debt())?;
 			if funded < plan.debt() {
-				plan = plan.resize(snapshot, context.price, funded);
+				let Some(resized) = plan.resize(snapshot, context.price, funded) else {
+					return Ok((None, None));
+				};
+				plan = resized;
 			}
 			Some(preservation)
 		};
@@ -321,9 +324,11 @@ impl<T: Config> Pallet<T> {
 		if debt.is_zero() {
 			return Step::Stop;
 		}
-		let collateral =
-			recovery_pricing::collateral_for_value(debt, price).min(snapshot.collateral);
-		Step::Redeem { debt, collateral }
+		// A failed face-value conversion cannot price this or any later target.
+		let Some(collateral) = recovery_pricing::collateral_for_value_floor(debt, price) else {
+			return Step::Stop;
+		};
+		Step::Redeem { debt, collateral: collateral.min(snapshot.collateral) }
 	}
 
 	fn execute_ordinary_step(
