@@ -4,9 +4,10 @@ use crate::{
 	weights::WeightInfo,
 	Error, Event,
 };
+use pallet_vaults::LiquidationSettlement;
 use pusd_primitives::{
 	collateralization_ratio, recovery_pricing, reducible_debit, DebtCollateral,
-	LiquidationSettlement, RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
+	RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
 };
 
 const HOUR_MS: Moment = 3_600 * 1_000;
