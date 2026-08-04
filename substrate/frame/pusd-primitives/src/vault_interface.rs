@@ -2,10 +2,7 @@
 //! by the `(collateral_id, stable_id)` market.
 
 use crate::{DebtCollateral, VaultStatus};
-use frame::deps::{
-	frame_support::pallet_prelude::{DispatchError, DispatchResult},
-	sp_runtime::Permill,
-};
+use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill};
 
 /// Settlement produced by the redemption orchestrator and consumed by
 /// [`VaultInterface::redeem_step`]. Owning `debt_payment` ties the burn to the
@@ -41,31 +38,6 @@ impl<Balance: Copy> RedemptionStepSnapshot<Balance> {
 	}
 }
 
-/// Result of the external liquidation work consumed by
-/// [`VaultInterface::execute_liquidation`]. External offset paths burn their
-/// stablecoin internally, so `debt_offset` remains a balance. Both collateral
-/// remainders return as credits because Vaults owns their final destinations:
-/// its redistribution account and the liquidated owner.
-#[must_use = "the settlement must be returned to VaultInterface::execute_liquidation"]
-pub struct LiquidationSettlement<CollateralCredit, Balance> {
-	pub debt_offset: Balance,
-	pub redistribution_collateral: CollateralCredit,
-	pub owner_surplus: CollateralCredit,
-}
-
-/// Fully-accrued vault figures handed to the settlement builder. These are the
-/// post-touch numbers the orchestrator must size its settlement against.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct LiquidationSnapshot<Balance> {
-	/// Post-touch total debt to settle.
-	pub debt: Balance,
-	/// Branch redistribution penalty: the premium debt pushed onto other vaults
-	/// carries, above the liquidation penalty an offset pays. Vaults owns it,
-	/// so the orchestrator prices redistribution against this rather than
-	/// against a parameter of its own.
-	pub redistribution_penalty: Permill,
-}
-
 /// The vault-side API used by external redemption and bad-debt flows. Reads
 /// are authoritative current state; writes re-shape the priority queue.
 ///
@@ -84,7 +56,6 @@ pub trait VaultInterface {
 	type AccountId;
 	type Balance;
 	type StableCredit;
-	type CollateralCredit;
 
 	/// The highest-priority redemption target and its lifecycle status:
 	/// `FinalRecovery` FIFO head first, then the dormant redemption target,
@@ -150,15 +121,6 @@ pub trait VaultInterface {
 		owner: &Self::AccountId,
 	) -> Result<Self::Balance, DispatchError>;
 
-	/// The market's redistribution penalty, or `None` when it is not
-	/// registered. The same value [`LiquidationSnapshot`] carries, exposed for
-	/// callers that must validate their own penalty against it before a
-	/// liquidation is in flight.
-	fn redistribution_penalty(
-		collateral_id: &Self::CollateralId,
-		stable_id: &Self::StableId,
-	) -> Option<Permill>;
-
 	/// Total debt issued in `stable_id` across every one of its collateral
 	/// markets, the denominator of the dynamic redemption fee's redeemed
 	/// fraction. Stablecoin-wide rather than per-market because the fee nudges
@@ -166,24 +128,6 @@ pub trait VaultInterface {
 	///
 	/// Includes aggregate interest accrued since each market was last touched.
 	fn stablecoin_debt(stable_id: &Self::StableId) -> Self::Balance;
-
-	/// Liquidate `owner`'s below-MCR vault. Vaults turns the fully-accrued
-	/// collateral hold into one credit and transfers ownership to the
-	/// orchestrator. After consuming external offsets and keeper compensation,
-	/// the orchestrator returns the redistribution and owner-surplus credits in
-	/// the settlement. Vaults owns both final destinations.
-	fn execute_liquidation(
-		collateral_id: &Self::CollateralId,
-		stable_id: &Self::StableId,
-		owner: &Self::AccountId,
-		build_settlement: impl FnOnce(
-			LiquidationSnapshot<Self::Balance>,
-			Self::CollateralCredit,
-		) -> Result<
-			LiquidationSettlement<Self::CollateralCredit, Self::Balance>,
-			DispatchError,
-		>,
-	) -> DispatchResult;
 
 	/// Burn up to the recorded bad debt of the market named by
 	/// `collateral_id` and the credit's own asset, returning the unconsumed

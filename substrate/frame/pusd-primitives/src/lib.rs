@@ -7,8 +7,6 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-extern crate alloc;
-
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
 	arithmetic::{helpers_128bit::multiply_by_rational_with_rounding, Rounding, Zero},
@@ -22,7 +20,6 @@ use scale_info::TypeInfo;
 
 pub mod branch_mode;
 pub mod debit;
-pub mod list_id;
 pub mod oracle;
 pub mod recovery_offset;
 pub mod recovery_pricing;
@@ -33,16 +30,12 @@ pub mod yield_routing;
 
 pub use branch_mode::{BranchMode, BranchModeProvider};
 pub use debit::{debit_preservation, reducible_debit};
-pub use list_id::StableListId;
 pub use oracle::ProvidePrice;
 pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetResult};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
 pub use stability_pool::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
-pub use vault_interface::{
-	LiquidationSettlement, LiquidationSnapshot, RedemptionSettlement, RedemptionStepSnapshot,
-	VaultInterface,
-};
+pub use vault_interface::{RedemptionSettlement, RedemptionStepSnapshot, VaultInterface};
 pub use yield_routing::OnBranchYield;
 
 /// TODO: Check if this is the best way to handle the "time"
@@ -173,10 +166,14 @@ pub fn mul_div_rate_floor<Balance: FixedPointOperand>(
 	.map(FixedU128::from_inner)
 }
 
-/// Per-market pallet sub-account: `pallet_id`'s sub-account for the Blake2
-/// hash of the `(collateral, stable)` pair, truncated to a bounded preimage so
-/// a large asset-id pair cannot overflow the sub-account seed and collide
-/// across markets. Sibling pallets stay distinct through their `PalletId`s.
+/// Returns a pallet sub-account for one `(collateral, stable)` market.
+///
+/// The function hashes the complete encoded asset pair with Blake2-256. Thus, long asset
+/// identifiers do not lose bytes before the function calculates the digest.
+///
+/// The digest has a fixed-size byte encoding. [`AccountIdConversion::into_sub_account_truncating`]
+/// truncates the encoded sub-account value only to fit `AccountId`. Different `PalletId` values
+/// keep the sub-accounts of sibling pallets separate.
 pub fn market_sub_account<AccountId, CollateralId, StableId>(
 	pallet_id: PalletId,
 	collateral_id: &CollateralId,
@@ -188,5 +185,5 @@ where
 	StableId: Encode,
 {
 	let seed = blake2_256(&(collateral_id, stable_id).encode());
-	pallet_id.into_sub_account_truncating(&seed[..24])
+	pallet_id.into_sub_account_truncating(seed)
 }

@@ -4,11 +4,11 @@ use super::{CloseOutcome, ResidualSettlement, VaultOp};
 use crate::{
 	pallet::{BalanceOf, Config, Error, Event, Pallet},
 	recovery,
-	types::{DebtCollateral, VaultStatus},
+	types::{DebtCollateral, LiquidationSnapshot, VaultStatus},
 };
 use frame::prelude::*;
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
-use pusd_primitives::{collateralization_ratio, LiquidationSnapshot, RedemptionStepSnapshot};
+use pusd_primitives::{collateralization_ratio, RedemptionStepSnapshot};
 
 impl<T: Config> VaultOp<T> {
 	/// Checks whether the vault may be liquidated.

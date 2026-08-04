@@ -3,10 +3,10 @@
 use crate::{
 	context::{ResidualSettlement, VaultOp},
 	pallet::{
-		BalanceOf, Branches, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason,
-		Pallet, StableCreditOf, StableIdOf,
+		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
+		StableCreditOf, StableIdOf,
 	},
-	types::{DebtCollateral, VaultListId, VaultStatus},
+	types::{DebtCollateral, LiquidationSettlement, LiquidationSnapshot, VaultListId, VaultStatus},
 };
 use frame::{
 	deps::frame_support::transactional,
@@ -21,8 +21,7 @@ use frame::{
 };
 use linked_list_interface::SortedListInterface;
 use pusd_primitives::{
-	BranchMode, BranchModeProvider, LiquidationSettlement, LiquidationSnapshot,
-	RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
+	BranchMode, BranchModeProvider, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
 
 impl<T: Config> BranchModeProvider<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
@@ -34,16 +33,19 @@ impl<T: Config> BranchModeProvider<CollateralIdOf<T>, StableIdOf<T>> for Pallet<
 	}
 }
 
-impl<T: Config> VaultInterface for Pallet<T> {
-	type CollateralId = CollateralIdOf<T>;
-	type StableId = StableIdOf<T>;
-	type AccountId = T::AccountId;
-	type Balance = BalanceOf<T>;
-	type StableCredit = StableCreditOf<T>;
-	type CollateralCredit = CollateralCreditOf<T>;
-
+impl<T: Config> Pallet<T> {
+	/// Liquidates `owner`'s eligible vault when its collateralization ratio is below MCR.
+	///
+	/// The pallet first applies accrued interest. It then gives `build_settlement` a post-touch
+	/// [`LiquidationSnapshot`] and one credit for all held collateral.
+	///
+	/// The builder uses the credit for offset payments and keeper compensation. It returns the
+	/// offset debt and the collateral credits for redistribution and owner surplus.
+	///
+	/// The function rejects a settlement that offsets too much debt or returns too much collateral.
+	/// The storage transaction rolls back all changes after an error.
 	#[transactional]
-	fn execute_liquidation(
+	pub fn execute_liquidation(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
@@ -116,6 +118,14 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		// The ratio check above applies; market mode rules do not.
 		op.commit_exempt()
 	}
+}
+
+impl<T: Config> VaultInterface for Pallet<T> {
+	type CollateralId = CollateralIdOf<T>;
+	type StableId = StableIdOf<T>;
+	type AccountId = T::AccountId;
+	type Balance = BalanceOf<T>;
+	type StableCredit = StableCreditOf<T>;
 
 	/// Returns the next redemption target.
 	///
@@ -275,13 +285,6 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		});
 		op.commit_exempt()?;
 		Ok(residual_debt)
-	}
-
-	fn redistribution_penalty(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-	) -> Option<Permill> {
-		Branches::<T>::get(collateral_id, stable_id).map(|b| b.config.redistribution_penalty)
 	}
 
 	fn stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {

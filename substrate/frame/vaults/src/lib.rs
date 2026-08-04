@@ -49,8 +49,9 @@ pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
 	BranchConfig, BranchConfigUpdate, BranchDebt, BranchMode, BranchState, DebtBreakdown,
-	DebtCollateral, FrozenReason, FrozenState, RedistributionAccumulators,
-	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultStatus,
+	DebtCollateral, FrozenReason, FrozenState, LiquidationSettlement, LiquidationSnapshot,
+	RedistributionAccumulators, RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId,
+	VaultStatus,
 };
 pub use weights::WeightInfo;
 
@@ -1365,12 +1366,9 @@ pub mod pallet {
 				VaultListId::Rate(collateral_id, stable_id) => {
 					Vaults::<T>::get((collateral_id, stable_id, item)).map(|v| v.annual_rate)
 				},
-				// FIFO lists never drift: the stored priority (assigned once
-				// at insertion) is authoritative. This also serves sibling
-				// pallets' FIFO variants on the shared list instance.
-				VaultListId::FinalRecovery(..) | VaultListId::StabilityPending(..) => {
-					T::VaultLists::priority(list_id, item)
-				},
+				// FIFO order does not change after insertion. Thus, the stored insertion priority
+				// remains authoritative.
+				VaultListId::FinalRecovery(..) => T::VaultLists::priority(list_id, item),
 			}
 		}
 	}

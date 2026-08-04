@@ -8,8 +8,63 @@ use frame::arithmetic::{
 	Zero,
 };
 use pusd_primitives::MILLIS_PER_YEAR;
-pub use pusd_primitives::{BranchMode, DebtCollateral, StableListId as VaultListId, VaultStatus};
+pub use pusd_primitives::{BranchMode, DebtCollateral, VaultStatus};
 use scale_info::TypeInfo;
+
+/// Identifies a Vaults list for one market and use case.
+///
+/// The runtime uses this value as a storage key for its `pallet-linked-list` instance. Each variant
+/// identifies one `(collateral, stable)` market and one list.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	PartialEq,
+	Eq,
+	PartialOrd,
+	Ord,
+	Debug,
+)]
+pub enum VaultListId<CollateralId, StableId> {
+	/// Identifies the borrow-rate index, which sorts vaults by annual rate.
+	#[codec(index = 0)]
+	Rate(CollateralId, StableId),
+	/// Identifies the `FinalRecovery` FIFO.
+	#[codec(index = 1)]
+	FinalRecovery(CollateralId, StableId),
+}
+
+/// Contains the liquidation result that [`crate::Pallet::execute_liquidation`] consumes.
+///
+/// External offset paths burn stablecoin internally. Thus, `debt_offset` is an amount and not a
+/// credit. The other fields are credits because this pallet controls their final destinations.
+#[must_use = "the settlement must be returned to execute_liquidation"]
+pub struct LiquidationSettlement<CollateralCredit, Balance> {
+	/// Debt that external offset paths burned.
+	pub debt_offset: Balance,
+	/// Collateral credit that the pallet sends to its redistribution account.
+	pub redistribution_collateral: CollateralCredit,
+	/// Collateral credit that the pallet returns to the liquidated owner.
+	pub owner_surplus: CollateralCredit,
+}
+
+/// Contains the post-touch vault values for a liquidation settlement.
+///
+/// The settlement builder must use these values to size its settlement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LiquidationSnapshot<Balance> {
+	/// Total debt after the pallet applies accrued interest.
+	pub debt: Balance,
+	/// Branch penalty for debt that the liquidation redistributes to other vaults.
+	///
+	/// Redistributed debt carries this premium. The premium must be at least the liquidation
+	/// penalty that an offset pays. Vaults controls this parameter, and the settlement builder
+	/// must use it.
+	pub redistribution_penalty: Permill,
+}
 
 /// Reason a market is frozen.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
