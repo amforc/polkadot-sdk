@@ -1,6 +1,5 @@
-use crate::{mock::*, tests::rate_pct};
+use crate::{mock::*, tests::rate_pct, types::LiquidationSettlement};
 use frame::traits::fungibles::Balanced;
-use pusd_primitives::{LiquidationSettlement, VaultInterface};
 
 #[test]
 fn liquidate_only_vault_returns_last_vault_error() {
@@ -71,9 +70,6 @@ fn execute_liquidation_rejects_frozen_branch() {
 	});
 }
 
-// The mock plan stands in for the future liquidation orchestrator. These tests
-// pin the production `VaultInterface` boundary: an inconsistent settlement is
-// rejected atomically, so a follow-up valid settlement still succeeds.
 #[test]
 fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 	build_and_execute(|| {
@@ -114,20 +110,15 @@ fn execute_liquidation_rejects_collateral_payout_above_held() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		assert_noop!(
-			<Pallet<Test> as VaultInterface>::execute_liquidation(
-				&DOT,
-				&PUSD,
-				&1,
-				|_snapshot, owner_surplus| {
-					let redistribution_collateral =
-						<VaultCollateralAssets as Balanced<AccountId>>::issue(DOT, 1);
-					Ok(LiquidationSettlement {
-						debt_offset: 0,
-						redistribution_collateral,
-						owner_surplus,
-					})
-				},
-			),
+			Pallet::<Test>::execute_liquidation(&DOT, &PUSD, &1, |_snapshot, owner_surplus| {
+				let redistribution_collateral =
+					<VaultCollateralAssets as Balanced<AccountId>>::issue(DOT, 1);
+				Ok(LiquidationSettlement {
+					debt_offset: 0,
+					redistribution_collateral,
+					owner_surplus,
+				})
+			},),
 			crate::Error::<Test>::InvalidLiquidationSettlement
 		);
 		assert!(crate::pallet::Vaults::<Test>::contains_key((DOT, PUSD, 1)));
