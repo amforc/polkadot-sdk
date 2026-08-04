@@ -65,19 +65,24 @@ impl<Balance: Copy> RecoveryPlan<Balance> {
 }
 
 impl<Balance: FixedPointOperand + Ord> RecoveryPlan<Balance> {
+	/// Re-prices the plan for a smaller `budget`.
+	///
+	/// Returns `None` if a price conversion fails. The original plan priced the
+	/// same regime at the same `price`, so this only happens on corrupt inputs;
+	/// the caller must skip the target.
 	pub(crate) fn resize(
 		self,
 		snapshot: &RedemptionStepSnapshot<Balance>,
 		price: FixedU128,
 		budget: Balance,
-	) -> Self {
+	) -> Option<Self> {
 		match self {
 			Self::AbovePar { bonus, .. } => {
 				let debt = snapshot.debt.min(budget);
 				let collateral =
-					recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)
+					recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)?
 						.min(snapshot.collateral);
-				Self::AbovePar { debt, collateral, bonus }
+				Some(Self::AbovePar { debt, collateral, bonus })
 			},
 			Self::BelowPar { split, .. } => {
 				let debt = split.market_cancel_debt.min(budget);
@@ -85,9 +90,9 @@ impl<Balance: FixedPointOperand + Ord> RecoveryPlan<Balance> {
 					debt,
 					split.recovery_rate,
 					price,
-				)
+				)?
 				.min(snapshot.collateral);
-				Self::BelowPar { debt, collateral, split }
+				Some(Self::BelowPar { debt, collateral, split })
 			},
 		}
 	}
@@ -129,18 +134,19 @@ impl<T: Config> Pallet<T> {
 				snapshot.redistribution_penalty,
 			);
 			let debt = snapshot.debt.min(budget);
-			let collateral = recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)
+			let collateral = recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)?
 				.min(snapshot.collateral);
 			return Some(RecoveryPlan::AbovePar { debt, collateral, bonus });
 		}
 
+		// `ratio < 1` implies `collateral_value < debt`, so the split is in range.
 		let collateral_value = price.saturating_mul_int(snapshot.collateral);
 		let shortfall = snapshot.debt.saturating_sub(collateral_value);
 		let cover = Self::insurance_fund_cover(stable_id, shortfall);
-		let split = recovery_pricing::insurance_adjusted(snapshot.debt, collateral_value, cover);
+		let split = recovery_pricing::insurance_adjusted(snapshot.debt, collateral_value, cover)?;
 		let debt = split.market_cancel_debt.min(budget);
 		let collateral =
-			recovery_pricing::recovery_rate_collateral_out(debt, split.recovery_rate, price)
+			recovery_pricing::recovery_rate_collateral_out(debt, split.recovery_rate, price)?
 				.min(snapshot.collateral);
 		Some(RecoveryPlan::BelowPar { debt, collateral, split })
 	}
