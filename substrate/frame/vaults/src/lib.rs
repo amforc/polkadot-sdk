@@ -697,9 +697,11 @@ pub mod pallet {
 		RedistributionWouldOverflow,
 		/// The vault is not eligible for liquidation.
 		VaultNotLiquidatable,
-		/// A non-zero direct keeper contribution is below the market minimum.
+		/// A non-zero keeper allowance or its funding is below the market minimum.
 		JitBelowMinimum,
 		/// Direct-offset collateral fell below the keeper's submitted floor.
+		///
+		/// Defensive: planning skips the contribution instead of executing it.
 		JitSlippageExceeded,
 		/// Collateral could not be delivered to its recipient.
 		CollateralPayoutFailed,
@@ -1419,10 +1421,12 @@ pub mod pallet {
 		/// ## Parameters
 		///
 		/// - `jit.max_stable`: Maximum stable assets the keeper allows the call to burn for a
-		///   direct contribution. Zero disables the contribution.
+		///   direct contribution. Zero disables the contribution; a non-zero allowance below the
+		///   market's minimum JIT contribution is rejected.
 		/// - `jit.min_collateral_out`: Minimum collateral allocated to an executed JIT slice,
 		///   excluding the keeper reward. This absolute floor is not scaled down for a partial JIT
-		///   execution, so it should reflect the smallest execution the keeper would accept.
+		///   execution, so it should reflect the smallest execution the keeper would accept. A
+		///   trade that would pay less is skipped and the liquidation proceeds without it.
 		#[pallet::call_index(19)]
 		#[pallet::weight(T::WeightInfo::liquidate())]
 		pub fn liquidate(
