@@ -375,11 +375,14 @@ pub mod pallet {
 
 	/// Vaults supplies the authoritative stablecoin market count: the first
 	/// market seeds these stablecoin-wide rows and the last one clears them.
-	impl<T: Config> pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
+	impl<T: Config>
+		pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId> for Pallet<T>
+	{
 		fn on_registered(
 			_: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 			stablecoin_markets: u32,
+			_depositor: Option<&T::AccountId>,
 		) -> DispatchResult {
 			ensure!(stablecoin_markets > 0, DispatchError::Corruption);
 			if stablecoin_markets > 1 {

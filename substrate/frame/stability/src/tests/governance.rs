@@ -1,6 +1,10 @@
 //! Branch lifecycle seeding and `set_stability_pool_config` governance.
 
 use crate::{mock::*, types::PoolSums, Error};
+use frame::traits::{
+	fungibles::{Inspect as _, Refund as _},
+	tokens::Provenance,
+};
 
 fn providers(who: AccountId) -> u32 {
 	System::providers(&who)
@@ -40,6 +44,72 @@ fn branch_registration_seeds_pool_rows() {
 		// (`Consideration`), pricing the storage.
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert!(providers(pool) >= 1);
+	});
+}
+
+#[test]
+fn issued_collateral_account_touch_is_required_and_refunded() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		let collateral = AssetId::WithId(77);
+		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+		let pool = Stability::pool_account(&collateral, &PUSD);
+
+		// Governance supplies no market depositor. It must pre-create the issued-asset account or
+		// use a signed creation path rather than registering a pool that can reject dust gains.
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::root(),
+				collateral.clone(),
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				default_branch_config(),
+			),
+			Error::<Test>::PoolAccountDepositRequired
+		);
+		assert!(crate::Pools::<Test>::get(collateral.clone(), PUSD).is_none());
+
+		let reserved_before = Balances::reserved_balance(1);
+		assert_ok!(Vaults::create_branch(
+			RuntimeOrigin::signed(1),
+			collateral.clone(),
+			PUSD,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			default_branch_config(),
+		));
+		assert_ok!(Assets::can_deposit(77, &pool, 1, Provenance::Extant).into_result());
+		let (depositor, account_deposit) =
+			Assets::deposit_held(77, pool).expect("registration touched the pool account");
+		assert_eq!(depositor, 1);
+		assert!(account_deposit > 0);
+
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
+		assert!(Assets::deposit_held(77, pool).is_none());
+		assert_eq!(Balances::reserved_balance(1), reserved_before);
+	});
+}
+
+#[test]
+fn branch_registration_rejects_prefunded_pool_account() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		let collateral = AssetId::WithId(77);
+		let pool = Stability::pool_account(&collateral, &PUSD);
+		mint_collateral(collateral.clone(), pool, 1_000);
+		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::signed(1),
+				collateral.clone(),
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				default_branch_config(),
+			),
+			Error::<Test>::PoolAccountNotEmpty
+		);
+		assert!(crate::Pools::<Test>::get(collateral, PUSD).is_none());
+		assert_eq!(collateral_balance(AssetId::WithId(77), pool), 1_000);
 	});
 }
 

@@ -30,7 +30,7 @@ use frame::{
 			BalancedHold as FungiblesBalancedHold, Credit, Inspect as FungiblesInspect,
 			InspectHold,
 		},
-		tokens::{fungible, imbalance::ResolveAssetTo},
+		tokens::{fungible, imbalance::ResolveAssetTo, Provenance},
 		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 		OnUnbalanced,
 	},
@@ -250,11 +250,12 @@ parameter_types! {
 
 /// Records market lifecycle calls and supports forced failures.
 pub struct RecordingLifecycle;
-impl pusd_primitives::OnBranchLifecycle<AssetId, StableId> for RecordingLifecycle {
+impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for RecordingLifecycle {
 	fn on_registered(
 		collateral_id: &AssetId,
 		stable_id: &StableId,
 		stablecoin_markets: u32,
+		_depositor: Option<&AccountId>,
 	) -> DispatchResult {
 		LifecycleLog::mutate(|l| {
 			l.push((collateral_id.clone(), *stable_id, true, stablecoin_markets))
@@ -367,6 +368,17 @@ impl StabilityPoolInspect<AssetId, StableId, Balance> for MockStabilityPool {
 
 	fn reducible_pending(_: &AssetId, _: &StableId, max_debt: Balance, _: Balance) -> Balance {
 		max_debt.min(PendingSpCapacity::get())
+	}
+
+	fn can_receive_collateral(collateral_id: &AssetId, _: &StableId, amount: Balance) -> bool {
+		<VaultCollateralAssets as FungiblesInspect<AccountId>>::can_deposit(
+			collateral_id.clone(),
+			&SP_ACCOUNT,
+			amount,
+			Provenance::Extant,
+		)
+		.into_result()
+		.is_ok()
 	}
 }
 

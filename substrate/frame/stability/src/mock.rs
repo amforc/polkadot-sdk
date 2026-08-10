@@ -519,8 +519,10 @@ pub fn register_branch(
 ) {
 	// `create_branch` requires a live price, so set it before creating.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+	// Account 1 owns every test stable asset. Its refundable market deposit also funds any
+	// collateral-account touch that Stability needs for the pool sub-account.
 	Vaults::create_branch(
-		RuntimeOrigin::root(),
+		RuntimeOrigin::signed(1),
 		collateral.clone(),
 		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
@@ -529,9 +531,8 @@ pub fn register_branch(
 	.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), collateral, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
-	// No ED pre-fund for the pool sub-account: the registration hook's
-	// provider reference keeps it alive, and pre-funding native balance
-	// would show up as untracked collateral in the DOT-market identity.
+	// No collateral pre-fund for the pool sub-account: registration creates a zero-balance asset
+	// account when necessary, so every gain remains tracked pool collateral.
 }
 
 /// Open a vault for `who` on the `(collateral, stable)` market with

@@ -2,7 +2,10 @@
 //! and the interplay with yield (invariant 12).
 
 use crate::{mock::*, Error};
-use frame::testing_prelude::hypothetically;
+use frame::{
+	testing_prelude::hypothetically,
+	traits::{fungibles::Inspect as _, tokens::Provenance},
+};
 
 #[test]
 fn vault_liquidation_uses_the_real_stability_pool() {
@@ -38,7 +41,7 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 }
 
 #[test]
-fn reserved_pool_leg_failure_rolls_back_the_liquidation() {
+fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 	build_and_execute(|| {
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
 		let collateral = AssetId::WithId(77);
@@ -48,41 +51,58 @@ fn reserved_pool_leg_failure_rolls_back_the_liquidation() {
 		register_branch(collateral.clone(), PUSD, config);
 		for owner in [1, 2] {
 			mint_collateral(collateral.clone(), owner, 5_000);
-			assert_ok!(open_vault(owner, collateral.clone(), PUSD, 2_000, 500));
+			assert_ok!(open_vault(owner, collateral.clone(), PUSD, 3_000, 500));
 		}
+		// Documented runtime duty for issued-asset markets: pre-fund custody
+		// sub-accounts with the asset minimum so holds can take their full
+		// amount (the hold's `Protect` preservation keeps the minimum free).
+		let redistribution = Vaults::redistribution_account(&collateral, &PUSD);
+		mint_collateral(collateral.clone(), redistribution, 1_000);
 		mint_stable(PUSD, 3, 100);
 		assert_ok!(deposit(3, collateral.clone(), PUSD, 100));
 		advance_time(5_000);
 		assert_ok!(poke(3, 3, collateral.clone(), PUSD));
-		set_price(collateral.clone(), FixedU128::from_rational(1u128, 5u128));
+		// floor(0.18 * 3_000) = 540 of value: CR 1.08 sits below the 1.10 MCR.
+		set_price(collateral.clone(), FixedU128::from_rational(9u128, 50u128));
 
-		let vault_before =
-			pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 1)).unwrap();
-		let pool_before = pool_state(collateral.clone(), PUSD);
 		let pool_account = Stability::pool_account(&collateral, &PUSD);
-		let stable_before = stable_balance(PUSD, pool_account);
+		// Registration touched a zero-balance asset account, so even a one-unit gain can enter it.
+		assert_ok!(Assets::can_deposit(77, &pool_account, 1, Provenance::Extant).into_result());
 
-		// The keeper reward clears the asset minimum, while the active pool's
-		// reserved 100-debt leg receives less than 1_000 collateral. Exact
-		// settlement rejects that leg and the outer transaction restores every
-		// earlier liquidation step.
-		assert_noop!(
-			Vaults::liquidate(
-				RuntimeOrigin::signed(4),
-				collateral.clone(),
-				PUSD,
-				1,
-				pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
-			),
-			Error::<Test>::OffsetSettlementFailed
-		);
+		// The active pool's share floor(1_803 * 105/525) = 360 is below the asset's 1_000 minimum.
+		// The pre-created account accepts it, so the normal active-first waterfall remains intact.
+		assert_ok!(Vaults::liquidate(
+			RuntimeOrigin::signed(4),
+			collateral.clone(),
+			PUSD,
+			1,
+			pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
+		));
+
+		// Equal 5% penalties seize ceil(525/0.18) = 2_917. The keeper takes
+		// ceil(200/0.18) + floor(0.1% * 2_917) = 1_112 + 2. Of the remaining 1_803,
+		// active receives 360 and redistribution receives 1_443 including the flooring remainder.
+		assert!(pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 1)).is_none());
+		let state = pool_state(collateral.clone(), PUSD);
+		assert_eq!(state.total_active_deposits, 0);
+		assert_eq!(state.total_collateral_gains_unclaimed, 360);
+		assert_eq!(stable_balance(PUSD, pool_account), 0);
+		assert_eq!(collateral_balance(collateral.clone(), pool_account), 360);
+		// The redistributed 1_443 sits under the custody hold; the pre-funded minimum stays
+		// free, which is what let the `Protect`-preserving hold succeed.
+		use frame::traits::fungibles::InspectHold;
 		assert_eq!(
-			pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 1)).unwrap(),
-			vault_before
+			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
+				collateral.clone(),
+				&pallet_vaults::HoldReason::VaultCollateral.into(),
+				&redistribution,
+			),
+			1_443
 		);
-		assert_eq!(pool_state(collateral.clone(), PUSD), pool_before);
-		assert_eq!(stable_balance(PUSD, pool_account), stable_before);
-		assert_eq!(collateral_balance(collateral, pool_account), 0);
+		assert_eq!(collateral_balance(collateral.clone(), redistribution), 1_000);
+		assert_eq!(collateral_balance(collateral.clone(), 4), 1_114);
+		// The owner's 3_000 hold was seized to 2_917; the 83 surplus returns.
+		assert_eq!(collateral_balance(collateral, 1), 5_000 - 2_917);
 	});
 }
 
@@ -454,10 +474,9 @@ fn offset_refuses_stale_sizing_reads() {
 }
 
 #[test]
-fn offset_with_sub_minimum_collateral_gain_steps_aside() {
+fn offset_accepts_sub_minimum_gain_after_registration_touch() {
 	build_and_execute(|| {
-		// A collateral whose pallet-assets minimum balance exceeds the gain:
-		// resolving the first-ever gain into the empty pool account fails.
+		// A collateral whose pallet-assets minimum balance exceeds the first gain.
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
 		let coll = AssetId::WithId(77);
 		register_branch(coll.clone(), PUSD, default_branch_config());
@@ -466,22 +485,23 @@ fn offset_with_sub_minimum_collateral_gain_steps_aside() {
 		advance_time(5_000);
 		assert_ok!(poke(1, 1, coll.clone(), PUSD));
 
-		// 500 collateral for 500 debt: gain 500 < the 1_000 minimum on an
-		// empty account — the whole offset steps aside, nothing moves.
+		// Registration created the zero-balance asset account, so a 500 gain below the 1_000
+		// minimum settles normally.
 		let (debt_offset, leftover) = simulate_offset(coll.clone(), PUSD, 500, 500);
-		assert_eq!(debt_offset, 0);
-		assert_eq!(leftover, 500);
+		assert_eq!(debt_offset, 500);
+		assert_eq!(leftover, 0);
 		let state = pool_state(coll.clone(), PUSD);
-		assert_eq!(state.total_active_deposits, 1_000);
-		assert_eq!(state.coords.p, FixedU128::one());
+		assert_eq!(state.total_active_deposits, 500);
+		assert_eq!(state.coords.p, FixedU128::from_rational(1, 2));
 		let pool = Stability::pool_account(&coll, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 1_000);
+		assert_eq!(stable_balance(PUSD, pool), 500);
+		assert_eq!(collateral_balance(coll.clone(), pool), 500);
 
-		// A gain clearing the minimum lands normally.
+		// The remaining deposit can then be depleted normally.
 		let (debt_offset, leftover) = simulate_offset(coll.clone(), PUSD, 500, 1_500);
 		assert_eq!(debt_offset, 500);
 		assert_eq!(leftover, 0);
-		assert_eq!(collateral_balance(coll, pool), 1_500);
+		assert_eq!(collateral_balance(coll, pool), 2_000);
 	});
 }
 

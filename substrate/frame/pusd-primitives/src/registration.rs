@@ -15,14 +15,18 @@ use frame::deps::frame_support::pallet_prelude::DispatchResult;
 ///
 /// [`on_registered`]: OnBranchLifecycle::on_registered
 /// [`on_deregistered`]: OnBranchLifecycle::on_deregistered
-pub trait OnBranchLifecycle<CollateralId, StableId> {
+pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 	/// Run when a new market is registered. `stablecoin_markets` includes it.
+	///
+	/// `depositor` is the account funding the market's refundable setup costs. Governance-created
+	/// markets can omit it when every lifecycle handler needs no additional account deposit.
 	fn on_registered(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
 		stablecoin_markets: u32,
+		depositor: Option<&AccountId>,
 	) -> DispatchResult {
-		let _ = (collateral_id, stable_id, stablecoin_markets);
+		let _ = (collateral_id, stable_id, stablecoin_markets, depositor);
 		Ok(())
 	}
 
@@ -41,14 +45,17 @@ pub trait OnBranchLifecycle<CollateralId, StableId> {
 /// Run each handler in order, short-circuiting on the first error so the caller
 /// can roll the transaction back.
 #[impl_trait_for_tuples::impl_for_tuples(8)]
-impl<CollateralId, StableId> OnBranchLifecycle<CollateralId, StableId> for Tuple {
+impl<CollateralId, StableId, AccountId> OnBranchLifecycle<CollateralId, StableId, AccountId>
+	for Tuple
+{
 	fn on_registered(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
 		stablecoin_markets: u32,
+		depositor: Option<&AccountId>,
 	) -> DispatchResult {
 		for_tuples!( #(
-			Tuple::on_registered(collateral_id, stable_id, stablecoin_markets)?;
+			Tuple::on_registered(collateral_id, stable_id, stablecoin_markets, depositor)?;
 		)* );
 		Ok(())
 	}

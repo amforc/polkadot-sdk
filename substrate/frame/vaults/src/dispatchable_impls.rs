@@ -405,6 +405,7 @@ impl<T: Config> Pallet<T> {
 			},
 			None => None,
 		};
+		let lifecycle_depositor = deposit.as_ref().map(|(who, _)| who.clone());
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		frame_system::Pallet::<T>::inc_providers(&redistribution_account);
 		let now = T::TimeProvider::now();
@@ -418,7 +419,12 @@ impl<T: Config> Pallet<T> {
 				deposit,
 			},
 		);
-		T::OnBranchLifecycle::on_registered(&collateral_id, &stable_id, stablecoin_markets)?;
+		T::OnBranchLifecycle::on_registered(
+			&collateral_id,
+			&stable_id,
+			stablecoin_markets,
+			lifecycle_depositor.as_ref(),
+		)?;
 		Self::deposit_event(Event::BranchRegistered { collateral_id, stable_id });
 		Ok(())
 	}

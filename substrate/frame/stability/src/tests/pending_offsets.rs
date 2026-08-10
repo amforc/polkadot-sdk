@@ -222,29 +222,29 @@ fn pending_offset_clamps_to_the_minimum_pool_floor() {
 }
 
 #[test]
-fn pending_offset_with_sub_minimum_collateral_gain_steps_aside() {
+fn pending_offset_accepts_sub_minimum_gain_after_registration_touch() {
 	build_and_execute(|| {
-		// Same sub-minimum first-gain guard as the active offset: resolving
-		// the collateral slice fails, so nothing of the offset applies.
+		// Same registration invariant as the active offset: the pool account accepts every positive
+		// gain even when the issued asset's minimum balance is larger.
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
 		let coll = AssetId::WithId(77);
 		register_branch(coll.clone(), PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 200);
 		assert_ok!(deposit(1, coll.clone(), PUSD, 200));
 
-		// Gain floor(500 * 200 / 200) = 500 < the 1_000 minimum on an empty
-		// pool account: the offset is attempted but nothing of it applies.
+		// Gain 500 is below the 1_000 minimum but enters the pre-created account.
 		let (debt_offset, leftover) = simulate_pending_offset(coll.clone(), PUSD, 200, 500);
-		assert_eq!(debt_offset, 0);
-		assert_eq!(leftover, 500);
+		assert_eq!(debt_offset, 200);
+		assert_eq!(leftover, 0);
 		let row = deposit_row(coll.clone(), PUSD, 1).expect("kept");
-		assert_eq!(row.pending_deposit.expect("untouched").amount, 200);
+		assert_eq!(row.pending_deposit.expect("lazy realization").amount, 200);
 		let state = pool_state(coll.clone(), PUSD);
-		assert_eq!(state.total_pending_deposits, 200);
+		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.pending_coords.p, FixedU128::one());
-		assert_eq!(state.pending_coords.epoch, 0);
+		assert_eq!(state.pending_coords.epoch, 1);
 		let pool = Stability::pool_account(&coll, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 200);
+		assert_eq!(stable_balance(PUSD, pool), 0);
+		assert_eq!(collateral_balance(coll, pool), 500);
 	});
 }
 
