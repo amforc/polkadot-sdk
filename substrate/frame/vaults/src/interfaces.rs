@@ -1,7 +1,7 @@
 //! Implementations of vault interfaces used by other pallets.
 
 use crate::{
-	context::{ResidualSettlement, VaultOp},
+	context::VaultOp,
 	pallet::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
 		StableCreditOf, StableIdOf,
@@ -171,37 +171,28 @@ impl<T: Config> VaultInterface for Pallet<T> {
 	}
 
 	#[transactional]
-	fn redeem_step<Outcome>(
+	fn redeem_step(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 		recipient: &T::AccountId,
-		build_settlement: impl FnOnce(
-			RedemptionStepSnapshot<BalanceOf<T>>,
-		) -> Result<
-			(Option<RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>>, Outcome),
-			DispatchError,
-		>,
-	) -> Result<Outcome, DispatchError> {
+		settlement: RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>,
+	) -> Result<(), DispatchError> {
+		let RedemptionSettlement { debt_payment, collateral_to_recipient } = settlement;
 		let mut op = VaultOp::<T>::load(collateral_id.clone(), stable_id.clone(), owner)?;
 		let snapshot = op.redemption_snapshot();
-		let post_touch_debt = snapshot.debt;
-		let held = snapshot.collateral;
 
-		let (settlement, outcome) = build_settlement(snapshot)?;
-		let Some(settlement) = settlement else {
-			// Keep interest applied by the touch even when this target is skipped.
-			op.commit_exempt()?;
-			return Ok(outcome);
-		};
-		let RedemptionSettlement { debt_payment, collateral_to_recipient } = settlement;
-
-		// Only the credit amount sets how much debt is cancelled. Use `None` to skip the target.
+		// Only the credit amount sets how much debt is cancelled. The caller
+		// sized it against a projection of the same touch; fail closed on any
+		// divergence.
 		ensure!(debt_payment.asset() == *op.stable_id(), Error::<T>::InvalidRedemptionSettlement);
 		let debt_to_cancel = debt_payment.peek();
 		ensure!(!debt_to_cancel.is_zero(), Error::<T>::InvalidRedemptionSettlement);
-		ensure!(debt_to_cancel <= post_touch_debt, Error::<T>::InvalidRedemptionSettlement);
-		ensure!(collateral_to_recipient <= held, Error::<T>::InvalidRedemptionSettlement);
+		ensure!(debt_to_cancel <= snapshot.debt, Error::<T>::InvalidRedemptionSettlement);
+		ensure!(
+			collateral_to_recipient <= snapshot.collateral,
+			Error::<T>::InvalidRedemptionSettlement
+		);
 
 		// Burn the stable asset used for payment.
 		drop(debt_payment);
@@ -234,57 +225,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			collateral_to_recipient,
 			vault_annual_rate: op.vault().annual_rate,
 		});
-		op.commit_exempt()?;
-		Ok(outcome)
-	}
-
-	#[transactional]
-	fn settle_recovery_residual(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		owner: &T::AccountId,
-	) -> Result<BalanceOf<T>, DispatchError> {
-		let mut op = VaultOp::<T>::load(collateral_id.clone(), stable_id.clone(), owner)?;
-		// Move the remaining vault debt to market bad debt. The caller heals it with insurance
-		// funds.
-		let ResidualSettlement { residual_debt, collateral_dust, swept_orphan_debt } =
-			op.settle_recovery_residual()?;
-
-		// Release only this market's dust. The same hold may back other markets.
-		if !collateral_dust.is_zero() {
-			T::CollateralAssets::release(
-				op.collateral_id().clone(),
-				&HoldReason::VaultCollateral.into(),
-				op.owner(),
-				collateral_dust,
-				Precision::Exact,
-			)?;
-		}
-
-		if !swept_orphan_debt.is_zero() {
-			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id: op.collateral_id().clone(),
-				stable_id: op.stable_id().clone(),
-				amount: swept_orphan_debt,
-			});
-		}
-		if !residual_debt.is_zero() {
-			Pallet::<T>::deposit_event(Event::BadDebtRecorded {
-				collateral_id: op.collateral_id().clone(),
-				stable_id: op.stable_id().clone(),
-				amount: residual_debt,
-			});
-		}
-		// Emit a closure event because the removed vault cannot carry a status change.
-		Pallet::<T>::deposit_event(Event::VaultClosed {
-			collateral_id: op.collateral_id().clone(),
-			stable_id: op.stable_id().clone(),
-			owner: op.owner().clone(),
-			recipient: op.owner().clone(),
-			collateral: collateral_dust,
-		});
-		op.commit_exempt()?;
-		Ok(residual_debt)
+		op.commit_exempt()
 	}
 
 	fn stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {
