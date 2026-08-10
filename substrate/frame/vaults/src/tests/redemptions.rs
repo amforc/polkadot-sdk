@@ -92,10 +92,7 @@ fn redeemed_above_min_debt_stays_active() {
 fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_noop!(
-			redeem_step(DOT, PUSD, 99, 3, |_| panic!("closure must not run")),
-			crate::Error::<Test>::VaultNotFound
-		);
+		assert_noop!(redeem_step(DOT, PUSD, 99, 3, 1, 0), crate::Error::<Test>::VaultNotFound);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		// A frozen branch must reject settlement, like every other price-dependent
 		// path; the gate fires before any vault is touched or priced.
@@ -105,17 +102,16 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 			PUSD,
 			true
 		));
-		assert_noop!(
-			redeem_step(DOT, PUSD, 1, 3, |_| panic!("closure must not run")),
-			crate::Error::<Test>::BranchFrozen
-		);
+		assert_noop!(redeem_step(DOT, PUSD, 1, 3, 1, 0), crate::Error::<Test>::BranchFrozen);
 	});
 }
 
+// The two-phase contract: sizing happens against the projection, application
+// re-touches inside `redeem_step`. Both must see the same numbers within one
+// dispatch, so a settlement sized exactly at the projected debt and collateral
+// is accepted and cancels exactly those amounts.
 #[test]
-fn projected_redemption_snapshot_matches_post_touch_without_mutating_state() {
-	use frame::deps::frame_support::storage::{with_transaction, TransactionOutcome};
-
+fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
@@ -129,26 +125,20 @@ fn projected_redemption_snapshot_matches_post_touch_without_mutating_state() {
 
 		let projected =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
-		assert_eq!(branch_state(DOT, PUSD), Some(branch_before.clone()));
+		// Projection is a pure read.
+		assert_eq!(branch_state(DOT, PUSD), Some(branch_before));
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(vault_before.clone()));
 		assert_eq!(held(DOT, 1), held_before);
 		assert_eq!(System::events(), events_before);
+		// The projection includes the year of pending interest the row lacks.
+		assert_eq!(projected.debt, vault_before.debt.total() + 250);
 
-		let mut touched = None;
-		with_transaction(|| {
-			let result = redeem_step(DOT, PUSD, 1, 3, |snapshot| {
-				touched = Some(snapshot);
-				Ok(None)
-			});
-			TransactionOutcome::Rollback(result)
-		})
-		.expect("touch succeeds");
-
-		assert_eq!(touched, Some(projected));
-		assert_eq!(branch_state(DOT, PUSD), Some(branch_before));
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(vault_before));
-		assert_eq!(held(DOT, 1), held_before);
-		assert_eq!(System::events(), events_before);
+		// A settlement filling the whole projected position is exact, proving
+		// execution touched to the same values the projection reported.
+		assert_ok!(redeem_step(DOT, PUSD, 1, 3, projected.debt, projected.collateral));
+		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		assert_eq!(v_post.debt.total(), 0);
+		assert_eq!(held(DOT, 1), held_before - projected.collateral);
 	});
 }
 
@@ -160,86 +150,52 @@ fn redeem_step_rejects_invalid_settlements_without_state_change() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		let vault_pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		let held_pre = held(DOT, 1);
+		let snapshot =
+			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
 
 		// `assert_noop!` pins the whole storage root, so each rejection also
-		// proves the rollback un-issues the credit synthesized inside the
-		// closure — the rollback contract for closure-created credits.
+		// proves the rollback un-issues the credit synthesized for the
+		// settlement — the rollback contract for settlement credits.
 		//
 		// Each case violates exactly one invariant so no check masks another.
 		// Excess debt.
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, 3, |snapshot| Ok(Some(settlement(
-				PUSD,
-				snapshot.debt + 1,
-				0
-			)))),
+			redeem_step(DOT, PUSD, 1, 3, snapshot.debt + 1, 0),
 			crate::Error::<Test>::InvalidRedemptionSettlement
 		);
 		// Excess collateral, with valid nonzero payment.
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, 3, |snapshot| Ok(Some(settlement(
-				PUSD,
-				1,
-				snapshot.collateral + 1
-			)))),
+			redeem_step(DOT, PUSD, 1, 3, 1, snapshot.collateral + 1),
 			crate::Error::<Test>::InvalidRedemptionSettlement
 		);
-		// Zero payment cannot release collateral; `Ok(None)` is the touch-only form.
+		// Zero payment cannot release collateral.
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, 3, |_| Ok(Some(settlement(PUSD, 0, 1)))),
+			redeem_step(DOT, PUSD, 1, 3, 0, 1),
 			crate::Error::<Test>::InvalidRedemptionSettlement
 		);
 		// A payment in another market's coin cannot settle this market's debt.
-		assert_noop!(
-			redeem_step(DOT, PUSD, 1, 3, |_| Ok(Some(settlement(USDX, 100, 0)))),
-			crate::Error::<Test>::InvalidRedemptionSettlement
-		);
+		{
+			use frame::deps::frame_support::storage::{with_transaction, TransactionOutcome};
+			assert_noop!(
+				with_transaction(|| {
+					let result = <crate::Pallet<Test> as VaultInterface>::redeem_step(
+						&DOT,
+						&PUSD,
+						&1,
+						&3,
+						settlement(USDX, 100, 0),
+					);
+					match result {
+						Ok(()) => TransactionOutcome::Commit(Ok(())),
+						Err(error) => TransactionOutcome::Rollback(Err(error)),
+					}
+				}),
+				crate::Error::<Test>::InvalidRedemptionSettlement
+			);
+		}
 
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap(), vault_pre);
 		assert_eq!(held(DOT, 1), held_pre);
-	});
-}
-
-// `Ok(None)` from the pricing closure is the skip signal: the step applies
-// nothing, but the touch it caused is committed rather than rolled back.
-#[test]
-fn redeem_step_skip_persists_touch_without_redeeming() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(60, 100)));
-		advance_time(pusd_primitives::MILLIS_PER_YEAR);
-		let now = pallet_timestamp::Pallet::<Test>::get();
-
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		let held_pre = held(DOT, 1);
-		assert_ok!(redeem_step(DOT, PUSD, 1, 3, |_| Ok(None)));
-
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		// No debt cancelled, no collateral moved — but the year of pending
-		// interest was folded into the row and the interest clock advanced.
-		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
-		// Exactly one year at 50% on 500 principal.
-		assert_eq!(v_post.debt.interest, v_pre.debt.interest + 250);
-		assert_eq!(held(DOT, 1), held_pre);
-		assert_eq!(v_post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
-		assert!(vault_status(DOT, PUSD, 1).is_active());
-	});
-}
-
-#[test]
-fn redeem_step_returns_the_builders_outcome() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-
-		let outcome =
-			<crate::Pallet<Test> as VaultInterface>::redeem_step(&DOT, &PUSD, &1, &3, |snapshot| {
-				Ok((None, snapshot.debt))
-			})
-			.expect("touch-only redemption step succeeds");
-
-		assert_eq!(outcome, Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total());
 	});
 }
 
@@ -264,18 +220,25 @@ fn redeem_step_burns_exactly_the_debt_payment() {
 		let recipient_coll_pre = collateral_balance(DOT, 3);
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 
-		assert_ok!(redeem_step(DOT, PUSD, 1, 3, |snapshot| {
-			assert!(snapshot.debt >= 300);
-			let debt_payment = <VaultStableAssets as Balanced<AccountId>>::withdraw(
-				PUSD,
-				&3,
-				300,
-				Precision::Exact,
-				Preservation::Expendable,
-				Fortitude::Polite,
-			)?;
-			Ok(Some(RedemptionSettlement { debt_payment, collateral_to_recipient: 30 }))
-		}));
+		let snapshot =
+			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
+		assert!(snapshot.debt >= 300);
+		let debt_payment = <VaultStableAssets as Balanced<AccountId>>::withdraw(
+			PUSD,
+			&3,
+			300,
+			Precision::Exact,
+			Preservation::Expendable,
+			Fortitude::Polite,
+		)
+		.expect("withdraw payment");
+		assert_ok!(<crate::Pallet<Test> as VaultInterface>::redeem_step(
+			&DOT,
+			&PUSD,
+			&1,
+			&3,
+			RedemptionSettlement { debt_payment, collateral_to_recipient: 30 }
+		));
 
 		assert_eq!(total_stable(PUSD), issuance_pre - 300);
 		assert_eq!(stable_balance(PUSD, 3), redeemer_pre - 300);

@@ -609,11 +609,6 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 			self.total_collateral.is_zero()
 	}
 
-	/// Adds bad debt to the market.
-	pub fn record_bad_debt(&mut self, amount: Balance) {
-		self.debt.bad_debt = self.debt.bad_debt.saturating_add(amount);
-	}
-
 	/// Removes bad debt from the market.
 	///
 	/// The subtraction saturates at zero.
