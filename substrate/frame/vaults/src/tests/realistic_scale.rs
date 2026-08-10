@@ -223,15 +223,11 @@ fn redemption_reverts_on_sub_ed_recipient_leg() {
 
 		assert_eq!(collateral_balance(XBT, 997), 0, "recipient is fresh");
 		assert_noop!(
-			redeem_step(XBT, USDX, 1, 997, |_| Ok(Some(settlement(USDX, 100 * USD, XBT_ED - 1)))),
+			redeem_step(XBT, USDX, 1, 997, 100 * USD, XBT_ED - 1),
 			TokenError::CannotCreate
 		);
 
-		assert_ok!(redeem_step(XBT, USDX, 1, 997, |_| Ok(Some(settlement(
-			USDX,
-			100 * USD,
-			XBT_ED
-		)))));
+		assert_ok!(redeem_step(XBT, USDX, 1, 997, 100 * USD, XBT_ED));
 		assert_eq!(collateral_balance(XBT, 997), XBT_ED, "ED-sized recipient leg paid");
 	});
 }

@@ -1,6 +1,6 @@
 //! Vault index, status, and removal transitions.
 
-use super::{CloseOutcome, ResidualSettlement, VaultOp};
+use super::{CloseOutcome, VaultOp};
 use crate::{
 	pallet::{BalanceOf, Config, Error, Event, Pallet},
 	recovery,
@@ -229,33 +229,6 @@ impl<T: Config> VaultOp<T> {
 		};
 		self.remove_on_commit = true;
 		Ok(CloseOutcome { collateral, branch_empties, orphan_debt })
-	}
-
-	/// Removes a final-recovery vault and moves its remaining debt to bad debt.
-	pub(crate) fn settle_recovery_residual(
-		&mut self,
-	) -> Result<ResidualSettlement<BalanceOf<T>>, DispatchError> {
-		ensure!(self.status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
-		let residual_debt = self.vault.debt.total();
-		let collateral_dust = self.vault.collateral;
-		self.remove_from_lifecycle()?;
-		self.ctx.branch.state.replace_vault(Some(&self.vault), None)?;
-		self.ctx.branch.state.record_bad_debt(residual_debt);
-		let total_collateral = self
-			.ctx
-			.branch
-			.state
-			.total_collateral
-			.checked_sub(&collateral_dust)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		self.ctx.branch.state.total_collateral = total_collateral;
-		let swept_orphan_debt = if self.ctx.branch.state.is_empty_of_liability() {
-			self.ctx.branch.state.sweep_orphan_debt()
-		} else {
-			BalanceOf::<T>::zero()
-		};
-		self.remove_on_commit = true;
-		Ok(ResidualSettlement { residual_debt, collateral_dust, swept_orphan_debt })
 	}
 
 	fn set_status(&mut self, new_status: VaultStatus) -> DispatchResult {

@@ -456,35 +456,39 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 	});
 }
 
-// `settle_recovery_residual` removes the row, so `VaultClosed` is its
-// owner-naming record; the residual lands on the bad-debt ledger.
+// Fully draining a `FinalRecovery` vault through `redeem_step` leaves a
+// Dormant husk — FIFO slot freed, dust collateral still held for the owner —
+// and records no bad debt: the Insurance Fund cover arrives merged into the
+// settlement payment, so nothing transits the bad-debt ledger.
 #[test]
-fn settle_recovery_residual_records_bad_debt_and_emits_vault_closed() {
+fn full_recovery_settlement_leaves_dormant_husk_without_bad_debt() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		enter_recovery(1, rate_pct(5, 100));
 
-		let residual =
-			<crate::Pallet<Test> as VaultInterface>::settle_recovery_residual(&DOT, &PUSD, &1)
-				.expect("settles");
-		assert!(residual > 0);
-		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
-		assert!(branch_state(DOT, PUSD).unwrap().debt.bad_debt >= residual);
+		let bad_debt_pre = branch_state(DOT, PUSD).unwrap().debt.bad_debt;
+		let snapshot =
+			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
+		assert_eq!(snapshot.collateral, 1_000, "entered recovery untouched");
+		// Pay the full debt in one settlement (upstream this is the redeemer's
+		// market payment merged with the Insurance Fund cover); the recipient
+		// takes all but a dust remainder of the collateral.
+		let dust = 3;
+		assert_ok!(redeem_step(DOT, PUSD, 1, 7, snapshot.debt, snapshot.collateral - dust));
 
-		// Settlement must name the owner (VaultClosed) and record the residual.
-		// The vault entered recovery untouched, so its full 1_000 collateral is
-		// released as dust.
-		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultClosed {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			recipient: 1,
-			collateral: 1_000,
-		}));
-		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtRecorded {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			amount: residual,
-		}));
+		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept");
+		assert_eq!(vault.debt.total(), 0);
+		assert_eq!(vault.collateral, dust);
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert_eq!(
+			crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10),
+			alloc::vec![] as alloc::vec::Vec<AccountId>
+		);
+		assert_eq!(held(DOT, 1), dust, "dust stays held until the owner closes the husk");
+		assert_eq!(
+			branch_state(DOT, PUSD).unwrap().debt.bad_debt,
+			bad_debt_pre,
+			"full settlement records no bad debt"
+		);
 	});
 }

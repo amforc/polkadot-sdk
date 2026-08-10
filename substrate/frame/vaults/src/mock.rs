@@ -667,29 +667,40 @@ pub fn redeem_from(
 	amount: Balance,
 ) -> DispatchResult {
 	let price = MockPrices::get().get(&collateral).copied().expect("price set");
-	redeem_step(collateral, stable, owner, recipient, |snapshot| {
-		let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
-		let collateral_to_recipient =
-			(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
-		Ok(Some(settlement(stable, debt_to_cancel, collateral_to_recipient)))
-	})
+	let snapshot =
+		<Vaults as VaultInterface>::project_redemption_snapshot(&collateral, &stable, &owner)?;
+	let debt_to_cancel = core::cmp::min(amount, snapshot.debt);
+	let collateral_to_recipient =
+		(FixedU128::saturating_from_integer(debt_to_cancel) / price).saturating_mul_int(1u128);
+	redeem_step(collateral, stable, owner, recipient, debt_to_cancel, collateral_to_recipient)
 }
 
-/// Runs one redemption step against a chosen vault.
+/// Runs one redemption step against a chosen vault, paying with newly issued
+/// stable assets.
+///
+/// The credit is issued and consumed inside one transaction layer, so a
+/// rejected settlement rolls the issuance back with the step.
 pub fn redeem_step(
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
 	recipient: AccountId,
-	build_settlement: impl FnOnce(
-		pusd_primitives::RedemptionStepSnapshot<Balance>,
-	) -> Result<
-		Option<RedemptionSettlement<StableCreditOf<Test>, Balance>>,
-		DispatchError,
-	>,
+	debt_to_cancel: Balance,
+	collateral_to_recipient: Balance,
 ) -> DispatchResult {
-	<Vaults as VaultInterface>::redeem_step(&collateral, &stable, &owner, &recipient, |snapshot| {
-		build_settlement(snapshot).map(|settlement| (settlement, ()))
+	use frame::deps::frame_support::storage::{with_transaction, TransactionOutcome};
+	with_transaction(|| {
+		let result = <Vaults as VaultInterface>::redeem_step(
+			&collateral,
+			&stable,
+			&owner,
+			&recipient,
+			settlement(stable, debt_to_cancel, collateral_to_recipient),
+		);
+		match result {
+			Ok(()) => TransactionOutcome::Commit(Ok(())),
+			Err(error) => TransactionOutcome::Rollback(Err(error)),
+		}
 	})
 }
 

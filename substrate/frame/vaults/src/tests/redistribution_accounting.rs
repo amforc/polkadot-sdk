@@ -377,7 +377,7 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 		// Reduce vault 2 to a small dust principal (well under MinimumDebt=200)
 		// via a redemption cancel so the vault becomes Dormant with non-zero
 		// residual debt.
-		assert_ok!(redeem_step(DOT, PUSD, 2, 99, |_| Ok(Some(settlement(PUSD, 450, 9_000)))));
+		assert_ok!(redeem_step(DOT, PUSD, 2, 99, 450, 9_000));
 		assert!(crate::Pallet::<Test>::vault_status(DOT, PUSD, 2).unwrap().is_dormant());
 
 		// Advance time so that simple interest at 50% APR pushes the residual
