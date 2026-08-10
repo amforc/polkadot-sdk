@@ -885,7 +885,23 @@ fn insurance_adjusted_settlement_with_partial_fund() {
 
 		assert_ok!(redeem(3, DOT, PUSD, market_cancel, 0, 4, 0));
 
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		// Full settlement leaves a debt-free Dormant husk keeping the flooring
+		// dust; the cover was paid inside the same settlement.
+		let husk = pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept");
+		assert_eq!(husk.debt.total(), 0);
+		assert_eq!(husk.collateral, 3);
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		System::assert_has_event(RuntimeEvent::Redemptions(Event::RecoveryRedemptionExecuted {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			redeemer: 3,
+			recipient: 4,
+			vault_owner: 1,
+			stable_burned: market_cancel,
+			insurance_cover: 50,
+			collateral_out: 997,
+			regime: RecoveryRegime::InsuranceAdjusted,
+		}));
 		// D = 501 against C = 400 pUSD (1_000 units at 0.40) with IF = 50: the
 		// fund covers 50, leaving market debt 451 at recovery rate 400/451. The
 		// fixed-point rate truncates just below the true ratio, so cancelling
@@ -1182,9 +1198,11 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		let redeemer_before_1 = Assets::balance(PUSD, 3);
 		let recipient_before_1 = collateral_balance(DOT, 4);
 
-		// First transaction settles only the FIFO head (vault 1).
+		// First transaction settles only the FIFO head (vault 1), leaving it a
+		// debt-free Dormant husk out of the FIFO.
 		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none(), "head settled");
+		assert_eq!(vault_debt(DOT, PUSD, 1), 0, "head settled");
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "head 1 drained the fund");
 		// Head-only: vault 2 is untouched and becomes the new FIFO head.
@@ -1205,9 +1223,8 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		// recovery rate falls to C/D, so the redeemer covers the entire debt and
 		// pUSD holders absorb the shortfall.
 		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
-		// With the fund empty there is no insurance residual to burn, so the debt
-		// is fully cancelled by the redeemer and the vault drops to zero debt (and
-		// leaves the FIFO) rather than being settled-and-removed like vault 1.
+		// With the fund empty there is no cover to merge, so the redeemer alone
+		// cancels the debt — the vault ends in the same husk state as vault 1.
 		assert_eq!(vault_debt(DOT, PUSD, 2), 0, "second head fully settled");
 		assert!(Vaults::final_recovery_queue(DOT, PUSD, 10).is_empty(), "FIFO drained");
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
@@ -1219,7 +1236,8 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before_2, 990);
 
 		// Conservation: issuance falls by both vaults' full debt and no more
-		// (redeemer burns + the atomic Insurance-Fund burn for vault 1).
+		// (the redeemer's burns plus vault 1's Insurance-Fund cover, merged
+		// into its settlement).
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), debt1 + debt2);
 	});
 }
@@ -1254,16 +1272,14 @@ fn insurance_adjusted_recovery_burns_fund_only_when_market_debt_exhausted() {
 		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 200);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 442);
 
-		// Second transaction finishes the market portion; only now does the atomic
-		// Insurance-Fund burn fire, covering the residual and removing the vault.
+		// Second transaction finishes the market portion; only now is the fund's
+		// cover withdrawn and merged into the settlement, cancelling the whole
+		// remaining debt and leaving a debt-free Dormant husk.
 		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none(), "vault settled");
+		assert_eq!(vault_debt(DOT, PUSD, 1), 0, "vault settled");
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
-		assert_eq!(
-			Assets::balance(PUSD, insurance_account(PUSD)),
-			0,
-			"residual burned on completion"
-		);
+		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "cover burned on completion");
 		// Conservation: the full vault debt leaves issuance across the two txs.
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), debt_before);
 	});
@@ -1948,7 +1964,9 @@ fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_not_coins() {
 
 		assert_ok!(redeem(3, DOT, USDX, market_cancel, 0, 4, 0));
 
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, USDX, 1)).is_none(), "vault settled");
+		let husk = pallet_vaults::Vaults::<Test>::get((DOT, USDX, 1)).expect("husk kept");
+		assert_eq!(husk.debt.total(), 0, "vault settled");
+		assert_eq!(husk.collateral, 3, "raw-unit dust stays with the husk");
 		// 400e6/450_479_124 yields value floor(market_cancel · rate) =
 		// 400·USDX_UNIT − 1, then collateral floor((400·USDX_UNIT − 1)/0.40) =
 		// 999_999_997 of the 1_000·USDX_UNIT held — a 3-raw-unit rounding loss.
@@ -2161,8 +2179,8 @@ fn example_3_final_recovery_redemption_above_par() {
 }
 
 /// Numeric example 4: a `FinalRecovery` head below par, where partial Insurance
-/// Fund cover raises the rate the market redeems at, and the fund burns the
-/// residual once the market side is exhausted.
+/// Fund cover raises the rate the market redeems at, and the fund's cover is
+/// merged into the final settlement once the market side is exhausted.
 #[test]
 fn example_4_final_recovery_redemption_below_par_with_insurance_cover() {
 	build_and_execute(|| {
@@ -2191,11 +2209,12 @@ fn example_4_final_recovery_redemption_below_par_with_insurance_cover() {
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 
 		// Settling the rest of the market side pays out the whole 4_000 DOT and
-		// leaves the fund to burn its 1_000 of cover against the residual.
+		// merges the fund's 1_000 of cover into the same settlement.
 		let if_before = Assets::balance(PUSD, insurance_account(PUSD));
 		assert_ok!(redeem(3, DOT, PUSD, 6_000 * UNIT, 0, 4, 0));
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 4_000 * UNIT);
 		assert_eq!(if_before - Assets::balance(PUSD, insurance_account(PUSD)), 1_000 * UNIT);
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert_eq!(vault_debt(DOT, PUSD, 1), 0, "vault fully settled");
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
 	});
 }
