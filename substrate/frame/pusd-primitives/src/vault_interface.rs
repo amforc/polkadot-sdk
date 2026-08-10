@@ -4,19 +4,18 @@
 use crate::{DebtCollateral, VaultStatus};
 use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill};
 
-/// Settlement produced by the redemption orchestrator and consumed by
-/// [`VaultInterface::redeem_step`]. Owning `debt_payment` ties the burn to the
-/// cancellation by construction: the vault pallet cannot cancel ledger debt
-/// without consuming the matching coin, and the orchestrator cannot misreport
-/// the amount it paid.
-#[must_use = "the settlement must be returned to VaultInterface::redeem_step"]
+/// Settlement consumed by [`VaultInterface::redeem_step`]. Owning
+/// `debt_payment` ties the burn to the cancellation by construction: the vault
+/// pallet cannot cancel ledger debt without consuming the matching coin, and
+/// the orchestrator cannot misreport the amount it paid.
+#[must_use = "dropping the settlement burns the payment without cancelling any debt"]
 pub struct RedemptionSettlement<Credit, Balance> {
 	pub debt_payment: Credit,
 	pub collateral_to_recipient: Balance,
 }
 
 /// Fully-accrued, post-touch snapshot of a redemption target. These are the
-/// numbers the orchestrator sizes and prices the step against; `status`
+/// numbers the orchestrator sizes and prices a step against; `status`
 /// selects the pricing rules: `Active` and `Dormant` redeem at face value,
 /// `FinalRecovery` by recovery-settlement rules.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,15 +40,17 @@ impl<Balance: Copy> RedemptionStepSnapshot<Balance> {
 /// The vault-side API used by external redemption and bad-debt flows. Reads
 /// are authoritative current state; writes re-shape the priority queue.
 ///
-/// The settlement builder makes each redemption step atomic: the caller sizes its
-/// settlement against a post-touch snapshot inside the same
-/// call that applies it, and returning `Err` (or producing an invalid one)
-/// rolls the whole step back, so a rejected step never leaves partial state.
+/// A redemption step is sized in two phases: the caller prices against
+/// [`Self::project_redemption_snapshot`], then applies via
+/// [`Self::redeem_step`]. Both run the same touch kernel at the same
+/// timestamp, so within one dispatch the projection equals the state the step
+/// settles against; [`Self::redeem_step`] still re-validates the settlement
+/// against its own post-touch values and fails closed on any divergence.
 ///
-/// Bad debt is only ever *recorded* inside the vault pallet (recovery
-/// settlement and orphan-debt sweeps); [`Self::heal`] carries the inverse
-/// side: the orchestrator withdraws cover from the Insurance Fund as a credit
-/// and hands it here to be burned against the recorded amount.
+/// Bad debt is only ever *recorded* inside the vault pallet (the branch-empty
+/// sweep); [`Self::heal`] carries the inverse side: an orchestrator withdraws
+/// cover from the Insurance Fund as a credit and hands it here to be burned
+/// against the recorded amount.
 pub trait VaultInterface {
 	type CollateralId;
 	type StableId;
@@ -82,44 +83,32 @@ pub trait VaultInterface {
 		stable_id: &Self::StableId,
 	) -> impl Iterator<Item = Self::AccountId>;
 
-	/// Project the fully-accrued values that [`Self::redeem_step`] would hand
-	/// to its settlement builder, without touching storage or moving assets.
+	/// Project the fully-accrued values [`Self::redeem_step`] would settle
+	/// against, without touching storage or moving assets.
 	fn project_redemption_snapshot(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,
 		owner: &Self::AccountId,
 	) -> Result<RedemptionStepSnapshot<Self::Balance>, DispatchError>;
 
-	/// One redemption step against `owner`'s vault: touch it, hand the caller a
-	/// fully-accrued snapshot, and apply the returned settlement atomically —
-	/// cancel exactly the debt `debt_payment` covers,
-	/// burn the payment, and pay `collateral_to_recipient` to `recipient`.
-	/// A `None` settlement skips the target but persists the touch, so build the
-	/// payment only on the settlement path. The tuple's `Outcome` is returned
-	/// unchanged after commit, letting the caller carry loop or pricing state
-	/// without a mutable side channel. Charging the redemption fee stays with
-	/// the caller.
-	fn redeem_step<Outcome>(
+	/// One redemption step against `owner`'s vault, applied atomically: touch
+	/// it, cancel exactly the debt `settlement.debt_payment` covers, burn the
+	/// payment, and pay `settlement.collateral_to_recipient` to `recipient`.
+	/// The settlement is validated against the post-touch state (payment in
+	/// the market's coin, nonzero, at most the accrued debt; collateral at
+	/// most what is held) and the step rolls back wholly on any error.
+	/// Charging the redemption fee stays with the caller.
+	///
+	/// An error consumes `settlement.debt_payment` inside the rolled-back
+	/// step, so callers MUST propagate the error and abort the dispatch —
+	/// swallowing it would strand the payment's issuance accounting.
+	fn redeem_step(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,
 		owner: &Self::AccountId,
 		recipient: &Self::AccountId,
-		build_settlement: impl FnOnce(
-			RedemptionStepSnapshot<Self::Balance>,
-		) -> Result<
-			(Option<RedemptionSettlement<Self::StableCredit, Self::Balance>>, Outcome),
-			DispatchError,
-		>,
-	) -> Result<Outcome, DispatchError>;
-
-	/// Move a `FinalRecovery` vault's fully-accrued residual debt off the row
-	/// and into the branch bad-debt ledger, returning the amount. The caller
-	/// settles it (Insurance Fund burn) atomically.
-	fn settle_recovery_residual(
-		collateral_id: &Self::CollateralId,
-		stable_id: &Self::StableId,
-		owner: &Self::AccountId,
-	) -> Result<Self::Balance, DispatchError>;
+		settlement: RedemptionSettlement<Self::StableCredit, Self::Balance>,
+	) -> Result<(), DispatchError>;
 
 	/// Total debt issued in `stable_id` across every one of its collateral
 	/// markets, the denominator of the dynamic redemption fee's redeemed
@@ -132,6 +121,11 @@ pub trait VaultInterface {
 	/// Burn up to the recorded bad debt of the market named by
 	/// `collateral_id` and the credit's own asset, returning the unconsumed
 	/// surplus (zero when the credit was fully used).
+	///
+	/// Bad debt originates only in the branch-empty sweep (ownerless debt,
+	/// unattributed interest, unclaimable redistribution) and persists until
+	/// healed; below-par recovery settlement pays its Insurance-Fund cover
+	/// directly through [`Self::redeem_step`] and records none.
 	#[must_use = "dropping the surplus burns it"]
 	fn heal(collateral_id: &Self::CollateralId, credit: Self::StableCredit) -> Self::StableCredit;
 }

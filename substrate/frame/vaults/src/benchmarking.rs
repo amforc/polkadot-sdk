@@ -561,25 +561,21 @@ mod benchmarks {
 		// intact, collateral still held, out of the rate index — which is the
 		// state this extrinsic acts on.
 		let recipient: T::AccountId = whitelisted_caller();
+		let snapshot = <Pallet<T> as VaultInterface>::project_redemption_snapshot(
+			&asset,
+			&stable::<T>(),
+			&caller,
+		)?;
+		let debt_payment = <T::StableAssets as FungiblesBalanced<T::AccountId>>::issue(
+			stable::<T>(),
+			snapshot.debt,
+		);
 		<Pallet<T> as VaultInterface>::redeem_step(
 			&asset,
 			&stable::<T>(),
 			&caller,
 			&recipient,
-			|snapshot| {
-				// Freshly issued inside the closure per the credit contract.
-				let debt_payment = <T::StableAssets as FungiblesBalanced<T::AccountId>>::issue(
-					stable::<T>(),
-					snapshot.debt,
-				);
-				Ok((
-					Some(RedemptionSettlement {
-						debt_payment,
-						collateral_to_recipient: BalanceOf::<T>::zero(),
-					}),
-					(),
-				))
-			},
+			RedemptionSettlement { debt_payment, collateral_to_recipient: BalanceOf::<T>::zero() },
 		)?;
 
 		#[extrinsic_call]
@@ -696,25 +692,21 @@ mod benchmarks {
 		// Dormant vault outside the rate index.
 		let remaining = balance::<T>(199);
 		let recipient: T::AccountId = whitelisted_caller();
+		let snapshot = <Pallet<T> as VaultInterface>::project_redemption_snapshot(
+			&asset,
+			&stable::<T>(),
+			&owner,
+		)?;
+		let debt_payment = <T::StableAssets as FungiblesBalanced<T::AccountId>>::issue(
+			stable::<T>(),
+			snapshot.debt.saturating_sub(remaining),
+		);
 		<Pallet<T> as VaultInterface>::redeem_step(
 			&asset,
 			&stable::<T>(),
 			&owner,
 			&recipient,
-			|snapshot| {
-				// Freshly issued inside the closure per the credit contract.
-				let debt_payment = <T::StableAssets as FungiblesBalanced<T::AccountId>>::issue(
-					stable::<T>(),
-					snapshot.debt.saturating_sub(remaining),
-				);
-				Ok((
-					Some(RedemptionSettlement {
-						debt_payment,
-						collateral_to_recipient: BalanceOf::<T>::zero(),
-					}),
-					(),
-				))
-			},
+			RedemptionSettlement { debt_payment, collateral_to_recipient: BalanceOf::<T>::zero() },
 		)?;
 		assert_eq!(
 			Pallet::<T>::vault_status(asset.clone(), stable::<T>(), owner.clone()),
