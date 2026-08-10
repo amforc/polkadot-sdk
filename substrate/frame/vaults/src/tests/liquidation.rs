@@ -133,6 +133,39 @@ fn full_redistribution_with_surplus() {
 	});
 }
 
+// Unlike the tests above, which sit between par and the penalty band, this vault is genuinely
+// under water: its collateral is worth less than its debt, and the recipients — not the
+// protocol — absorb the shortfall.
+#[test]
+fn redistribution_with_collateral_below_debt() {
+	build_and_execute(|| {
+		setup_underwater_vault();
+		// 600 * 0.7 = 420 of value against 500 of debt: CR 0.84.
+		set_price(DOT, FixedU128::from_rational(7, 10));
+
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
+
+		// The 10%-penalty ask ceil(550/0.7) = 786 dwarfs the 600 held, so the
+		// owner keeps nothing and the keeper takes the flat ceil(100/0.7) = 143
+		// (floor(0.1% * 600) adds nothing).
+		assert_eq!(Balances::free_balance(1), GENESIS_BALANCE - 600);
+		assert_eq!(Balances::free_balance(KEEPER), GENESIS_BALANCE + 143);
+		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 457], 143, 0));
+
+		// The recipient inherits 500 of debt against 457 of collateral worth
+		// only floor(457 * 0.7) = 319; both shares divide the 2_000 stake
+		// exactly, and no bad debt is recorded — vault 2's CR carries the loss.
+		// Its own debt is 501: 500 of principal plus the 1 upfront fee its
+		// 0.2% rate paid at open.
+		assert_ok!(Vaults::poke(RuntimeOrigin::signed(KEEPER), DOT, PUSD, 2));
+		let vault = crate::Vaults::<Test>::get((DOT, PUSD, 2)).expect("recipient remains");
+		assert_eq!(vault.debt.total(), 501 + 500);
+		assert_eq!(vault.collateral, 2_457);
+		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 0);
+		assert_eq!(branch_state(DOT, PUSD).expect("branch state").debt.bad_debt, 0);
+	});
+}
+
 // Liquidation must settle current debt so accrued interest cannot escape the waterfall.
 #[test]
 fn debt_includes_accrued_interest() {
@@ -306,10 +339,25 @@ fn remainder_follows_last_offset() {
 fn jit_below_minimum_rejected() {
 	build_and_execute(|| {
 		setup_underwater_vault();
-		mint_stable(PUSD, KEEPER, 50);
+		mint_stable(PUSD, KEEPER, 500);
 
 		// A 50-unit allowance sits below the 100-unit `minimum_jit_contribution`.
+		// The keeper is fully funded, so the allowance alone triggers the reject.
 		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 50, 0), Error::<Test>::JitBelowMinimum);
+	});
+}
+
+// A keeper must not bypass the market minimum by underfunding a large allowance either.
+#[test]
+fn jit_underfunded_below_minimum_rejected() {
+	build_and_execute(|| {
+		setup_underwater_vault();
+		mint_stable(PUSD, KEEPER, 50);
+
+		// The 1_000 allowance clears the minimum, but the keeper's 50 of
+		// funding would clamp the contribution below it — the funding shortfall
+		// is keeper-side, so it rejects like a small allowance.
+		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 1_000, 0), Error::<Test>::JitBelowMinimum);
 	});
 }
 
@@ -335,25 +383,31 @@ fn jit_executes_at_minimum_funding() {
 	});
 }
 
-// Residual debt below the minimum must not block liquidation when the keeper did not select that
-// amount.
+// A system ask below the market minimum must still execute: the keeper's allowance and funding
+// clear the minimum, and the small residual is the waterfall's choice, not the keeper's.
 #[test]
-fn jit_skipped_below_minimum_ask() {
+fn jit_executes_below_minimum_ask() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(450);
 		mint_stable(PUSD, KEEPER, 500);
-		let keeper_stable_before = stable_balance(PUSD, KEEPER);
 
 		// The active pool leaves only 50 debt, below the market's 100-unit
-		// minimum JIT contribution. The keeper is willing and funded, but the
-		// system ask itself is dust, so JIT is skipped and liquidation proceeds.
-		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 500, 1_000));
+		// minimum JIT contribution — the JIT burns it anyway.
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 500, 0));
 
-		assert_eq!(ActiveSpCapacity::get(), 0, "the active leg settled");
-		assert_eq!(stable_balance(PUSD, KEEPER), keeper_stable_before, "no dust JIT burn");
-		assert!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)) > 0);
+		// Seizure prices the whole 500 of offset debt at 5%: ceil(525/0.9) =
+		// 584 leaves the owner 16. Of the 472 after the keeper, the path
+		// weights 473 : 53 (450 + ceil(22.5) and 50 + ceil(2.5)) give active
+		// floor(472 * 473/526) = 424 and JIT floor(472 * 53/526) = 47 plus the
+		// 1 the flooring leaves.
+		assert_eq!(ActiveSpCapacity::get(), 0);
+		assert_eq!(stable_balance(PUSD, KEEPER), 500 - 50, "the dust residual burned");
+		assert_eq!(Balances::free_balance(KEEPER), GENESIS_BALANCE + 112 + 48);
+		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 0);
 		assert!(crate::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+
+		assert_liquidated_event(outcome([450, 50, 0, 0], [424, 48, 0, 0], 112, 16));
 	});
 }
 
@@ -381,15 +435,21 @@ fn jit_executes_at_minimum_ask() {
 	});
 }
 
-// The slippage floor must protect the keeper from a collateral amount below the accepted amount.
+// The slippage floor must protect the keeper's trade without blocking the liquidation: an
+// unmet floor skips the JIT contribution and the waterfall proceeds.
 #[test]
-fn slippage_above_share_rejected() {
+fn slippage_above_share_skips_jit() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(PUSD, KEEPER, 200);
 
-		// One above the 189 the trade would pay.
-		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 200, 190), Error::<Test>::JitSlippageExceeded);
+		// One above the 189 the trade would pay: the trade is dropped, no
+		// stablecoin burns, and the standard full redistribution follows.
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 200, 190));
+
+		assert_eq!(stable_balance(PUSD, KEEPER), 200, "no JIT burn under the floor");
+		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 488);
+		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 488], 112, 0));
 	});
 }
 
@@ -408,23 +468,33 @@ fn slippage_at_share_accepted() {
 	});
 }
 
-// A late JIT slippage failure must roll back an earlier pool settlement to keep liquidation atomic.
+// Dropping a JIT trade for slippage must keep the pool settlement: only the keeper's leg falls
+// out of the plan, and its debt moves down the waterfall.
 #[test]
-fn slippage_failure_rolls_back_pool_settlement() {
+fn slippage_skip_preserves_pool_settlement() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(300);
 		mint_stable(PUSD, KEEPER, 500);
 
-		// The same split as `jit_burns_after_active_pool`: the JIT carries
-		// 189 of collateral, so a 190 floor fails after the pool settlement.
-		assert_noop!(
-			liquidate(KEEPER, DOT, PUSD, 1, 1_000, 190),
-			Error::<Test>::JitSlippageExceeded
-		);
-		assert_eq!(Balances::free_balance(SP_ACCOUNT), GENESIS_BALANCE);
-		assert_eq!(Balances::free_balance(KEEPER), GENESIS_BALANCE);
-		assert!(crate::Vaults::<Test>::get((DOT, PUSD, 1)).is_some());
+		// The same split as `jit_burns_after_active_pool` would pay the JIT
+		// 189 of collateral, so a 190 floor drops the trade and its 200 debt
+		// redistributes instead.
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 1_000, 190));
+
+		// The re-plan weighs 315 : 220 (300 at 1.05 and 200 at 1.10), so 535 of
+		// value seizes ceil(535/0.9) = 595 and leaves the owner 5. Of the 483
+		// left after the keeper, active takes floor(483 * 315/535) = 284 and
+		// redistribution floor(483 * 220/535) = 198 plus the 1 the flooring
+		// leaves.
+		assert_eq!(ActiveSpCapacity::get(), 0, "the active leg settled");
+		assert_eq!(Balances::free_balance(SP_ACCOUNT), GENESIS_BALANCE + 284);
+		assert_eq!(stable_balance(PUSD, KEEPER), 500, "no JIT burn under the floor");
+		assert_eq!(Balances::free_balance(KEEPER), GENESIS_BALANCE + 112);
+		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 199);
+		assert!(crate::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+
+		assert_liquidated_event(outcome([300, 0, 0, 200], [284, 0, 0, 199], 112, 5));
 	});
 }
 
@@ -495,6 +565,46 @@ fn safety_mode_allows_liquidation() {
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 488], 112, 0));
+	});
+}
+
+// A branch whose every vault is under water must still clear its riskiest vault: liquidation
+// works when the recipients are themselves below par.
+#[test]
+fn branch_below_par_still_liquidates() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, liquidation_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 600, 500, FixedU128::from_rational(1, 1_000)));
+		assert_ok!(open(2, DOT, PUSD, 600, 500, FixedU128::from_rational(2, 1_000)));
+		// Both vaults sit at CR 600 * 0.8 / 500 = 0.96, so branch TCR is 0.96.
+		set_price(DOT, FixedU128::from_rational(4, 5));
+
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
+
+		// The 10%-penalty ask ceil(550/0.8) = 688 exceeds the vault's collateral:
+		// the whole 600 is seized, the keeper takes ceil(100/0.8) = 125, and the
+		// remaining 475 follows the 500 of redistributed debt.
+		assert!(crate::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 475], 125, 0));
+
+		// Over vault 2's 600 stake the per-stake fixed-point floors once each
+		// way: it inherits floor(500/600 * 600) = 499 of debt (1 goes to
+		// ownerless debt) and floor(475/600 * 600) = 474 of collateral (1 stays
+		// with the redistribution account). Its own debt is 501: 500 of
+		// principal plus the 1 upfront fee its 0.2% rate paid at open.
+		assert_ok!(Vaults::poke(RuntimeOrigin::signed(KEEPER), DOT, PUSD, 2));
+		let vault = crate::Vaults::<Test>::get((DOT, PUSD, 2)).expect("recipient remains");
+		assert_eq!(vault.debt.total(), 501 + 499);
+		assert_eq!(vault.collateral, 600 + 474);
+		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 1);
+		assert_eq!(branch_state(DOT, PUSD).expect("branch state").ownerless_debt, 1);
+
+		// Vault 2 is now deeper under water, but as the last stake-bearer it
+		// takes the final-recovery path, not another liquidation.
+		assert_noop!(
+			liquidate(KEEPER, DOT, PUSD, 2, 0, 0),
+			Error::<Test>::LastVaultCannotBeLiquidated
+		);
 	});
 }
 
