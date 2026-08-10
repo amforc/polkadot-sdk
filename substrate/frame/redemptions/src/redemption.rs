@@ -7,7 +7,6 @@ use crate::{
 		RedemptionConfigs, RedemptionQuoteOf, RedemptionStates, SnapshotOf, StableCreditOf,
 		StableIdOf,
 	},
-	recovery::RecoveryPlan,
 	types::{RedemptionState, RedemptionTerms},
 };
 use frame::{
@@ -129,32 +128,76 @@ impl<T: Config> Pallet<T> {
 		Self::redeem_ordinary(&context, &inputs.config, first_target, terms, max_steps)
 	}
 
+	/// Settle the `FinalRecovery` FIFO head in one step. The redeemer funds the
+	/// externally-cancellable debt; when that cancels in full, the Insurance
+	/// Fund cover is withdrawn and merged into the same payment, so the whole
+	/// vault debt is cancelled by one settlement.
 	fn redeem_recovery(
 		context: &WalkContext<'_, T>,
 		config: &RedemptionConfigOf<T>,
 		owner: T::AccountId,
 		terms: RedemptionTerms<BalanceOf<T>>,
 	) -> Result<u32, DispatchError> {
+		let snapshot = T::Vaults::project_redemption_snapshot(
+			context.collateral_id,
+			context.stable_id,
+			&owner,
+		)?;
 		let budget = terms
 			.max_stable_in
 			.min(Self::spendable_stable(context.stable_id, context.redeemer));
-		let plan = T::Vaults::redeem_step(
+		let plan =
+			Self::price_recovery(context.stable_id, &snapshot, context.price, budget, config)
+				.ok_or(Error::<T>::NoRedeemableVault)?;
+		let (plan, preservation) = if plan.debt().is_zero() {
+			(plan, None)
+		} else {
+			let (funded, preservation) =
+				Self::fundable_budget(context.stable_id, context.redeemer, plan.debt())?;
+			let plan = if funded < plan.debt() {
+				Self::price_recovery(context.stable_id, &snapshot, context.price, funded, config)
+					.ok_or(Error::<T>::NoRedeemableVault)?
+			} else {
+				plan
+			};
+			(plan, Some(preservation))
+		};
+
+		let insurance_cover = plan.insurance_cover();
+		ensure!(
+			!plan.debt().is_zero() || !insurance_cover.is_zero(),
+			Error::<T>::NoRedeemableVault
+		);
+		let scaled_min =
+			fees::scale_floor(terms.min_collateral_out, plan.debt(), terms.max_stable_in);
+		ensure!(plan.collateral() >= scaled_min, Error::<T>::SlippageExceeded);
+
+		let mut debt_payment = match preservation {
+			Some(preservation) => Self::fund_redemption(
+				context.stable_id,
+				context.redeemer,
+				plan.debt(),
+				preservation,
+			)?,
+			None => StableCreditOf::<T>::zero(context.stable_id.clone()),
+		};
+		if !insurance_cover.is_zero() {
+			let cover = Self::withdraw_insurance_cover(context.stable_id, insurance_cover)?;
+			if let Err(cover) = debt_payment.subsume(cover) {
+				// Both credits carry `stable_id`, so the merge cannot fail;
+				// refuse the settlement and let the dispatch roll back.
+				drop(cover);
+				return Err(Error::<T>::InsuranceFundWithdrawFailed.into());
+			}
+		}
+
+		T::Vaults::redeem_step(
 			context.collateral_id,
 			context.stable_id,
 			&owner,
 			context.recipient,
-			|snapshot| Self::execute_recovery_step(context, config, &snapshot, budget),
-		)?
-		.ok_or(Error::<T>::NoRedeemableVault)?;
-		let residual = if plan.settles_residual() {
-			Self::settle_recovery_residual(context.collateral_id, context.stable_id, &owner)?
-		} else {
-			Zero::zero()
-		};
-		ensure!(!plan.debt().is_zero() || !residual.is_zero(), Error::<T>::NoRedeemableVault);
-		let scaled_min =
-			fees::scale_floor(terms.min_collateral_out, plan.debt(), terms.max_stable_in);
-		ensure!(plan.collateral() >= scaled_min, Error::<T>::SlippageExceeded);
+			RedemptionSettlement { debt_payment, collateral_to_recipient: plan.collateral() },
+		)?;
 
 		Self::deposit_event(Event::RecoveryRedemptionExecuted {
 			collateral_id: context.collateral_id.clone(),
@@ -163,59 +206,11 @@ impl<T: Config> Pallet<T> {
 			recipient: context.recipient.clone(),
 			vault_owner: owner,
 			stable_burned: plan.debt(),
+			insurance_cover,
 			collateral_out: plan.collateral(),
 			regime: plan.regime(),
 		});
 		Ok(1)
-	}
-
-	fn execute_recovery_step(
-		context: &WalkContext<'_, T>,
-		config: &RedemptionConfigOf<T>,
-		snapshot: &SnapshotOf<T>,
-		budget: BalanceOf<T>,
-	) -> Result<
-		(
-			Option<RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>>,
-			Option<RecoveryPlan<BalanceOf<T>>>,
-		),
-		DispatchError,
-	> {
-		let Some(mut plan) =
-			Self::price_recovery(context.stable_id, snapshot, context.price, budget, config)
-		else {
-			return Ok((None, None));
-		};
-		let preservation = if plan.debt().is_zero() {
-			None
-		} else {
-			let (funded, preservation) =
-				Self::fundable_budget(context.stable_id, context.redeemer, plan.debt())?;
-			if funded < plan.debt() {
-				let Some(resized) = plan.resize(snapshot, context.price, funded) else {
-					return Ok((None, None));
-				};
-				plan = resized;
-			}
-			Some(preservation)
-		};
-		if plan.debt().is_zero() && !plan.settles_residual() {
-			return Ok((None, None));
-		}
-		let payment = match preservation {
-			Some(preservation) => Some(Self::fund_redemption(
-				context.stable_id,
-				context.redeemer,
-				plan.debt(),
-				preservation,
-			)?),
-			None => None,
-		};
-		let settlement = payment.map(|debt_payment| RedemptionSettlement {
-			debt_payment,
-			collateral_to_recipient: plan.collateral(),
-		});
-		Ok((settlement, Some(plan)))
 	}
 
 	fn redeem_ordinary(
@@ -282,13 +277,7 @@ impl<T: Config> Pallet<T> {
 				break;
 			}
 
-			let applied = T::Vaults::redeem_step(
-				context.collateral_id,
-				context.stable_id,
-				&owner,
-				context.recipient,
-				|snapshot| Self::execute_ordinary_step(context, &snapshot, result.remaining),
-			)?;
+			let applied = Self::apply_ordinary_step(context, &owner, result.remaining)?;
 			result.steps = result.steps.saturating_add(1);
 
 			match applied {
@@ -331,40 +320,44 @@ impl<T: Config> Pallet<T> {
 		Step::Redeem { debt, collateral: collateral.min(snapshot.collateral) }
 	}
 
-	fn execute_ordinary_step(
+	/// Price one target from its projection, fund what the redeemer can pay,
+	/// and apply the settlement. `Skip` and `Stop` never touch storage.
+	fn apply_ordinary_step(
 		context: &WalkContext<'_, T>,
-		snapshot: &SnapshotOf<T>,
+		owner: &T::AccountId,
 		budget: BalanceOf<T>,
-	) -> Result<
-		(Option<RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>>, Step<BalanceOf<T>>),
-		DispatchError,
-	> {
-		match Self::price_ordinary_step(snapshot, context.price, budget) {
-			Step::Redeem { mut debt, mut collateral } => {
-				let (funded, preservation) =
-					Self::fundable_budget(context.stable_id, context.redeemer, debt)?;
-				if funded < debt {
-					match Self::price_ordinary_step(snapshot, context.price, funded) {
-						Step::Redeem { debt: resized_debt, collateral: resized_collateral } => {
-							debt = resized_debt;
-							collateral = resized_collateral;
-						},
-						_ => return Ok((None, Step::Stop)),
-					}
-				}
-				let debt_payment =
-					Self::fund_redemption(context.stable_id, context.redeemer, debt, preservation)?;
-				Ok((
-					Some(RedemptionSettlement {
-						debt_payment,
-						collateral_to_recipient: collateral,
-					}),
-					Step::Redeem { debt, collateral },
-				))
-			},
-			Step::Skip => Ok((None, Step::Skip)),
-			Step::Stop => Ok((None, Step::Stop)),
-		}
+	) -> Result<Step<BalanceOf<T>>, DispatchError> {
+		let snapshot = T::Vaults::project_redemption_snapshot(
+			context.collateral_id,
+			context.stable_id,
+			owner,
+		)?;
+		let priced = Self::price_ordinary_step(&snapshot, context.price, budget);
+		let Step::Redeem { debt, collateral } = priced else {
+			return Ok(priced);
+		};
+
+		let (funded, preservation) =
+			Self::fundable_budget(context.stable_id, context.redeemer, debt)?;
+		let (debt, collateral) = if funded < debt {
+			match Self::price_ordinary_step(&snapshot, context.price, funded) {
+				Step::Redeem { debt, collateral } => (debt, collateral),
+				_ => return Ok(Step::Stop),
+			}
+		} else {
+			(debt, collateral)
+		};
+
+		let debt_payment =
+			Self::fund_redemption(context.stable_id, context.redeemer, debt, preservation)?;
+		T::Vaults::redeem_step(
+			context.collateral_id,
+			context.stable_id,
+			owner,
+			context.recipient,
+			RedemptionSettlement { debt_payment, collateral_to_recipient: collateral },
+		)?;
+		Ok(Step::Redeem { debt, collateral })
 	}
 
 	fn fundable_budget(
@@ -533,7 +526,7 @@ impl<T: Config> Pallet<T> {
 				max_stable_in,
 				&inputs.config,
 			)
-			.filter(|plan| !plan.debt().is_zero() || plan.settles_residual())
+			.filter(|plan| !plan.debt().is_zero() || !plan.insurance_cover().is_zero())
 			.ok_or(Error::<T>::NoRedeemableVault)?;
 			return Ok(RedemptionQuoteOf::<T> {
 				debt_cancelled: plan.debt(),

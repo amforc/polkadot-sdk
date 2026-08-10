@@ -14059,7 +14059,6 @@ dependencies = [
 name = "pallet-redemptions"
 version = "0.1.0"
 dependencies = [
- "log",
  "pallet-assets",
  "pallet-assets-holder",
  "pallet-balances",

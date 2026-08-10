@@ -47,8 +47,6 @@ pub use types::{
 };
 pub use weights::WeightInfo;
 
-pub(crate) const LOG_TARGET: &str = "runtime::redemptions";
-
 /// Runtime-supplied benchmark setup.
 ///
 /// Redemptions delegates setup because the pallet cannot create markets or vaults itself.
@@ -216,8 +214,11 @@ pub mod pallet {
 			recipient: T::AccountId,
 			/// Owner of the settled vault.
 			vault_owner: T::AccountId,
-			/// Stable assets burned against vault debt.
+			/// Stable assets the redeemer burned against vault debt.
 			stable_burned: BalanceOf<T>,
+			/// Insurance Fund cover burned against the same vault's debt, in
+			/// the same settlement. Nonzero only for a full below-par fill.
+			insurance_cover: BalanceOf<T>,
 			/// Collateral paid to the recipient.
 			collateral_out: BalanceOf<T>,
 			/// Pricing regime applied to the settlement.
@@ -253,10 +254,8 @@ pub mod pallet {
 		StablecoinNotRegistered,
 		/// The oracle returned no usable price.
 		OracleUnavailable,
-		/// The vault pallet rejected a `FinalRecovery` settlement.
-		RecoverySettlementFailed,
-		/// Burning the Insurance-Fund residual failed.
-		InsuranceFundBurnFailed,
+		/// Withdrawing the Insurance Fund cover for a below-par settlement failed.
+		InsuranceFundWithdrawFailed,
 		/// The supplied redemption config is internally inconsistent.
 		InvalidRedemptionConfig,
 	}
