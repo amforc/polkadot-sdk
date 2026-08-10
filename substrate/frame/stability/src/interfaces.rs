@@ -5,7 +5,14 @@ use crate::pallet::{
 	BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Pallet, Pools, StabilityPoolOf,
 	StableCreditOf, StableIdOf,
 };
-use frame::{deps::frame_support::require_transactional, prelude::*, traits::tokens::Preservation};
+use frame::{
+	deps::frame_support::require_transactional,
+	prelude::*,
+	traits::{
+		fungibles::Inspect as _,
+		tokens::{Preservation, Provenance},
+	},
+};
 use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, StabilityPoolOffset};
 
 /// The vault engine hands every minted branch credit through here; the pool
@@ -100,6 +107,25 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 		let pool_account = Self::pool_account(collateral_id, stable_id);
 		Self::size_pending_offset(&pool, stable_id, &pool_account, max_debt, active_debt)
 			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+	}
+
+	fn can_receive_collateral(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		amount: BalanceOf<T>,
+	) -> bool {
+		if Self::offset_pool(collateral_id, stable_id).is_none() {
+			return false;
+		}
+		let pool_account = Self::pool_account(collateral_id, stable_id);
+		T::CollateralAssets::can_deposit(
+			collateral_id.clone(),
+			&pool_account,
+			amount,
+			Provenance::Extant,
+		)
+		.into_result()
+		.is_ok()
 	}
 }
 
