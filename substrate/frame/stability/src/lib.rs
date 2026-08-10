@@ -124,14 +124,17 @@ pub mod pallet {
 		},
 	};
 	use frame::{
-		deps::frame_support::{
-			traits::{
-				fungibles,
-				fungibles::{Balanced as _, Inspect as _},
-				tokens::{Fortitude, Precision, Preservation},
-				EnsureOriginWithArg, OnUnbalanced, Time,
+		deps::{
+			frame_support::{
+				traits::{
+					fungibles,
+					fungibles::{Balanced as _, Inspect as _, Refund as _},
+					tokens::{Fortitude, Precision, Preservation, Provenance},
+					AccountTouch, EnsureOriginWithArg, OnUnbalanced, Time,
+				},
+				PalletId,
 			},
-			PalletId,
+			sp_runtime::traits::One,
 		},
 		prelude::*,
 	};
@@ -197,7 +200,9 @@ pub mod pallet {
 				Self::AccountId,
 				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance = BalanceOf<Self>,
-			> + fungibles::Balanced<Self::AccountId>;
+			> + fungibles::Balanced<Self::AccountId>
+			+ AccountTouch<CollateralIdOf<Self>, Self::AccountId>
+			+ fungibles::Refund<Self::AccountId, AssetId = CollateralIdOf<Self>>;
 
 		/// Clock for the entry delay and the Safety-mode withdrawal delay.
 		type TimeProvider: Time<Moment = Millis>;
@@ -456,6 +461,15 @@ pub mod pallet {
 		/// The pool parameters contradict each other. See
 		/// [`types::StabilityPoolConfig::is_valid`].
 		InvalidStabilityPoolConfig,
+		/// The pool's collateral account needs a refundable deposit, and registration named no
+		/// account to pay it. Register the market from a signed origin rather than from Root.
+		PoolAccountDepositRequired,
+		/// The pool's collateral account still cannot receive a gain after registration created
+		/// it. The pool would have to refuse collateral it owes to depositors.
+		PoolAccountNotReceivable,
+		/// The pool account already holds a balance, sent before the market was registered. It
+		/// belongs to no depositor, so registration refuses to start from it.
+		PoolAccountNotEmpty,
 		/// The `precision` parameters differ from their registered values. Stored snapshots depend
 		/// on those values and would produce incorrect amounts after a change.
 		AccumulatorParamsImmutable,
@@ -749,9 +763,36 @@ pub mod pallet {
 			);
 			Ok((stable_dust, collateral_dust))
 		}
+
+		/// Ensures that even a one-unit offset gain can enter the pool account. Issued assets whose
+		/// minimum balance is larger than one need a zero-balance asset account created up front;
+		/// [`AccountTouch`] charges its refundable native deposit to the market depositor.
+		fn ensure_collateral_account(
+			collateral_id: &CollateralIdOf<T>,
+			pool_account: &T::AccountId,
+			depositor: Option<&T::AccountId>,
+		) -> DispatchResult {
+			let can_receive_unit = || {
+				T::CollateralAssets::can_deposit(
+					collateral_id.clone(),
+					pool_account,
+					BalanceOf::<T>::one(),
+					Provenance::Extant,
+				)
+				.into_result()
+				.is_ok()
+			};
+			if can_receive_unit() {
+				return Ok(());
+			}
+			let depositor = depositor.ok_or(Error::<T>::PoolAccountDepositRequired)?;
+			T::CollateralAssets::touch(collateral_id.clone(), pool_account, depositor)?;
+			ensure!(can_receive_unit(), Error::<T>::PoolAccountNotReceivable);
+			Ok(())
+		}
 	}
 
-	impl<T: Config> OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
+	impl<T: Config> OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId> for Pallet<T> {
 		/// Pool parameters required when the market is registered.
 		type RegistrationConfig = StabilityPoolConfigOf<T>;
 
@@ -760,8 +801,16 @@ pub mod pallet {
 			stable_id: &StableIdOf<T>,
 			_stablecoin_markets: u32,
 			config: Self::RegistrationConfig,
+			depositor: Option<&T::AccountId>,
 		) -> DispatchResult {
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
+			let pool_account = Self::pool_account(collateral_id, stable_id);
+			ensure!(
+				T::StableAssets::balance(stable_id.clone(), &pool_account).is_zero() &&
+					T::CollateralAssets::balance(collateral_id.clone(), &pool_account).is_zero(),
+				Error::<T>::PoolAccountNotEmpty
+			);
+
 			Pools::<T>::insert(collateral_id, stable_id, StabilityPoolOf::<T>::fresh(config));
 			for leg in Leg::ALL {
 				PoolSumsStore::<T>::insert(
@@ -772,10 +821,10 @@ pub mod pallet {
 
 			// A provider reference keeps the pool account alive while it holds nothing, without
 			// locking up an existential deposit.
-			let pool_account = Self::pool_account(collateral_id, stable_id);
 			if frame_system::Pallet::<T>::providers(&pool_account) == 0 {
 				frame_system::Pallet::<T>::inc_providers(&pool_account);
 			}
+			Self::ensure_collateral_account(collateral_id, &pool_account, depositor)?;
 			Ok(())
 		}
 
@@ -797,6 +846,11 @@ pub mod pallet {
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			let (stable_amount, collateral_amount) =
 				Self::sweep_dust(collateral_id, stable_id, &pool_account)?;
+			if T::CollateralAssets::deposit_held(collateral_id.clone(), pool_account.clone())
+				.is_some()
+			{
+				T::CollateralAssets::refund(collateral_id.clone(), pool_account.clone())?;
+			}
 			if !stable_amount.is_zero() || !collateral_amount.is_zero() {
 				Self::deposit_event(Event::DustSwept {
 					collateral_id: collateral_id.clone(),

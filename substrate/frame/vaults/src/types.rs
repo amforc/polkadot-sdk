@@ -62,6 +62,9 @@ pub struct LiquidationConfig<Balance> {
 	/// Maximum keeper compensation, in stablecoin value.
 	pub keeper_compensation_cap_value: Balance,
 	/// Smallest direct keeper contribution; prevents dust burns.
+	///
+	/// Binds the keeper's allowance and funding, not the residual the waterfall asks for: a
+	/// smaller system ask still executes.
 	pub minimum_jit_contribution: Balance,
 	/// Extra collateral assigned to redistributed debt.
 	///
@@ -90,7 +93,8 @@ pub struct JitTerms<Balance> {
 	/// Minimum collateral allocated to an executed JIT slice, excluding the keeper reward.
 	///
 	/// This absolute floor is not scaled down for a partial JIT execution. Keepers should set it
-	/// for the smallest execution they would accept.
+	/// for the smallest execution they would accept. A trade that would pay less is skipped and
+	/// the liquidation proceeds without the contribution.
 	pub min_collateral_out: Balance,
 }
 

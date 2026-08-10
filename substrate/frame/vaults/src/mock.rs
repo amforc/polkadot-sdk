@@ -269,7 +269,7 @@ parameter_types! {
 
 /// Records market lifecycle calls and supports forced failures.
 pub struct RecordingLifecycle;
-impl pusd_primitives::OnBranchLifecycle<AssetId, StableId> for RecordingLifecycle {
+impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for RecordingLifecycle {
 	type RegistrationConfig = ();
 
 	fn on_registered(
@@ -277,6 +277,7 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId> for RecordingLifecycl
 		stable_id: &StableId,
 		stablecoin_markets: u32,
 		_config: Self::RegistrationConfig,
+		_depositor: Option<&AccountId>,
 	) -> DispatchResult {
 		LifecycleLog::mutate(|l| {
 			l.push((collateral_id.clone(), *stable_id, true, stablecoin_markets))

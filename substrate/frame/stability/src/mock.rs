@@ -545,17 +545,10 @@ pub fn register_branch(
 ) {
 	// A market cannot be registered without a live price.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
-	// A market Root registers has no depositor, so its full admin pays the custody seed. The
-	// withdrawal keeps the payer alive, so the admin needs two minimum balances.
-	mint_collateral(
-		collateral.clone(),
-		ADMIN,
-		2 * <VaultCollateralAssets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(
-			collateral.clone(),
-		),
-	);
+	// Account 1 owns every test stablecoin. The refundable deposit it pays for the market also
+	// funds the collateral account the pool needs.
 	Vaults::create_branch(
-		RuntimeOrigin::root(),
+		RuntimeOrigin::signed(1),
 		collateral.clone(),
 		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
@@ -565,9 +558,8 @@ pub fn register_branch(
 	.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
-	// The pool account gets no existential deposit. The provider reference from the
-	// registration hook keeps it alive, and native funds parked here would read as collateral
-	// the DOT market cannot account for.
+	// The pool account gets no collateral pre-fund. Registration creates a zero-balance asset
+	// account when one is needed, so every gain stays tracked as pool collateral.
 }
 
 /// Opens a vault, so that a test can create real market debt and move the TCR.
@@ -590,6 +582,12 @@ pub fn open_vault(
 		FixedU128::from_rational(5u128, 100u128),
 		pallet_linked_list::Position::endpoints_only(),
 	)
+}
+
+/// The native balance an account holds on hold, where every refundable market deposit ends up.
+pub fn native_on_hold(who: AccountId) -> Balance {
+	use frame::traits::fungible::InspectHold;
+	<Balances as InspectHold<AccountId>>::total_balance_on_hold(&who)
 }
 
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {

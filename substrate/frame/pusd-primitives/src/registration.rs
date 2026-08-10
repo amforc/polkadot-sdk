@@ -22,7 +22,7 @@ use frame::deps::frame_support::pallet_prelude::{DispatchResult, Parameter};
 /// [`on_registered`]: OnBranchLifecycle::on_registered
 /// [`on_deregistered`]: OnBranchLifecycle::on_deregistered
 /// [`RegistrationConfig`]: OnBranchLifecycle::RegistrationConfig
-pub trait OnBranchLifecycle<CollateralId, StableId> {
+pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 	/// Handler-specific configuration supplied at market registration.
 	///
 	/// Tuple implementers compose this as a tuple of the inner payloads.
@@ -32,13 +32,17 @@ pub trait OnBranchLifecycle<CollateralId, StableId> {
 	/// is the market that seeds whatever the handler keeps per stablecoin. Handlers that keep
 	/// such state decide from that count rather than from their own storage, so the rule they
 	/// enforce is the one a caller can predict.
+	///
+	/// `depositor` is the account funding the market's refundable setup costs. Governance-created
+	/// markets can omit it when every lifecycle handler needs no additional account deposit.
 	fn on_registered(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
 		stablecoin_markets: u32,
 		config: Self::RegistrationConfig,
+		depositor: Option<&AccountId>,
 	) -> DispatchResult {
-		let _ = (collateral_id, stable_id, stablecoin_markets, config);
+		let _ = (collateral_id, stable_id, stablecoin_markets, config, depositor);
 		Ok(())
 	}
 
@@ -68,7 +72,9 @@ pub trait OnBranchLifecycle<CollateralId, StableId> {
 /// Run each handler in order, short-circuiting on the first error so the caller
 /// can roll the transaction back.
 #[impl_trait_for_tuples::impl_for_tuples(8)]
-impl<CollateralId, StableId> OnBranchLifecycle<CollateralId, StableId> for Tuple {
+impl<CollateralId, StableId, AccountId> OnBranchLifecycle<CollateralId, StableId, AccountId>
+	for Tuple
+{
 	// Each payload becomes a field of the composed tuple, so without this the projected
 	// associated types outlive nothing the compiler can name (E0310).
 	for_tuples!( where #( Tuple::RegistrationConfig: 'static )* );
@@ -80,11 +86,18 @@ impl<CollateralId, StableId> OnBranchLifecycle<CollateralId, StableId> for Tuple
 		stable_id: &StableId,
 		stablecoin_markets: u32,
 		config: Self::RegistrationConfig,
+		depositor: Option<&AccountId>,
 	) -> DispatchResult {
 		// Each handler takes its own field by value, so the composed tuple is moved apart
 		// field by field.
 		for_tuples!( #(
-			Tuple::on_registered(collateral_id, stable_id, stablecoin_markets, config.Tuple)?;
+			Tuple::on_registered(
+				collateral_id,
+				stable_id,
+				stablecoin_markets,
+				config.Tuple,
+				depositor,
+			)?;
 		)* );
 		Ok(())
 	}
