@@ -60,16 +60,6 @@ pub struct CloseOutcome<Balance> {
 	pub orphan_debt: Balance,
 }
 
-/// What [`VaultOp::settle_recovery_residual`] moved.
-pub struct ResidualSettlement<Balance> {
-	/// Remaining vault debt recorded as branch bad debt.
-	pub residual_debt: Balance,
-	/// Collateral dust to release to the owner.
-	pub collateral_dust: Balance,
-	/// Orphan debt swept to bad debt because the branch emptied.
-	pub swept_orphan_debt: Balance,
-}
-
 impl<T: Config> Context<T> {
 	/// Loads a market and applies its pending interest in memory.
 	fn load(

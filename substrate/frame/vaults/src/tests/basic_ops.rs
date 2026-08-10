@@ -434,9 +434,11 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 #[test]
 fn redemption_slot_rejects_second_owner() {
 	fn park(owner: AccountId) -> DispatchResult {
-		redeem_step(DOT, PUSD, owner, 7, |snapshot| {
-			Ok(Some(settlement(PUSD, snapshot.debt - 150, (snapshot.debt - 150) / 10)))
-		})
+		let snapshot =
+			<crate::Pallet<Test> as pusd_primitives::VaultInterface>::project_redemption_snapshot(
+				&DOT, &PUSD, &owner,
+			)?;
+		redeem_step(DOT, PUSD, owner, 7, snapshot.debt - 150, (snapshot.debt - 150) / 10)
 	}
 	fn parked() -> Option<AccountId> {
 		branch_state(DOT, PUSD).expect("branch state").dormant_redemption_target
