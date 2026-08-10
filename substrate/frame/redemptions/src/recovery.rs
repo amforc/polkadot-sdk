@@ -1,4 +1,4 @@
-//! Final-recovery pricing, Insurance Fund settlement, and Stability Pool offsets.
+//! Final-recovery pricing, Insurance Fund cover, and Stability Pool offsets.
 
 use crate::{
 	pallet::{
@@ -8,12 +8,9 @@ use crate::{
 	types::{RecoveryOffsetQuote, RecoveryRegime},
 };
 use frame::{
-	deps::{
-		frame_support::storage::{with_transaction, TransactionOutcome},
-		sp_runtime::{
-			traits::{Convert, Saturating, Zero},
-			FixedPointNumber, FixedPointOperand, FixedU128,
-		},
+	deps::sp_runtime::{
+		traits::{Convert, Saturating, Zero},
+		FixedPointNumber, FixedU128,
 	},
 	prelude::*,
 	traits::{
@@ -23,18 +20,17 @@ use frame::{
 };
 use pusd_primitives::{
 	debit_preservation, recovery_pricing, reducible_debit, ProvidePrice, RecoveryOffsetInterface,
-	RecoveryOffsetResult, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
+	RecoveryOffsetResult, RedemptionSettlement, VaultInterface,
 };
 
 /// One authoritative price for a `FinalRecovery` head.
 ///
 /// Redemption execution, quotes, and Stability Pool offsets all consume this
-/// plan. Only execution may resize it to what its payer can actually fund.
+/// plan. Re-price with a smaller budget when the payer cannot fund it in full.
 pub(crate) enum RecoveryPlan<Balance> {
 	AbovePar {
 		debt: Balance,
 		collateral: Balance,
-		bonus: FixedU128,
 	},
 	BelowPar {
 		debt: Balance,
@@ -64,53 +60,25 @@ impl<Balance: Copy> RecoveryPlan<Balance> {
 	}
 }
 
-impl<Balance: FixedPointOperand + Ord> RecoveryPlan<Balance> {
-	/// Re-prices the plan for a smaller `budget`.
-	///
-	/// Returns `None` if a price conversion fails. The original plan priced the
-	/// same regime at the same `price`, so this only happens on corrupt inputs;
-	/// the caller must skip the target.
-	pub(crate) fn resize(
-		self,
-		snapshot: &RedemptionStepSnapshot<Balance>,
-		price: FixedU128,
-		budget: Balance,
-	) -> Option<Self> {
+impl<Balance: Copy + Eq + Zero> RecoveryPlan<Balance> {
+	/// The Insurance Fund cover paid alongside the market payment. Nonzero only
+	/// when the plan cancels the full externally-cancellable debt: partial
+	/// fills leave the vault at the FIFO head and the fund untouched.
+	pub(crate) fn insurance_cover(&self) -> Balance {
 		match self {
-			Self::AbovePar { bonus, .. } => {
-				let debt = snapshot.debt.min(budget);
-				let collateral =
-					recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)?
-						.min(snapshot.collateral);
-				Some(Self::AbovePar { debt, collateral, bonus })
+			Self::AbovePar { .. } => Balance::zero(),
+			Self::BelowPar { debt, split, .. } if *debt == split.market_cancel_debt => {
+				split.effective_cover
 			},
-			Self::BelowPar { split, .. } => {
-				let debt = split.market_cancel_debt.min(budget);
-				let collateral = recovery_pricing::recovery_rate_collateral_out(
-					debt,
-					split.recovery_rate,
-					price,
-				)?
-				.min(snapshot.collateral);
-				Some(Self::BelowPar { debt, collateral, split })
-			},
+			Self::BelowPar { .. } => Balance::zero(),
 		}
-	}
-
-	/// Full external cancellation unlocks the Insurance Fund residual.
-	pub(crate) fn settles_residual(&self) -> bool {
-		matches!(
-			self,
-			Self::BelowPar { debt, split, .. }
-				if *debt == split.market_cancel_debt && !split.effective_cover.is_zero()
-		)
 	}
 }
 
-enum OffsetDecision<Balance> {
+enum OffsetDecision<AccountId, Balance> {
 	NoTarget,
 	BelowPar,
-	Available { debt: Balance, collateral: Balance },
+	Available { owner: AccountId, debt: Balance, collateral: Balance },
 }
 
 impl<T: Config> Pallet<T> {
@@ -136,7 +104,7 @@ impl<T: Config> Pallet<T> {
 			let debt = snapshot.debt.min(budget);
 			let collateral = recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)?
 				.min(snapshot.collateral);
-			return Some(RecoveryPlan::AbovePar { debt, collateral, bonus });
+			return Some(RecoveryPlan::AbovePar { debt, collateral });
 		}
 
 		// `ratio < 1` implies `collateral_value < debt`, so the split is in range.
@@ -160,41 +128,29 @@ impl<T: Config> Pallet<T> {
 		.0
 	}
 
-	/// Settle and burn the Insurance Fund portion after the vault step commits.
-	pub(crate) fn settle_recovery_residual(
-		collateral_id: &CollateralIdOf<T>,
+	/// Withdraw the Insurance Fund cover a below-par settlement pays. The
+	/// caller merges it into the settlement payment, so the cover cancels
+	/// vault debt directly — no transient bad debt is recorded.
+	pub(crate) fn withdraw_insurance_cover(
 		stable_id: &StableIdOf<T>,
-		owner: &T::AccountId,
-	) -> Result<BalanceOf<T>, DispatchError> {
-		let residual = T::Vaults::settle_recovery_residual(collateral_id, stable_id, owner)
-			.map_err(|_| Error::<T>::RecoverySettlementFailed)?;
-		if residual.is_zero() {
-			return Ok(residual);
-		}
-
+		cover: BalanceOf<T>,
+	) -> Result<StableCreditOf<T>, DispatchError> {
+		debug_assert!(!cover.is_zero());
 		let account = T::InsuranceFundAccount::convert(stable_id.clone());
 		let preservation =
-			debit_preservation::<T::StableAssets, _>(stable_id.clone(), &account, residual);
-		let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
+			debit_preservation::<T::StableAssets, _>(stable_id.clone(), &account, cover);
+		// The cover was capped at the fund's reducible balance when priced, in
+		// this same dispatch; a failure means the payer drained the fund
+		// mid-redemption (it is the fund itself) and must abort.
+		<T::StableAssets as FungiblesBalanced<_>>::withdraw(
 			stable_id.clone(),
 			&account,
-			residual,
+			cover,
 			Precision::Exact,
 			preservation,
 			Fortitude::Polite,
 		)
-		.map_err(|_| Error::<T>::InsuranceFundBurnFailed)?;
-		let surplus = T::Vaults::heal(collateral_id, credit);
-		if !surplus.peek().is_zero() {
-			log::error!(
-				target: crate::LOG_TARGET,
-				"insurance heal left surplus settling residual {residual:?}"
-			);
-			drop(surplus);
-			return Err(Error::<T>::InsuranceFundBurnFailed.into());
-		}
-		drop(surplus);
-		Ok(residual)
+		.map_err(|_| Error::<T>::InsuranceFundWithdrawFailed.into())
 	}
 
 	fn final_recovery_head(
@@ -217,15 +173,26 @@ impl<T: Config> Pallet<T> {
 		Ok((config, price))
 	}
 
-	fn offset_decision(plan: Option<RecoveryPlan<BalanceOf<T>>>) -> OffsetDecision<BalanceOf<T>> {
-		match plan {
+	/// Locate and price the recovery head for an offset, as a pure read.
+	fn offset_decision(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		max_debt_to_cancel: BalanceOf<T>,
+	) -> Result<OffsetDecision<T::AccountId, BalanceOf<T>>, DispatchError> {
+		let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
+			return Ok(OffsetDecision::NoTarget);
+		};
+		let (config, price) = Self::offset_inputs(collateral_id, stable_id)?;
+		let snapshot = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?;
+		let plan = Self::price_recovery(stable_id, &snapshot, price, max_debt_to_cancel, &config);
+		Ok(match plan {
 			None => OffsetDecision::NoTarget,
 			Some(RecoveryPlan::BelowPar { .. }) => OffsetDecision::BelowPar,
 			Some(RecoveryPlan::AbovePar { debt, .. }) if debt.is_zero() => OffsetDecision::NoTarget,
-			Some(RecoveryPlan::AbovePar { debt, collateral, .. }) => {
-				OffsetDecision::Available { debt, collateral }
+			Some(RecoveryPlan::AbovePar { debt, collateral }) => {
+				OffsetDecision::Available { owner, debt, collateral }
 			},
-		}
+		})
 	}
 
 	/// Quote how much debt a Stability Pool may cancel against the recovery head.
@@ -234,24 +201,11 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		max_debt_to_cancel: BalanceOf<T>,
 	) -> Result<RecoveryOffsetQuote<BalanceOf<T>>, DispatchError> {
-		let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
-			return Ok(RecoveryOffsetQuote::NoTarget);
-		};
-		let (config, price) = Self::offset_inputs(collateral_id, stable_id)?;
-		let snapshot = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?;
-		Ok(
-			match Self::offset_decision(Self::price_recovery(
-				stable_id,
-				&snapshot,
-				price,
-				max_debt_to_cancel,
-				&config,
-			)) {
-				OffsetDecision::NoTarget => RecoveryOffsetQuote::NoTarget,
-				OffsetDecision::BelowPar => RecoveryOffsetQuote::BelowPar,
-				OffsetDecision::Available { debt, .. } => RecoveryOffsetQuote::Available { debt },
-			},
-		)
+		Ok(match Self::offset_decision(collateral_id, stable_id, max_debt_to_cancel)? {
+			OffsetDecision::NoTarget => RecoveryOffsetQuote::NoTarget,
+			OffsetDecision::BelowPar => RecoveryOffsetQuote::BelowPar,
+			OffsetDecision::Available { debt, .. } => RecoveryOffsetQuote::Available { debt },
+		})
 	}
 }
 
@@ -267,47 +221,25 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 		collateral_recipient: &T::AccountId,
 	) -> Result<(RecoveryOffsetResult<BalanceOf<T>>, StableCreditOf<T>), DispatchError> {
 		// The payment's own asset names the market: a coin mismatch is
-		// unrepresentable rather than an error.
-		let stable_id = &payment.asset();
-		let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
-			return Ok((RecoveryOffsetResult::NoTarget, payment));
-		};
-		let (config, price) = Self::offset_inputs(collateral_id, stable_id)?;
-		let budget = payment.peek();
-
-		with_transaction(|| {
-			let mut payment = payment;
-			let step = T::Vaults::redeem_step(
-				collateral_id,
-				stable_id,
-				&owner,
-				collateral_recipient,
-				|snapshot| match Self::offset_decision(Self::price_recovery(
-					stable_id, &snapshot, price, budget, &config,
-				)) {
-					OffsetDecision::NoTarget => Ok((None, RecoveryOffsetResult::NoTarget)),
-					OffsetDecision::BelowPar => Ok((None, RecoveryOffsetResult::BelowPar)),
-					OffsetDecision::Available { debt, collateral } => {
-						let debt_payment = payment.extract(debt);
-						debug_assert_eq!(debt_payment.peek(), debt);
-						Ok((
-							Some(RedemptionSettlement {
-								debt_payment,
-								collateral_to_recipient: collateral,
-							}),
-							RecoveryOffsetResult::Applied { collateral_out: collateral },
-						))
-					},
-				},
-			);
-
-			match step {
-				Err(error) => TransactionOutcome::Rollback(Err(error)),
-				Ok(result @ RecoveryOffsetResult::Applied { .. }) => {
-					TransactionOutcome::Commit(Ok((result, payment)))
-				},
-				Ok(result) => TransactionOutcome::Rollback(Ok((result, payment))),
-			}
-		})
+		// unrepresentable rather than an error. The decision is a pure read,
+		// so non-applied outcomes return the payment without touching storage.
+		let stable_id = payment.asset();
+		match Self::offset_decision(collateral_id, &stable_id, payment.peek())? {
+			OffsetDecision::NoTarget => Ok((RecoveryOffsetResult::NoTarget, payment)),
+			OffsetDecision::BelowPar => Ok((RecoveryOffsetResult::BelowPar, payment)),
+			OffsetDecision::Available { owner, debt, collateral } => {
+				let mut payment = payment;
+				let debt_payment = payment.extract(debt);
+				debug_assert_eq!(debt_payment.peek(), debt);
+				T::Vaults::redeem_step(
+					collateral_id,
+					&stable_id,
+					&owner,
+					collateral_recipient,
+					RedemptionSettlement { debt_payment, collateral_to_recipient: collateral },
+				)?;
+				Ok((RecoveryOffsetResult::Applied { collateral_out: collateral }, payment))
+			},
+		}
 	}
 }
