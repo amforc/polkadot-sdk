@@ -35,11 +35,14 @@ pub(crate) enum RecoveryPlan<Balance> {
 	BelowPar {
 		debt: Balance,
 		collateral: Balance,
-		split: pusd_primitives::InsuranceAdjusted<Balance>,
+		/// Insurance Fund payment for a full settlement.
+		///
+		/// A partial settlement must not draw from the fund.
+		insurance_cover: Balance,
 	},
 }
 
-impl<Balance: Copy> RecoveryPlan<Balance> {
+impl<Balance: Copy + Zero> RecoveryPlan<Balance> {
 	pub(crate) fn debt(&self) -> Balance {
 		match self {
 			Self::AbovePar { debt, .. } | Self::BelowPar { debt, .. } => *debt,
@@ -58,19 +61,14 @@ impl<Balance: Copy> RecoveryPlan<Balance> {
 			Self::BelowPar { .. } => RecoveryRegime::InsuranceAdjusted,
 		}
 	}
-}
 
-impl<Balance: Copy + Eq + Zero> RecoveryPlan<Balance> {
-	/// The Insurance Fund cover paid alongside the market payment. Nonzero only
-	/// when the plan cancels the full externally-cancellable debt: partial
-	/// fills leave the vault at the FIFO head and the fund untouched.
+	/// Returns the Insurance Fund payment for a full settlement.
+	///
+	/// Returns zero for a partial settlement because the vault remains in the FIFO.
 	pub(crate) fn insurance_cover(&self) -> Balance {
 		match self {
 			Self::AbovePar { .. } => Balance::zero(),
-			Self::BelowPar { debt, split, .. } if *debt == split.market_cancel_debt => {
-				split.effective_cover
-			},
-			Self::BelowPar { .. } => Balance::zero(),
+			Self::BelowPar { insurance_cover, .. } => *insurance_cover,
 		}
 	}
 }
@@ -101,22 +99,35 @@ impl<T: Config> Pallet<T> {
 				config.final_recovery_bonus_buffer,
 				snapshot.redistribution_penalty,
 			);
-			let debt = snapshot.debt.min(budget);
+			let debt = snapshot.size_within(budget);
 			let collateral = recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)?
 				.min(snapshot.collateral);
 			return Some(RecoveryPlan::AbovePar { debt, collateral });
 		}
 
-		// `ratio < 1` implies `collateral_value < debt`, so the split is in range.
+		// A partial settlement excludes the terminal charge and Insurance Fund cover.
 		let collateral_value = price.saturating_mul_int(snapshot.collateral);
-		let shortfall = snapshot.debt.saturating_sub(collateral_value);
-		let cover = Self::insurance_fund_cover(stable_id, shortfall);
-		let split = recovery_pricing::insurance_adjusted(snapshot.debt, collateral_value, cover)?;
-		let debt = split.market_cancel_debt.min(budget);
+		let full_payoff = snapshot.full_payoff();
+		let full_shortfall = full_payoff.saturating_sub(collateral_value);
+		let full_cover = Self::insurance_fund_cover(stable_id, full_shortfall);
+		let full_split =
+			recovery_pricing::insurance_adjusted(full_payoff, collateral_value, full_cover)?;
+		let (split, debt, insurance_cover) = if budget >= full_split.market_cancel_debt {
+			(full_split, full_split.market_cancel_debt, full_split.effective_cover)
+		} else if snapshot.terminal_interest_charge.is_zero() {
+			(full_split, full_split.market_cancel_debt.min(budget), BalanceOf::<T>::zero())
+		} else {
+			let base_shortfall = snapshot.debt.saturating_sub(collateral_value);
+			let base_cover = Self::insurance_fund_cover(stable_id, base_shortfall);
+			let split =
+				recovery_pricing::insurance_adjusted(snapshot.debt, collateral_value, base_cover)?;
+			let debt = snapshot.partial_cap(split.market_cancel_debt).min(budget);
+			(split, debt, BalanceOf::<T>::zero())
+		};
 		let collateral =
 			recovery_pricing::recovery_rate_collateral_out(debt, split.recovery_rate, price)?
 				.min(snapshot.collateral);
-		Some(RecoveryPlan::BelowPar { debt, collateral, split })
+		Some(RecoveryPlan::BelowPar { debt, collateral, insurance_cover })
 	}
 
 	fn insurance_fund_cover(stable_id: &StableIdOf<T>, shortfall: BalanceOf<T>) -> BalanceOf<T> {
@@ -128,9 +139,7 @@ impl<T: Config> Pallet<T> {
 		.0
 	}
 
-	/// Withdraw the Insurance Fund cover a below-par settlement pays. The
-	/// caller merges it into the settlement payment, so the cover cancels
-	/// vault debt directly — no transient bad debt is recorded.
+	/// Withdraws cover as a credit that cancels vault debt in the same settlement.
 	pub(crate) fn withdraw_insurance_cover(
 		stable_id: &StableIdOf<T>,
 		cover: BalanceOf<T>,
