@@ -1,8 +1,10 @@
-//! The vault-side surface external redemption and bad-debt flows drive, keyed
-//! by the `(collateral_id, stable_id)` market.
+//! Vault operations for external redemption flows, keyed by `(collateral_id, stable_id)`.
 
 use crate::{DebtCollateral, VaultStatus};
-use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill};
+use frame::{
+	arithmetic::{One, Saturating, Zero},
+	deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill},
+};
 
 /// Settlement consumed by [`VaultInterface::redeem_step`]. Owning
 /// `debt_payment` ties the burn to the cancellation by construction: the vault
@@ -21,8 +23,10 @@ pub struct RedemptionSettlement<Credit, Balance> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RedemptionStepSnapshot<Balance> {
 	pub status: VaultStatus,
-	/// Post-touch total debt; the maximum debt the payment may cover.
+	/// Post-touch base debt, excluding the conditional terminal charge.
 	pub debt: Balance,
+	/// One-unit charge applied only when this step settles the vault in full.
+	pub terminal_interest_charge: Balance,
 	/// Collateral currently held against the vault.
 	pub collateral: Balance,
 	/// Branch redistribution penalty, bounding the recovery bonus. Only
@@ -37,20 +41,39 @@ impl<Balance: Copy> RedemptionStepSnapshot<Balance> {
 	}
 }
 
-/// The vault-side API used by external redemption and bad-debt flows. Reads
-/// are authoritative current state; writes re-shape the priority queue.
+impl<Balance: Copy + Ord + Zero + One + Saturating> RedemptionStepSnapshot<Balance> {
+	/// The payment that settles the vault in full: base debt plus the terminal charge.
+	pub fn full_payoff(&self) -> Balance {
+		self.debt.saturating_add(self.terminal_interest_charge)
+	}
+
+	/// Reserves one base-debt unit for the terminal charge on a partial payment.
+	pub fn partial_cap(&self, limit: Balance) -> Balance {
+		if self.terminal_interest_charge.is_zero() {
+			limit
+		} else {
+			limit.saturating_sub(Balance::one())
+		}
+	}
+
+	/// Returns the largest debt payment within `budget`.
+	///
+	/// Returns the full payoff when possible. Otherwise, returns a payment limited by
+	/// [`Self::partial_cap`].
+	pub fn size_within(&self, budget: Balance) -> Balance {
+		let full_payoff = self.full_payoff();
+		if budget >= full_payoff {
+			full_payoff
+		} else {
+			self.partial_cap(self.debt).min(budget)
+		}
+	}
+}
+
+/// Provides authoritative vault state and atomic settlement for external redemption flows.
 ///
-/// A redemption step is sized in two phases: the caller prices against
-/// [`Self::project_redemption_snapshot`], then applies via
-/// [`Self::redeem_step`]. Both run the same touch kernel at the same
-/// timestamp, so within one dispatch the projection equals the state the step
-/// settles against; [`Self::redeem_step`] still re-validates the settlement
-/// against its own post-touch values and fails closed on any divergence.
-///
-/// Bad debt is only ever *recorded* inside the vault pallet (the branch-empty
-/// sweep); [`Self::heal`] carries the inverse side: an orchestrator withdraws
-/// cover from the Insurance Fund as a credit and hands it here to be burned
-/// against the recorded amount.
+/// [`Self::redeem_step`] validates the settlement against a new projection. A mismatch aborts the
+/// complete step.
 pub trait VaultInterface {
 	type CollateralId;
 	type StableId;
@@ -91,13 +114,12 @@ pub trait VaultInterface {
 		owner: &Self::AccountId,
 	) -> Result<RedemptionStepSnapshot<Self::Balance>, DispatchError>;
 
-	/// One redemption step against `owner`'s vault, applied atomically: touch
-	/// it, cancel exactly the debt `settlement.debt_payment` covers, burn the
-	/// payment, and pay `settlement.collateral_to_recipient` to `recipient`.
-	/// The settlement is validated against the post-touch state (payment in
-	/// the market's coin, nonzero, at most the accrued debt; collateral at
-	/// most what is held) and the step rolls back wholly on any error.
-	/// Charging the redemption fee stays with the caller.
+	/// Applies one atomic redemption settlement to `owner`'s vault.
+	///
+	/// The payment must use the market stablecoin and must not exceed the full payoff. The
+	/// collateral payment must not exceed the vault collateral. A full payment closes the vault.
+	/// A partial payment must leave base debt when a terminal charge applies. The caller charges
+	/// the redemption fee.
 	///
 	/// An error consumes `settlement.debt_payment` inside the rolled-back
 	/// step, so callers MUST propagate the error and abort the dispatch —
@@ -117,15 +139,4 @@ pub trait VaultInterface {
 	///
 	/// Includes aggregate interest accrued since each market was last touched.
 	fn stablecoin_debt(stable_id: &Self::StableId) -> Self::Balance;
-
-	/// Burn up to the recorded bad debt of the market named by
-	/// `collateral_id` and the credit's own asset, returning the unconsumed
-	/// surplus (zero when the credit was fully used).
-	///
-	/// Bad debt originates only in the branch-empty sweep (ownerless debt,
-	/// unattributed interest, unclaimable redistribution) and persists until
-	/// healed; below-par recovery settlement pays its Insurance-Fund cover
-	/// directly through [`Self::redeem_step`] and records none.
-	#[must_use = "dropping the surplus burns it"]
-	fn heal(collateral_id: &Self::CollateralId, credit: Self::StableCredit) -> Self::StableCredit;
 }

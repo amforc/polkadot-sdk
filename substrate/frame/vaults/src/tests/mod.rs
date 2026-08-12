@@ -1,7 +1,6 @@
 //! `pallet-vaults` test suite.
 
 mod asset_roles;
-mod bad_debt;
 mod basic_ops;
 mod borrower_operations;
 mod critical_threshold;

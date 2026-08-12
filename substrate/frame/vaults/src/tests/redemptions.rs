@@ -116,7 +116,7 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(60, 100)));
-		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		advance_time(pusd_primitives::MILLIS_PER_YEAR + 1);
 
 		let branch_before = branch_state(DOT, PUSD).expect("branch stored");
 		let vault_before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
@@ -132,13 +132,43 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 		assert_eq!(System::events(), events_before);
 		// The projection includes the year of pending interest the row lacks.
 		assert_eq!(projected.debt, vault_before.debt.total() + 250);
+		assert_eq!(projected.terminal_interest_charge, 1);
 
 		// A settlement filling the whole projected position is exact, proving
 		// execution touched to the same values the projection reported.
-		assert_ok!(redeem_step(DOT, PUSD, 1, 3, projected.debt, projected.collateral));
+		assert_ok!(redeem_step(
+			DOT,
+			PUSD,
+			1,
+			3,
+			projected.debt + projected.terminal_interest_charge,
+			projected.collateral,
+		));
 		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		assert_eq!(v_post.debt.total(), 0);
 		assert_eq!(held(DOT, 1), held_before - projected.collateral);
+	});
+}
+
+#[test]
+fn terminal_charge_is_rejected_on_a_base_debt_only_full_step() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
+		advance_time(1);
+		let snapshot =
+			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
+		assert_eq!(snapshot.terminal_interest_charge, 1);
+		assert_noop!(
+			redeem_step(DOT, PUSD, 1, 3, snapshot.debt, 0),
+			crate::Error::<Test>::InvalidRedemptionSettlement
+		);
+		assert_ok!(redeem_step(DOT, PUSD, 1, 3, snapshot.debt - 1, 0));
+		let remaining = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
+			.expect("remaining snapshot");
+		assert_eq!(remaining.debt, 1);
+		assert_eq!(remaining.terminal_interest_charge, 1);
 	});
 }
 
@@ -377,12 +407,9 @@ fn dormant_vault_with_residual_accrues_interest() {
 	});
 }
 
-// Dormant vaults keep stake and receive redistribution gains on touch. We drive
-// a genuine redistribution (not an offset) of vault 3's debt, so the dormant
-// vault's principal *strictly* increases by its stake-weighted share — pinning
-// `>` (not `>=`) since the 200-debt redistribution is not tiny.
+// Debt-bearing Dormant vaults keep stake and receive liquidation allocations.
 #[test]
-fn dormant_vault_receives_redistribution_gains_on_touch() {
+fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Distinct rates so the rate-index tail is deterministic — acct 1 at
@@ -391,7 +418,7 @@ fn dormant_vault_receives_redistribution_gains_on_touch() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		assert_ok!(open(3, DOT, PUSD, 200, 200, rate_pct(5, 100)));
-		assert_ok!(redeem(DOT, PUSD, 4, 700)); // pushes acct 1 to Dormant
+		assert_ok!(redeem(DOT, PUSD, 4, 350)); // leaves acct 1 Dormant with debt
 
 		// Drop the price so acct 3's CR falls below MCR — the vault pallet
 		// refuses liquidation of a vault whose CR is at/above MCR. 1.0 puts
@@ -406,17 +433,39 @@ fn dormant_vault_receives_redistribution_gains_on_touch() {
 			redistribution_collateral: coll_3,
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
-		// Touch acct 1 so the interest-time lag closes and redistribution gains land on it.
-		let pending_pre = branch_state(DOT, PUSD).unwrap().debt.pending_redistribution_principal;
+		assert_eq!(
+			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal,
+			v_dormant_pre.debt.principal,
+			"the allocation stays lazy until this vault is touched",
+		);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
 		let v_dormant_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		// The Dormant vault receives its exact stake-weighted share of the redistributed
-		// principal on touch.
+		// Dormant debt must not remove a vault from redistribution.
 		let gained = v_dormant_post.debt.principal - v_dormant_pre.debt.principal;
-		assert_eq!(gained, 97);
-		// The branch's pending redistribution pool is drawn down by exactly that share.
-		let pending_post = branch_state(DOT, PUSD).unwrap().debt.pending_redistribution_principal;
-		assert_eq!(pending_pre - pending_post, gained);
+		assert_eq!(gained, 98);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
+	});
+}
+
+#[test]
+fn debt_free_dormant_husk_cannot_receive_liquidation_debt() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(3, DOT, PUSD, 200, 200, rate_pct(5, 100)));
+		assert_ok!(redeem(DOT, PUSD, 4, 700));
+
+		let husk_before = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		assert_eq!(husk_before.debt.total(), 0);
+		assert_eq!(husk_before.redistribution_stake, 0);
+		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
+
+		let husk_after = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		assert_eq!(husk_after.debt.total(), 0);
+		assert_eq!(husk_after.collateral, husk_before.collateral);
+		assert_eq!(husk_after.redistribution_stake, 0);
 	});
 }
 

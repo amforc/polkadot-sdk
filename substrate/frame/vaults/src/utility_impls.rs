@@ -6,43 +6,48 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
-		Error, IdleCursor, Millis, Pallet, StableIdOf, StablecoinDebt, Vaults,
+		Error, IdleCursor, Millis, Pallet, StableCreditOf, StableIdOf, StablecoinDebt, Vaults,
 	},
 	recovery,
 	types::{
 		AdminLevel, BranchConfig, BranchMode, BranchState, DebtBreakdown, DebtCollateral,
-		PendingInterest, StablecoinDebtState, Vault, VaultListId, VaultStatus,
+		InterestWeight, PendingInterest, RedistributionAttribution, StablecoinDebtState, Vault,
+		VaultListId, VaultStatus,
 	},
 	weights::WeightInfo,
 };
 use frame::{
+	arithmetic::ArithmeticError,
 	deps::frame_support::{
 		require_transactional, storage::with_storage_layer, weights::WeightMeter,
 	},
 	prelude::*,
-	traits::{fungibles::Balanced as FungiblesBalanced, Defensive, DefensiveOption, Time},
+	traits::{
+		fungibles::{Balanced as FungiblesBalanced, Inspect as FungiblesInspect},
+		tokens::Provenance,
+		AccountTouch, DefensiveOption, Time,
+	},
 };
 use linked_list_interface::{ListError, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, OnBranchYield, ProvidePrice};
 
-/// Deltas the next vault touch would apply.
+/// Exact changes the next vault touch would apply.
 pub(crate) struct PendingTouch<Balance> {
-	/// Capped redistributed principal moved into `vault.debt.principal`
-	/// (and out of `state.debt.pending_redistribution_principal`).
-	pub principal: Balance,
-	/// Redistributed collateral released to the owner's hold.
-	pub collateral: Balance,
-	/// Stored-principal pending interest plus redistribution interest, both
-	/// folded into `vault.debt.interest`.
-	pub interest: Balance,
+	/// Principal and collateral moved from the redistribution pools into the vault.
+	pub redistribution: DebtCollateral<Balance>,
+	/// Pending weight and its time anchor removed from the virtual pool atomically.
+	pub attribution: RedistributionAttribution<Balance>,
+	/// Whole interest folded into the vault and the sub-unit remainder retained on it.
+	pub interest: PendingInterest<Balance>,
 }
 
-/// One fully touched vault and its isolated branch draft.
+/// One fully touched vault and its isolated branch draft, accrued to `now`.
 pub(crate) struct TouchedVaultDraft<AccountId, Balance> {
 	pub(crate) config: BranchConfig<Balance>,
 	pub(crate) state: BranchState<AccountId, Balance>,
 	pub(crate) vault: Vault<Balance>,
 	pub(crate) status: VaultStatus,
+	pub(crate) now: Millis,
 }
 
 /// How one idle-walk pass ended, deciding the cursor write.
@@ -61,7 +66,7 @@ enum WalkExit<K> {
 struct BranchContribution<Balance> {
 	outstanding: Balance,
 	pending_interest: PendingInterest<Balance>,
-	active_weight: Balance,
+	active_weight: InterestWeight<Balance>,
 }
 
 impl<T: Config> Pallet<T> {
@@ -83,45 +88,54 @@ impl<T: Config> Pallet<T> {
 	/// Apply one vault touch to in-memory branch and vault drafts.
 	///
 	/// The branch's aggregate interest must already be accrued to `now`.
+	/// Returns the touch and the interest units that require new issuance.
 	pub(crate) fn apply_vault_touch(
 		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		vault: &mut Vault<BalanceOf<T>>,
 		status: VaultStatus,
 		now: Millis,
-	) -> Result<PendingTouch<BalanceOf<T>>, DispatchError> {
+	) -> Result<(PendingTouch<BalanceOf<T>>, BalanceOf<T>), DispatchError> {
 		debug_assert_eq!(state.debt.last_interest_time, state.interest_time(now));
-		let pending = Self::pending_touch_for(vault, state, now);
+		let pending = Self::pending_touch_for(vault, state, now)?;
+		let interest_to_mint = state
+			.debt
+			.attribute_interest(pending.interest.interest)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
 
-		if !pending.interest.is_zero() {
+		if !pending.interest.interest.is_zero() {
 			vault.debt.interest = vault
 				.debt
 				.interest
-				.checked_add(&pending.interest)
+				.checked_add(&pending.interest.interest)
 				.ok_or(Error::<T>::ArithmeticOverflow)?;
 		}
+		vault.interest_remainder = pending.interest.remainder;
 		let accounted_before = vault.clone();
-
-		if !pending.principal.is_zero() {
-			state.consume_redistributed_debt(vault, pending.principal)?;
+		if !pending.redistribution.debt.is_zero() ||
+			!pending.redistribution.collateral.is_zero() ||
+			!pending.attribution.is_zero()
+		{
+			state.consume_redistribution(pending.redistribution, pending.attribution)?;
 			vault.debt.principal = vault
 				.debt
 				.principal
-				.checked_add(&pending.principal)
+				.checked_add(&pending.redistribution.debt)
 				.ok_or(Error::<T>::ArithmeticOverflow)?;
-		}
-		if !pending.collateral.is_zero() {
 			vault.collateral = vault
 				.collateral
-				.checked_add(&pending.collateral)
+				.checked_add(&pending.redistribution.collateral)
 				.ok_or(Error::<T>::ArithmeticOverflow)?;
 		}
 		vault.redistribution_checkpoint = state.redistribution;
 		vault.last_interest_time = state.interest_time(now);
-		vault.redistribution_stake =
-			if status.is_final_recovery() { Zero::zero() } else { vault.collateral };
+		vault.redistribution_stake = if status.is_final_recovery() || vault.debt.total().is_zero() {
+			Zero::zero()
+		} else {
+			state.stake_for(vault.collateral).ok_or(Error::<T>::ArithmeticOverflow)?
+		};
 
 		state.replace_vault(Some(&accounted_before), Some(vault))?;
-		Ok(pending)
+		Ok((pending, interest_to_mint))
 	}
 
 	/// Read the whole branch record, returning `BranchNotFound` when missing.
@@ -203,7 +217,7 @@ impl<T: Config> Pallet<T> {
 		let mut total = StablecoinDebt::<T>::get(stable_id);
 		let elapsed = now.saturating_sub(total.last_update);
 		let elapsed_interest =
-			PendingInterest::from_weight_millis(total.active_weighted_principal_sum, elapsed)
+			PendingInterest::from_interest_weight(total.active_weighted_principal, elapsed)
 				.ok_or(Error::<T>::ArithmeticOverflow)?;
 		total.pending_interest = total
 			.pending_interest
@@ -218,11 +232,10 @@ impl<T: Config> Pallet<T> {
 			.checked_add(&after.pending_interest)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 
-		total.active_weighted_principal_sum = Self::shifted_total(
-			total.active_weighted_principal_sum,
-			before.active_weight,
-			after.active_weight,
-		)?;
+		total.active_weighted_principal = total
+			.active_weighted_principal
+			.shifted(&before.active_weight, &after.active_weight)
+			.ok_or(DispatchError::Corruption)?;
 		total.outstanding =
 			Self::shifted_total(total.outstanding, before.outstanding, after.outstanding)?;
 		Ok(total)
@@ -234,28 +247,37 @@ impl<T: Config> Pallet<T> {
 		now: Millis,
 	) -> Result<BranchContribution<BalanceOf<T>>, DispatchError> {
 		Ok(BranchContribution {
-			outstanding: state
-				.debt
-				.outstanding()
-				.checked_add(&state.ownerless_debt)
-				.ok_or(Error::<T>::ArithmeticOverflow)?,
+			outstanding: state.debt.outstanding(),
 			pending_interest: Self::branch_pending_interest(state, now)?,
 			active_weight: if state.is_frozen() {
-				BalanceOf::<T>::zero()
+				InterestWeight::zero()
 			} else {
-				state.debt.weighted_principal_sum
+				state.debt.weighted_principal
 			},
 		})
 	}
 
-	/// The exact pending-interest numerator one market contributes to its
-	/// stablecoin-wide aggregate, in split form.
+	/// Returns the market's exact pending-interest contribution in split form.
 	pub(crate) fn branch_pending_interest(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
 	) -> Result<PendingInterest<BalanceOf<T>>, DispatchError> {
-		let elapsed = state.interest_time(now).saturating_sub(state.debt.last_interest_time);
-		PendingInterest::from_weight_millis(state.debt.weighted_principal_sum, elapsed)
+		let tau = state.interest_time(now);
+		let elapsed = tau.saturating_sub(state.debt.last_interest_time);
+		Self::attributed_window_with_carry(state, elapsed)
+	}
+
+	/// Returns the attributed interest window with its carried subunit residue.
+	fn attributed_window_with_carry(
+		state: &BranchState<T::AccountId, BalanceOf<T>>,
+		elapsed: Millis,
+	) -> Result<PendingInterest<BalanceOf<T>>, DispatchError> {
+		let carry = PendingInterest::from_remainder(state.debt.aggregate_interest_remainder);
+		if elapsed == 0 {
+			return Ok(carry);
+		}
+		PendingInterest::from_interest_weight(state.debt.weighted_principal, elapsed)
+			.and_then(|window| window.checked_add(&carry))
 			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 	}
 
@@ -270,7 +292,7 @@ impl<T: Config> Pallet<T> {
 		let debt = StablecoinDebt::<T>::get(stable_id);
 		let elapsed = T::TimeProvider::now().saturating_sub(debt.last_update);
 		let Some(elapsed_interest) =
-			PendingInterest::from_weight_millis(debt.active_weighted_principal_sum, elapsed)
+			PendingInterest::from_interest_weight(debt.active_weighted_principal, elapsed)
 		else {
 			return BalanceOf::<T>::max_value();
 		};
@@ -490,8 +512,12 @@ impl<T: Config> Pallet<T> {
 		if config.ceiling_gap.is_zero() {
 			return false;
 		}
-		let target =
-			state.debt.principal.saturating_add(config.ceiling_gap).min(config.debt_ceiling);
+		let target = state
+			.debt
+			.principal
+			.saturating_add(state.debt.pending_redistribution_principal)
+			.saturating_add(config.ceiling_gap)
+			.min(config.debt_ceiling);
 		if target < state.effective_ceiling {
 			state.effective_ceiling = target;
 			true
@@ -544,26 +570,16 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Fully-accrued total branch debt (the TCR numerator): principal + minted
-	/// interest + pending aggregate interest + pending redistribution principal +
-	/// bad debt + ownerless debt.
+	/// interest plus the rounded-up pending numerator.
 	pub(crate) fn accrued_branch_debt(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
 	) -> BalanceOf<T> {
-		let elapsed = state.interest_time(now).saturating_sub(state.debt.last_interest_time);
-		let pending_aggregate = math::simple_interest_ceil(
-			state.debt.weighted_principal_sum,
-			FixedU128::one(),
-			elapsed,
-		);
-		state
-			.debt
-			.principal
-			.saturating_add(state.debt.minted_interest)
-			.saturating_add(pending_aggregate)
-			.saturating_add(state.debt.pending_redistribution_principal)
-			.saturating_add(state.debt.bad_debt)
-			.saturating_add(state.ownerless_debt)
+		let pending_aggregate = Self::branch_pending_interest(state, now)
+			.ok()
+			.and_then(|pending| pending.ceil())
+			.unwrap_or_else(BalanceOf::<T>::max_value);
+		state.debt.outstanding().saturating_add(pending_aggregate)
 	}
 
 	/// Compute TCR including aggregate interest accrued since the last update.
@@ -606,32 +622,83 @@ impl<T: Config> Pallet<T> {
 		if elapsed == 0 {
 			return Ok(BalanceOf::<T>::zero());
 		}
-		let new_interest = math::simple_interest_ceil(
-			state.debt.weighted_principal_sum,
-			FixedU128::one(),
-			elapsed,
-		);
+		let total = Self::attributed_window_with_carry(state, elapsed)?;
+		let new_interest = total.interest;
 		let minted_interest = state
 			.debt
 			.minted_interest
 			.checked_add(&new_interest)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		state.debt.minted_interest = minted_interest;
+		state.debt.pending_interest_attribution = state
+			.debt
+			.pending_interest_attribution
+			.checked_add(&new_interest)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		state.debt.aggregate_interest_remainder = total.remainder;
 		state.debt.last_interest_time = tau;
 		Ok(new_interest)
 	}
 
-	/// Issue `amount` of the market's coin (branch interest or an upfront
-	/// fee), let `T::YieldHook` take the Stability-Pool share, and hand the
-	/// remainder to `T::FeeHandler`.
+	/// Issues market yield and routes the remainder from `T::YieldHook` to `T::FeeAccount`.
 	pub(crate) fn mint_and_route_yield(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		amount: BalanceOf<T>,
-	) {
+	) -> DispatchResult {
 		let credit = T::StableAssets::issue(stable_id.clone(), amount);
 		let credit = T::YieldHook::distribute_yield(collateral_id, credit);
-		T::FeeHandler::on_unbalanced(credit);
+		Self::resolve_fee_credit(stable_id, credit)
+	}
+
+	/// Issues uncovered terminal rounding revenue to the fee account.
+	pub(crate) fn mint_rounding_fee(
+		stable_id: &StableIdOf<T>,
+		amount: BalanceOf<T>,
+	) -> DispatchResult {
+		Self::resolve_fee_credit(stable_id, T::StableAssets::issue(stable_id.clone(), amount))
+	}
+
+	/// Makes the fee account able to receive a one-unit credit for `stable_id`.
+	///
+	/// The fee account pays its deposit because it can outlive one market.
+	pub(crate) fn ensure_fee_account_receivable(stable_id: &StableIdOf<T>) -> DispatchResult {
+		let fee_account = T::FeeAccount::convert(stable_id.clone());
+		let can_receive_unit = || {
+			<T::StableAssets as FungiblesInspect<T::AccountId>>::can_deposit(
+				stable_id.clone(),
+				&fee_account,
+				BalanceOf::<T>::one(),
+				Provenance::Extant,
+			)
+			.into_result()
+			.is_ok()
+		};
+		if can_receive_unit() {
+			return Ok(());
+		}
+		<T::StableAssets as AccountTouch<_, _>>::touch(
+			stable_id.clone(),
+			&fee_account,
+			&fee_account,
+		)?;
+		ensure!(can_receive_unit(), Error::<T>::FeeAccountNotReceivable);
+		Ok(())
+	}
+
+	/// Resolves a fee credit to the configured fee account.
+	///
+	/// A failure aborts the transaction because the credit backs a recorded liability.
+	fn resolve_fee_credit(stable_id: &StableIdOf<T>, credit: StableCreditOf<T>) -> DispatchResult {
+		if credit.peek().is_zero() {
+			return Ok(());
+		}
+		let fee_account = T::FeeAccount::convert(stable_id.clone());
+		T::StableAssets::resolve(&fee_account, credit).map_err(|credit| {
+			drop(credit);
+			Error::<T>::FeeResolutionFailed
+		})?;
+		Ok(())
 	}
 
 	/// Project a vault touch without mutating storage.
@@ -639,62 +706,112 @@ impl<T: Config> Pallet<T> {
 		vault: &Vault<BalanceOf<T>>,
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
-	) -> PendingTouch<BalanceOf<T>> {
+	) -> Result<PendingTouch<BalanceOf<T>>, ArithmeticError> {
 		let tau = state.interest_time(now);
 		let elapsed = tau.saturating_sub(vault.last_interest_time);
-		let principal_interest =
-			math::simple_interest_floor(vault.debt.principal, vault.annual_rate, elapsed);
+		let carry = PendingInterest::from_remainder(vault.interest_remainder);
+		let principal_interest = PendingInterest::from_principal_rate_millis(
+			vault.debt.principal,
+			vault.annual_rate,
+			elapsed,
+		)
+		.and_then(|pending| pending.checked_add(&carry))
+		.ok_or(ArithmeticError::Overflow)?;
 
 		let redistribution = state.redistribution;
 		let snap = vault.redistribution_checkpoint;
-		if snap == redistribution {
-			return PendingTouch {
-				principal: BalanceOf::<T>::zero(),
-				collateral: BalanceOf::<T>::zero(),
+		let only_recipient = state.stakes.total == vault.redistribution_stake;
+		let pending_complement = !state.debt.pending_redistribution_principal.is_zero() ||
+			!state.pending_redistribution_collateral.is_zero() ||
+			!state.debt.pending_redistribution_weight.is_zero();
+		if (redistribution == snap && !(only_recipient && pending_complement)) ||
+			vault.redistribution_stake.is_zero()
+		{
+			return Ok(PendingTouch {
+				redistribution: DebtCollateral {
+					debt: BalanceOf::<T>::zero(),
+					collateral: BalanceOf::<T>::zero(),
+				},
+				attribution: RedistributionAttribution::zero(),
 				interest: principal_interest,
-			};
+			});
 		}
 
-		let delta_debt_per_stake =
-			redistribution.debt_per_stake.saturating_sub(snap.debt_per_stake);
-		let delta_collat_per_stake =
+		let delta_principal =
+			redistribution.principal_per_stake.saturating_sub(snap.principal_per_stake);
+		let delta_collateral =
 			redistribution.collateral_per_stake.saturating_sub(snap.collateral_per_stake);
-		let delta_dt_per_stake =
-			redistribution.debt_time_per_stake.saturating_sub(snap.debt_time_per_stake);
-		// Cap against the branch counter; rounding dust stays in branch aggregates.
-		let raw_principal = delta_debt_per_stake.saturating_mul_int(vault.redistribution_stake);
-		let principal = core::cmp::min(raw_principal, state.debt.pending_redistribution_principal);
-		let collateral = delta_collat_per_stake.saturating_mul_int(vault.redistribution_stake);
-		// Keep this in branch interest time, matching the liquidation writer.
-		let now_fp = FixedU128::saturating_from_integer(tau);
-		let extra_per_stake =
-			now_fp.saturating_mul(delta_debt_per_stake).saturating_sub(delta_dt_per_stake);
-		let rate_factor = vault
-			.annual_rate
-			.checked_div(&FixedU128::saturating_from_integer(pusd_primitives::MILLIS_PER_YEAR))
-			.defensive_unwrap_or_else(FixedU128::zero);
-		let redistribution_interest = extra_per_stake
-			.saturating_mul(rate_factor)
-			.saturating_mul_int(vault.redistribution_stake);
+		let delta_weight = redistribution
+			.weight_per_weighted_stake
+			.saturating_sub(snap.weight_per_weighted_stake);
+		let delta_weight_time = redistribution
+			.weight_time_per_weighted_stake
+			.checked_sub(snap.weight_time_per_weighted_stake)
+			.ok_or(ArithmeticError::Underflow)?;
+		let principal = if only_recipient {
+			state.debt.pending_redistribution_principal
+		} else {
+			delta_principal
+				.saturating_mul_int(vault.redistribution_stake)
+				.min(state.debt.pending_redistribution_principal)
+		};
+		let collateral = if only_recipient {
+			state.pending_redistribution_collateral
+		} else {
+			delta_collateral
+				.saturating_mul_int(vault.redistribution_stake)
+				.min(state.pending_redistribution_collateral)
+		};
+		let weighted_stake =
+			InterestWeight::from_principal_rate(vault.redistribution_stake, vault.annual_rate);
+		let attribution = if only_recipient {
+			RedistributionAttribution::claim(
+				state.debt.pending_redistribution_weight,
+				state.pending_redistribution_weight_time,
+				state.debt.pending_redistribution_weight,
+				state.pending_redistribution_weight_time,
+				tau,
+			)?
+		} else if let Some(weighted_stake) = weighted_stake {
+			let candidate = weighted_stake
+				.apply_redistribution_ratio(delta_weight)
+				.ok_or(ArithmeticError::Overflow)?;
+			let desired_weight_time = weighted_stake
+				.apply_weight_time_ratio(delta_weight_time)
+				.ok_or(ArithmeticError::Overflow)?;
+			RedistributionAttribution::claim(
+				candidate,
+				desired_weight_time,
+				state.debt.pending_redistribution_weight,
+				state.pending_redistribution_weight_time,
+				tau,
+			)?
+		} else {
+			RedistributionAttribution::zero()
+		};
+		let pending_redistribution_interest = attribution.pending_interest(tau)?;
+		let redistribution_interest = principal_interest
+			.checked_add(&pending_redistribution_interest)
+			.ok_or(ArithmeticError::Overflow)?;
 
-		PendingTouch {
-			principal,
-			collateral,
-			interest: principal_interest.saturating_add(redistribution_interest),
-		}
+		Ok(PendingTouch {
+			redistribution: DebtCollateral { debt: principal, collateral },
+			attribution,
+			interest: redistribution_interest,
+		})
 	}
 
-	/// A vault's fully-accrued debt after its next touch. `None` when the row
-	/// is missing.
+	/// Projects a vault's fully accrued debt from branch state accrued to `now`.
+	///
+	/// Returns `None` when the vault is missing. Each projection is independent of iteration order.
 	pub(crate) fn projected_vault_debt(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
-		state: &BranchState<T::AccountId, BalanceOf<T>>,
+		accrued_state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
 	) -> Option<BalanceOf<T>> {
-		let mut state = state.clone();
-		Self::accrue_aggregate_interest(&mut state, now).ok()?;
+		let mut state = accrued_state.clone();
 		let mut vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
 		let status = Self::vault_status_of(collateral_id, stable_id, owner);
 		Self::apply_vault_touch(&mut state, &mut vault, status, now).ok()?;
@@ -718,6 +835,7 @@ impl<T: Config> Pallet<T> {
 			debt: DebtBreakdown { principal: Zero::zero(), interest: Zero::zero() },
 			annual_rate,
 			last_interest_time: state.interest_time(now),
+			interest_remainder: 0,
 			last_rate_update: now,
 			redistribution_stake: Zero::zero(),
 			redistribution_checkpoint: state.redistribution,
@@ -726,7 +844,7 @@ impl<T: Config> Pallet<T> {
 
 	fn avg_rate(state: &BranchState<T::AccountId, BalanceOf<T>>) -> FixedU128 {
 		math::average_branch_rate(
-			state.debt.weighted_principal_sum,
+			state.debt.weighted_principal.whole,
 			state.debt.principal.saturating_add(state.debt.pending_redistribution_principal),
 		)
 	}
@@ -858,6 +976,23 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
+	/// Returns branch configuration and accrued state for a read-only projection.
+	///
+	/// The projection does not issue aggregate interest.
+	pub(crate) fn accrued_branch_view(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> Result<
+		(BranchConfig<BalanceOf<T>>, BranchState<T::AccountId, BalanceOf<T>>, Millis),
+		DispatchError,
+	> {
+		let now = T::TimeProvider::now();
+		let branch = Self::branch_of(collateral_id, stable_id)?;
+		let mut state = branch.state;
+		Self::accrue_aggregate_interest(&mut state, now)?;
+		Ok((branch.config, state, now))
+	}
+
 	/// Read and fully touch one vault into an isolated branch draft.
 	///
 	/// Views use the same transition kernel as execution, but the returned
@@ -867,14 +1002,11 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<TouchedVaultDraft<T::AccountId, BalanceOf<T>>, DispatchError> {
-		let now = T::TimeProvider::now();
-		let branch = Self::branch_of(collateral_id, stable_id)?;
-		let mut state = branch.state;
-		Self::accrue_aggregate_interest(&mut state, now)?;
+		let (config, mut state, now) = Self::accrued_branch_view(collateral_id, stable_id)?;
 		let mut vault = Self::vault_of(collateral_id, stable_id, owner)?;
 		let status = Self::vault_status_of(collateral_id, stable_id, owner);
 		Self::apply_vault_touch(&mut state, &mut vault, status, now)?;
-		Ok(TouchedVaultDraft { config: branch.config, state, vault, status })
+		Ok(TouchedVaultDraft { config, state, vault, status, now })
 	}
 
 	/// Refresh markets and vaults with the block's leftover weight, clamped to

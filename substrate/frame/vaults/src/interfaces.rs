@@ -58,8 +58,7 @@ impl<T: Config> Pallet<T> {
 		>,
 	) -> DispatchResult {
 		let mut op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), owner)?;
-		op.ensure_liquidatable()?;
-		let liquidation = op.liquidation_snapshot();
+		let liquidation = op.prepare_liquidation()?;
 		let post_touch_debt = liquidation.debt;
 		let held = op.vault().collateral;
 
@@ -89,10 +88,10 @@ impl<T: Config> Pallet<T> {
 
 		// `debt_offset <= post_touch_debt` was checked above, so the
 		// subtraction is exact.
-		op.apply_liquidation(DebtCollateral {
+		let redistribution = DebtCollateral {
 			debt: post_touch_debt.saturating_sub(debt_offset),
 			collateral: redistribution_amount,
-		})?;
+		};
 
 		if redistribution_amount.is_zero() {
 			drop(redistribution_collateral);
@@ -115,8 +114,7 @@ impl<T: Config> Pallet<T> {
 			resolve_collateral_credit::<T>(op.owner(), owner_surplus)?;
 		}
 
-		// The ratio check above applies; market mode rules do not.
-		op.commit_exempt()
+		op.finish_liquidation(redistribution)
 	}
 }
 
@@ -162,12 +160,9 @@ impl<T: Config> VaultInterface for Pallet<T> {
 	) -> Result<RedemptionStepSnapshot<BalanceOf<T>>, DispatchError> {
 		let draft = Self::touched_vault_draft(collateral_id, stable_id, owner)?;
 		ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
-		Ok(RedemptionStepSnapshot {
-			status: draft.status,
-			debt: draft.vault.debt.total(),
-			collateral: draft.vault.collateral,
-			redistribution_penalty: draft.config.redistribution_penalty,
-		})
+		Ok(draft
+			.vault
+			.redemption_snapshot(draft.status, draft.config.redistribution_penalty))
 	}
 
 	#[transactional]
@@ -182,13 +177,10 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		let mut op = VaultOp::<T>::load(collateral_id.clone(), stable_id.clone(), owner)?;
 		let snapshot = op.redemption_snapshot();
 
-		// Only the credit amount sets how much debt is cancelled. The caller
-		// sized it against a projection of the same touch; fail closed on any
-		// divergence.
+		// The owned payment determines settlement size and prevents an unsupported close request.
 		ensure!(debt_payment.asset() == *op.stable_id(), Error::<T>::InvalidRedemptionSettlement);
 		let debt_to_cancel = debt_payment.peek();
 		ensure!(!debt_to_cancel.is_zero(), Error::<T>::InvalidRedemptionSettlement);
-		ensure!(debt_to_cancel <= snapshot.debt, Error::<T>::InvalidRedemptionSettlement);
 		ensure!(
 			collateral_to_recipient <= snapshot.collateral,
 			Error::<T>::InvalidRedemptionSettlement
@@ -197,7 +189,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		// Burn the stable asset used for payment.
 		drop(debt_payment);
 
-		let payment = op.redeem(debt_to_cancel)?;
+		let payment = op.cancel_debt(debt_to_cancel)?;
 		debug_assert_eq!(payment.total(), debt_to_cancel);
 
 		if !collateral_to_recipient.is_zero() {
@@ -211,9 +203,8 @@ impl<T: Config> VaultInterface for Pallet<T> {
 				Restriction::Free,
 				Fortitude::Polite,
 			)?;
+			op.remove_collateral(collateral_to_recipient)?;
 		}
-
-		op.remove_collateral(collateral_to_recipient)?;
 		op.reconcile_after_debt_reduction()?;
 
 		Pallet::<T>::deposit_event(Event::VaultRedeemed {
@@ -230,36 +221,6 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 	fn stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {
 		Self::accrued_stablecoin_debt(stable_id)
-	}
-
-	fn heal(collateral_id: &CollateralIdOf<T>, credit: StableCreditOf<T>) -> StableCreditOf<T> {
-		// The credit's own coin selects the market's stable axis.
-		let stable_id = credit.asset();
-		let available = credit.peek();
-		let mutated = Self::try_mutate_branch_state(collateral_id, &stable_id, |_, state, _| {
-			let healable = available.min(state.debt.bad_debt);
-			state.heal_bad_debt(healable);
-			Ok(healable)
-		});
-		let healable = match mutated {
-			Ok(healable) => healable,
-			// Unknown market (or defensive aggregate failure): the helper
-			// errors before its first storage write, so nothing happened.
-			Err(_) => return credit,
-		};
-		if healable.is_zero() {
-			return credit;
-		}
-		let (to_burn, surplus) = credit.split(healable);
-		debug_assert_eq!(to_burn.peek(), healable);
-		// Burn the stable asset used to heal the debt.
-		drop(to_burn);
-		Pallet::<T>::deposit_event(Event::BadDebtHealed {
-			collateral_id: collateral_id.clone(),
-			stable_id,
-			amount: healable,
-		});
-		surplus
 	}
 }
 
