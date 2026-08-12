@@ -252,7 +252,7 @@ impl pallet_vaults::Config for Test {
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
-	type FeeHandler = ResolveAssetTo<FeeDestAccount, Assets>;
+	type FeeAccount = FeeAccounts;
 	// The pool takes its `yield_share` of every minted branch credit; the
 	// fee destination receives the remainder.
 	type YieldHook = Stability;
@@ -329,6 +329,14 @@ pub struct InsuranceFundAccounts;
 impl Convert<StableId, AccountId> for InsuranceFundAccounts {
 	fn convert(stable: StableId) -> AccountId {
 		700_000 + AccountId::from(stable)
+	}
+}
+
+/// Routes all test stablecoin vault fees to [`FEE_DEST`].
+pub struct FeeAccounts;
+impl Convert<StableId, AccountId> for FeeAccounts {
+	fn convert(_stable: StableId) -> AccountId {
+		FEE_DEST
 	}
 }
 
@@ -434,7 +442,8 @@ pub fn new_test_ext() -> TestState {
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
-			balances: (1u128..=10u128).map(|i| (i, 1_000_000_000_000)).collect(),
+			// The fee account needs native funds to pay its asset-account deposit.
+			balances: (1u128..=10u128).chain([FEE_DEST]).map(|i| (i, 1_000_000_000_000)).collect(),
 			..Default::default()
 		},
 	}
