@@ -250,24 +250,22 @@ fn par_band_head_settles_at_face_value() {
 		);
 		assert_eq!(vault_debt(DOT, PUSD, 5), 300);
 
-		// Incoming deposits are likewise accepted — the head is not below
-		// par — and settle the remaining 300 at face value:
-		// collateral_out = floor(300 / 0.5025) = 597.
-		mint_stable(PUSD, 2, 300);
-		assert_ok!(deposit(2, DOT, PUSD, 300));
+		// Full settlement includes the terminal charge. Partial settlement does not.
+		mint_stable(PUSD, 2, 301);
+		assert_ok!(deposit(2, DOT, PUSD, 301));
 		System::assert_has_event(
 			crate::Event::RecoveryOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 300,
-				collateral_gain: 597,
+				debt_burned: 301,
+				collateral_gain: 599,
 				source: crate::types::RecoveryOffsetSource::IncomingDeposit,
 			}
 			.into(),
 		);
 		assert_eq!(vault_debt(DOT, PUSD, 5), 0);
 		let row = deposit_row(DOT, PUSD, 2).expect("row created");
-		assert_eq!(row.claimable_collateral, 597);
+		assert_eq!(row.claimable_collateral, 599);
 		assert!(row.pending_deposit.is_none());
 	});
 }
@@ -305,9 +303,7 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		let state_before = pool_state(DOT, PUSD);
 		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
 
-		// used = min(800, capacity 500) = 500, burned straight from the
-		// depositor; collateral_out = floor(floor(500 * 1.03) / 0.52)
-		//                           = floor(515/0.52) = 990.
+		// Full settlement burns the depositor payment and collects the terminal charge.
 		mint_stable(PUSD, 2, 800);
 		assert_ok!(deposit(2, DOT, PUSD, 800));
 
@@ -315,8 +311,8 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 			crate::Event::RecoveryOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 500,
-				collateral_gain: 990,
+				debt_burned: 501,
+				collateral_gain: 992,
 				source: crate::types::RecoveryOffsetSource::IncomingDeposit,
 			}
 			.into(),
@@ -327,8 +323,8 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 				stable_id: PUSD,
 				depositor: 2,
 				amount: 800,
-				used_for_recovery: 500,
-				pending_amount: 300,
+				used_for_recovery: 501,
+				pending_amount: 299,
 			}
 			.into(),
 		);
@@ -337,34 +333,34 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		assert_eq!(vault_debt(DOT, PUSD, 5), 0);
 
 		let row = deposit_row(DOT, PUSD, 2).expect("row created");
-		assert_eq!(row.claimable_collateral, 990);
-		assert_eq!(row.pending_deposit.expect("leftover queued").amount, 300);
+		assert_eq!(row.claimable_collateral, 992);
+		assert_eq!(row.pending_deposit.expect("leftover queued").amount, 299);
 		assert_eq!(stable_balance(PUSD, 2), 0);
 
 		// The used portion never entered the pool's stablecoin balance and
 		// never touched the accumulators (invariant 7).
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 400);
-		assert_eq!(state.total_pending_deposits, 300);
-		assert_eq!(state.total_collateral_gains_unclaimed, 990);
+		assert_eq!(state.total_pending_deposits, 299);
+		assert_eq!(state.total_collateral_gains_unclaimed, 992);
 		assert_eq!(state.coords.p, state_before.coords.p);
 		assert_eq!(state.coords.epoch, state_before.coords.epoch);
 		assert_eq!(state.coords.scale, state_before.coords.scale);
 		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), sums_before);
 		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 700);
-		assert_eq!(collateral_balance(DOT, pool), 990);
+		assert_eq!(stable_balance(PUSD, pool), 699);
+		assert_eq!(collateral_balance(DOT, pool), 992);
 
 		// With the head gone, a follow-up deposit queues normally.
 		mint_stable(PUSD, 2, 100);
 		assert_ok!(deposit(2, DOT, PUSD, 100));
 		let row = deposit_row(DOT, PUSD, 2).expect("row kept");
-		assert_eq!(row.pending_deposit.expect("merged").amount, 400);
+		assert_eq!(row.pending_deposit.expect("merged").amount, 399);
 
 		// The direct credit is claimable through the normal path.
 		let before = collateral_balance(DOT, 2);
 		assert_ok!(claim_collateral(2, DOT, PUSD, 2));
-		assert_eq!(collateral_balance(DOT, 2) - before, 990);
+		assert_eq!(collateral_balance(DOT, 2) - before, 992);
 	});
 }
 
