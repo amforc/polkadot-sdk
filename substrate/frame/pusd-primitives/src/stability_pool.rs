@@ -46,18 +46,6 @@ pub trait StabilityPoolInspect<CollateralId, StableId, Balance> {
 		max_debt: Balance,
 		active_debt: Balance,
 	) -> Balance;
-
-	/// Returns whether the pool's custody can accept `amount` of collateral gain.
-	///
-	/// The first gain an offset resolves may have to create the pool's collateral account, and
-	/// an amount below the asset's minimum balance cannot. Callers check the first non-zero
-	/// collateral leg before committing to a plan; on `false` they drop both pool legs so the
-	/// rest of the liquidation waterfall carries the debt instead of the offset failing.
-	fn can_receive_collateral(
-		collateral_id: &CollateralId,
-		stable_id: &StableId,
-		amount: Balance,
-	) -> bool;
 }
 
 /// Applies a liquidation offset to one Stability Pool market.
@@ -76,9 +64,7 @@ pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit>
 	/// The function returns an error if one equality does not hold. On success, the pool burns the
 	/// specified stablecoin debt. The caller reduces vault debt by the same amounts.
 	///
-	/// Settlement also fails when the pool's custody cannot accept a collateral leg. Callers
-	/// avoid this by checking [`StabilityPoolInspect::can_receive_collateral`] with the first
-	/// non-zero collateral leg before committing to a plan.
+	/// Branch registration prepares pool custody for all nonzero collateral credits.
 	///
 	/// TODO: The function consumes the collateral credits even when it returns an error, so it must
 	/// run inside a storage transaction that restores them on rollback. Implementations must
@@ -104,10 +90,6 @@ impl<CollateralId, StableId, Balance: Zero> StabilityPoolInspect<CollateralId, S
 
 	fn reducible_pending(_: &CollateralId, _: &StableId, _: Balance, _: Balance) -> Balance {
 		Balance::zero()
-	}
-
-	fn can_receive_collateral(_: &CollateralId, _: &StableId, _: Balance) -> bool {
-		false
 	}
 }
 
