@@ -1,7 +1,7 @@
 //! Implementations for pallet extrinsics.
 
 use crate::{
-	context::{CloseOutcome, VaultOp},
+	context::VaultOp,
 	pallet::{
 		AssetRoles, BalanceOf, Branches, CollateralIdOf, CollateralRisks, Config, Error, Event,
 		HoldReason, Pallet, StableIdOf, Vaults,
@@ -108,7 +108,7 @@ impl<T: Config> Pallet<T> {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
 		if op.apply_collateral_withdrawal(amount)? {
-			return Self::close_inner(op, &recipient);
+			return op.finish_close(&recipient);
 		}
 
 		T::CollateralAssets::transfer_on_hold(
@@ -168,8 +168,15 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
-		// Never burn more than the current debt.
-		let repay = op.repayment_amount(amount);
+		let debt_before_terminal = op.vault().debt.total();
+		let full_payoff = debt_before_terminal
+			.checked_add(&op.vault().terminal_interest_charge())
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		// The live repayment must not exceed the requested amount or payoff.
+		let repay = amount.min(full_payoff);
+		if repay >= debt_before_terminal {
+			ensure!(amount >= full_payoff, Error::<T>::PayoffExceedsMaximum);
+		}
 		T::StableAssets::burn_from(
 			op.stable_id().clone(),
 			&from,
@@ -195,7 +202,7 @@ impl<T: Config> Pallet<T> {
 		// Close a fully repaid vault when it has no collateral left.
 		if new_total.is_zero() && op.vault().collateral.is_zero() {
 			op.load_price()?;
-			return Self::close_inner(op, &owner);
+			return op.finish_close(&owner);
 		}
 
 		op.reconcile_after_debt_reduction()?;
@@ -229,46 +236,7 @@ impl<T: Config> Pallet<T> {
 		let op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
 		let recipient = recipient.unwrap_or(owner);
 
-		Self::close_inner(op, &recipient)
-	}
-
-	/// Closes a vault and returns its collateral.
-	fn close_inner(mut op: VaultOp<T>, recipient: &T::AccountId) -> DispatchResult {
-		let CloseOutcome { collateral, branch_empties, orphan_debt } = op.detach_for_close()?;
-
-		if !collateral.is_zero() {
-			T::CollateralAssets::transfer_on_hold(
-				op.collateral_id().clone(),
-				&HoldReason::VaultCollateral.into(),
-				op.owner(),
-				recipient,
-				collateral,
-				Precision::Exact,
-				Restriction::Free,
-				Fortitude::Polite,
-			)?;
-		}
-
-		if !orphan_debt.is_zero() {
-			Self::deposit_event(Event::BadDebtRecorded {
-				collateral_id: op.collateral_id().clone(),
-				stable_id: op.stable_id().clone(),
-				amount: orphan_debt,
-			});
-		}
-		Self::deposit_event(Event::VaultClosed {
-			collateral_id: op.collateral_id().clone(),
-			stable_id: op.stable_id().clone(),
-			owner: op.owner().clone(),
-			recipient: recipient.clone(),
-			collateral,
-		});
-		// Closing the last liable vault may reduce the TCR.
-		if branch_empties {
-			op.commit_exempt()
-		} else {
-			op.commit_checked()
-		}
+		op.finish_close(&recipient)
 	}
 
 	/// Moves the last unsafe eligible vault into final recovery.
@@ -405,6 +373,7 @@ impl<T: Config> Pallet<T> {
 			},
 			None => None,
 		};
+		Self::ensure_fee_account_receivable(&stable_id)?;
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		frame_system::Pallet::<T>::inc_providers(&redistribution_account);
 		let now = T::TimeProvider::now();
@@ -443,9 +412,7 @@ impl<T: Config> Pallet<T> {
 			remaining_stablecoin_markets,
 		)?;
 		let removed_outstanding = Branches::<T>::take(&collateral_id, &stable_id)
-			.map(|removed| {
-				removed.state.debt.outstanding().saturating_add(removed.state.ownerless_debt)
-			})
+			.map(|removed| removed.state.debt.outstanding())
 			.unwrap_or_default();
 		defensive_assert!(
 			removed_outstanding.is_zero(),
@@ -582,7 +549,7 @@ impl<T: Config> Pallet<T> {
 			})?;
 		// Mint interest only after storing the updated market.
 		if !minted.is_zero() {
-			Self::mint_and_route_yield(collateral_id, stable_id, minted);
+			Self::mint_and_route_yield(collateral_id, stable_id, minted)?;
 		}
 		Self::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),

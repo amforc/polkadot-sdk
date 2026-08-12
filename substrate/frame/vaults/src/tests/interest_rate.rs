@@ -599,13 +599,7 @@ fn redemption_full_state_changes() {
 	});
 }
 
-// Fee routing, end to end. The upfront fee is minted and handed whole to the
-// mock's `DealWithFees`, which splits per `SpFeeShare`: the SP share is
-// dropped (rescinding its mint) and the residual resolves to `FEE_DEST`. So
-// `total_issuance` grows by the borrow amount plus that routed residual (the
-// dropped SP share nets to zero), and we can pin the exact fee that reaches
-// the destination in pUSD. The fee is also recorded as debt on
-// `state.debt.minted_interest` and `vault.debt.interest`.
+// The routed fee must match vault debt, market debt, and the net issuance increase.
 #[test]
 fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 	build_and_execute(|| {
@@ -618,7 +612,7 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(10, 100)));
 
-		// `DealWithFees` takes the `SpFeeShare` cut; the residual reaches FEE_DEST.
+		// Only the residual fee increases issuance in this mock.
 		let sp_share = SpFeeShare::get() * predicted_fee;
 		let fee_residual = predicted_fee - sp_share;
 		assert_eq!(
@@ -637,15 +631,9 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 	});
 }
 
-// Liquidate vault C, then permissionlessly poke A's vault — A absorbs C's debt
-// and collateral via redistribution, so A's debt grows by its accrued interest
-// plus its redistribution share. The redistribution interest is accrued
-// per-stake with floor rounding, so rather than reconstruct the exact figure
-// here we pin the invariant that matters: A's debt never decreases across a
-// liquidation+redistribution cycle. (`redistribution_accounting.rs` pins the
-// exact aggregate figures.)
+// A later permissionless touch must not reduce an assigned redistribution share.
 #[test]
-fn poke_after_liquidation_applies_redistribution_gains() {
+fn liquidation_assigns_redistribution_before_later_poke() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(25, 100)));
@@ -667,39 +655,17 @@ fn poke_after_liquidation_applies_redistribution_gains() {
 	});
 }
 
-// Accrued simple interest is path-independent up to per-poke floor dust: poking
-// a vault repeatedly over a window accrues the same interest as a single poke at
-// the end, minus at most one base unit of floor rounding per intermediate poke.
-// (Interest accrues on a fixed principal — accrued interest is not folded back
-// into principal — so it never compounds.)
 #[test]
-fn accrued_interest_is_path_independent_across_pokes() {
+fn long_idle_exact_interest_has_no_terminal_charge() {
+	use pusd_primitives::VaultInterface;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		// Two identical vaults with a large principal so the daily floor dust is a
-		// negligible fraction. Acct 1 is poked daily; acct 2 only once at the end.
-		assert_ok!(open(1, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
-		let base1 = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest;
-		let base2 = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.interest;
-
-		const DAYS: u64 = 10;
-		for _ in 0..DAYS {
-			advance_time(ONE_DAY_MS);
-			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		}
-		// One poke over the whole window.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
-
-		let many = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest - base1;
-		let once = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.interest - base2;
-		// Exact: each daily poke accrues floor(1e6 * 0.5 * 1day / year) = 1_368, so ten
-		// pokes give 13_680; a single poke over ten days accrues
-		// floor(1e6 * 0.5 * 10days / year) = 13_689. Frequent poking loses exactly 9
-		// units to per-poke flooring (bounded by one unit per intermediate poke).
-		assert_eq!(many, 13_680, "ten daily pokes: 10 * floor(1e6 * 0.5 * 1day / year)");
-		assert_eq!(once, 13_689, "one poke over ten days: floor(1e6 * 0.5 * 10days / year)");
-		assert!(once - many <= DAYS as u128, "floor dust bounded by one unit per poke");
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
+		advance_time(10 * pusd_primitives::MILLIS_PER_YEAR);
+		let snapshot =
+			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
+		assert_eq!(snapshot.debt, 1_502);
+		assert_eq!(snapshot.terminal_interest_charge, 0);
 	});
 }
 
@@ -717,9 +683,8 @@ fn open_fee_matches_post_open_average_rate_closed_form() {
 		let config = branch_config(DOT, PUSD).unwrap();
 		let new_debt: Balance = 1_000;
 		let new_rate = rate_pct(10, 100);
-		let total_ib =
-			state.debt.principal + state.debt.pending_redistribution_principal + new_debt;
-		let weighted = state.debt.weighted_principal_sum + new_rate.saturating_mul_int(new_debt);
+		let total_ib = state.debt.principal + new_debt;
+		let weighted = state.debt.weighted_principal.whole + new_rate.saturating_mul_int(new_debt);
 		let avg = crate::math::average_branch_rate(weighted, total_ib);
 		let expected = crate::math::simple_interest_ceil(new_debt, avg, config.upfront_fee_period);
 		assert!(expected > 0);
@@ -733,4 +698,34 @@ fn open_fee_matches_post_open_average_rate_closed_form() {
 		let vault = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
 		assert_eq!(vault.debt.interest, expected, "charged fee matches the quote");
 	});
+}
+
+// Touch frequency must not change vault debt, market debt, or total issuance.
+#[test]
+fn poke_cadence_cannot_change_accrued_state() {
+	let run = |poke_gaps_ms: &[Moment]| {
+		new_test_ext().execute_with(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
+			assert_ok!(open(2, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
+			let base1 = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest;
+			let base2 = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.interest;
+			for gap in poke_gaps_ms {
+				advance_time(*gap);
+				assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+			}
+			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
+
+			let vault_1 = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+			let vault_2 = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
+			// Both schedules cover the same ten-day simple-interest period.
+			assert_eq!(vault_1.debt.interest - base1, 13_689);
+			assert_eq!(vault_2.debt.interest - base2, 13_689);
+			let state = branch_state(DOT, PUSD).unwrap();
+			assert_eq!(state.debt.pending_interest_attribution, 0);
+			assert_eq!(state.debt.minted_interest, vault_1.debt.interest + vault_2.debt.interest);
+			(state, vault_1, vault_2)
+		})
+	};
+	assert_eq!(run(&[ONE_DAY_MS; 10]), run(&[10 * ONE_DAY_MS]));
 }

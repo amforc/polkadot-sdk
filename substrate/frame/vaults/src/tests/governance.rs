@@ -533,28 +533,6 @@ fn set_ceiling_knobs_apply_within_envelope() {
 	});
 }
 
-// A market with residual bad debt cannot be removed, even with no vaults, stake,
-// or principal left — the bad debt is still an unbacked liability.
-#[test]
-fn remove_branch_rejected_while_bad_debt_remains() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		mutate_branch_state(DOT, PUSD, |state| {
-			state.debt.bad_debt = 1;
-		});
-		assert_noop!(
-			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
-			Error::<Test>::BranchNotEmpty
-		);
-		// Once the bad debt is cleared, the empty market is removable.
-		mutate_branch_state(DOT, PUSD, |state| {
-			state.debt.bad_debt = 0;
-		});
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert!(!market_exists(DOT, PUSD));
-	});
-}
-
 // A market still holding collateral in its redistribution account cannot be
 // removed — the collateral would be stranded with no path left to reach it.
 #[test]
