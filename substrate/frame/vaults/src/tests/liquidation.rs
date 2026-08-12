@@ -102,11 +102,12 @@ fn full_redistribution_without_surplus() {
 		// owner keeps nothing rather than the 16 a 5%-priced seizure would have
 		// left.
 		assert_eq!(Balances::free_balance(1), GENESIS_BALANCE - 600);
-		// Resolution collateral 488 is held by the redistribution account.
+		// Redistribution collateral remains in custody until the recipient is touched.
 		let redistribution = Vaults::redistribution_account(&DOT, &PUSD);
 		assert_eq!(held(DOT, redistribution), 488);
 		// No stability capital was touched.
 		assert_eq!(Balances::free_balance(SP_ACCOUNT), GENESIS_BALANCE);
+		assert_eq!(SpOffsetCalls::get(), 0, "a pure redistribution must not call the pool");
 
 		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 488], 112, 0));
 	});
@@ -152,17 +153,12 @@ fn redistribution_with_collateral_below_debt() {
 		assert_eq!(Balances::free_balance(KEEPER), GENESIS_BALANCE + 143);
 		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 457], 143, 0));
 
-		// The recipient inherits 500 of debt against 457 of collateral worth
-		// only floor(457 * 0.7) = 319; both shares divide the 2_000 stake
-		// exactly, and no bad debt is recorded — vault 2's CR carries the loss.
-		// Its own debt is 501: 500 of principal plus the 1 upfront fee its
-		// 0.2% rate paid at open.
+		// The recipient must own the complete redistributed shortfall after its touch.
 		assert_ok!(Vaults::poke(RuntimeOrigin::signed(KEEPER), DOT, PUSD, 2));
 		let vault = crate::Vaults::<Test>::get((DOT, PUSD, 2)).expect("recipient remains");
 		assert_eq!(vault.debt.total(), 501 + 500);
 		assert_eq!(vault.collateral, 2_457);
 		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 0);
-		assert_eq!(branch_state(DOT, PUSD).expect("branch state").debt.bad_debt, 0);
 	});
 }
 
@@ -183,6 +179,23 @@ fn debt_includes_accrued_interest() {
 		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 488);
 
 		assert_liquidated_event(outcome([0, 0, 0, 505], [0, 0, 0, 488], 112, 0));
+	});
+}
+
+#[test]
+fn terminal_interest_enters_the_waterfall_before_redistribution() {
+	build_and_execute(|| {
+		SpFeeShare::set(Permill::from_percent(100));
+		setup_underwater_vault();
+		advance_time(1);
+		let fee_before = stable_balance(PUSD, FEE_DEST);
+
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
+
+		// Liquidation must include the terminal interest unit.
+		assert_liquidated_event(outcome([0, 0, 0, 501], [0, 0, 0, 488], 112, 0));
+		// Only terminal interest increases fee-account revenue.
+		assert_eq!(stable_balance(PUSD, FEE_DEST), fee_before + 1);
 	});
 }
 
@@ -207,6 +220,12 @@ fn active_pool_precedes_jit() {
 		assert_eq!(Balances::free_balance(1), GENESIS_BALANCE - 600 + 16);
 		// 500 of the 1_000 mocked capacity was consumed.
 		assert_eq!(ActiveSpCapacity::get(), 500);
+		assert_eq!(
+			PendingSpInspectionCalls::get(),
+			0,
+			"a full active offset must not inspect pending capacity"
+		);
+		assert_eq!(SpOffsetCalls::get(), 1, "the non-zero active leg settles once");
 
 		assert_liquidated_event(outcome([500, 0, 0, 0], [472, 0, 0, 0], 112, 16));
 	});
@@ -587,17 +606,12 @@ fn branch_below_par_still_liquidates() {
 		assert!(crate::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
 		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 475], 125, 0));
 
-		// Over vault 2's 600 stake the per-stake fixed-point floors once each
-		// way: it inherits floor(500/600 * 600) = 499 of debt (1 goes to
-		// ownerless debt) and floor(475/600 * 600) = 474 of collateral (1 stays
-		// with the redistribution account). Its own debt is 501: 500 of
-		// principal plus the 1 upfront fee its 0.2% rate paid at open.
+		// The sole recipient must receive the complete redistributed debt and collateral.
 		assert_ok!(Vaults::poke(RuntimeOrigin::signed(KEEPER), DOT, PUSD, 2));
 		let vault = crate::Vaults::<Test>::get((DOT, PUSD, 2)).expect("recipient remains");
-		assert_eq!(vault.debt.total(), 501 + 499);
-		assert_eq!(vault.collateral, 600 + 474);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 1);
-		assert_eq!(branch_state(DOT, PUSD).expect("branch state").ownerless_debt, 1);
+		assert_eq!(vault.debt.total(), 501 + 500);
+		assert_eq!(vault.collateral, 600 + 475);
+		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 0);
 
 		// Vault 2 is now deeper under water, but as the last stake-bearer it
 		// takes the final-recovery path, not another liquidation.
@@ -779,7 +793,6 @@ fn redistribution_outpays_offsets() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(200);
-
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		let sp = Balances::free_balance(SP_ACCOUNT) - GENESIS_BALANCE;
