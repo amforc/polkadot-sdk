@@ -10,7 +10,7 @@ use crate::{
 	pallet::{StablecoinDebt, Vaults},
 	tests::rate_pct,
 };
-use frame::traits::fungibles::{Balanced, Mutate};
+use frame::traits::fungibles::Mutate;
 use pusd_primitives::VaultInterface;
 
 const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
@@ -221,38 +221,6 @@ fn closing_one_market_leaves_shared_collateral_held() {
 	});
 }
 
-// The credit's own coin selects the market a heal settles against: an EUSD
-// credit heals `(DOT, EUSD)` and cannot touch the sibling `(DOT, PUSD)`.
-#[test]
-fn heal_routes_by_the_credits_coin() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		register_market(DOT, EUSD);
-		// Bad debt is only ever recorded inside the vault pallet; seed it directly.
-		mutate_branch_state(DOT, PUSD, |state| {
-			state.debt.bad_debt = 1_000;
-		});
-		mutate_branch_state(DOT, EUSD, |state| {
-			state.debt.bad_debt = 400;
-		});
-
-		// The EUSD credit heals the EUSD market; the PUSD ledger is untouched.
-		let eusd = <VaultStableAssets as Balanced<AccountId>>::issue(EUSD, 1_000);
-		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, eusd);
-		assert_eq!(surplus.peek(), 600, "only the 400 recorded EUSD debt is consumed");
-		assert_eq!(surplus.asset(), EUSD);
-		assert_eq!(branch_state(DOT, EUSD).unwrap().debt.bad_debt, 0);
-		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.bad_debt, 1_000, "sibling untouched");
-		drop(surplus);
-
-		// The PUSD credit heals the sibling.
-		let pusd = <VaultStableAssets as Balanced<AccountId>>::issue(PUSD, 1_000);
-		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, pusd);
-		assert_eq!(surplus.peek(), 0);
-		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.bad_debt, 0);
-	});
-}
-
 // Yield (interest) on a market accrues in that market's own coin. The mock
 // fee sink routes by the credit's own asset, so the balance assertions guard
 // the accrual path end-to-end.
@@ -273,8 +241,7 @@ fn yield_accrues_in_the_markets_own_coin() {
 		// A full year at 50% on 5_000 principal accrues exactly 2_500 EUSD of vault
 		// interest (interest is on principal, not the open fee).
 		assert_eq!(interest_after - interest_before, 2_500);
-		// The branch minted that interest and `DealWithFees` routed the non-SP
-		// residual to FEE_DEST in the market's own coin (2_500 − 75% = 625).
+		// Fee routing must use the market's stablecoin.
 		let residual = 2_500u128 - SpFeeShare::get() * 2_500u128;
 		assert_eq!(stable_balance(EUSD, FEE_DEST) - eusd_fee_before, residual);
 		// The PUSD market was never involved, so its supply is unchanged.

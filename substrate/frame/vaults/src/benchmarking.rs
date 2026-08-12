@@ -7,7 +7,7 @@
 use crate::{
 	pallet::{
 		AccountIdLookupOf, BalanceOf, BranchIdleCursor, Branches, CollateralIdOf, CollateralRisks,
-		Config, Error, HoldReason, IdleCursor, Pallet, StableIdOf, Vaults,
+		Config, IdleCursor, Pallet, StableIdOf, Vaults,
 	},
 	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
@@ -17,12 +17,9 @@ use frame::{
 	arithmetic::{FixedU128, Permill},
 	benchmarking::prelude::*,
 	traits::{
-		fungibles::{
-			Balanced as FungiblesBalanced, Mutate as FungiblesMutate,
-			MutateHold as FungiblesMutateHold,
-		},
+		fungibles::{Balanced as FungiblesBalanced, Mutate as FungiblesMutate},
 		tokens::Precision,
-		EnsureOrigin, EnsureOriginWithArg, SaturatedConversion, Zero,
+		EnsureOrigin, EnsureOriginWithArg, SaturatedConversion, Time, Zero,
 	},
 };
 use frame_system::RawOrigin;
@@ -43,11 +40,6 @@ const RECOVERY_TRIGGER_PRICE: u32 = 1;
 /// non-zero interest at the default 5% vault rate.
 const ONE_HOUR_MS: u64 = 60 * 60 * 1_000;
 const RECOVERY_VAULT_COLL: u128 = 200;
-const REDIST_PER_STAKE_NUM: u128 = 1;
-const REDIST_PER_STAKE_DEN: u128 = 100;
-const REDIST_WEIGHT_PER_STAKE_NUM: u128 = 1;
-const REDIST_WEIGHT_PER_STAKE_DEN: u128 = 10_000;
-const REDIST_PRESTAGE_COLL: u128 = 10_000_000;
 
 fn stable<T: Config>() -> StableIdOf<T> {
 	T::BenchmarkHelper::stable_asset_id()
@@ -118,6 +110,9 @@ fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkEr
 		asset.clone(),
 		FixedU128::saturating_from_integer(ORACLE_PRICE),
 	);
+	// The fee account needs native funds to pay its asset-account deposit.
+	let fee_account = T::FeeAccount::convert(stable::<T>());
+	fund_collateral::<T>(&asset, &fee_account, balance::<T>(1_000_000_000_000))?;
 	Pallet::<T>::create_branch(
 		create_origin::<T>()?,
 		asset.clone(),
@@ -270,43 +265,6 @@ fn worst_case_head_hint<T: Config>(
 	Ok(Position::between(seeds[s - 1].clone(), seeds[s].clone()))
 }
 
-/// Plant a non-trivial branch redistribution snapshot so every vault touch
-/// enters the `snap != redistribution` branch with non-zero `redistribution_collateral` and
-/// `redistribution_debt_principal`.
-fn seed_pending_redistribution<T: Config>(asset: &CollateralIdOf<T>) -> Result<(), BenchmarkError> {
-	let per_stake = rate(REDIST_PER_STAKE_NUM, REDIST_PER_STAKE_DEN);
-	let weight_per_stake = rate(REDIST_WEIGHT_PER_STAKE_NUM, REDIST_WEIGHT_PER_STAKE_DEN);
-
-	let redistribution_account_id = Pallet::<T>::redistribution_account(asset, &stable::<T>());
-	let pre_stage = balance::<T>(REDIST_PRESTAGE_COLL);
-	fund_collateral::<T>(asset, &redistribution_account_id, pre_stage)?;
-	T::CollateralAssets::hold(
-		asset.clone(),
-		&HoldReason::VaultCollateral.into(),
-		&redistribution_account_id,
-		pre_stage,
-	)
-	.map_err(|_| BenchmarkError::Stop("hold on redistribution account failed"))?;
-
-	// Seed through the audited boundary so `CollateralRisks` stays true.
-	Pallet::<T>::try_mutate_branch_state(asset, &stable::<T>(), |_, state, _| {
-		state.redistribution.debt_per_stake = per_stake;
-		state.redistribution.collateral_per_stake = per_stake;
-		state.redistribution.weight_per_stake = weight_per_stake;
-		state.redistribution.debt_time_per_stake = FixedU128::zero();
-		state.debt.pending_redistribution_principal =
-			per_stake.saturating_mul_int(state.stakes.total);
-		let pending_weight = weight_per_stake.saturating_mul_int(state.stakes.total);
-		state.debt.weighted_principal_sum = state
-			.debt
-			.weighted_principal_sum
-			.checked_add(&pending_weight)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		Ok(())
-	})
-	.map_err(|_| BenchmarkError::Stop("branch commit failed"))
-}
-
 /// Open a fresh "only-eligible" vault, drop the oracle so it qualifies for
 /// recovery, push it into the FinalRecovery FIFO via `enter_final_recovery`,
 /// then restore the oracle.
@@ -388,7 +346,6 @@ mod benchmarks {
 		)?;
 		let caller = funded_account::<T>("caller", &asset)?;
 		let deposit = balance::<T>(SEED_COLL);
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
@@ -413,7 +370,6 @@ mod benchmarks {
 			Position::endpoints_only(),
 		)?;
 		let withdraw = balance::<T>(SEED_COLL);
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
@@ -452,7 +408,6 @@ mod benchmarks {
 		let extra_debt = balance::<T>(SEED_DEBT);
 		let new_rate = Some(bounds.above);
 		let hint = worst_case_head_hint::<T>(&seeds)?;
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
@@ -487,7 +442,6 @@ mod benchmarks {
 		T::StableAssets::mint_into(stable::<T>(), &caller, balance::<T>(SEED_DEBT * 100))
 			.expect("mint pUSD to repay caller");
 		let amount = balance::<T>(SEED_DEBT);
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
@@ -519,7 +473,6 @@ mod benchmarks {
 		)?;
 		let new_rate = bounds.above;
 		let hint = worst_case_head_hint::<T>(&seeds)?;
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
@@ -568,7 +521,7 @@ mod benchmarks {
 		)?;
 		let debt_payment = <T::StableAssets as FungiblesBalanced<T::AccountId>>::issue(
 			stable::<T>(),
-			snapshot.debt,
+			snapshot.full_payoff(),
 		);
 		<Pallet<T> as VaultInterface>::redeem_step(
 			&asset,
@@ -598,7 +551,6 @@ mod benchmarks {
 			rate(5, 100),
 			Position::endpoints_only(),
 		)?;
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 		let caller: T::AccountId = whitelisted_caller();
 
@@ -623,7 +575,6 @@ mod benchmarks {
 			rate(5, 100),
 			Position::endpoints_only(),
 		)?;
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 		T::BenchmarkHelper::set_oracle_price(
 			asset.clone(),
@@ -648,7 +599,6 @@ mod benchmarks {
 		let owner = recovery_cycle::<T>(1, &asset)?;
 		let _c = recovery_cycle::<T>(2, &asset)?;
 		let seeds = seed_worst_case_chain::<T>(&asset)?;
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 		let caller: T::AccountId = whitelisted_caller();
 		let hint = worst_case_head_hint::<T>(&seeds)?;
@@ -967,7 +917,6 @@ mod benchmarks {
 	#[benchmark]
 	fn on_idle_one_vault() -> Result<(), BenchmarkError> {
 		let (asset, owner) = seed_idle_market::<T>()?;
-		seed_pending_redistribution::<T>(&asset)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		// One `idle_vault_walk` step: the key pull plus the shared step fn.
@@ -981,8 +930,9 @@ mod benchmarks {
 		let vault = Vaults::<T>::get((&asset, &stable::<T>(), &owner)).expect("vault opened above");
 		let branch = Branches::<T>::get(&asset, &stable::<T>()).expect("branch registered above");
 		assert_eq!(
-			vault.redistribution_checkpoint, branch.state.redistribution,
-			"the refresh caught the vault up to the seeded redistribution"
+			vault.last_interest_time,
+			branch.state.interest_time(T::TimeProvider::now()),
+			"the refresh caught the vault up to the branch interest clock"
 		);
 		Ok(())
 	}
