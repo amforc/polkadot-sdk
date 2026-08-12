@@ -309,7 +309,7 @@ impl<T: Config> Pallet<T> {
 			return if snapshot.status.is_dormant() { Step::Stop } else { Step::Skip };
 		}
 
-		let debt = snapshot.debt.min(budget);
+		let debt = snapshot.size_within(budget);
 		if debt.is_zero() {
 			return Step::Stop;
 		}
@@ -406,7 +406,8 @@ impl<T: Config> Pallet<T> {
 		max_stable_in: BalanceOf<T>,
 		spendable: BalanceOf<T>,
 	) -> BalanceOf<T> {
-		let max_debt = max_stable_in.min(fee_inputs.stablecoin_debt);
+		// Aggregate debt can exclude a terminal charge. The caller's budget must limit the walk.
+		let max_debt = max_stable_in;
 		fees::max_debt_for_budget(spendable, max_debt, |debt| {
 			fees::redemption_fee(debt, Self::charged_fee_rate(config, fee_inputs, debt))
 		})

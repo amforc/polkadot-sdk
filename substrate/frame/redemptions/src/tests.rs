@@ -915,6 +915,34 @@ fn insurance_adjusted_settlement_with_partial_fund() {
 	});
 }
 
+/// A partial settlement with zero market debt must not draw Insurance Fund cover.
+#[test]
+fn partial_fill_with_zero_market_cancel_debt_pays_no_cover() {
+	build_and_execute(|| {
+		let snapshot = pusd_primitives::RedemptionStepSnapshot {
+			status: pusd_primitives::VaultStatus::FinalRecovery,
+			debt: 400,
+			terminal_interest_charge: 1,
+			collateral: 100,
+			redistribution_penalty: Permill::zero(),
+		};
+		// A zero budget selects the partial branch after collateral value floors to zero.
+		mint_stable(PUSD, insurance_account(PUSD), 400);
+		let price = FixedU128::from_rational(1u128, 1_000_000u128);
+		let plan = Redemptions::price_recovery(
+			&PUSD,
+			&snapshot,
+			price,
+			0,
+			&DefaultRedemptionConfig::get(),
+		)
+		.expect("prices");
+		assert_eq!(plan.debt(), 0);
+		assert_eq!(plan.insurance_cover(), 0, "partial fill must leave the fund untouched");
+		assert_eq!(plan.regime(), RecoveryRegime::InsuranceAdjusted);
+	});
+}
+
 #[test]
 fn insurance_adjusted_settlement_with_empty_fund() {
 	build_and_execute(|| {
@@ -1103,6 +1131,54 @@ fn preview_redeem_quotes_without_side_effects() {
 		assert_eq!(preview.fee, 42);
 		// Quoting projects the pending touch without applying it.
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
+	});
+}
+
+#[test]
+fn preview_and_execution_include_terminal_charge_only_for_full_step() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 2_000, 500, rate_pct(10, 100)));
+		mint_stable(PUSD, 5, 10_000);
+		advance_time(1);
+
+		let snapshot = Vaults::project_redemption_snapshot(&DOT, &PUSD, &1).unwrap();
+		assert_eq!(snapshot.terminal_interest_charge, 1);
+		let quote = Redemptions::preview_redeem(DOT, PUSD, 10_000, 1).unwrap();
+		assert_eq!(quote.steps, 1);
+		assert_eq!(quote.debt_cancelled, snapshot.debt + 1);
+
+		let stable_before = Assets::balance(PUSD, 5);
+		let collateral_before = collateral_balance(DOT, 6);
+		assert_ok!(redeem(5, DOT, PUSD, 10_000, quote.collateral_out, 6, 1));
+		assert_eq!(stable_before - Assets::balance(PUSD, 5), quote.stable_in());
+		assert_eq!(collateral_balance(DOT, 6) - collateral_before, quote.collateral_out);
+		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
+	});
+}
+
+// A partial payment must preserve the terminal charge for the surviving vault.
+#[test]
+fn partial_redemption_with_terminal_remainder_caps_below_base_debt() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 2_000, 500, rate_pct(10, 100)));
+		mint_stable(PUSD, 5, 10_000);
+		advance_time(1);
+
+		let snapshot = Vaults::project_redemption_snapshot(&DOT, &PUSD, &1).unwrap();
+		assert_eq!(snapshot.terminal_interest_charge, 1);
+		let quote = Redemptions::preview_redeem(DOT, PUSD, snapshot.debt, 1).unwrap();
+		assert_eq!(quote.steps, 1);
+		assert_eq!(quote.debt_cancelled, snapshot.debt - 1);
+
+		let stable_before = Assets::balance(PUSD, 5);
+		assert_ok!(redeem(5, DOT, PUSD, snapshot.debt, 0, 6, 1));
+		assert_eq!(stable_before - Assets::balance(PUSD, 5), quote.stable_in());
+		assert_eq!(vault_debt(DOT, PUSD, 1), 1);
+		// The final settlement must collect the preserved terminal charge.
+		let after = Vaults::project_redemption_snapshot(&DOT, &PUSD, &1).unwrap();
+		assert_eq!(after.terminal_interest_charge, 1);
 	});
 }
 
@@ -1512,21 +1588,20 @@ fn liquidate_redistribute_all(owner: AccountId) {
 	.expect("liquidation succeeds");
 }
 
+// Debt-free husks stay redistribution-eligible, so a full wipe never leaves a sole stake bearer
+// to absorb sub-resolution residue: execution reproduces the quote exactly and the complement
+// stays pending until only one stake bearer remains.
 #[test]
-fn quote_matches_execution_across_redistribution_rounds() {
+fn full_wipe_execution_matches_the_quote_and_leaves_the_pending_complement() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		// Distinct stakes and rates so per-stake redistribution shares floor
-		// non-trivially per recipient.
+		// Distinct stakes and rates create allocation residue.
 		assert_ok!(open(1, DOT, PUSD, 1_100, 300, rate_pct(1, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_700, 450, rate_pct(2, 100)));
 		assert_ok!(open(3, DOT, PUSD, 2_300, 600, rate_pct(3, 100)));
 		mint_stable(PUSD, 5, 1_000_000);
 
-		// Two full-redistribution rounds with the recipients untouched
-		// throughout: every quoted snapshot projects its share across both
-		// pending rounds against the original branch aggregate, while
-		// execution decrements that aggregate touch by touch.
+		// Two redistributions leave two debt units and two collateral units pending.
 		for sacrificial in [9, 10] {
 			assert_ok!(open(sacrificial, DOT, PUSD, 480, 480, rate_pct(4, 100)));
 			set_price(DOT, FixedU128::one());
@@ -1542,18 +1617,38 @@ fn quote_matches_execution_across_redistribution_rounds() {
 		let redeemer_before = Assets::balance(PUSD, 5);
 		let recipient_before = collateral_balance(DOT, 6);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
-		let issuance_before = Assets::total_supply(PUSD);
 		assert_ok!(redeem(5, DOT, PUSD, 100_000, 0, 6, 0));
 
-		// Execution reproduces the quote exactly across every dimension,
-		// projected redistribution shares included. Per-stake flooring keeps
-		// each share within the remaining branch aggregate here; the
-		// documented indicative-quote drift needs caps that bind, which
-		// untouched recipients cannot produce.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 5), quote.stable_in());
-		assert_eq!(collateral_balance(DOT, 6) - recipient_before, quote.collateral_out);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, quote.fee);
-		assert_eq!(issuance_before - Assets::total_supply(PUSD), quote.debt_cancelled);
+		let executed_stable = redeemer_before - Assets::balance(PUSD, 5);
+		let executed_collateral = collateral_balance(DOT, 6) - recipient_before;
+		let executed_fee = Assets::balance(PUSD, FEE_DEST) - fee_before;
+		assert_eq!(executed_stable, quote.stable_in());
+		assert_eq!(executed_collateral, quote.collateral_out);
+		assert_eq!(executed_fee, quote.fee);
+		assert_eq!(executed_stable - executed_fee, quote.debt_cancelled);
+
+		// The husks own no debt but keep their stake, so the complement stays pending.
+		let vault = |owner| pallet_vaults::pallet::Vaults::<Test>::get((DOT, PUSD, owner)).unwrap();
+		let state = || pallet_vaults::pallet::Branches::<Test>::get(DOT, PUSD).unwrap().state;
+		assert_eq!(state().debt.principal, 0);
+		assert_eq!(state().debt.pending_redistribution_principal, 2);
+		assert_eq!(state().pending_redistribution_collateral, 2);
+		assert_eq!(
+			state().stakes.total,
+			vault(1).redistribution_stake +
+				vault(2).redistribution_stake +
+				vault(3).redistribution_stake
+		);
+
+		// Once the other husks close, the last stake bearer receives the exact complement.
+		assert_ok!(Vaults::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_ok!(Vaults::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
+		let collateral_before = vault(3).collateral;
+		assert_ok!(Vaults::poke(RuntimeOrigin::signed(5), DOT, PUSD, 3));
+		assert_eq!(vault(3).debt.principal, 2);
+		assert_eq!(vault(3).collateral, collateral_before + 2);
+		assert_eq!(state().debt.pending_redistribution_principal, 0);
+		assert_eq!(state().pending_redistribution_collateral, 0);
 	});
 }
 

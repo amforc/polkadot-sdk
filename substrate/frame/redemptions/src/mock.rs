@@ -237,7 +237,7 @@ impl pallet_vaults::Config for Test {
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
-	type FeeHandler = ();
+	type FeeAccount = FeeAccounts;
 	type YieldHook = ();
 	// Registering a market seeds this pallet's redemption config via `on_registered`.
 	type OnBranchLifecycle = Redemptions;
@@ -295,6 +295,17 @@ pub struct InsuranceFundAccounts;
 impl Convert<StableId, AccountId> for InsuranceFundAccounts {
 	fn convert(stable: StableId) -> AccountId {
 		insurance_account(stable)
+	}
+}
+
+/// Collects vault fees separately from redemption fees in [`FEE_DEST`].
+pub const VAULT_FEE_DEST: AccountId = 887;
+
+/// Routes all test stablecoin vault fees to [`VAULT_FEE_DEST`].
+pub struct FeeAccounts;
+impl Convert<StableId, AccountId> for FeeAccounts {
+	fn convert(_stable: StableId) -> AccountId {
+		VAULT_FEE_DEST
 	}
 }
 
@@ -397,8 +408,9 @@ pub fn new_test_ext() -> TestState {
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
+			// The fee account needs native funds to pay its asset-account deposit.
 			balances: (1u64..=10u64)
-				.chain([insurance_account(PUSD), FEE_DEST])
+				.chain([insurance_account(PUSD), FEE_DEST, VAULT_FEE_DEST])
 				.map(|i| (i, 1_000_000_000_000))
 				.collect(),
 			..Default::default()

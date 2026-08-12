@@ -3504,8 +3504,7 @@ parameter_types! {
 	pub const InsurancePalletId: PalletId = PalletId(*b"py/insur");
 }
 
-/// One insurance-fund account per stablecoin, derived as a sub-account so one
-/// coin's cover can never settle another coin's bad debt.
+/// Isolates each stablecoin's Insurance Fund cover in a separate account.
 pub struct StableInsuranceAccount;
 impl traits::Convert<VaultsStableId, AccountId> for StableInsuranceAccount {
 	fn convert(stable_id: VaultsStableId) -> AccountId {
