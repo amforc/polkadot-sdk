@@ -126,10 +126,9 @@ pub mod pallet {
 			StableCredit = StableCreditOf<Self>,
 		>;
 
-		/// Maps each stablecoin to the account holding its insurance cover.
-		/// Cover is read at settlement time — nothing is reserved per vault —
-		/// and per-stable accounts keep one coin's cover from settling another
-		/// coin's bad debt.
+		/// Maps each stablecoin to its Insurance Fund account.
+		///
+		/// Separate accounts prevent one stablecoin from covering another stablecoin's vault debt.
 		type InsuranceFundAccount: Convert<StableIdOf<Self>, Self::AccountId>;
 
 		/// Destination for redemption fees.
