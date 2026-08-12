@@ -19,7 +19,7 @@ use frame::{
 	arithmetic::{
 		AtLeast32BitUnsigned, CheckedAdd, FixedPointOperand, FixedU128, Permill, Saturating, Zero,
 	},
-	deps::frame_support::transactional,
+	deps::frame_support::{require_transactional, transactional},
 	prelude::*,
 	traits::{
 		fungibles::{
@@ -66,12 +66,6 @@ struct LiquidationPlan<Balance> {
 	owner_surplus: Balance,
 }
 
-struct LiquidationSettlement<Credit, Balance> {
-	redistribution_collateral: Credit,
-	owner_surplus: Credit,
-	outcome: LiquidationOutcome<Balance>,
-}
-
 impl<T: Config> Pallet<T> {
 	/// Executes liquidation and commits all custody changes as one transaction.
 	///
@@ -85,8 +79,8 @@ impl<T: Config> Pallet<T> {
 		owner: T::AccountId,
 		jit: JitTerms<BalanceOf<T>>,
 	) -> DispatchResult {
-		let op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), &owner)?;
-		let snapshot = op.liquidation_snapshot()?;
+		let mut op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), &owner)?;
+		let snapshot = op.prepare_liquidation()?;
 		let held = op.vault().collateral;
 
 		let (collateral, shortfall) = T::CollateralAssets::slash(
@@ -100,15 +94,14 @@ impl<T: Config> Pallet<T> {
 			return Err(DispatchError::Corruption);
 		}
 
-		let settlement =
-			Self::settle_with_pool(&keeper, &collateral_id, &stable_id, jit, snapshot, collateral)?;
-		let LiquidationSettlement { redistribution_collateral, owner_surplus, outcome } =
-			settlement;
-		Self::settle_liquidation_custody(
+		let outcome = Self::settle_liquidation(
 			op,
-			outcome.redistribution,
-			redistribution_collateral,
-			owner_surplus,
+			&keeper,
+			&collateral_id,
+			&stable_id,
+			jit,
+			snapshot,
+			collateral,
 		)?;
 
 		Self::deposit_event(Event::VaultLiquidated {
@@ -121,20 +114,19 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Finalizes the vault and transfers the two collateral credits.
+	/// Finalizes the vault and transfers the redistribution and owner credits.
 	///
-	/// This shared path keeps production and mock custody rules identical. The redistribution
-	/// account holds its collateral, and the owner receives surplus as free balance.
+	/// The redistribution account holds collateral until recipients materialize it. The owner
+	/// receives surplus as free balance.
+	#[require_transactional]
 	pub(crate) fn settle_liquidation_custody(
-		mut op: VaultOp<T>,
+		op: VaultOp<T>,
 		redistribution: DebtCollateral<BalanceOf<T>>,
 		redistribution_collateral: CollateralCreditOf<T>,
 		owner_collateral: CollateralCreditOf<T>,
 	) -> DispatchResult {
 		debug_assert_eq!(redistribution_collateral.peek(), redistribution.collateral);
 		let owner = op.owner().clone();
-		op.apply_liquidation(redistribution)?;
-
 		if redistribution.collateral.is_zero() {
 			drop(redistribution_collateral);
 		} else {
@@ -149,17 +141,18 @@ impl<T: Config> Pallet<T> {
 			)?;
 		}
 		Self::resolve_collateral(&owner, owner_collateral)?;
-		op.commit_exempt()
+		op.finish_liquidation(redistribution)
 	}
 
-	fn settle_with_pool(
+	fn settle_liquidation(
+		op: VaultOp<T>,
 		keeper: &T::AccountId,
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		jit: JitTerms<BalanceOf<T>>,
 		snapshot: LiquidationSnapshot<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
-	) -> Result<LiquidationSettlement<CollateralCreditOf<T>, BalanceOf<T>>, DispatchError> {
+	) -> Result<LiquidationOutcome<BalanceOf<T>>, DispatchError> {
 		debug_assert!(snapshot.config.offset_penalty <= snapshot.config.redistribution_penalty);
 		let (plan, jit_preservation) = Self::plan_liquidation(
 			keeper,
@@ -175,7 +168,9 @@ impl<T: Config> Pallet<T> {
 		let (keeper_reward, mut resolution) = seized.split(plan.keeper_reward);
 		Self::resolve_collateral(keeper, keeper_reward)?;
 
-		let active_collateral = resolution.extract(plan.collateral.active_pool);
+		let has_pool_offset = !plan.debt.active_pool.is_zero() || !plan.debt.pending_pool.is_zero();
+		let active_collateral =
+			has_pool_offset.then(|| resolution.extract(plan.collateral.active_pool));
 		Self::apply_jit(
 			keeper,
 			stable_id,
@@ -185,24 +180,26 @@ impl<T: Config> Pallet<T> {
 			plan.collateral.keeper_jit,
 			&mut resolution,
 		)?;
-		let pending_collateral = resolution.extract(plan.collateral.pending_pool);
+		if let Some(active_collateral) = active_collateral {
+			let pending_collateral = resolution.extract(plan.collateral.pending_pool);
 
-		// One exact call settles both pool legs. The allocation gives a
-		// zero-debt leg a zero collateral share, which is exactly the shape
-		// `offset` accepts for a leg that sized to nothing (and its all-zero
-		// fast path when the pool covered nothing at all).
-		if plan.debt.active_pool.is_zero() {
-			debug_assert!(active_collateral.peek().is_zero());
+			// One exact call keeps the active and pending pool legs atomic.
+			if plan.debt.active_pool.is_zero() {
+				debug_assert!(active_collateral.peek().is_zero());
+			}
+			if plan.debt.pending_pool.is_zero() {
+				debug_assert!(pending_collateral.peek().is_zero());
+			}
+			T::StabilityPool::offset(
+				collateral_id,
+				stable_id,
+				OffsetLegs { active: plan.debt.active_pool, pending: plan.debt.pending_pool },
+				OffsetLegs { active: active_collateral, pending: pending_collateral },
+			)?;
+		} else {
+			debug_assert!(plan.collateral.active_pool.is_zero());
+			debug_assert!(plan.collateral.pending_pool.is_zero());
 		}
-		if plan.debt.pending_pool.is_zero() {
-			debug_assert!(pending_collateral.peek().is_zero());
-		}
-		T::StabilityPool::offset(
-			collateral_id,
-			stable_id,
-			OffsetLegs { active: plan.debt.active_pool, pending: plan.debt.pending_pool },
-			OffsetLegs { active: active_collateral, pending: pending_collateral },
-		)?;
 
 		debug_assert_eq!(resolution.peek(), plan.collateral.redistribution);
 		let redistribution_collateral = resolution;
@@ -226,7 +223,13 @@ impl<T: Config> Pallet<T> {
 			keeper_reward: plan.keeper_reward,
 			owner_surplus: owner_surplus.peek(),
 		};
-		Ok(LiquidationSettlement { redistribution_collateral, owner_surplus, outcome })
+		Self::settle_liquidation_custody(
+			op,
+			outcome.redistribution,
+			redistribution_collateral,
+			owner_surplus,
+		)?;
+		Ok(outcome)
 	}
 
 	// Builds the ordinary waterfall plan, then retries once without JIT when its collateral share
@@ -299,8 +302,11 @@ impl<T: Config> Pallet<T> {
 		let (keeper_jit, preservation) =
 			Self::size_jit(keeper, stable_id, &snapshot.config, jit, remaining)?;
 		remaining.saturating_reduce(keeper_jit);
-		let pending_pool =
-			T::StabilityPool::reducible_pending(collateral_id, stable_id, remaining, active_pool);
+		let pending_pool = if remaining.is_zero() {
+			Zero::zero()
+		} else {
+			T::StabilityPool::reducible_pending(collateral_id, stable_id, remaining, active_pool)
+		};
 		ensure!(pending_pool <= remaining, Error::<T>::InvalidLiquidationPlan);
 		remaining.saturating_reduce(pending_pool);
 		Ok((

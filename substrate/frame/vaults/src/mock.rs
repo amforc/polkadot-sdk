@@ -396,6 +396,8 @@ pub type VaultDepositConsideration = FungiblesHoldConsideration<
 parameter_types! {
 	pub static ActiveSpCapacity: Balance = 0;
 	pub static PendingSpCapacity: Balance = 0;
+	pub static PendingSpInspectionCalls: u32 = 0;
+	pub static SpOffsetCalls: u32 = 0;
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
 	pub TestBranchConfigBounds: BranchConfigBounds = BranchConfigBounds {
 		min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
@@ -433,6 +435,7 @@ impl StabilityPoolInspect<AssetId, StableId, Balance> for MockStabilityPool {
 	}
 
 	fn reducible_pending(_: &AssetId, _: &StableId, max_debt: Balance, _: Balance) -> Balance {
+		PendingSpInspectionCalls::mutate(|calls| *calls += 1);
 		max_debt.min(PendingSpCapacity::get())
 	}
 }
@@ -446,6 +449,7 @@ impl StabilityPoolOffset<AssetId, StableId, Balance, CollateralCreditOf<Test>>
 		debt: OffsetLegs<Balance>,
 		collateral: OffsetLegs<CollateralCreditOf<Test>>,
 	) -> DispatchResult {
+		SpOffsetCalls::mutate(|calls| *calls += 1);
 		if debt.active.is_zero() {
 			ensure!(collateral.active.peek().is_zero(), Error::<Test>::InvalidLiquidationPlan);
 			drop(collateral.active);
@@ -583,6 +587,8 @@ pub fn new_test_ext() -> TestState {
 		MockOracleAvailable::set(true);
 		ActiveSpCapacity::set(0);
 		PendingSpCapacity::set(0);
+		PendingSpInspectionCalls::set(0);
+		SpOffsetCalls::set(0);
 		LifecycleLog::set(Vec::new());
 		FailOnRegistered::set(false);
 		FailOnDeregistered::set(false);
