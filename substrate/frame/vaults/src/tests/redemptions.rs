@@ -421,15 +421,14 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 		let vault_dormant_pre = vault(DOT, PUSD, 1);
 		// At 1.0 vault 3 (200 collateral, ~200 debt) sits under MCR while 1 and 2 stay above it.
 		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
-		// Redistribute vault 3's whole debt across the recipients (no offset).
-		let coll_3 = held(DOT, 3);
-		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
+		// An empty pool sends the residual to both eligible vaults.
+		assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
 		assert_eq!(
 			vault(DOT, PUSD, 1).debt.principal,
 			vault_dormant_pre.debt.principal,
 			"the allocation stays lazy until this vault is touched",
 		);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
 		let vault_dormant_post = vault(DOT, PUSD, 1);
 		// Dormant debt must not remove a vault from redistribution.
 		let gained = vault_dormant_post.debt.principal - vault_dormant_pre.debt.principal;

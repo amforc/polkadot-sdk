@@ -36,7 +36,8 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
 		assert_eq!(collateral_balance(DOT, pool_account) - pool_before, 472);
 		assert_eq!(collateral_balance(DOT, 4) - keeper_before, 112);
-		assert_eq!(collateral_balance(DOT, 1) - owner_before, 16);
+		// Terminal interest makes debt 501 and reduces the owner surplus to 14.
+		assert_eq!(collateral_balance(DOT, 1) - owner_before, 14);
 	});
 }
 
@@ -69,7 +70,7 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 		// Registration touched a zero-balance asset account, so even a one-unit gain can enter it.
 		assert_ok!(Assets::can_deposit(77, &pool_account, 1, Provenance::Extant).into_result());
 
-		// The active pool's share floor(1_803 * 105/525) = 360 is below the asset's 1_000 minimum.
+		// The active-pool gain is below the asset minimum to test prepared custody.
 		// The pre-created account accepts it, so the normal active-first waterfall remains intact.
 		assert_ok!(Vaults::liquidate(
 			RuntimeOrigin::signed(4),
@@ -79,17 +80,14 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 			pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
 		));
 
-		// Equal 5% penalties seize ceil(525/0.18) = 2_917. The keeper takes
-		// ceil(200/0.18) + floor(0.1% * 2_917) = 1_112 + 2. Of the remaining 1_803,
-		// active receives 360 and redistribution receives 1_443 including the flooring remainder.
+		// The expected split includes terminal interest and both 5% penalties.
 		assert!(pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 1)).is_none());
 		let state = pool_state(collateral.clone(), PUSD);
 		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.total_collateral_gains_unclaimed, 360);
+		assert_eq!(state.total_collateral_gains_unclaimed, 361);
 		assert_eq!(stable_balance(PUSD, pool_account), 0);
-		assert_eq!(collateral_balance(collateral.clone(), pool_account), 360);
-		// The redistributed 1_443 sits under the custody hold; the pre-funded minimum stays
-		// free, which is what let the `Protect`-preserving hold succeed.
+		assert_eq!(collateral_balance(collateral.clone(), pool_account), 361);
+		// Redistribution collateral remains in custody until the recipient is touched.
 		use frame::traits::fungibles::InspectHold;
 		assert_eq!(
 			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
@@ -97,12 +95,43 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 				&pallet_vaults::HoldReason::VaultCollateral.into(),
 				&redistribution,
 			),
-			1_443
+			1_453
+		);
+		assert_eq!(
+			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
+				collateral.clone(),
+				&pallet_vaults::HoldReason::VaultCollateral.into(),
+				&2,
+			),
+			3_000
+		);
+		assert_eq!(
+			pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 2))
+				.unwrap()
+				.collateral,
+			3_000
+		);
+		assert_ok!(Vaults::poke(RuntimeOrigin::signed(4), collateral.clone(), PUSD, 2));
+		assert_eq!(
+			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
+				collateral.clone(),
+				&pallet_vaults::HoldReason::VaultCollateral.into(),
+				&redistribution,
+			),
+			0
+		);
+		assert_eq!(
+			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
+				collateral.clone(),
+				&pallet_vaults::HoldReason::VaultCollateral.into(),
+				&2,
+			),
+			4_453
 		);
 		assert_eq!(collateral_balance(collateral.clone(), redistribution), 1_000);
 		assert_eq!(collateral_balance(collateral.clone(), 4), 1_114);
-		// The owner's 3_000 hold was seized to 2_917; the 83 surplus returns.
-		assert_eq!(collateral_balance(collateral, 1), 5_000 - 2_917);
+		// The owner receives all collateral not required by the liquidation.
+		assert_eq!(collateral_balance(collateral, 1), 5_000 - 2_928);
 	});
 }
 

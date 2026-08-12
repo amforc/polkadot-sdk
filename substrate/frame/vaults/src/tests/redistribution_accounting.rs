@@ -56,7 +56,7 @@ fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
 			let liquidated_debt = vault(DOT, PUSD, 3).debt.total();
 
 			set_price(DOT, FixedU128::from_rational(1u128, 1u128));
-			assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
+			assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
 			assert_eq!(vault(DOT, PUSD, 1).debt.principal, before_1);
 			assert_eq!(vault(DOT, PUSD, 2).debt.principal, before_2);
 
@@ -584,7 +584,7 @@ fn dust_ratio_stake_floors_to_one_unit_and_stays_liquidatable() {
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 3));
 
 		set_price(DOT, FixedU128::from_rational(50u128, 100u128));
-		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
+		assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
 		assert!(!vault_exists(DOT, PUSD, 3));
 		assert_accounting_identity_holds();
 	});
