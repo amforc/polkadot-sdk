@@ -192,8 +192,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 			.debt
 			.total();
 
-		// Cancelling the entire debt pulls the vault out of the FIFO; it settles
-		// to Dormant with its stake re-synced to the still-held collateral.
+		// A debt-free Dormant vault must leave the FIFO and stop receiving liability.
 		assert_ok!(redeem_from(DOT, PUSD, 1, 7, full));
 
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultStatusChanged {
@@ -207,9 +206,9 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
 		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(vault.debt.total(), 0);
-		assert_eq!(vault.redistribution_stake, held(DOT, 1));
+		assert_eq!(vault.redistribution_stake, 0);
 		let state = branch_state(DOT, PUSD).expect("state");
-		assert_eq!(state.stakes.total, held(DOT, 1));
+		assert_eq!(state.stakes.total, 0);
 	});
 }
 
@@ -456,17 +455,13 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 	});
 }
 
-// Fully draining a `FinalRecovery` vault through `redeem_step` leaves a
-// Dormant husk — FIFO slot freed, dust collateral still held for the owner —
-// and records no bad debt: the Insurance Fund cover arrives merged into the
-// settlement payment, so nothing transits the bad-debt ledger.
+// Full recovery settlement must leave a debt-free Dormant vault outside the FIFO.
 #[test]
-fn full_recovery_settlement_leaves_dormant_husk_without_bad_debt() {
+fn full_recovery_settlement_leaves_debt_free_dormant_husk() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		enter_recovery(1, rate_pct(5, 100));
 
-		let bad_debt_pre = branch_state(DOT, PUSD).unwrap().debt.bad_debt;
 		let snapshot =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
 		assert_eq!(snapshot.collateral, 1_000, "entered recovery untouched");
@@ -474,7 +469,8 @@ fn full_recovery_settlement_leaves_dormant_husk_without_bad_debt() {
 		// market payment merged with the Insurance Fund cover); the recipient
 		// takes all but a dust remainder of the collateral.
 		let dust = 3;
-		assert_ok!(redeem_step(DOT, PUSD, 1, 7, snapshot.debt, snapshot.collateral - dust));
+		let payoff = snapshot.debt + snapshot.terminal_interest_charge;
+		assert_ok!(redeem_step(DOT, PUSD, 1, 7, payoff, snapshot.collateral - dust));
 
 		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept");
 		assert_eq!(vault.debt.total(), 0);
@@ -485,10 +481,6 @@ fn full_recovery_settlement_leaves_dormant_husk_without_bad_debt() {
 			alloc::vec![] as alloc::vec::Vec<AccountId>
 		);
 		assert_eq!(held(DOT, 1), dust, "dust stays held until the owner closes the husk");
-		assert_eq!(
-			branch_state(DOT, PUSD).unwrap().debt.bad_debt,
-			bad_debt_pre,
-			"full settlement records no bad debt"
-		);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.minted_interest, 0);
 	});
 }

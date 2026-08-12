@@ -3340,12 +3340,20 @@ impl EnsureOriginWithArg<RuntimeOrigin, VaultsStableId> for VaultsCreateOrigin {
 	}
 }
 
+/// Routes each stablecoin's vault fee remainder to the treasury.
+pub struct VaultsFeeAccount;
+impl traits::Convert<VaultsStableId, AccountId> for VaultsFeeAccount {
+	fn convert(_stable: VaultsStableId) -> AccountId {
+		TreasuryAccount::get()
+	}
+}
+
 impl pallet_vaults::Config for Runtime {
 	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultsCollateral;
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
-	type FeeHandler = ();
+	type FeeAccount = VaultsFeeAccount;
 	type YieldHook = ();
 	type OnBranchLifecycle = ();
 	type TimeProvider = Timestamp;

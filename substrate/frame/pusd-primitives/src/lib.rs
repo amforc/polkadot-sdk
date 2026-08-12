@@ -142,10 +142,9 @@ pub fn mul_div_floor<Balance: FixedPointOperand>(
 	.and_then(|raw| Balance::try_from(raw).ok())
 }
 
-/// `floor(value * rate / denominator)` reinterpreted as a `FixedU128` per-unit
-/// delta — the shared per-stake accumulator step for vault redistribution
-/// weights. `Some(0)` when there is nothing to distribute, `None` when the
-/// stake denominator is zero or the product overflows `u128`.
+/// Returns `floor(value * rate / denominator)` as a `FixedU128` per-unit delta.
+///
+/// Returns `Some(0)` for a zero value or rate. Returns `None` for a zero denominator or overflow.
 pub fn mul_div_rate_floor<Balance: FixedPointOperand>(
 	value: Balance,
 	rate: FixedU128,
@@ -186,4 +185,46 @@ where
 {
 	let seed = blake2_256(&(collateral_id, stable_id).encode());
 	pallet_id.into_sub_account_truncating(seed)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use frame::arithmetic::{FixedPointNumber, One, Saturating};
+
+	#[test]
+	fn mul_div_rate_floor_round_trips_small_inputs() {
+		let got = mul_div_rate_floor::<u128>(100, FixedU128::one(), 1_000).expect("fits");
+		assert_eq!(got, FixedU128::from_rational(1u128, 10u128));
+	}
+
+	#[test]
+	fn mul_div_rate_zero_value_returns_zero() {
+		assert_eq!(mul_div_rate_floor::<u128>(0, FixedU128::one(), 1_000), Some(FixedU128::zero()));
+	}
+
+	#[test]
+	fn mul_div_rate_floor_overflow_returns_none() {
+		let got = mul_div_rate_floor(u128::MAX / 2, FixedU128::one(), 1);
+		assert!(got.is_none());
+		// Confirm that the function does not reject values below the overflow limit.
+		let safe = mul_div_rate_floor(u128::MAX / (FixedU128::DIV * 2), FixedU128::one(), 1);
+		assert!(safe.is_some());
+	}
+
+	#[test]
+	fn mul_div_rate_floor_matches_two_step_when_safe() {
+		let rate = FixedU128::from_rational(5u128, 100u128);
+		let got = mul_div_rate_floor::<u128>(10_000, rate, 100).expect("fits");
+		let two_step = FixedU128::from_rational(10_000u128, 100u128).saturating_mul(rate);
+		assert!(got.into_inner().abs_diff(two_step.into_inner()) <= 1);
+	}
+
+	#[test]
+	fn mul_div_rate_floor_avoids_two_step_overflow() {
+		// The complete formula fits although `value / denominator` does not fit in `FixedU128`.
+		let rate = FixedU128::from_inner(1);
+		let got = mul_div_rate_floor(u128::MAX / 4, rate, 1);
+		assert_eq!(got, Some(FixedU128::from_inner(u128::MAX / 4)));
+	}
 }

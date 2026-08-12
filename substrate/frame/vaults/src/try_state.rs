@@ -8,13 +8,11 @@ use crate::{
 		AssetRoles, BalanceOf, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
 		HoldReason, Millis, Pallet, StableIdOf, StablecoinDebt, Vaults,
 	},
-	types::{AssetRole, AssetRoleUsage, PendingInterest, VaultListId},
+	types::{AssetRole, AssetRoleUsage, InterestWeight, PendingInterest, VaultListId},
 };
 use alloc::collections::BTreeMap;
 use frame::{
-	arithmetic::{
-		CheckedAdd, FixedPointNumber, FixedU128, One, Saturating, UniqueSaturatedInto, Zero,
-	},
+	arithmetic::{CheckedAdd, FixedPointNumber, FixedU128, Zero},
 	traits::{fungibles::InspectHold, Convert, Time},
 	try_runtime::TryRuntimeError,
 };
@@ -32,7 +30,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	let mut outstanding: BTreeMap<CollateralIdOf<T>, BalanceOf<T>> = BTreeMap::new();
 	let mut stablecoin_debt: BTreeMap<
 		StableIdOf<T>,
-		(BalanceOf<T>, BalanceOf<T>, PendingInterest<BalanceOf<T>>),
+		(BalanceOf<T>, InterestWeight<BalanceOf<T>>, PendingInterest<BalanceOf<T>>),
 	> = BTreeMap::new();
 	for (collateral_id, stable_id, branch) in Branches::<T>::iter() {
 		claim_role::<T>(&mut roles, collateral_id.clone(), AssetRole::Collateral)?;
@@ -41,12 +39,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			T::StableToCollateralId::convert(stable_id.clone()),
 			AssetRole::Stable,
 		)?;
-		let branch_outstanding = branch
-			.state
-			.debt
-			.outstanding()
-			.checked_add(&branch.state.ownerless_debt)
-			.ok_or("branch outstanding debt overflow")?;
+		let branch_outstanding = branch.state.debt.outstanding();
 		let debt_entry = outstanding.entry(collateral_id.clone()).or_default();
 		*debt_entry = debt_entry
 			.checked_add(&branch_outstanding)
@@ -59,7 +52,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if !branch.state.is_frozen() {
 			stable_entry.1 = stable_entry
 				.1
-				.checked_add(&branch.state.debt.weighted_principal_sum)
+				.checked_add(&branch.state.debt.weighted_principal)
 				.ok_or("stablecoin active weighted-principal sum overflow")?;
 		}
 		stable_entry.2 = stable_entry
@@ -103,7 +96,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 fn check_stablecoin_debt<T: Config>(
 	mut expected: BTreeMap<
 		StableIdOf<T>,
-		(BalanceOf<T>, BalanceOf<T>, PendingInterest<BalanceOf<T>>),
+		(BalanceOf<T>, InterestWeight<BalanceOf<T>>, PendingInterest<BalanceOf<T>>),
 	>,
 	now: Millis,
 ) -> Result<(), TryRuntimeError> {
@@ -118,7 +111,7 @@ fn check_stablecoin_debt<T: Config>(
 		let projected = stored
 			.pending_interest
 			.checked_add(
-				&PendingInterest::from_weight_millis(stored.active_weighted_principal_sum, elapsed)
+				&PendingInterest::from_interest_weight(stored.active_weighted_principal, elapsed)
 					.ok_or("StablecoinDebt projection overflow")?,
 			)
 			.ok_or("StablecoinDebt projection overflow")?;
@@ -126,7 +119,7 @@ fn check_stablecoin_debt<T: Config>(
 		if stored.outstanding != outstanding {
 			return Err("StablecoinDebt outstanding diverges from Branches".into());
 		}
-		if stored.active_weighted_principal_sum != active {
+		if stored.active_weighted_principal != active {
 			return Err("StablecoinDebt active weight diverges from Branches".into());
 		}
 		if projected != pending {
@@ -229,21 +222,45 @@ fn check_branch_identities<T: Config>(
 	if state.debt.last_interest_time > tau {
 		return Err("branch last_interest_time ahead of interest_time(now)".into());
 	}
-	let cumul_debt_ps = state.redistribution.debt_per_stake;
-	let cumul_collat_ps = state.redistribution.collateral_per_stake;
+	let interest_denominator = PendingInterest::<BalanceOf<T>>::DENOMINATOR;
+	if state.debt.aggregate_interest_remainder >= interest_denominator {
+		return Err("aggregate interest remainder is not normalized".into());
+	}
+	if state.debt.weighted_principal.remainder >= FixedU128::DIV {
+		return Err("weighted principal remainder is not normalized".into());
+	}
 
 	let mut sum_stake = BalanceOf::<T>::zero();
 	let mut sum_market_collateral = BalanceOf::<T>::zero();
-	let mut sum_pending_debt_share = BalanceOf::<T>::zero();
-	let mut sum_pending_collat_share = BalanceOf::<T>::zero();
 	let mut sum_principal = BalanceOf::<T>::zero();
-	let mut sum_weighted_principal = BalanceOf::<T>::zero();
-	let mut sum_weighted_stake = BalanceOf::<T>::zero();
-	let mut n_live_vaults: u128 = 0;
+	let mut sum_interest = BalanceOf::<T>::zero();
+	let mut sum_weighted_principal = InterestWeight::<BalanceOf<T>>::default();
+	let mut sum_weighted_stake = InterestWeight::<BalanceOf<T>>::default();
+	let mut sum_eligible_collateral = BalanceOf::<T>::zero();
+	let mut vault_count: u32 = 0;
 
 	for (owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
+		vault_count = vault_count.checked_add(1).ok_or("branch vault count overflow")?;
 		if vault.last_interest_time > tau {
 			return Err("vault last_interest_time ahead of interest_time(now)".into());
+		}
+		if vault.interest_remainder >= interest_denominator {
+			return Err("vault interest remainder is not normalized".into());
+		}
+		if vault.redistribution_checkpoint.principal_per_stake >
+			state.redistribution.principal_per_stake ||
+			vault.redistribution_checkpoint.collateral_per_stake >
+				state.redistribution.collateral_per_stake ||
+			vault.redistribution_checkpoint.weight_per_weighted_stake >
+				state.redistribution.weight_per_weighted_stake ||
+			vault.redistribution_checkpoint.weight_time_per_weighted_stake.to_wide() >
+				state.redistribution.weight_time_per_weighted_stake.to_wide()
+		{
+			return Err("vault redistribution checkpoint is ahead of branch totals".into());
+		}
+		// Debt-free vaults must not retain fractional interest.
+		if vault.debt.total().is_zero() && vault.interest_remainder != 0 {
+			return Err("debt-free vault carries an interest fraction".into());
 		}
 		let in_rate_index = T::VaultLists::contains(rate_list, &owner);
 		let in_recovery = T::VaultLists::contains(recovery_list, &owner);
@@ -266,78 +283,93 @@ fn check_branch_identities<T: Config>(
 		sum_principal = sum_principal
 			.checked_add(&vault.debt.principal)
 			.ok_or("branch principal sum overflow")?;
+		sum_interest = sum_interest
+			.checked_add(&vault.debt.interest)
+			.ok_or("branch interest sum overflow")?;
 		sum_weighted_principal = sum_weighted_principal
 			.checked_add(
-				&vault
-					.annual_rate
-					.checked_mul_int(vault.debt.principal)
+				&InterestWeight::from_principal_rate(vault.debt.principal, vault.annual_rate)
 					.ok_or("weighted principal term overflow")?,
 			)
 			.ok_or("weighted principal sum overflow")?;
-		sum_weighted_stake = sum_weighted_stake
-			.checked_add(
-				&vault
-					.annual_rate
-					.checked_mul_int(vault.redistribution_stake)
-					.ok_or("weighted stake term overflow")?,
-			)
-			.ok_or("weighted stake sum overflow")?;
 		if in_recovery {
 			if !vault.redistribution_stake.is_zero() {
 				return Err("FinalRecovery vault has non-zero redistribution_stake".into());
 			}
 			continue;
 		}
-		if vault.redistribution_stake != vault.collateral {
-			return Err("vault.redistribution_stake != vault.collateral".into());
+		if in_rate_index && vault.debt.total().is_zero() {
+			return Err("debt-free vault remains in the rate index".into());
+		}
+		if !in_rate_index &&
+			!vault.debt.total().is_zero() &&
+			state.dormant_redemption_target.as_ref() != Some(&owner)
+		{
+			return Err("debt-bearing Dormant vault is not the redemption target".into());
+		}
+		if vault.debt.total().is_zero() && !vault.redistribution_stake.is_zero() {
+			return Err("debt-free vault has redistribution stake".into());
+		}
+		if !vault.debt.total().is_zero() && vault.redistribution_stake.is_zero() {
+			return Err("eligible debt-bearing vault has zero redistribution stake".into());
 		}
 		sum_stake = sum_stake
 			.checked_add(&vault.redistribution_stake)
 			.ok_or("branch stake sum overflow")?;
-		let snap = vault.redistribution_checkpoint;
-		let delta_debt = cumul_debt_ps.saturating_sub(snap.debt_per_stake);
-		sum_pending_debt_share = sum_pending_debt_share
-			.saturating_add(delta_debt.saturating_mul_int(vault.redistribution_stake));
-		let delta_collat = cumul_collat_ps.saturating_sub(snap.collateral_per_stake);
-		sum_pending_collat_share = sum_pending_collat_share
-			.saturating_add(delta_collat.saturating_mul_int(vault.redistribution_stake));
-		n_live_vaults = n_live_vaults.saturating_add(1);
+		if !vault.redistribution_stake.is_zero() {
+			sum_eligible_collateral = sum_eligible_collateral
+				.checked_add(&vault.collateral)
+				.ok_or("eligible collateral sum overflow")?;
+			sum_weighted_stake = sum_weighted_stake
+				.checked_add(
+					&InterestWeight::from_principal_rate(
+						vault.redistribution_stake,
+						vault.annual_rate,
+					)
+					.ok_or("weighted stake term overflow")?,
+				)
+				.ok_or("weighted stake sum overflow")?;
+		}
+	}
+	if state.vault_count != vault_count {
+		return Err("branch vault_count != number of vault rows".into());
 	}
 
 	if state.stakes.total != sum_stake {
-		return Err("total_stakes != Σ active+dormant vault.redistribution_stake".into());
+		return Err("total_stakes != Σ debt-bearing vault.redistribution_stake".into());
 	}
-	// Every writer moves principal on the branch and the vault by the same
-	// amount, so this identity is exact (the prepare→finalize liquidation gap
-	// is intra-extrinsic and invisible at block end).
+	if state.stakes.weighted != sum_weighted_stake {
+		return Err("weighted stakes != exact Σ rate · stake".into());
+	}
 	if state.debt.principal != sum_principal {
 		return Err("branch principal != Σ vault principal".into());
 	}
-	// Every stake mutation swaps full `floor(rate · stake)` contributions, so
-	// this identity is exact as well.
-	if state.stakes.weighted_sum != sum_weighted_stake {
-		return Err("stakes.weighted_sum != Σ floor(rate · stake)".into());
+	let issued_interest = sum_interest
+		.checked_add(&state.debt.pending_interest_attribution)
+		.ok_or("issued interest sum overflow")?;
+	if state.debt.minted_interest != issued_interest {
+		return Err("minted interest != Σ vault interest + pending attribution".into());
 	}
-	check_weighted_principal_sum::<T>(
-		&branch.config,
-		state.debt.weighted_principal_sum,
-		state.debt.pending_redistribution_principal.saturating_add(state.ownerless_debt),
-		sum_weighted_principal,
-		n_live_vaults,
-	)?;
-
-	let tolerance: BalanceOf<T> = n_live_vaults.unique_saturated_into();
-
-	let debt_drift = if state.debt.pending_redistribution_principal >= sum_pending_debt_share {
-		state
-			.debt
-			.pending_redistribution_principal
-			.saturating_sub(sum_pending_debt_share)
-	} else {
-		sum_pending_debt_share.saturating_sub(state.debt.pending_redistribution_principal)
-	};
-	if debt_drift > tolerance {
-		return Err("pending redistribution principal drift exceeds rounding tolerance".into());
+	let expected_weighted_principal = sum_weighted_principal
+		.checked_add(&state.debt.pending_redistribution_weight)
+		.ok_or("weighted principal plus pending sum overflow")?;
+	if state.debt.weighted_principal != expected_weighted_principal {
+		return Err("weighted principal != row weight + pending redistribution weight".into());
+	}
+	let expected_basis = sum_eligible_collateral
+		.checked_add(&state.pending_redistribution_collateral)
+		.ok_or("redistribution collateral basis overflow")?;
+	if state.stakes.collateral_basis != expected_basis {
+		return Err("stake collateral basis != eligible rows + pending collateral".into());
+	}
+	let maximum_weight_time = state
+		.debt
+		.pending_redistribution_weight
+		.raw()
+		.checked_mul(tau.into())
+		.ok_or("pending redistribution weight-time bound overflow")?;
+	if state.pending_redistribution_weight_time.to_wide() > maximum_weight_time {
+		return Err("pending redistribution weight-time exceeds current-time bound".into());
 	}
 
 	let held_redistribution = T::CollateralAssets::balance_on_hold(
@@ -345,45 +377,14 @@ fn check_branch_identities<T: Config>(
 		&HoldReason::VaultCollateral.into(),
 		&Pallet::<T>::redistribution_account(collateral_id, stable_id),
 	);
-	let physical = sum_market_collateral
-		.checked_add(&held_redistribution)
-		.ok_or("physical collateral sum overflow")?;
-	if state.total_collateral != physical {
-		return Err("total_collateral != Σ owner-held + redistribution-account hold".into());
+	if held_redistribution != state.pending_redistribution_collateral {
+		return Err("redistribution account hold != pending collateral".into());
 	}
-
-	// The redistribution account's hold = Σ pending collateral shares vaults
-	// will pick up on next touch + ownerless collateral surplus. Per-vault
-	// flooring may leave shares slightly below the held amount; treat the gap
-	// as tolerance plus the explicit ownerless bucket.
-	let claimed_plus_surplus = sum_pending_collat_share.saturating_add(state.ownerless_collateral);
-	let collateral_drift = if held_redistribution >= claimed_plus_surplus {
-		held_redistribution.saturating_sub(claimed_plus_surplus)
-	} else {
-		claimed_plus_surplus.saturating_sub(held_redistribution)
-	};
-	if collateral_drift > tolerance {
-		return Err("pending collateral share drift exceeds rounding tolerance".into());
-	}
-	Ok(())
-}
-
-fn check_weighted_principal_sum<T: Config>(
-	config: &crate::types::BranchConfig<BalanceOf<T>>,
-	weighted_principal_sum: BalanceOf<T>,
-	pending_pool: BalanceOf<T>,
-	sum_weighted_principal: BalanceOf<T>,
-	n_live_vaults: u128,
-) -> Result<(), TryRuntimeError> {
-	if weighted_principal_sum < sum_weighted_principal {
-		return Err("weighted_principal_sum below Σ floor(rate · principal)".into());
-	}
-	let rate_bound = config.maximum_borrow_rate.max(FixedU128::one());
-	let w_pending = rate_bound.saturating_mul_int(pending_pool);
-	let slack: BalanceOf<T> = n_live_vaults.saturating_add(1).unique_saturated_into();
-	let upper = sum_weighted_principal.saturating_add(w_pending).saturating_add(slack);
-	if weighted_principal_sum > upper {
-		return Err("weighted_principal_sum exceeds Σ floor(rate · principal) + allowance".into());
+	let expected_total_collateral = sum_market_collateral
+		.checked_add(&state.pending_redistribution_collateral)
+		.ok_or("total collateral sum overflow")?;
+	if state.total_collateral != expected_total_collateral {
+		return Err("total_collateral != rows + pending redistribution collateral".into());
 	}
 	Ok(())
 }

@@ -2,8 +2,8 @@
 //! the FinalRecovery exit / orchestrator-trust hot spots after liquidations.
 //!
 //! Conventions:
-//! - Vaults are opened with `stake == collateral`; `vault.redistribution_stake` mirrors the live
-//!   `VaultCollateral` hold for every Active/Dormant vault, so the two stay equal across the test.
+//! - Debt-bearing vaults use snapshot-corrected stake. `FinalRecovery` and debt-free `Dormant`
+//!   vaults have zero stake.
 //! - "Recipient rate" means the recipient vault's `annual_rate`, not the liquidated vault's rate.
 //! - Stake calculations are checked by `assert_accounting_identity_holds` (`stakes.total == Σ
 //!   vault.redistribution_stake`) and the `try_state` identities.
@@ -13,7 +13,6 @@ use crate::{
 	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
-use pusd_primitives::VaultInterface;
 
 const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
 
@@ -22,55 +21,114 @@ fn weighted(x: Balance, rate: FixedU128) -> Balance {
 	rate.saturating_mul_int(x)
 }
 
-/// Invariant: the branch stake aggregate equals the sum of per-vault stakes, and
-/// the pending-redistribution principal matches the sum of per-vault shares to
-/// within per-stake flooring dust.
+/// Confirms that each debt and collateral unit has a vault or pending-pool owner.
 fn assert_accounting_identity_holds() {
 	let state = branch_state(DOT, PUSD).unwrap();
-	let cumul = state.redistribution.debt_per_stake;
-	let mut sum_shares: Balance = 0;
-	let mut sum_held: Balance = 0;
-	let mut n: u128 = 0;
-	for (owner, vault) in Vaults::<Test>::iter_prefix((DOT, PUSD)) {
-		let snap = vault.redistribution_checkpoint;
-		// How much debt-per-stake has accumulated since this vault's snapshot?
-		let delta = cumul.saturating_sub(snap.debt_per_stake);
-		// This vault's pending redistribution share; summed over all vaults it
-		// must recover the branch's pending-redistribution principal.
-		sum_shares =
-			sum_shares.saturating_add(delta.saturating_mul_int(vault.redistribution_stake));
-		let h = held(DOT, owner);
-		sum_held = sum_held.saturating_add(h);
-		n += 1;
-	}
-	// Live (Active+Dormant) per-vault stake must equal the branch aggregate.
-	// FinalRecovery vaults are zeroed on entry, so summing `redistribution_stake`
-	// over all vault rows gives the same answer.
-	let sum_stake: Balance = Vaults::<Test>::iter_prefix((DOT, PUSD))
-		.map(|(_, v)| v.redistribution_stake)
-		.sum();
+	let rows: Vec<_> = Vaults::<Test>::iter_prefix((DOT, PUSD)).collect();
+	let sum_stake: Balance = rows.iter().map(|(_, v)| v.redistribution_stake).sum();
+	let sum_principal: Balance = rows.iter().map(|(_, v)| v.debt.principal).sum();
+	let sum_collateral: Balance = rows.iter().map(|(_, v)| v.collateral).sum();
 	assert_eq!(
 		state.stakes.total, sum_stake,
 		"stakes.total must equal Σ vault.redistribution_stake of live recipients",
 	);
-	let _ = sum_held;
-	// pending_redistribution_principal now holds only the recipient-attributable share;
-	// per-stake flooring dust lives in ownerless_debt separately.
-	let tolerance: Balance = n;
-	let drift = state.debt.pending_redistribution_principal.abs_diff(sum_shares);
-	assert!(
-		drift <= tolerance,
-		"pending redistribution principal drift: pending={}, sum_shares={}, ownerless={}, drift={}, tol={}",
-		state.debt.pending_redistribution_principal,
-		sum_shares,
-		state.ownerless_debt,
-		drift,
-		tolerance,
+	assert_eq!(state.debt.principal, sum_principal);
+	assert_eq!(state.total_collateral, sum_collateral + state.pending_redistribution_collateral);
+	assert_eq!(state.vault_count as usize, rows.len());
+	assert_eq!(
+		held(DOT, crate::Pallet::<Test>::redistribution_account(&DOT, &PUSD)),
+		state.pending_redistribution_collateral,
 	);
 }
 
+// Touch order must not change mixed-rate allocation or pending residue.
+#[test]
+fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
+	let run = |first, second| {
+		new_test_ext().execute_with(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+			assert_ok!(open(2, DOT, PUSD, 999, 500, rate_pct(90, 100)));
+			assert_ok!(open(3, DOT, PUSD, 200, 200, rate_pct(5, 100)));
+			let before_1 = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal;
+			let before_2 = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.principal;
+			let liquidated_debt = Vaults::<Test>::get((DOT, PUSD, 3)).unwrap().debt.total();
+
+			set_price(DOT, FixedU128::from_rational(1u128, 1u128));
+			assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
+			assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal, before_1);
+			assert_eq!(Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.principal, before_2);
+
+			advance_time(ONE_YEAR_MS);
+			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, first,));
+			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, second,));
+			let final_state = branch_state(DOT, PUSD).unwrap();
+			let allocated_1 =
+				Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal - before_1;
+			let allocated_2 =
+				Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.principal - before_2;
+			// The nondividing stakes must leave one debt unit in the pending pool.
+			assert_eq!(liquidated_debt, 202);
+			assert_eq!(allocated_1, 101);
+			assert_eq!(allocated_2, 100);
+			assert_eq!(final_state.debt.pending_redistribution_principal, 1);
+			(
+				allocated_1,
+				allocated_2,
+				final_state.debt.weighted_principal,
+				final_state.debt.outstanding(),
+				final_state.debt.pending_redistribution_principal,
+			)
+		})
+	};
+
+	assert_eq!(run(1, 2), run(2, 1));
+}
+
+// Each weight claim and the remaining pool must retain valid time anchors in both touch orders.
+#[test]
+fn nonzero_time_weight_residue_is_touch_order_independent() {
+	let run = |first, second| {
+		new_test_ext().execute_with(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 1_001, 500, rate_pct(7, 100)));
+			assert_ok!(open(2, DOT, PUSD, 997, 500, rate_pct(23, 100)));
+			assert_ok!(open(3, DOT, PUSD, 200, 202, rate_pct(5, 100)));
+
+			advance_time(1_000);
+			set_price(DOT, FixedU128::from_rational(1u128, 1u128));
+			assert_eq!(redistribute_for_test(DOT, PUSD, 3, 0).unwrap(), 204);
+
+			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, first));
+			let after_first = branch_state(DOT, PUSD).unwrap();
+			let tau = after_first.interest_time(Timestamp::get());
+			// The pending residue must have zero accrued interest at the record time.
+			assert!(!after_first.debt.pending_redistribution_weight.is_zero());
+			assert_eq!(
+				after_first.pending_redistribution_weight_time.to_wide(),
+				after_first
+					.debt
+					.pending_redistribution_weight
+					.raw()
+					.checked_mul(tau.into())
+					.unwrap()
+			);
+
+			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, second));
+			assert_accounting_identity_holds();
+			(
+				branch_state(DOT, PUSD).unwrap(),
+				Vaults::<Test>::get((DOT, PUSD, 1)).unwrap(),
+				Vaults::<Test>::get((DOT, PUSD, 2)).unwrap(),
+			)
+		})
+	};
+
+	assert_eq!(run(1, 2), run(2, 1));
+}
+
 // After a redistribute-everything liquidation, the branch's
-// `debt.weighted_principal_sum` must reflect the economic debt at the recipient's
+// `debt.weighted_principal` must reflect the economic debt at the recipient's
 // actual rate — total economic debt × recipient rate — not the redistributed
 // principal carried at rate=1.0.
 #[test]
@@ -87,24 +145,19 @@ fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 
 		let coll_1 = held(DOT, 1);
-		assert_ok!(liquidate_with(DOT, PUSD, 1, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_1,
-			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 1, coll_1));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
 
 		// Collateral conservation: the liquidatee's hold is released; the
-		// recipient keeps its own collateral (the redistributed collateral is held
-		// by the branch redistribution account until vault 2 touches).
+		// recipient immediately receives the redistributed collateral.
 		assert_eq!(held(DOT, 1), 0, "liquidatee collateral released");
-		assert_eq!(held(DOT, 2), 1_000, "recipient collateral untouched");
+		assert_eq!(held(DOT, 2), 2_000, "recipient owns redistributed collateral");
 
 		let state = branch_state(DOT, PUSD).expect("branch state");
-		let total_econ =
-			state.debt.principal.saturating_add(state.debt.pending_redistribution_principal);
+		let total_econ = state.debt.principal;
 		// Vault 2 (20%) is the only recipient; ≤3 dust units of ceil/floor mismatch.
 		let expected = weighted(total_econ, rate_pct(20, 100));
-		let actual = state.debt.weighted_principal_sum;
+		let actual = state.debt.weighted_principal.whole;
 		assert!(
 			actual.abs_diff(expected) <= 3,
 			"weighted_sum after redistribution out of bounds: actual={}, expected={} (20% of {})",
@@ -138,10 +191,7 @@ fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 
 		let pre_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
 		let branch_state_pre = branch_state(DOT, PUSD).unwrap();
-		let total_econ_pre = branch_state_pre
-			.debt
-			.principal
-			.saturating_add(branch_state_pre.debt.pending_redistribution_principal);
+		let total_econ_pre = branch_state_pre.debt.outstanding();
 
 		advance_time(ONE_YEAR_MS);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
@@ -151,7 +201,7 @@ fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 
 		// Deliberate ±20% regime band (recipient 20% vs liquidatee 5% vs raw 100%),
 		// not rounding slack.
-		let target = weighted(total_econ_pre, rate_pct(20, 100));
+		let target = branch_state_pre.debt.weighted_principal.whole;
 		let lower = target.saturating_mul(80).saturating_div(100);
 		let upper = target.saturating_mul(120).saturating_div(100);
 		assert!(
@@ -164,13 +214,9 @@ fn aggregate_interest_post_redistribution_bounded_by_recipient_rates() {
 	});
 }
 
-// Setup three vaults at different rates; liquidate one with full
-// redistribution. Each per-vault touch reconciles the redistributed principal
-// to that vault's own rate, so after both surviving recipients touch the branch
-// `debt.weighted_principal_sum` equals the sum of each recipient's post-touch
-// contribution at its **own** rate, within a small rounding tolerance.
+// Recipient touches must preserve the market's rate-weighted projection.
 #[test]
-fn mixed_rate_recipients_reconcile_on_touch() {
+fn mixed_rate_recipients_materialize_at_their_own_rates() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100))); // A — recipient
@@ -193,7 +239,7 @@ fn mixed_rate_recipients_reconcile_on_touch() {
 		let v_b = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
 		let expected = weighted(v_a.debt.principal, rate_pct(5, 100))
 			.saturating_add(weighted(v_b.debt.principal, rate_pct(50, 100)));
-		let actual = state.debt.weighted_principal_sum;
+		let actual = state.debt.weighted_principal.whole;
 		// One ceil (`average_branch_rate`) against two per-recipient floors.
 		assert!(
 			actual.abs_diff(expected) <= 2,
@@ -241,7 +287,7 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 		let v_b = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
 		let expected = weighted(v_a.debt.principal, rate_pct(5, 100))
 			.saturating_add(weighted(v_b.debt.principal, rate_pct(50, 100)));
-		let actual = state.debt.weighted_principal_sum;
+		let actual = state.debt.weighted_principal.whole;
 		// Same ceil-vs-floor drift as above, plus the borrow's own reconciliation.
 		assert!(
 			actual.abs_diff(expected) <= 2,
@@ -341,8 +387,131 @@ fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
 	});
 }
 
+// A liquidation below accumulator resolution must remain an explicit branch liability.
 #[test]
-fn vault_cr_view_includes_pending_redistribution() {
+fn sub_resolution_liquidation_remains_explicitly_pending() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(Balances::force_set_balance(
+			RuntimeOrigin::root(),
+			1,
+			2_000_000_000_000_000_000_000_000
+		));
+		assert_ok!(Balances::force_set_balance(
+			RuntimeOrigin::root(),
+			2,
+			3_000_000_000_000_000_000_000_000
+		));
+		// Large collateral creates a stake total that exceeds accumulator resolution.
+		assert_ok!(open(
+			1,
+			DOT,
+			PUSD,
+			1_000_000_000_000_000_000_000_000,
+			1_000_000,
+			rate_pct(5, 100)
+		));
+		assert_ok!(open(
+			2,
+			DOT,
+			PUSD,
+			2_000_000_000_000_000_000_000_000,
+			1_000_000,
+			rate_pct(5, 100)
+		));
+		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+
+		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
+		let debt_3 = Vaults::<Test>::get((DOT, PUSD, 3)).unwrap().debt.total();
+		let coll_3 = held(DOT, 3);
+		let p1_before = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal;
+		let p2_before = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.principal;
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
+
+		assert!(debt_3 < 3_000_000, "the event must sit below the index resolution");
+		let p1_after = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal;
+		let p2_after = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.principal;
+		let state = branch_state(DOT, PUSD).unwrap();
+		assert_eq!(
+			(p1_after - p1_before) +
+				(p2_after - p2_before) +
+				state.debt.pending_redistribution_principal,
+			debt_3,
+		);
+		assert_eq!(
+			held(DOT, crate::Pallet::<Test>::redistribution_account(&DOT, &PUSD)),
+			state.pending_redistribution_collateral,
+		);
+
+		// Stake consolidation must give the remaining bearer the exact residue.
+		mint_stable(PUSD, 2, 10_000);
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(2),
+			DOT,
+			PUSD,
+			2,
+			Balance::MAX,
+		));
+		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		let drained = branch_state(DOT, PUSD).unwrap();
+		assert_eq!(drained.debt.pending_redistribution_principal, 0);
+		assert_eq!(drained.pending_redistribution_collateral, 0);
+		assert_eq!(held(DOT, crate::Pallet::<Test>::redistribution_account(&DOT, &PUSD)), 0,);
+		assert_accounting_identity_holds();
+	});
+}
+
+// The sole survivor must receive the complete pending-pool complement.
+#[test]
+fn sole_survivor_receives_the_exact_remainder() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 10_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+
+		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
+		let debt_2 = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.total();
+		let coll_2 = held(DOT, 2);
+		let principal_before = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal;
+		assert_ok!(redistribute_for_test(DOT, PUSD, 2, coll_2));
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal, principal_before);
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		let principal_after = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal;
+		assert_eq!(principal_after - principal_before, debt_2);
+		assert_eq!(held(DOT, 1), 11_000);
+		assert_accounting_identity_holds();
+	});
+}
+
+// A one-unit stake floor keeps a debt-bearing vault eligible for redistribution and liquidation.
+#[test]
+fn dust_ratio_stake_floors_to_one_unit_and_stays_liquidatable() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		// The fixture makes the corrected stake floor to zero before the minimum applies.
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 2_000_000, 500, rate_pct(5, 100)));
+		set_price(DOT, FixedU128::from_rational(1u128, 10_000u128));
+		let coll_2 = held(DOT, 2);
+		assert_ok!(redistribute_for_test(DOT, PUSD, 2, coll_2));
+
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 3)).unwrap().redistribution_stake, 1);
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 3));
+
+		set_price(DOT, FixedU128::from_rational(50u128, 100u128));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
+		assert!(Vaults::<Test>::get((DOT, PUSD, 3)).is_none());
+		assert_accounting_identity_holds();
+	});
+}
+
+#[test]
+fn vault_cr_projects_lazy_redistribution_before_materialization() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
@@ -362,7 +531,7 @@ fn vault_cr_view_includes_pending_redistribution() {
 		let view_pre = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).expect("cr");
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
 		let view_post = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).expect("cr");
-		// The view projects the same pending redistribution as a touch.
+		// Projection must match execution before materialization.
 		assert_eq!(view_pre, view_post);
 	});
 }
@@ -402,41 +571,6 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 			state.dormant_redemption_target,
 			Some(2),
 			"the dormant slot is retained; nothing revived the vault",
-		);
-	});
-}
-
-#[test]
-fn redistribution_residue_lands_in_ownerless_debt() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// Two recipients with stakes that do not evenly divide an
-		// arbitrary redistributed debt, guaranteeing per-stake floor residue.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 999, 500, rate_pct(5, 100)));
-		assert_ok!(open(3, DOT, PUSD, 5_000, 500, rate_pct(5, 100))); // liquidatee
-		let stablecoin_debt_before =
-			<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD);
-
-		let pre_owner = branch_state(DOT, PUSD).unwrap().ownerless_debt;
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		// `redistribution_collateral: 0` on purpose — the per-stake *debt* flooring
-		// residue surfaces regardless of the collateral leg, so it is left out.
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_post_touch| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: 0,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
-
-		let state = branch_state(DOT, PUSD).unwrap();
-		// Redistributed debt 501 over stakes 1_000 + 999 = 1_999: the double floor
-		// (per-stake, then × stake) distributes 500 and strands exactly 1 unit — a tight
-		// bound, not an open `> 0` that would also pass if hundreds were mis-routed.
-		assert_eq!(state.ownerless_debt, pre_owner + 1);
-		assert_eq!(
-			<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD),
-			stablecoin_debt_before,
-			"moving debt into ownerless redistribution dust must not reduce stablecoin debt"
 		);
 	});
 }
@@ -481,7 +615,7 @@ fn full_lifecycle_holds_branch_identities() {
 		assert_eq!(collateral_balance(DOT, 8), keeper_8_pre + 10);
 		assert_eq!(collateral_balance(DOT, 9), offset_9_pre + 100);
 
-		// A recipient touch absorbs its redistribution share.
+		// The recipient must accrue interest from the redistribution time.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
 		assert_identities();
 
@@ -534,46 +668,117 @@ fn redistributed_principal_accrues_interest_from_liquidation_moment() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 2_000, 800, rate_pct(50, 100)));
-		// Age the branch so the interest-time origin and t1 are well separated.
-		advance_time(10 * 24 * 3_600 * 1_000);
-		// Settle vault 2's own interest at t1 so the t2 delta decomposes into
-		// "own principal interest" + "redistribution interest" cleanly.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
 
-		// Fully redistribute vault 1's debt at t1.
+		// The 501 debt remains pending until the recipient is touched.
 		set_price(DOT, FixedU128::from_rational(55u128, 100u128));
-		let mut redistributed: Balance = 0;
-		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| {
-			redistributed = post_touch;
-			LiquidationAllocation {
-				offset: OffsetAllocation { collateral_recipient: 9, debt: 0, collateral: 0 },
-				redistribution_collateral: 0,
-				keeper: KeeperCompensation { recipient: 8, collateral: 0 },
-			}
-		}));
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault 2 stored");
+		let redistributed = redistribute_for_test(DOT, PUSD, 1, 0).unwrap();
+		assert_eq!(redistributed, 501);
+		let v_at_record = Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault 2 stored");
+		assert_eq!(v_at_record.debt.principal, v_pre.debt.principal);
+		let minted_pre = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
 
-		let elapsed: u128 = 30 * 24 * 3_600 * 1_000;
-		advance_time(elapsed as Moment);
+		// The expected interest includes own and redistributed principal for two years.
+		advance_time(2 * ONE_YEAR_MS);
+		let projected =
+			<crate::Pallet<Test> as pusd_primitives::VaultInterface>::stablecoin_debt(&PUSD);
+		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.minted_interest, minted_pre);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
 		let v_post = Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault 2 stored");
+		assert_eq!(v_post.debt.principal, v_at_record.debt.principal + 501);
+		assert_eq!(v_post.debt.interest - v_at_record.debt.interest, 1_301);
+		let state = branch_state(DOT, PUSD).unwrap();
+		assert_eq!(state.debt.minted_interest - minted_pre, 1_301);
+		assert_eq!(state.debt.pending_interest_attribution, 0);
+		assert_eq!(projected, state.debt.outstanding());
+	});
+}
 
-		// Vault 2 is the only recipient: per-stake quantization loses at most
-		// one unit of the redistributed principal.
-		let share = v_post.debt.principal - v_pre.debt.principal;
-		assert!(share > 0);
-		assert!(redistributed.abs_diff(share) <= 1, "share ≈ full redistributed debt");
+// Seeds pending redistribution debt of 502 with rate weight 50.2.
+fn seed_redistributed_recipient() {
+	register_market(DOT, PUSD);
+	assert_ok!(open(1, DOT, PUSD, 10_000, 500, rate_pct(10, 100)));
+	assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
+	// Only vault 2 must be liquidatable in this fixture.
+	set_price(DOT, FixedU128::from_rational(50u128, 100u128));
+	let coll_2 = held(DOT, 2);
+	assert_ok!(redistribute_for_test(DOT, PUSD, 2, coll_2));
+}
 
-		// Both expectations follow `floor(P · rate · Δt / year)` with the 50%
-		// rate folded as a halving.
-		let own_expected = v_pre.debt.principal * elapsed / 2 / u128::from(ONE_YEAR_MS);
-		let redistribution_expected = share * elapsed / 2 / u128::from(ONE_YEAR_MS);
-		let interest_delta = v_post.debt.interest - v_pre.debt.interest;
-		assert!(interest_delta >= own_expected);
-		let redistribution_part = interest_delta - own_expected;
-		assert!(
-			redistribution_part.abs_diff(redistribution_expected) <= 2,
-			"redistribution interest accrues from t1: got {redistribution_part}, want ≈{redistribution_expected}"
+// Pending redistribution interest must appear in branch debt before a recipient touch.
+#[test]
+fn recipient_owned_redistribution_interest_stays_in_branch_projection() {
+	build_and_execute(|| {
+		seed_redistributed_recipient();
+
+		let state = branch_state(DOT, PUSD).unwrap();
+		assert_eq!(state.debt.principal, 500);
+		assert_eq!(state.debt.pending_redistribution_principal, 502);
+		let accrued_at_record =
+			crate::Pallet::<Test>::accrued_branch_debt(&state, Timestamp::get());
+		assert_eq!(accrued_at_record, 1_003);
+
+		advance_time(ONE_YEAR_MS);
+		let accrued_after_idle_year = crate::Pallet::<Test>::accrued_branch_debt(
+			&branch_state(DOT, PUSD).unwrap(),
+			Timestamp::get(),
 		);
+		assert_eq!(accrued_after_idle_year, 1_104);
+		assert_accounting_identity_holds();
+	});
+}
+
+// Branch refresh frequency must not change projected debt at the same time.
+#[test]
+fn branch_debt_projection_is_refresh_cadence_independent() {
+	let run = |refreshes: u64| {
+		new_test_ext().execute_with(|| {
+			seed_redistributed_recipient();
+			assert_ok!(open(9, DOT, PUSD, 1_000, 300, rate_pct(5, 100)));
+
+			for step in 0..10u64 {
+				advance_time(ONE_YEAR_MS / 10);
+				if step < refreshes {
+					assert_ok!(crate::Pallet::<Test>::poke(
+						RuntimeOrigin::signed(99),
+						DOT,
+						PUSD,
+						9
+					));
+				}
+			}
+			crate::Pallet::<Test>::accrued_branch_debt(
+				&branch_state(DOT, PUSD).unwrap(),
+				Timestamp::get(),
+			)
+		})
+	};
+	assert_eq!(run(9), run(0));
+}
+
+// A recipient touch must preserve the aggregate interest projection.
+#[test]
+fn recipient_touch_preserves_the_aggregate_interest_projection() {
+	build_and_execute(|| {
+		seed_redistributed_recipient();
+
+		advance_time(ONE_YEAR_MS);
+		let accrued_before_absorb = crate::Pallet::<Test>::accrued_branch_debt(
+			&branch_state(DOT, PUSD).unwrap(),
+			Timestamp::get(),
+		);
+		assert_eq!(accrued_before_absorb, 1_104);
+
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
+
+		let state = branch_state(DOT, PUSD).unwrap();
+		let vault = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		// Whole interest is 101, and the fractional residue remains carried.
+		assert_eq!(vault.debt.interest, 101);
+		assert!(vault.interest_remainder != 0);
+		let accrued_after_absorb =
+			crate::Pallet::<Test>::accrued_branch_debt(&state, Timestamp::get());
+		assert_eq!(accrued_after_absorb, accrued_before_absorb);
+		assert_accounting_identity_holds();
 	});
 }

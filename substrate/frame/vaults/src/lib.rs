@@ -50,8 +50,8 @@ pub use pusd_primitives;
 pub use types::{
 	BranchConfig, BranchConfigUpdate, BranchDebt, BranchMode, BranchState, DebtBreakdown,
 	DebtCollateral, FrozenReason, FrozenState, LiquidationSettlement, LiquidationSnapshot,
-	RedistributionAccumulators, RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId,
-	VaultStatus,
+	RedistributionAccumulators, RedistributionCarry, RedistributionStakeTotals,
+	StablecoinDebtState, Vault, VaultListId, VaultStatus,
 };
 pub use weights::WeightInfo;
 
@@ -86,7 +86,7 @@ pub mod pallet {
 				Balanced as FungiblesBalanced, Inspect as FungiblesInspect,
 				Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold,
 			},
-			Consideration, EnsureOriginWithArg, Footprint, Time,
+			AccountTouch, Consideration, EnsureOriginWithArg, Footprint, Time,
 		},
 	};
 	use linked_list_interface::{Position, PriorityProvider, SortedListInterface};
@@ -146,11 +146,14 @@ pub mod pallet {
 			> + fungibles::BalancedHold<Self::AccountId>;
 
 		/// Multi-asset system used to mint and burn stable assets.
+		///
+		/// [`AccountTouch`] prepares the fee account to receive sub-minimum credits.
 		type StableAssets: FungiblesMutate<
 				Self::AccountId,
 				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance = BalanceOf<Self>,
-			> + FungiblesBalanced<Self::AccountId>;
+			> + FungiblesBalanced<Self::AccountId>
+			+ AccountTouch<StableIdOf<Self>, Self::AccountId, Balance = BalanceOf<Self>>;
 
 		/// Converts a stable asset ID into the collateral asset ID type.
 		///
@@ -161,12 +164,18 @@ pub mod pallet {
 		/// Provides the value of each collateral asset in stable units.
 		type Oracle: ProvidePrice<AssetId = CollateralIdOf<Self>>;
 
-		/// Receives stable-asset fees left by [`Config::YieldHook`].
-		type FeeHandler: OnUnbalanced<StableCreditOf<Self>>;
+		/// Converts each stablecoin ID to its fee account.
+		///
+		/// This account receives stable-asset fees that remain after [`Config::YieldHook`]. Fee
+		/// resolution must be exact because each fee credit backs a recorded liability.
+		///
+		/// The account must fund its asset-account deposit before registration of the first market
+		/// for that stablecoin.
+		type FeeAccount: Convert<StableIdOf<Self>, Self::AccountId>;
 
 		/// Receives the first share of interest and upfront fees.
 		///
-		/// The remaining credit is sent to [`Config::FeeHandler`].
+		/// The pallet resolves the remaining credit to [`Config::FeeAccount`].
 		type YieldHook: OnBranchYield<CollateralIdOf<Self>, StableCreditOf<Self>>;
 
 		/// Notifies other pallets when a market is created or removed.
@@ -367,24 +376,6 @@ pub mod pallet {
 			/// Status after the change.
 			new_status: VaultStatus,
 		},
-		/// Bad debt was added to a market.
-		BadDebtRecorded {
-			/// Collateral asset ID.
-			collateral_id: CollateralIdOf<T>,
-			/// Stable asset ID.
-			stable_id: StableIdOf<T>,
-			/// Bad debt added.
-			amount: BalanceOf<T>,
-		},
-		/// Bad debt was repaid and burned.
-		BadDebtHealed {
-			/// Collateral asset ID.
-			collateral_id: CollateralIdOf<T>,
-			/// Stable asset ID.
-			stable_id: StableIdOf<T>,
-			/// Bad debt removed.
-			amount: BalanceOf<T>,
-		},
 		/// Collateral was added to a vault.
 		CollateralDeposited {
 			/// Collateral asset ID.
@@ -459,6 +450,17 @@ pub mod pallet {
 			/// Vault owner.
 			owner: T::AccountId,
 			/// Interest added.
+			amount: BalanceOf<T>,
+		},
+		/// A vault paid one stablecoin unit for terminal fractional interest.
+		InterestRoundingFeeCharged {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Vault owner.
+			owner: T::AccountId,
+			/// Fee added to the terminal debt.
 			amount: BalanceOf<T>,
 		},
 		/// An upfront fee was charged to a vault.
@@ -576,12 +578,18 @@ pub mod pallet {
 		StableCollateralCollision,
 		/// This collateral and stable asset pair is already registered.
 		BranchAlreadyRegistered,
+		/// The fee account cannot be made able to receive the stable asset.
+		FeeAccountNotReceivable,
+		/// A fee credit backing a recorded liability failed to resolve.
+		FeeResolutionFailed,
 		/// The resulting debt is below the market minimum.
 		DebtBelowMinimum,
 		/// The repayment would leave debt below the market minimum.
 		///
 		/// Repay less or repay the full debt.
 		DebtWouldBecomeDust,
+		/// The live full payoff, including terminal rounding, exceeds the supplied maximum.
+		PayoffExceedsMaximum,
 		/// The borrow would exceed the market debt limit.
 		DebtCeilingExceeded,
 		/// The borrow would exceed the global debt limit for this collateral asset.
@@ -800,32 +808,32 @@ pub mod pallet {
 				return total;
 			};
 			let now = T::TimeProvider::now();
+			// All vault projections must use the same accrued branch state.
+			let accrued = {
+				let mut state = branch.state;
+				if Self::accrue_aggregate_interest(&mut state, now).is_err() {
+					return total;
+				}
+				state
+			};
 			let mut steps_left = max_steps;
 			let recovery_list = recovery::list_id::<T>(&collateral_id, &stable_id);
 			for owner in T::VaultLists::iter_from_tail(recovery_list).take(steps_left as usize) {
 				steps_left -= 1;
-				if let Some(debt) = Self::projected_vault_debt(
-					&collateral_id,
-					&stable_id,
-					&owner,
-					&branch.state,
-					now,
-				) {
+				if let Some(debt) =
+					Self::projected_vault_debt(&collateral_id, &stable_id, &owner, &accrued, now)
+				{
 					total = total.saturating_add(debt);
 				}
 			}
-			if let Some(target) = &branch.state.dormant_redemption_target {
+			if let Some(target) = &accrued.dormant_redemption_target {
 				if steps_left == 0 {
 					return total;
 				}
 				steps_left -= 1;
-				if let Some(debt) = Self::projected_vault_debt(
-					&collateral_id,
-					&stable_id,
-					target,
-					&branch.state,
-					now,
-				) {
+				if let Some(debt) =
+					Self::projected_vault_debt(&collateral_id, &stable_id, target, &accrued, now)
+				{
 					total = total.saturating_add(debt);
 				}
 			}
@@ -840,7 +848,7 @@ pub mod pallet {
 					break;
 				}
 				if let Some(debt) =
-					Self::projected_vault_debt(&collateral_id, &stable_id, &o, &branch.state, now)
+					Self::projected_vault_debt(&collateral_id, &stable_id, &o, &accrued, now)
 				{
 					total = total.saturating_add(debt);
 				}
@@ -858,12 +866,9 @@ pub mod pallet {
 			initial_debt: BalanceOf<T>,
 			annual_rate: FixedU128,
 		) -> Result<BalanceOf<T>, DispatchError> {
-			let branch = Self::branch_of(&collateral_id, &stable_id)?;
-			let (config, mut state) = (branch.config, branch.state);
+			let (config, mut state, now) = Self::accrued_branch_view(&collateral_id, &stable_id)?;
 			ensure!(!state.is_frozen(), Error::<T>::BranchFrozen);
 			Self::validate_rate(&config, annual_rate)?;
-			let now = T::TimeProvider::now();
-			Self::accrue_aggregate_interest(&mut state, now)?;
 			let mut scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
 			Self::apply_borrow_unchecked(
 				&mut state,
@@ -892,14 +897,13 @@ pub mod pallet {
 			ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
 			let new_rate = maybe_new_rate.unwrap_or(draft.vault.annual_rate);
 			Self::validate_rate(&draft.config, new_rate)?;
-			let now = T::TimeProvider::now();
 			Self::apply_borrow_unchecked(
 				&mut draft.state,
 				&draft.config,
 				&mut draft.vault,
 				debt_increase,
 				new_rate,
-				now,
+				draft.now,
 			)
 		}
 
@@ -916,13 +920,12 @@ pub mod pallet {
 			let mut draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
 			ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
 			Self::validate_rate(&draft.config, new_rate)?;
-			let now = T::TimeProvider::now();
 			Self::apply_rate_change(
 				&mut draft.state,
 				&draft.config,
 				&mut draft.vault,
 				new_rate,
-				now,
+				draft.now,
 			)
 		}
 	}

@@ -2,8 +2,7 @@
 //! and the per-market autoline.
 
 use crate::{mock::*, tests::rate_pct};
-use frame::traits::fungibles::{Balanced as FungiblesBalanced, Mutate};
-use pusd_primitives::VaultInterface;
+use frame::traits::fungibles::Mutate;
 
 const DAY_MS: Moment = 24 * 3_600 * 1_000;
 
@@ -93,20 +92,16 @@ fn global_ceiling_is_shared_across_a_collaterals_markets() {
 	});
 }
 
-// The global ceiling caps a market's total outstanding stable debt — principal
-// plus minted interest, pending redistribution, and socialized bad debt — not
-// principal alone.
+// The global ceiling must include principal and minted interest.
 #[test]
 fn global_ceiling_counts_all_outstanding_debt() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Ceiling 200 DOT; 1_500 PUSD (150 DOT) of principal fits with headroom.
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::root(), DOT, 200));
-		// Seed 600 PUSD (== 60 DOT) of non-principal debt on the branch.
+		// Add non-principal debt that makes the next borrow exceed the ceiling.
 		mutate_branch_state(DOT, PUSD, |state| {
-			state.debt.minted_interest = 200;
-			state.debt.pending_redistribution_principal = 200;
-			state.debt.bad_debt = 200;
+			state.debt.minted_interest = 600;
 		});
 		// 150 DOT principal + 60 DOT non-principal debt == 210 DOT > the 200 DOT cap.
 		assert_noop!(
@@ -116,8 +111,6 @@ fn global_ceiling_counts_all_outstanding_debt() {
 		// Clearing the non-principal debt frees the headroom; the same borrow lands.
 		mutate_branch_state(DOT, PUSD, |state| {
 			state.debt.minted_interest = 0;
-			state.debt.pending_redistribution_principal = 0;
-			state.debt.bad_debt = 0;
 		});
 		assert_ok!(open(1, DOT, PUSD, 100_000, 1_500, rate_pct(1, 1_000)));
 	});
@@ -144,12 +137,10 @@ fn repaying_frees_global_ceiling_headroom() {
 	});
 }
 
-/// The full recomputation the aggregate mirrors: stored branch debt plus
-/// ownerless redistribution dust over the collateral's markets.
+/// Recomputes debt across all markets for one collateral asset.
 fn recomputed_collateral_debt(collateral: AssetId) -> Balance {
-	crate::pallet::Branches::<Test>::iter_prefix(collateral).fold(0, |acc, (_stable, branch)| {
-		acc + branch.state.debt.outstanding() + branch.state.ownerless_debt
-	})
+	crate::pallet::Branches::<Test>::iter_prefix(collateral)
+		.fold(0, |acc, (_stable, branch)| acc + branch.state.debt.outstanding())
 }
 
 #[track_caller]
@@ -213,9 +204,7 @@ fn projected_ceiling_counts_accrued_aggregate_interest() {
 	});
 }
 
-// Every debt-changing write path keeps the per-collateral aggregate equal to
-// a full recomputation: open, borrow, rate change, poke-accrual, repay,
-// redemption, liquidation, freeze-time accrual, bad-debt seeding, and heal.
+// Each debt write must preserve the per-collateral debt aggregate.
 #[test]
 fn collateral_debt_aggregate_tracks_every_write() {
 	build_and_execute(|| {
@@ -280,16 +269,6 @@ fn collateral_debt_aggregate_tracks_every_write() {
 			PUSD,
 			false
 		));
-
-		// Bad debt seeded through the audited boundary, then partially healed.
-		mutate_branch_state(DOT, PUSD, |state| {
-			state.debt.bad_debt += 100;
-		});
-		assert_aggregate_matches(DOT);
-		let credit = <VaultStableAssets as FungiblesBalanced<AccountId>>::issue(PUSD, 60);
-		let surplus = <Pallet<Test> as VaultInterface>::heal(&DOT, credit);
-		drop(surplus);
-		assert_aggregate_matches(DOT);
 	});
 }
 

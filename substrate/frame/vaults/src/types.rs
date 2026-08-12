@@ -2,10 +2,12 @@
 
 use crate::{math, Millis};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::arithmetic::{
-	helpers_128bit::multiply_by_rational_with_rounding, ArithmeticError, CheckedAdd, CheckedMul,
-	CheckedSub, FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Rounding, Saturating,
-	Zero,
+use frame::{
+	arithmetic::{
+		ArithmeticError, CheckedAdd, CheckedSub, FixedPointNumber, FixedPointOperand, FixedU128,
+		One, Permill, Saturating, Zero,
+	},
+	deps::sp_core::{U256, U512},
 };
 use pusd_primitives::MILLIS_PER_YEAR;
 pub use pusd_primitives::{BranchMode, DebtCollateral, VaultStatus};
@@ -35,6 +37,13 @@ pub enum VaultListId<CollateralId, StableId> {
 	/// Identifies the `FinalRecovery` FIFO.
 	#[codec(index = 1)]
 	FinalRecovery(CollateralId, StableId),
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl<CollateralId: Default, StableId: Default> Default for VaultListId<CollateralId, StableId> {
+	fn default() -> Self {
+		Self::Rate(CollateralId::default(), StableId::default())
+	}
 }
 
 /// Contains the liquidation result that [`crate::Pallet::execute_liquidation`] consumes.
@@ -161,12 +170,125 @@ impl<Balance: Ord + Saturating + Copy> DebtBreakdown<Balance> {
 pub struct RedistributionAccumulators {
 	/// Cumulative collateral assigned per unit of stake.
 	pub collateral_per_stake: FixedU128,
-	/// Cumulative debt assigned per unit of stake.
-	pub debt_per_stake: FixedU128,
-	/// Cumulative market time multiplied by debt per unit of stake.
-	pub debt_time_per_stake: FixedU128,
-	/// Cumulative rate-weighted debt assigned per unit of stake.
-	pub weight_per_stake: FixedU128,
+	/// Cumulative principal assigned per unit of stake.
+	pub principal_per_stake: FixedU128,
+	/// Cumulative pending weight assigned per unit of rate-weighted stake.
+	pub weight_per_weighted_stake: FixedU128,
+	/// Cumulative `weight_per_weighted_stake * liquidation_interest_time` anchor.
+	pub weight_time_per_weighted_stake: WeightTime,
+}
+
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WeightTime {
+	pub low: u128,
+	pub high: u128,
+}
+
+impl WeightTime {
+	pub(crate) fn from_wide(value: U256) -> Self {
+		Self { low: value.low_u128(), high: (value >> 128).low_u128() }
+	}
+
+	pub(crate) fn to_wide(self) -> U256 {
+		(U256::from(self.high) << 128) | U256::from(self.low)
+	}
+
+	pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
+		self.to_wide().checked_add(other.to_wide()).map(Self::from_wide)
+	}
+
+	pub(crate) fn checked_sub(self, other: Self) -> Option<Self> {
+		self.to_wide().checked_sub(other.to_wide()).map(Self::from_wide)
+	}
+
+	pub(crate) fn is_zero(self) -> bool {
+		self.low == 0 && self.high == 0
+	}
+}
+
+/// Groups pending redistribution weight with its time anchor.
+///
+/// Both values must move together to keep the claimed and remaining time anchors valid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RedistributionAttribution<Balance> {
+	weight: InterestWeight<Balance>,
+	weight_time: WeightTime,
+}
+
+impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One>
+	RedistributionAttribution<Balance>
+{
+	pub(crate) fn zero() -> Self {
+		Self { weight: InterestWeight::zero(), weight_time: WeightTime::default() }
+	}
+
+	pub(crate) fn is_zero(&self) -> bool {
+		self.weight.is_zero()
+	}
+
+	/// Returns a claim that gives both pool parts valid time anchors at `now`.
+	///
+	/// The claim conserves weight and weight-time. A claim for all weight receives the exact pool
+	/// complement.
+	pub(crate) fn claim(
+		candidate: InterestWeight<Balance>,
+		desired_weight_time: WeightTime,
+		available_weight: InterestWeight<Balance>,
+		available_weight_time: WeightTime,
+		now: Millis,
+	) -> Result<Self, ArithmeticError> {
+		let available_raw = available_weight.raw();
+		let available_time = available_weight_time.to_wide();
+		let available_time_cap =
+			available_raw.checked_mul(U256::from(now)).ok_or(ArithmeticError::Overflow)?;
+		if available_time > available_time_cap {
+			return Err(ArithmeticError::Underflow);
+		}
+
+		let candidate_raw = candidate.raw();
+		if candidate_raw >= available_raw {
+			return Ok(Self { weight: available_weight, weight_time: available_weight_time });
+		}
+
+		let remaining_raw =
+			available_raw.checked_sub(candidate_raw).ok_or(ArithmeticError::Underflow)?;
+		let remaining_time_cap =
+			remaining_raw.checked_mul(U256::from(now)).ok_or(ArithmeticError::Overflow)?;
+		let minimum_claim_time = if available_time > remaining_time_cap {
+			available_time
+				.checked_sub(remaining_time_cap)
+				.ok_or(ArithmeticError::Underflow)?
+		} else {
+			U256::zero()
+		};
+		let claim_time_cap = candidate_raw
+			.checked_mul(U256::from(now))
+			.ok_or(ArithmeticError::Overflow)?
+			.min(available_time);
+		if minimum_claim_time > claim_time_cap {
+			return Err(ArithmeticError::Underflow);
+		}
+
+		let desired = desired_weight_time.to_wide();
+		let claimed_time = desired.max(minimum_claim_time).min(claim_time_cap);
+		Ok(Self { weight: candidate, weight_time: WeightTime::from_wide(claimed_time) })
+	}
+
+	pub(crate) fn pending_interest(
+		&self,
+		now: Millis,
+	) -> Result<PendingInterest<Balance>, ArithmeticError> {
+		PendingInterest::from_weight_time(&self.weight, self.weight_time, now)
+	}
+}
+
+/// Stores division residue between redistributions.
+///
+/// These values are not debt or collateral. They preserve subunit allocation precision.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RedistributionCarry {
+	pub principal: u128,
+	pub collateral: u128,
 }
 
 /// State of one vault.
@@ -182,11 +304,17 @@ pub struct Vault<Balance> {
 	pub annual_rate: FixedU128,
 	/// Market interest time of the last vault update.
 	pub last_interest_time: Millis,
+	/// Sub-unit interest carried across touches, below [`PendingInterest::DENOMINATOR`].
+	///
+	/// A touch realizes whole stablecoin units. A terminal settlement charges one unit for a
+	/// nonzero remainder.
+	pub interest_remainder: u128,
 	/// Wall-clock time of the last rate change.
 	pub last_rate_update: Millis,
 	/// Collateral used as redistribution stake.
 	///
-	/// This is zero during final recovery and otherwise equals [`Self::collateral`].
+	/// This is zero during final recovery or while debt-free. After a liquidation,
+	/// snapshot correction prevents touch order from changing later allocations.
 	pub redistribution_stake: Balance,
 	/// Redistribution totals applied by the last vault update.
 	pub redistribution_checkpoint: RedistributionAccumulators,
@@ -201,19 +329,21 @@ pub struct Vault<Balance> {
 struct VaultContribution<Balance> {
 	principal: Balance,
 	interest: Balance,
-	weighted_principal: Balance,
+	weighted_principal: InterestWeight<Balance>,
 	stake: Balance,
-	weighted_stake: Balance,
+	weighted_stake: InterestWeight<Balance>,
+	eligible_collateral: Balance,
 }
 
-impl<Balance: FixedPointOperand> VaultContribution<Balance> {
+impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> VaultContribution<Balance> {
 	fn zero() -> Self {
 		Self {
 			principal: Zero::zero(),
 			interest: Zero::zero(),
-			weighted_principal: Zero::zero(),
+			weighted_principal: InterestWeight::zero(),
 			stake: Zero::zero(),
-			weighted_stake: Zero::zero(),
+			weighted_stake: InterestWeight::zero(),
+			eligible_collateral: Zero::zero(),
 		}
 	}
 
@@ -222,15 +352,22 @@ impl<Balance: FixedPointOperand> VaultContribution<Balance> {
 		Ok(Self {
 			principal: vault.debt.principal,
 			interest: vault.debt.interest,
-			weighted_principal: vault
-				.annual_rate
-				.checked_mul_int(vault.debt.principal)
-				.ok_or(ArithmeticError::Overflow)?,
+			weighted_principal: InterestWeight::from_principal_rate(
+				vault.debt.principal,
+				vault.annual_rate,
+			)
+			.ok_or(ArithmeticError::Overflow)?,
 			stake: vault.redistribution_stake,
-			weighted_stake: vault
-				.annual_rate
-				.checked_mul_int(vault.redistribution_stake)
-				.ok_or(ArithmeticError::Overflow)?,
+			weighted_stake: InterestWeight::from_principal_rate(
+				vault.redistribution_stake,
+				vault.annual_rate,
+			)
+			.ok_or(ArithmeticError::Overflow)?,
+			eligible_collateral: if vault.redistribution_stake.is_zero() {
+				Balance::zero()
+			} else {
+				vault.collateral
+			},
 		})
 	}
 }
@@ -250,6 +387,38 @@ impl<Balance: Ord + Saturating + Copy> Vault<Balance> {
 	/// The debt/collateral pair the CR gates read.
 	pub fn position(&self) -> DebtCollateral<Balance> {
 		DebtCollateral { debt: self.debt.total(), collateral: self.collateral }
+	}
+}
+
+impl<Balance: Zero + One> Vault<Balance> {
+	/// Returns the protocol-favoring unit due on a terminal settlement.
+	///
+	/// Zero when no fraction is carried.
+	pub fn terminal_interest_charge(&self) -> Balance {
+		if self.interest_remainder == 0 {
+			Balance::zero()
+		} else {
+			Balance::one()
+		}
+	}
+}
+
+impl<Balance: Ord + Saturating + Copy + Zero + One> Vault<Balance> {
+	/// Returns the values for one redemption step.
+	///
+	/// Projection and execution use this snapshot to keep all fields consistent.
+	pub(crate) fn redemption_snapshot(
+		&self,
+		status: VaultStatus,
+		redistribution_penalty: Permill,
+	) -> pusd_primitives::RedemptionStepSnapshot<Balance> {
+		pusd_primitives::RedemptionStepSnapshot {
+			status,
+			debt: self.debt.total(),
+			terminal_interest_charge: self.terminal_interest_charge(),
+			collateral: self.collateral,
+			redistribution_penalty,
+		}
 	}
 }
 
@@ -293,82 +462,289 @@ pub struct BranchConfig<Balance> {
 pub struct BranchDebt<Balance> {
 	/// Principal stored across all vaults.
 	pub principal: Balance,
+	/// Liquidated principal assigned through the per-stake accumulator but not yet materialized.
+	pub pending_redistribution_principal: Balance,
 	/// Interest and fees minted by the market and not yet repaid.
 	pub minted_interest: Balance,
-	/// Liquidated principal waiting to be applied to vaults.
-	pub pending_redistribution_principal: Balance,
-	/// Debt that is not backed by a vault.
-	pub bad_debt: Balance,
-	/// Rate-weighted principal used for aggregate interest.
+	/// Minted aggregate interest not yet attributed to vault debt.
 	///
-	/// This includes pending redistributed debt at the market's average rate.
-	pub weighted_principal_sum: Balance,
+	/// This is a subset of [`Self::minted_interest`], not an additional debt term.
+	pub pending_interest_attribution: Balance,
+	/// Rate-weighted principal used for debt projections.
+	pub weighted_principal: InterestWeight<Balance>,
+	/// Pending redistribution's subset of [`Self::weighted_principal`].
+	pub pending_redistribution_weight: InterestWeight<Balance>,
 	/// Market interest time of the last aggregate interest update.
 	pub last_interest_time: Millis,
+	/// Sub-unit aggregate interest carried across refreshes, below
+	/// [`PendingInterest::DENOMINATOR`].
+	pub aggregate_interest_remainder: u128,
 }
 
 impl<Balance: FixedPointOperand + Saturating> BranchDebt<Balance> {
 	/// Returns all debt owed by the market.
 	pub fn outstanding(&self) -> Balance {
 		self.principal
-			.saturating_add(self.minted_interest)
 			.saturating_add(self.pending_redistribution_principal)
-			.saturating_add(self.bad_debt)
+			.saturating_add(self.minted_interest)
 	}
 }
 
-/// An exact interest amount split at the year boundary.
+impl<Balance: Zero> BranchDebt<Balance> {
+	/// Returns whether all attributed interest state is zero.
+	///
+	/// This excludes `aggregate_interest_remainder`, which has no owner after the branch becomes
+	/// empty.
+	pub(crate) fn interest_ledger_settled(&self) -> bool {
+		self.pending_interest_attribution.is_zero() &&
+			self.weighted_principal.is_zero() &&
+			self.pending_redistribution_weight.is_zero()
+	}
+}
+
+impl<Balance: FixedPointOperand + Ord + Saturating + CheckedAdd + CheckedSub> BranchDebt<Balance> {
+	/// Attributes `amount` and returns the part that requires new issuance.
+	///
+	/// This preserves `minted_interest == Σ vault interest + pending_interest_attribution`.
+	pub(crate) fn attribute_interest(&mut self, amount: Balance) -> Option<Balance> {
+		let covered = amount.min(self.pending_interest_attribution);
+		let uncovered = amount.saturating_sub(covered);
+		self.pending_interest_attribution =
+			self.pending_interest_attribution.checked_sub(&covered)?;
+		self.minted_interest = self.minted_interest.checked_add(&uncovered)?;
+		Some(uncovered)
+	}
+}
+
+/// An exact interest amount split at the shared interest denominator.
 ///
-/// The represented weight-millis numerator is
-/// `interest * MILLIS_PER_YEAR + remainder`. Splitting keeps both limbs inside
-/// `Balance`/`u64` without a wide integer, while carry/borrow arithmetic stays
-/// exact, so one market's contribution can be subtracted back out of an
-/// aggregate without drift.
+/// Represents `principal × rate-inner × millis` as `interest * DENOMINATOR + remainder`.
+///
+/// The split representation permits exact aggregate addition and subtraction within the stored
+/// integer types.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug, Default)]
 pub struct PendingInterest<Balance> {
-	/// Whole interest units: `numerator / MILLIS_PER_YEAR`, rounded down.
+	/// Whole interest units: `numerator / DENOMINATOR`, rounded down.
 	pub interest: Balance,
-	/// Sub-unit residue: `numerator % MILLIS_PER_YEAR`, in weight-millis.
-	pub remainder: u64,
+	/// Sub-unit residue: `numerator % DENOMINATOR`.
+	pub remainder: u128,
+}
+
+/// An annual rate-weighted principal with its fixed-point fraction retained.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct InterestWeight<Balance> {
+	/// Whole weight units: `Σ principal · rate / FixedU128::DIV`, rounded down.
+	pub whole: Balance,
+	/// Sub-unit residue below [`FixedU128::DIV`].
+	pub remainder: u128,
+}
+
+/// `whole * denominator + remainder`: the wide numerator one split limb represents.
+fn join_wide(whole: u128, remainder: u128, denominator: u128) -> U256 {
+	U256::from(whole) * U256::from(denominator) + U256::from(remainder)
+}
+
+/// Splits a wide numerator at `denominator` into whole `Balance` units and a
+/// sub-unit residue. `None` when the whole part overflows `Balance`.
+fn split_wide<Balance: FixedPointOperand>(
+	numerator: U256,
+	denominator: u128,
+) -> Option<(Balance, u128)> {
+	let (whole, remainder) = numerator.div_mod(U256::from(denominator));
+	if whole > U256::from(u128::MAX) {
+		return None;
+	}
+	Some((Balance::try_from(whole.low_u128()).ok()?, remainder.low_u128()))
+}
+
+/// Adds two `(whole, remainder)` limbs at `denominator`, carrying into the whole part.
+fn limb_add<Balance: CheckedAdd + One>(
+	lhs: (&Balance, u128),
+	rhs: (&Balance, u128),
+	denominator: u128,
+) -> Option<(Balance, u128)> {
+	let mut whole = lhs.0.checked_add(rhs.0)?;
+	let mut remainder = lhs.1.checked_add(rhs.1)?;
+	if remainder >= denominator {
+		remainder -= denominator;
+		whole = whole.checked_add(&Balance::one())?;
+	}
+	Some((whole, remainder))
+}
+
+/// Subtracts two `(whole, remainder)` limbs at `denominator`, borrowing from the whole part.
+fn limb_sub<Balance: CheckedSub + One>(
+	lhs: (&Balance, u128),
+	rhs: (&Balance, u128),
+	denominator: u128,
+) -> Option<(Balance, u128)> {
+	let mut whole = lhs.0.checked_sub(rhs.0)?;
+	let remainder = if lhs.1 >= rhs.1 {
+		lhs.1 - rhs.1
+	} else {
+		whole = whole.checked_sub(&Balance::one())?;
+		lhs.1 + denominator - rhs.1
+	};
+	Some((whole, remainder))
+}
+
+impl<Balance: Zero> InterestWeight<Balance> {
+	pub fn zero() -> Self {
+		Self { whole: Balance::zero(), remainder: 0 }
+	}
+
+	pub fn is_zero(&self) -> bool {
+		self.whole.is_zero() && self.remainder == 0
+	}
+}
+
+impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> InterestWeight<Balance> {
+	pub(crate) fn raw(&self) -> U256 {
+		join_wide(self.whole.unique_saturated_into(), self.remainder, FixedU128::DIV)
+	}
+
+	pub(crate) fn from_raw(raw: U256) -> Option<Self> {
+		let (whole, remainder) = split_wide(raw, FixedU128::DIV)?;
+		Some(Self { whole, remainder })
+	}
+
+	pub(crate) fn from_principal_rate(principal: Balance, rate: FixedU128) -> Option<Self> {
+		let product = U256::from(principal.unique_saturated_into()) * U256::from(rate.into_inner());
+		let (whole, remainder) = split_wide(product, FixedU128::DIV)?;
+		Some(Self { whole, remainder })
+	}
+
+	pub(crate) fn checked_add(&self, other: &Self) -> Option<Self> {
+		let (whole, remainder) = limb_add(
+			(&self.whole, self.remainder),
+			(&other.whole, other.remainder),
+			FixedU128::DIV,
+		)?;
+		Some(Self { whole, remainder })
+	}
+
+	pub(crate) fn checked_sub(&self, other: &Self) -> Option<Self> {
+		let (whole, remainder) = limb_sub(
+			(&self.whole, self.remainder),
+			(&other.whole, other.remainder),
+			FixedU128::DIV,
+		)?;
+		Some(Self { whole, remainder })
+	}
+
+	/// Rate-weighted principal posted for one redistribution, rounded once upward.
+	pub(crate) fn posted_redistribution(
+		principal: Balance,
+		weighted_stake: &Self,
+		total_stake: Balance,
+	) -> Option<Self> {
+		let denominator = total_stake.unique_saturated_into();
+		if denominator == 0 || weighted_stake.is_zero() {
+			return None;
+		}
+		let numerator = U512::from(principal.unique_saturated_into())
+			.checked_mul(U512::from(weighted_stake.raw()))?;
+		let (quotient, remainder) = numerator.div_mod(U512::from(denominator));
+		let ceiled =
+			if remainder.is_zero() { quotient } else { quotient.checked_add(U512::one())? };
+		Self::from_raw(U256::try_from(ceiled).ok()?)
+	}
+
+	/// Fixed-point allocation ratio for pending weight over rate-weighted stake.
+	pub(crate) fn redistribution_ratio(&self, total_weighted_stake: &Self) -> Option<FixedU128> {
+		let denominator = total_weighted_stake.raw();
+		if denominator.is_zero() {
+			return None;
+		}
+		let numerator = U512::from(self.raw()).checked_mul(U512::from(FixedU128::DIV))?;
+		let ratio = numerator / U512::from(denominator);
+		if ratio > U512::from(u128::MAX) {
+			return None;
+		}
+		Some(FixedU128::from_inner(ratio.low_u128()))
+	}
+
+	/// Floors one accumulator ratio against this rate-weighted stake.
+	pub(crate) fn apply_redistribution_ratio(&self, ratio: FixedU128) -> Option<Self> {
+		let numerator = U512::from(self.raw()).checked_mul(U512::from(ratio.into_inner()))?;
+		Self::from_raw(U256::try_from(numerator / U512::from(FixedU128::DIV)).ok()?)
+	}
+
+	/// Floors one cumulative time ratio against this rate-weighted stake.
+	pub(crate) fn apply_weight_time_ratio(&self, ratio: WeightTime) -> Option<WeightTime> {
+		let numerator = U512::from(self.raw()).checked_mul(U512::from(ratio.to_wide()))?;
+		Some(WeightTime::from_wide(U256::try_from(numerator / U512::from(FixedU128::DIV)).ok()?))
+	}
+
+	/// `self − before + after`: swaps one contribution inside an aggregate.
+	pub(crate) fn shifted(&self, before: &Self, after: &Self) -> Option<Self> {
+		self.checked_sub(before)?.checked_add(after)
+	}
 }
 
 impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> PendingInterest<Balance> {
+	/// The shared interest denominator: one whole unit of interest per year of
+	/// one whole unit of rate-weighted principal.
+	pub const DENOMINATOR: u128 = FixedU128::DIV * MILLIS_PER_YEAR as u128;
+
 	/// The exact `weight * elapsed` numerator, in split form.
 	///
 	/// Returns `None` when the divided product overflows `Balance`.
-	pub fn from_weight_millis(weight: Balance, elapsed: Millis) -> Option<Self> {
-		let weight: u128 = weight.unique_saturated_into();
-		let year = u128::from(MILLIS_PER_YEAR);
-		let divided =
-			multiply_by_rational_with_rounding(weight, u128::from(elapsed), year, Rounding::Down)?;
-		// `(a * b) % m == ((a % m) * (b % m)) % m`; both factors are below
-		// `MILLIS_PER_YEAR`, so the product stays far inside `u128`.
-		let remainder = ((weight % year) * (u128::from(elapsed) % year)) % year;
-		Some(Self {
-			interest: Balance::try_from(divided).ok()?,
-			remainder: u64::try_from(remainder).ok()?,
-		})
+	pub(crate) fn from_interest_weight(
+		weight: InterestWeight<Balance>,
+		elapsed: Millis,
+	) -> Option<Self> {
+		let numerator =
+			join_wide(weight.whole.unique_saturated_into(), weight.remainder, FixedU128::DIV) *
+				U256::from(elapsed);
+		let (interest, remainder) = split_wide(numerator, Self::DENOMINATOR)?;
+		Some(Self { interest, remainder })
+	}
+
+	pub(crate) fn from_principal_rate_millis(
+		principal: Balance,
+		rate: FixedU128,
+		elapsed: Millis,
+	) -> Option<Self> {
+		let numerator = (U256::from(principal.unique_saturated_into()) *
+			U256::from(rate.into_inner()))
+		.checked_mul(U256::from(elapsed))?;
+		let (interest, remainder) = split_wide(numerator, Self::DENOMINATOR)?;
+		Some(Self { interest, remainder })
+	}
+
+	/// Interest accrued by a pending weight since its liquidation-time anchor.
+	pub(crate) fn from_weight_time(
+		weight: &InterestWeight<Balance>,
+		weight_time: WeightTime,
+		now: Millis,
+	) -> Result<Self, ArithmeticError> {
+		let numerator = weight
+			.raw()
+			.checked_mul(U256::from(now))
+			.ok_or(ArithmeticError::Overflow)?
+			.checked_sub(weight_time.to_wide())
+			.ok_or(ArithmeticError::Underflow)?;
+		let (interest, remainder) =
+			split_wide(numerator, Self::DENOMINATOR).ok_or(ArithmeticError::Overflow)?;
+		Ok(Self { interest, remainder })
 	}
 
 	pub fn checked_add(&self, other: &Self) -> Option<Self> {
-		// Each limb is below `MILLIS_PER_YEAR`, so the sum cannot overflow `u64`.
-		let mut interest = self.interest.checked_add(&other.interest)?;
-		let mut remainder = self.remainder + other.remainder;
-		if remainder >= MILLIS_PER_YEAR {
-			remainder -= MILLIS_PER_YEAR;
-			interest = interest.checked_add(&Balance::one())?;
-		}
+		let (interest, remainder) = limb_add(
+			(&self.interest, self.remainder),
+			(&other.interest, other.remainder),
+			Self::DENOMINATOR,
+		)?;
 		Some(Self { interest, remainder })
 	}
 
 	pub fn checked_sub(&self, other: &Self) -> Option<Self> {
-		let mut interest = self.interest.checked_sub(&other.interest)?;
-		let remainder = if self.remainder >= other.remainder {
-			self.remainder - other.remainder
-		} else {
-			interest = interest.checked_sub(&Balance::one())?;
-			self.remainder + MILLIS_PER_YEAR - other.remainder
-		};
+		let (interest, remainder) = limb_sub(
+			(&self.interest, self.remainder),
+			(&other.interest, other.remainder),
+			Self::DENOMINATOR,
+		)?;
 		Some(Self { interest, remainder })
 	}
 
@@ -383,6 +759,11 @@ impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> PendingInterest
 }
 
 impl<Balance: Zero> PendingInterest<Balance> {
+	/// A carry-only amount: no whole units, just a sub-unit residue.
+	pub(crate) fn from_remainder(remainder: u128) -> Self {
+		Self { interest: Balance::zero(), remainder }
+	}
+
 	pub fn is_zero(&self) -> bool {
 		self.interest.is_zero() && self.remainder == 0
 	}
@@ -396,8 +777,8 @@ impl<Balance: Zero> PendingInterest<Balance> {
 pub struct StablecoinDebtState<Balance> {
 	/// Realized debt summed across every market issuing the stablecoin.
 	pub outstanding: Balance,
-	/// Σ `weighted_principal_sum` over the coin's non-frozen markets.
-	pub active_weighted_principal_sum: Balance,
+	/// Σ `weighted_principal` over the coin's non-frozen markets.
+	pub active_weighted_principal: InterestWeight<Balance>,
 	/// Interest accrued up to `last_update` but not yet minted anywhere.
 	pub pending_interest: PendingInterest<Balance>,
 	/// Time the projection was last advanced.
@@ -407,7 +788,7 @@ pub struct StablecoinDebtState<Balance> {
 impl<Balance: Zero> StablecoinDebtState<Balance> {
 	pub fn is_empty(&self) -> bool {
 		self.outstanding.is_zero() &&
-			self.active_weighted_principal_sum.is_zero() &&
+			self.active_weighted_principal.is_zero() &&
 			self.pending_interest.is_zero()
 	}
 }
@@ -417,8 +798,14 @@ impl<Balance: Zero> StablecoinDebtState<Balance> {
 pub struct RedistributionStakeTotals<Balance> {
 	/// Total stake of eligible vaults.
 	pub total: Balance,
-	/// Sum of each vault's annual rate multiplied by its stake.
-	pub weighted_sum: Balance,
+	/// Exact sum of each eligible vault's `stake * annual_rate`.
+	pub weighted: InterestWeight<Balance>,
+	/// Eligible vault collateral plus collateral still pending in redistribution custody.
+	pub collateral_basis: Balance,
+	/// Total stake captured after the latest redistribution.
+	pub snapshot_total: Balance,
+	/// Stake-bearing collateral captured after the latest redistribution.
+	pub snapshot_collateral: Balance,
 }
 
 /// Accounting state for one market.
@@ -430,14 +817,16 @@ pub struct BranchState<AccountId, Balance> {
 	pub debt: BranchDebt<Balance>,
 	/// Market redistribution stake totals.
 	pub stakes: RedistributionStakeTotals<Balance>,
-	/// Redistribution debt lost to per-stake rounding.
-	///
-	/// This becomes bad debt when no vault liability remains.
-	pub ownerless_debt: Balance,
-	/// Redistribution collateral lost to per-stake rounding.
-	pub ownerless_collateral: Balance,
-	/// Current redistribution totals.
+	/// Current lazy redistribution totals.
 	pub redistribution: RedistributionAccumulators,
+	/// Sub-unit division phases carried into the next redistribution.
+	pub redistribution_carry: RedistributionCarry,
+	/// Redistributed collateral held by the market account until vaults materialize it.
+	pub pending_redistribution_collateral: Balance,
+	/// Liquidation-time anchor for pending rate-weighted principal.
+	pub pending_redistribution_weight_time: WeightTime,
+	/// Number of vault rows in this market.
+	pub vault_count: u32,
 	/// Wall-clock origin used to calculate market interest time.
 	///
 	/// Frozen periods move this value forward so interest does not accrue while frozen.
@@ -468,9 +857,11 @@ impl<AccountId, Balance: Default + Zero + Ord + Copy> BranchState<AccountId, Bal
 			total_collateral: Balance::zero(),
 			debt: BranchDebt::default(),
 			stakes: RedistributionStakeTotals::default(),
-			ownerless_debt: Balance::zero(),
-			ownerless_collateral: Balance::zero(),
 			redistribution: RedistributionAccumulators::default(),
+			redistribution_carry: RedistributionCarry::default(),
+			pending_redistribution_collateral: Balance::zero(),
+			pending_redistribution_weight_time: WeightTime::default(),
+			vault_count: 0,
 			interest_epoch: now,
 			dormant_redemption_target: None,
 			frozen: None,
@@ -518,7 +909,7 @@ impl<AccountId: PartialEq, Balance> BranchState<AccountId, Balance> {
 	}
 }
 
-impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSub>
+impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSub + One>
 	BranchState<AccountId, Balance>
 {
 	/// Replace one vault's complete contribution to the market totals.
@@ -542,53 +933,167 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 				.ok_or(ArithmeticError::Overflow)
 		};
 
+		let shifted_weight = |current: InterestWeight<Balance>| {
+			current
+				.shifted(&before.weighted_principal, &after.weighted_principal)
+				.ok_or(ArithmeticError::Underflow)
+		};
+		let shifted_stake_weight = |current: InterestWeight<Balance>| {
+			current
+				.shifted(&before.weighted_stake, &after.weighted_stake)
+				.ok_or(ArithmeticError::Underflow)
+		};
+
 		let principal = shifted(self.debt.principal, before.principal, after.principal)?;
 		let minted_interest = shifted(self.debt.minted_interest, before.interest, after.interest)?;
-		let weighted_principal = shifted(
-			self.debt.weighted_principal_sum,
-			before.weighted_principal,
-			after.weighted_principal,
-		)?;
+		let weighted_principal = shifted_weight(self.debt.weighted_principal)?;
 		let stake = shifted(self.stakes.total, before.stake, after.stake)?;
-		let weighted_stake =
-			shifted(self.stakes.weighted_sum, before.weighted_stake, after.weighted_stake)?;
-
+		let weighted_stake = shifted_stake_weight(self.stakes.weighted)?;
+		let collateral_basis = shifted(
+			self.stakes.collateral_basis,
+			before.eligible_collateral,
+			after.eligible_collateral,
+		)?;
 		self.debt.principal = principal;
 		self.debt.minted_interest = minted_interest;
-		self.debt.weighted_principal_sum = weighted_principal;
+		self.debt.weighted_principal = weighted_principal;
 		self.stakes.total = stake;
-		self.stakes.weighted_sum = weighted_stake;
+		self.stakes.weighted = weighted_stake;
+		self.stakes.collateral_basis = collateral_basis;
 		Ok(())
 	}
 
-	/// Remove the pending-pool side of principal assigned to a vault.
+	/// Recomputes one vault's stake from the latest redistribution snapshots.
 	///
-	/// Redistribution initially enters the market at its average rate. The
-	/// caller subsequently adds the principal to the receiving vault through
-	/// [`Self::replace_vault`], which installs that vault's own rate weighting.
-	pub(crate) fn consume_redistributed_debt(
+	/// Snapshot correction makes redistribution weights independent of collateral touch order.
+	/// Nonzero collateral maps to at least one stake unit. `None` identifies arithmetic overflow.
+	pub(crate) fn stake_for(&self, collateral: Balance) -> Option<Balance> {
+		if collateral.is_zero() {
+			return Some(Balance::zero());
+		}
+		if self.stakes.snapshot_collateral.is_zero() {
+			return Some(collateral);
+		}
+		let stake = pusd_primitives::mul_div_floor(
+			collateral,
+			self.stakes.snapshot_total,
+			self.stakes.snapshot_collateral,
+		)?;
+		// Debt-bearing vaults need nonzero stake to receive liability and drain the final residue.
+		if stake.is_zero() {
+			return Some(Balance::one());
+		}
+		Some(stake)
+	}
+
+	/// Removes a materialized redistribution share from the branch-side pending pools.
+	pub(crate) fn consume_redistribution(
 		&mut self,
-		vault: &Vault<Balance>,
-		principal: Balance,
+		redistribution: DebtCollateral<Balance>,
+		attribution: RedistributionAttribution<Balance>,
 	) -> Result<(), ArithmeticError> {
 		self.debt.pending_redistribution_principal = self
 			.debt
 			.pending_redistribution_principal
-			.checked_sub(&principal)
+			.checked_sub(&redistribution.debt)
 			.ok_or(ArithmeticError::Underflow)?;
-		let delta_weight_per_stake = self
-			.redistribution
-			.weight_per_stake
-			.saturating_sub(vault.redistribution_checkpoint.weight_per_stake);
-		let weight_to_remove = delta_weight_per_stake
-			.checked_mul_int(vault.redistribution_stake)
-			.ok_or(ArithmeticError::Overflow)?;
-		self.debt.weighted_principal_sum = self
+		self.pending_redistribution_collateral = self
+			.pending_redistribution_collateral
+			.checked_sub(&redistribution.collateral)
+			.ok_or(ArithmeticError::Underflow)?;
+		self.stakes.collateral_basis = self
+			.stakes
+			.collateral_basis
+			.checked_sub(&redistribution.collateral)
+			.ok_or(ArithmeticError::Underflow)?;
+		self.debt.pending_redistribution_weight = self
 			.debt
-			.weighted_principal_sum
-			.checked_sub(&weight_to_remove)
+			.pending_redistribution_weight
+			.checked_sub(&attribution.weight)
+			.ok_or(ArithmeticError::Underflow)?;
+		self.pending_redistribution_weight_time = self
+			.pending_redistribution_weight_time
+			.checked_sub(attribution.weight_time)
+			.ok_or(ArithmeticError::Underflow)?;
+		self.debt.weighted_principal = self
+			.debt
+			.weighted_principal
+			.checked_sub(&attribution.weight)
 			.ok_or(ArithmeticError::Underflow)?;
 		Ok(())
+	}
+
+	/// Records one liquidation residual in the per-stake accumulators.
+	///
+	/// Pending pools retain the complete principal and collateral. The final stake bearer receives
+	/// the exact pool complement.
+	pub(crate) fn record_redistribution(
+		&mut self,
+		redistributed: DebtCollateral<Balance>,
+		now: Millis,
+	) -> Option<()> {
+		if self.stakes.total.is_zero() {
+			return None;
+		}
+		let posted_weight = InterestWeight::posted_redistribution(
+			redistributed.debt,
+			&self.stakes.weighted,
+			self.stakes.total,
+		)?;
+		let (principal_per_stake, principal_carry) = math::redistribution_per_stake_with_carry(
+			redistributed.debt,
+			self.stakes.total,
+			self.redistribution_carry.principal,
+		)?;
+		let (collateral_per_stake, collateral_carry) = math::redistribution_per_stake_with_carry(
+			redistributed.collateral,
+			self.stakes.total,
+			self.redistribution_carry.collateral,
+		)?;
+		let weight_per_weighted_stake =
+			posted_weight.redistribution_ratio(&self.stakes.weighted)?;
+		let interest_time = self.interest_time(now);
+		let weight_time_per_weighted_stake = WeightTime::from_wide(
+			U256::from(weight_per_weighted_stake.into_inner())
+				.checked_mul(U256::from(interest_time))?,
+		);
+		let posted_weight_time =
+			WeightTime::from_wide(posted_weight.raw().checked_mul(U256::from(interest_time))?);
+
+		self.redistribution = RedistributionAccumulators {
+			collateral_per_stake: self
+				.redistribution
+				.collateral_per_stake
+				.checked_add(&collateral_per_stake)?,
+			principal_per_stake: self
+				.redistribution
+				.principal_per_stake
+				.checked_add(&principal_per_stake)?,
+			weight_per_weighted_stake: self
+				.redistribution
+				.weight_per_weighted_stake
+				.checked_add(&weight_per_weighted_stake)?,
+			weight_time_per_weighted_stake: self
+				.redistribution
+				.weight_time_per_weighted_stake
+				.checked_add(weight_time_per_weighted_stake)?,
+		};
+		self.redistribution_carry =
+			RedistributionCarry { principal: principal_carry, collateral: collateral_carry };
+		self.debt.pending_redistribution_principal =
+			self.debt.pending_redistribution_principal.checked_add(&redistributed.debt)?;
+		self.pending_redistribution_collateral =
+			self.pending_redistribution_collateral.checked_add(&redistributed.collateral)?;
+		self.stakes.collateral_basis =
+			self.stakes.collateral_basis.checked_add(&redistributed.collateral)?;
+		self.debt.pending_redistribution_weight =
+			self.debt.pending_redistribution_weight.checked_add(&posted_weight)?;
+		self.pending_redistribution_weight_time =
+			self.pending_redistribution_weight_time.checked_add(posted_weight_time)?;
+		self.debt.weighted_principal = self.debt.weighted_principal.checked_add(&posted_weight)?;
+		self.stakes.snapshot_total = self.stakes.total;
+		self.stakes.snapshot_collateral = self.stakes.collateral_basis;
+		Some(())
 	}
 
 	/// Returns whether no vault liability remains.
@@ -597,86 +1102,19 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 	/// market.
 	pub fn is_empty_of_liability(&self) -> bool {
 		self.debt.principal.is_zero() &&
-			self.stakes.total.is_zero() &&
-			self.debt.pending_redistribution_principal.is_zero()
+			self.debt.pending_redistribution_principal.is_zero() &&
+			self.stakes.total.is_zero()
 	}
 
 	/// Returns whether the market has no debt, stake, or collateral.
 	pub fn is_removable(&self) -> bool {
 		self.debt.outstanding().is_zero() &&
-			self.ownerless_debt.is_zero() &&
+			self.debt.interest_ledger_settled() &&
+			self.debt.aggregate_interest_remainder == 0 &&
 			self.stakes.total.is_zero() &&
+			self.pending_redistribution_collateral.is_zero() &&
+			self.pending_redistribution_weight_time.is_zero() &&
 			self.total_collateral.is_zero()
-	}
-
-	/// Removes bad debt from the market.
-	///
-	/// The subtraction saturates at zero.
-	pub fn heal_bad_debt(&mut self, amount: Balance) {
-		self.debt.bad_debt = self.debt.bad_debt.saturating_sub(amount);
-	}
-
-	/// Moves ownerless debt and remaining interest into bad debt.
-	///
-	/// Returns the amount moved.
-	pub fn sweep_orphan_debt(&mut self) -> Balance {
-		let orphan = self.debt.minted_interest.saturating_add(self.ownerless_debt);
-		self.debt.minted_interest = Balance::zero();
-		self.ownerless_debt = Balance::zero();
-		self.debt.bad_debt = self.debt.bad_debt.saturating_add(orphan);
-		orphan
-	}
-}
-
-impl<AccountId, Balance: FixedPointOperand + Ord> BranchState<AccountId, Balance> {
-	/// Records debt and collateral redistributed by one liquidation.
-	///
-	/// Debt is first weighted at the market's average rate. Rounding remains in the ownerless
-	/// fields. Returns `None` if an accumulator would overflow.
-	pub fn record_redistribution(
-		&mut self,
-		redistributed: DebtCollateral<Balance>,
-		now: Millis,
-	) -> Option<()> {
-		let avg_rate = math::average_branch_rate(self.stakes.weighted_sum, self.stakes.total);
-		let debt_per_stake = math::redistribution_per_stake(redistributed.debt, self.stakes.total)?;
-		let collateral_per_stake =
-			math::redistribution_per_stake(redistributed.collateral, self.stakes.total)?;
-		let weight_per_stake =
-			math::redistribution_weight_per_stake(redistributed.debt, avg_rate, self.stakes.total)?;
-		// Use the same market clock as `pending_touch_for`.
-		let now_fp = FixedU128::saturating_from_integer(self.interest_time(now));
-		let debt_time_increment = now_fp.checked_mul(&debt_per_stake)?;
-
-		self.redistribution = RedistributionAccumulators {
-			debt_per_stake: self.redistribution.debt_per_stake.checked_add(&debt_per_stake)?,
-			collateral_per_stake: self
-				.redistribution
-				.collateral_per_stake
-				.checked_add(&collateral_per_stake)?,
-			debt_time_per_stake: self
-				.redistribution
-				.debt_time_per_stake
-				.checked_add(&debt_time_increment)?,
-			weight_per_stake: self
-				.redistribution
-				.weight_per_stake
-				.checked_add(&weight_per_stake)?,
-		};
-
-		let distributed_debt = debt_per_stake.saturating_mul_int(self.stakes.total);
-		self.debt.pending_redistribution_principal =
-			self.debt.pending_redistribution_principal.saturating_add(distributed_debt);
-		self.debt.weighted_principal_sum = self
-			.debt
-			.weighted_principal_sum
-			.saturating_add(avg_rate.saturating_mul_int(redistributed.debt));
-		let debt_dust = redistributed.debt.saturating_sub(distributed_debt);
-		self.ownerless_debt = self.ownerless_debt.saturating_add(debt_dust);
-		let distributed_collateral = collateral_per_stake.saturating_mul_int(self.stakes.total);
-		let collateral_dust = redistributed.collateral.saturating_sub(distributed_collateral);
-		self.ownerless_collateral = self.ownerless_collateral.saturating_add(collateral_dust);
-		Some(())
 	}
 }
 
@@ -875,16 +1313,20 @@ mod tests {
 			total_collateral: 0,
 			debt: BranchDebt {
 				principal,
-				minted_interest: 0,
 				pending_redistribution_principal: 0,
-				bad_debt: 0,
-				weighted_principal_sum: weighted,
+				minted_interest: 0,
+				pending_interest_attribution: 0,
+				weighted_principal: InterestWeight { whole: weighted, remainder: 0 },
+				pending_redistribution_weight: InterestWeight::zero(),
 				last_interest_time: 0,
+				aggregate_interest_remainder: 0,
 			},
-			stakes: RedistributionStakeTotals { total: 0, weighted_sum: 0 },
-			ownerless_debt: 0,
-			ownerless_collateral: 0,
+			stakes: RedistributionStakeTotals::default(),
 			redistribution: RedistributionAccumulators::default(),
+			redistribution_carry: RedistributionCarry::default(),
+			pending_redistribution_collateral: 0,
+			pending_redistribution_weight_time: WeightTime::default(),
+			vault_count: 0,
 			interest_epoch: 0,
 			dormant_redemption_target: None,
 			frozen: None,
@@ -895,8 +1337,7 @@ mod tests {
 
 	#[test]
 	fn replace_vault_swaps_full_contribution() {
-		// The weighted contribution falls from 3 to 2. Subtracting
-		// `floor(rate * payment)` would subtract zero and leave the wrong value.
+		// Subtraction must retain the fractional weight.
 		let rate = FixedU128::from_rational(3u128, 10u128);
 		let mut state = make_branch_state(10, 3);
 		let before = Vault {
@@ -904,6 +1345,7 @@ mod tests {
 			debt: DebtBreakdown { interest: 0, principal: 10 },
 			annual_rate: rate,
 			last_interest_time: 0,
+			interest_remainder: 0,
 			last_rate_update: 0,
 			redistribution_stake: 0,
 			redistribution_checkpoint: RedistributionAccumulators::default(),
@@ -912,7 +1354,10 @@ mod tests {
 		after.debt.principal = 9;
 		state.replace_vault(Some(&before), Some(&after)).unwrap();
 		assert_eq!(state.debt.principal, 9);
-		assert_eq!(state.debt.weighted_principal_sum, 2);
+		assert_eq!(
+			state.debt.weighted_principal,
+			InterestWeight { whole: 2, remainder: 7 * (FixedU128::DIV / 10) }
+		);
 	}
 
 	#[test]
@@ -924,6 +1369,7 @@ mod tests {
 			debt: DebtBreakdown { interest: 0, principal: 10 },
 			annual_rate: rate,
 			last_interest_time: 0,
+			interest_remainder: 0,
 			last_rate_update: 0,
 			redistribution_stake: 0,
 			redistribution_checkpoint: RedistributionAccumulators::default(),
@@ -932,7 +1378,7 @@ mod tests {
 		after.debt.principal = 0;
 		state.replace_vault(Some(&before), Some(&after)).unwrap();
 		assert_eq!(state.debt.principal, 0);
-		assert_eq!(state.debt.weighted_principal_sum, 0);
+		assert_eq!(state.debt.weighted_principal, InterestWeight { whole: 0, remainder: 0 });
 	}
 
 	#[test]
@@ -944,6 +1390,7 @@ mod tests {
 			debt: DebtBreakdown { interest: 0, principal: 1 },
 			annual_rate: rate,
 			last_interest_time: 0,
+			interest_remainder: 0,
 			last_rate_update: 0,
 			redistribution_stake: 0,
 			redistribution_checkpoint: RedistributionAccumulators::default(),
@@ -952,37 +1399,6 @@ mod tests {
 
 		assert_eq!(state.replace_vault(Some(&before), None), Err(ArithmeticError::Underflow));
 		assert_eq!(state, state_before);
-	}
-
-	#[test]
-	fn consume_redistributed_debt_swaps_avg_rate_weighting_for_own_rate() {
-		// Remove 2 of average-rate weight and 5 of old vault weight. Then add 6 for
-		// the new principal: 20 - 2 - 5 + 6 = 19.
-		let rate = FixedU128::from_rational(5u128, 10u128);
-		let mut state = make_branch_state(30, 20);
-		state.stakes = RedistributionStakeTotals { total: 10, weighted_sum: 5 };
-		state.debt.pending_redistribution_principal = 6;
-		state.redistribution.weight_per_stake = FixedU128::from_rational(3u128, 10u128);
-		let mut vault = Vault {
-			collateral: 10,
-			debt: DebtBreakdown { principal: 10, interest: 0 },
-			annual_rate: rate,
-			last_interest_time: 0,
-			last_rate_update: 0,
-			redistribution_stake: 10,
-			redistribution_checkpoint: RedistributionAccumulators {
-				weight_per_stake: FixedU128::from_rational(1u128, 10u128),
-				..RedistributionAccumulators::default()
-			},
-		};
-		let before = vault.clone();
-		state.consume_redistributed_debt(&vault, 3).unwrap();
-		vault.debt.principal += 3;
-		state.replace_vault(Some(&before), Some(&vault)).unwrap();
-		assert_eq!(vault.debt.principal, 13);
-		assert_eq!(state.debt.principal, 33);
-		assert_eq!(state.debt.pending_redistribution_principal, 3);
-		assert_eq!(state.debt.weighted_principal_sum, 19);
 	}
 
 	const YEAR: u64 = MILLIS_PER_YEAR;
@@ -994,9 +1410,13 @@ mod tests {
 		let weight: u128 = 1_000_000_007;
 		let elapsed: u64 = 123_456_789;
 		let numerator = weight * u128::from(elapsed);
-		let split = PendingInterest::from_weight_millis(weight, elapsed).unwrap();
+		let split = PendingInterest::from_interest_weight(
+			InterestWeight { whole: weight, remainder: 0 },
+			elapsed,
+		)
+		.unwrap();
 		assert_eq!(split.interest, numerator / u128::from(YEAR));
-		assert_eq!(u128::from(split.remainder), numerator % u128::from(YEAR));
+		assert_eq!(split.remainder, (numerator % u128::from(YEAR)) * FixedU128::DIV);
 	}
 
 	#[test]
@@ -1007,7 +1427,11 @@ mod tests {
 		let weight = k * u128::from(YEAR);
 		let elapsed: u64 = 400;
 		assert!(weight.checked_mul(u128::from(elapsed)).is_none());
-		let split = PendingInterest::from_weight_millis(weight, elapsed).unwrap();
+		let split = PendingInterest::from_interest_weight(
+			InterestWeight { whole: weight, remainder: 0 },
+			elapsed,
+		)
+		.unwrap();
 		assert_eq!(split.interest, k * u128::from(elapsed));
 		assert_eq!(split.remainder, 0);
 	}
@@ -1017,13 +1441,18 @@ mod tests {
 		// The divided product itself exceeds `u128`.
 		let weight = u128::MAX / 2;
 		let elapsed = 4 * YEAR;
-		assert!(PendingInterest::<u128>::from_weight_millis(weight, elapsed).is_none());
+		assert!(PendingInterest::from_interest_weight(
+			InterestWeight { whole: weight, remainder: 0 },
+			elapsed
+		)
+		.is_none());
 	}
 
 	#[test]
 	fn pending_interest_add_carries_and_sub_borrows() {
-		let a = PendingInterest::<u128> { interest: 5, remainder: YEAR - 1 };
-		let b = PendingInterest::<u128> { interest: 2, remainder: 3 };
+		let denominator = FixedU128::DIV * u128::from(YEAR);
+		let a = PendingInterest::<u128> { interest: 5, remainder: denominator - 1 };
+		let b = PendingInterest { interest: 2, remainder: 3 };
 		let sum = a.checked_add(&b).unwrap();
 		assert_eq!(sum, PendingInterest { interest: 8, remainder: 2 });
 		assert_eq!(sum.checked_sub(&b).unwrap(), a);
@@ -1038,7 +1467,7 @@ mod tests {
 		// interest limb, `b - a` underflows.
 		assert_eq!(
 			a.checked_sub(&b).unwrap(),
-			PendingInterest { interest: 0, remainder: YEAR - 1 }
+			PendingInterest { interest: 0, remainder: FixedU128::DIV * u128::from(YEAR) - 1 }
 		);
 		assert!(b.checked_sub(&a).is_none());
 	}
@@ -1048,5 +1477,28 @@ mod tests {
 		assert_eq!(PendingInterest::<u128> { interest: 7, remainder: 0 }.ceil().unwrap(), 7);
 		assert_eq!(PendingInterest::<u128> { interest: 7, remainder: 1 }.ceil().unwrap(), 8);
 		assert!(PendingInterest::<u128> { interest: u128::MAX, remainder: 1 }.ceil().is_none());
+	}
+
+	#[test]
+	fn interest_weight_from_principal_rate_is_exact() {
+		// This input has no rate-weight residue.
+		let rate = FixedU128::from_rational(47u128, 1_000u128);
+		let weight = InterestWeight::<u128>::from_principal_rate(10u128.pow(21), rate).unwrap();
+		assert_eq!(weight, InterestWeight { whole: 47 * 10u128.pow(18), remainder: 0 });
+		// A one-unit principal has only rate-weight residue.
+		let dust = InterestWeight::<u128>::from_principal_rate(1, rate).unwrap();
+		assert_eq!(dust, InterestWeight { whole: 0, remainder: 47 * 10u128.pow(15) });
+	}
+
+	#[test]
+	fn interest_weight_add_sub_round_trips_across_the_carry() {
+		let a = InterestWeight::<u128> { whole: 5, remainder: FixedU128::DIV - 1 };
+		let b = InterestWeight { whole: 2, remainder: 3 };
+		let sum = a.checked_add(&b).unwrap();
+		assert_eq!(sum, InterestWeight { whole: 8, remainder: 2 });
+		assert_eq!(sum.checked_sub(&b).unwrap(), a);
+		assert_eq!(sum.checked_sub(&a).unwrap(), b);
+		// Weight subtraction must reject an underflow.
+		assert!(b.checked_sub(&a).is_none());
 	}
 }

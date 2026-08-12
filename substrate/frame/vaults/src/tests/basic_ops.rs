@@ -343,26 +343,15 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 	});
 }
 
-// Closing the last vault used to dead-end: the branch mints aggregate interest
-// with per-op ceilings while vaults accrue floors, so a drift residual stayed in
-// `minted_interest` forever, read as TCR 0, and `WouldEnterSafetyMode` blocked
-// the close. The terminal close must instead sweep the orphan into `bad_debt`
-// (it is unbacked circulating pUSD) and settle.
-//
-// Repaying to zero now only turns each vault into a husk; the sweep happens when
-// the *last* husk is closed with `close_vault`. The drift here is tiny — a
-// handful of base units (`DRIFT` below), the sum of per-mint ceiling-vs-floor
-// rounding across the two pokes — which is exactly why it strands unnoticed
-// unless the terminal close sweeps it.
+// Terminal settlement must leave the branch debt-free after all vaults close.
 #[test]
-fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
+fn closing_last_vault_leaves_no_terminal_debt() {
 	use frame::traits::fungible::Mutate;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 400, rate_pct(7, 100)));
-		// Distinct accrual timestamps make several ceiling mints land while
-		// the vaults only ever accrue floors.
+		// Distinct timestamps create independent aggregate and vault residue.
 		advance_time(30 * 24 * 3_600 * 1_000);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
 		advance_time(24 * 3_600 * 1_000);
@@ -371,8 +360,6 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 100));
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&2, 100));
 
-		// Repay both to zero: each becomes a husk, no sweep yet (their stakes keep
-		// the branch non-empty).
 		assert_ok!(crate::Pallet::<Test>::repay_for(
 			RuntimeOrigin::signed(2),
 			DOT,
@@ -389,16 +376,9 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		));
 		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "vault 2 is a husk");
 		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "vault 1 is a husk");
-		let state = branch_state(DOT, PUSD).expect("branch state");
-		assert_eq!(state.debt.bad_debt, 0, "no sweep while husks still hold stake");
-
-		// Closing the first husk still leaves the branch non-empty: no sweep.
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
-		let state = branch_state(DOT, PUSD).expect("branch state");
-		assert_eq!(state.debt.bad_debt, 0, "no sweep while a husk remains");
 
-		// Closing the last husk empties the branch and sweeps the drift. This
-		// terminal close was previously rejected with `WouldEnterSafetyMode`.
+		// The last close must not calculate a ratio because the branch has no debt.
 		// A maximal price would overflow its pre-close TCR; settlement bypasses
 		// ratio math entirely and must still complete.
 		set_price(DOT, FixedU128::from_inner(u128::MAX));
@@ -408,26 +388,98 @@ fn closing_last_vault_sweeps_interest_drift_to_bad_debt() {
 		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.debt.principal, 0);
 		assert_eq!(state.stakes.total, 0);
-		assert_eq!(state.debt.minted_interest, 0, "drift swept out of minted_interest");
-		assert_eq!(state.ownerless_debt, 0);
-		// The drift is exactly this small — a few base units of rounding.
-		const DRIFT: Balance = 2;
-		assert_eq!(state.debt.bad_debt, DRIFT, "drift recorded as bad debt");
-		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BadDebtRecorded {
+		assert_eq!(state.debt.minted_interest, 0);
+		assert_eq!(state.debt.pending_interest_attribution, 0);
+		assert_eq!(state.debt.aggregate_interest_remainder, 0);
+	});
+}
+
+#[test]
+fn stale_full_payoff_max_reverts_without_leaving_a_husk() {
+	use frame::traits::fungible::Mutate;
+	use pusd_primitives::VaultInterface;
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 100));
+
+		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		let quote = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
+			.expect("payoff quote");
+		assert_eq!(quote.terminal_interest_charge, 0);
+		advance_time(1);
+
+		assert_noop!(
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, quote.debt,),
+			crate::Error::<Test>::PayoffExceedsMaximum
+		);
+	});
+}
+
+#[test]
+fn uncovered_terminal_charge_bypasses_the_yield_split() {
+	use frame::traits::fungible::Mutate;
+	use pusd_primitives::VaultInterface;
+	build_and_execute(|| {
+		SpFeeShare::set(Permill::from_percent(100));
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
+		advance_time(1);
+
+		let quote = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
+			.expect("payoff quote");
+		assert_eq!(quote.terminal_interest_charge, 1);
+		let fee_before = stable_balance(PUSD, FEE_DEST);
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			quote.debt + 1,
+		));
+
+		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total(), 0);
+		assert_eq!(stable_balance(PUSD, FEE_DEST), fee_before + 1);
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::InterestRoundingFeeCharged {
 			collateral_id: DOT,
 			stable_id: PUSD,
-			amount: state.debt.bad_debt,
+			owner: 1,
+			amount: 1,
 		}));
+	});
+}
 
-		// The insurance flow can now heal the branch clean.
-		let credit = <Assets as frame::traits::fungibles::Balanced<AccountId>>::issue(
-			PUSD,
-			state.debt.bad_debt,
+#[test]
+fn last_vault_close_fails_closed_on_unattributed_liability() {
+	use frame::traits::fungible::Mutate;
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
+		assert_ok!(
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 1_000,)
 		);
-		let surplus = <crate::Pallet<Test> as pusd_primitives::VaultInterface>::heal(&DOT, credit);
-		assert_eq!(surplus.peek(), 0);
-		let state = branch_state(DOT, PUSD).expect("branch state");
-		assert_eq!(state.debt.bad_debt, 0, "branch fully settled");
+		// Isolate each residue so that each guard has independent coverage.
+
+		// Minted interest prevents branch removal.
+		mutate_branch_state(DOT, PUSD, |state| state.debt.minted_interest = 1);
+		assert_noop!(
+			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None),
+			DispatchError::Corruption
+		);
+		mutate_branch_state(DOT, PUSD, |state| state.debt.minted_interest = 0);
+
+		// Unattributed issuance prevents branch removal independently.
+		mutate_branch_state(DOT, PUSD, |state| state.debt.pending_interest_attribution = 1);
+		assert_noop!(
+			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None),
+			DispatchError::Corruption
+		);
+		assert!(Vaults::<Test>::contains_key((DOT, PUSD, 1)));
+		mutate_branch_state(DOT, PUSD, |state| state.debt.pending_interest_attribution = 0);
+
+		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
 	});
 }
 
@@ -459,4 +511,51 @@ fn redemption_slot_rejects_second_owner() {
 			"second vault stays Active (step rolled back)"
 		);
 	});
+}
+
+// Settlement order must not change terminal charges, issuance, or branch removability.
+#[test]
+fn two_vault_terminal_ceils_drain_the_bucket_in_either_order() {
+	use frame::traits::fungible::Mutate;
+	use pusd_primitives::VaultInterface;
+	let run = |first: u64, second: u64| {
+		new_test_ext().execute_with(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+			assert_ok!(open(2, DOT, PUSD, 1_400, 700, rate_pct(37, 100)));
+			assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 1_000));
+			assert_ok!(<Pusd as Mutate<u64>>::mint_into(&2, 1_000));
+			advance_time(10 * 24 * 3_600 * 1_000);
+
+			// Each vault must owe a terminal charge for this order-independence test.
+			for owner in [1, 2] {
+				let quote = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &owner)
+					.expect("payoff quote");
+				assert_eq!(quote.terminal_interest_charge, 1);
+			}
+			for owner in [first, second] {
+				assert_ok!(crate::Pallet::<Test>::repay_for(
+					RuntimeOrigin::signed(owner),
+					DOT,
+					PUSD,
+					owner,
+					Balance::MAX,
+				));
+				assert_ok!(crate::Pallet::<Test>::close_vault(
+					RuntimeOrigin::signed(owner),
+					DOT,
+					PUSD,
+					None,
+				));
+			}
+
+			let state = branch_state(DOT, PUSD).expect("branch persists after closes");
+			assert_eq!(state.debt.minted_interest, 0);
+			assert_eq!(state.debt.pending_interest_attribution, 0);
+			assert_eq!(state.debt.aggregate_interest_remainder, 0);
+			assert!(state.is_removable());
+			total_stable(PUSD)
+		})
+	};
+	assert_eq!(run(1, 2), run(2, 1));
 }

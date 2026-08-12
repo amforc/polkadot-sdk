@@ -8,7 +8,14 @@
 
 use crate::{mock::*, tests::rate_pct};
 use frame::{
-	arithmetic::Permill, prelude::TokenError, traits::fungibles::Mutate as FungiblesMutate,
+	arithmetic::Permill,
+	prelude::TokenError,
+	traits::{
+		fungible::Inspect as FungibleInspect,
+		fungibles::Mutate as FungiblesMutate,
+		tokens::{Fortitude, Preservation},
+		AccountTouch,
+	},
 };
 use pusd_primitives::{collateralization_ratio, MILLIS_PER_YEAR};
 
@@ -33,6 +40,44 @@ fn register_realistic_market() {
 			..default_branch_config()
 		},
 	);
+}
+
+#[test]
+fn fee_account_pays_its_own_asset_account_deposit() {
+	build_and_execute(|| {
+		set_price(TOKEN_X, FixedU128::from_rational(10u128, 1u128));
+		let deposit = <Assets as AccountTouch<StableId, AccountId>>::deposit_required(USDX);
+		let spendable = |who| {
+			<Balances as FungibleInspect<AccountId>>::reducible_balance(
+				&who,
+				Preservation::Expendable,
+				Fortitude::Polite,
+			)
+		};
+		let creator_spendable = spendable(PUSD_OWNER);
+		let fee_spendable = spendable(FEE_DEST);
+
+		assert_ok!(crate::Pallet::<Test>::create_branch(
+			RuntimeOrigin::signed(PUSD_OWNER),
+			TOKEN_X,
+			USDX,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			default_branch_config(),
+		));
+
+		assert_eq!(
+			spendable(PUSD_OWNER),
+			creator_spendable -
+				MarketDepositBase::get() -
+				<Balances as FungibleInspect<AccountId>>::minimum_balance(),
+			"the creator pays only the market's own refundable deposit",
+		);
+		assert_eq!(
+			spendable(FEE_DEST),
+			fee_spendable - deposit - <Balances as FungibleInspect<AccountId>>::minimum_balance(),
+			"the stablecoin-wide fee account owns its refundable deposit",
+		);
+	});
 }
 
 // The math is scale-free end to end: exact CR through the decimals-offset
@@ -141,44 +186,45 @@ fn borrow_below_stable_ed_depends_on_recipient() {
 	});
 }
 
-// A fee credit below the stable's ED resolved to a fresh fee account is
-// silently dropped by `OnUnbalanced` — supply is rescinded while the fee stays
-// recorded in `minted_interest`. Pre-funding the fee account (the documented
-// runtime duty on `Config::FeeHandler`) makes the same credit land.
+// A fee below the stablecoin minimum must reach a fee account with no balance.
 #[test]
-fn sub_ed_fee_residual_is_dropped_without_prefund() {
+fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
 	build_and_execute(|| {
-		// Drop the whole upfront-fee credit at open so FEE_DEST stays fresh.
+		// Start with a zero fee balance to test the sub-minimum credit.
 		SpFeeShare::set(Permill::from_percent(100));
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		assert_eq!(stable_balance(USDX, FEE_DEST), 0);
+		assert_eq!(stable_balance(USDX, FEE_DEST), 0, "touched at registration, still empty");
 
 		// Route the full credit from here on.
 		SpFeeShare::set(Permill::zero());
 
-		// One minute at 5% on 5×10^9: ceil(2.5×10^8 × 60_000 / MILLIS_PER_YEAR)
-		// = 476 minor units — well below the 10_000-unit ED.
+		// The 475-unit fee is below the 10_000-unit asset minimum.
 		let minted_pre = branch_state(XBT, USDX).expect("state").debt.minted_interest;
 		let issuance_pre = total_stable(USDX);
 		advance_time(60_000);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 1));
 		let minted_delta =
 			branch_state(XBT, USDX).expect("state").debt.minted_interest - minted_pre;
-		assert_eq!(minted_delta, 476);
-		assert_eq!(stable_balance(USDX, FEE_DEST), 0, "sub-ED credit dropped");
-		assert_eq!(total_stable(USDX), issuance_pre, "mint rescinded: supply overstated by ledger");
+		assert_eq!(minted_delta, 475);
+		assert_eq!(stable_balance(USDX, FEE_DEST), 475, "sub-ED credit landed");
+		assert_eq!(total_stable(USDX) - issuance_pre, 475, "supply backs the recorded fee");
+	});
+}
 
-		// Pre-fund the fee account; the next sub-ED credit now lands.
-		assert_ok!(<Assets as FungiblesMutate<AccountId>>::mint_into(USDX, &FEE_DEST, USDX_ED));
-		let minted_pre = branch_state(XBT, USDX).expect("state").debt.minted_interest;
+// Interest accrual must roll back when the fee account cannot receive its credit.
+#[test]
+fn frozen_stable_fails_fee_resolution_loudly() {
+	build_and_execute(|| {
+		SpFeeShare::set(Permill::zero());
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 		advance_time(60_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 1));
-		let minted_delta =
-			branch_state(XBT, USDX).expect("state").debt.minted_interest - minted_pre;
-		assert!(0 < minted_delta);
-		assert!(minted_delta < USDX_ED);
-		assert_eq!(stable_balance(USDX, FEE_DEST), USDX_ED + minted_delta);
+		assert_ok!(Assets::freeze_asset(RuntimeOrigin::signed(1), USDX));
+		assert_noop!(
+			crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 1),
+			Error::<Test>::FeeResolutionFailed
+		);
 	});
 }
 

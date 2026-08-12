@@ -20,7 +20,7 @@ pub use frame::{
 	testing_prelude::{assert_err, assert_noop, assert_ok},
 };
 use frame::{
-	deps::sp_runtime::traits::ConvertInto,
+	deps::sp_runtime::traits::{Convert as ConvertTrait, ConvertInto},
 	testing_prelude::*,
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
@@ -28,9 +28,8 @@ use frame::{
 			roles::Inspect as FungiblesRolesInspect, Balanced as FungiblesBalanced, Credit,
 			Inspect as FungiblesInspect, InspectHold,
 		},
-		tokens::{fungible, imbalance::ResolveAssetTo},
+		tokens::fungible,
 		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
-		OnUnbalanced,
 	},
 };
 pub use pallet_linked_list::Position;
@@ -220,16 +219,27 @@ parameter_types! {
 	pub static SpFeeShare: Permill = Permill::from_percent(75);
 }
 
-/// Splits fees between the Stability Pool and [`FEE_DEST`].
-///
-/// The Stability Pool share is burned until that pallet is added.
-pub struct DealWithFees;
-impl OnUnbalanced<Credit<AccountId, VaultStableAssets>> for DealWithFees {
-	fn on_nonzero_unbalanced(credit: Credit<AccountId, VaultStableAssets>) {
+/// Routes all test stablecoin fee remainders to [`FEE_DEST`].
+pub struct FeeAccounts;
+impl ConvertTrait<StableId, AccountId> for FeeAccounts {
+	fn convert(_stable: StableId) -> AccountId {
+		FEE_DEST
+	}
+}
+
+/// Burns the test Stability Pool fee share and returns the remainder.
+pub struct MockYieldHook;
+impl pusd_primitives::OnBranchYield<AssetId, Credit<AccountId, VaultStableAssets>>
+	for MockYieldHook
+{
+	fn distribute_yield(
+		_: &AssetId,
+		credit: Credit<AccountId, VaultStableAssets>,
+	) -> Credit<AccountId, VaultStableAssets> {
 		let sp_share = SpFeeShare::get() * credit.peek();
 		let (sp_credit, residual) = credit.split(sp_share);
 		drop(sp_credit);
-		ResolveAssetTo::<FeeDestAccount, VaultStableAssets>::on_unbalanced(residual);
+		residual
 	}
 }
 
@@ -335,8 +345,8 @@ impl pallet_vaults::Config for Test {
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = VaultStableAssets;
 	type Oracle = MockOracle;
-	type FeeHandler = DealWithFees;
-	type YieldHook = ();
+	type FeeAccount = FeeAccounts;
+	type YieldHook = MockYieldHook;
 	type OnBranchLifecycle = RecordingLifecycle;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
@@ -400,7 +410,8 @@ pub fn new_test_ext() -> TestState {
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
-			balances: (1u64..=10u64).map(|i| (i, 1_000_000_000_000)).collect(),
+			// The fee account needs native funds to pay its asset-account deposit.
+			balances: (1u64..=10u64).chain([FEE_DEST]).map(|i| (i, 1_000_000_000_000)).collect(),
 			..Default::default()
 		},
 	}
@@ -620,6 +631,28 @@ pub fn liquidate_with(
 			owner_surplus: collateral_credit,
 		})
 	})
+}
+
+/// Removes a vault and records its whole debt as redistribution.
+///
+/// This bypasses liquidation pricing only for tests concerned with the
+/// redistribution ledger. Economic and custody tests use [`liquidate_with`].
+pub fn redistribute_for_test(
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+	redistribution_collateral: Balance,
+) -> Result<Balance, DispatchError> {
+	let mut redistributed: Balance = 0;
+	liquidate_with(collateral, stable, owner, |post_touch| {
+		redistributed = post_touch;
+		LiquidationAllocation {
+			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
+			redistribution_collateral,
+			keeper: KeeperCompensation { recipient: 0, collateral: 0 },
+		}
+	})?;
+	Ok(redistributed)
 }
 
 fn resolve_test_collateral(

@@ -12,6 +12,27 @@ use crate::{
 use pallet_linked_list::SortedListInterface;
 
 #[test]
+fn open_vault_count_is_not_capped_by_redistribution() {
+	use frame::traits::fungible::Mutate;
+
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		for owner in 1_000..1_064 {
+			assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&owner, 2_000));
+			let rate = rate_pct(u128::from(owner - 999), 100);
+			assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate));
+		}
+		assert_eq!(branch_state(DOT, PUSD).unwrap().vault_count, 64);
+
+		let owner = 1_064;
+		assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&owner, 2_000));
+		assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate_pct(65, 100)));
+		assert_eq!(branch_state(DOT, PUSD).unwrap().vault_count, 65);
+		assert!(Vaults::<Test>::get((DOT, PUSD, owner)).is_some());
+	});
+}
+
+#[test]
 fn register_branch_creates_state() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
