@@ -3594,9 +3594,12 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		let full_admin: AccountId = frame_benchmarking::account("vaults_admin", 0, 0);
 		let emergency_admin: AccountId = frame_benchmarking::account("vaults_emergency", 0, 0);
 		let admins = pallet_vaults::types::BranchAdmins {
-			full_admin: <Runtime as frame_system::Config>::Lookup::unlookup(full_admin),
+			full_admin: <Runtime as frame_system::Config>::Lookup::unlookup(full_admin.clone()),
 			emergency_admin: <Runtime as frame_system::Config>::Lookup::unlookup(emergency_admin),
 		};
+		// A Root-created market charges its full admin one minimum balance of collateral, which
+		// the redistribution account carries until removal refunds it.
+		fund_vaults_benchmark_collateral(collateral_id.clone(), &full_admin, 100 * DOLLARS);
 		pallet_vaults::Pallet::<Runtime>::create_branch(
 			RawOrigin::Root.into(),
 			collateral_id.clone(),
