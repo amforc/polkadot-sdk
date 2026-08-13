@@ -23,8 +23,8 @@ use frame::{
 	},
 	prelude::*,
 	traits::{
-		fungibles::{Balanced as FungiblesBalanced, Inspect as FungiblesInspect},
-		tokens::Provenance,
+		fungibles::{Balanced as FungiblesBalanced, Inspect as FungiblesInspect, InspectHold as _},
+		tokens::{Fortitude, Precision, Preservation, Provenance},
 		AccountTouch, DefensiveOption, Time,
 	},
 };
@@ -683,6 +683,98 @@ impl<T: Config> Pallet<T> {
 			&fee_account,
 		)?;
 		ensure!(can_receive_unit(), Error::<T>::FeeAccountNotReceivable);
+		Ok(())
+	}
+
+	/// Returns the account that pays and is refunded a market's custody seed.
+	///
+	/// A market that charged a creation deposit charges the same account. A privileged creation
+	/// has no depositor, so the market's own full administrator funds it. Removal recomputes this
+	/// from the stored record: rotating that admin of a privileged market therefore refunds the
+	/// new one.
+	pub(crate) fn custody_funder(
+		depositor: Option<&T::AccountId>,
+		admins: &crate::types::BranchAdmins<T::AccountId>,
+	) -> T::AccountId {
+		depositor.unwrap_or(&admins.full_admin).clone()
+	}
+
+	/// Parks one minimum balance of collateral in the market's redistribution account.
+	///
+	/// A hold must leave the asset's minimum balance free, so custody carries that float for as
+	/// long as the market exists. The provider reference alone does not cover this: `pallet-assets`
+	/// keeps the minimum balance untouchable whatever the account's existence reason, while
+	/// `pallet-balances` waives it for an account another provider keeps alive. Seeding both makes
+	/// every later seizure hold exactly what it deposited.
+	pub(crate) fn seed_redistribution_custody(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		funder: &T::AccountId,
+	) -> DispatchResult {
+		let seed = T::CollateralAssets::minimum_balance(collateral_id.clone());
+		if seed.is_zero() {
+			return Ok(());
+		}
+		let custody = Pallet::<T>::redistribution_account(collateral_id, stable_id);
+		// A registration fee must not dust the account that pays it.
+		let credit = <T::CollateralAssets as FungiblesBalanced<T::AccountId>>::withdraw(
+			collateral_id.clone(),
+			funder,
+			seed,
+			Precision::Exact,
+			Preservation::Preserve,
+			Fortitude::Polite,
+		)
+		.map_err(|_| Error::<T>::CustodySeedUnavailable)?;
+		T::CollateralAssets::resolve(&custody, credit).map_err(|credit| {
+			drop(credit);
+			Error::<T>::CustodySeedUnavailable
+		})?;
+		Ok(())
+	}
+
+	/// Returns the custody float to the account that funded it.
+	///
+	/// Removal happens on an empty market, so nothing is on hold and the whole free balance is
+	/// swept: the seed, plus anything donated to the address, which the funder keeps. Emptying the
+	/// account also lets it die, releasing the consumer references that would otherwise block the
+	/// market's provider reference.
+	pub(crate) fn refund_redistribution_custody(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		funder: &T::AccountId,
+	) -> DispatchResult {
+		let custody = Pallet::<T>::redistribution_account(collateral_id, stable_id);
+		defensive_assert!(
+			T::CollateralAssets::balance_on_hold(
+				collateral_id.clone(),
+				&crate::pallet::HoldReason::VaultCollateral.into(),
+				&custody,
+			)
+			.is_zero(),
+			"custody still holds collateral at market removal"
+		);
+		let seed = <T::CollateralAssets as FungiblesInspect<T::AccountId>>::reducible_balance(
+			collateral_id.clone(),
+			&custody,
+			Preservation::Expendable,
+			Fortitude::Polite,
+		);
+		if seed.is_zero() {
+			return Ok(());
+		}
+		let credit = <T::CollateralAssets as FungiblesBalanced<T::AccountId>>::withdraw(
+			collateral_id.clone(),
+			&custody,
+			seed,
+			Precision::Exact,
+			Preservation::Expendable,
+			Fortitude::Polite,
+		)?;
+		T::CollateralAssets::resolve(funder, credit).map_err(|credit| {
+			drop(credit);
+			Error::<T>::CollateralPayoutFailed
+		})?;
 		Ok(())
 	}
 
