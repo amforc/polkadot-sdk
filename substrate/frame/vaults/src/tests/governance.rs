@@ -2,8 +2,8 @@ use crate::{mock::*, pallet::Vaults, tests::rate_pct, types::BranchConfigUpdate}
 use frame::traits::{fungibles::Mutate as FungiblesMutate, BadOrigin};
 
 /// Replacement admins used by the reassignment test.
-const NEW_FULL_ADMIN: AccountId = 200;
-const NEW_EMERGENCY_ADMIN: AccountId = 201;
+const NEW_FULL_ADMIN: AccountId = 300;
+const NEW_EMERGENCY_ADMIN: AccountId = 301;
 /// One day in milliseconds — the mock guard's `min_ceiling_ttl`.
 const DAY_MS: Moment = 24 * 3_600 * 1_000;
 
@@ -37,13 +37,63 @@ fn signed_create_takes_deposit_and_remove_refunds() {
 			DOT,
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config()
+			default_branch_config(),
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), MarketDepositBase::get());
 
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0, "deposit refunded on removal");
 		assert!(!market_exists(DOT, PUSD));
+	});
+}
+
+// A privileged creation has no depositor, so the market's full administrator
+// pays the custody seed. Without the collateral to pay it, registration fails
+// outright rather than leaving a market whose first redistributing liquidation
+// would revert.
+#[test]
+fn create_rejects_a_creator_that_cannot_pay_the_custody_seed() {
+	build_and_execute(|| {
+		const PENNILESS_ADMIN: AccountId = 999;
+		set_price(TOKEN_X, FixedU128::from_rational(10u128, 1u128));
+		assert_eq!(collateral_balance(TOKEN_X, PENNILESS_ADMIN), 0);
+		assert_noop!(
+			Pallet::<Test>::create_branch(
+				RuntimeOrigin::root(),
+				TOKEN_X,
+				PUSD,
+				branch_admins(PENNILESS_ADMIN, EMERGENCY_ADMIN),
+				default_branch_config(),
+			),
+			Error::<Test>::CustodySeedUnavailable
+		);
+		assert!(!market_exists(TOKEN_X, PUSD));
+	});
+}
+
+// Registration takes the provider reference before it
+// moves the custody seed, so the seed lands on an account the asset pallet
+// would otherwise refuse to create.
+#[test]
+fn insufficient_collateral_custody_needs_the_provider_reference() {
+	build_and_execute(|| {
+		let custody = Pallet::<Test>::redistribution_account(&INSUFFICIENT, &PUSD);
+		assert_eq!(System::providers(&custody), 0);
+		set_price(INSUFFICIENT, FixedU128::from_rational(10u128, 1u128));
+
+		assert_ok!(Pallet::<Test>::create_branch(
+			RuntimeOrigin::root(),
+			INSUFFICIENT,
+			PUSD,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			default_branch_config(),
+		));
+		assert_eq!(collateral_balance(INSUFFICIENT, custody), min_collateral_balance(INSUFFICIENT));
+		assert_eq!(System::consumers(&custody), 1, "the asset account holds a consumer reference");
+
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), INSUFFICIENT, PUSD));
+		assert_eq!(System::consumers(&custody), 0);
+		assert_eq!(System::providers(&custody), 0);
 	});
 }
 
@@ -57,7 +107,7 @@ fn root_create_takes_no_deposit() {
 			DOT,
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config()
+			default_branch_config(),
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
 		assert!(market_exists(DOT, PUSD));
@@ -75,7 +125,7 @@ fn lifecycle_hooks_fire_on_create_and_remove() {
 			DOT,
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config()
+			default_branch_config(),
 		));
 		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true, 1)]);
 
@@ -100,7 +150,7 @@ fn create_branch_rejects_config_outside_envelope() {
 				DOT,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				config
+				config,
 			),
 			Error::<Test>::ConfigOutsideEnvelope
 		);
@@ -122,7 +172,7 @@ fn create_branch_rejects_line_above_envelope() {
 				DOT,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				config
+				config,
 			),
 			Error::<Test>::ConfigOutsideEnvelope
 		);
@@ -140,7 +190,7 @@ fn create_branch_rejects_unpriced_collateral() {
 				DOT,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config()
+				default_branch_config(),
 			),
 			Error::<Test>::OraclePriceNotAvailable
 		);
@@ -331,7 +381,7 @@ fn redistribution_account_provider_reference_is_paired() {
 	build_and_execute(|| {
 		let account = Pallet::<Test>::redistribution_account(&DOT, &PUSD);
 		register_market(DOT, PUSD);
-		assert_eq!(System::providers(&account), 1);
+		assert_eq!(System::providers(&account), 2);
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert_eq!(System::providers(&account), 0);
 
@@ -342,11 +392,29 @@ fn redistribution_account_provider_reference_is_paired() {
 			DOT,
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config()
+			default_branch_config(),
 		));
-		assert_eq!(System::providers(&account), 2);
+		assert_eq!(System::providers(&account), 3);
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert_eq!(System::providers(&account), 1);
+	});
+}
+
+// An issued-asset market keeps the seed in a `pallet-assets` account, which
+// takes consumer references rather than a provider one. Removal has to sweep
+// the seed before releasing the provider reference, or the consumers block it.
+#[test]
+fn issued_collateral_registration_leaves_no_references_behind() {
+	build_and_execute(|| {
+		let account = Pallet::<Test>::redistribution_account(&TOKEN_X, &PUSD);
+		let funder_before = collateral_balance(TOKEN_X, ADMIN);
+		register_market(TOKEN_X, PUSD);
+		assert_eq!(collateral_balance(TOKEN_X, account), min_collateral_balance(TOKEN_X));
+
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD));
+		assert_eq!(System::providers(&account), 0);
+		assert_eq!(System::consumers(&account), 0);
+		assert_eq!(collateral_balance(TOKEN_X, ADMIN), funder_before);
 	});
 }
 
@@ -403,7 +471,7 @@ fn registry_has_no_global_cap() {
 			DOT,
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config()
+			default_branch_config(),
 		));
 		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 10);
 	});
@@ -421,7 +489,7 @@ fn create_branch_rejects_unknown_stable() {
 				DOT,
 				9_999,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config()
+				default_branch_config(),
 			),
 			Error::<Test>::UnknownStable
 		);
@@ -442,7 +510,7 @@ fn create_branch_rejects_stable_collateral_collision() {
 				AssetId::WithId(PUSD),
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config()
+				default_branch_config(),
 			),
 			Error::<Test>::StableCollateralCollision
 		);
@@ -468,7 +536,7 @@ fn create_branch_rejects_autoline_knobs_outside_envelope() {
 				DOT,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				wide_gap
+				wide_gap,
 			),
 			Error::<Test>::ConfigOutsideEnvelope
 		);
@@ -481,7 +549,7 @@ fn create_branch_rejects_autoline_knobs_outside_envelope() {
 				DOT,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				fast_ttl
+				fast_ttl,
 			),
 			Error::<Test>::ConfigOutsideEnvelope
 		);

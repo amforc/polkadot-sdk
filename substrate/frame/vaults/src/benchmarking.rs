@@ -113,6 +113,8 @@ fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkEr
 	// The fee account needs native funds to pay its asset-account deposit.
 	let fee_account = T::FeeAccount::convert(stable::<T>());
 	fund_collateral::<T>(&asset, &fee_account, balance::<T>(1_000_000_000_000))?;
+	// A Root-created market charges the custody seed to its full admin.
+	fund_collateral::<T>(&asset, &branch_admin_accounts::<T>().0, balance::<T>(ACCOUNT_FUNDING))?;
 	Pallet::<T>::create_branch(
 		create_origin::<T>()?,
 		asset.clone(),
@@ -691,6 +693,11 @@ mod benchmarks {
 			FixedU128::saturating_from_integer(ORACLE_PRICE),
 		);
 		let origin = create_origin::<T>()?;
+		fund_collateral::<T>(
+			&asset,
+			&branch_admin_accounts::<T>().0,
+			balance::<T>(ACCOUNT_FUNDING),
+		)?;
 
 		#[extrinsic_call]
 		_(origin, asset.clone(), stable::<T>(), admins, config);
@@ -786,6 +793,11 @@ mod benchmarks {
 			asset.clone(),
 			FixedU128::saturating_from_integer(ORACLE_PRICE),
 		);
+		fund_collateral::<T>(
+			&asset,
+			&branch_admin_accounts::<T>().0,
+			balance::<T>(ACCOUNT_FUNDING),
+		)?;
 		Pallet::<T>::create_branch(
 			create_origin::<T>()?,
 			asset.clone(),

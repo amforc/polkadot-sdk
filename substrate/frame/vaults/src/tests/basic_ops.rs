@@ -7,12 +7,13 @@ use pallet_linked_list::SortedListInterface;
 
 // Opening a vault from an account whose free balance is below the requested
 // collateral fails at the token layer: the `fungible::hold` call returns an
-// error. Account 100 is not funded by genesis (only 1..=10 are).
+// error. Account 999 is not funded by genesis (only 1..=10 and the market
+// actors are).
 #[test]
 fn open_vault_fails_without_balance() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert!(open(100, DOT, PUSD, 1_000, 500, rate_pct(5, 100)).is_err());
+		assert!(open(999, DOT, PUSD, 1_000, 500, rate_pct(5, 100)).is_err());
 	});
 }
 

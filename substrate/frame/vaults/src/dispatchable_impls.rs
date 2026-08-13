@@ -376,6 +376,11 @@ impl<T: Config> Pallet<T> {
 		Self::ensure_fee_account_receivable(&stable_id)?;
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		frame_system::Pallet::<T>::inc_providers(&redistribution_account);
+		Self::seed_redistribution_custody(
+			&collateral_id,
+			&stable_id,
+			&Self::custody_funder(deposit.as_ref().map(|(who, _)| who), &admins),
+		)?;
 		let now = T::TimeProvider::now();
 		Branches::<T>::insert(
 			&collateral_id,
@@ -392,9 +397,11 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Removes an empty market and refunds its deposit.
+	/// Removes an empty market and refunds its deposit and custody seed.
 	///
 	/// This also releases its asset roles and provider reference, and calls the lifecycle hook.
+	/// The seed follows [`Self::custody_funder`] on the stored record, so a privileged market
+	/// refunds its current full administrator.
 	pub(crate) fn do_remove_branch(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -418,6 +425,13 @@ impl<T: Config> Pallet<T> {
 			removed_outstanding.is_zero(),
 			"market removal must leave the CollateralRisks aggregate untouched"
 		);
+		// The refund kills the collateral account, so its consumer references are gone before the
+		// provider reference is released.
+		Self::refund_redistribution_custody(
+			&collateral_id,
+			&stable_id,
+			&Self::custody_funder(branch.deposit.as_ref().map(|(who, _)| who), &branch.admins),
+		)?;
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		if let Err(err) = frame_system::Pallet::<T>::dec_providers(&redistribution_account) {
 			defensive!("redistribution-account provider reference not released", err);

@@ -580,6 +580,8 @@ pub mod pallet {
 		BranchAlreadyRegistered,
 		/// The fee account cannot be made able to receive the stable asset.
 		FeeAccountNotReceivable,
+		/// The market creator cannot pay one minimum balance of the collateral asset.
+		CustodySeedUnavailable,
 		/// A fee credit backing a recorded liability failed to resolve.
 		FeeResolutionFailed,
 		/// The resulting debt is below the market minimum.
@@ -648,6 +650,8 @@ pub mod pallet {
 		RedistributionWouldOverflow,
 		/// The vault is not eligible for liquidation.
 		VaultNotLiquidatable,
+		/// Collateral could not be delivered to its recipient.
+		CollateralPayoutFailed,
 		/// Another dormant vault is already first in the redemption queue.
 		DormantTargetOccupied,
 		/// The amount is zero.
@@ -1159,6 +1163,11 @@ pub mod pallet {
 		///
 		/// The assets must exist, the oracle must have a price, and the configuration must be
 		/// allowed. A non-privileged creator pays a refundable deposit.
+		///
+		/// Registration also charges one minimum balance of the collateral asset, which the
+		/// market's redistribution account carries until removal refunds it. A deposit-paying
+		/// creator funds it. A privileged creation charges the named full administrator: that
+		/// account never signed, so an unfunded admin fails with [`Error::CustodySeedUnavailable`].
 		#[pallet::call_index(10)]
 		#[pallet::weight(T::WeightInfo::create_branch())]
 		pub fn create_branch(
@@ -1255,7 +1264,10 @@ pub mod pallet {
 		///
 		/// Requires [`Config::ForceOrigin`] or the market's full administrator.
 		///
-		/// The market must have no vaults, collateral, or debt. Its creation deposit is refunded.
+		/// The market must have no vaults, collateral, or debt. Its creation deposit is refunded,
+		/// and the redistribution custody seed returns to the original depositor, or to the current
+		/// full administrator of a privileged market. Rotating that admin therefore redirects the
+		/// seed.
 		#[pallet::call_index(14)]
 		#[pallet::weight(T::WeightInfo::remove_branch())]
 		pub fn remove_branch(
