@@ -545,8 +545,16 @@ pub fn register_branch(
 ) {
 	// A market cannot be registered without a live price.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
-	// Account 1 owns every test stablecoin. The refundable deposit it pays for the market also
-	// funds the collateral account the pool needs.
+	// Account 1 owns every test stablecoin. The refundable deposit it pays for the market funds
+	// the collateral account the pool needs, and as the depositor it also pays the redistribution
+	// custody seed. That seed is withdrawn under `Preserve`, so it needs two minimum balances.
+	mint_collateral(
+		collateral.clone(),
+		1,
+		2 * <VaultCollateralAssets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(
+			collateral.clone(),
+		),
+	);
 	Vaults::create_branch(
 		RuntimeOrigin::signed(1),
 		collateral.clone(),

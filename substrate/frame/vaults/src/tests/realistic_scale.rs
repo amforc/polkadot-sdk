@@ -318,6 +318,44 @@ fn liquidation_reverts_on_sub_ed_keeper_leg() {
 	});
 }
 
+// Redistribution custody on an issued collateral: `pallet-assets` keeps the
+// minimum balance untouchable once an account holds anything, so seizing into
+// custody only works because registration seeded it. The rest of the suite
+// redistributes native collateral, where a provider reference waives the ED and
+// hides this.
+#[test]
+fn redistribution_custody_holds_issued_collateral() {
+	build_and_execute(|| {
+		register_realistic_market();
+		let custody = Vaults::redistribution_account(&XBT, &USDX);
+		assert_eq!(collateral_balance(XBT, custody), XBT_ED, "registration seeded custody");
+
+		// Vaults 1 and 2 sit at par, vault 3 at 400%, so two liquidations still
+		// leave an eligible recipient.
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(3, XBT, USDX, 4_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		set_price(XBT, FixedU128::from_rational(1u128, 2_000u128));
+
+		// No Stability capital, so the whole seizure lands in custody.
+		assert_ok!(liquidate(9, XBT, USDX, 1, 0, 0));
+		let first = held(XBT, custody);
+		assert!(first > 0, "seizure reached custody");
+		assert_eq!(first, branch_state(XBT, USDX).unwrap().pending_redistribution_collateral);
+		assert_eq!(collateral_balance(XBT, custody), XBT_ED, "the seed stays free");
+
+		// The seed is a float, not a consumable: the next seizure holds too.
+		assert_ok!(liquidate(9, XBT, USDX, 2, 0, 0));
+		assert!(held(XBT, custody) > first, "second seizure added to custody");
+		assert_eq!(collateral_balance(XBT, custody), XBT_ED);
+
+		// Materializing drains the hold and leaves the seed behind.
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 3));
+		assert_eq!(held(XBT, custody), 0);
+		assert_eq!(collateral_balance(XBT, custody), XBT_ED);
+	});
+}
+
 // A JIT target inside `(balance - ED, balance)` rounds down to the preserving
 // limit. The exact burn then succeeds under `Preserve` and leaves the keeper's
 // stable account alive at exactly the ED.

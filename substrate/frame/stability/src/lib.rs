@@ -201,7 +201,7 @@ pub mod pallet {
 				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance = BalanceOf<Self>,
 			> + fungibles::Balanced<Self::AccountId>
-			+ AccountTouch<CollateralIdOf<Self>, Self::AccountId>
+			+ AccountTouch<CollateralIdOf<Self>, Self::AccountId, Balance: Zero>
 			+ fungibles::Refund<Self::AccountId, AssetId = CollateralIdOf<Self>>;
 
 		/// Clock for the entry delay and the Safety-mode withdrawal delay.
@@ -764,31 +764,50 @@ pub mod pallet {
 			Ok((stable_dust, collateral_dust))
 		}
 
-		/// Ensures that even a one-unit offset gain can enter the pool account. Issued assets whose
-		/// minimum balance is larger than one need a zero-balance asset account created up front;
-		/// [`AccountTouch`] charges its refundable native deposit to the market depositor.
+		/// Ensures the pool account can receive the first offset gain of this collateral.
+		///
+		/// Issued assets whose minimum balance is larger than one need a zero-balance asset
+		/// account created up front; [`AccountTouch`] charges its refundable native deposit to
+		/// the market depositor. Native balances have no such account: a one-unit probe always
+		/// fails against a production ED, and `touch` is a no-op. The provider reference taken
+		/// at registration is enough for the account to receive its own minimum, which is the
+		/// native contract (a first gain below ED is dusted).
 		fn ensure_collateral_account(
 			collateral_id: &CollateralIdOf<T>,
 			pool_account: &T::AccountId,
 			depositor: Option<&T::AccountId>,
 		) -> DispatchResult {
-			let can_receive_unit = || {
+			let can_receive = |amount| {
 				T::CollateralAssets::can_deposit(
 					collateral_id.clone(),
 					pool_account,
-					BalanceOf::<T>::one(),
+					amount,
 					Provenance::Extant,
 				)
 				.into_result()
 				.is_ok()
 			};
-			if can_receive_unit() {
+			if can_receive(BalanceOf::<T>::one()) {
 				return Ok(());
 			}
-			let depositor = depositor.ok_or(Error::<T>::PoolAccountDepositRequired)?;
-			T::CollateralAssets::touch(collateral_id.clone(), pool_account, depositor)?;
-			ensure!(can_receive_unit(), Error::<T>::PoolAccountNotReceivable);
-			Ok(())
+			if let Some(depositor) = depositor {
+				T::CollateralAssets::touch(collateral_id.clone(), pool_account, depositor)?;
+				if can_receive(BalanceOf::<T>::one()) {
+					return Ok(());
+				}
+			}
+			// `touch` is a no-op for native (and any asset whose account deposit is zero).
+			// Accept the account if it can receive its own minimum.
+			if T::CollateralAssets::deposit_required(collateral_id.clone()).is_zero() &&
+				can_receive(T::CollateralAssets::minimum_balance(collateral_id.clone()))
+			{
+				return Ok(());
+			}
+			Err(if depositor.is_none() {
+				Error::<T>::PoolAccountDepositRequired.into()
+			} else {
+				Error::<T>::PoolAccountNotReceivable.into()
+			})
 		}
 	}
 

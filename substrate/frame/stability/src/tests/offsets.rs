@@ -54,11 +54,9 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 			mint_collateral(collateral.clone(), owner, 5_000);
 			assert_ok!(open_vault(owner, collateral.clone(), PUSD, 3_000, 500));
 		}
-		// Documented runtime duty for issued-asset markets: pre-fund custody
-		// sub-accounts with the asset minimum so holds can take their full
-		// amount (the hold's `Protect` preservation keeps the minimum free).
+		// Registration seeded custody with the asset minimum, which a hold's
+		// `Protect` preservation keeps free.
 		let redistribution = Vaults::redistribution_account(&collateral, &PUSD);
-		mint_collateral(collateral.clone(), redistribution, 1_000);
 		mint_stable(PUSD, 3, 100);
 		assert_ok!(deposit(3, collateral.clone(), PUSD, 100));
 		advance_time(5_000);
@@ -66,6 +64,7 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 		// floor(0.18 * 3_000) = 540 of value: CR 1.08 sits below the 1.10 MCR.
 		set_price(collateral.clone(), FixedU128::from_rational(9u128, 50u128));
 
+		let owner_free_before = collateral_balance(collateral.clone(), 1);
 		let pool_account = Stability::pool_account(&collateral, &PUSD);
 		// Registration touched a zero-balance asset account, so even a one-unit gain can enter it.
 		assert_ok!(Assets::can_deposit(77, &pool_account, 1, Provenance::Extant).into_result());
@@ -130,8 +129,10 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 		);
 		assert_eq!(collateral_balance(collateral.clone(), redistribution), 1_000);
 		assert_eq!(collateral_balance(collateral.clone(), 4), 1_114);
-		// The owner receives all collateral not required by the liquidation.
-		assert_eq!(collateral_balance(collateral, 1), 5_000 - 2_928);
+		// The owner receives all collateral not required by the liquidation: 2_928 of the 3_000
+		// it pledged was seized. (Account 1 also created the market, so its balance carries the
+		// minimum the seed withdrawal preserved.)
+		assert_eq!(collateral_balance(collateral, 1), owner_free_before + 3_000 - 2_928);
 	});
 }
 
