@@ -13,7 +13,10 @@ use crate::{
 use alloc::collections::BTreeMap;
 use frame::{
 	arithmetic::{CheckedAdd, FixedPointNumber, FixedU128, Zero},
-	traits::{fungibles::InspectHold, Convert, Time},
+	traits::{
+		fungibles::{Inspect as FungiblesInspect, InspectHold},
+		Convert, Time,
+	},
 	try_runtime::TryRuntimeError,
 };
 use linked_list_interface::SortedListInterface;
@@ -372,13 +375,20 @@ fn check_branch_identities<T: Config>(
 		return Err("pending redistribution weight-time exceeds current-time bound".into());
 	}
 
+	let redistribution_account = Pallet::<T>::redistribution_account(collateral_id, stable_id);
 	let held_redistribution = T::CollateralAssets::balance_on_hold(
 		collateral_id.clone(),
 		&HoldReason::VaultCollateral.into(),
-		&Pallet::<T>::redistribution_account(collateral_id, stable_id),
+		&redistribution_account,
 	);
 	if held_redistribution != state.pending_redistribution_collateral {
 		return Err("redistribution account hold != pending collateral".into());
+	}
+	// A hold must leave the asset's minimum balance free, so the registration seed has to survive
+	// every seizure for the next one to succeed.
+	let custody_free = T::CollateralAssets::balance(collateral_id.clone(), &redistribution_account);
+	if custody_free < T::CollateralAssets::minimum_balance(collateral_id.clone()) {
+		return Err("redistribution account free balance below the collateral minimum".into());
 	}
 	let expected_total_collateral = sum_market_collateral
 		.checked_add(&state.pending_redistribution_collateral)
