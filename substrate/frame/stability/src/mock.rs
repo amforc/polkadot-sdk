@@ -443,7 +443,11 @@ pub fn new_test_ext() -> TestState {
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
 			// The fee account needs native funds to pay its asset-account deposit.
-			balances: (1u128..=10u128).chain([FEE_DEST]).map(|i| (i, 1_000_000_000_000)).collect(),
+			// The full admin pays the custody seed of every Root-created market.
+			balances: (1u128..=10u128)
+				.chain([FEE_DEST, ADMIN])
+				.map(|i| (i, 1_000_000_000_000))
+				.collect(),
 			..Default::default()
 		},
 	}
