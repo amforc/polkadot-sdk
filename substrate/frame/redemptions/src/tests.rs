@@ -1066,6 +1066,8 @@ fn set_redemption_config_rejects_market_admins() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		let other_admin: AccountId = 55;
+		// A Root-created market charges its full admin the custody seed.
+		mint_collateral(TOKEN_X_ID, other_admin, 2);
 		set_price(TOKEN_X, FixedU128::one());
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::root(),
