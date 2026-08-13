@@ -524,6 +524,15 @@ pub fn register_branch(
 ) {
 	// `create_branch` requires a live price, so set it before creating.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+	// A Root-created market has no depositor, so its full administrator pays the redistribution
+	// custody seed. The withdrawal preserves the payer, so it needs two minimum balances on hand.
+	mint_collateral(
+		collateral.clone(),
+		ADMIN,
+		2 * <VaultCollateralAssets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(
+			collateral.clone(),
+		),
+	);
 	Vaults::create_branch(
 		RuntimeOrigin::root(),
 		collateral.clone(),
