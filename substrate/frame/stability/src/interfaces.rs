@@ -5,11 +5,7 @@ use crate::pallet::{
 	BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Pallet, Pools, StabilityPoolOf,
 	StableCreditOf, StableIdOf,
 };
-use frame::{
-	deps::frame_support::require_transactional,
-	prelude::*,
-	traits::tokens::Preservation,
-};
+use frame::{deps::frame_support::require_transactional, prelude::*, traits::tokens::Preservation};
 use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, StabilityPoolOffset};
 
 /// The vault engine hands every minted branch credit through here; the pool
