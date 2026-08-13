@@ -52,7 +52,7 @@ fn create_branch_requires_asset_owner_or_root() {
 				TOKEN_X,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config()
+				default_branch_config(),
 			),
 			DispatchError::BadOrigin
 		);
@@ -63,7 +63,7 @@ fn create_branch_requires_asset_owner_or_root() {
 			TOKEN_X,
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config()
+			default_branch_config(),
 		));
 	});
 }
@@ -79,7 +79,7 @@ fn create_branch_rejects_unknown_asset() {
 				unknown,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config()
+				default_branch_config(),
 			),
 			crate::Error::<Test>::UnknownCollateral
 		);
@@ -96,7 +96,7 @@ fn create_branch_rejects_duplicate_collateral() {
 				DOT,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config()
+				default_branch_config(),
 			),
 			crate::Error::<Test>::BranchAlreadyRegistered
 		);

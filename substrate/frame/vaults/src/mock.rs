@@ -84,6 +84,11 @@ pub const USD: Balance = 1_000_000;
 /// Minimum USDX balance.
 pub const USDX_ED: Balance = USD / 100;
 
+/// Issued collateral that is not sufficient: its accounts exist only through a
+/// consumer reference, which the system account needs a provider for.
+pub const INSUFFICIENT_ID: AssetIdForAssets = 6;
+pub const INSUFFICIENT: AssetId = AssetId::WithId(INSUFFICIENT_ID);
+
 /// Issued collateral with ten decimals and a 0.01 minimum balance.
 pub const XBT_ID: AssetIdForAssets = 5;
 pub const XBT: AssetId = AssetId::WithId(XBT_ID);
@@ -402,6 +407,7 @@ pub fn new_test_ext() -> TestState {
 				(EUSD, 1, true, 1),
 				(USDX, 1, true, USDX_ED),
 				(XBT_ID, 1, true, XBT_ED),
+				(INSUFFICIENT_ID, 1, false, 1),
 			],
 			metadata: vec![],
 			accounts: vec![],
@@ -411,7 +417,11 @@ pub fn new_test_ext() -> TestState {
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
 			// The fee account needs native funds to pay its asset-account deposit.
-			balances: (1u64..=10u64).chain([FEE_DEST]).map(|i| (i, 1_000_000_000_000)).collect(),
+			// The full admin funds the custody seed of every Root-created market.
+			balances: (1u64..=10u64)
+				.chain([FEE_DEST, ADMIN])
+				.map(|i| (i, 1_000_000_000_000))
+				.collect(),
 			..Default::default()
 		},
 	}
@@ -422,7 +432,7 @@ pub fn new_test_ext() -> TestState {
 		System::set_block_number(1);
 		Timestamp::set_timestamp(1_000);
 		// Native collateral is already funded. Mint the issued assets now.
-		for who in 1u64..=10 {
+		for who in (1u64..=10).chain([ADMIN]) {
 			for asset in [TOKEN_X_ID, ETH_ID, COLL_C_ID, COLL_D_ID] {
 				<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
 					asset,
@@ -438,6 +448,14 @@ pub fn new_test_ext() -> TestState {
 			)
 			.expect("mint realistic collateral in test setup");
 		}
+		// Only the market creator holds the insufficient asset: an account of one takes a consumer
+		// reference, which changes what that account may spend down to.
+		<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
+			INSUFFICIENT_ID,
+			&ADMIN,
+			1_000_000_000_000,
+		)
+		.expect("mint insufficient collateral in test setup");
 		MockPrices::set(BTreeMap::new());
 		MockOracleAvailable::set(true);
 		LifecycleLog::set(Vec::new());
@@ -796,6 +814,11 @@ pub fn held(collateral: AssetId, who: AccountId) -> Balance {
 /// Returns an account's total collateral balance, including holds.
 pub fn collateral_balance(collateral: AssetId, who: AccountId) -> Balance {
 	<VaultCollateralAssets as FungiblesInspect<AccountId>>::balance(collateral, &who)
+}
+
+/// Returns a collateral asset's minimum balance, which is the size of the custody seed.
+pub fn min_collateral_balance(collateral: AssetId) -> Balance {
+	<VaultCollateralAssets as FungiblesInspect<AccountId>>::minimum_balance(collateral)
 }
 
 /// Returns an account's balance of one stable asset.
