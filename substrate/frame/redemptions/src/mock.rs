@@ -409,8 +409,9 @@ pub fn new_test_ext() -> TestState {
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
 			// The fee account needs native funds to pay its asset-account deposit.
+			// The full admin pays the custody seed of every Root-created market.
 			balances: (1u64..=10u64)
-				.chain([insurance_account(PUSD), FEE_DEST, VAULT_FEE_DEST])
+				.chain([insurance_account(PUSD), FEE_DEST, VAULT_FEE_DEST, ADMIN])
 				.map(|i| (i, 1_000_000_000_000))
 				.collect(),
 			..Default::default()
@@ -424,6 +425,8 @@ pub fn new_test_ext() -> TestState {
 		Timestamp::set_timestamp(1_000);
 		MockPrices::set(alloc::collections::BTreeMap::new());
 		MockOracleAvailable::set(true);
+		// Every market's registration seed comes out of the full admin's balance.
+		mint_collateral(TOKEN_X_ID, ADMIN, 1_000_000_000_000);
 	});
 	ext
 }
@@ -478,7 +481,6 @@ pub fn register_branch(
 	stable: StableId,
 	config: pallet_vaults::BranchConfig<Balance>,
 ) {
-	use frame::traits::fungible::Mutate as FungibleMutate;
 	// `create_branch` requires a live price, so set it before creating.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
 	Vaults::create_branch(
@@ -491,9 +493,6 @@ pub fn register_branch(
 	.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), collateral.clone(), GLOBAL_CEILING)
 		.expect("set global debt ceiling");
-	// Native ED so the redistribution sub-account can receive funds later.
-	let redistribution: AccountId = Vaults::redistribution_account(&collateral, &stable);
-	let _ = <Balances as FungibleMutate<AccountId>>::mint_into(&redistribution, 1);
 }
 
 /// Open a vault for `who` on the `(collateral, stable)` market with
