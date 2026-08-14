@@ -75,7 +75,7 @@ fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
 		rate_adjustment_cooldown: DAY_MS,
 		liquidation: crate::LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
-			keeper_flat_compensation_value: balance::<T>(100),
+			keeper_flat_compensation_value: balance::<T>(10),
 			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
 			keeper_compensation_cap_value: balance::<T>(10_000),
 			minimum_jit_contribution: balance::<T>(100),
