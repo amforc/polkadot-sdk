@@ -461,9 +461,6 @@ pub mod pallet {
 		/// The pool parameters contradict each other. See
 		/// [`types::StabilityPoolConfig::is_valid`].
 		InvalidStabilityPoolConfig,
-		/// The pool's collateral account needs a refundable deposit, and registration named no
-		/// account to pay it. Register the market from a signed origin rather than from Root.
-		PoolAccountDepositRequired,
 		/// The pool's collateral account still cannot receive a gain after registration created
 		/// it. The pool would have to refuse collateral it owes to depositors.
 		PoolAccountNotReceivable,
@@ -768,14 +765,14 @@ pub mod pallet {
 		///
 		/// Issued assets whose minimum balance is larger than one need a zero-balance asset
 		/// account created up front; [`AccountTouch`] charges its refundable native deposit to
-		/// the market depositor. Native balances have no such account: a one-unit probe always
-		/// fails against a production ED, and `touch` is a no-op. The provider reference taken
-		/// at registration is enough for the account to receive its own minimum, which is the
+		/// `funder`. Native balances have no such account: a one-unit probe always fails
+		/// against a production ED, and `touch` is a no-op. The provider reference taken at
+		/// registration is enough for the account to receive its own minimum, which is the
 		/// native contract (a first gain below ED is dusted).
 		fn ensure_collateral_account(
 			collateral_id: &CollateralIdOf<T>,
 			pool_account: &T::AccountId,
-			depositor: Option<&T::AccountId>,
+			funder: &T::AccountId,
 		) -> DispatchResult {
 			let can_receive = |amount| {
 				T::CollateralAssets::can_deposit(
@@ -790,11 +787,9 @@ pub mod pallet {
 			if can_receive(BalanceOf::<T>::one()) {
 				return Ok(());
 			}
-			if let Some(depositor) = depositor {
-				T::CollateralAssets::touch(collateral_id.clone(), pool_account, depositor)?;
-				if can_receive(BalanceOf::<T>::one()) {
-					return Ok(());
-				}
+			T::CollateralAssets::touch(collateral_id.clone(), pool_account, funder)?;
+			if can_receive(BalanceOf::<T>::one()) {
+				return Ok(());
 			}
 			// `touch` is a no-op for native (and any asset whose account deposit is zero).
 			// Accept the account if it can receive its own minimum.
@@ -803,11 +798,7 @@ pub mod pallet {
 			{
 				return Ok(());
 			}
-			Err(if depositor.is_none() {
-				Error::<T>::PoolAccountDepositRequired.into()
-			} else {
-				Error::<T>::PoolAccountNotReceivable.into()
-			})
+			Err(Error::<T>::PoolAccountNotReceivable.into())
 		}
 	}
 
@@ -820,7 +811,7 @@ pub mod pallet {
 			stable_id: &StableIdOf<T>,
 			_stablecoin_markets: u32,
 			config: Self::RegistrationConfig,
-			depositor: Option<&T::AccountId>,
+			funder: &T::AccountId,
 		) -> DispatchResult {
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
 			let pool_account = Self::pool_account(collateral_id, stable_id);
@@ -843,7 +834,7 @@ pub mod pallet {
 			if frame_system::Pallet::<T>::providers(&pool_account) == 0 {
 				frame_system::Pallet::<T>::inc_providers(&pool_account);
 			}
-			Self::ensure_collateral_account(collateral_id, &pool_account, depositor)?;
+			Self::ensure_collateral_account(collateral_id, &pool_account, funder)?;
 			Ok(())
 		}
 

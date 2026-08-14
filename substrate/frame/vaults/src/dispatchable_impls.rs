@@ -400,15 +400,14 @@ impl<T: Config> Pallet<T> {
 			},
 			None => None,
 		};
-		let lifecycle_depositor = deposit.as_ref().map(|(who, _)| who.clone());
+		// Every refundable setup cost this registration takes — Vaults' own custody seed and
+		// whatever the lifecycle handlers touch — is charged to the same account, so a
+		// governance-created market funds its handlers exactly as it funds custody.
+		let funder = Self::custody_funder(deposit.as_ref().map(|(who, _)| who), &admins);
 		Self::ensure_fee_account_receivable(&stable_id)?;
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		frame_system::Pallet::<T>::inc_providers(&redistribution_account);
-		Self::seed_redistribution_custody(
-			&collateral_id,
-			&stable_id,
-			&Self::custody_funder(deposit.as_ref().map(|(who, _)| who), &admins),
-		)?;
+		Self::seed_redistribution_custody(&collateral_id, &stable_id, &funder)?;
 		let now = T::TimeProvider::now();
 		Branches::<T>::insert(
 			&collateral_id,
@@ -420,7 +419,7 @@ impl<T: Config> Pallet<T> {
 			&stable_id,
 			stablecoin_markets,
 			lifecycle_config,
-			lifecycle_depositor.as_ref(),
+			&funder,
 		)?;
 		Self::deposit_event(Event::BranchRegistered { collateral_id, stable_id });
 		Ok(())

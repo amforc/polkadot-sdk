@@ -493,7 +493,9 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
 		liquidation: pallet_vaults::LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
-			keeper_flat_compensation_value: 100,
+			// The keeper is paid out of the offset penalty, which on the smallest
+			// vault here is 5% of a 200 debt.
+			keeper_flat_compensation_value: 10,
 			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
 			keeper_compensation_cap_value: 10_000,
 			minimum_jit_contribution: 100,

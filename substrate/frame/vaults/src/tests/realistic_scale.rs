@@ -6,7 +6,7 @@
 //! `10^-3` stable-per-collateral minor unit = $10_000; against 5_000 USDX
 //! (5×10^9 minor units) of debt that is a 200% CR.
 
-use crate::{mock::*, tests::rate_pct, types::BranchConfigUpdate, Error, LiquidationConfig};
+use crate::{mock::*, tests::rate_pct, types::BranchConfigUpdate, Error};
 use frame::{
 	arithmetic::Permill,
 	prelude::TokenError,
@@ -295,18 +295,10 @@ fn liquidation_reverts_on_sub_ed_keeper_leg() {
 		set_price(XBT, FixedU128::from_rational(1u128, 100_000u128));
 
 		let set_keeper_value = |value| {
-			let defaults = default_branch_config().liquidation;
-			Vaults::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				XBT,
-				USDX,
-				BranchConfigUpdate::Liquidation(LiquidationConfig {
-					keeper_flat_compensation_value: value,
-					keeper_percent_compensation: Permill::zero(),
-					keeper_compensation_cap_value: value,
-					..defaults
-				}),
-			)
+			let set = |update| Vaults::set_param(RuntimeOrigin::signed(ADMIN), XBT, USDX, update);
+			set(BranchConfigUpdate::KeeperPercentCompensation(Permill::zero()))?;
+			set(BranchConfigUpdate::KeeperCompensationCapValue(value))?;
+			set(BranchConfigUpdate::KeeperFlatCompensationValue(value))
 		};
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
 		assert_ok!(set_keeper_value(500));

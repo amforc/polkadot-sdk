@@ -15,7 +15,11 @@ fn example_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	config.initial_collateralization_ratio = FixedU128::from_rational(140u128, 100u128);
 	config.safety_collateralization_ratio = FixedU128::from_rational(150u128, 100u128);
 	config.minimum_debt = 100;
-	// No upfront fee, so drawn principal is the debt.
+	// That floor leaves a 5 offset penalty on the smallest vault, too little to pay the flat
+	// keeper fee of the mock. These examples redeem and offset in recovery; none of them
+	// liquidates.
+	config.liquidation.keeper_flat_compensation_value = 0;
+	// No upfront fee, so the drawn principal is the debt.
 	config.upfront_fee_period = 0;
 	// Caps the recovery bonus at the examples' 10%.
 	config.liquidation.redistribution_penalty = Permill::from_percent(10);

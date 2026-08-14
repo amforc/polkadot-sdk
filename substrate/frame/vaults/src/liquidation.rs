@@ -412,16 +412,17 @@ fn max_seizable_collateral<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 }
 
 // Computes keeper compensation inside the seized collateral. The minimum rule keeps the reward
-// within the configured cap and available collateral.
+// within the configured cap, the penalty funding it, and the available collateral.
 fn keeper_reward<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	seized: Balance,
+	penalty_budget: Balance,
 	price: FixedU128,
 	config: &LiquidationConfig<Balance>,
 ) -> Option<Balance> {
 	let flat = collateral_for_value_ceil(config.keeper_flat_compensation_value, price)?;
 	let cap = collateral_for_value_ceil(config.keeper_compensation_cap_value, price)?;
 	let percent = config.keeper_percent_compensation.mul_floor(seized);
-	Some(seized.min(cap).min(flat.checked_add(&percent)?))
+	Some(seized.min(cap).min(flat.checked_add(&percent)?).min(penalty_budget))
 }
 
 // Allocates resolution collateral by penalty-adjusted debt. Floor division prevents
@@ -481,7 +482,13 @@ fn plan<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	let max_seizable = max_seizable_collateral(debt, price, config)?;
 	let seized = total_collateral.min(max_seizable);
 	let owner_surplus = total_collateral.checked_sub(&seized)?;
-	let keeper_reward = keeper_reward(seized, price, config)?;
+	// The penalty a full seizure holds above the debt it resolves, which is all the keeper is
+	// ever paid from. A vault can owe less than the `minimum_debt` its market sized the
+	// compensation against, since a market may raise that floor after the vault opened, so the
+	// vault in hand caps the reward rather than the configuration.
+	let penalty_budget =
+		max_seizable.checked_sub(&collateral_for_value_ceil(debt.checked_total()?, price)?)?;
+	let keeper_reward = keeper_reward(seized, penalty_budget, price, config)?;
 	let resolution = seized.checked_sub(&keeper_reward)?;
 	let collateral = allocate_collateral(resolution, debt, config)?;
 	Some(LiquidationPlan { debt, collateral, seized, keeper_reward, owner_surplus })
@@ -533,6 +540,30 @@ mod tests {
 	#[test]
 	fn keeper_reward_is_deducted_before_allocation() {
 		let mut policy = config();
+		policy.keeper_flat_compensation_value = 10;
+		policy.keeper_percent_compensation = Permill::from_percent(1);
+		policy.keeper_compensation_cap_value = 10_000;
+		let debt = LiquidationSplit {
+			active_pool: 500,
+			keeper_jit: 0,
+			pending_pool: 0,
+			redistribution: 0,
+		};
+		// The reward 15 = 10 flat + floor(1% of 525) comes out of the seized
+		// lot before allocation — the penalty is gross of keeper compensation,
+		// so the pool receives 510, not 525.
+		let plan = plan(600, debt, FixedU128::one(), &policy).unwrap();
+		assert_eq!(plan.seized, 525);
+		assert_eq!(plan.keeper_reward, 15);
+		assert_eq!(plan.owner_surplus, 75);
+		assert_eq!(plan.collateral.active_pool, 510);
+	}
+
+	// A vault that opened under looser terms than the market now configures must still leave the
+	// pool its principal cover. The penalty the vault itself carries is all the keeper can take.
+	#[test]
+	fn keeper_reward_never_outgrows_the_penalty_seized() {
+		let mut policy = config();
 		policy.keeper_flat_compensation_value = 100;
 		policy.keeper_percent_compensation = Permill::from_percent(10);
 		policy.keeper_compensation_cap_value = 10_000;
@@ -542,35 +573,36 @@ mod tests {
 			pending_pool: 0,
 			redistribution: 0,
 		};
-		// The reward 152 = 100 flat + floor(10% of 525) comes out of the
-		// seized lot before allocation — the penalty is gross of keeper
-		// compensation, so the pool receives 373, not 525.
+		// The configured 152 = 100 flat + floor(10% of 525) is larger than the 25 penalty this
+		// vault seizes, so the keeper takes the 25 and the pool still receives its whole 500.
 		let plan = plan(600, debt, FixedU128::one(), &policy).unwrap();
 		assert_eq!(plan.seized, 525);
-		assert_eq!(plan.keeper_reward, 152);
-		assert_eq!(plan.owner_surplus, 75);
-		assert_eq!(plan.collateral.active_pool, 373);
+		assert_eq!(plan.keeper_reward, 25);
+		assert_eq!(plan.collateral.active_pool, 500);
 	}
 
 	// Each reward bound must independently cap keeper compensation so it cannot exceed seized
-	// collateral or policy limits.
+	// collateral, the penalty funding it, or policy limits.
 	#[test]
 	fn keeper_reward_takes_the_binding_minimum() {
-		let reward = |flat: u128, percent: Permill, cap: u128, seized: u128| {
+		let reward = |flat: u128, percent: Permill, cap: u128, budget: u128, seized: u128| {
 			let mut policy = config();
 			policy.keeper_flat_compensation_value = flat;
 			policy.keeper_percent_compensation = percent;
 			policy.keeper_compensation_cap_value = cap;
-			keeper_reward(seized, FixedU128::one(), &policy)
+			keeper_reward(seized, budget, FixedU128::one(), &policy)
 		};
+		let percent_per_mille = Permill::from_rational(1u32, 1_000u32);
 		// Flat plus percent binds: 100 + floor(0.1% of 584) = 100.
-		assert_eq!(reward(100, Permill::from_rational(1u32, 1_000u32), 10_000, 584), Some(100));
+		assert_eq!(reward(100, percent_per_mille, 10_000, 10_000, 584), Some(100));
 		// The cap binds: flat 5_000 clamped to 300.
-		assert_eq!(reward(5_000, Permill::zero(), 300, 584), Some(300));
+		assert_eq!(reward(5_000, Permill::zero(), 300, 10_000, 584), Some(300));
 		// The seized lot binds: everything else is larger.
-		assert_eq!(reward(5_000, Permill::zero(), 10_000, 584), Some(584));
+		assert_eq!(reward(5_000, Permill::zero(), 10_000, 10_000, 584), Some(584));
+		// The penalty this seizure carries binds: everything else is larger.
+		assert_eq!(reward(5_000, Permill::zero(), 10_000, 29, 584), Some(29));
 		// Percent contributes above the flat: 100 + floor(10% of 500) = 150.
-		assert_eq!(reward(100, Permill::from_percent(10), 10_000, 500), Some(150));
+		assert_eq!(reward(100, Permill::from_percent(10), 10_000, 10_000, 500), Some(150));
 	}
 
 	// Separate penalties must make redistribution harsher than an offset. Zero penalties must

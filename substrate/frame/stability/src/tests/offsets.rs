@@ -34,8 +34,8 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 
 		assert!(pallet_vaults::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
-		assert_eq!(collateral_balance(DOT, pool_account) - pool_before, 472);
-		assert_eq!(collateral_balance(DOT, 4) - keeper_before, 112);
+		assert_eq!(collateral_balance(DOT, pool_account) - pool_before, 571);
+		assert_eq!(collateral_balance(DOT, 4) - keeper_before, 12);
 		// Terminal interest makes debt 501 and reduces the owner surplus to 14.
 		assert_eq!(collateral_balance(DOT, 1) - owner_before, 14);
 	});
@@ -46,14 +46,16 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 	build_and_execute(|| {
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
 		let collateral = AssetId::WithId(77);
-		let mut config = default_branch_config();
+		let mut config = branch_config_for(collateral.clone(), PUSD);
 		config.upfront_fee_period = 0;
-		config.liquidation.keeper_flat_compensation_value = 200;
 		register_branch(collateral.clone(), PUSD, config);
 		for owner in [1, 2] {
 			mint_collateral(collateral.clone(), owner, 5_000);
 			assert_ok!(open_vault(owner, collateral.clone(), PUSD, 3_000, 500));
 		}
+		// The keeper's reward is itself below this asset's 1_000 minimum, so give account 4 an
+		// account to receive it. The pool's gain is what this test is about.
+		mint_collateral(collateral.clone(), 4, 1_000);
 		// Registration seeded custody with the asset minimum, which a hold's
 		// `Protect` preservation keeps free.
 		let redistribution = Vaults::redistribution_account(&collateral, &PUSD);
@@ -83,9 +85,9 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 		assert!(pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 1)).is_none());
 		let state = pool_state(collateral.clone(), PUSD);
 		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.total_collateral_gains_unclaimed, 361);
+		assert_eq!(state.total_collateral_gains_unclaimed, 571);
 		assert_eq!(stable_balance(PUSD, pool_account), 0);
-		assert_eq!(collateral_balance(collateral.clone(), pool_account), 361);
+		assert_eq!(collateral_balance(collateral.clone(), pool_account), 571);
 		// Redistribution collateral remains in custody until the recipient is touched.
 		use frame::traits::fungibles::InspectHold;
 		assert_eq!(
@@ -94,7 +96,7 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 				&pallet_vaults::HoldReason::VaultCollateral.into(),
 				&redistribution,
 			),
-			1_453
+			2_299
 		);
 		assert_eq!(
 			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
@@ -125,10 +127,10 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 				&pallet_vaults::HoldReason::VaultCollateral.into(),
 				&2,
 			),
-			4_453
+			5_299
 		);
 		assert_eq!(collateral_balance(collateral.clone(), redistribution), 1_000);
-		assert_eq!(collateral_balance(collateral.clone(), 4), 1_114);
+		assert_eq!(collateral_balance(collateral.clone(), 4), 1_000 + 58);
 		// The owner receives all collateral not required by the liquidation: 2_928 of the 3_000
 		// it pledged was seized. (Account 1 also created the market, so its balance carries the
 		// minimum the seed withdrawal preserved.)

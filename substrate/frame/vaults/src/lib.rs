@@ -53,9 +53,9 @@ pub use pusd_primitives;
 pub use types::{
 	AssetMinimums, BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate,
 	BranchDebt, BranchMode, BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState,
-	JitTerms, LiquidationConfig, LiquidationOutcome, LiquidationSettlement, LiquidationSnapshot,
-	RedistributionAccumulators, RedistributionCarry, RedistributionStakeTotals,
-	StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
+	JitTerms, LiquidationConfig, LiquidationOutcome, RedistributionAccumulators,
+	RedistributionCarry, RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId,
+	VaultRecord, VaultStatus,
 };
 pub use weights::WeightInfo;
 
@@ -124,6 +124,7 @@ pub mod pallet {
 	pub type RegistrationConfigOf<T> = <<T as Config>::OnBranchLifecycle as OnBranchLifecycle<
 		CollateralIdOf<T>,
 		StableIdOf<T>,
+		<T as frame_system::Config>::AccountId,
 	>>::RegistrationConfig;
 
 	/// Stable-asset credit produced by the pallet.

@@ -386,7 +386,7 @@ pub mod pallet {
 			stable_id: &StableIdOf<T>,
 			stablecoin_markets: u32,
 			config: Self::RegistrationConfig,
-			_depositor: Option<&T::AccountId>,
+			_funder: &T::AccountId,
 		) -> DispatchResult {
 			// The count includes the market being announced, so it is never zero here.
 			ensure!(stablecoin_markets > 0, DispatchError::Corruption);

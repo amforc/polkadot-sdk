@@ -33,16 +33,18 @@ pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 	/// such state decide from that count rather than from their own storage, so the rule they
 	/// enforce is the one a caller can predict.
 	///
-	/// `depositor` is the account funding the market's refundable setup costs. Governance-created
-	/// markets can omit it when every lifecycle handler needs no additional account deposit.
+	/// `funder` is the account charged for any refundable setup cost the handler takes, such as
+	/// an asset account deposit. Vaults resolves it the same way it funds its own collateral
+	/// custody: the depositor a signed creation charged, and the market's full administrator
+	/// otherwise. A handler can therefore always name a payer, whoever created the market.
 	fn on_registered(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
 		stablecoin_markets: u32,
 		config: Self::RegistrationConfig,
-		depositor: Option<&AccountId>,
+		funder: &AccountId,
 	) -> DispatchResult {
-		let _ = (collateral_id, stable_id, stablecoin_markets, config, depositor);
+		let _ = (collateral_id, stable_id, stablecoin_markets, config, funder);
 		Ok(())
 	}
 
@@ -86,7 +88,7 @@ impl<CollateralId, StableId, AccountId> OnBranchLifecycle<CollateralId, StableId
 		stable_id: &StableId,
 		stablecoin_markets: u32,
 		config: Self::RegistrationConfig,
-		depositor: Option<&AccountId>,
+		funder: &AccountId,
 	) -> DispatchResult {
 		// Each handler takes its own field by value, so the composed tuple is moved apart
 		// field by field.
@@ -96,7 +98,7 @@ impl<CollateralId, StableId, AccountId> OnBranchLifecycle<CollateralId, StableId
 				stable_id,
 				stablecoin_markets,
 				config.Tuple,
-				depositor,
+				funder,
 			)?;
 		)* );
 		Ok(())
