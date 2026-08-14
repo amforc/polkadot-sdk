@@ -3513,18 +3513,6 @@ impl traits::Convert<VaultsStableId, AccountId> for StableInsuranceAccount {
 }
 
 parameter_types! {
-	/// Redemption parameters seeded on every branch registration.
-	pub RedemptionsDefaultConfig: pallet_redemptions::RedemptionConfig<Balance> =
-		pallet_redemptions::RedemptionConfig {
-			minimum_redemption_amount: 100_000_000, // 100 pUSD (6 decimals)
-			dynamic_fee_decay_period: 6 * 60 * 60 * 1_000, // 6 hours in ms
-			dynamic_fee_floor: FixedU128::from_rational(0u128, 1u128),
-			dynamic_fee_ceiling: FixedU128::from_rational(1u128, 1u128),
-			base_fee: Permill::from_rational(5u32, 1_000u32), // 0.5%
-			fee_ceiling: Permill::one(),
-			dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
-			final_recovery_bonus_buffer: Permill::from_percent(1),
-		};
 	pub const RedemptionsMaxSteps: u32 = 16;
 }
 
@@ -3536,7 +3524,6 @@ impl pallet_redemptions::Config for Runtime {
 	type FeeHandler = ResolveAssetTo<TreasuryAccount, Assets>;
 	type TimeProvider = Timestamp;
 	type UpdateOrigin = VaultsCreateOrigin;
-	type DefaultRedemptionConfig = RedemptionsDefaultConfig;
 	type MaxRedemptionSteps = RedemptionsMaxSteps;
 	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
 	#[cfg(feature = "runtime-benchmarks")]
@@ -3555,7 +3542,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 	) -> (VaultsCollateralId, VaultsStableId, AccountId, Balance) {
 		use frame_support::traits::fungibles::Mutate as FungiblesMutate;
 		use frame_system::RawOrigin;
-		use pallet_vaults::BenchmarkHelper as _;
+		use pallet_vaults::{pusd_primitives::OnBranchLifecycle as _, BenchmarkHelper as _};
 
 		let collateral_id = VaultsCollateralId::Native;
 		let stable_id: VaultsStableId = PsmStablecoinAssetId::get();
@@ -3582,14 +3569,17 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 			safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
 			debt_ceiling: 1_000_000 * DOLLARS,
 			minimum_debt: 10 * DOLLARS,
-			minimum_collateral: 1,
+			minimum_collateral: {
+				use frame_support::traits::fungibles::Inspect as FungiblesInspect;
+				<VaultsCollateral as FungiblesInspect<AccountId>>::minimum_balance(
+					collateral_id.clone(),
+				)
+			},
 			minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
 			maximum_borrow_rate: FixedU128::from_rational(1u128, 1u128),
 			upfront_fee_period: 7 * 24 * 60 * 60 * 1_000,
 			rate_adjustment_cooldown: 24 * 60 * 60 * 1_000,
 			redistribution_penalty: Permill::from_percent(5),
-			ceiling_gap: 0,
-			ceiling_ttl: 0,
 		};
 		let full_admin: AccountId = frame_benchmarking::account("vaults_admin", 0, 0);
 		let emergency_admin: AccountId = frame_benchmarking::account("vaults_emergency", 0, 0);
@@ -3600,17 +3590,22 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		// A Root-created market charges its full admin one minimum balance of collateral, which
 		// the redistribution account carries until removal refunds it.
 		fund_vaults_benchmark_collateral(collateral_id.clone(), &full_admin, 100 * DOLLARS);
+		// Each handler's own benchmark payload, not the runtime's production parameters: those
+		// carry live minimums that would bind inside a benchmark.
+		let lifecycle_config =
+			<Runtime as pallet_vaults::Config>::OnBranchLifecycle::benchmark_registration_config(1);
 		pallet_vaults::Pallet::<Runtime>::create_branch(
 			RawOrigin::Root.into(),
 			collateral_id.clone(),
 			stable_id,
 			admins,
 			branch_config,
+			lifecycle_config,
 		)
 		.expect("create branch for benchmark");
 		pallet_vaults::Pallet::<Runtime>::set_global_debt_ceiling(
 			RawOrigin::Root.into(),
-			collateral_id.clone(),
+			stable_id,
 			1_000_000_000 * DOLLARS,
 		)
 		.expect("set global debt ceiling for benchmark");
