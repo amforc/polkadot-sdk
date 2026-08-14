@@ -150,7 +150,7 @@ fn deposit_auto_activates_matured_pending() {
 #[test]
 fn deposit_in_the_wallet_dead_zone_fails_instead_of_dusting() {
 	build_and_execute(|| {
-		register_branch(DOT, USDX, default_branch_config());
+		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		mint_stable(USDX, 1, 50_000);
 
 		// 45_000 would leave 5_000 < the 10_000 USDX minimum in the wallet.

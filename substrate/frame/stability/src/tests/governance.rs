@@ -44,11 +44,10 @@ fn branch_registration_seeds_pool_rows() {
 }
 
 #[test]
-fn branch_registration_rejects_invalid_default_config() {
+fn branch_registration_rejects_invalid_pool_config() {
 	build_and_execute(|| {
 		let mut bad = default_pool_config();
 		bad.minimum_deposit = 0;
-		DefaultStabilityPoolConfig::set(bad);
 
 		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
 		assert_noop!(
@@ -58,6 +57,7 @@ fn branch_registration_rejects_invalid_default_config() {
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				(Some(default_redemption_config()), bad),
 			),
 			Error::<Test>::InvalidStabilityPoolConfig
 		);
