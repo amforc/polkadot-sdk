@@ -143,9 +143,6 @@ pub mod pallet {
 		/// accepts as its `CreateOrigin`) rather than any single market's admin.
 		type UpdateOrigin: EnsureOriginWithArg<Self::RuntimeOrigin, StableIdOf<Self>>;
 
-		/// Redemption configuration seeded when a market is registered.
-		type DefaultRedemptionConfig: Get<RedemptionConfigOf<Self>>;
-
 		/// Maximum number of vaults a redemption may visit.
 		#[pallet::constant]
 		type MaxRedemptionSteps: Get<u32>;
@@ -257,6 +254,10 @@ pub mod pallet {
 		InsuranceFundWithdrawFailed,
 		/// The supplied redemption config is internally inconsistent.
 		InvalidRedemptionConfig,
+		/// The stablecoin's first market must supply a redemption config.
+		RedemptionConfigRequired,
+		/// Only a stablecoin's first market supplies a redemption config.
+		RedemptionConfigNotExpected,
 	}
 
 	#[pallet::hooks]
@@ -265,12 +266,6 @@ pub mod pallet {
 			// A zero cap makes `effective_step_cap(0)` zero: the walk never
 			// runs and every redeem fails with `NoRedeemableVault`.
 			assert!(T::MaxRedemptionSteps::get() > 0, "`MaxRedemptionSteps` must be > 0");
-			// An invalid default would reject every market registration at
-			// runtime; under permissionless creation that bricks the pallet.
-			assert!(
-				T::DefaultRedemptionConfig::get().is_valid(),
-				"`DefaultRedemptionConfig` must satisfy `RedemptionConfig::is_valid`"
-			);
 		}
 
 		#[cfg(feature = "try-runtime")]
@@ -372,24 +367,50 @@ pub mod pallet {
 		}
 	}
 
-	/// Vaults supplies the authoritative stablecoin market count: the first
-	/// market seeds these stablecoin-wide rows and the last one clears them.
+	/// Whether the market being registered is the one that seeds a stablecoin's
+	/// rows. Vaults' counter includes the market it is announcing, so the first
+	/// one sees exactly one.
+	///
+	/// Every use of "first market" resolves through here, so the rule the
+	/// registration path enforces is the rule a caller builds its payload
+	/// against.
+	pub(crate) const fn is_first_market(stablecoin_markets: u32) -> bool {
+		stablecoin_markets == 1
+	}
+
+	/// The stablecoin's first market seeds these stablecoin-wide rows, and the
+	/// last one to leave clears them.
 	impl<T: Config> pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
+		/// One redemption policy governs every collateral market issuing the
+		/// coin, so only the first market carries it. Later markets must pass
+		/// `None` rather than restate a policy they do not own.
+		type RegistrationConfig = Option<RedemptionConfigOf<T>>;
+
 		fn on_registered(
 			_: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 			stablecoin_markets: u32,
+			config: Self::RegistrationConfig,
 		) -> DispatchResult {
+			// The count includes the market being announced, so it is never zero here.
 			ensure!(stablecoin_markets > 0, DispatchError::Corruption);
-			if stablecoin_markets > 1 {
-				ensure!(RedemptionConfigs::<T>::contains_key(stable_id), DispatchError::Corruption);
-				return Ok(());
+			let first_market = is_first_market(stablecoin_markets);
+			// Vaults' counter decides which market seeds the policy; a stored policy is the
+			// same fact recorded here, so the two disagreeing means one of them is corrupt.
+			ensure!(
+				RedemptionConfigs::<T>::contains_key(stable_id) == !first_market,
+				DispatchError::Corruption
+			);
+			match (first_market, config) {
+				(true, Some(config)) => {
+					ensure!(config.is_valid(), Error::<T>::InvalidRedemptionConfig);
+					RedemptionConfigs::<T>::insert(stable_id, config);
+					Ok(())
+				},
+				(false, None) => Ok(()),
+				(true, None) => Err(Error::<T>::RedemptionConfigRequired.into()),
+				(false, Some(_)) => Err(Error::<T>::RedemptionConfigNotExpected.into()),
 			}
-			ensure!(!RedemptionConfigs::<T>::contains_key(stable_id), DispatchError::Corruption);
-			let config = T::DefaultRedemptionConfig::get();
-			ensure!(config.is_valid(), Error::<T>::InvalidRedemptionConfig);
-			RedemptionConfigs::<T>::insert(stable_id, config);
-			Ok(())
 		}
 
 		fn on_deregistered(
@@ -403,6 +424,11 @@ pub mod pallet {
 				RedemptionStates::<T>::remove(stable_id);
 			}
 			Ok(())
+		}
+
+		#[cfg(feature = "runtime-benchmarks")]
+		fn benchmark_registration_config(stablecoin_markets: u32) -> Self::RegistrationConfig {
+			is_first_market(stablecoin_markets).then(crate::benchmarking::registration_config::<T>)
 		}
 	}
 }
