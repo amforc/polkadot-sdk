@@ -1714,6 +1714,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "asset-hub-westend-pusd-integration-tests"
+version = "1.0.0"
+dependencies = [
+ "emulated-integration-tests-common",
+ "frame-support",
+ "frame-system",
+ "pallet-assets",
+ "pallet-aura",
+ "pallet-balances",
+ "pallet-linked-list",
+ "pallet-redemptions",
+ "pallet-stability",
+ "pallet-timestamp",
+ "pallet-vaults",
+ "parachains-common",
+ "parity-scale-codec",
+ "pusd-primitives",
+ "sp-consensus-slots",
+ "sp-runtime 31.0.1",
+ "staging-xcm",
+ "westend-system-emulated-network",
+]
+
+[[package]]
 name = "asset-hub-westend-runtime"
 version = "0.15.0"
 dependencies = [
@@ -1768,6 +1792,7 @@ dependencies = [
  "pallet-election-provider-multi-block",
  "pallet-fast-unstake",
  "pallet-indices",
+ "pallet-linked-list",
  "pallet-message-queue",
  "pallet-meta-tx",
  "pallet-migrations",
@@ -1784,11 +1809,13 @@ dependencies = [
  "pallet-proxy",
  "pallet-psm",
  "pallet-recovery",
+ "pallet-redemptions",
  "pallet-referenda",
  "pallet-revive",
  "pallet-revive-fixtures",
  "pallet-scheduler",
  "pallet-session",
+ "pallet-stability",
  "pallet-staking",
  "pallet-staking-async",
  "pallet-staking-async-rc-client",
@@ -1801,6 +1828,7 @@ dependencies = [
  "pallet-treasury",
  "pallet-uniques",
  "pallet-utility",
+ "pallet-vaults",
  "pallet-verify-signature",
  "pallet-vesting",
  "pallet-vesting-precompiles",
@@ -1816,6 +1844,7 @@ dependencies = [
  "polkadot-primitives",
  "polkadot-runtime-common",
  "primitive-types 0.13.1",
+ "pusd-primitives",
  "scale-info",
  "serde_json",
  "snowbridge-outbound-queue-primitives",
