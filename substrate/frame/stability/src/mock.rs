@@ -233,17 +233,12 @@ pub type VaultsConsideration = HoldConsideration<
 
 parameter_types! {
 	/// Governance envelope the test default config sits comfortably inside.
-	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds<Balance> =
+	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
 		pallet_vaults::types::BranchConfigBounds {
 			min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
 			min_initial_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 			min_safety_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
-			min_minimum_debt: 100,
-			min_minimum_collateral: 1,
 			max_borrow_rate: FixedU128::from_rational(400u128, 100u128),
-			max_debt_ceiling: 1_000_000_000_000_000,
-			max_ceiling_gap: 1_000_000_000,
-			min_ceiling_ttl: 24 * 3_600 * 1_000,
 		};
 }
 
@@ -307,10 +302,6 @@ pub type StabilityUpdateOrigin = EitherOf<
 	pallet_vaults::EnsureBranchFullAdmin<Test>,
 >;
 
-parameter_types! {
-	pub static DefaultStabilityPoolConfig: StabilityPoolConfig<Balance> = default_pool_config();
-}
-
 /// Account the redemption `FeeHandler` resolves pUSD fees into. Recovery
 /// offsets are fee-free, so it only collects from ordinary redemptions.
 pub const FEE_DEST: AccountId = 888;
@@ -342,17 +333,20 @@ impl Convert<StableId, AccountId> for FeeAccounts {
 
 parameter_types! {
 	pub const FeeDestAccount: AccountId = FEE_DEST;
-	pub static DefaultRedemptionConfig: pallet_redemptions::types::RedemptionConfig<Balance> =
-		pallet_redemptions::types::RedemptionConfig {
-			minimum_redemption_amount: 100,
-			dynamic_fee_decay_period: 6 * 3_600 * 1_000,
-			dynamic_fee_floor: FixedU128::zero(),
-			dynamic_fee_ceiling: FixedU128::one(),
-			base_fee: Permill::from_rational(5u32, 1_000u32),
-			fee_ceiling: Permill::one(),
-			dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
-			final_recovery_bonus_buffer: Permill::from_percent(1),
-		};
+}
+
+/// The redemption payload a stablecoin's first market registers.
+pub fn default_redemption_config() -> pallet_redemptions::types::RedemptionConfig<Balance> {
+	pallet_redemptions::types::RedemptionConfig {
+		minimum_redemption_amount: 100,
+		dynamic_fee_decay_period: 6 * 3_600 * 1_000,
+		dynamic_fee_floor: FixedU128::zero(),
+		dynamic_fee_ceiling: FixedU128::one(),
+		base_fee: Permill::from_rational(5u32, 1_000u32),
+		fee_ceiling: Permill::one(),
+		dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
+		final_recovery_bonus_buffer: Permill::from_percent(1),
+	}
 }
 
 impl pallet_redemptions::Config for Test {
@@ -363,7 +357,6 @@ impl pallet_redemptions::Config for Test {
 	type FeeHandler = ResolveAssetTo<FeeDestAccount, Assets>;
 	type TimeProvider = Timestamp;
 	type UpdateOrigin = EnsureAssetOwner;
-	type DefaultRedemptionConfig = DefaultRedemptionConfig;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
@@ -404,7 +397,6 @@ impl pallet_stability::Config for Test {
 	type CollateralDustHandler = ResolveAssetTo<DustDestAccount, PoolCollateralAssets>;
 	type TimeProvider = Timestamp;
 	type UpdateOrigin = StabilityUpdateOrigin;
-	type DefaultStabilityPoolConfig = DefaultStabilityPoolConfig;
 	type PalletId = StabilityPalletId;
 	type WeightInfo = ();
 }
@@ -459,8 +451,6 @@ pub fn new_test_ext() -> TestState {
 		Timestamp::set_timestamp(1_000);
 		MockPrices::set(alloc::collections::BTreeMap::new());
 		MockOracleAvailable::set(true);
-		// Reset: a prior test on this thread may have replaced the default.
-		DefaultStabilityPoolConfig::set(default_pool_config());
 	});
 	ext
 }
@@ -509,9 +499,40 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
 		redistribution_penalty: Permill::from_percent(5),
-		ceiling_gap: 0,
-		ceiling_ttl: 0,
 	}
+}
+
+/// [`default_branch_config`] rescaled to a pair that does not hold to a unit.
+///
+/// A market's vault floors have to clear its own assets' minimum balances, and
+/// the default's 1-unit floors only do that for the 1-unit assets most tests
+/// use. Everything else is left alone, so a test still reads as the default.
+pub fn branch_config_for(
+	collateral: AssetId,
+	stable: StableId,
+) -> pallet_vaults::BranchConfig<Balance> {
+	use frame::traits::fungibles::Inspect as FungiblesInspect;
+	let stable_minimum = <Assets as FungiblesInspect<AccountId>>::minimum_balance(stable);
+	let collateral_minimum =
+		<PoolCollateralAssets as FungiblesInspect<AccountId>>::minimum_balance(collateral);
+	let config = default_branch_config();
+	pallet_vaults::BranchConfig {
+		minimum_debt: config.minimum_debt.max(stable_minimum),
+		minimum_collateral: config.minimum_collateral.max(collateral_minimum),
+		..config
+	}
+}
+
+/// The `(redemptions, stability)` payload a market on `stable` registers with.
+///
+/// The redemption policy is stablecoin-wide, so only the coin's first market
+/// carries one; the pool is per market, so every market carries one.
+pub fn registration_config(
+	stable: StableId,
+) -> (Option<pallet_redemptions::types::RedemptionConfig<Balance>>, StabilityPoolConfig<Balance>) {
+	let redemption_config = (!pallet_redemptions::RedemptionConfigs::<Test>::contains_key(stable))
+		.then(default_redemption_config);
+	(redemption_config, default_pool_config())
 }
 
 /// Registers the `(collateral, stable)` market at price 1.25$ with a high
@@ -539,9 +560,10 @@ pub fn register_branch(
 		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
 		config,
+		registration_config(stable),
 	)
 	.expect("create_branch ok");
-	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), collateral, 1_000_000_000_000_000)
+	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
 	// No ED pre-fund for the pool sub-account: the registration hook's
 	// provider reference keeps it alive, and pre-funding native balance
@@ -570,6 +592,13 @@ pub fn open_vault(
 		FixedU128::from_rational(5u128, 100u128),
 		pallet_linked_list::Position::endpoints_only(),
 	)
+}
+
+/// Native balance an account holds on hold, where every refundable deposit a
+/// market takes ends up.
+pub fn native_on_hold(who: AccountId) -> Balance {
+	use frame::traits::fungible::InspectHold;
+	<Balances as InspectHold<AccountId>>::total_balance_on_hold(&who)
 }
 
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {

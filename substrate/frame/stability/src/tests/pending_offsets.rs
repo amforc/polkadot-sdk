@@ -228,7 +228,7 @@ fn pending_offset_with_sub_minimum_collateral_gain_steps_aside() {
 		// the collateral slice fails, so nothing of the offset applies.
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
 		let coll = AssetId::WithId(77);
-		register_branch(coll.clone(), PUSD, default_branch_config());
+		register_branch(coll.clone(), PUSD, branch_config_for(coll.clone(), PUSD));
 		mint_stable(PUSD, 1, 200);
 		assert_ok!(deposit(1, coll.clone(), PUSD, 200));
 
@@ -421,7 +421,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 #[test]
 fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 	build_and_execute(|| {
-		register_branch(DOT, USDX, default_branch_config());
+		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		mint_stable(USDX, 1, 60_000);
 		assert_ok!(deposit(1, DOT, USDX, 50_000));
 
