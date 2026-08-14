@@ -67,6 +67,7 @@ fn redemption_config_outlives_all_but_the_last_market_on_the_coin() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			None,
 		));
 
 		// The second market joins the coin's existing fee state untouched.
@@ -91,11 +92,10 @@ fn redemption_config_outlives_all_but_the_last_market_on_the_coin() {
 }
 
 #[test]
-fn branch_registration_rejects_invalid_default_redemption_config() {
+fn branch_registration_rejects_invalid_redemption_config() {
 	build_and_execute(|| {
-		let mut bad = DefaultRedemptionConfig::get();
+		let mut bad = default_redemption_config();
 		bad.minimum_redemption_amount = 0;
-		DefaultRedemptionConfig::set(bad);
 
 		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
 		assert_noop!(
@@ -105,11 +105,48 @@ fn branch_registration_rejects_invalid_default_redemption_config() {
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				Some(bad),
 			),
 			Error::<Test>::InvalidRedemptionConfig
 		);
 		assert!(crate::RedemptionConfigs::<Test>::get(PUSD).is_none());
 		assert!(Vaults::branch_tcr(DOT, PUSD).is_err());
+	});
+}
+
+// The redemption policy is per stablecoin, so exactly one market registers it:
+// the coin's first. Neither omitting it there nor restating it later can pass,
+// or a later market would silently claim a policy it does not own.
+#[test]
+fn only_the_first_market_on_a_coin_carries_the_redemption_config() {
+	build_and_execute(|| {
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::root(),
+				DOT,
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				default_branch_config(),
+				None,
+			),
+			Error::<Test>::RedemptionConfigRequired
+		);
+
+		register_branch(DOT, PUSD, default_branch_config());
+
+		set_price(TOKEN_X, FixedU128::one());
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::root(),
+				TOKEN_X,
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				default_branch_config(),
+				Some(default_redemption_config()),
+			),
+			Error::<Test>::RedemptionConfigNotExpected
+		);
 	});
 }
 
@@ -929,14 +966,9 @@ fn partial_fill_with_zero_market_cancel_debt_pays_no_cover() {
 		// A zero budget selects the partial branch after collateral value floors to zero.
 		mint_stable(PUSD, insurance_account(PUSD), 400);
 		let price = FixedU128::from_rational(1u128, 1_000_000u128);
-		let plan = Redemptions::price_recovery(
-			&PUSD,
-			&snapshot,
-			price,
-			0,
-			&DefaultRedemptionConfig::get(),
-		)
-		.expect("prices");
+		let plan =
+			Redemptions::price_recovery(&PUSD, &snapshot, price, 0, &default_redemption_config())
+				.expect("prices");
 		assert_eq!(plan.debt(), 0);
 		assert_eq!(plan.insurance_cover(), 0, "partial fill must leave the fund untouched");
 		assert_eq!(plan.regime(), RecoveryRegime::InsuranceAdjusted);
@@ -1075,6 +1107,7 @@ fn set_redemption_config_rejects_market_admins() {
 			PUSD,
 			branch_admins(other_admin, other_admin),
 			default_branch_config(),
+			None,
 		));
 		let cfg = crate::RedemptionConfigs::<Test>::get(PUSD).unwrap();
 
@@ -1093,7 +1126,7 @@ fn set_redemption_config_rejects_market_admins() {
 #[test]
 fn set_redemption_config_unregistered_branch_reverts() {
 	build_and_execute(|| {
-		let cfg = DefaultRedemptionConfig::get();
+		let cfg = default_redemption_config();
 		assert_noop!(
 			Redemptions::set_redemption_config(RuntimeOrigin::root(), PUSD, cfg),
 			Error::<Test>::StablecoinNotRegistered
@@ -1664,7 +1697,7 @@ fn split_redemptions_equal_a_single_redemption_without_fees() {
 		build_and_execute(|| {
 			register_branch(DOT, PUSD, default_branch_config());
 			// Zero every fee knob so the mechanic is isolated from fee dynamics.
-			let mut cfg = DefaultRedemptionConfig::get();
+			let mut cfg = default_redemption_config();
 			cfg.dynamic_fee_ceiling = FixedU128::zero();
 			cfg.base_fee = Permill::zero();
 			cfg.fee_ceiling = Permill::zero();
@@ -2082,7 +2115,7 @@ fn zero_fee_redemption_config() -> RedemptionConfig<Balance> {
 		dynamic_fee_ceiling: FixedU128::zero(),
 		base_fee: Permill::zero(),
 		fee_ceiling: Permill::zero(),
-		..DefaultRedemptionConfig::get()
+		..default_redemption_config()
 	}
 }
 

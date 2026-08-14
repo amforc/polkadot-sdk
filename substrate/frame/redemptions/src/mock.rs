@@ -218,17 +218,12 @@ pub type VaultsConsideration = HoldConsideration<
 
 parameter_types! {
 	/// Governance envelope the test default config sits comfortably inside.
-	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds<Balance> =
+	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
 		pallet_vaults::types::BranchConfigBounds {
 			min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
 			min_initial_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 			min_safety_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
-			min_minimum_debt: 100,
-			min_minimum_collateral: 1,
 			max_borrow_rate: FixedU128::from_rational(400u128, 100u128),
-			max_debt_ceiling: 1_000_000_000_000_000,
-			max_ceiling_gap: 1_000_000_000,
-			min_ceiling_ttl: 24 * 3_600 * 1_000,
 		};
 }
 
@@ -318,8 +313,9 @@ parameter_types! {
 /// `CreateOrigin`, which already admits Root as the governance override.
 pub type RedemptionsUpdateOrigin = EnsureAssetOwner;
 
-parameter_types! {
-	pub static DefaultRedemptionConfig: RedemptionConfig<Balance> = RedemptionConfig {
+/// Test fixture for a stablecoin's first-market redemption policy.
+pub fn default_redemption_config() -> RedemptionConfig<Balance> {
+	RedemptionConfig {
 		minimum_redemption_amount: 100,
 		dynamic_fee_decay_period: 6 * 3_600 * 1_000,
 		dynamic_fee_floor: FixedU128::zero(),
@@ -328,7 +324,7 @@ parameter_types! {
 		fee_ceiling: Permill::one(),
 		dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
 		final_recovery_bonus_buffer: Permill::from_percent(1),
-	};
+	}
 }
 
 impl pallet_redemptions::Config for Test {
@@ -339,7 +335,6 @@ impl pallet_redemptions::Config for Test {
 	type FeeHandler = ResolveAssetTo<FeeDestAccount, Assets>;
 	type TimeProvider = Timestamp;
 	type UpdateOrigin = RedemptionsUpdateOrigin;
-	type DefaultRedemptionConfig = DefaultRedemptionConfig;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
@@ -389,7 +384,7 @@ pub const USDX_UNIT: Balance = 1_000_000;
 /// The [`USDX`] minimum balance: 0.01 coin.
 pub const USDX_MIN_BALANCE: Balance = USDX_UNIT / 100;
 
-/// Default per-collateral global debt ceiling for test markets — high enough
+/// Default stablecoin-wide global debt ceiling for test markets — high enough
 /// that the global cap never binds unless a test sets a lower one.
 pub const GLOBAL_CEILING: Balance = 1_000_000_000_000_000;
 
@@ -456,8 +451,6 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
 		redistribution_penalty: Permill::from_percent(5),
-		ceiling_gap: 0,
-		ceiling_ttl: 0,
 	}
 }
 
@@ -466,16 +459,14 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 /// whose 100-raw-unit minimum admits arbitrarily small redemptions.
 pub fn usdx_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	pallet_vaults::BranchConfig {
-		// The largest ceiling the guard envelope admits: 1_000 coins.
-		debt_ceiling: TestBranchConfigBounds::get().max_debt_ceiling,
+		debt_ceiling: 1_000_000_000 * USDX_UNIT,
 		minimum_debt: 200 * USDX_UNIT,
 		..default_branch_config()
 	}
 }
 
 /// Registers the `(collateral, stable)` market at price 1.25$ with a high
-/// global debt ceiling. Creation also seeds the redemptions config through the
-/// `OnBranchLifecycle` hook.
+/// global debt ceiling.
 pub fn register_branch(
 	collateral: AssetId,
 	stable: StableId,
@@ -483,15 +474,18 @@ pub fn register_branch(
 ) {
 	// `create_branch` requires a live price, so set it before creating.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+	let redemption_config =
+		(!crate::RedemptionConfigs::<Test>::contains_key(stable)).then(default_redemption_config);
 	Vaults::create_branch(
 		RuntimeOrigin::root(),
 		collateral.clone(),
 		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
 		config,
+		redemption_config,
 	)
 	.expect("create_branch ok");
-	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), collateral.clone(), GLOBAL_CEILING)
+	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, GLOBAL_CEILING)
 		.expect("set global debt ceiling");
 }
 
