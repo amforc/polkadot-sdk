@@ -35,9 +35,11 @@ mod bag_thresholds;
 pub mod governance;
 #[cfg(not(feature = "runtime-benchmarks"))]
 mod migrations;
+pub mod pusd_config;
 pub mod staking;
 
 use governance::{pallet_custom_origins, GeneralAdmin, StakingAdmin};
+use pusd_config::pallet_mock_oracle;
 
 extern crate alloc;
 
@@ -366,6 +368,13 @@ impl pallet_assets_holder::Config<AssetsHolderInstance> for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 }
 
+// Allow Holds for the `ForeignAssets` pallet.
+pub type ForeignAssetsHolderInstance = pallet_assets_holder::Instance2;
+impl pallet_assets_holder::Config<ForeignAssetsHolderInstance> for Runtime {
+	type RuntimeHoldReason = RuntimeHoldReason;
+	type RuntimeEvent = RuntimeEvent;
+}
+
 parameter_types! {
 	pub const AssetConversionPalletId: PalletId = PalletId(*b"py/ascon");
 	pub LpFee: Permill = Permill::from_rational(3u32, 1_000u32); // 0.3%
@@ -434,6 +443,19 @@ pub type LocalAndForeignAssets = fungibles::UnionOf<
 pub type LocalAndForeignAssetsFreezer = fungibles::UnionOf<
 	AssetsFreezer,
 	ForeignAssetsFreezer,
+	LocalFromLeft<
+		AssetIdForTrustBackedAssetsConvert<TrustBackedAssetsPalletLocation, xcm::v5::Location>,
+		AssetIdForTrustBackedAssets,
+		xcm::v5::Location,
+	>,
+	xcm::v5::Location,
+	AccountId,
+>;
+
+/// Union fungibles implementation for `AssetsHolder` and `ForeignAssetsHolder`.
+pub type LocalAndForeignAssetsHolder = fungibles::UnionOf<
+	AssetsHolder,
+	ForeignAssetsHolder,
 	LocalFromLeft<
 		AssetIdForTrustBackedAssetsConvert<TrustBackedAssetsPalletLocation, xcm::v5::Location>,
 		AssetIdForTrustBackedAssets,
@@ -665,7 +687,7 @@ impl pallet_assets::Config<ForeignAssetsInstance> for Runtime {
 	type MetadataDepositPerByte = ForeignAssetsMetadataDepositPerByte;
 	type ApprovalDeposit = ForeignAssetsApprovalDeposit;
 	type StringLimit = ForeignAssetsAssetsStringLimit;
-	type Holder = ();
+	type Holder = ForeignAssetsHolder;
 	type Freezer = ForeignAssetsFreezer;
 	type Extra = ();
 	type WeightInfo = weights::pallet_assets_foreign::WeightInfo<Runtime>;
@@ -1837,6 +1859,7 @@ construct_runtime!(
 		PoolAssetsFreezer: pallet_assets_freezer::<Instance3> = 59,
 		Revive: pallet_revive = 60,
 		AssetsHolder: pallet_assets_holder::<Instance1> = 66,
+		ForeignAssetsHolder: pallet_assets_holder::<Instance2> = 67,
 
 		AssetRewards: pallet_asset_rewards = 61,
 		AssetsPrecompiles: pallet_assets_precompiles::pallet = 62,
@@ -1875,6 +1898,13 @@ construct_runtime!(
 
 		// Dynamic Allocation Pool / Issuance Buffer
 		Dap: pallet_dap = 100,
+
+		// Generic Stablecoin Framework.
+		MockOracle: pallet_mock_oracle = 101,
+		LinkedList: pallet_linked_list = 102,
+		Vaults: pallet_vaults = 103,
+		Redemptions: pallet_redemptions = 104,
+		Stability: pallet_stability = 105,
 
 		// TODO: the pallet instance should be removed once all pools have migrated
 		// to the new account IDs.
