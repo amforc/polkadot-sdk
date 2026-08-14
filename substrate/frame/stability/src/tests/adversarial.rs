@@ -27,7 +27,7 @@ fn burn_stable(stable: StableId, who: AccountId, amount: Balance) {
 #[test]
 fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 	build_and_execute(|| {
-		register_branch(DOT, USDX, default_branch_config());
+		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		mint_stable(USDX, 1, USDX_MIN_BALANCE);
 		assert_ok!(deposit(1, DOT, USDX, USDX_MIN_BALANCE));
 		advance_time(5_000);

@@ -233,7 +233,7 @@ fn combined_offset_settles_active_then_pending() {
 	build_and_execute(|| {
 		use pusd_primitives::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
 
-		register_branch(DOT, USDX, default_branch_config());
+		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		mint_stable(USDX, 1, 60_000);
 		assert_ok!(deposit(1, DOT, USDX, 60_000));
 		advance_time(5_000);
@@ -378,7 +378,7 @@ fn offset_with_sub_minimum_collateral_gain_steps_aside() {
 		// resolving the first-ever gain into the empty pool account fails.
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
 		let coll = AssetId::WithId(77);
-		register_branch(coll.clone(), PUSD, default_branch_config());
+		register_branch(coll.clone(), PUSD, branch_config_for(coll.clone(), PUSD));
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit(1, coll.clone(), PUSD, 1_000));
 		advance_time(5_000);
@@ -428,7 +428,7 @@ fn compounded_yield_absorbs_offsets() {
 #[test]
 fn offset_rounds_down_at_the_pool_minimum_balance_dead_zone() {
 	build_and_execute(|| {
-		register_branch(DOT, USDX, default_branch_config());
+		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		// One active depositor plus 6_000 raw units of pending deposit, so
 		// the pool balance exceeds the active total by less than the
 		// 10_000-unit USDX minimum.

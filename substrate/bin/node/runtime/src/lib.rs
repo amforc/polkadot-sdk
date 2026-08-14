@@ -3530,18 +3530,6 @@ impl pallet_redemptions::Config for Runtime {
 
 parameter_types! {
 	pub const StabilityPalletId: PalletId = PalletId(*b"py/stabl");
-	pub StabilityDefaultConfig: pallet_stability::types::StabilityPoolConfig<Balance> =
-		pallet_stability::types::StabilityPoolConfig {
-			minimum_deposit: 100_000_000, // 100 pUSD (6 decimals)
-			minimum_active_pool_balance: 100_000_000, // 100 pUSD (6 decimals)
-			entry_delay: 5_000, // 5 seconds
-			safety_withdrawal_delay: 10 * 60 * 1_000, // 10 minutes
-			precision: pallet_stability::types::PoolPrecision {
-				p_min: FixedU128::from_inner(1_000_000_000),
-				scale_factor: 1_000_000_000,
-			},
-			yield_share: Permill::from_percent(75),
-		};
 }
 
 impl pallet_stability::Config for Runtime {
@@ -3556,7 +3544,6 @@ impl pallet_stability::Config for Runtime {
 		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
 		pallet_vaults::EnsureBranchFullAdmin<Runtime>,
 	>;
-	type DefaultStabilityPoolConfig = StabilityDefaultConfig;
 	type PalletId = StabilityPalletId;
 	type WeightInfo = ();
 }

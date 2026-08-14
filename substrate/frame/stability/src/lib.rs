@@ -132,9 +132,6 @@ pub mod pallet {
 			Success = (),
 		>;
 
-		/// Config every newly registered branch starts with.
-		type DefaultStabilityPoolConfig: Get<StabilityPoolConfigOf<Self>>;
-
 		/// Seed for the per-market pool sub-accounts.
 		#[pallet::constant]
 		type PalletId: Get<PalletId>;
@@ -370,15 +367,6 @@ pub mod pallet {
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
-		fn integrity_test() {
-			// An invalid default would reject every market registration at
-			// runtime; under permissionless creation that bricks the pallet.
-			assert!(
-				T::DefaultStabilityPoolConfig::get().is_valid(),
-				"`DefaultStabilityPoolConfig` must satisfy `StabilityPoolConfig::is_valid`"
-			);
-		}
-
 		#[cfg(feature = "try-runtime")]
 		fn try_state(_: BlockNumberFor<T>) -> Result<(), frame::try_runtime::TryRuntimeError> {
 			crate::try_state::do_try_state::<T>()
@@ -595,12 +583,16 @@ pub mod pallet {
 	}
 
 	impl<T: Config> OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
+		/// One pool per `(collateral, stablecoin)` market, so every
+		/// registration carries its own parameters.
+		type RegistrationConfig = StabilityPoolConfigOf<T>;
+
 		fn on_registered(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 			_stablecoin_markets: u32,
+			config: Self::RegistrationConfig,
 		) -> DispatchResult {
-			let config = T::DefaultStabilityPoolConfig::get();
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
 			Pools::<T>::insert(collateral_id, stable_id, StabilityPoolOf::<T>::fresh(config));
 			PoolSumsStore::<T>::insert((collateral_id, stable_id, 0u32, 0u32), PoolSums::default());
@@ -671,6 +663,25 @@ pub mod pallet {
 				let _ = frame_system::Pallet::<T>::dec_providers(&pool_account);
 			}
 			Ok(())
+		}
+
+		/// One-unit thresholds and no delays, so nothing in the pool becomes
+		/// the binding constraint of a benchmark. `p_min * scale_factor` lands
+		/// exactly at one, the tightest rescale [`PoolPrecision::is_valid`]
+		/// accepts.
+		#[cfg(feature = "runtime-benchmarks")]
+		fn benchmark_registration_config(_stablecoin_markets: u32) -> Self::RegistrationConfig {
+			StabilityPoolConfig {
+				minimum_deposit: BalanceOf::<T>::one(),
+				minimum_active_pool_balance: BalanceOf::<T>::one(),
+				entry_delay: 0,
+				safety_withdrawal_delay: 0,
+				precision: crate::types::PoolPrecision {
+					p_min: FixedU128::from_inner(1_000_000_000),
+					scale_factor: 1_000_000_000,
+				},
+				yield_share: Permill::from_percent(75),
+			}
 		}
 	}
 }
