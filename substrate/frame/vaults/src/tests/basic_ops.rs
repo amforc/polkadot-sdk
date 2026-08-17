@@ -113,7 +113,13 @@ fn repay_for_by_third_party_burns_payer_balance_and_updates_owner_vault() {
 		let payer_pre = stable_balance(PUSD, 2);
 		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, PUSD, 1, 100));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(2),
+			DOT,
+			PUSD,
+			1,
+			Some(100)
+		));
 
 		assert_eq!(stable_balance(PUSD, 2), payer_pre - 100);
 		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
@@ -166,7 +172,13 @@ fn repay_for_to_zero_leaves_dormant_husk() {
 			v.debt.interest,
 			frame::traits::tokens::Preservation::Expendable,
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, total));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(total)
+		));
 
 		// Row survives as a zero-debt husk with its collateral still held.
 		let husk = Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk survives");
@@ -246,7 +258,7 @@ fn repay_overpay_burns_only_debt_and_leaves_husk() {
 			DOT,
 			PUSD,
 			1,
-			balance_before
+			Some(balance_before)
 		));
 
 		assert_eq!(stable_balance(PUSD, 1), balance_before - total, "only the debt burned");
@@ -293,7 +305,7 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 			DOT,
 			PUSD,
 			1,
-			balance_before
+			Some(balance_before)
 		));
 
 		assert_eq!(
@@ -333,7 +345,13 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 			total.saturating_sub(stable_balance(PUSD, 1)),
 			frame::traits::tokens::Preservation::Expendable,
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, total));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(total)
+		));
 
 		let husk = Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk survives");
 		assert_eq!(husk.debt.total(), 0);
@@ -344,9 +362,9 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 	});
 }
 
-// Terminal settlement must leave the branch debt-free after all vaults close.
+// A liability-free market has no collateralization ratio to protect.
 #[test]
-fn closing_last_vault_leaves_no_terminal_debt() {
+fn liability_free_husks_close_without_ratio_math() {
 	use frame::traits::fungible::Mutate;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
@@ -366,23 +384,21 @@ fn closing_last_vault_leaves_no_terminal_debt() {
 			DOT,
 			PUSD,
 			2,
-			10_000
+			Some(10_000)
 		));
 		assert_ok!(crate::Pallet::<Test>::repay_for(
 			RuntimeOrigin::signed(1),
 			DOT,
 			PUSD,
 			1,
-			10_000
+			Some(10_000)
 		));
 		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "vault 2 is a husk");
 		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "vault 1 is a husk");
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
 
-		// The last close must not calculate a ratio because the branch has no debt.
-		// A maximal price would overflow its pre-close TCR; settlement bypasses
-		// ratio math entirely and must still complete.
+		// A maximal price proves that both closes bypass ratio math, not only the last close.
 		set_price(DOT, FixedU128::from_inner(u128::MAX));
+		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
 		assert!(Vaults::<Test>::get((DOT, PUSD, 1)).is_none(), "last husk closed");
 
@@ -395,8 +411,11 @@ fn closing_last_vault_leaves_no_terminal_debt() {
 	});
 }
 
+// The payoff is the recorded debt plus the terminal interest charge. A capped repayment quoted
+// before more interest accrues must not settle only the debt and leave the charge unpaid; an
+// uncapped repayment uses the live payoff and cannot become stale.
 #[test]
-fn stale_full_payoff_max_reverts_without_leaving_a_husk() {
+fn stale_payoff_quote_reverts_while_an_uncapped_repay_settles() {
 	use frame::traits::fungible::Mutate;
 	use pusd_primitives::VaultInterface;
 	build_and_execute(|| {
@@ -411,12 +430,26 @@ fn stale_full_payoff_max_reverts_without_leaving_a_husk() {
 		advance_time(1);
 
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, quote.debt,),
-			crate::Error::<Test>::PayoffExceedsMaximum
+			crate::Pallet::<Test>::repay_for(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				1,
+				Some(quote.debt)
+			),
+			crate::Error::<Test>::TerminalChargeUnpaid
 		);
+
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
+		let vault = Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept");
+		assert_eq!(vault.debt.total(), 0);
+		assert_eq!(vault.interest_remainder, 0, "the terminal charge settled the fraction");
+		assert_eq!(stable_balance(PUSD, 1), 600 - quote.debt - 1, "one unit past the stale quote");
 	});
 }
 
+// A full repayment rounds the carried sub-unit interest up to one whole unit: the terminal
+// charge. It settles a rounding remainder, not yield, so it goes only to the fee handler.
 #[test]
 fn uncovered_terminal_charge_bypasses_the_yield_split() {
 	use frame::traits::fungible::Mutate;
@@ -437,7 +470,7 @@ fn uncovered_terminal_charge_bypasses_the_yield_split() {
 			DOT,
 			PUSD,
 			1,
-			quote.debt + 1,
+			Some(quote.debt + 1),
 		));
 
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total(), 0);
@@ -451,16 +484,22 @@ fn uncovered_terminal_charge_bypasses_the_yield_split() {
 	});
 }
 
+// A liability-free close can discard only unowned rounding residue. These forged states verify
+// that issued or attributed interest still prevents removal.
 #[test]
-fn last_vault_close_fails_closed_on_unattributed_liability() {
+fn liability_free_close_fails_closed_on_unattributed_liability() {
 	use frame::traits::fungible::Mutate;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
-		assert_ok!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 1_000,)
-		);
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(1_000),
+		));
 		// Isolate each residue so that each guard has independent coverage.
 
 		// Minted interest prevents branch removal.
@@ -514,9 +553,11 @@ fn redemption_slot_rejects_second_owner() {
 	});
 }
 
-// Settlement order must not change terminal charges, issuance, or branch removability.
+// Each full repayment ceils its own sub-unit interest into a terminal charge, and together they
+// must empty the branch-wide `aggregate_interest_remainder`. Settlement order must not change the
+// charges, the issuance, or market removal.
 #[test]
-fn two_vault_terminal_ceils_drain_the_bucket_in_either_order() {
+fn terminal_charges_empty_the_shared_remainder_in_either_order() {
 	use frame::traits::fungible::Mutate;
 	use pusd_primitives::VaultInterface;
 	let run = |first: u64, second: u64| {
@@ -540,7 +581,7 @@ fn two_vault_terminal_ceils_drain_the_bucket_in_either_order() {
 					DOT,
 					PUSD,
 					owner,
-					Balance::MAX,
+					None,
 				));
 				assert_ok!(crate::Pallet::<Test>::close_vault(
 					RuntimeOrigin::signed(owner),

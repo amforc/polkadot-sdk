@@ -113,7 +113,13 @@ fn repay_emits_repaid() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 200));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(200)
+		));
 		assert_event(crate::Event::Repaid {
 			collateral_id: DOT,
 			stable_id: PUSD,

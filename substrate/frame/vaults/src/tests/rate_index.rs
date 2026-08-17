@@ -54,9 +54,7 @@ fn find_rate_position_returns_valid_neighbors() {
 	});
 }
 
-// Repaying a vault to zero drops it from the rate index (it becomes a Dormant
-// husk, out of the index — no longer auto-closed); a follow-up `close_vault`
-// then removes the row entirely.
+// Repayment keeps the Dormant row outside the rate index so the owner can close it explicitly.
 #[test]
 fn repay_to_zero_drops_vault_from_rate_index() {
 	build_and_execute(|| {
@@ -73,7 +71,13 @@ fn repay_to_zero_drops_vault_from_rate_index() {
 			v.debt.interest,
 			frame::traits::tokens::Preservation::Expendable,
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), DOT, PUSD, 3, total));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(3),
+			DOT,
+			PUSD,
+			3,
+			Some(total)
+		));
 		// The husk is out of the rate index even though its row survives.
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
 			&rate_list(DOT, PUSD),
