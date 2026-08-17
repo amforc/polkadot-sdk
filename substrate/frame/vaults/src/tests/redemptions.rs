@@ -229,10 +229,9 @@ fn redeem_step_rejects_invalid_settlements_without_state_change() {
 	});
 }
 
-// The payment credit is the sole authority on the burn. Withdrawing it from a
-// funded redeemer pins the full
-// settlement chain: the redeemer pays exactly the cancelled debt, total
-// issuance falls by exactly that amount, and the ledger debt falls with it.
+// Stablecoin withdrawn from a funded redeemer becomes the Credit that `redeem_step` consumes.
+// Overall the redeemer pays exactly the cancelled debt, total issuance falls by exactly that
+// amount, and the ledger debt falls with it.
 #[test]
 fn redeem_step_burns_exactly_the_debt_payment() {
 	use frame::traits::{
@@ -420,11 +419,8 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 		assert_ok!(open(3, DOT, PUSD, 200, 200, rate_pct(5, 100)));
 		assert_ok!(redeem(DOT, PUSD, 4, 350)); // leaves acct 1 Dormant with debt
 
-		// Drop the price so acct 3's CR falls below MCR — the vault pallet
-		// refuses liquidation of a vault whose CR is at/above MCR. 1.0 puts
-		// vault 3 (200 collateral, ~200 debt) under the 110% MCR while leaving vaults
-		// 1 and 2 above it.
-		let v_dormant_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let vault_dormant_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		// At 1.0 vault 3 (200 collateral, ~200 debt) sits under MCR while 1 and 2 stay above it.
 		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
 		// Redistribute vault 3's whole debt across the recipients (no offset).
 		let coll_3 = held(DOT, 3);
@@ -435,20 +431,22 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 		}));
 		assert_eq!(
 			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal,
-			v_dormant_pre.debt.principal,
+			vault_dormant_pre.debt.principal,
 			"the allocation stays lazy until this vault is touched",
 		);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
-		let v_dormant_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let vault_dormant_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		// Dormant debt must not remove a vault from redistribution.
-		let gained = v_dormant_post.debt.principal - v_dormant_pre.debt.principal;
+		let gained = vault_dormant_post.debt.principal - vault_dormant_pre.debt.principal;
 		assert_eq!(gained, 98);
 		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 	});
 }
 
+// A debt-free Dormant vault remains eligible for redistribution, but it does not occupy the
+// redemption slot. Redistribution can make it debt-bearing again.
 #[test]
-fn debt_free_dormant_husk_cannot_receive_liquidation_debt() {
+fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
@@ -458,14 +456,23 @@ fn debt_free_dormant_husk_cannot_receive_liquidation_debt() {
 
 		let husk_before = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		assert_eq!(husk_before.debt.total(), 0);
-		assert_eq!(husk_before.redistribution_stake, 0);
+		assert_eq!(husk_before.collateral, 950);
+		assert_eq!(husk_before.redistribution_stake, 950, "a debt-free husk stays eligible");
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
+
 		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
 		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
 
+		// The liquidated vault leaves the recipient set before allocation.
 		let husk_after = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		assert_eq!(husk_after.debt.total(), 0);
-		assert_eq!(husk_after.collateral, husk_before.collateral);
-		assert_eq!(husk_after.redistribution_stake, 0);
+		assert_eq!(husk_after.debt.principal, 97);
+		assert_eq!(husk_after.collateral, 950 + 97);
+		// Snapshot correction does not let new collateral increase this allocation weight.
+		assert_eq!(husk_after.redistribution_stake, 949);
+		// Redistribution does not put a Dormant vault in the redemption slot.
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
 	});
 }
 
@@ -498,13 +505,8 @@ fn dormant_borrow_below_min_debt_reverts() {
 	});
 }
 
-// Reactivation model, and how it interacts with batching. A Dormant vault is
-// revived only by `borrow` crossing MinimumDebt (or `activate_dormant` once
-// accrued debt has) — never by a collateral deposit, which is rejected while
-// Dormant because it cannot revive the vault. So the batch a user submits to
-// "borrow with a collateral top-up" is `[borrow, deposit]`, borrow first: the
-// borrow revives the vault to Active, after which the deposit is accepted. A
-// `[deposit, borrow]` batch would instead fail at the deposit leg and roll back.
+// A collateral deposit cannot reactivate a Dormant vault. A batch must borrow past MinimumDebt
+// before it deposits collateral because each call validates the state left by the prior call.
 #[test]
 fn dormant_revived_by_borrow_then_accepts_deposit() {
 	build_and_execute(|| {

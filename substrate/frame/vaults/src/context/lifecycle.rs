@@ -278,7 +278,7 @@ impl<T: Config> VaultOp<T> {
 
 	/// Recomputes redistribution stake from the latest liquidation snapshot.
 	///
-	/// Final-recovery vaults and debt-free vaults must not receive new liability.
+	/// A debt-free Dormant vault remains eligible because redistribution can give it debt again.
 	pub(super) fn sync_stake(&mut self) -> DispatchResult {
 		let before = self.vault.clone();
 		self.sync_stake_from(before)
@@ -286,7 +286,7 @@ impl<T: Config> VaultOp<T> {
 
 	/// Recomputes stake and replaces the specified accounting contribution.
 	pub(super) fn sync_stake_from(&mut self, before: Vault<BalanceOf<T>>) -> DispatchResult {
-		let target = if self.status.is_final_recovery() || self.vault.debt.total().is_zero() {
+		let target = if self.status.is_final_recovery() {
 			BalanceOf::<T>::zero()
 		} else {
 			self.ctx

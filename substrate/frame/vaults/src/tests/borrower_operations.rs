@@ -24,7 +24,7 @@ fn repay_into_dust_window_reverts() {
 		// borrow=1000, min_debt=200. Repay 850 would leave 150 < 200.
 		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 850),
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(850)),
 			crate::Error::<Test>::DebtWouldBecomeDust
 		);
 	});
@@ -81,7 +81,7 @@ fn zero_amount_repay_is_rejected_without_touching_the_vault() {
 		advance_time(86_400_000);
 
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 0),
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(0)),
 			crate::Error::<Test>::ZeroAmount
 		);
 		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
@@ -138,7 +138,7 @@ fn zero_amount_deposit_is_rejected_without_touching_the_vault() {
 }
 
 #[test]
-fn zero_amount_borrow_is_rejected() {
+fn zero_amount_borrow_is_rejected_without_touching_the_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
@@ -186,7 +186,13 @@ fn repay_for_allowed_in_safety_mode() {
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		let tcr_before = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
 		assert!(tcr_before < rate_pct(130, 100), "setup must leave the branch in Safety mode");
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 2_000));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(2_000)
+		));
 		let tcr_after = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
 		assert!(tcr_after > tcr_before, "repay improves branch TCR even in Safety mode");
 	});

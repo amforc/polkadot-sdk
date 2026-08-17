@@ -95,9 +95,6 @@ fn lifecycle_exact_at_realistic_scale() {
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 		assert_eq!(stable_balance(USDX, 1), 5_000 * USD, "borrowed amount minted at scale");
 
-		// CR = (10^13 × 10^-3) / (5×10^9 + upfront fee) — the human 200% less
-		// the fee's dilution, exactly (recomputed from raw inputs through the
-		// shared primitive, so storage + oracle plumbing is what's pinned).
 		let fee = vault(1).debt.interest;
 		assert!(fee > 0, "upfront fee recorded as interest");
 		let cr = crate::Pallet::<Test>::vault_cr(XBT, USDX, 1).expect("cr");
@@ -124,7 +121,7 @@ fn lifecycle_exact_at_realistic_scale() {
 			XBT,
 			USDX,
 			1,
-			10_000 * USD
+			Some(10_000 * USD)
 		));
 		assert!(crate::Pallet::<Test>::vault_status(XBT, USDX, 1).expect("status").is_dormant());
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), XBT, USDX, None));
@@ -314,8 +311,8 @@ fn liquidation_reverts_on_sub_ed_keeper_leg() {
 	});
 }
 
-// A recipient leg below the collateral's ED to a fresh recipient reverts the
-// step; an ED-sized leg passes.
+// A redemption must either pay the recipient or return the stablecoin, so a collateral leg the
+// recipient cannot receive (sub-ED to a fresh account) reverts the step; an ED-sized leg passes.
 #[test]
 fn redemption_reverts_on_sub_ed_recipient_leg() {
 	build_and_execute(|| {
@@ -353,7 +350,7 @@ fn repay_dusts_sub_ed_payer_remainder() {
 			XBT,
 			USDX,
 			3,
-			10_000 * USD
+			Some(10_000 * USD)
 		));
 		assert_eq!(stable_balance(USDX, 3), 0, "payer reaped, sub-ED remainder gone");
 		assert_eq!(total_stable(USDX), issuance_pre - debt - 5_000, "remainder burned from supply");

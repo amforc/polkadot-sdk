@@ -159,23 +159,31 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Repays debt for a vault from another account.
+	///
+	/// `None` uses the live payoff and pays the terminal interest charge.
 	pub(crate) fn do_repay_for(
 		from: T::AccountId,
 		owner: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
-		amount: BalanceOf<T>,
+		amount: Option<BalanceOf<T>>,
 	) -> DispatchResult {
-		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
+		if let Some(amount) = amount {
+			ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
+		}
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		let debt_before_terminal = op.vault().debt.total();
 		let full_payoff = debt_before_terminal
 			.checked_add(&op.vault().terminal_interest_charge())
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		// The live repayment must not exceed the requested amount or payoff.
-		let repay = amount.min(full_payoff);
+		let repay = amount.map_or(full_payoff, |amount| amount.min(full_payoff));
 		if repay >= debt_before_terminal {
-			ensure!(amount >= full_payoff, Error::<T>::PayoffExceedsMaximum);
+			// Settling the debt without its terminal charge would strand the interest remainder.
+			ensure!(
+				amount.is_none_or(|amount| amount >= full_payoff),
+				Error::<T>::TerminalChargeUnpaid
+			);
 		}
 		T::StableAssets::burn_from(
 			op.stable_id().clone(),

@@ -1,5 +1,5 @@
 use crate::{mock::*, pallet::Vaults, tests::rate_pct, types::BranchConfigUpdate};
-use frame::traits::{fungibles::Mutate as FungiblesMutate, BadOrigin};
+use frame::traits::fungibles::Mutate as FungiblesMutate;
 
 /// Replacement admins used by the reassignment test.
 const NEW_FULL_ADMIN: AccountId = 300;
@@ -15,9 +15,10 @@ fn market_exists(collateral: AssetId, stable: StableId) -> bool {
 /// collateral, so an explicit `close_vault` is needed to empty the market.
 fn repay_to_close(owner: AccountId) {
 	let total = Vaults::<Test>::get((DOT, PUSD, owner)).expect("vault stored").debt.total();
-	<VaultStableAssets as FungiblesMutate<AccountId>>::mint_into(PUSD, &owner, total)
+	// The terminal charge can put the payoff one unit past the recorded debt.
+	<VaultStableAssets as FungiblesMutate<AccountId>>::mint_into(PUSD, &owner, total + 1)
 		.expect("mint repay buffer");
-	assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(owner), DOT, PUSD, owner, total));
+	assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(owner), DOT, PUSD, owner, None));
 	assert_ok!(Pallet::<Test>::close_vault(RuntimeOrigin::signed(owner), DOT, PUSD, None));
 	assert!(Vaults::<Test>::get((DOT, PUSD, owner)).is_none(), "close removed the vault");
 }
@@ -252,8 +253,8 @@ fn inverted_borrow_rate_band_is_rejected_on_every_write() {
 }
 
 // The debt limit is denominated in the market's own stablecoin, so no global
-// envelope can judge it: the creator picks it and the per-collateral global
-// ceiling is what actually caps systemic exposure.
+// envelope can judge it: the creator picks it, while the stablecoin-wide global
+// ceiling caps total exposure across all markets that issue that stablecoin.
 #[test]
 fn create_branch_accepts_any_debt_ceiling() {
 	build_and_execute(|| {
@@ -435,35 +436,43 @@ fn governance_can_freeze_bypassing_admins() {
 	});
 }
 
-// ForceOrigin is not implicitly a branch admin: branch-admin-only parameter
-// updates and unfreezing reject it as a non-signed origin.
+// ForceOrigin acts as a full administrator so governance can recover a market with unavailable
+// administrators. The runtime configuration limits still apply.
 #[test]
-fn force_origin_gets_bad_origin_on_branch_admin_only_calls() {
+fn force_origin_acts_as_full_branch_admin() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
+		assert_ok!(Pallet::<Test>::set_param(
+			RuntimeOrigin::root(),
+			DOT,
+			PUSD,
+			BranchConfigUpdate::MinimumDebt(250)
+		));
+		assert_eq!(branch_config(DOT, PUSD).expect("config").minimum_debt, 250);
+		assert_noop!(
+			Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(9),
+				DOT,
+				PUSD,
+				BranchConfigUpdate::MinimumDebt(300)
+			),
+			Error::<Test>::NotBranchAdmin
+		);
 		assert_noop!(
 			Pallet::<Test>::set_param(
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				BranchConfigUpdate::MinimumDebt(200)
+				BranchConfigUpdate::BorrowRateBounds {
+					min: FixedU128::from_rational(1u128, 1_000u128),
+					max: FixedU128::from_rational(500u128, 100u128),
+				}
 			),
-			BadOrigin
+			Error::<Test>::ConfigOutsideEnvelope(BoundViolation::BorrowRateTooHigh)
 		);
 
-		// The force origin may set the kill switch, but only the branch's full
-		// admin may clear it.
 		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
-		assert_noop!(
-			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, false),
-			BadOrigin
-		);
-		assert_ok!(Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			false
-		));
+		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, false));
 		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }

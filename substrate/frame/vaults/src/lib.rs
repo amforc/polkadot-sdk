@@ -591,11 +591,13 @@ pub mod pallet {
 		///
 		/// Repay less or repay the full debt.
 		DebtWouldBecomeDust,
-		/// The live full payoff, including terminal rounding, exceeds the supplied maximum.
-		PayoffExceedsMaximum,
+		/// The repayment covers the recorded debt but not the terminal interest charge.
+		///
+		/// Repay less, or pass `None` to settle the full payoff.
+		TerminalChargeUnpaid,
 		/// The borrow would exceed the market debt limit.
 		DebtCeilingExceeded,
-		/// The borrow would exceed the global debt limit for this collateral asset.
+		/// The borrow would exceed the global debt limit for this stablecoin.
 		GlobalDebtCeilingExceeded,
 		/// The caller does not have the required market role.
 		NotBranchAdmin,
@@ -1044,9 +1046,9 @@ pub mod pallet {
 		///
 		/// Must be signed by the account paying the stable assets.
 		///
-		/// Any account may repay for a vault owner. The amount must be non-zero and is capped at
-		/// the current debt. A vault in final recovery must leave final recovery before it can be
-		/// repaid.
+		/// Any account may repay for a vault owner. `None` settles the full payoff at execution.
+		/// A `Some` amount must be non-zero and cannot leave only the terminal charge unpaid.
+		/// A vault in final recovery must leave final recovery before repayment.
 		#[pallet::call_index(4)]
 		#[pallet::weight(T::WeightInfo::repay_for())]
 		pub fn repay_for(
@@ -1054,7 +1056,7 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
-			amount: BalanceOf<T>,
+			amount: Option<BalanceOf<T>>,
 		) -> DispatchResult {
 			let from = ensure_signed(origin)?;
 			Self::do_repay_for(from, owner, collateral_id, stable_id, amount)
@@ -1202,10 +1204,10 @@ pub mod pallet {
 		///
 		/// ## Dispatch Origin
 		///
-		/// Must be signed by a market administrator with the required role.
+		/// Requires [`Config::ForceOrigin`] or a market administrator with the required role.
 		///
 		/// Emergency administrators may only reduce risk. The full configuration must remain
-		/// structurally valid and within [`Config::BranchConfigBounds`].
+		/// structurally valid and within [`Config::BranchConfigBounds`] for every origin.
 		#[pallet::call_index(11)]
 		#[pallet::weight(T::WeightInfo::set_param())]
 		pub fn set_param(
@@ -1214,9 +1216,8 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			update: BranchConfigUpdate<BalanceOf<T>>,
 		) -> DispatchResult {
-			let who = ensure_signed(origin)?;
-			let level = Self::ensure_branch_admin(
-				&who,
+			let level = Self::ensure_force_or_branch_admin(
+				origin,
 				&collateral_id,
 				&stable_id,
 				update.required_level(),
@@ -1229,7 +1230,7 @@ pub mod pallet {
 		/// ## Dispatch Origin
 		///
 		/// Freezing requires [`Config::ForceOrigin`] or a market administrator. Unfreezing requires
-		/// the signed full administrator.
+		/// [`Config::ForceOrigin`] or the market's full administrator.
 		///
 		/// The call does nothing if the requested administrative state is already satisfied. Oracle
 		/// freezes are managed by [`Pallet::refresh_branch`].
@@ -1241,17 +1242,9 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			frozen: bool,
 		) -> DispatchResult {
-			if frozen {
-				Self::ensure_force_or_branch_admin(
-					origin,
-					&collateral_id,
-					&stable_id,
-					AdminLevel::Emergency,
-				)?;
-			} else {
-				let who = ensure_signed(origin)?;
-				Self::ensure_branch_admin(&who, &collateral_id, &stable_id, AdminLevel::Full)?;
-			}
+			// An emergency admin may pull the kill switch but not clear it.
+			let required = if frozen { AdminLevel::Emergency } else { AdminLevel::Full };
+			Self::ensure_force_or_branch_admin(origin, &collateral_id, &stable_id, required)?;
 			Self::do_set_governance_frozen(&collateral_id, &stable_id, frozen)
 		}
 

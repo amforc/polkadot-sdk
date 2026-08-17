@@ -295,8 +295,8 @@ pub struct Vault<Balance> {
 	pub last_rate_update: Millis,
 	/// Collateral used as redistribution stake.
 	///
-	/// This is zero during final recovery or while debt-free. After a liquidation,
-	/// snapshot correction prevents touch order from changing later allocations.
+	/// This is zero for a vault in final recovery. Snapshot correction makes later allocations
+	/// independent of touch order.
 	pub redistribution_stake: Balance,
 	/// Redistribution totals applied by the last vault update.
 	pub redistribution_checkpoint: RedistributionAccumulators,
@@ -415,7 +415,7 @@ pub struct BranchConfig<Balance> {
 	pub initial_collateralization_ratio: FixedU128,
 	/// Market ratio below which safety mode begins.
 	pub safety_collateralization_ratio: FixedU128,
-	/// Maximum market debt and upper bound for the automatic debt limit.
+	/// Maximum market debt.
 	pub debt_ceiling: Balance,
 	/// Minimum debt for an active vault.
 	pub minimum_debt: Balance,
@@ -1034,7 +1034,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 			self.stakes.snapshot_total,
 			self.stakes.snapshot_collateral,
 		)?;
-		// Debt-bearing vaults need nonzero stake to receive liability and drain the final residue.
+		// An eligible vault needs nonzero stake to receive liability and drain the final residue.
 		if stake.is_zero() {
 			return Some(Balance::one());
 		}
@@ -1153,12 +1153,10 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 
 	/// Returns whether no vault liability remains.
 	///
-	/// Other debt or collateral may still remain. Use [`Self::is_removable`] before removing the
-	/// market.
+	/// Interest is paid before principal, so a live market cannot have interest without principal.
+	/// Use [`Self::is_removable`] to also check debt-free vaults, collateral, and stake.
 	pub fn is_empty_of_liability(&self) -> bool {
-		self.debt.principal.is_zero() &&
-			self.debt.pending_redistribution_principal.is_zero() &&
-			self.stakes.total.is_zero()
+		self.debt.principal.is_zero() && self.debt.pending_redistribution_principal.is_zero()
 	}
 
 	/// Returns whether the market has no debt, stake, or collateral.
