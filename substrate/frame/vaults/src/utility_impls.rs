@@ -128,7 +128,7 @@ impl<T: Config> Pallet<T> {
 		}
 		vault.redistribution_checkpoint = state.redistribution;
 		vault.last_interest_time = state.interest_time(now);
-		vault.redistribution_stake = if status.is_final_recovery() || vault.debt.total().is_zero() {
+		vault.redistribution_stake = if status.is_final_recovery() {
 			Zero::zero()
 		} else {
 			state.stake_for(vault.collateral).ok_or(Error::<T>::ArithmeticOverflow)?
@@ -499,21 +499,18 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Authorize a call [`Config::ForceOrigin`] may force and a market
-	/// admin of `required` tier may issue: the force origin can always do what a
-	/// market admin can do here. It is checked first; `try_origin`
-	/// hands the origin back on failure, so the admin fallback is lossless.
+	/// Authorizes [`Config::ForceOrigin`] as a full administrator.
+	///
+	/// This authority lets governance recover a market when its administrators are unavailable.
 	pub(crate) fn ensure_force_or_branch_admin(
 		origin: OriginFor<T>,
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		required: AdminLevel,
-	) -> DispatchResult {
-		if let Err(origin) = T::ForceOrigin::try_origin(origin) {
-			let who = ensure_signed(origin)?;
-			Self::ensure_branch_admin(&who, collateral_id, stable_id, required)?;
-		}
-		Ok(())
+	) -> Result<AdminLevel, DispatchError> {
+		let Err(origin) = T::ForceOrigin::try_origin(origin) else { return Ok(AdminLevel::Full) };
+		let who = ensure_signed(origin)?;
+		Self::ensure_branch_admin(&who, collateral_id, stable_id, required)
 	}
 
 	/// Authorize a per-market admin account, returning its [`AdminLevel`].

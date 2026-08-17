@@ -459,7 +459,7 @@ mod benchmarks {
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), amount);
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), Some(amount));
 
 		assert!(Vaults::<T>::contains_key((&asset, &stable::<T>(), &owner)));
 		Ok(())

@@ -825,6 +825,21 @@ pub fn stable_balance(stable: StableId, who: AccountId) -> Balance {
 	<VaultStableAssets as FungiblesInspect<AccountId>>::balance(stable, &who)
 }
 
+/// Mints collateral through the fungible traits: the holder union has no minting side, so the
+/// native and issued halves are addressed directly.
+pub fn mint_collateral(collateral: AssetId, who: AccountId, amount: Balance) {
+	match collateral {
+		NativeOrWithId::Native => {
+			<Balances as fungible::Mutate<AccountId>>::mint_into(&who, amount)
+				.expect("mint native collateral")
+		},
+		NativeOrWithId::WithId(asset) => {
+			<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(asset, &who, amount)
+				.expect("mint issued collateral")
+		},
+	};
+}
+
 /// Mints stable assets for liquidation and repayment tests.
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
 	<VaultStableAssets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(

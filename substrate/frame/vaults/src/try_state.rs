@@ -71,13 +71,16 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			now,
 			&mut owner_collateral,
 		)?;
-		// `dormant_redemption_target`, when set, must point at a Dormant vault.
+		// The slot exposes redemption dust, so a debt-free Dormant vault cannot occupy it.
 		if let Some(owner) = branch.state.dormant_redemption_target.clone() {
-			if !Vaults::<T>::contains_key((collateral_id, stable_id, &owner)) {
+			let Some(vault) = Vaults::<T>::get((collateral_id, stable_id, &owner)) else {
 				return Err("dormant_redemption_target points at missing vault".into());
-			}
+			};
 			if !Pallet::<T>::vault_status_of(collateral_id, stable_id, &owner).is_dormant() {
 				return Err("dormant_redemption_target points at non-Dormant".into());
+			}
+			if vault.debt.total().is_zero() {
+				return Err("dormant_redemption_target points at a debt-free vault".into());
 			}
 		}
 	}
@@ -278,17 +281,12 @@ fn check_branch_identities<T: Config>(
 		if in_rate_index && vault.debt.total().is_zero() {
 			return Err("debt-free vault remains in the rate index".into());
 		}
-		if !in_rate_index &&
-			!vault.debt.total().is_zero() &&
-			state.dormant_redemption_target.as_ref() != Some(&owner)
-		{
-			return Err("debt-bearing Dormant vault is not the redemption target".into());
+		// Redistribution can give debt to Dormant vaults that ordinary redemption cannot target.
+		if !vault.collateral.is_zero() && vault.redistribution_stake.is_zero() {
+			return Err("eligible vault with collateral has zero redistribution stake".into());
 		}
-		if vault.debt.total().is_zero() && !vault.redistribution_stake.is_zero() {
-			return Err("debt-free vault has redistribution stake".into());
-		}
-		if !vault.debt.total().is_zero() && vault.redistribution_stake.is_zero() {
-			return Err("eligible debt-bearing vault has zero redistribution stake".into());
+		if vault.collateral.is_zero() && !vault.redistribution_stake.is_zero() {
+			return Err("collateral-free vault has redistribution stake".into());
 		}
 		sum_stake = sum_stake
 			.checked_add(&vault.redistribution_stake)
@@ -313,7 +311,7 @@ fn check_branch_identities<T: Config>(
 	}
 
 	if state.stakes.total != sum_stake {
-		return Err("total_stakes != Σ debt-bearing vault.redistribution_stake".into());
+		return Err("total_stakes != Σ eligible vault.redistribution_stake".into());
 	}
 	if state.stakes.weighted != sum_weighted_stake {
 		return Err("weighted stakes != exact Σ rate · stake".into());

@@ -127,14 +127,21 @@ fn stablecoin_debt_sums_the_markets_issuing_that_coin() {
 		// The aggregate tracks debt leaving as well as arriving: repaying 1_000
 		// on one PUSD market drops the shared total by exactly that, and leaves
 		// the other coin's total alone.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), ETH, PUSD, 1, 1_000));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			ETH,
+			PUSD,
+			1,
+			Some(1_000)
+		));
 		assert_eq!(StablecoinDebt::<Test>::get(PUSD).outstanding, 4_007);
 		assert_eq!(StablecoinDebt::<Test>::get(EUSD).outstanding, 4_004);
 	});
 }
 
+// The stablecoin debt view must include interest accrued on markets nobody has touched.
 #[test]
-fn stablecoin_debt_projects_interest_across_untouched_markets() {
+fn stablecoin_debt_accrues_interest_across_untouched_markets() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		register_market(ETH, PUSD);
@@ -208,7 +215,13 @@ fn closing_one_market_leaves_shared_collateral_held() {
 		<VaultStableAssets as Mutate<AccountId>>::mint_into(PUSD, &1, 10_000)
 			.expect("mint pUSD to repay");
 		let debt = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total();
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, debt));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(debt)
+		));
 		// Repay-to-zero leaves a husk still holding the PUSD market's collateral;
 		// close it to release only that market's share.
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));

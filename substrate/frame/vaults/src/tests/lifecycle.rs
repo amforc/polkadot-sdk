@@ -11,6 +11,8 @@ use crate::{
 };
 use pallet_linked_list::SortedListInterface;
 
+// Lazy redistribution has constant cost per vault operation, so it does not require a market
+// vault limit. The fixture exceeds the former limit of 64.
 #[test]
 fn open_vault_count_is_not_capped_by_redistribution() {
 	use frame::traits::fungible::Mutate;

@@ -140,7 +140,13 @@ fn safety_mode_allows_repay_then_withdraw() {
 		enter_safety_mode_single_vault();
 		// Repay 3000 pUSD: total debt drops from 5005 to ~2005, TCR rises to
 		// 1000*6.3/2005 ≈ 314%. Branch exits Safety mode.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 3_000));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(3_000)
+		));
 		// Now withdraw 100 DOT — TCR drops to 900*6.3/2005 ≈ 282%, still in
 		// Normal mode and well above Safety threshold.
 		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
@@ -243,7 +249,13 @@ fn safety_mode_blocks_close_with_collateral() {
 		));
 		// Repay to zero at $10 (Normal mode) — allowed, leaves a Dormant husk
 		// still holding its 1000 DOT.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, PUSD, 2, total));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(2),
+			DOT,
+			PUSD,
+			2,
+			Some(total)
+		));
 		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "husk survives the repay");
 		// Now drop the price: releasing the husk's collateral on close would push
 		// post-close TCR below the safety threshold, so the close must revert.
@@ -276,7 +288,13 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 			frame::traits::tokens::Preservation::Expendable,
 		));
 		// Repay to zero — leaves a Dormant husk still holding its 1000 DOT.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, PUSD, 2, total));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(2),
+			DOT,
+			PUSD,
+			2,
+			Some(total)
+		));
 		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "husk survives the repay");
 		// At $6.30 releasing the husk's 1000 DOT would push TCR into Safety, so
 		// the emptying withdraw is blocked exactly like the explicit close.
@@ -321,28 +339,19 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 	});
 }
 
-// A vault whose CR has fallen below ICR (e.g., due to a price drop) cannot
-// borrow until enough collateral is deposited to bring the CR back above ICR.
-// The ICR gate is per-vault and mode-independent — borrowing is only ever
-// allowed down to ICR (see `normal_mode_blocks_borrow_when_cr_below_icr` for the
-// Normal-mode case).
+// The ICR gate protects each vault in both branch modes. A change to another vault can change the
+// branch mode, but it cannot make this vault safe.
 #[test]
-fn safety_mode_blocks_borrow_when_cr_below_icr() {
+fn borrow_below_icr_is_blocked_in_both_modes() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		// Open a healthy whale (acct 1) so acct 2's vault isn't the last on
-		// the branch and so the price drop puts both vaults into Safety mode.
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 100, 200, rate_pct(5, 100)));
-		// Drop price to $2.10: acct 2's CR ≈ 100*2.10/205 ≈ 102.4% — below
-		// MCR 110%, above 100%. Branch TCR also enters Safety mode.
+		// This price puts the vault below ICR and the branch in Safety mode.
 		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
-		// The price drop puts the branch in Safety mode (TCR ≈ 44%, below 130%).
-		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Safety),);
+		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Safety));
 
-		// CR is below ICR, so the per-vault guard fires before the Safety-mode
-		// TCR guard.
-		assert_noop!(
+		let borrow_one = || {
 			crate::Pallet::<Test>::borrow(
 				RuntimeOrigin::signed(2),
 				DOT,
@@ -350,13 +359,23 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 				1,
 				None,
 				None,
-				Position::endpoints_only()
-			),
-			crate::Error::<Test>::UnsafeCollateralizationRatio
-		);
+				Position::endpoints_only(),
+			)
+		};
+		assert_noop!(borrow_one(), crate::Error::<Test>::UnsafeCollateralizationRatio);
 
-		// Top up enough collateral to push acct 2's CR comfortably above
-		// ICR (200 DOT * 2.10 / 205 ≈ 204.9%).
+		// Improve only the branch ratio to isolate the per-vault gate.
+		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			99_000
+		));
+		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Normal));
+		assert_noop!(borrow_one(), crate::Error::<Test>::UnsafeCollateralizationRatio);
+
+		// The same borrow succeeds after this vault clears ICR.
 		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
 			RuntimeOrigin::signed(2),
 			DOT,
@@ -364,53 +383,7 @@ fn safety_mode_blocks_borrow_when_cr_below_icr() {
 			2,
 			100
 		));
-		// The same borrow now clears ICR and reaches the branch-level guard;
-		// increasing debt in Safety mode would worsen TCR.
-		assert_noop!(
-			crate::Pallet::<Test>::borrow(
-				RuntimeOrigin::signed(2),
-				DOT,
-				PUSD,
-				1,
-				None,
-				None,
-				Position::endpoints_only()
-			),
-			crate::Error::<Test>::SafetyModeTcrWorsening
-		);
-	});
-}
-
-// The ICR gate is not a Safety-mode rule: borrowing is only ever allowed down to
-// ICR, in Normal mode too. Here a healthy whale keeps the branch TCR well in
-// Normal mode while acct 2's CR sits below ICR — a small borrow still reverts.
-#[test]
-fn normal_mode_blocks_borrow_when_cr_below_icr() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// A large healthy whale dominates branch TCR, keeping it in Normal mode.
-		assert_ok!(open(1, DOT, PUSD, 100_000, 5_000, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 100, 200, rate_pct(5, 100)));
-		// Drop price to $2.10: acct 2's CR ≈ 102% (below ICR 120%), but branch
-		// TCR ≈ 100_100*2.10/5205 ≈ 4038% stays firmly in Normal mode.
-		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
-		assert_eq!(
-			branch_mode(DOT, PUSD),
-			Some(BranchMode::Normal),
-			"whale keeps the branch in Normal mode"
-		);
-		assert_noop!(
-			crate::Pallet::<Test>::borrow(
-				RuntimeOrigin::signed(2),
-				DOT,
-				PUSD,
-				1,
-				None,
-				None,
-				Position::endpoints_only()
-			),
-			crate::Error::<Test>::UnsafeCollateralizationRatio
-		);
+		assert_ok!(borrow_one());
 	});
 }
 

@@ -266,7 +266,13 @@ fn collateral_or_debt_adjust_does_not_reorder_dll() {
 			None,
 			Position::endpoints_only()
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(3), DOT, PUSD, 3, 50));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(3),
+			DOT,
+			PUSD,
+			3,
+			Some(50)
+		));
 		let order_after = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
 		assert_eq!(order_before, order_after);
 	});
@@ -456,7 +462,13 @@ fn repay_full_state_changes() {
 		top_up_pusd(1, 2, v_pre.debt.interest + 500);
 
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 500));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(500)
+		));
 		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
@@ -526,7 +538,13 @@ fn poke_after_full_repayment_pokes_dormant_husk() {
 		let v = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
 		let total = v.debt.principal + v.debt.interest;
 		top_up_pusd(1, 2, v.debt.interest);
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, total));
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(total)
+		));
 		// The husk survives as a Dormant zero-debt row and remains pokeable.
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(3), DOT, PUSD, 1));
@@ -631,7 +649,8 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 	});
 }
 
-// A later permissionless touch must not reduce an assigned redistribution share.
+// A delayed touch must not change an assigned redistribution share. Interest starts at the
+// liquidation time and uses the recipient's rate.
 #[test]
 fn liquidation_assigns_redistribution_before_later_poke() {
 	build_and_execute(|| {
@@ -640,18 +659,23 @@ fn liquidation_assigns_redistribution_before_later_poke() {
 		assert_ok!(open(3, DOT, PUSD, 1_000, 2_000, rate_pct(25, 100)));
 		set_price(DOT, FixedU128::from_rational(15u128, 10u128));
 
-		let v_a_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		let entire_a_pre = v_a_pre.debt.principal + v_a_pre.debt.interest;
+		let vault_a_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		assert_eq!(vault_a_pre.debt.principal, 2_000);
 
-		assert_ok!(liquidate(DOT, PUSD, 3));
+		let redistributed = redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)).expect("liquidated");
+		assert_eq!(redistributed, 2_010);
 
+		advance_time(pusd_primitives::MILLIS_PER_YEAR);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
-		let v_a_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		let entire_a_post = v_a_post.debt.principal + v_a_post.debt.interest;
-		assert!(
-			entire_a_post >= entire_a_pre,
-			"A's debt should not decrease across a liquidation cycle"
-		);
+
+		let vault_a_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		// A sole recipient receives the complete pending amount.
+		assert_eq!(vault_a_post.debt.principal, vault_a_pre.debt.principal + redistributed);
+		assert_eq!(vault_a_post.collateral, vault_a_pre.collateral + 1_000);
+		assert_eq!(vault_a_post.debt.interest, 1_012);
+		let state = branch_state(DOT, PUSD).unwrap();
+		assert_eq!(state.debt.pending_redistribution_principal, 0);
+		assert_eq!(state.pending_redistribution_collateral, 0);
 	});
 }
 
