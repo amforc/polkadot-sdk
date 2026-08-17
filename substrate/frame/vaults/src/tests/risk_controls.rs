@@ -103,7 +103,7 @@ fn repaying_frees_global_ceiling_headroom() {
 
 		// Repay most of owner 1's debt, dropping the collateral debt well below the cap.
 		<VaultStableAssets as Mutate<AccountId>>::mint_into(PUSD, &1, 10_000).unwrap();
-		assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 1_500));
+		assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(1_500)));
 
 		// The freed headroom now admits the previously-rejected borrow.
 		assert_ok!(open(2, DOT, PUSD, 100_000, 1_000, rate_pct(5, 100)));
@@ -213,7 +213,7 @@ fn stablecoin_debt_aggregate_tracks_every_write() {
 		assert_ok!(Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
 		assert_aggregate_matches(PUSD);
 
-		assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 500));
+		assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(500)));
 		assert_aggregate_matches(PUSD);
 
 		assert_ok!(redeem_from(DOT, PUSD, 1, 9, 300));

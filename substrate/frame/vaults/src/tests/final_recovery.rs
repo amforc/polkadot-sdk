@@ -59,6 +59,43 @@ fn enter_final_recovery_rejects_non_last_eligible_vault() {
 	});
 }
 
+// A debt-free Dormant vault remains a redistribution recipient. Thus, another vault is not the
+// last eligible recipient and cannot enter final recovery.
+#[test]
+fn debt_free_husk_keeps_the_branch_out_of_final_recovery() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		// The lower rate makes account 1 the first redemption target.
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(redeem(DOT, PUSD, 4, 501));
+		let husk_before = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk");
+		assert_eq!(husk_before.debt.total(), 0);
+		assert_eq!(husk_before.collateral, 950);
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+
+		set_price(DOT, FixedU128::from_rational(1u128, 2u128));
+		assert_noop!(
+			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(99), DOT, PUSD, 2),
+			crate::Error::<Test>::NotLastEligibleVault
+		);
+
+		assert_ok!(redistribute_for_test(DOT, PUSD, 2, held(DOT, 2)));
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+
+		// The sole recipient must drain both pending pools.
+		let husk = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept");
+		assert_eq!(husk.debt.principal, 501);
+		assert_eq!(husk.collateral, 950 + 1_000);
+		let state = branch_state(DOT, PUSD).expect("state");
+		assert_eq!(state.debt.pending_redistribution_principal, 0);
+		assert_eq!(state.pending_redistribution_collateral, 0);
+		// Redistribution does not reactivate a Dormant vault.
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+	});
+}
+
 #[test]
 fn enter_final_recovery_rejects_vault_above_mcr() {
 	build_and_execute(|| {
@@ -180,6 +217,8 @@ fn frozen_branch_rejects_exit_final_recovery() {
 	});
 }
 
+// Final recovery is the only status that suspends redistribution eligibility. Full settlement
+// returns the residual collateral to the recipient set as a Dormant vault.
 #[test]
 fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 	build_and_execute(|| {
@@ -192,7 +231,6 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 			.debt
 			.total();
 
-		// A debt-free Dormant vault must leave the FIFO and stop receiving liability.
 		assert_ok!(redeem_from(DOT, PUSD, 1, 7, full));
 
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultStatusChanged {
@@ -206,9 +244,12 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
 		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
 		assert_eq!(vault.debt.total(), 0);
-		assert_eq!(vault.redistribution_stake, 0);
+		assert_eq!(vault.collateral, 950);
+		assert_eq!(held(DOT, 1), 950, "the residual stays held until the owner closes the husk");
+		assert_eq!(vault.redistribution_stake, 950);
 		let state = branch_state(DOT, PUSD).expect("state");
-		assert_eq!(state.stakes.total, 0);
+		assert_eq!(state.stakes.total, 950);
+		assert_eq!(state.debt.minted_interest, 0);
 	});
 }
 
@@ -231,7 +272,7 @@ fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, 100),
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(100)),
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
@@ -388,9 +429,8 @@ fn final_recovery_rescue_deposit_then_exit() {
 	});
 }
 
-// Redemption targeting is tiered with a cutoff, not concatenated.
-// While the FinalRecovery FIFO is non-empty, only its head is exposed — even
-// with a dormant target and rate-index vaults present behind it.
+// The final-recovery FIFO blocks the Dormant target and the rate index. The fixture creates the
+// Dormant target through the FIFO to preserve the normal lifecycle.
 #[test]
 fn redemption_queue_gates_on_final_recovery() {
 	build_and_execute(|| {
@@ -398,22 +438,24 @@ fn redemption_queue_gates_on_final_recovery() {
 
 		enter_recovery(1, rate_pct(1, 100));
 		enter_recovery(2, rate_pct(2, 100));
+		enter_recovery(3, rate_pct(3, 100));
 
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_eq!(redeem(DOT, PUSD, 10, 350).expect("redeemed"), 1);
+		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
+			RuntimeOrigin::signed(99),
+			DOT,
+			PUSD,
+			1,
+			Position::endpoints_only()
+		));
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
+
 		assert_ok!(open(4, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		assert_ok!(open(5, DOT, PUSD, 1_000, 500, rate_pct(3, 100)));
+		assert_ok!(open(5, DOT, PUSD, 1_000, 500, rate_pct(4, 100)));
 
-		// `redeem_from` targets vault 3 explicitly, bypassing the normal
-		// FR-first targeting (which would pick head 1) — a deliberate workaround
-		// to manufacture a Dormant vault sitting *behind* the FR FIFO, so the
-		// gating assertion below is meaningful.
-		assert_ok!(redeem_from(DOT, PUSD, 3, 10, 350));
-		assert!(vault_status(DOT, PUSD, 3).is_dormant());
-
-		// Only the FinalRecovery head (1), regardless of `n`; the dormant target
-		// (3) and rate-index tail (4, 5) stay gated behind it.
-		assert_eq!(crate::Pallet::<Test>::redemption_queue(DOT, PUSD, 10), alloc::vec![1]);
+		assert_eq!(crate::Pallet::<Test>::redemption_queue(DOT, PUSD, 10), alloc::vec![2]);
 	});
 }
 
@@ -452,35 +494,5 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 		let p2 = <LinkedList as SortedListInterface<VaultList, AccountId>>::priority(&list, &2)
 			.expect("member");
 		assert!(p1 > p2, "re-entered vault must carry a strictly greater priority");
-	});
-}
-
-// Full recovery settlement must leave a debt-free Dormant vault outside the FIFO.
-#[test]
-fn full_recovery_settlement_leaves_debt_free_dormant_husk() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
-
-		let snapshot =
-			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
-		assert_eq!(snapshot.collateral, 1_000, "entered recovery untouched");
-		// Pay the full debt in one settlement (upstream this is the redeemer's
-		// market payment merged with the Insurance Fund cover); the recipient
-		// takes all but a dust remainder of the collateral.
-		let dust = 3;
-		let payoff = snapshot.debt + snapshot.terminal_interest_charge;
-		assert_ok!(redeem_step(DOT, PUSD, 1, 7, payoff, snapshot.collateral - dust));
-
-		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept");
-		assert_eq!(vault.debt.total(), 0);
-		assert_eq!(vault.collateral, dust);
-		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(
-			crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10),
-			alloc::vec![] as alloc::vec::Vec<AccountId>
-		);
-		assert_eq!(held(DOT, 1), dust, "dust stays held until the owner closes the husk");
-		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.minted_interest, 0);
 	});
 }
