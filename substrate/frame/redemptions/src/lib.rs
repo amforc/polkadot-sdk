@@ -30,7 +30,7 @@ pub mod weights;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
 
-#[cfg(feature = "try-runtime")]
+#[cfg(any(feature = "try-runtime", test))]
 mod try_state;
 
 #[cfg(test)]
@@ -238,7 +238,7 @@ pub mod pallet {
 
 	#[pallet::error]
 	pub enum Error<T> {
-		/// `max_stable_in` is below the branch `minimum_redemption_amount`.
+		/// `max_stable_to_spend` cannot buy the branch `minimum_redemption_amount` of debt.
 		BelowMinimumRedemptionAmount,
 		/// No redeemable vault made any progress.
 		NoRedeemableVault,
@@ -276,56 +276,46 @@ pub mod pallet {
 
 	#[pallet::view_functions]
 	impl<T: Config> Pallet<T> {
-		/// Quotes the market-side result of cancelling up to `max_stable_in` of debt.
+		/// Quotes the market-side result of spending up to `max_stable_to_spend`.
 		///
-		/// `max_stable_in` and the fee have the same meaning as in
-		/// [`Pallet::redeem`]: [`RedemptionQuote::debt_cancelled`] is the
-		/// requested debt dimension, while [`RedemptionQuote::stable_in`]
-		/// adds the fee that much redemption would raise the rate to.
+		/// `max_stable_to_spend` and `max_steps` mean the same as in [`Pallet::redeem`]. The
+		/// quote projects pending vault updates without applying them and ignores the
+		/// redeemer's balance, so an account that cannot cover [`RedemptionQuote::stable_in`]
+		/// while keeping its minimum balance fills less. Use `min_collateral_out` on execution
+		/// to guard against state changes after the quote.
 		///
-		/// `max_steps` has the same meaning as in [`Pallet::redeem`]: zero uses
-		/// [`Config::MaxRedemptionSteps`]. The quote projects pending vault
-		/// updates without applying them and does not inspect a redeemer's
-		/// wallet, so execution against a wallet that cannot cover
-		/// `stable_in` fills less. Use `min_collateral_out` on execution to
-		/// protect against state changes after the quote.
-		///
-		/// Validation, oracle, and vault-projection failures are returned to the
-		/// caller. An empty or blocked queue returns [`Error::NoRedeemableVault`].
+		/// Validation, oracle, and vault-projection failures are returned to the caller. An
+		/// empty or blocked queue returns [`Error::NoRedeemableVault`].
 		pub fn preview_redeem(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			max_stable_in: BalanceOf<T>,
+			max_stable_to_spend: BalanceOf<T>,
 			max_steps: u32,
 		) -> Result<RedemptionQuoteOf<T>, DispatchError> {
-			Self::quote_redeem(&collateral_id, &stable_id, max_stable_in, max_steps)
+			Self::quote_redeem(&collateral_id, &stable_id, max_stable_to_spend, max_steps)
 		}
 	}
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// Cancels up to `terms.max_stable_in` of vault debt, paying the redeemer collateral for
-		/// it.
+		/// Cancels vault debt and pays collateral to `recipient`.
 		///
 		/// ## Dispatch Origin
 		///
 		/// Must be signed by the redeemer.
 		///
-		/// `terms.max_stable_in` is the debt the redeemer is willing to cancel, **not** its total
-		/// spend: the redemption fee is charged on top, so the redeemer needs
-		/// `terms.max_stable_in` plus the fee and the walk is bounded by what its balance covers at
-		/// both.
+		/// `terms.max_stable_to_spend` caps the total cost, fee included; the walk cancels the
+		/// most debt whose sum with its fee fits it, and never more than the redeemer can pay
+		/// while staying at or above the stablecoin's minimum balance. The fee is the integral
+		/// of the fee rate over the cancelled debt (see [`RedemptionConfig`]).
 		///
-		/// The fee is charged once for the whole redemption, at the rate this redemption itself
-		/// raises the dynamic accelerator to — a large redemption after a quiet period pays the
-		/// rate it causes, not the decayed one it arrived at.
+		/// `terms.min_collateral_out` is the slippage floor for the full budget, scaled pro rata
+		/// on a partial fill. A fee rise between quote and execution can fail it like a price
+		/// move.
 		///
-		/// Redemption targets are visited from the cheapest borrow rate upward. `max_steps` caps
-		/// how many vaults the walk may touch; zero uses [`Config::MaxRedemptionSteps`]. Weight is
-		/// charged for the cap and refunded to the number of steps actually taken.
-		///
-		/// `terms.min_collateral_out` is the redeemer's slippage floor. Partial fills scale it
-		/// pro-rata to the debt actually cancelled.
+		/// Targets are visited from the cheapest borrow rate upward. `max_steps` caps the vaults
+		/// touched; zero uses [`Config::MaxRedemptionSteps`]. Weight is charged for the cap and
+		/// refunded to the steps taken.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps)))]
 		pub fn redeem(

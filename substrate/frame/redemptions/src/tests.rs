@@ -17,6 +17,27 @@ fn rate_pct(num: u128, denom: u128) -> FixedU128 {
 	FixedU128::from_rational(num, denom)
 }
 
+/// Builds the ordinary-redemption fee curve for the default test policy.
+///
+/// The curve starts at `decayed` and uses stablecoin debt of `debt`.
+fn fee_curve(decayed: FixedU128, debt: Balance) -> crate::fees::DynamicFeeCurve {
+	let config = default_redemption_config();
+	crate::fees::DynamicFeeCurve::try_new(decayed, debt, &config).expect("test debt fits u128")
+}
+
+/// Calculates the stable amount that buys exactly `debt` of PUSD at the current time.
+///
+/// The amount includes the debt and its fee. The calculation uses the stored policy, decayed
+/// dynamic fee, and current debt that an ordinary redemption reads.
+fn spend_for_debt(debt: Balance) -> Balance {
+	let config = crate::RedemptionConfigs::<Test>::get(PUSD).expect("PUSD is registered");
+	let decayed =
+		crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee_at(Timestamp::get(), &config);
+	let curve = crate::fees::DynamicFeeCurve::try_new(decayed, stablecoin_debt(PUSD), &config)
+		.expect("test debt fits u128");
+	debt + curve.fee::<Balance>(debt)
+}
+
 /// Branch TCR as the vault pallet reports it, including pending interest.
 fn branch_tcr(collateral: AssetId, stable: StableId) -> FixedU128 {
 	Vaults::branch_tcr(collateral, stable).expect("branch registered")
@@ -216,13 +237,18 @@ fn ordinary_redemption_hits_lowest_rate_vault_and_settles_every_dimension() {
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 		let issuance_before = Assets::total_supply(PUSD);
 
-		// 201 is debt to cancel, with the fee on top. Both vaults owe 501 (500
-		// plus a 1-unit 7-day upfront fee), so the coin carries 1_002 and this
-		// redemption is 201/1_002 = 20.06% of it: the accelerator rises to half
-		// that, 10.03%, and the redemption pays the rate it caused —
-		// 10.03% + 0.5% = 10.53%, so ceil(201 * 0.105299) = 22 fee. Collateral
-		// is floor(201/1.25) = 160.
-		assert_ok!(redeem(3, DOT, PUSD, 201, 0, 4, 0));
+		// The full cost of 213 includes the fee and buys 201 debt. Each vault owes 501, which
+		// includes a one-unit seven-day upfront fee.
+		//
+		// The stablecoin debt is 1_002, and 201 is 20.06% of it. The dynamic fee increases by
+		// half of that share, to 10.03%.
+		//
+		// The redemption pays the 5.01% mean and the 0.5% base fee. Thus, the fee is
+		// `ceil(201 * 0.055150) = 12`, and the total cost is 213.
+		//
+		// An amount of 202 cannot buy the same debt with its fee. The collateral output is
+		// `floor(201 / 1.25) = 160`.
+		assert_ok!(redeem(3, DOT, PUSD, 213, 0, 4, 0));
 
 		// The lowest-rate vault absorbs the whole fill, in debt and in held
 		// collateral; the higher-rate vault is untouched in both.
@@ -232,9 +258,9 @@ fn ordinary_redemption_hits_lowest_rate_vault_and_settles_every_dimension() {
 		assert_eq!(held(DOT, 2), v2_held_before);
 		// Money movement across every dimension: the redeemer pays the debt it
 		// cancelled plus the fee, which is charged on top rather than out of it.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 223);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 213);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 160);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 22);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 12);
 		// Fees are transferred, so issuance must only fall by cancelled debt.
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), 201);
 		// The event reports exactly the figures it settled.
@@ -245,7 +271,7 @@ fn ordinary_redemption_hits_lowest_rate_vault_and_settles_every_dimension() {
 			recipient: 4,
 			stable_burned: 201,
 			collateral_out: 160,
-			fee: 22,
+			fee: 12,
 			steps: 1,
 		}));
 	});
@@ -264,15 +290,19 @@ fn redemption_partially_fills_to_budget() {
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 		let issuance_before = Assets::total_supply(PUSD);
 
-		// The sole vault owes 5_005, so cancelling 1_005 leaves debt to spare.
-		// 1_005/5_005 = 20.08% of the coin raises the accelerator to 10.04%,
-		// and the redemption pays 10.04% + 0.5%: ceil(1_005 * 0.105400) = 106.
-		assert_ok!(redeem(3, DOT, PUSD, 1_005, 0, 4, 0));
+		// The vault owes 5_005, so a spend of 1_061 leaves debt. It buys 1_005 debt, which is
+		// 20.08% of the stablecoin debt.
+		//
+		// The dynamic fee increases by half of that share, to 10.04%. The redemption pays the
+		// 5.02% mean and the 0.5% base fee.
+		//
+		// Thus, the fee is `ceil(1_005 * 0.055200) = 56`, and the total cost is 1_061.
+		assert_ok!(redeem(3, DOT, PUSD, 1_061, 0, 4, 0));
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before - 1_005);
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 1_111);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 1_061);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 804);
 		assert_eq!(held_before - held(DOT, 1), 804);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 106);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 56);
 		// Fees are routed, so issuance falls only by the cancelled debt.
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), 1_005);
 	});
@@ -293,7 +323,7 @@ fn caller_max_steps_caps_the_loop() {
 	});
 }
 
-fn quoted_walk(step_cap: u32, budget: Balance) -> RedemptionQuote<Balance> {
+fn preview_walk(step_cap: u32, budget: Balance) -> RedemptionQuote<Balance> {
 	Redemptions::preview_redeem(DOT, PUSD, budget, step_cap).expect("quote")
 }
 
@@ -302,16 +332,18 @@ fn walk_reports_only_cap_exhaustion_as_truncated() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		// Vault 2 has a much higher collateral ratio than vault 1. Thus, a price can put vault 1
+		// below par while vault 2 stays eligible for redemption.
+		assert_ok!(open(2, DOT, PUSD, 10_000, 500, rate_pct(2, 100)));
 
 		// A one-step cap with budget and a second target to spare: only the
 		// cap guard reports truncation.
-		let capped = quoted_walk(1, 100_000);
+		let capped = preview_walk(1, 100_000);
 		assert_eq!(capped.steps, 1);
 		assert!(capped.truncated, "the cap guard ended the walk");
 
 		// Budget exhaustion inside the cap is a complete walk, not truncation.
-		let filled = quoted_walk(20, 200);
+		let filled = preview_walk(20, 200);
 		assert_eq!(filled.steps, 1);
 		assert!(!filled.truncated);
 
@@ -320,11 +352,32 @@ fn walk_reports_only_cap_exhaustion_as_truncated() {
 		mint_stable(PUSD, 3, 1_000);
 		assert_ok!(redeem(3, DOT, PUSD, 360, 0, 4, 0));
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
-		set_price(DOT, FixedU128::from_rational(1, 10));
+		set_price(DOT, FixedU128::from_rational(15, 100));
+		assert!(
+			collateralization_ratio(
+				&DebtCollateral { debt: vault_debt(DOT, PUSD, 2), collateral: held(DOT, 2) },
+				FixedU128::from_rational(15, 100),
+			)
+			.expect("finite CR") >
+				FixedU128::one(),
+			"fixture must keep vault 2 redeemable behind the barrier"
+		);
 		assert_noop!(
 			Redemptions::preview_redeem(DOT, PUSD, 100_000, 20),
 			Error::<Test>::NoRedeemableVault
 		);
+
+		// The barrier does not permanently block the queue. Liquidation removes the underwater husk
+		// from the priority position.
+		//
+		// The walk then reaches the healthy vault behind it and can redeem its debt after
+		// redistribution.
+		liquidate_redistribute_all(1);
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none(), "husk gone");
+		let unblocked = preview_walk(20, 100_000);
+		assert_eq!(unblocked.steps, 1);
+		assert!(!unblocked.truncated);
+		assert_eq!(unblocked.debt_cancelled, projected_full_debt(2));
 	});
 }
 
@@ -364,11 +417,15 @@ fn underwater_ordinary_vault_is_skipped() {
 		let recipient_before = collateral_balance(DOT, 4);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 
-		// Both vaults owe 241, so the coin carries 482 and cancelling 100 of it
-		// is 20.75%: the accelerator rises to 10.37% and the redemption pays
-		// 10.37% + 0.5%, ceil(100 * 0.108734) = 11. The whole 100 lands on
-		// vault 2, paying floor(100/0.9) = 111 collateral.
-		assert_ok!(redeem(3, DOT, PUSD, 100, 0, 4, 0));
+		// Each vault owes 241, so the stablecoin debt is 482. A spend of 106 buys 100 debt, which
+		// is 20.75% of this total.
+		//
+		// The dynamic fee increases by half of that share, to 10.37%. The redemption pays the
+		// 5.19% mean and the 0.5% base fee.
+		//
+		// Thus, the fee is `ceil(100 * 0.056867) = 6`, and the total cost is 106. Vault 2 supplies
+		// `floor(100 / 0.9) = 111` collateral.
+		assert_ok!(redeem(3, DOT, PUSD, 106, 0, 4, 0));
 		// The skipped underwater vault keeps its debt and its held collateral.
 		assert_eq!(vault_debt(DOT, PUSD, 1), v1_before);
 		assert_eq!(held(DOT, 1), v1_held_before);
@@ -376,7 +433,7 @@ fn underwater_ordinary_vault_is_skipped() {
 		assert_eq!(v2_before - vault_debt(DOT, PUSD, 2), 100);
 		assert_eq!(v2_held_before - held(DOT, 2), 111);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 111);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 11);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 6);
 	});
 }
 
@@ -437,9 +494,11 @@ fn slippage_bound_reverts_without_state_change() {
 		let held_before = held(DOT, 1);
 		let issuance_before = Assets::total_supply(PUSD);
 
-		// 201 pUSD would cancel 200 debt for only floor(200/1.25) = 160 collateral,
-		// below the 161 floor, so the whole redemption reverts with no side effects.
-		assert_noop!(redeem(3, DOT, PUSD, 201, 161, 4, 0), Error::<Test>::SlippageExceeded);
+		// An amount of 221 pUSD buys 200 debt and pays its fee of 21. It receives
+		// `floor(200 / 1.25) = 160` collateral, below the floor of 161.
+		//
+		// Thus, the full redemption reverts without side effects.
+		assert_noop!(redeem(3, DOT, PUSD, 221, 161, 4, 0), Error::<Test>::SlippageExceeded);
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
 		assert_eq!(Assets::balance(PUSD, 3), redeemer_before);
 		assert_eq!(collateral_balance(DOT, 4), recipient_before);
@@ -448,9 +507,10 @@ fn slippage_bound_reverts_without_state_change() {
 	});
 }
 
-/// A partial fill scales the caller's slippage floor pro-rata to the pUSD
-/// actually spent, so a floor quoted for the full budget
-/// cannot spuriously revert a smaller fill.
+/// Verifies that a partial fill scales the caller's slippage floor pro rata.
+///
+/// The scale uses the pUSD amount spent. Thus, a floor for the full budget does not incorrectly
+/// reject a smaller fill.
 #[test]
 fn slippage_floor_scales_to_partial_fill() {
 	build_and_execute(|| {
@@ -458,17 +518,61 @@ fn slippage_floor_scales_to_partial_fill() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		mint_stable(PUSD, 3, 1_000_000);
 
-		// The sole vault owes 501 (500 + the 1-unit 7-day upfront fee) and the
-		// request to cancel 1_000 over-covers it: the fill cancels all 501 and
-		// pays floor(501/1.25) = 400 collateral. Only 501 of the 1_000 asked for
-		// was cancelled, so the floor scales to floor(min · 501/1_000): 801
-		// scales to 401 > 400 (reverts), 800 scales to 400 (fills).
-		assert_noop!(redeem(3, DOT, PUSD, 1_000, 801, 4, 0), Error::<Test>::SlippageExceeded);
+		// The vault owes 501, which includes a one-unit seven-day upfront fee. The offer of 1_000
+		// exceeds the required amount.
+		//
+		// The fill cancels all 501 debt and pays
+		// `floor(501 / 1.25) = 400` collateral.
+		//
+		// Full redemption has a share of one and increases the dynamic fee by `1 / 2` to 50%.
+		// The mean is 25% plus the 0.5% base fee, and `ceil(501 * 0.255) = 128`.
+		//
+		// The redemption spends only 629 of the 1_000 offer. Thus, the floor becomes
+		// `floor(min · 629 / 1_000)`. A floor of 638 becomes 401 and fails.
+		//
+		// A floor of 637 becomes 400 and succeeds.
+		let quote = Redemptions::preview_redeem(DOT, PUSD, 1_000, 0).expect("quote");
+		assert_eq!((quote.debt_cancelled, quote.fee, quote.collateral_out), (501, 128, 400));
+		assert_noop!(redeem(3, DOT, PUSD, 1_000, 638, 4, 0), Error::<Test>::SlippageExceeded);
 
 		let recipient_before = collateral_balance(DOT, 4);
-		assert_ok!(redeem(3, DOT, PUSD, 1_000, 800, 4, 0));
+		assert_ok!(redeem(3, DOT, PUSD, 1_000, 637, 4, 0));
 		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 400);
+	});
+}
+
+/// Verifies that the collateral floor scales to the stable amount spent.
+///
+/// A fee increase between quote and execution buys less debt and collateral for the same cost. It
+/// can fail the floor in the same way as a price change.
+#[test]
+fn slippage_floor_catches_a_fee_that_climbs_after_the_quote() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 100_000, 50_000, rate_pct(5, 100)));
+		mint_stable(PUSD, 3, 1_000_000);
+		mint_stable(PUSD, 5, 1_000_000);
+
+		let quote = Redemptions::preview_redeem(DOT, PUSD, 10_000, 0).expect("quote");
+
+		// Another redeemer acts first and increases the dynamic fee. Thus, the same 10_000 buys
+		// less debt and uses more of the amount for the fee.
+		assert_ok!(redeem(5, DOT, PUSD, 10_000, 0, 6, 0));
+		let requoted = Redemptions::preview_redeem(DOT, PUSD, 10_000, 0).expect("requote");
+		assert!(requoted.fee > quote.fee, "the fee climbed");
+		assert!(requoted.debt_cancelled < quote.debt_cancelled, "the spend buys less debt");
+		assert!(requoted.collateral_out < quote.collateral_out, "and less collateral");
+
+		// The original collateral floor causes a revert. The new quoted collateral floor permits
+		// the fill.
+		assert_noop!(
+			redeem(3, DOT, PUSD, 10_000, quote.collateral_out, 4, 0),
+			Error::<Test>::SlippageExceeded
+		);
+		let recipient_before = collateral_balance(DOT, 4);
+		assert_ok!(redeem(3, DOT, PUSD, 10_000, requoted.collateral_out, 4, 0));
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, requoted.collateral_out);
 	});
 }
 
@@ -483,22 +587,88 @@ fn insufficient_stable_balance_reverts() {
 }
 
 #[test]
-fn wallet_bound_uses_the_fee_raised_by_the_affordable_debt() {
+fn balance_bound_uses_the_fee_raised_by_the_affordable_debt() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 10_000, 1_000, rate_pct(5, 100)));
 		mint_stable(PUSD, 3, 1_000);
 		let debt_before = vault_debt(DOT, PUSD, 1);
+		let coin_debt_before = stablecoin_debt(PUSD);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 
-		assert_ok!(redeem(3, DOT, PUSD, 1_000, 0, 4, 0));
+		// The 2_000 offered exceeds the 1_000 balance. The account can pay 999 while it keeps
+		// its one-unit minimum balance, and that limit binds.
+		assert_ok!(redeem(3, DOT, PUSD, 2_000, 0, 4, 0));
 
-		// The wallet can afford 730 debt plus the 270 fee that 730 itself
-		// raises. Pricing the unreachable 1_000-debt maximum would reserve a
-		// much higher rate and cancel only 664.
-		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 730);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 270);
-		assert_eq!(Assets::balance(PUSD, 3), 0);
+		// The dynamic fee uses the debt that the redemption can cancel, not the requested amount.
+		// The 999 supplies 824 debt and the 174 fee that this debt causes, and leaves one unit
+		// that cannot buy more.
+		//
+		// A fee based on the unavailable 2_000 offer would reserve a much higher rate and cancel
+		// much less debt.
+		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 824);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 174);
+		assert_eq!(Assets::balance(PUSD, 3), 2, "the minimum balance and the spare unit stay");
+		// 825 debt pays one more unit of fee, and would need the whole balance.
+		let curve = fee_curve(FixedU128::zero(), coin_debt_before);
+		assert!(824 + curve.fee::<Balance>(824) <= 999);
+		assert!(825 + curve.fee::<Balance>(825) > 999);
+	});
+}
+
+/// Verifies that a fully funded budget buys the maximum debt whose fee also fits the budget.
+///
+/// The quote and execution use the same amount.
+#[test]
+fn budget_binds_before_a_larger_balance() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 10_000, 1_000, rate_pct(5, 100)));
+		mint_stable(PUSD, 3, 2_000);
+
+		let quote = Redemptions::preview_redeem(DOT, PUSD, 1_000, 0).expect("quote");
+		assert_eq!((quote.debt_cancelled, quote.fee, quote.stable_in()), (825, 175, 1_000));
+
+		let debt_before = vault_debt(DOT, PUSD, 1);
+		let stable_before = Assets::balance(PUSD, 3);
+		assert_ok!(redeem(3, DOT, PUSD, 1_000, 0, 4, 0));
+		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), quote.debt_cancelled);
+		assert_eq!(stable_before - Assets::balance(PUSD, 3), quote.stable_in());
+		assert_eq!(Assets::balance(PUSD, 3), 1_000, "the rest of the balance stays put");
+	});
+}
+
+/// Verifies failure when a budget cannot buy the minimum debt after inclusion of its fee.
+///
+/// The terms cause the failure if the balance covers the budget. The balance causes the failure if
+/// it does not cover the budget.
+#[test]
+fn budget_that_the_fee_takes_below_the_minimum_reverts() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		mint_stable(PUSD, 3, 1_000);
+
+		// The stablecoin debt is 501, so the 100 minimum is 19.96% of it. The increase is half of
+		// that share, 9.98%, with a 4.99% mean.
+		//
+		// The 0.5% base gives `ceil(100 * 0.054900) = 6`. Thus, 106 buys exactly 100 debt. An
+		// amount of 105 buys only 99 debt with the same fee of 6.
+		let quote = Redemptions::preview_redeem(DOT, PUSD, 106, 0).expect("quote");
+		assert_eq!((quote.debt_cancelled, quote.fee), (100, 6));
+		assert_noop!(
+			Redemptions::preview_redeem(DOT, PUSD, 105, 0),
+			Error::<Test>::BelowMinimumRedemptionAmount
+		);
+		assert_noop!(
+			redeem(3, DOT, PUSD, 105, 0, 4, 0),
+			Error::<Test>::BelowMinimumRedemptionAmount
+		);
+
+		// If the balance cannot cover the budget, the balance causes the same shortfall.
+		mint_stable(PUSD, 5, 105);
+		assert_noop!(redeem(5, DOT, PUSD, 106, 0, 6, 0), Error::<Test>::InsufficientStableBalance);
+		assert_ok!(redeem(3, DOT, PUSD, 106, 0, 4, 0));
 	});
 }
 
@@ -514,29 +684,26 @@ fn dynamic_fee_rises_after_ordinary_redemption() {
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 		let recipient_before = collateral_balance(DOT, 4);
 
-		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
+		assert_ok!(redeem(3, DOT, PUSD, 10_550, 0, 4, 0));
 
-		// 10_000 is debt to cancel, and the fee rides on top. The vault owes
-		// 50_048, so this is 19.98% of the coin: the accelerator rises to 9.99%
-		// and this same redemption pays 9.99% + 0.5%, ceil(10_000 * 0.104904) =
-		// 1_050. Collateral is 10_000/1.25 = 8_000.
+		// A spend of 10_550 buys 10_000 debt and pays the fee in addition. The vault owes 50_048,
+		// so this amount is 19.98% of the stablecoin debt.
+		//
+		// The dynamic fee increases by half of that share, to 9.99%. The redemption pays the 5.00%
+		// mean and the 0.5% base fee.
+		//
+		// Thus, the fee is `ceil(10_000 * 0.054952) = 550`, and the total cost is 10_550. The
+		// collateral output is `10_000 / 1.25 = 8_000`.
 		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 10_000);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 1_050);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 550);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 8_000);
 		// The stablecoin debt aggregate falls by exactly the cancelled debt.
 		assert_eq!(stablecoin_debt_before - stablecoin_debt(PUSD), 10_000);
 
-		// The new dynamic fee is decayed(0) + redeemed_fraction / increase_divisor,
-		// computed against the stablecoin debt captured before the redemption.
-		let fraction = FixedU128::checked_from_rational(10_000u128, stablecoin_debt_before)
-			.expect("nonzero stablecoin debt");
-		let expected = crate::fees::increased_dynamic_fee(
-			FixedU128::zero(),
-			fraction,
-			FixedU128::from_rational(2, 1),
-			FixedU128::zero(),
-			FixedU128::one(),
-		);
+		// The new dynamic fee is `decayed(0) + share / increase_divisor`, computed against the
+		// stablecoin debt captured before the redemption.
+		let expected =
+			fee_curve(FixedU128::zero(), stablecoin_debt_before).raised_dynamic_fee(10_000);
 		assert!(expected > FixedU128::zero());
 		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee, expected);
 		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).last_fee_operation, 1_000);
@@ -563,58 +730,89 @@ fn redeeming_one_collateral_raises_the_fee_on_its_sibling_markets() {
 		assert_eq!(both_markets, 2 * branch_outstanding(DOT, PUSD));
 
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
-		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
+		// An amount of 10_300 buys 10_000 debt. The calculation below gives the fee.
+		assert_ok!(redeem(3, DOT, PUSD, 10_300, 0, 4, 0));
 		let dot_fee = Assets::balance(PUSD, FEE_DEST) - fee_before;
 
-		let fraction = FixedU128::checked_from_rational(10_000u128, both_markets)
-			.expect("nonzero stablecoin debt");
-		let raised = crate::fees::increased_dynamic_fee(
-			FixedU128::zero(),
-			fraction,
-			FixedU128::from_rational(2, 1),
-			FixedU128::zero(),
-			FixedU128::one(),
-		);
+		let raised = fee_curve(FixedU128::zero(), both_markets).raised_dynamic_fee(10_000);
 		assert!(raised > FixedU128::zero());
 		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee, raised);
 
 		// The TOKEN_X redeemer, who redeemed nothing, now pays the raised rate.
-		// Both cancel the same 10_000 of debt, but the first paid
-		// ceil(10_000 · (4.995% + 0.5%)) = 550 against an untouched accelerator,
-		// while the second starts from that 4.995%, adds half of 10_000/90_096
-		// on top, and pays ceil(10_000 · (10.545% + 0.5%)) = 1_105.
+		// Both redemptions cancel 10_000 debt. The first increases the dynamic fee from zero to
+		// `10_000 / 100_096 / 2 = 4.995%`.
+		//
+		// It pays the mean rate, and `ceil(10_000 · (2.498% + 0.5%)) = 300`. The second starts at
+		// 4.995% and increases the fee by `10_000 / 90_096 / 2 = 5.550%` to 10.545% over the final
+		// 90_096 debt.
+		//
+		// It pays `ceil(10_000 · (7.770% + 0.5%)) = 828`. The total costs are 10_300 and 10_828.
 		let debt_before = vault_debt(TOKEN_X, PUSD, 2);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
-		assert_ok!(redeem(3, TOKEN_X, PUSD, 10_000, 0, 4, 0));
+		assert_ok!(redeem(3, TOKEN_X, PUSD, 10_828, 0, 4, 0));
 		assert_eq!(debt_before - vault_debt(TOKEN_X, PUSD, 2), 10_000);
-		assert_eq!(dot_fee, 550);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 1_105);
+		assert_eq!(dot_fee, 300);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 828);
 	});
 }
 
-// The redemption that raises the accelerator pays the raised rate, so a large
-// redemption after a quiet period cannot pay only the decayed one. Splitting it
-// into two halves is therefore never cheaper than doing it at once — the first
-// half raises the rate the second half then pays.
-#[test]
-fn a_redemption_pays_the_rate_it_raises() {
+/// Runs consecutive DOT/PUSD redemptions of `debts` through the pallet and returns the fees paid
+/// and the dynamic fee left behind.
+///
+/// One vault owes 500_480: 500_000 plus a 480-unit seven-day upfront fee. Each redemption spends
+/// exactly what its debt and fee cost, so the mock verifies the quote and settlement of every
+/// call. Each `idle_ms` elapses before its redemption.
+fn redeem_in_sequence(debts: &[(Balance, Moment)]) -> (Balance, FixedU128) {
+	let mut outcome = None;
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000_000, 500_000, rate_pct(5, 100)));
 		mint_stable(PUSD, 3, 2_000_000);
-		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee, FixedU128::zero());
-
-		// Arriving at a fully-decayed accelerator does not buy the decayed rate:
-		// 20_000 of the coin's 500_048 is 4.0%, so the rate rises to 2.0% and
-		// this same redemption pays 2.0% + 0.5%, ceil(20_000 * 0.024999) = 500.
+		assert_eq!(vault_debt(DOT, PUSD, 1), 500_480);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
-		assert_ok!(redeem(3, DOT, PUSD, 20_000, 0, 4, 0));
-		let at_once = Assets::balance(PUSD, FEE_DEST) - fee_before;
-		assert_eq!(at_once, 500);
-		// A pre-increase charge would have been the bare base fee on the same
-		// debt, which is what this redesign is meant to stop.
-		assert!(at_once > 20_000 * 5 / 1_000);
+		let collateral_before = collateral_balance(DOT, 4);
+		let total: Balance = debts.iter().map(|&(debt, _)| debt).sum();
+		for &(debt, idle_ms) in debts {
+			advance_time(idle_ms);
+			assert_ok!(redeem(3, DOT, PUSD, spend_for_debt(debt), 0, 4, 0));
+		}
+		// Every unit of debt buys the same collateral at the 1.25 price, however it is split.
+		assert_eq!(collateral_balance(DOT, 4) - collateral_before, total * 4 / 5);
+		outcome = Some((
+			Assets::balance(PUSD, FEE_DEST) - fee_before,
+			crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee,
+		));
 	});
+	outcome.expect("the redemptions ran")
+}
+
+/// Verifies the worked example through the pallet: 20_000 of the 500_480 stablecoin debt, at
+/// once and in halves.
+///
+/// The curve values are those of `fees::tests::the_worked_example_at_once_and_in_halves`: 300 at
+/// once, and 100 plus 201 in halves, which leave a higher dynamic fee. The pallet feeds the curve
+/// the stablecoin debt and the stored dynamic fee that each redemption leaves.
+///
+/// Time makes a split cheaper. After one idle half-life, the second half starts at half the
+/// dynamic fee that the first half caused: it pays `ceil(10_000 · (0.4995% + 0.5097% + 0.5%)) =
+/// 151` instead of 201.
+#[test]
+fn a_redemption_in_halves_pays_the_climb_that_the_first_half_causes() {
+	let (at_once_fee, at_once_dynamic_fee) = redeem_in_sequence(&[(20_000, 0)]);
+	assert_eq!(at_once_fee, 300);
+	assert_eq!(
+		at_once_dynamic_fee,
+		fee_curve(FixedU128::zero(), 500_480).raised_dynamic_fee(20_000)
+	);
+
+	let (halves_fee, halves_dynamic_fee) = redeem_in_sequence(&[(10_000, 0), (10_000, 0)]);
+	assert_eq!(halves_fee, 301);
+	assert!(halves_dynamic_fee > at_once_dynamic_fee);
+
+	let (rested_fee, rested_dynamic_fee) =
+		redeem_in_sequence(&[(10_000, 0), (10_000, 6 * HOUR_MS)]);
+	assert_eq!(rested_fee, 251);
+	assert!(rested_dynamic_fee < at_once_dynamic_fee);
 }
 
 #[test]
@@ -633,20 +831,13 @@ fn dynamic_fee_decays_between_redemptions() {
 		advance_time(24 * HOUR_MS);
 		let decayed = FixedU128::from_inner(raised.into_inner() >> 4);
 		let stablecoin_debt_before = stablecoin_debt(PUSD);
-		assert_ok!(redeem(3, DOT, PUSD, 1_000, 0, 4, 0));
+		assert_ok!(redeem(3, DOT, PUSD, spend_for_debt(1_000), 0, 4, 0));
 
-		// The stored fee is that exact decayed value plus this redemption's own
-		// increase, reproduced here with the very primitives execution uses. The
-		// whole 1_000 is cancelled debt now that the fee is charged on top.
-		let fraction = FixedU128::checked_from_rational(1_000u128, stablecoin_debt_before)
-			.expect("nonzero stablecoin debt");
-		let expected = crate::fees::increased_dynamic_fee(
-			decayed,
-			fraction,
-			FixedU128::from_rational(2, 1),
-			FixedU128::zero(),
-			FixedU128::one(),
-		);
+		// The stored fee is the exact decayed value plus this redemption's increase. This
+		// calculation uses the same primitives as execution.
+		//
+		// The spend buys 1_000 canceled debt and pays the fee in addition.
+		let expected = fee_curve(decayed, stablecoin_debt_before).raised_dynamic_fee(1_000);
 		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee, expected);
 		assert!(expected < raised, "the decay must outweigh a small re-increase");
 		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).last_fee_operation, Timestamp::get());
@@ -670,26 +861,21 @@ fn dynamic_fee_fully_decays_to_the_base_fee_after_long_idle() {
 		// pre-poke storage value would understate the debt the cancel lands on.
 		let accrued = projected_full_debt(1);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
-		assert_ok!(redeem(3, DOT, PUSD, 200, 0, 4, 0));
+		// An amount of 202 buys 200 debt. The calculation below gives the fee of 2.
+		assert_ok!(redeem(3, DOT, PUSD, 202, 0, 4, 0));
 
-		// The requested debt is cancelled whatever the rate, so the zero-residue
-		// proof lives in the fee state: it rebuilds from exactly zero, as a first
-		// redemption would. A residue as small as 1e-18 would survive into the
-		// stored value and fail this.
+		// Debt cancellation does not depend on the rate. Thus, the fee state proves that no residue
+		// remains. It starts again from exactly zero, as it does for a first redemption.
+		//
+		// A residue as small as `1e-18` would remain in the stored value and fail this test.
 		assert_eq!(vault_debt(DOT, PUSD, 1), accrued - 200);
-		let fraction = FixedU128::checked_from_rational(200u128, stablecoin_debt_before)
-			.expect("nonzero stablecoin debt");
-		let expected = crate::fees::increased_dynamic_fee(
-			FixedU128::zero(),
-			fraction,
-			FixedU128::from_rational(2, 1),
-			FixedU128::zero(),
-			FixedU128::one(),
-		);
+		let expected = fee_curve(FixedU128::zero(), stablecoin_debt_before).raised_dynamic_fee(200);
 		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee, expected);
-		// A year of idle leaves a 500_048-debt coin, so this redemption's own
-		// increase is 200/500_048/2 = 0.02%: the charged rate is 0.52% and the
-		// fee ceil(200 * 0.0052) = 2.
+		// One year of idle interest gives stablecoin debt of 420_504. This redemption increases the
+		// dynamic fee by `200 / 420_504 / 2 = 0.024%`.
+		//
+		// It pays the 0.012% mean and the 0.5% base fee. Thus, `ceil(200 * 0.005119) = 2`, and the
+		// total cost is 202.
 		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 2);
 	});
 }
@@ -702,7 +888,9 @@ fn dormant_target_is_redeemed_before_rate_index() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		mint_stable(PUSD, 3, 1_000_000);
 
-		assert_ok!(redeem(3, DOT, PUSD, 360, 0, 4, 0));
+		// The redemption cancels 360 of the 501 debt in vault 1. Its sub-minimum residual makes it
+		// Dormant.
+		assert_ok!(redeem(3, DOT, PUSD, spend_for_debt(360), 0, 4, 0));
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
 		assert_eq!(
 			pallet_vaults::Branches::<Test>::get(DOT, PUSD)
@@ -719,7 +907,7 @@ fn dormant_target_is_redeemed_before_rate_index() {
 		// redemption can reach it is via the Dormant slot, which is served before
 		// the rate index. It redeems the Dormant vault and never touches ordinary
 		// vault 2.
-		assert_ok!(redeem(3, DOT, PUSD, 100, 0, 4, 0));
+		assert_ok!(redeem(3, DOT, PUSD, spend_for_debt(100), 0, 4, 0));
 		// Cancel less than the residual so the husk survives the step and its
 		// row stays readable: a full drain removes the vault, and the debt
 		// cancelled could then only be inferred.
@@ -733,7 +921,7 @@ fn dormant_target_is_redeemed_before_rate_index() {
 }
 
 #[test]
-fn quote_continues_from_drained_dormant_into_rate_index() {
+fn preview_redeem_continues_from_drained_dormant_into_rate_index() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
@@ -1078,9 +1266,19 @@ fn stablecoin_owner_can_update_redemption_config() {
 		let mut cfg = crate::RedemptionConfigs::<Test>::get(PUSD).unwrap();
 		cfg.minimum_redemption_amount = 250;
 
-		// Account 1 owns the PUSD asset in genesis, so it is the coin's
-		// authority under the same rule vaults uses for `create_branch`.
-		assert_ok!(Redemptions::set_redemption_config(RuntimeOrigin::signed(1), PUSD, cfg));
+		// The `pallet-assets` owner is the stablecoin authority. Vaults uses the same rule for
+		// `create_branch`.
+		//
+		// A market full admin is not sufficient because one policy controls all markets for the
+		// stablecoin.
+		use frame::traits::fungibles::roles::Inspect as _;
+		assert_eq!(Assets::owner(PUSD), Some(STABLECOIN_OWNER));
+		assert_ne!(STABLECOIN_OWNER, ADMIN);
+		assert_ok!(Redemptions::set_redemption_config(
+			RuntimeOrigin::signed(STABLECOIN_OWNER),
+			PUSD,
+			cfg
+		));
 
 		assert_eq!(
 			crate::RedemptionConfigs::<Test>::get(PUSD).unwrap().minimum_redemption_amount,
@@ -1089,10 +1287,10 @@ fn stablecoin_owner_can_update_redemption_config() {
 	});
 }
 
-/// The complete negative origin space for `set_redemption_config`: a plain
-/// user with no admin power anywhere, this market's emergency (tighten-only)
-/// admin, and another market's full admin. Only Root and this market's full
-/// admin pass — the two accept paths the tests above pin.
+/// Verifies all unauthorized origins for `set_redemption_config`.
+///
+/// They are this market's full admin, its emergency admin, and another market's full admin. Only
+/// Root and the stablecoin owner have authority.
 #[test]
 fn set_redemption_config_rejects_market_admins() {
 	build_and_execute(|| {
@@ -1154,16 +1352,20 @@ fn preview_redeem_quotes_without_side_effects() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		let debt_before = vault_debt(DOT, PUSD, 1);
 
-		// The quote prices the fee the same way execution does: cancelling 201 of
-		// the coin's 501 debt raises the accelerator to 20.06%, so the fee is
-		// ceil(201 * 0.205598) = 42 and the redeemer would spend 243 in total.
-		let preview = Redemptions::preview_redeem(DOT, PUSD, 201, 0).expect("preview");
+		// The quote and execution use the same fee calculation. An amount of 223 buys 201 of the
+		// 501 stablecoin debt, a 40.12% share.
+		//
+		// The dynamic fee increases by half of that share, to 20.06%. Its mean is 10.03%, so the
+		// fee is `ceil(201 * 0.105299) = 22`.
+		//
+		// Thus, the redeemer spends all 223.
+		let preview = Redemptions::preview_redeem(DOT, PUSD, 223, 0).expect("preview");
 		assert_eq!(preview.steps, 1);
 		assert!(!preview.truncated);
-		assert_eq!(preview.stable_in(), 243);
+		assert_eq!(preview.stable_in(), 223);
 		assert_eq!(preview.debt_cancelled, 201);
 		assert_eq!(preview.collateral_out, 160);
-		assert_eq!(preview.fee, 42);
+		assert_eq!(preview.fee, 22);
 		// Quoting projects the pending touch without applying it.
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
 	});
@@ -1203,12 +1405,14 @@ fn partial_redemption_with_terminal_remainder_caps_below_base_debt() {
 
 		let snapshot = Vaults::project_redemption_snapshot(&DOT, &PUSD, &1).unwrap();
 		assert_eq!(snapshot.terminal_interest_charge, 1);
-		let quote = Redemptions::preview_redeem(DOT, PUSD, snapshot.debt, 1).unwrap();
+		// A spend that buys the whole base debt but not the terminal charge.
+		let spend = spend_for_debt(snapshot.debt);
+		let quote = Redemptions::preview_redeem(DOT, PUSD, spend, 1).unwrap();
 		assert_eq!(quote.steps, 1);
 		assert_eq!(quote.debt_cancelled, snapshot.debt - 1);
 
 		let stable_before = Assets::balance(PUSD, 5);
-		assert_ok!(redeem(5, DOT, PUSD, snapshot.debt, 0, 6, 1));
+		assert_ok!(redeem(5, DOT, PUSD, spend, 0, 6, 1));
 		assert_eq!(stable_before - Assets::balance(PUSD, 5), quote.stable_in());
 		assert_eq!(vault_debt(DOT, PUSD, 1), 1);
 		// The final settlement must collect the preserved terminal charge.
@@ -1263,16 +1467,17 @@ fn ordinary_redemption_end_to_end() {
 		let held_before = held(DOT, 1);
 		let issuance_before = Assets::total_supply(PUSD);
 
-		assert_ok!(redeem(3, DOT, PUSD, 1_020, 0, 4, 0));
+		assert_ok!(redeem(3, DOT, PUSD, 1_093, 0, 4, 0));
 
-		// The vault owes 5_005, so cancelling 1_020 is 20.38% of the coin and
-		// lifts the 1.5% accelerator by half of that to 11.69%. This redemption
-		// pays the rate it caused: 11.69% + 0.5% = 12.19%, so the fee is
-		// ceil(1_020 * 0.121898) = 125 on top of the 1_020 of debt, and the
-		// collateral is 1_020/2 = 510.
+		// The 1_093 spent buys 1_020 debt. The vault owes 5_005, so that is
+		// 20.38% of the coin and climbs the 1.5% dynamic fee by half of that
+		// share, 10.19%, to 11.69%. This redemption pays the mean dynamic fee
+		// along that climb, 6.59%, plus the 0.5% base:
+		// ceil(1_020 * 0.070949) = 73 on top of the 1_020 of debt, 1_093
+		// exactly, and the collateral is 1_020/2 = 510.
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 510);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 125);
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 1_145);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 73);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 1_093);
 		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 1_020);
 		assert_eq!(held_before - held(DOT, 1), 510);
 		// Fees are transferred, so issuance must only fall by cancelled debt.
@@ -1367,8 +1572,12 @@ fn insurance_adjusted_recovery_burns_fund_only_when_market_debt_exhausted() {
 		let recipient_before = collateral_balance(DOT, 4);
 		let issuance_before = Assets::total_supply(PUSD);
 
-		// First transaction cancels only part of the market-cancellable debt: the
-		// fund must stay untouched until the market portion is fully exhausted.
+		// The first transaction spends 200 against a vault with much more debt. Preview and
+		// execution cancel exactly 200 without a fee.
+		//
+		// The Insurance Fund must not change until the transaction cancels all market-side debt.
+		let partial = Redemptions::preview_redeem(DOT, PUSD, 200, 0).expect("partial quote");
+		assert_eq!((partial.debt_cancelled, partial.fee), (200, 0));
 		assert_ok!(redeem(3, DOT, PUSD, 200, 0, 4, 0));
 		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_some(), "still settling");
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
@@ -1378,19 +1587,48 @@ fn insurance_adjusted_recovery_burns_fund_only_when_market_debt_exhausted() {
 			if_before,
 			"fund untouched mid-settlement"
 		);
-		// Recovery is fee-free and budget-bound: this step cancels exactly 200 debt
-		// (200 < market_cancel_debt) and pays collateral at recovery_rate = C/(D-50).
+		// Recovery has no fee and cannot exceed the spend. This step cancels exactly 200 debt
+		// because `200 < market_cancel_debt = 451`.
+		//
+		// The recovery rate is `C / (D − 50) = 400 / 451`. The collateral payment is
+		// `floor(floor(200 · 400 / 451) / 0.40) = floor(177 / 0.40) = 442`.
 		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 200);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 442);
 
-		// Second transaction finishes the market portion; only now is the fund's
-		// cover withdrawn and merged into the settlement, cancelling the whole
-		// remaining debt and leaving a debt-free Dormant husk.
+		// The price changes before the second transaction. Thus, live state must set a new
+		// market-side price instead of the first-step rate.
+		//
+		// At 0.30, the final 301 debt has `1_000 − 442 = 558` collateral units with a value of 167.
+		// The shortfall increases to 134.
+		//
+		// The Insurance Fund covers only 50, so the market-side debt is 251. The count matches the
+		// stale view, but the recovery rate is `167 / 251` instead of `400 / 451`.
+		//
+		// Cancellation pays `floor(floor(251 · 167 / 251) / 0.30) = 553` collateral units. The
+		// stale rate would incorrectly pay all 558 units.
+		//
+		// The same settlement uses the Insurance Fund cover of 50 and clears the final debt.
+		set_price(DOT, FixedU128::from_rational(30u128, 100u128));
+		let recipient_mid = collateral_balance(DOT, 4);
+		let redeemer_mid = Assets::balance(PUSD, 3);
 		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
+		assert_eq!(redeemer_mid - Assets::balance(PUSD, 3), 251, "market portion re-priced");
+		assert_eq!(collateral_balance(DOT, 4) - recipient_mid, 553);
 		assert_eq!(vault_debt(DOT, PUSD, 1), 0, "vault settled");
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "cover burned on completion");
+		System::assert_has_event(RuntimeEvent::Redemptions(Event::RecoveryRedemptionExecuted {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			redeemer: 3,
+			recipient: 4,
+			vault_owner: 1,
+			stable_burned: 251,
+			insurance_cover: 50,
+			collateral_out: 553,
+			regime: RecoveryRegime::InsuranceAdjusted,
+		}));
 		// Conservation: the full vault debt leaves issuance across the two txs.
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), debt_before);
 	});
@@ -1411,7 +1649,7 @@ fn recovery_redemption_leaves_ordinary_dynamic_fee_untouched() {
 
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
 		assert!(!ordinary_event_emitted(), "recovery must not emit an ordinary redemption");
-		// Recovery activity must not feed the ordinary-redemption fee accelerator.
+		// Recovery activity must not feed the ordinary redemption's dynamic fee.
 		assert_eq!(
 			crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee,
 			state_before.dynamic_fee
@@ -1464,15 +1702,18 @@ fn ordinary_redemption_succeeds_in_safety_mode() {
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 		let tcr_before = branch_tcr(DOT, PUSD);
 
-		// Cancelling 201 of the coin's 501 debt is 40.12%, lifting the accelerator
-		// to 20.06%; the redemption pays that plus the 0.5% base, so
-		// ceil(201 * 0.205598) = 42 on top. At price 0.6 the 201 buys
-		// floor(201/0.6) = 335 collateral.
-		assert_ok!(redeem(3, DOT, PUSD, 201, 0, 4, 0));
+		// An amount of 223 buys 201 of the 501 stablecoin debt, which is 40.12%. The dynamic fee
+		// increases by half of that share, to 20.06%.
+		//
+		// The redemption pays the 10.03% mean and the 0.5% base fee. Thus,
+		// `ceil(201 * 0.105299) = 22`, and the total cost is 223.
+		//
+		// At a price of 0.6, the 201 debt buys `floor(201 / 0.6) = 335` collateral.
+		assert_ok!(redeem(3, DOT, PUSD, 223, 0, 4, 0));
 		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 201);
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 243);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 223);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 335);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 42);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 22);
 		// Ordinary redemptions always raise a >100% branch's TCR; that invariant
 		// is exactly why they remain permitted in Safety mode.
 		assert!(branch_tcr(DOT, PUSD) > tcr_before, "redemption must raise TCR");
@@ -1549,18 +1790,21 @@ fn ordinary_redemption_accrues_target_interest_before_cancelling() {
 		let redeemer_before = Assets::balance(PUSD, 3);
 		let recipient_before = collateral_balance(DOT, 4);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
-		assert_ok!(redeem(3, DOT, PUSD, 1_005, 0, 4, 0));
+		// An amount of 1_011 buys 1_005 debt. The calculation below gives the fee of 6.
+		assert_ok!(redeem(3, DOT, PUSD, 1_011, 0, 4, 0));
 
-		// Redeeming poked the target: its interest clock advanced to now, and the
-		// 1_000 debt cancellation landed on the accrued balance, not the stale
-		// opening principal.
+		// The redemption touches the target and advances its interest clock to the current time.
+		// Cancellation of 1_005 debt applies to the accrued balance, not the opening principal.
 		assert_eq!(vault_interest_time(1), branch_interest_time(Timestamp::get()));
 		assert!(vault_interest_time(1) > stamped_at_open);
 		assert_eq!(vault_debt(DOT, PUSD, 1), accrued - 1_005);
-		// Every dimension of the fill: 1_005 of debt cancelled, floor(1_005/1.25)
-		// = 804 collateral out, and the fee on top. The denominator includes the
-		// year of aggregate interest without touching the market, so the
-		// increase is roughly 1_005/1_009_590/2 = 0.0498% and the charge is 6.
+		// The fill cancels 1_005 debt and pays `floor(1_005 / 1.25) = 804` collateral, plus the
+		// fee. The denominator includes one year of aggregate interest without a market touch.
+		//
+		// Thus, the increase is approximately `1_005 / 1_009_583 / 2 = 0.0498%`.
+		//
+		// Its mean is half that value, and the charge is `ceil(1_005 * 0.005249) = 6`. The total
+		// cost is 1_011.
 		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 1_011);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 804);
 		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 6);
@@ -1688,41 +1932,6 @@ fn full_wipe_execution_matches_the_quote_and_leaves_the_pending_complement() {
 }
 
 #[test]
-fn split_redemptions_equal_a_single_redemption_without_fees() {
-	// With fees neutralized, redeeming a total in equal chunks must net the same
-	// collateral out, debt cancelled, and issuance drop as redeeming it in one
-	// call: pure path-independence of the redemption mechanic.
-	let run = |chunks: &[Balance]| -> (Balance, Balance, Balance) {
-		let mut result = (0, 0, 0);
-		build_and_execute(|| {
-			register_branch(DOT, PUSD, default_branch_config());
-			// Zero every fee knob so the mechanic is isolated from fee dynamics.
-			let mut cfg = default_redemption_config();
-			cfg.dynamic_fee_ceiling = FixedU128::zero();
-			cfg.base_fee = Permill::zero();
-			cfg.fee_ceiling = Permill::zero();
-			assert_ok!(Redemptions::set_redemption_config(RuntimeOrigin::root(), PUSD, cfg));
-			assert_ok!(open(1, DOT, PUSD, 100_000, 10_000, rate_pct(5, 100)));
-			mint_stable(PUSD, 3, 1_000_000);
-			let debt_before = vault_debt(DOT, PUSD, 1);
-			let coll_before = collateral_balance(DOT, 4);
-			let issuance_before = Assets::total_supply(PUSD);
-			for &amount in chunks {
-				assert_ok!(redeem(3, DOT, PUSD, amount, 0, 4, 0));
-			}
-			result = (
-				collateral_balance(DOT, 4) - coll_before,
-				debt_before - vault_debt(DOT, PUSD, 1),
-				issuance_before - Assets::total_supply(PUSD),
-			);
-		});
-		result
-	};
-
-	assert_eq!(run(&[100, 100, 100]), run(&[300]));
-}
-
-#[test]
 fn ordinary_redemption_at_six_decimals_scales_exactly() {
 	build_and_execute(|| {
 		register_branch(DOT, USDX, usdx_branch_config());
@@ -1735,20 +1944,24 @@ fn ordinary_redemption_at_six_decimals_scales_exactly() {
 		let issuance_before = Assets::total_supply(USDX);
 		assert_eq!(Assets::balance(USDX, FEE_DEST), 0);
 
-		assert_ok!(redeem(3, DOT, USDX, 201 * USDX_UNIT, 0, 4, 0));
+		assert_ok!(redeem(3, DOT, USDX, 222_186_162, 0, 4, 0));
 
-		// The whole request is cancelled debt, exactly 201 USDX at six decimals,
-		// and collateral is 201/1.25 = 160.8 USDX worth — both exact, no dust.
+		// The spend buys exactly 201 USDX of debt at six decimals, plus the fee calculated below.
+		// The collateral value is `201 / 1.25 = 160.8` USDX.
+		//
+		// Both values are exact and have no dust.
 		assert_eq!(debt_before - vault_debt(DOT, USDX, 1), 201 * USDX_UNIT);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 160_800_000);
 		assert_eq!(held_before - held(DOT, 1), 160_800_000);
 		assert_eq!(issuance_before - Assets::total_supply(USDX), 201 * USDX_UNIT);
-		// The fee is the one figure that cannot be round: the coin carries
-		// 500_479_124 (500 USDX plus a 479_124 upfront fee), so cancelling
-		// 201 USDX is 40.16% of it, the accelerator rises to 20.08%, and the
-		// charge is ceil(201_000_000 * 0.205808) = 41_367_323 on top.
-		assert_eq!(Assets::balance(USDX, FEE_DEST), 41_367_323);
-		assert_eq!(redeemer_before - Assets::balance(USDX, 3), 201 * USDX_UNIT + 41_367_323);
+		// The fee is the one figure that cannot be round: the coin carries 500_479_124 (500 USDX
+		// plus a 479_124 upfront fee), so 201 USDX is 40.16% of the stablecoin debt. The dynamic
+		// fee increases by half of that share, to 20.08%, with a mean of 10.04%.
+		//
+		// The fee is `ceil(201_000_000 * 0.1054037883) = 21_186_162`. Thus, the total cost is
+		// 222_186_162.
+		assert_eq!(Assets::balance(USDX, FEE_DEST), 21_186_162);
+		assert_eq!(redeemer_before - Assets::balance(USDX, 3), 201 * USDX_UNIT + 21_186_162);
 	});
 }
 
@@ -2107,8 +2320,7 @@ fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_not_coins() {
 	});
 }
 
-/// The default config with every fee component zeroed, so a step's payment
-/// need equals its budget exactly and dead-zone arithmetic stays readable.
+/// The default config with every fee component zeroed.
 fn zero_fee_redemption_config() -> RedemptionConfig<Balance> {
 	RedemptionConfig {
 		dynamic_fee_floor: FixedU128::zero(),
@@ -2119,8 +2331,62 @@ fn zero_fee_redemption_config() -> RedemptionConfig<Balance> {
 	}
 }
 
+/// Verifies that an ordinary redemption spends at most what keeps the redeemer at or above
+/// the stablecoin's minimum balance, whatever the request.
+///
+/// The fee is the last debit and the walk may cancel less than planned. Only a plan that
+/// keeps the account alive is certain to be payable in full: every step and the fee are then
+/// preserving debits, so no request can strand a sub-minimum remainder that the last debit
+/// could not take.
+///
+/// The redeemer holds 300 USDX with a 10_000-raw-unit minimum balance, so the payable limit is
+/// 299_990_000. It buys 263_885_993 debt: `263_885_993 / 500_479_124 / 2` raises the dynamic fee
+/// by 26.36%, its mean is 13.18%, and with the 0.5% base the fee is
+/// `ceil(263_885_993 · 0.1368166834) = 36_104_007`, exactly the limit in total. The collateral
+/// is `floor(263_885_993 / 1.25) = 211_108_794`.
+///
+/// A request that would leave less than the minimum, the whole balance, and more than the
+/// balance all fill to this same limit, and the redeemer keeps exactly the minimum.
 #[test]
-fn dead_zone_redemption_reprices_to_the_preserving_limit() {
+fn ordinary_redemption_keeps_the_redeemer_at_or_above_the_minimum_balance() {
+	let balance = 300 * USDX_UNIT;
+	let payable = balance - USDX_MIN_BALANCE;
+	for request in [payable + 1, balance - 4_000, balance, balance + 1, Balance::MAX] {
+		build_and_execute(|| {
+			register_branch(DOT, USDX, usdx_branch_config());
+			assert_ok!(open(1, DOT, USDX, 1_000 * USDX_UNIT, 500 * USDX_UNIT, rate_pct(5, 100)));
+			mint_stable(USDX, 3, balance);
+			let debt_before = vault_debt(DOT, USDX, 1);
+			let recipient_before = collateral_balance(DOT, 4);
+			let issuance_before = Assets::total_supply(USDX);
+
+			// The quote does not know the balance, so it prices the request itself, and the
+			// request buys more than the account can pay while it keeps its minimum balance.
+			let requested = Redemptions::preview_redeem(DOT, USDX, request, 0).expect("quote");
+			assert!(requested.stable_in() > payable, "request {request} would breach the minimum");
+			let quote = Redemptions::preview_redeem(DOT, USDX, payable, 0).expect("quote");
+			assert_eq!(quote.debt_cancelled, 263_885_993);
+			assert_eq!(quote.fee, 36_104_007);
+			assert_eq!(quote.stable_in(), payable);
+			assert_eq!(quote.collateral_out, 211_108_794);
+
+			assert_ok!(redeem(3, DOT, USDX, request, 0, 4, 0));
+
+			assert_eq!(debt_before - vault_debt(DOT, USDX, 1), quote.debt_cancelled);
+			assert_eq!(Assets::balance(USDX, FEE_DEST), quote.fee);
+			assert_eq!(collateral_balance(DOT, 4) - recipient_before, quote.collateral_out);
+			assert_eq!(issuance_before - Assets::total_supply(USDX), quote.debt_cancelled);
+			assert_eq!(Assets::balance(USDX, 3), USDX_MIN_BALANCE, "request {request}");
+		});
+	}
+}
+
+/// Verifies that a fee-free policy follows the same rule.
+///
+/// Without a fee the debt is the whole spend, but the account still keeps its minimum
+/// balance: the limit comes from the plan, not from the fee.
+#[test]
+fn fee_free_redemption_also_keeps_the_minimum_balance() {
 	build_and_execute(|| {
 		register_branch(DOT, USDX, usdx_branch_config());
 		assert_ok!(Redemptions::set_redemption_config(
@@ -2131,75 +2397,100 @@ fn dead_zone_redemption_reprices_to_the_preserving_limit() {
 		assert_ok!(open(1, DOT, USDX, 1_000 * USDX_UNIT, 500 * USDX_UNIT, rate_pct(5, 100)));
 		let debt_before = vault_debt(DOT, USDX, 1);
 		mint_stable(USDX, 3, 300 * USDX_UNIT);
-		let recipient_before = collateral_balance(DOT, 4);
 		let issuance_before = Assets::total_supply(USDX);
 
-		// Spending all but 4_000 raw units would strand the wallet below the
-		// 10_000-unit minimum: the step reprices once at the preserving limit
-		// and commits the partial fill instead of folding the 4_000 in.
-		let request = 300 * USDX_UNIT - 4_000;
 		let burned = 300 * USDX_UNIT - USDX_MIN_BALANCE;
-		assert_ok!(redeem(3, DOT, USDX, request, 0, 4, 0));
+		assert_ok!(redeem(3, DOT, USDX, 300 * USDX_UNIT, 0, 4, 0));
 
 		assert_eq!(Assets::balance(USDX, 3), USDX_MIN_BALANCE);
 		assert_eq!(debt_before - vault_debt(DOT, USDX, 1), burned);
 		assert_eq!(issuance_before - Assets::total_supply(USDX), burned);
 		assert_eq!(Assets::balance(USDX, FEE_DEST), 0);
-		// Price 1.25: collateral out = burned / 1.25 exactly.
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before, burned * 4 / 5);
 	});
 }
 
+/// Verifies that a recovery redemption may spend the whole balance.
+///
+/// Recovery charges no fee, so its single debit is the whole spend and can consume the
+/// account. A spend that would strand a sub-minimum remainder is repriced to the amount that
+/// keeps the minimum balance instead.
 #[test]
-fn full_wallet_redemption_expends_the_redeemer_account() {
+fn recovery_redemption_may_consume_the_redeemer_account() {
+	let request = 200 * USDX_UNIT;
+	for (balance, burned) in [
+		// The request is the whole balance and drains the account.
+		(request, request),
+		// The request would leave 4_000 raw units, less than the 10_000-unit minimum, so the
+		// spend stops at the minimum instead.
+		(request + 4_000, request - 6_000),
+	] {
+		build_and_execute(|| {
+			register_branch(DOT, USDX, usdx_branch_config());
+			assert_ok!(open(1, DOT, USDX, 1_000 * USDX_UNIT, 500 * USDX_UNIT, rate_pct(5, 100)));
+			set_price(DOT, FixedU128::from_rational(52u128, 100u128));
+			assert_ok!(enter_final_recovery(DOT, USDX, 1));
+			let debt_before = vault_debt(DOT, USDX, 1);
+			mint_stable(USDX, 3, balance);
+
+			assert_ok!(redeem(3, DOT, USDX, request, 0, 4, 0));
+
+			assert_eq!(debt_before - vault_debt(DOT, USDX, 1), burned);
+			assert_eq!(Assets::balance(USDX, 3), balance - burned);
+			assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
+		});
+	}
+}
+
+/// A recovery spend the balance cannot fund at all reports the balance, not the queue: at
+/// exactly the minimum balance, a smaller request can neither preserve nor consume the account.
+#[test]
+fn recovery_redemption_at_the_minimum_balance_reports_insufficient_balance() {
 	build_and_execute(|| {
 		register_branch(DOT, USDX, usdx_branch_config());
-		assert_ok!(Redemptions::set_redemption_config(
-			RuntimeOrigin::root(),
-			USDX,
-			zero_fee_redemption_config(),
-		));
 		assert_ok!(open(1, DOT, USDX, 1_000 * USDX_UNIT, 500 * USDX_UNIT, rate_pct(5, 100)));
-		let debt_before = vault_debt(DOT, USDX, 1);
-		mint_stable(USDX, 3, 300 * USDX_UNIT);
-		let issuance_before = Assets::total_supply(USDX);
+		set_price(DOT, FixedU128::from_rational(52u128, 100u128));
+		assert_ok!(enter_final_recovery(DOT, USDX, 1));
+		mint_stable(USDX, 3, USDX_MIN_BALANCE);
+		let request = USDX_MIN_BALANCE / 2;
 
-		// Spending the whole wallet is the legitimate full expend: the
-		// account reaps with no dust folded into the burn.
-		assert_ok!(redeem(3, DOT, USDX, 300 * USDX_UNIT, 0, 4, 0));
-
-		assert_eq!(Assets::balance(USDX, 3), 0);
-		assert_eq!(debt_before - vault_debt(DOT, USDX, 1), 300 * USDX_UNIT);
-		assert_eq!(issuance_before - Assets::total_supply(USDX), 300 * USDX_UNIT);
+		let quote = Redemptions::preview_redeem(DOT, USDX, request, 0).expect("recovery quote");
+		assert_eq!(quote.debt_cancelled, request);
+		assert_noop!(
+			redeem(3, DOT, USDX, request, 0, 4, 0),
+			Error::<Test>::InsufficientStableBalance
+		);
 	});
 }
 
-// ---------------------------------------------------------------------------
-// Numeric examples from `numeric-examples.md`, at the parameters its shared
-// assumptions fix: 1 DOT = 2 pUSD, redemption_fee_floor 0.5%.
-// ---------------------------------------------------------------------------
+/// Raw units give an exact representation of the fractional token amounts in the examples.
+const UNIT: Balance = 1_000;
 
-/// Numeric example 1: the redemption raises the accelerator and then pays the
-/// raised rate, priced against market-wide stablecoin debt.
+/// Builds a branch without an upfront fee, so a vault's principal equals its debt.
+fn example_config() -> pallet_vaults::BranchConfig<Balance> {
+	pallet_vaults::BranchConfig { upfront_fee_period: 0, ..default_branch_config() }
+}
+
+/// Verifies that an ordinary redemption prices its dynamic fee against stablecoin-wide debt.
+///
+/// The redemption increases the dynamic fee and pays the mean rate during that increase. It does
+/// not use only the target vault's debt.
 #[test]
-fn example_1_ordinary_redemption_with_base_rate_update_and_fee() {
+fn ordinary_redemption_prices_its_fee_against_the_stablecoin_wide_debt() {
 	build_and_execute(|| {
-		// No upfront fee, so each vault's drawn principal is its debt and the
-		// coin's total is exactly the example's 100_000.
-		let config =
-			pallet_vaults::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
-		register_branch(DOT, PUSD, config);
+		// Without an upfront fee, each vault's principal equals its debt. Thus, the stablecoin debt
+		// is exactly 100_000.
+		register_branch(DOT, PUSD, example_config());
 		set_price(DOT, FixedU128::from_rational(2, 1));
 
-		// The example's vault: 5_000 of debt against 4_000 DOT = 8_000 pUSD, a
-		// 160% CR. It borrows at the floor rate so the walk reaches it first.
+		// The target has 5_000 debt and 4_000 DOT, with a value of 8_000 pUSD and a 160% CR. It
+		// uses the floor borrow rate, so the walk reaches it first.
 		assert_ok!(open(1, DOT, PUSD, 4_000, 5_000, rate_pct(1, 1_000)));
 		// The rest of the coin's 100_000 of debt, on a costlier vault so it is
 		// never the redemption target.
 		assert_ok!(open(2, DOT, PUSD, 200_000, 95_000, rate_pct(5, 100)));
 		assert_eq!(stablecoin_debt(PUSD), 100_000);
 
-		// The example's decayed base rate.
+		// The setup sets the decayed dynamic fee at which the redemption starts.
 		set_dynamic_fee(PUSD, FixedU128::from_rational(15, 1_000));
 
 		mint_stable(PUSD, 3, 1_000_000);
@@ -2207,18 +2498,21 @@ fn example_1_ordinary_redemption_with_base_rate_update_and_fee() {
 		let recipient_before = collateral_balance(DOT, 4);
 		let fee_before = Assets::balance(PUSD, FEE_DEST);
 
-		assert_ok!(redeem(3, DOT, PUSD, 1_000, 0, 4, 0));
+		assert_ok!(redeem(3, DOT, PUSD, 1_023, 0, 4, 0));
 
-		// redeemed_fraction = 1_000/100_000 = 1%, so the accelerator rises by
-		// half of that to 2.0%, and this redemption pays 2.0% + 0.5% = 2.5%:
-		// a 25 fee on top of the 1_000 cancelled, 1_025 spent in total, for
-		// 1_000/2 = 500 DOT of collateral.
-		assert_eq!(
-			crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee,
-			FixedU128::from_rational(2, 100)
-		);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 25);
-		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 1_025);
+		// The 1_023 spent buys 1_000 debt. This is `1_000 / 100_000 = 1%` of the stablecoin debt,
+		// not 20% of the target-vault debt.
+		//
+		// The dynamic fee increases by `1% / 2 = 0.5%` to 2.0%. The redemption pays the mean
+		// dynamic fee of `1.5% + 0.25%` and the 0.5% base fee.
+		//
+		// Therefore, the fee is `ceil(1_000 * 0.0225) = 23`, and the total cost is 1_023. The
+		// collateral output is `1_000 / 2 = 500` DOT.
+		let dynamic_fee = crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee;
+		assert_eq!(dynamic_fee, fee_curve(rate_pct(15, 1_000), 100_000).raised_dynamic_fee(1_000));
+		assert_eq!(dynamic_fee, rate_pct(2, 100));
+		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_before, 23);
+		assert_eq!(redeemer_before - Assets::balance(PUSD, 3), 1_023);
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 500);
 
 		// The vault after redemption: 4_000 of debt against 3_500 DOT =
@@ -2228,20 +2522,14 @@ fn example_1_ordinary_redemption_with_base_rate_update_and_fee() {
 	});
 }
 
-/// The examples are written in whole tokens but their arithmetic produces
-/// fractions, which raw units express exactly. Every figure below is the
-/// example's, scaled by this.
-const UNIT: Balance = 1_000;
+// The next three examples do not test the redemption fee. The ordinary example checks only the
+// vault result, and recovery settlements have no fee.
 
-/// No upfront fee, so a vault's drawn principal is its debt.
-fn example_config() -> pallet_vaults::BranchConfig<Balance> {
-	pallet_vaults::BranchConfig { upfront_fee_period: 0, ..default_branch_config() }
-}
-
-/// Numeric example 2: a redemption that leaves the vault below `minimum_debt`
-/// parks it as the Dormant continuation target rather than closing it.
+/// Verifies that a vault below `minimum_debt` becomes the Dormant continuation target.
+///
+/// The redemption does not close the vault.
 #[test]
-fn example_2_redemption_creates_a_dormant_continuation_vault() {
+fn redemption_below_minimum_debt_leaves_a_dormant_continuation_vault() {
 	build_and_execute(|| {
 		let config = pallet_vaults::BranchConfig { minimum_debt: 2_000 * UNIT, ..example_config() };
 		register_branch(DOT, PUSD, config);
@@ -2252,7 +2540,8 @@ fn example_2_redemption_creates_a_dormant_continuation_vault() {
 		mint_stable(PUSD, 3, 1_000_000 * UNIT);
 		let recipient_before = collateral_balance(DOT, 4);
 
-		assert_ok!(redeem(3, DOT, PUSD, 2_800 * UNIT, 0, 4, 0));
+		// The test spends the amount that cancels exactly 2_800 debt. It does not check the fee.
+		assert_ok!(redeem(3, DOT, PUSD, spend_for_debt(2_800 * UNIT), 0, 4, 0));
 
 		// 2_800 cancelled pays 2_800/2 = 1_400 DOT, leaving 200 of debt against
 		// 600 DOT — below the 2_000 minimum, so the vault goes Dormant and
@@ -2271,21 +2560,22 @@ fn example_2_redemption_creates_a_dormant_continuation_vault() {
 	});
 }
 
-/// Numeric example 3: a `FinalRecovery` head at CR >= 100% redeems at face
-/// value plus a bonus capped by the redistribution penalty.
+/// Verifies a `FinalRecovery` head with `CR >= 100%`.
+///
+/// The redemption uses face value plus a bonus that the redistribution penalty limits.
 #[test]
-fn example_3_final_recovery_redemption_above_par() {
+fn final_recovery_redemption_above_par_pays_the_capped_bonus() {
 	build_and_execute(|| {
 		let mut config = example_config();
-		// The example's vault sits at CR 120%, so the MCR must exceed it.
+		// The vault will sit at CR 120%, so the MCR must exceed it.
 		config.minimum_collateralization_ratio = FixedU128::from_rational(130u128, 100u128);
 		config.initial_collateralization_ratio = FixedU128::from_rational(140u128, 100u128);
 		config.safety_collateralization_ratio = FixedU128::from_rational(150u128, 100u128);
 		config.redistribution_penalty = Permill::from_percent(10);
 		register_branch(DOT, PUSD, config);
 
-		// Open above the 140% ICR, then drop to the example's 1 DOT = 2 pUSD,
-		// where 6_000 DOT = 12_000 pUSD against 10_000 of debt is CR 120%.
+		// The test opens above the 140% ICR and then sets 1 DOT = 2 pUSD. At this price, 6_000 DOT
+		// has a value of 12_000 pUSD against 10_000 debt, which gives a 120% CR.
 		set_price(DOT, FixedU128::from_rational(4, 1));
 		assert_ok!(open(1, DOT, PUSD, 6_000 * UNIT, 10_000 * UNIT, rate_pct(1, 1_000)));
 		set_price(DOT, FixedU128::from_rational(2, 1));
@@ -2308,16 +2598,17 @@ fn example_3_final_recovery_redemption_above_par() {
 	});
 }
 
-/// Numeric example 4: a `FinalRecovery` head below par, where partial Insurance
-/// Fund cover raises the rate the market redeems at, and the fund's cover is
-/// merged into the final settlement once the market side is exhausted.
+/// Verifies a `FinalRecovery` head below par with partial Insurance Fund cover.
+///
+/// The cover increases the market-side redemption rate. After cancellation of all market-side
+/// debt, the final settlement includes the Insurance Fund cover.
 #[test]
-fn example_4_final_recovery_redemption_below_par_with_insurance_cover() {
+fn final_recovery_redemption_below_par_settles_with_insurance_cover() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, example_config());
 
-		// Open healthy, then drop to the example's price: 4_000 DOT = 8_000 pUSD
-		// against 10_000 of debt is CR 80%.
+		// The test opens a healthy vault and then sets 1 DOT = 2 pUSD. Thus, 4_000 DOT has a value
+		// of 8_000 pUSD against 10_000 debt, which gives an 80% CR.
 		set_price(DOT, FixedU128::from_rational(4, 1));
 		assert_ok!(open(1, DOT, PUSD, 4_000 * UNIT, 10_000 * UNIT, rate_pct(1, 1_000)));
 		set_price(DOT, FixedU128::from_rational(2, 1));
@@ -2327,19 +2618,19 @@ fn example_4_final_recovery_redemption_below_par_with_insurance_cover() {
 		mint_stable(PUSD, 3, 1_000_000 * UNIT);
 		let recipient_before = collateral_balance(DOT, 4);
 
-		// shortfall = 10_000 - 8_000 = 2_000, cover = min(1_000, 2_000) = 1_000,
-		// market_cancel_debt = 9_000, recovery_rate = 8_000/9_000 = 0.888…
+		// The shortfall is `10_000 - 8_000 = 2_000`. The cover is
+		// `min(1_000, 2_000) = 1_000`.
 		//
-		// Burning 3_000 buys 3_000 * 8/9 = 2_666.66… pUSD of value, i.e.
-		// 1_333.33… DOT. The doc prints 1_333.335, having rounded its own
-		// intermediate 2_666.66… up to 2_666.67 before halving; the exact
-		// quotient is 1_333.33…, which the pallet floors.
+		// Thus, `market_cancel_debt = 9_000` and `recovery_rate = 8_000 / 9_000 = 0.888…`.
+		// A burn of 3_000 buys `3_000 * 8 / 9 = 2_666.66…` pUSD of value.
+		//
+		// This value equals 1_333.33… DOT, which the pallet rounds down to 1_333.333 tokens.
 		assert_ok!(redeem(3, DOT, PUSD, 3_000 * UNIT, 0, 4, 0));
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 1_333_333);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 
-		// Settling the rest of the market side pays out the whole 4_000 DOT and
-		// merges the fund's 1_000 of cover into the same settlement.
+		// Settlement of the other market-side debt pays all 4_000 DOT. The same settlement includes
+		// the Insurance Fund cover of 1_000.
 		let if_before = Assets::balance(PUSD, insurance_account(PUSD));
 		assert_ok!(redeem(3, DOT, PUSD, 6_000 * UNIT, 0, 4, 0));
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 4_000 * UNIT);

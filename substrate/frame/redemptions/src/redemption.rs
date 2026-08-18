@@ -12,11 +12,11 @@ use crate::{
 use frame::{
 	deps::sp_runtime::{
 		traits::{Saturating, Zero},
-		FixedPointNumber, FixedU128,
+		ArithmeticError, FixedU128,
 	},
 	prelude::*,
 	traits::{
-		fungibles::Balanced as FungiblesBalanced,
+		fungibles::{self, Balanced as FungiblesBalanced},
 		tokens::{Fortitude, Precision, Preservation},
 		OnUnbalanced, Time,
 	},
@@ -32,11 +32,10 @@ struct RedemptionInputs<Balance> {
 }
 
 /// Fee inputs read only for an ordinary redemption.
-struct FeeInputs<Balance> {
+struct FeeInputs {
 	state: RedemptionState,
 	now: Millis,
-	decayed_fee: FixedU128,
-	stablecoin_debt: Balance,
+	curve: fees::DynamicFeeCurve,
 }
 
 struct WalkContext<'a, T: Config> {
@@ -79,12 +78,13 @@ impl<T: Config> Pallet<T> {
 	fn redemption_inputs(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-		max_stable_in: BalanceOf<T>,
+		max_stable_to_spend: BalanceOf<T>,
 	) -> Result<RedemptionInputs<BalanceOf<T>>, Error<T>> {
 		let config =
 			RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::StablecoinNotRegistered)?;
+		// A budget below the minimum cannot buy it however small the fee.
 		ensure!(
-			max_stable_in >= config.minimum_redemption_amount,
+			max_stable_to_spend >= config.minimum_redemption_amount,
 			Error::<T>::BelowMinimumRedemptionAmount
 		);
 		let price =
@@ -96,15 +96,15 @@ impl<T: Config> Pallet<T> {
 	fn fee_inputs(
 		stable_id: &StableIdOf<T>,
 		config: &RedemptionConfigOf<T>,
-	) -> FeeInputs<BalanceOf<T>> {
+	) -> Result<FeeInputs, ArithmeticError> {
 		let now = T::TimeProvider::now();
 		let state = RedemptionStates::<T>::get(stable_id);
-		FeeInputs {
-			state,
-			now,
-			decayed_fee: Self::decayed_dynamic_fee(&state, config, now),
-			stablecoin_debt: T::Vaults::stablecoin_debt(stable_id),
-		}
+		let curve = fees::DynamicFeeCurve::try_new(
+			state.dynamic_fee_at(now, config),
+			T::Vaults::stablecoin_debt(stable_id),
+			config,
+		)?;
+		Ok(FeeInputs { state, now, curve })
 	}
 
 	pub(crate) fn do_redeem(
@@ -115,7 +115,7 @@ impl<T: Config> Pallet<T> {
 		recipient: &T::AccountId,
 		max_steps: u32,
 	) -> Result<u32, DispatchError> {
-		let inputs = Self::redemption_inputs(collateral_id, stable_id, terms.max_stable_in)?;
+		let inputs = Self::redemption_inputs(collateral_id, stable_id, terms.max_stable_to_spend)?;
 		let first_target = T::Vaults::next_redemption_target(collateral_id, stable_id, None)
 			.ok_or(Error::<T>::NoRedeemableVault)?;
 		let context =
@@ -143,9 +143,11 @@ impl<T: Config> Pallet<T> {
 			context.stable_id,
 			&owner,
 		)?;
-		let budget = terms
-			.max_stable_in
-			.min(Self::spendable_stable(context.stable_id, context.redeemer));
+		// Recovery charges no fee, so its single debit may consume the account: a spend that
+		// would leave less than the minimum balance is repriced below to the amount that keeps it.
+		let expendable =
+			Self::reducible_stable(context.stable_id, context.redeemer, Preservation::Expendable);
+		let budget = terms.max_stable_to_spend.min(expendable);
 		let plan =
 			Self::price_recovery(context.stable_id, &snapshot, context.price, budget, config)
 				.ok_or(Error::<T>::NoRedeemableVault)?;
@@ -168,12 +170,13 @@ impl<T: Config> Pallet<T> {
 			!plan.debt().is_zero() || !insurance_cover.is_zero(),
 			Error::<T>::NoRedeemableVault
 		);
+		// Recovery charges no fee, so the debt is the whole spend.
 		let scaled_min =
-			fees::scale_floor(terms.min_collateral_out, plan.debt(), terms.max_stable_in);
+			fees::scale_floor(terms.min_collateral_out, plan.debt(), terms.max_stable_to_spend);
 		ensure!(plan.collateral() >= scaled_min, Error::<T>::SlippageExceeded);
 
 		let mut debt_payment = match preservation {
-			Some(preservation) => Self::fund_redemption(
+			Some(preservation) => Self::debit_redeemer(
 				context.stable_id,
 				context.redeemer,
 				plan.debt(),
@@ -220,44 +223,61 @@ impl<T: Config> Pallet<T> {
 		terms: RedemptionTerms<BalanceOf<T>>,
 		max_steps: u32,
 	) -> Result<u32, DispatchError> {
-		let fee_inputs = Self::fee_inputs(context.stable_id, config);
-		let spendable = Self::spendable_stable(context.stable_id, context.redeemer);
+		let fee_inputs = Self::fee_inputs(context.stable_id, config)?;
+		let payable =
+			Self::reducible_stable(context.stable_id, context.redeemer, Preservation::Preserve);
 		let debt_budget =
-			Self::ordinary_debt_budget(config, &fee_inputs, terms.max_stable_in, spendable);
-		ensure!(
-			debt_budget >= config.minimum_redemption_amount,
+			Self::ordinary_debt_budget(&fee_inputs, terms.max_stable_to_spend.min(payable));
+		// A short budget is the terms' fault when the balance covers them, else the balance's.
+		let short_budget = if payable >= terms.max_stable_to_spend {
+			Error::<T>::BelowMinimumRedemptionAmount
+		} else {
 			Error::<T>::InsufficientStableBalance
-		);
+		};
+		ensure!(debt_budget >= config.minimum_redemption_amount, short_budget);
+		let planned_fee = fee_inputs.curve.fee(debt_budget);
 
+		let mut payment = Self::debit_redeemer(
+			context.stable_id,
+			context.redeemer,
+			debt_budget.checked_add(&planned_fee).ok_or(ArithmeticError::Overflow)?,
+			Preservation::Preserve,
+		)?;
 		let result = Self::execute_ordinary_walk(
 			context,
 			Self::effective_step_cap(max_steps),
 			debt_budget,
 			first_target,
+			&mut payment,
 		)?;
 		ensure!(!result.debt.is_zero(), Error::<T>::NoRedeemableVault);
 
-		let fee = fees::redemption_fee(
-			result.debt,
-			Self::charged_fee_rate(config, &fee_inputs, result.debt),
-		);
-		Self::charge_fee(context.stable_id, context.redeemer, fee)?;
+		// The `payment` reserved `planned_fee`. The fee rate is monotonic only up to fixed-point
+		// rounding, so the cap keeps a shorter walk from costing more than the plan it was
+		// funded against.
+		let fee = fee_inputs.curve.fee(result.debt).min(planned_fee);
+		Self::route_fee(&mut payment, fee)?;
+		Self::refund_change(context.redeemer, payment)?;
 
-		let redeemed = debt_budget.saturating_sub(result.remaining);
-		let scaled_min = fees::scale_floor(terms.min_collateral_out, redeemed, terms.max_stable_in);
+		let stable_spent = result.debt.saturating_add(fee);
+		let scaled_min =
+			fees::scale_floor(terms.min_collateral_out, stable_spent, terms.max_stable_to_spend);
 		ensure!(result.collateral >= scaled_min, Error::<T>::SlippageExceeded);
 
-		Self::finalize_ordinary(context, config, &fee_inputs, &result, fee);
+		Self::finalize_ordinary(context, &fee_inputs, &result, fee);
 		Ok(result.steps)
 	}
 
 	/// Execute the ordinary Vaults-owned queue. Recovery is handled before this walk starts.
+	/// Each settled step carves its debt out of `payment`.
 	fn execute_ordinary_walk(
 		context: &WalkContext<'_, T>,
 		step_cap: u32,
 		debt_budget: BalanceOf<T>,
 		first_target: (T::AccountId, pusd_primitives::VaultStatus),
+		payment: &mut StableCreditOf<T>,
 	) -> Result<OrdinaryResult<BalanceOf<T>>, DispatchError> {
+		debug_assert!(payment.peek() >= debt_budget);
 		let mut result = OrdinaryResult::new(debt_budget);
 		let mut cursor = None;
 		let mut next = Some(first_target);
@@ -277,7 +297,7 @@ impl<T: Config> Pallet<T> {
 				break;
 			}
 
-			let applied = Self::apply_ordinary_step(context, &owner, result.remaining)?;
+			let applied = Self::apply_ordinary_step(context, &owner, result.remaining, payment)?;
 			result.steps = result.steps.saturating_add(1);
 
 			match applied {
@@ -320,13 +340,15 @@ impl<T: Config> Pallet<T> {
 		Step::Redeem { debt, collateral: collateral.min(snapshot.collateral) }
 	}
 
-	/// Price one target from its projection, fund what the redeemer can pay,
-	/// and apply the settlement. `Skip` and `Stop` never touch storage.
+	/// Price one target from its projection, carve its debt out of `payment`, and apply the
+	/// settlement. `Skip` and `Stop` never touch storage.
 	fn apply_ordinary_step(
 		context: &WalkContext<'_, T>,
 		owner: &T::AccountId,
 		budget: BalanceOf<T>,
+		payment: &mut StableCreditOf<T>,
 	) -> Result<Step<BalanceOf<T>>, DispatchError> {
+		debug_assert!(payment.peek() >= budget);
 		let snapshot = T::Vaults::project_redemption_snapshot(
 			context.collateral_id,
 			context.stable_id,
@@ -337,19 +359,7 @@ impl<T: Config> Pallet<T> {
 			return Ok(priced);
 		};
 
-		let (funded, preservation) =
-			Self::fundable_budget(context.stable_id, context.redeemer, debt)?;
-		let (debt, collateral) = if funded < debt {
-			match Self::price_ordinary_step(&snapshot, context.price, funded) {
-				Step::Redeem { debt, collateral } => (debt, collateral),
-				_ => return Ok(Step::Stop),
-			}
-		} else {
-			(debt, collateral)
-		};
-
-		let debt_payment =
-			Self::fund_redemption(context.stable_id, context.redeemer, debt, preservation)?;
+		let debt_payment = Self::exact_credit(payment.extract(debt), debt)?;
 		T::Vaults::redeem_step(
 			context.collateral_id,
 			context.stable_id,
@@ -360,6 +370,9 @@ impl<T: Config> Pallet<T> {
 		Ok(Step::Redeem { debt, collateral })
 	}
 
+	/// The part of `need` one debit can take from the redeemer, and its preservation. A
+	/// shortfall is returned for re-pricing only when `need` would leave less than the minimum
+	/// balance and something is still payable; any other shortfall is an insufficient balance.
 	fn fundable_budget(
 		stable_id: &StableIdOf<T>,
 		redeemer: &T::AccountId,
@@ -369,82 +382,94 @@ impl<T: Config> Pallet<T> {
 			reducible_debit::<T::StableAssets, _>(stable_id.clone(), redeemer, need);
 		if funded < need {
 			ensure!(preservation == Preservation::Preserve, Error::<T>::InsufficientStableBalance);
+			ensure!(!funded.is_zero(), Error::<T>::InsufficientStableBalance);
 		}
 		Ok((funded, preservation))
 	}
 
-	fn fund_redemption(
+	/// Withdraws exactly `amount` of the stablecoin from the redeemer as a credit.
+	fn debit_redeemer(
 		stable_id: &StableIdOf<T>,
 		redeemer: &T::AccountId,
-		debt: BalanceOf<T>,
+		amount: BalanceOf<T>,
 		preservation: Preservation,
 	) -> Result<StableCreditOf<T>, DispatchError> {
 		let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
 			stable_id.clone(),
 			redeemer,
-			debt,
+			amount,
 			Precision::Exact,
 			preservation,
 			Fortitude::Polite,
 		)?;
-		debug_assert_eq!(credit.peek(), debt);
-		Ok(credit)
+		Self::exact_credit(credit, amount)
 	}
 
-	fn spendable_stable(stable_id: &StableIdOf<T>, redeemer: &T::AccountId) -> BalanceOf<T> {
-		reducible_debit::<T::StableAssets, _>(
-			stable_id.clone(),
-			redeemer,
-			BalanceOf::<T>::max_value(),
-		)
-		.0
+	/// Accepts `credit` only if it carries exactly `amount`: vaults and the fee handler take
+	/// whatever a credit carries, so any other size would settle an unpriced amount.
+	pub(crate) fn exact_credit(
+		credit: StableCreditOf<T>,
+		amount: BalanceOf<T>,
+	) -> Result<StableCreditOf<T>, DispatchError> {
+		if credit.peek() == amount {
+			Ok(credit)
+		} else {
+			drop(credit);
+			Err(DispatchError::Corruption)
+		}
 	}
 
-	fn ordinary_debt_budget(
-		config: &RedemptionConfigOf<T>,
-		fee_inputs: &FeeInputs<BalanceOf<T>>,
-		max_stable_in: BalanceOf<T>,
-		spendable: BalanceOf<T>,
-	) -> BalanceOf<T> {
-		// Aggregate debt can exclude a terminal charge. The caller's budget must limit the walk.
-		let max_debt = max_stable_in;
-		fees::max_debt_for_budget(spendable, max_debt, |debt| {
-			fees::redemption_fee(debt, Self::charged_fee_rate(config, fee_inputs, debt))
-		})
-	}
-
-	fn charge_fee(
+	/// The stablecoin the redeemer can pay under `preservation`, net of freezes.
+	fn reducible_stable(
 		stable_id: &StableIdOf<T>,
 		redeemer: &T::AccountId,
-		fee: BalanceOf<T>,
-	) -> DispatchResult {
+		preservation: Preservation,
+	) -> BalanceOf<T> {
+		<T::StableAssets as fungibles::Inspect<_>>::reducible_balance(
+			stable_id.clone(),
+			redeemer,
+			preservation,
+			Fortitude::Polite,
+		)
+	}
+
+	/// Calculates the debt that `stable_budget` buys on this redemption's curve, including the fee.
+	///
+	/// Only the budget limits the walk. The aggregate debt in the curve can exclude a terminal
+	/// charge that a full payoff cancels.
+	fn ordinary_debt_budget(fee_inputs: &FeeInputs, stable_budget: BalanceOf<T>) -> BalanceOf<T> {
+		fees::max_debt_for_budget(stable_budget, |debt| fee_inputs.curve.fee(debt))
+	}
+
+	/// Carves the fee out of `payment` and routes it to the fee handler.
+	fn route_fee(payment: &mut StableCreditOf<T>, fee: BalanceOf<T>) -> DispatchResult {
 		if fee.is_zero() {
 			return Ok(());
 		}
-		let (funded, preservation) =
-			reducible_debit::<T::StableAssets, _>(stable_id.clone(), redeemer, fee);
-		ensure!(funded >= fee, Error::<T>::InsufficientStableBalance);
-		let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
-			stable_id.clone(),
-			redeemer,
-			fee,
-			Precision::Exact,
-			preservation,
-			Fortitude::Polite,
-		)?;
-		debug_assert_eq!(credit.peek(), fee);
+		let credit = Self::exact_credit(payment.extract(fee), fee)?;
 		T::FeeHandler::on_unbalanced(credit);
 		Ok(())
 	}
 
+	/// Returns the unspent part of `payment` to the redeemer. The preserving debit kept the
+	/// account alive, so a refused deposit is an invariant break.
+	fn refund_change(redeemer: &T::AccountId, change: StableCreditOf<T>) -> DispatchResult {
+		if change.peek().is_zero() {
+			return Ok(());
+		}
+		<T::StableAssets as FungiblesBalanced<_>>::resolve(redeemer, change).map_err(|change| {
+			drop(change);
+			DispatchError::Corruption
+		})
+	}
+
 	fn finalize_ordinary(
 		context: &WalkContext<'_, T>,
-		config: &RedemptionConfigOf<T>,
-		fee_inputs: &FeeInputs<BalanceOf<T>>,
+		fee_inputs: &FeeInputs,
 		result: &OrdinaryResult<BalanceOf<T>>,
 		fee: BalanceOf<T>,
 	) {
-		let new_fee = Self::raised_dynamic_fee(config, fee_inputs, result.debt);
+		let new_fee = fee_inputs.curve.raised_dynamic_fee(result.debt.unique_saturated_into());
 		RedemptionStates::<T>::insert(
 			context.stable_id,
 			RedemptionState { dynamic_fee: new_fee, last_fee_operation: fee_inputs.now },
@@ -468,53 +493,14 @@ impl<T: Config> Pallet<T> {
 		});
 	}
 
-	fn charged_fee_rate(
-		config: &RedemptionConfigOf<T>,
-		fee_inputs: &FeeInputs<BalanceOf<T>>,
-		redeemed: BalanceOf<T>,
-	) -> FixedU128 {
-		let raised = Self::raised_dynamic_fee(config, fee_inputs, redeemed);
-		fees::fee_rate(raised, config.base_fee, config.fee_ceiling)
-	}
-
-	fn raised_dynamic_fee(
-		config: &RedemptionConfigOf<T>,
-		fee_inputs: &FeeInputs<BalanceOf<T>>,
-		redeemed: BalanceOf<T>,
-	) -> FixedU128 {
-		let fraction = FixedU128::checked_from_rational(redeemed, fee_inputs.stablecoin_debt)
-			.unwrap_or_else(FixedU128::one);
-		fees::increased_dynamic_fee(
-			fee_inputs.decayed_fee,
-			fraction,
-			config.dynamic_fee_increase_divisor,
-			config.dynamic_fee_floor,
-			config.dynamic_fee_ceiling,
-		)
-	}
-
-	fn decayed_dynamic_fee(
-		state: &RedemptionState,
-		config: &RedemptionConfigOf<T>,
-		now: Millis,
-	) -> FixedU128 {
-		fees::decay_dynamic_fee(
-			state.dynamic_fee,
-			now.saturating_sub(state.last_fee_operation),
-			config.dynamic_fee_decay_period,
-		)
-		.max(config.dynamic_fee_floor)
-		.min(config.dynamic_fee_ceiling)
-	}
-
-	/// Build an indicative read-only quote from projected post-touch snapshots.
+	/// Builds an indicative read-only quote from projected post-touch snapshots.
 	pub(crate) fn quote_redeem(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-		max_stable_in: BalanceOf<T>,
+		max_stable_to_spend: BalanceOf<T>,
 		max_steps: u32,
 	) -> Result<RedemptionQuoteOf<T>, DispatchError> {
-		let inputs = Self::redemption_inputs(collateral_id, stable_id, max_stable_in)?;
+		let inputs = Self::redemption_inputs(collateral_id, stable_id, max_stable_to_spend)?;
 		let mut targets = T::Vaults::redemption_quote_targets(collateral_id, stable_id);
 		let first_owner = targets.next().ok_or(Error::<T>::NoRedeemableVault)?;
 		let first = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &first_owner)?;
@@ -524,7 +510,7 @@ impl<T: Config> Pallet<T> {
 				stable_id,
 				&first,
 				inputs.price,
-				max_stable_in,
+				max_stable_to_spend,
 				&inputs.config,
 			)
 			.filter(|plan| !plan.debt().is_zero() || !plan.insurance_cover().is_zero())
@@ -538,13 +524,18 @@ impl<T: Config> Pallet<T> {
 			});
 		}
 
-		let fee_inputs = Self::fee_inputs(stable_id, &inputs.config);
+		let fee_inputs = Self::fee_inputs(stable_id, &inputs.config)?;
+		let debt_budget = Self::ordinary_debt_budget(&fee_inputs, max_stable_to_spend);
+		ensure!(
+			debt_budget >= inputs.config.minimum_redemption_amount,
+			Error::<T>::BelowMinimumRedemptionAmount
+		);
 		Self::quote_ordinary(
 			collateral_id,
 			stable_id,
 			&inputs,
 			&fee_inputs,
-			max_stable_in,
+			debt_budget,
 			Self::effective_step_cap(max_steps),
 			first,
 			targets,
@@ -555,8 +546,8 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		inputs: &RedemptionInputs<BalanceOf<T>>,
-		fee_inputs: &FeeInputs<BalanceOf<T>>,
-		max_stable_in: BalanceOf<T>,
+		fee_inputs: &FeeInputs,
+		debt_budget: BalanceOf<T>,
 		step_cap: u32,
 		first: SnapshotOf<T>,
 		mut targets: impl Iterator<Item = T::AccountId>,
@@ -565,7 +556,7 @@ impl<T: Config> Pallet<T> {
 		let mut next = Some(first);
 
 		loop {
-			let remaining = max_stable_in.saturating_sub(quote.debt_cancelled);
+			let remaining = debt_budget.saturating_sub(quote.debt_cancelled);
 			if remaining.is_zero() {
 				break;
 			}
@@ -595,10 +586,7 @@ impl<T: Config> Pallet<T> {
 		}
 
 		ensure!(!quote.debt_cancelled.is_zero(), Error::<T>::NoRedeemableVault);
-		quote.fee = fees::redemption_fee(
-			quote.debt_cancelled,
-			Self::charged_fee_rate(&inputs.config, fee_inputs, quote.debt_cancelled),
-		);
+		quote.fee = fee_inputs.curve.fee(quote.debt_cancelled);
 		Ok(quote)
 	}
 }
