@@ -27,6 +27,7 @@ pallet-balances = { workspace = true, features = ["std"] }
 pallet-linked-list = { workspace = true, features = ["std"] }
 pallet-timestamp = { workspace = true, features = ["std"] }
 pallet-vaults = { workspace = true, features = ["std"] }
+proptest = { workspace = true }
 
 [features]
 default = ["std"]

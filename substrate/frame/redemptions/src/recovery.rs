@@ -151,7 +151,7 @@ impl<T: Config> Pallet<T> {
 		// The cover was capped at the fund's reducible balance when priced, in
 		// this same dispatch; a failure means the payer drained the fund
 		// mid-redemption (it is the fund itself) and must abort.
-		<T::StableAssets as FungiblesBalanced<_>>::withdraw(
+		let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
 			stable_id.clone(),
 			&account,
 			cover,
@@ -159,7 +159,8 @@ impl<T: Config> Pallet<T> {
 			preservation,
 			Fortitude::Polite,
 		)
-		.map_err(|_| Error::<T>::InsuranceFundWithdrawFailed.into())
+		.map_err(|_| Error::<T>::InsuranceFundWithdrawFailed)?;
+		Self::exact_credit(credit, cover)
 	}
 
 	fn final_recovery_head(
