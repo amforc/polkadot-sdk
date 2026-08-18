@@ -1,7 +1,7 @@
 //! `offset_pending_liquidation`: the last-resort backstop consuming ALL
-//! pending deposits pro-rata (design decision 2026-07-29, replacing the spec
-//! sketch's oldest-first FIFO), tracked lazily through the pending `P`/`S`
-//! accumulator pair. The active `P`/`S`/`G` are never touched (invariant 11).
+//! pending deposits pro-rata rather than oldest-first, tracked lazily through
+//! the pending `P`/`S` accumulator pair. The active `P`/`S`/`G` are never
+//! touched (invariant 11).
 
 use crate::{math::pro_rata_floor, mock::*, Error};
 
@@ -362,7 +362,8 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		//   collateral slice = floor(2_090_841_613_637 * 350 / 399)
 		//                    = 1_834_071_590_909  (183.4071590909 DOT),
 		//   delta_S = floor(1_834_071_590_909e18 / 350)
-		//           = 5_240_204_545_454_285_714_285_714_285e-18.
+		//           = 5_240_204_545_454_285_714_285_714_285e-18,
+		//             i.e. 0.5240204545 DOT per pUSD — the same stage price.
 		let (debt_offset2, leftover2) =
 			simulate_pending_offset(DOT, PUSD, after_jit_debt, after_jit_collat);
 		assert_eq!(debt_offset2, 350);
@@ -459,12 +460,12 @@ fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 	});
 }
 
-/// Numeric example 9: the accepted pending-deposit portion of a liquidation
-/// allocation, shared pro-rata across all pending deposits (the 2026-07-29
-/// grouped/proportional ruling; the spec sketch's FIFO figures no longer
-/// apply). The pool keeps 400 of the 1_400 total pending.
+/// The accepted pending-deposit portion of a liquidation allocation, shared
+/// pro-rata across every pending deposit: each of the three depositors takes
+/// its share of both the burn and the collateral, whatever its age. The pool
+/// keeps 400 of the 1_400 pending total.
 #[test]
-fn example_9_pending_deposit_pro_rata_offset() {
+fn pending_deposit_offset_is_shared_pro_rata() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_pending(1, 300); // Alice.

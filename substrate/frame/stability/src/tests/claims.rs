@@ -164,9 +164,9 @@ fn poke_activates_matured_pending() {
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 
-		// Long past maturity, a third party pokes the row: activation is
-		// automatic after the entry delay — the owner committed risk capital
-		// at deposit time — so the poke completes the move.
+		// Nothing folds a matured pending leg in on its own: the row needs a
+		// touch. Long past maturity a third party supplies one, and the poke
+		// completes the move.
 		advance_time(49_000);
 		assert_ok!(poke(7, 1, DOT, PUSD));
 

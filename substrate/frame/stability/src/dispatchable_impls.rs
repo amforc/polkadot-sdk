@@ -1084,10 +1084,10 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Housekeeping (SPEC.md §8.2): permissionlessly realize `owner`'s
+	/// Permissionlessly realize `owner`'s
 	/// deposit without moving value, and fold in a matured pending deposit.
-	/// Activation is automatic after the entry delay — the owner committed
-	/// risk capital at deposit time — so any caller may complete the move.
+	/// A matured pending deposit needs a touch to fold in; past the entry
+	/// delay the move is mechanical, so any caller may supply that touch.
 	/// A frozen branch skips the activation (it changes offsettable risk,
 	/// which the freeze halts) but still realizes.
 	pub(crate) fn do_poke_deposit(
