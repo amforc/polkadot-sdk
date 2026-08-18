@@ -4,8 +4,6 @@ use frame::traits::{fungibles::Mutate as FungiblesMutate, BadOrigin};
 /// Replacement admins used by the reassignment test.
 const NEW_FULL_ADMIN: AccountId = 300;
 const NEW_EMERGENCY_ADMIN: AccountId = 301;
-/// One day in milliseconds — the mock guard's `min_ceiling_ttl`.
-const DAY_MS: Moment = 24 * 3_600 * 1_000;
 
 fn market_exists(collateral: AssetId, stable: StableId) -> bool {
 	branch_state(collateral, stable).is_some()
@@ -38,6 +36,7 @@ fn signed_create_takes_deposit_and_remove_refunds() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			(),
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), MarketDepositBase::get());
 
@@ -64,6 +63,7 @@ fn create_rejects_a_creator_that_cannot_pay_the_custody_seed() {
 				PUSD,
 				branch_admins(PENNILESS_ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				(),
 			),
 			Error::<Test>::CustodySeedUnavailable
 		);
@@ -87,6 +87,7 @@ fn insufficient_collateral_custody_needs_the_provider_reference() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			(),
 		));
 		assert_eq!(collateral_balance(INSUFFICIENT, custody), min_collateral_balance(INSUFFICIENT));
 		assert_eq!(System::consumers(&custody), 1, "the asset account holds a consumer reference");
@@ -108,6 +109,7 @@ fn root_create_takes_no_deposit() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			(),
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
 		assert!(market_exists(DOT, PUSD));
@@ -126,6 +128,7 @@ fn lifecycle_hooks_fire_on_create_and_remove() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			(),
 		));
 		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true, 1)]);
 
@@ -151,31 +154,120 @@ fn create_branch_rejects_config_outside_envelope() {
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				config,
+				(),
 			),
-			Error::<Test>::ConfigOutsideEnvelope
+			Error::<Test>::ConfigOutsideEnvelope(
+				BoundViolation::MinimumCollateralizationRatioTooLow
+			)
 		);
 		assert!(!market_exists(DOT, PUSD));
 	});
 }
 
-// A line above the envelope's `max_debt_ceiling` is rejected at creation.
+// A market with no floor under its vaults can be filled with dust: each vault is
+// a storage row, a list node, and a redemption step that the debt inside it never
+// pays for. Every write of a config is held to the rule, so an update cannot
+// install what creation refuses.
 #[test]
-fn create_branch_rejects_line_above_envelope() {
+fn zero_vault_floors_are_rejected_on_every_write() {
 	build_and_execute(|| {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		// One above the guard's `max_debt_ceiling` (10^15).
-		let config =
-			BranchConfig { debt_ceiling: 1_000_000_000_000_001, ..default_branch_config() };
-		assert_noop!(
+		let create = |config| {
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				config,
-			),
-			Error::<Test>::ConfigOutsideEnvelope
+				(),
+			)
+		};
+		assert_noop!(
+			create(BranchConfig { minimum_debt: 0, ..default_branch_config() }),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumDebt)
 		);
+		assert_noop!(
+			create(BranchConfig { minimum_collateral: 0, ..default_branch_config() }),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumCollateral)
+		);
+
+		register_market(DOT, PUSD);
+		let set_param =
+			|update| Pallet::<Test>::set_param(RuntimeOrigin::signed(ADMIN), DOT, PUSD, update);
+		assert_noop!(
+			set_param(BranchConfigUpdate::MinimumDebt(0)),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumDebt)
+		);
+		assert_noop!(
+			set_param(BranchConfigUpdate::MinimumCollateral(0)),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumCollateral)
+		);
+	});
+}
+
+// An inverted rate band accepts no rate at all, so the market takes neither a new
+// vault nor a rate change. The emergency admin can reach it: moving both ends
+// inward is a narrowing by the defensive rule, which compares each end against its
+// own old value and never against the other end.
+#[test]
+fn inverted_borrow_rate_band_is_rejected_on_every_write() {
+	build_and_execute(|| {
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		let inverted = BranchConfig {
+			minimum_borrow_rate: rate_pct(300, 100),
+			maximum_borrow_rate: rate_pct(200, 100),
+			..default_branch_config()
+		};
+		assert_noop!(
+			Pallet::<Test>::create_branch(
+				RuntimeOrigin::root(),
+				DOT,
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				inverted,
+				(),
+			),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumBorrowRateAboveMaximum)
+		);
+
+		register_market(DOT, PUSD); // Band is 0.1%..400%.
+		let narrow = |min, max| {
+			Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(EMERGENCY_ADMIN),
+				DOT,
+				PUSD,
+				BranchConfigUpdate::BorrowRateBounds { min, max },
+			)
+		};
+		assert_noop!(
+			narrow(rate_pct(300, 100), rate_pct(200, 100)),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumBorrowRateAboveMaximum)
+		);
+		// A narrowing that leaves the ends in order still applies.
+		assert_ok!(narrow(rate_pct(200, 100), rate_pct(300, 100)));
+		let config = branch_config(DOT, PUSD).expect("config");
+		assert_eq!(config.minimum_borrow_rate, rate_pct(200, 100));
+		assert_eq!(config.maximum_borrow_rate, rate_pct(300, 100));
+	});
+}
+
+// The debt limit is denominated in the market's own stablecoin, so no global
+// envelope can judge it: the creator picks it and the per-collateral global
+// ceiling is what actually caps systemic exposure.
+#[test]
+fn create_branch_accepts_any_debt_ceiling() {
+	build_and_execute(|| {
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		let config = BranchConfig { debt_ceiling: u128::MAX, ..default_branch_config() };
+		assert_ok!(Pallet::<Test>::create_branch(
+			RuntimeOrigin::root(),
+			DOT,
+			PUSD,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			config,
+			(),
+		));
+		assert_eq!(branch_config(DOT, PUSD).expect("config").debt_ceiling, u128::MAX);
 	});
 }
 
@@ -191,6 +283,7 @@ fn create_branch_rejects_unpriced_collateral() {
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				(),
 			),
 			Error::<Test>::OraclePriceNotAvailable
 		);
@@ -222,7 +315,9 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 				PUSD,
 				BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(104, 100))
 			),
-			Error::<Test>::ConfigOutsideEnvelope
+			Error::<Test>::ConfigOutsideEnvelope(
+				BoundViolation::MinimumCollateralizationRatioTooLow
+			)
 		);
 	});
 }
@@ -393,6 +488,7 @@ fn redistribution_account_provider_reference_is_paired() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			(),
 		));
 		assert_eq!(System::providers(&account), 3);
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
@@ -472,6 +568,7 @@ fn registry_has_no_global_cap() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			(),
 		));
 		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 10);
 	});
@@ -490,6 +587,7 @@ fn create_branch_rejects_unknown_stable() {
 				9_999,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				(),
 			),
 			Error::<Test>::UnknownStable
 		);
@@ -511,92 +609,9 @@ fn create_branch_rejects_stable_collateral_collision() {
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				(),
 			),
 			Error::<Test>::StableCollateralCollision
-		);
-	});
-}
-
-// The autoline knobs must sit inside the envelope: the gap at or below
-// `max_ceiling_gap`, and — when the autoline is enabled — the ttl at or above
-// `min_ceiling_ttl`. This stops a creator defeating the gradual-increase control.
-#[test]
-fn create_branch_rejects_autoline_knobs_outside_envelope() {
-	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		// A gap above `max_ceiling_gap` is rejected.
-		let wide_gap = BranchConfig {
-			ceiling_gap: 2_000_000_000,
-			ceiling_ttl: DAY_MS,
-			..default_branch_config()
-		};
-		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				DOT,
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				wide_gap,
-			),
-			Error::<Test>::ConfigOutsideEnvelope
-		);
-		// With the autoline enabled, a ttl below `min_ceiling_ttl` is rejected.
-		let fast_ttl =
-			BranchConfig { ceiling_gap: 1_000, ceiling_ttl: DAY_MS - 1, ..default_branch_config() };
-		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				DOT,
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				fast_ttl,
-			),
-			Error::<Test>::ConfigOutsideEnvelope
-		);
-		assert!(!market_exists(DOT, PUSD));
-	});
-}
-
-// The autoline knobs can be tuned after creation, but only within the envelope.
-#[test]
-fn set_ceiling_knobs_apply_within_envelope() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD); // autoline off: gap == 0, ttl == 0
-							  // Raise the ttl first (valid while the autoline is still disabled), then the gap.
-		assert_ok!(Pallet::<Test>::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			BranchConfigUpdate::CeilingTtl(DAY_MS)
-		));
-		assert_ok!(Pallet::<Test>::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			BranchConfigUpdate::CeilingGap(1_000)
-		));
-		let config = branch_config(DOT, PUSD).expect("config");
-		assert_eq!(config.ceiling_gap, 1_000);
-		assert_eq!(config.ceiling_ttl, DAY_MS);
-		// A ttl below the floor (autoline now enabled) is rejected.
-		assert_noop!(
-			Pallet::<Test>::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				BranchConfigUpdate::CeilingTtl(DAY_MS - 1)
-			),
-			Error::<Test>::ConfigOutsideEnvelope
-		);
-		// A gap above the cap is rejected.
-		assert_noop!(
-			Pallet::<Test>::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				BranchConfigUpdate::CeilingGap(2_000_000_000)
-			),
-			Error::<Test>::ConfigOutsideEnvelope
 		);
 	});
 }

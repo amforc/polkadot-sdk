@@ -4,10 +4,13 @@ use crate::{math, Millis};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
 	arithmetic::{
-		ArithmeticError, CheckedAdd, CheckedSub, FixedPointNumber, FixedPointOperand, FixedU128,
-		One, Permill, Saturating, Zero,
+		ArithmeticError, AtLeast32BitUnsigned, CheckedAdd, CheckedSub, FixedPointNumber,
+		FixedPointOperand, FixedU128, One, Permill, Saturating, Zero,
 	},
-	deps::sp_core::{U256, U512},
+	deps::{
+		frame_support::PalletError,
+		sp_core::{U256, U512},
+	},
 };
 use pusd_primitives::MILLIS_PER_YEAR;
 pub use pusd_primitives::{BranchMode, DebtCollateral, VaultStatus};
@@ -111,27 +114,6 @@ pub struct AssetRoleUsage {
 	pub role: AssetRole,
 	/// Number of markets using the asset in this role.
 	pub markets: u32,
-}
-
-/// Global debt state for one collateral asset.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Eq, Default)]
-pub struct CollateralRisk<Balance> {
-	/// Maximum debt across all markets using this collateral.
-	///
-	/// The value is measured in collateral units. Zero blocks new debt.
-	pub debt_ceiling: Balance,
-	/// Current debt across all markets using this collateral.
-	///
-	/// This value is derived from the market records. Stable assets are counted at the same unit
-	/// value.
-	pub outstanding: Balance,
-}
-
-impl<Balance: Zero> CollateralRisk<Balance> {
-	/// Whether this record carries neither a governance ceiling nor outstanding debt.
-	pub fn is_empty(&self) -> bool {
-		self.debt_ceiling.is_zero() && self.outstanding.is_zero()
-	}
 }
 
 /// A debt amount split into principal and interest.
@@ -449,12 +431,100 @@ pub struct BranchConfig<Balance> {
 	pub rate_adjustment_cooldown: Millis,
 	/// Collateral penalty applied during liquidation.
 	pub redistribution_penalty: Permill,
-	/// Headroom above current debt for the automatic debt limit.
+}
+
+/// The smallest balance each of a market's two assets can hold.
+///
+/// A market's own amounts mean nothing on their own: a six-decimal stablecoin and an
+/// eighteen-decimal one disagree about what "one" is. Both agree that a balance under the
+/// asset's minimum cannot be held, which is what makes it the one floor every market can be
+/// judged against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AssetMinimums<Balance> {
+	/// Smallest collateral balance an account can hold.
+	pub collateral: Balance,
+	/// Smallest stablecoin balance an account can hold.
+	pub stable: Balance,
+}
+
+/// A way one [`BranchConfig`] contradicts itself or the assets it names.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, TypeInfo, PalletError, Clone, PartialEq, Eq, Debug,
+)]
+pub enum BranchConfigDefect {
+	/// The liquidation ratio is above the borrow ratio, so every new vault opens liquidatable.
+	LiquidationRatioAboveInitial,
+	/// The liquidation ratio is above the safety ratio, so the market liquidates before it
+	/// enters safety mode.
+	LiquidationRatioAboveSafety,
+	/// The rate band is inverted, so no rate a vault could pick is inside it.
+	MinimumBorrowRateAboveMaximum,
+	/// The debt floor is zero, so a vault could open owing nothing and never be dormant.
+	ZeroMinimumDebt,
+	/// The collateral floor is zero, so every vault could open on dust.
+	ZeroMinimumCollateral,
+	/// The debt floor is under the stablecoin's minimum balance, so the smallest vault could
+	/// not be paid what it borrows.
+	MinimumDebtBelowStableMinimum,
+	/// The collateral floor is under the collateral's minimum balance, so the smallest vault
+	/// could hold less than an account can carry.
+	MinimumCollateralBelowCollateralMinimum,
+}
+
+impl<Balance: AtLeast32BitUnsigned + Copy> BranchConfig<Balance> {
+	/// Returns how this configuration contradicts itself, or `None` when it is consistent.
 	///
-	/// Zero disables automatic updates.
-	pub ceiling_gap: Balance,
-	/// Minimum time between automatic debt-limit increases.
-	pub ceiling_ttl: Millis,
+	/// Every amount here is denominated in the market's own assets, so its
+	/// magnitude is the creator's choice; `minimums` is the one yardstick those
+	/// assets themselves provide. This rejects only the combinations that
+	/// contradict each other and so cannot describe a working market.
+	/// Runtime-owned floors live in [`BranchConfigBounds::violation`].
+	pub fn structural_defect(
+		&self,
+		minimums: &AssetMinimums<Balance>,
+	) -> Option<BranchConfigDefect> {
+		// A liquidation ratio above the borrow or safety ratio would open
+		// vaults that are already liquidatable.
+		if self.minimum_collateralization_ratio > self.initial_collateralization_ratio {
+			return Some(BranchConfigDefect::LiquidationRatioAboveInitial);
+		}
+		if self.minimum_collateralization_ratio > self.safety_collateralization_ratio {
+			return Some(BranchConfigDefect::LiquidationRatioAboveSafety);
+		}
+		// An empty rate band leaves no rate a vault could open or re-rate at, which stops
+		// borrowing as surely as a zero debt limit does.
+		if self.minimum_borrow_rate > self.maximum_borrow_rate {
+			return Some(BranchConfigDefect::MinimumBorrowRateAboveMaximum);
+		}
+		if let Some(defect) = self.vault_floor_defect(minimums) {
+			return Some(defect);
+		}
+		None
+	}
+
+	/// Returns how the vault floors fail to describe a vault worth carrying.
+	///
+	/// The floors are all that stands between a market and unbounded dust vaults. Each vault is
+	/// a storage row, a sorted-list node, and a step a redemption may walk, and a vault owing
+	/// less than the stablecoin's minimum balance pays for none of it. Measuring against the
+	/// assets' own minimums holds every market to the same rule rather than the same number.
+	fn vault_floor_defect(&self, minimums: &AssetMinimums<Balance>) -> Option<BranchConfigDefect> {
+		// A zero debt floor also makes every husk active, since a vault is dormant exactly
+		// while it owes less than the floor.
+		if self.minimum_debt.is_zero() {
+			return Some(BranchConfigDefect::ZeroMinimumDebt);
+		}
+		if self.minimum_collateral.is_zero() {
+			return Some(BranchConfigDefect::ZeroMinimumCollateral);
+		}
+		if self.minimum_debt < minimums.stable {
+			return Some(BranchConfigDefect::MinimumDebtBelowStableMinimum);
+		}
+		if self.minimum_collateral < minimums.collateral {
+			return Some(BranchConfigDefect::MinimumCollateralBelowCollateralMinimum);
+		}
+		None
+	}
 }
 
 /// Debt totals for one market.
@@ -835,24 +905,11 @@ pub struct BranchState<AccountId, Balance> {
 	pub dormant_redemption_target: Option<AccountId>,
 	/// Frozen state, if the market is frozen.
 	pub frozen: Option<FrozenState>,
-	/// Current automatic debt limit.
-	///
-	/// This value cannot exceed [`BranchConfig::debt_ceiling`].
-	pub effective_ceiling: Balance,
-	/// Time when the automatic debt limit last increased.
-	pub ceiling_last_inc: Millis,
 }
 
-impl<AccountId, Balance: Default + Zero + Ord + Copy> BranchState<AccountId, Balance> {
+impl<AccountId, Balance: Default + Zero> BranchState<AccountId, Balance> {
 	/// Creates empty state for a new market.
-	///
-	/// The automatic debt limit starts at its gap or at the market debt limit, whichever is lower.
-	pub fn fresh(config: &BranchConfig<Balance>, now: Millis) -> Self {
-		let effective_ceiling = if config.ceiling_gap.is_zero() {
-			config.debt_ceiling
-		} else {
-			config.ceiling_gap.min(config.debt_ceiling)
-		};
+	pub fn fresh(now: Millis) -> Self {
 		Self {
 			total_collateral: Balance::zero(),
 			debt: BranchDebt::default(),
@@ -865,8 +922,6 @@ impl<AccountId, Balance: Default + Zero + Ord + Copy> BranchState<AccountId, Bal
 			interest_epoch: now,
 			dormant_redemption_target: None,
 			frozen: None,
-			effective_ceiling,
-			ceiling_last_inc: now,
 		}
 	}
 }
@@ -1144,14 +1199,8 @@ pub enum BranchConfigUpdate<Balance> {
 	UpfrontFeePeriod(Millis),
 	/// Sets the rate-change cooldown.
 	RateAdjustmentCooldown(Millis),
-	/// Sets the collateral penalty applied during liquidation.
+	/// Sets the extra collateral assigned to redistributed debt.
 	RedistributionPenalty(Permill),
-	/// Sets headroom for the automatic debt limit.
-	///
-	/// Zero disables automatic updates.
-	CeilingGap(Balance),
-	/// Sets the delay between automatic debt-limit increases.
-	CeilingTtl(Millis),
 }
 
 impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
@@ -1171,8 +1220,6 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::UpfrontFeePeriod(v) => config.upfront_fee_period = v,
 			Self::RateAdjustmentCooldown(v) => config.rate_adjustment_cooldown = v,
 			Self::RedistributionPenalty(v) => config.redistribution_penalty = v,
-			Self::CeilingGap(v) => config.ceiling_gap = v,
-			Self::CeilingTtl(v) => config.ceiling_ttl = v,
 		}
 	}
 
@@ -1188,15 +1235,19 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::MinimumCollateral(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
-			Self::RedistributionPenalty(_) |
-			Self::CeilingGap(_) |
-			Self::CeilingTtl(_) => AdminLevel::Full,
+			Self::RedistributionPenalty(_) => AdminLevel::Full,
 		}
 	}
 
 	/// Returns whether this update only reduces risk.
 	///
 	/// A defensive update raises ratio limits, lowers the debt limit, or narrows the rate range.
+	/// Nothing else is defensive: an update that needs a full administrator changes what the
+	/// market charges or seizes, which is a policy decision rather than a risk reduction.
+	/// [`required_level`] turns an emergency administrator away from those before this is asked,
+	/// so the `false` below is what keeps the answer right if that order ever changes.
+	///
+	/// [`required_level`]: BranchConfigUpdate::required_level
 	pub fn is_defensive(&self, config: &BranchConfig<Balance>) -> bool {
 		match self {
 			Self::MinimumCollateralizationRatio(v) => *v >= config.minimum_collateralization_ratio,
@@ -1210,49 +1261,54 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::MinimumCollateral(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
-			Self::RedistributionPenalty(_) |
-			Self::CeilingGap(_) |
-			Self::CeilingTtl(_) => true,
+			Self::RedistributionPenalty(_) => false,
 		}
 	}
 }
 
-/// Global limits for market configuration.
-pub struct BranchConfigBounds<Balance> {
+/// Limits for market configuration.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
+pub struct BranchConfigBounds {
 	/// Lowest allowed liquidation and final recovery ratio.
 	pub min_minimum_collateralization_ratio: FixedU128,
 	/// Lowest allowed ratio after borrowing or withdrawing collateral.
 	pub min_initial_collateralization_ratio: FixedU128,
 	/// Lowest allowed market safety-mode ratio.
 	pub min_safety_collateralization_ratio: FixedU128,
-	/// Lowest allowed minimum debt.
-	pub min_minimum_debt: Balance,
-	/// Lowest allowed minimum collateral.
-	pub min_minimum_collateral: Balance,
 	/// Highest allowed annual rate.
 	pub max_borrow_rate: FixedU128,
-	/// Highest allowed market debt limit.
-	pub max_debt_ceiling: Balance,
-	/// Highest allowed headroom for the automatic debt limit.
-	pub max_ceiling_gap: Balance,
-	/// Shortest allowed delay between automatic debt-limit increases.
-	pub min_ceiling_ttl: Millis,
 }
 
-impl<Balance: PartialOrd + Copy + Zero> BranchConfigBounds<Balance> {
-	/// Returns whether `config` is within the global limits.
-	///
-	/// The minimum increase delay applies only when automatic debt-limit updates are enabled.
-	pub fn permits(&self, config: &BranchConfig<Balance>) -> bool {
-		config.minimum_collateralization_ratio >= self.min_minimum_collateralization_ratio &&
-			config.initial_collateralization_ratio >= self.min_initial_collateralization_ratio &&
-			config.safety_collateralization_ratio >= self.min_safety_collateralization_ratio &&
-			config.minimum_debt >= self.min_minimum_debt &&
-			config.minimum_collateral >= self.min_minimum_collateral &&
-			config.maximum_borrow_rate <= self.max_borrow_rate &&
-			config.debt_ceiling <= self.max_debt_ceiling &&
-			config.ceiling_gap <= self.max_ceiling_gap &&
-			(config.ceiling_gap.is_zero() || config.ceiling_ttl >= self.min_ceiling_ttl)
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, TypeInfo, PalletError, Clone, PartialEq, Eq, Debug,
+)]
+pub enum BoundViolation {
+	/// The liquidation ratio is below the runtime's floor.
+	MinimumCollateralizationRatioTooLow,
+	/// The borrow ratio is below the runtime's floor.
+	InitialCollateralizationRatioTooLow,
+	/// The safety-mode ratio is below the runtime's floor.
+	SafetyCollateralizationRatioTooLow,
+	/// The annual rate cap is above the runtime's ceiling.
+	BorrowRateTooHigh,
+}
+
+impl BranchConfigBounds {
+	/// Returns the limit `config` breaches, or `None` when it is within all of them.
+	pub fn violation<Balance>(&self, config: &BranchConfig<Balance>) -> Option<BoundViolation> {
+		if config.minimum_collateralization_ratio < self.min_minimum_collateralization_ratio {
+			return Some(BoundViolation::MinimumCollateralizationRatioTooLow);
+		}
+		if config.initial_collateralization_ratio < self.min_initial_collateralization_ratio {
+			return Some(BoundViolation::InitialCollateralizationRatioTooLow);
+		}
+		if config.safety_collateralization_ratio < self.min_safety_collateralization_ratio {
+			return Some(BoundViolation::SafetyCollateralizationRatioTooLow);
+		}
+		if config.maximum_borrow_rate > self.max_borrow_rate {
+			return Some(BoundViolation::BorrowRateTooHigh);
+		}
+		None
 	}
 }
 
@@ -1330,8 +1386,6 @@ mod tests {
 			interest_epoch: 0,
 			dormant_redemption_target: None,
 			frozen: None,
-			effective_ceiling: 0,
-			ceiling_last_inc: 0,
 		}
 	}
 

@@ -48,10 +48,10 @@ mod tests;
 pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
-	BranchConfig, BranchConfigUpdate, BranchDebt, BranchMode, BranchState, DebtBreakdown,
-	DebtCollateral, FrozenReason, FrozenState, LiquidationSettlement, LiquidationSnapshot,
-	RedistributionAccumulators, RedistributionCarry, RedistributionStakeTotals,
-	StablecoinDebtState, Vault, VaultListId, VaultStatus,
+	AssetMinimums, BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate,
+	BranchDebt, BranchMode, BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState,
+	LiquidationSettlement, LiquidationSnapshot, RedistributionAccumulators, RedistributionCarry,
+	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultStatus,
 };
 pub use weights::WeightInfo;
 
@@ -114,6 +114,12 @@ pub mod pallet {
 
 	/// UNIX time in milliseconds.
 	pub use pusd_primitives::Millis;
+
+	/// Lifecycle registration payload forwarded to [`Config::OnBranchLifecycle`].
+	pub type RegistrationConfigOf<T> = <<T as Config>::OnBranchLifecycle as OnBranchLifecycle<
+		CollateralIdOf<T>,
+		StableIdOf<T>,
+	>>::RegistrationConfig;
 
 	/// Stable-asset credit produced by the pallet.
 	pub type StableCreditOf<T> =
@@ -197,8 +203,9 @@ pub mod pallet {
 		/// Refundable deposit charged for creating a market.
 		type Consideration: Consideration<Self::AccountId, Footprint>;
 
-		/// Limits the configuration of every market.
-		type BranchConfigBounds: Get<BranchConfigBounds<BalanceOf<Self>>>;
+		/// Runtime-owned, scale-independent limits for every market.
+		#[pallet::constant]
+		type BranchConfigBounds: Get<BranchConfigBounds>;
 
 		/// Origin allowed to manage global limits and override market administrators.
 		type ForceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
@@ -272,18 +279,12 @@ pub mod pallet {
 	pub type AssetRoles<T: Config> =
 		StorageMap<_, Blake2_128Concat, CollateralIdOf<T>, AssetRoleUsage, OptionQuery>;
 
-	/// Global debt limit and current debt for each collateral asset.
+	/// Governance debt limit across every market issuing one stable asset.
 	///
-	/// Current debt is derived from [`Branches`]. Stable assets are counted at the same unit value.
-	/// A default record is not stored.
+	/// The limit uses that stablecoin's own units. A zero limit blocks new debt and is not stored.
 	#[pallet::storage]
-	pub type CollateralRisks<T: Config> = StorageMap<
-		_,
-		Blake2_128Concat,
-		CollateralIdOf<T>,
-		crate::types::CollateralRisk<BalanceOf<T>>,
-		ValueQuery,
-	>;
+	pub type GlobalDebtCeilings<T: Config> =
+		StorageMap<_, Blake2_128Concat, StableIdOf<T>, BalanceOf<T>, ValueQuery>;
 
 	/// Fully accrued debt state across every market issuing one stable asset.
 	///
@@ -514,10 +515,10 @@ pub mod pallet {
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
 		},
-		/// The global debt limit for a collateral asset changed.
+		/// The global debt limit for a stable asset changed.
 		GlobalDebtCeilingSet {
-			/// Collateral asset ID.
-			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
 			/// New global debt limit.
 			ceiling: BalanceOf<T>,
 		},
@@ -600,8 +601,10 @@ pub mod pallet {
 		NotBranchAdmin,
 		/// The branch still has vaults, collateral, or debt.
 		BranchNotEmpty,
-		/// The market configuration is outside the allowed limits.
-		ConfigOutsideEnvelope,
+		/// The market configuration contradicts itself.
+		InvalidBranchConfig(crate::types::BranchConfigDefect),
+		/// The market configuration is outside the runtime's limits.
+		ConfigOutsideEnvelope(crate::types::BoundViolation),
 		/// The annual interest rate is outside the market limits.
 		RateOutOfBounds,
 		/// The operation would leave the vault below its required collateral ratio.
@@ -1162,7 +1165,12 @@ pub mod pallet {
 		/// Must pass [`Config::CreateOrigin`] for the stable asset.
 		///
 		/// The assets must exist, the oracle must have a price, and the configuration must be
-		/// allowed. A non-privileged creator pays a refundable deposit.
+		/// structurally valid and within [`Config::BranchConfigBounds`]. A non-privileged creator
+		/// pays a refundable deposit.
+		///
+		/// `lifecycle_config` is forwarded to [`Config::OnBranchLifecycle`]. Vaults does not
+		/// interpret it: each handler validates and stores its own payload, and any hook error
+		/// rolls the complete registration back.
 		///
 		/// Registration also charges one minimum balance of the collateral asset, which the
 		/// market's redistribution account carries until removal refunds it. A deposit-paying
@@ -1175,11 +1183,19 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			admins: BranchAdmins<AccountIdLookupOf<T>>,
-			config: BranchConfig<BalanceOf<T>>,
+			vault_config: BranchConfig<BalanceOf<T>>,
+			lifecycle_config: RegistrationConfigOf<T>,
 		) -> DispatchResult {
 			let depositor = T::CreateOrigin::ensure_origin(origin, &stable_id)?;
 			let admins = admins.try_map(T::Lookup::lookup)?;
-			Self::do_create_branch(collateral_id, stable_id, admins, config, depositor)
+			Self::do_create_branch(
+				collateral_id,
+				stable_id,
+				admins,
+				vault_config,
+				lifecycle_config,
+				depositor,
+			)
 		}
 
 		/// Changes one market parameter.
@@ -1188,8 +1204,8 @@ pub mod pallet {
 		///
 		/// Must be signed by a market administrator with the required role.
 		///
-		/// Emergency administrators may only reduce risk. The full configuration must remain within
-		/// [`Config::BranchConfigBounds`].
+		/// Emergency administrators may only reduce risk. The full configuration must remain
+		/// structurally valid and within [`Config::BranchConfigBounds`].
 		#[pallet::call_index(11)]
 		#[pallet::weight(T::WeightInfo::set_param())]
 		pub fn set_param(
@@ -1329,42 +1345,24 @@ pub mod pallet {
 			Ok(Pays::No.into())
 		}
 
-		/// Sets the global debt limit for a collateral asset.
+		/// Sets the global debt limit for a stable asset.
 		///
 		/// ## Dispatch Origin
 		///
 		/// Requires [`Config::ForceOrigin`].
 		///
-		/// The limit is measured in the collateral asset's units. A limit of zero blocks new debt.
+		/// The limit is measured in the stable asset's units and spans all of its collateral
+		/// markets. A limit of zero blocks new debt.
 		#[pallet::call_index(17)]
 		#[pallet::weight(T::WeightInfo::set_global_debt_ceiling())]
 		pub fn set_global_debt_ceiling(
 			origin: OriginFor<T>,
-			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
 			ceiling: BalanceOf<T>,
 		) -> DispatchResult {
 			T::ForceOrigin::ensure_origin(origin)?;
-			Self::do_set_global_debt_ceiling(collateral_id, ceiling);
+			Self::do_set_global_debt_ceiling(stable_id, ceiling);
 			Ok(())
-		}
-
-		/// Updates a market's automatic debt limit.
-		///
-		/// ## Dispatch Origin
-		///
-		/// May be called by any signed account.
-		///
-		/// Decreases apply at once. Increases wait for the configured delay. The call does nothing
-		/// when the automatic limit is disabled.
-		#[pallet::call_index(18)]
-		#[pallet::weight(T::WeightInfo::poke_ceiling())]
-		pub fn poke_ceiling(
-			origin: OriginFor<T>,
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
-			Self::do_poke_ceiling(collateral_id, stable_id)
 		}
 	}
 
