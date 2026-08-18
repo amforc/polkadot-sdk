@@ -6,7 +6,7 @@
 //!   default coin, [`USDX`] the 6-decimals coin the scale tests use.
 
 use crate as pallet_redemptions;
-use crate::types::RedemptionConfig;
+use crate::types::{RedemptionConfig, RedemptionQuote};
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, One, Permill, Saturating, Zero},
 	prelude::{DispatchError, DispatchResult},
@@ -21,7 +21,7 @@ use frame::{
 			roles::Inspect as FungiblesRolesInspect, Inspect as FungiblesInspect, InspectHold,
 			Mutate as FungiblesMutate,
 		},
-		tokens::{fungible, imbalance::ResolveAssetTo},
+		tokens::{fungible, imbalance::ResolveAssetTo, Fortitude, Preservation},
 		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
@@ -169,6 +169,12 @@ parameter_types! {
 		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
 	pub const MarketDepositBase: Balance = 1_000;
 }
+
+/// Genesis owner of each test stablecoin.
+///
+/// [`EnsureAssetOwner`] gives this account authority for
+/// [`pallet_redemptions::Call::set_redemption_config`]. This account is not a market admin.
+pub const STABLECOIN_OWNER: AccountId = 1;
 
 /// Full admin of every market a test helper registers.
 pub const ADMIN: AccountId = 100;
@@ -393,8 +399,8 @@ pub fn new_test_ext() -> TestState {
 		assets: pallet_assets::GenesisConfig {
 			assets: vec![
 				(TOKEN_X_ID, 1, true, 1),
-				(PUSD, 1, true, 1),
-				(USDX, 1, true, USDX_MIN_BALANCE),
+				(PUSD, STABLECOIN_OWNER, true, 1),
+				(USDX, STABLECOIN_OWNER, true, USDX_MIN_BALANCE),
 			],
 			metadata: vec![(USDX, b"USDX".to_vec(), b"USDX".to_vec(), 6)],
 			accounts: vec![],
@@ -426,11 +432,10 @@ pub fn new_test_ext() -> TestState {
 	ext
 }
 
-/// Run `test` and check post-state invariants under `try-runtime`.
+/// Runs `test` and then checks its final storage against the pallet's `try_state` invariants.
 pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
-		#[cfg(feature = "try-runtime")]
 		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 	});
 }
@@ -510,25 +515,252 @@ pub fn open(
 	)
 }
 
-/// Redeem on the `(collateral, stable)` market, mirroring the extrinsic's
-/// argument order with `who` as the signed origin.
+/// Redeems on the `(collateral, stable)` market with `who` as the signed origin.
 pub fn redeem(
 	who: AccountId,
 	collateral: AssetId,
 	stable: StableId,
-	max_pusd_in: Balance,
+	max_stable_to_spend: Balance,
 	min_collateral_out: Balance,
 	recipient: AccountId,
 	max_steps: u32,
 ) -> DispatchResultWithPostInfo {
-	Redemptions::redeem(
+	let snapshot =
+		RedeemSnapshot::take(who, &collateral, stable, recipient, max_stable_to_spend, max_steps);
+	let result = Redemptions::redeem(
 		RuntimeOrigin::signed(who),
 		collateral,
 		stable,
-		crate::RedemptionTerms { max_stable_in: max_pusd_in, min_collateral_out },
+		crate::RedemptionTerms { max_stable_to_spend, min_collateral_out },
 		recipient,
 		max_steps,
-	)
+	);
+	if result.is_ok() {
+		snapshot.assert_settled();
+	}
+	result
+}
+
+/// Records the state used to check a redemption after settlement.
+struct RedeemSnapshot {
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	recipient: AccountId,
+	/// Execution must reproduce this quote when the account can fund it.
+	quote: Option<RedemptionQuote<Balance>>,
+	/// Number of events before dispatch. Settlement events must follow them.
+	events: usize,
+	supply: Balance,
+	redeemer_stable: Balance,
+	fee_dest_stable: Balance,
+	vault_fee_dest_stable: Balance,
+	insurance_stable: Balance,
+	recipient_collateral: Balance,
+	fee_state: pallet_redemptions::RedemptionState,
+}
+
+/// Contains the values from an ordinary or recovery settlement event.
+struct Settlement {
+	collateral_id: AssetId,
+	stable_id: StableId,
+	redeemer: AccountId,
+	recipient: AccountId,
+	stable_burned: Balance,
+	insurance_cover: Balance,
+	fee: Balance,
+	collateral_out: Balance,
+	/// Number of steps in an ordinary settlement.
+	///
+	/// A recovery settlement uses `None` because it settles one FIFO head and does not change the
+	/// dynamic fee.
+	ordinary_steps: Option<u32>,
+}
+
+impl Settlement {
+	fn from_event(event: RuntimeEvent) -> Option<Self> {
+		match event {
+			RuntimeEvent::Redemptions(pallet_redemptions::Event::OrdinaryRedemptionExecuted {
+				collateral_id,
+				stable_id,
+				redeemer,
+				recipient,
+				stable_burned,
+				collateral_out,
+				fee,
+				steps,
+			}) => Some(Self {
+				collateral_id,
+				stable_id,
+				redeemer,
+				recipient,
+				stable_burned,
+				insurance_cover: 0,
+				fee,
+				collateral_out,
+				ordinary_steps: Some(steps),
+			}),
+			RuntimeEvent::Redemptions(pallet_redemptions::Event::RecoveryRedemptionExecuted {
+				collateral_id,
+				stable_id,
+				redeemer,
+				recipient,
+				stable_burned,
+				insurance_cover,
+				collateral_out,
+				..
+			}) => Some(Self {
+				collateral_id,
+				stable_id,
+				redeemer,
+				recipient,
+				stable_burned,
+				insurance_cover,
+				fee: 0,
+				collateral_out,
+				ordinary_steps: None,
+			}),
+			_ => None,
+		}
+	}
+}
+
+/// Calculates recipient-side collateral as the total balance less all holds.
+fn free_collateral(collateral: &AssetId, who: AccountId) -> Balance {
+	collateral_balance(collateral.clone(), who) - held(collateral.clone(), who)
+}
+
+impl RedeemSnapshot {
+	fn take(
+		who: AccountId,
+		collateral: &AssetId,
+		stable: StableId,
+		recipient: AccountId,
+		max_stable_to_spend: Balance,
+		max_steps: u32,
+	) -> Self {
+		let spendable = <Assets as FungiblesInspect<AccountId>>::reducible_balance(
+			stable,
+			&who,
+			Preservation::Preserve,
+			Fortitude::Polite,
+		);
+		let quote =
+			Redemptions::preview_redeem(collateral.clone(), stable, max_stable_to_spend, max_steps)
+				.ok()
+				.filter(|quote| spendable >= quote.stable_in());
+		Self {
+			who,
+			collateral: collateral.clone(),
+			stable,
+			recipient,
+			quote,
+			events: System::events().len(),
+			supply: Assets::total_supply(stable),
+			redeemer_stable: Assets::balance(stable, who),
+			fee_dest_stable: Assets::balance(stable, FEE_DEST),
+			vault_fee_dest_stable: Assets::balance(stable, VAULT_FEE_DEST),
+			insurance_stable: Assets::balance(stable, insurance_account(stable)),
+			recipient_collateral: free_collateral(collateral, recipient),
+			fee_state: pallet_redemptions::RedemptionStates::<Test>::get(stable),
+		}
+	}
+
+	fn assert_settled(&self) {
+		let settlements: Vec<Settlement> = System::events()
+			.into_iter()
+			.skip(self.events)
+			.filter_map(|record| Settlement::from_event(record.event))
+			.collect();
+		assert_eq!(settlements.len(), 1, "one redemption settles per call");
+		let settled = &settlements[0];
+		assert_eq!(settled.collateral_id, self.collateral);
+		assert_eq!(settled.stable_id, self.stable);
+		assert_eq!(settled.redeemer, self.who);
+		assert_eq!(settled.recipient, self.recipient);
+		self.assert_moves(settled);
+		match settled.ordinary_steps {
+			Some(_) => self.assert_ordinary_fee_state(),
+			None => assert_eq!(
+				pallet_redemptions::RedemptionStates::<Test>::get(self.stable),
+				self.fee_state,
+				"a recovery settlement leaves the ordinary accelerator alone"
+			),
+		}
+		self.assert_quote_honoured(settled);
+	}
+
+	fn assert_moves(&self, settled: &Settlement) {
+		let stable = self.stable;
+		assert_eq!(
+			self.redeemer_stable - Assets::balance(stable, self.who),
+			settled.stable_burned + settled.fee,
+			"the redeemer pays the burned debt plus the fee"
+		);
+		assert_eq!(
+			Assets::balance(stable, FEE_DEST) - self.fee_dest_stable,
+			settled.fee,
+			"the fee lands in FEE_DEST"
+		);
+		assert_eq!(
+			self.insurance_stable - Assets::balance(stable, insurance_account(stable)),
+			settled.insurance_cover,
+			"the Insurance Fund pays exactly the cover"
+		);
+		let yield_settled = Assets::balance(stable, VAULT_FEE_DEST) - self.vault_fee_dest_stable;
+		assert_eq!(
+			self.supply + yield_settled - Assets::total_supply(stable),
+			settled.stable_burned + settled.insurance_cover,
+			"issuance falls by the burn and the cover, and by nothing else"
+		);
+		assert_eq!(
+			free_collateral(&self.collateral, self.recipient) - self.recipient_collateral,
+			settled.collateral_out,
+			"the recipient receives exactly the collateral out"
+		);
+	}
+
+	fn assert_ordinary_fee_state(&self) {
+		let config = pallet_redemptions::RedemptionConfigs::<Test>::get(self.stable)
+			.expect("a redeemed coin has a policy");
+		let state = pallet_redemptions::RedemptionStates::<Test>::get(self.stable);
+		assert!(state.dynamic_fee >= config.dynamic_fee_floor, "dynamic fee below the floor");
+		assert!(state.dynamic_fee <= config.dynamic_fee_ceiling, "dynamic fee above the ceiling");
+		assert_eq!(state.last_fee_operation, Timestamp::get(), "fee state not stamped now");
+		// An event reports each fee-state change and no event reports an unchanged state.
+		let reported =
+			System::events()
+				.into_iter()
+				.skip(self.events)
+				.find_map(|record| match record.event {
+					RuntimeEvent::Redemptions(
+						pallet_redemptions::Event::RedemptionDynamicFeeUpdated {
+							old_dynamic_fee,
+							new_dynamic_fee,
+							..
+						},
+					) => Some((old_dynamic_fee, new_dynamic_fee)),
+					_ => None,
+				});
+		match reported {
+			Some((old, new)) => {
+				assert_eq!(old, self.fee_state.dynamic_fee, "reported old dynamic fee");
+				assert_eq!(new, state.dynamic_fee, "reported new dynamic fee");
+				assert_ne!(old, new, "a fee move reported where there was none");
+			},
+			None => assert_eq!(state.dynamic_fee, self.fee_state.dynamic_fee, "an unreported move"),
+		}
+	}
+
+	fn assert_quote_honoured(&self, settled: &Settlement) {
+		let Some(quote) = &self.quote else { return };
+		assert_eq!(settled.stable_burned, quote.debt_cancelled, "execution vs quoted debt");
+		assert_eq!(settled.fee, quote.fee, "execution vs quoted fee");
+		assert_eq!(settled.collateral_out, quote.collateral_out, "execution vs quoted collateral");
+		if let Some(steps) = settled.ordinary_steps {
+			assert_eq!(steps, quote.steps, "execution vs quoted steps");
+		}
+	}
 }
 
 /// Park `owner`'s vault in `FinalRecovery`. The call is permissionless, so an
@@ -590,7 +822,7 @@ pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Bala
 		.unwrap_or_default()
 }
 
-/// Stablecoin-wide debt: the denominator the dynamic-fee accelerator uses.
+/// Gets stablecoin-wide debt, which is the denominator for the dynamic-fee increase.
 pub fn stablecoin_debt(stable: StableId) -> Balance {
 	pallet_vaults::Pallet::<Test>::stablecoin_debt(&stable)
 }

@@ -47,7 +47,10 @@ mod benchmarks {
 			RawOrigin::Signed(redeemer),
 			collateral_id,
 			stable_id,
-			RedemptionTerms { max_stable_in: budget, min_collateral_out: BalanceOf::<T>::zero() },
+			RedemptionTerms {
+				max_stable_to_spend: budget,
+				min_collateral_out: BalanceOf::<T>::zero(),
+			},
 			recipient,
 			s,
 		);
