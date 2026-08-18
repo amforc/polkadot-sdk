@@ -19,8 +19,9 @@ use pallet_redemptions::{RedemptionStates, RedemptionTerms};
 use pusd_primitives::VaultStatus;
 
 /// A 1,000 pUSD redemption against 100,000 pUSD of market-wide debt raises the
-/// decayed 1.5% dynamic fee by 1,000/100,000/2 = 0.5%; the post-increase 2.0%
-/// rate plus the 0.5% base fee prices the whole transaction.
+/// decayed 1.5% dynamic fee by 1,000/100,000/2 = 0.5%. The redemption pays the
+/// 1.75% mean of the 1.5% arrival and 2.0% terminal dynamic fees plus the 0.5%
+/// base fee. The budget covers the debt and the fee.
 #[test]
 fn example_01_ordinary_redemption_with_dynamic_fee_update_and_fee() {
 	AssetHubWestend::execute_with(|| {
@@ -39,8 +40,10 @@ fn example_01_ordinary_redemption_with_dynamic_fee_update_and_fee() {
 
 		let redeemer = acct(3);
 		fund_dot(&redeemer, 0);
-		// 1,000 pUSD cancelled + 1,000 * 2.5% = 25 pUSD fee.
-		mint_pusd(&redeemer, 1_025 * PUSD);
+		// 1,000 pUSD cancelled + 1,000 * 2.25% = 22.5 pUSD fee. An ordinary redemption
+		// keeps the redeemer's pUSD account alive, so it holds the minimum balance on top.
+		let fee = 45 * PUSD / 2;
+		mint_pusd(&redeemer, 1_000 * PUSD + fee + PUSD_MIN_BALANCE);
 		let treasury_pusd_before = pusd_balance(&TreasuryAccount::get());
 		let redeemer_native_before = native_balance(&redeemer);
 
@@ -48,7 +51,10 @@ fn example_01_ordinary_redemption_with_dynamic_fee_update_and_fee() {
 			RuntimeOrigin::signed(redeemer.clone()),
 			get_native_id(),
 			get_pusd_id(),
-			RedemptionTerms { max_stable_in: 1_000 * PUSD, min_collateral_out: 500 * WND },
+			RedemptionTerms {
+				max_stable_to_spend: 1_000 * PUSD + fee,
+				min_collateral_out: 500 * WND,
+			},
 			redeemer.clone(),
 			16,
 		));
@@ -57,11 +63,11 @@ fn example_01_ordinary_redemption_with_dynamic_fee_update_and_fee() {
 		let state = RedemptionStates::<Runtime>::get(get_pusd_id());
 		assert_eq!(state.dynamic_fee, FixedU128::from_rational(2, 100));
 
-		// total_pusd_in = 1,025; collateral_out = 1,000 / 2 = 500 WND.
-		assert_eq!(pusd_balance(&redeemer), 0);
+		// total_pusd_in = 1,022.5; collateral_out = 1,000 / 2 = 500 WND.
+		assert_eq!(pusd_balance(&redeemer), PUSD_MIN_BALANCE);
 		assert_eq!(native_balance(&redeemer) - redeemer_native_before, 500 * WND);
-		// fee_pusd = 25 routed to the fee handler.
-		assert_eq!(pusd_balance(&TreasuryAccount::get()) - treasury_pusd_before, 25 * PUSD);
+		// fee_pusd = 22.5 routed to the fee handler.
+		assert_eq!(pusd_balance(&TreasuryAccount::get()) - treasury_pusd_before, fee);
 
 		// Vault after: 4,000 pUSD debt, 3,500 WND = 7,000 pUSD value, CR 175%.
 		let target_vault = vault(&target_owner);
@@ -89,22 +95,26 @@ fn example_02_ordinary_redemption_creates_dormant_continuation_vault() {
 
 		let redeemer = acct(3);
 		fund_dot(&redeemer, 0);
-		// dynamic_fee increase = 2,800/10,000/2 = 14%; fee rate = 14% + 0.5%
-		// base = 14.5%; fee = 2,800 * 14.5% = 406 pUSD.
-		mint_pusd(&redeemer, (2_800 + 406) * PUSD);
+		// dynamic_fee increase = 2,800/10,000/2 = 14%; the redemption pays the 7%
+		// mean of the 0% arrival and 14% terminal dynamic fees plus the 0.5% base
+		// fee: 2,800 * 7.5% = 210 pUSD. The redeemer keeps the minimum balance on top.
+		mint_pusd(&redeemer, (2_800 + 210) * PUSD + PUSD_MIN_BALANCE);
 		let redeemer_native_before = native_balance(&redeemer);
 
 		assert_ok!(Redemptions::redeem(
 			RuntimeOrigin::signed(redeemer.clone()),
 			get_native_id(),
 			get_pusd_id(),
-			RedemptionTerms { max_stable_in: 2_800 * PUSD, min_collateral_out: 1_400 * WND },
+			RedemptionTerms {
+				max_stable_to_spend: (2_800 + 210) * PUSD,
+				min_collateral_out: 1_400 * WND,
+			},
 			redeemer.clone(),
 			16,
 		));
 
 		// collateral_out = 2,800 / 2 = 1,400 WND.
-		assert_eq!(pusd_balance(&redeemer), 0);
+		assert_eq!(pusd_balance(&redeemer), PUSD_MIN_BALANCE);
 		assert_eq!(native_balance(&redeemer) - redeemer_native_before, 1_400 * WND);
 
 		// Vault after: 200 pUSD debt, 600 WND, status Dormant.
