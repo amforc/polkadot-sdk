@@ -7,7 +7,7 @@ mod lifecycle;
 
 use crate::{
 	pallet::{
-		BalanceOf, CollateralIdOf, CollateralRisks, Config, Error, Event, HoldReason, Millis,
+		BalanceOf, CollateralIdOf, Config, Error, Event, GlobalDebtCeilings, HoldReason, Millis,
 		Pallet, StableIdOf, Vaults,
 	},
 	types::{
@@ -23,7 +23,7 @@ use frame::{
 	},
 };
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
-use pusd_primitives::{recovery_pricing::collateral_for_value_ceil, ProvidePrice};
+use pusd_primitives::ProvidePrice;
 
 struct Context<T: Config> {
 	collateral_id: CollateralIdOf<T>,
@@ -110,25 +110,18 @@ impl<T: Config> Context<T> {
 		self.price.defensive_ok_or(DispatchError::Corruption)
 	}
 
-	/// Checks the global debt limit for this collateral.
-	///
-	/// TODO: Debt from different stable assets is added before price conversion. This is correct
-	/// only while they use the same unit value and scale. Once prices are keyed by market, convert
-	/// each market before adding its debt.
-	fn ensure_global_ceiling(
-		&self,
-		price: FixedU128,
-		operation_debt_increase: BalanceOf<T>,
-	) -> DispatchResult {
-		let risk = CollateralRisks::<T>::get(&self.collateral_id);
-		let projected_total = risk
-			.outstanding
-			.checked_add(&self.pending_interest_mint)
-			.and_then(|total| total.checked_add(&operation_debt_increase))
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		let collateral_debt = collateral_for_value_ceil(projected_total, price)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		ensure!(collateral_debt <= risk.debt_ceiling, Error::<T>::GlobalDebtCeilingExceeded);
+	/// Checks the stablecoin-wide debt limit against this operation's post-state.
+	fn ensure_global_ceiling(&self) -> DispatchResult {
+		let projected_total = Pallet::<T>::projected_stablecoin_debt(
+			&self.collateral_id,
+			&self.stable_id,
+			&self.state,
+			self.now,
+		)?;
+		ensure!(
+			projected_total <= GlobalDebtCeilings::<T>::get(&self.stable_id),
+			Error::<T>::GlobalDebtCeilingExceeded
+		);
 		Ok(())
 	}
 
@@ -181,7 +174,6 @@ impl<T: Config> Context<T> {
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		ensure!(vault_principal_after >= self.config.minimum_debt, Error::<T>::DebtBelowMinimum);
 
-		Pallet::<T>::ratchet_ceiling(&mut self.state, &self.config, self.now);
 		let principal_after = self
 			.state
 			.debt
@@ -189,12 +181,6 @@ impl<T: Config> Context<T> {
 			.checked_add(&amount)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		ensure!(principal_after <= self.config.debt_ceiling, Error::<T>::DebtCeilingExceeded);
-		if !self.config.ceiling_gap.is_zero() {
-			ensure!(
-				principal_after <= self.state.effective_ceiling,
-				Error::<T>::DebtCeilingExceeded
-			);
-		}
 		let upfront_fee = Pallet::<T>::apply_borrow_unchecked(
 			&mut self.state,
 			&self.config,
@@ -203,9 +189,7 @@ impl<T: Config> Context<T> {
 			new_rate,
 			self.now,
 		)?;
-		let operation_debt_increase =
-			amount.checked_add(&upfront_fee).ok_or(Error::<T>::ArithmeticOverflow)?;
-		self.ensure_global_ceiling(price, operation_debt_increase)?;
+		self.ensure_global_ceiling()?;
 		Pallet::<T>::ensure_above_icr(&vault.position(), price, &self.config)?;
 		Ok(upfront_fee)
 	}

@@ -100,7 +100,7 @@ fn branch_walk_cannot_starve_the_vault_walk() {
 		register_ten_markets();
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(
 			RuntimeOrigin::root(),
-			DOT,
+			PUSD,
 			GLOBAL_CEILING
 		));
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));

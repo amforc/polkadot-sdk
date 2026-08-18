@@ -5,8 +5,8 @@ use crate::{
 	context::VaultOp,
 	math,
 	pallet::{
-		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
-		Error, IdleCursor, Millis, Pallet, StableCreditOf, StableIdOf, StablecoinDebt, Vaults,
+		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, Config, Error, IdleCursor,
+		Millis, Pallet, StableCreditOf, StableIdOf, StablecoinDebt, Vaults,
 	},
 	recovery,
 	types::{
@@ -161,7 +161,7 @@ impl<T: Config> Pallet<T> {
 				&stored.as_ref().ok_or(Error::<T>::BranchNotFound)?.state,
 				now,
 			)?;
-			Self::update_branch_aggregates(collateral_id, stable_id, now, &before, &state)?;
+			Self::update_branch_aggregates(stable_id, now, &before, &state)?;
 			stored.as_mut().ok_or(Error::<T>::BranchNotFound)?.state = state;
 			Ok(())
 		})
@@ -183,13 +183,12 @@ impl<T: Config> Pallet<T> {
 			let branch = maybe.as_mut().ok_or(Error::<T>::BranchNotFound)?;
 			let before = Self::branch_contribution(&branch.state, now)?;
 			let result = mutate(&branch.config, &mut branch.state, now)?;
-			Self::update_branch_aggregates(collateral_id, stable_id, now, &before, &branch.state)?;
+			Self::update_branch_aggregates(stable_id, now, &before, &branch.state)?;
 			Ok(result)
 		})
 	}
 
 	fn update_branch_aggregates(
-		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		now: Millis,
 		before: &BranchContribution<BalanceOf<T>>,
@@ -197,7 +196,6 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let after = Self::branch_contribution(after_state, now)?;
 		let stablecoin_debt = Self::updated_stablecoin_debt(stable_id, before, &after, now)?;
-		Self::apply_collateral_debt_delta(collateral_id, before.outstanding, after.outstanding)?;
 		if stablecoin_debt.is_empty() {
 			StablecoinDebt::<T>::remove(stable_id);
 		} else {
@@ -239,6 +237,27 @@ impl<T: Config> Pallet<T> {
 		total.outstanding =
 			Self::shifted_total(total.outstanding, before.outstanding, after.outstanding)?;
 		Ok(total)
+	}
+
+	/// Fully accrued stablecoin debt if one market were replaced by `after_state`.
+	///
+	/// This is the exact state [`Self::commit_branch`] would derive, including sibling-market
+	/// interest and the current market's own rounding, without writing it.
+	pub(crate) fn projected_stablecoin_debt(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		after_state: &BranchState<T::AccountId, BalanceOf<T>>,
+		now: Millis,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let before_state = Self::branch_of(collateral_id, stable_id)?.state;
+		let before = Self::branch_contribution(&before_state, now)?;
+		let after = Self::branch_contribution(after_state, now)?;
+		let projected = Self::updated_stablecoin_debt(stable_id, &before, &after, now)?;
+		let pending = projected.pending_interest.ceil().ok_or(Error::<T>::ArithmeticOverflow)?;
+		projected
+			.outstanding
+			.checked_add(&pending)
+			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 	}
 
 	/// Derive the complete aggregate contribution of one branch at `now`.
@@ -303,25 +322,6 @@ impl<T: Config> Pallet<T> {
 			return BalanceOf::<T>::max_value();
 		};
 		debt.outstanding.saturating_add(accrued)
-	}
-
-	fn apply_collateral_debt_delta(
-		collateral_id: &CollateralIdOf<T>,
-		outstanding_before: BalanceOf<T>,
-		outstanding_after: BalanceOf<T>,
-	) -> DispatchResult {
-		if outstanding_before == outstanding_after {
-			return Ok(());
-		}
-		CollateralRisks::<T>::try_mutate_exists(collateral_id, |maybe| {
-			let risk = maybe.get_or_insert_default();
-			risk.outstanding =
-				Self::shifted_total(risk.outstanding, outstanding_before, outstanding_after)?;
-			if risk.is_empty() {
-				maybe.take();
-			}
-			Ok::<_, DispatchError>(())
-		})
 	}
 
 	/// Move an aggregate from `before` to `after`. Underflow means the aggregate
@@ -497,40 +497,6 @@ impl<T: Config> Pallet<T> {
 			);
 		}
 		Ok(())
-	}
-
-	/// Advance the autoline `effective_ceiling` toward `min(branch_debt + gap,
-	/// debt_ceiling)`. Increases are gated by `ceiling_ttl`; decreases apply
-	/// immediately. A frozen market pins or lowers the ceiling but never raises it.
-	/// Returns whether `state` was changed; a no-op (autoline disabled via
-	/// `ceiling_gap == 0`, or already at target) returns `false`.
-	pub(crate) fn ratchet_ceiling(
-		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
-		config: &BranchConfig<BalanceOf<T>>,
-		now: Millis,
-	) -> bool {
-		if config.ceiling_gap.is_zero() {
-			return false;
-		}
-		let target = state
-			.debt
-			.principal
-			.saturating_add(state.debt.pending_redistribution_principal)
-			.saturating_add(config.ceiling_gap)
-			.min(config.debt_ceiling);
-		if target < state.effective_ceiling {
-			state.effective_ceiling = target;
-			true
-		} else if target > state.effective_ceiling &&
-			!state.is_frozen() &&
-			now >= state.ceiling_last_inc.saturating_add(config.ceiling_ttl)
-		{
-			state.effective_ceiling = target;
-			state.ceiling_last_inc = now;
-			true
-		} else {
-			false
-		}
 	}
 
 	/// Authorize a call [`Config::ForceOrigin`] may force and a market

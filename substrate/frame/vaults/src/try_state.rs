@@ -5,7 +5,7 @@
 
 use crate::{
 	pallet::{
-		AssetRoles, BalanceOf, BranchOf, Branches, CollateralIdOf, CollateralRisks, Config,
+		AssetRoles, BalanceOf, BranchOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings,
 		HoldReason, Millis, Pallet, StableIdOf, StablecoinDebt, Vaults,
 	},
 	types::{AssetRole, AssetRoleUsage, InterestWeight, PendingInterest, VaultListId},
@@ -27,10 +27,8 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	// `check_branch_identities`' single vault pass, then checked once below.
 	let mut owner_collateral: BTreeMap<(CollateralIdOf<T>, T::AccountId), BalanceOf<T>> =
 		BTreeMap::new();
-	// Derived-index accumulators, recomputed in full from the authoritative
-	// registry and compared against `AssetRoles`/`CollateralRisks` below.
+	// Derived-index accumulators, recomputed in full from the authoritative registry.
 	let mut roles: BTreeMap<CollateralIdOf<T>, AssetRoleUsage> = BTreeMap::new();
-	let mut outstanding: BTreeMap<CollateralIdOf<T>, BalanceOf<T>> = BTreeMap::new();
 	let mut stablecoin_debt: BTreeMap<
 		StableIdOf<T>,
 		(BalanceOf<T>, InterestWeight<BalanceOf<T>>, PendingInterest<BalanceOf<T>>),
@@ -43,10 +41,6 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			AssetRole::Stable,
 		)?;
 		let branch_outstanding = branch.state.debt.outstanding();
-		let debt_entry = outstanding.entry(collateral_id.clone()).or_default();
-		*debt_entry = debt_entry
-			.checked_add(&branch_outstanding)
-			.ok_or("collateral outstanding-debt sum overflow")?;
 		let stable_entry = stablecoin_debt.entry(stable_id.clone()).or_default();
 		stable_entry.0 = stable_entry
 			.0
@@ -90,7 +84,9 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 
 	check_owner_holds::<T>(owner_collateral)?;
 	check_asset_roles::<T>(roles)?;
-	check_collateral_risks::<T>(outstanding)?;
+	if GlobalDebtCeilings::<T>::iter_values().any(|ceiling| ceiling.is_zero()) {
+		return Err("zero GlobalDebtCeilings record stored".into());
+	}
 	check_stablecoin_debt::<T>(stablecoin_debt, now)?;
 	Ok(())
 }
@@ -160,28 +156,6 @@ fn check_asset_roles<T: Config>(
 	let stored: BTreeMap<CollateralIdOf<T>, AssetRoleUsage> = AssetRoles::<T>::iter().collect();
 	if stored != roles {
 		return Err("AssetRoles diverges from its recomputation over Branches".into());
-	}
-	Ok(())
-}
-
-/// Every `CollateralRisks` record must carry the recomputed outstanding total
-/// for its collateral, no default records may be stored (the write paths
-/// remove those), and no collateral with outstanding debt may lack a record.
-/// The `debt_ceiling` side is a governance input with no recomputation.
-fn check_collateral_risks<T: Config>(
-	mut outstanding: BTreeMap<CollateralIdOf<T>, BalanceOf<T>>,
-) -> Result<(), TryRuntimeError> {
-	for (collateral_id, risk) in CollateralRisks::<T>::iter() {
-		if risk.is_empty() {
-			return Err("default CollateralRisk record stored".into());
-		}
-		let recomputed = outstanding.remove(&collateral_id).unwrap_or_default();
-		if risk.outstanding != recomputed {
-			return Err("CollateralRisks diverges from its recomputation over Branches".into());
-		}
-	}
-	if outstanding.into_values().any(|total| !total.is_zero()) {
-		return Err("collateral with outstanding debt lacks a CollateralRisks record".into());
 	}
 	Ok(())
 }

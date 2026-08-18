@@ -74,6 +74,7 @@ fn cross_role_reuse_rejected_in_both_directions() {
 				EUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				(),
 			),
 			Error::<Test>::StableCollateralCollision
 		);
@@ -89,6 +90,7 @@ fn cross_role_reuse_rejected_in_both_directions() {
 				TOKEN_X_ID,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				(),
 			),
 			Error::<Test>::StableCollateralCollision
 		);
@@ -109,6 +111,7 @@ fn failed_registration_hook_rolls_back_everything() {
 				PUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
+				(),
 			),
 			DispatchError::Other("on_registered failure")
 		);
@@ -125,6 +128,7 @@ fn failed_registration_hook_rolls_back_everything() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			(),
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), MarketDepositBase::get());
 	});
@@ -142,6 +146,7 @@ fn failed_deregistration_hook_rolls_back_everything() {
 			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
+			(),
 		));
 
 		FailOnDeregistered::set(true);

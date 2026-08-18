@@ -3,12 +3,12 @@
 use crate::{
 	context::VaultOp,
 	pallet::{
-		AssetRoles, BalanceOf, Branches, CollateralIdOf, CollateralRisks, Config, Error, Event,
-		HoldReason, Pallet, StableIdOf, Vaults,
+		AssetRoles, BalanceOf, Branches, CollateralIdOf, Config, Error, Event, GlobalDebtCeilings,
+		HoldReason, Pallet, RegistrationConfigOf, StableIdOf, Vaults,
 	},
 	types::{
-		AdminLevel, AssetRole, AssetRoleUsage, BranchAdmins, BranchConfig, BranchConfigUpdate,
-		BranchMode, BranchState, FrozenReason, FrozenState,
+		AdminLevel, AssetMinimums, AssetRole, AssetRoleUsage, BranchAdmins, BranchConfig,
+		BranchConfigUpdate, BranchMode, BranchState, FrozenReason, FrozenState,
 	},
 };
 use frame::{
@@ -336,6 +336,33 @@ impl<T: Config> Pallet<T> {
 		Self::release_asset_role(&stable_key, AssetRole::Stable)
 	}
 
+	/// Rejects a configuration that contradicts itself or breaches the runtime's limits.
+	///
+	/// Every path that writes a [`BranchConfig`] goes through this, so registration and later
+	/// parameter changes are held to one standard. The reported defect names the failing rule:
+	/// with a dozen of them across the two checks, a single opaque error would leave a market
+	/// creator guessing.
+	///
+	/// Both assets must already exist: their minimum balances are the scale the market's own
+	/// amounts are judged on, and an absent asset reports no minimum at all.
+	fn ensure_config_allowed(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		config: &BranchConfig<BalanceOf<T>>,
+	) -> DispatchResult {
+		let minimums = AssetMinimums {
+			collateral: T::CollateralAssets::minimum_balance(collateral_id.clone()),
+			stable: T::StableAssets::minimum_balance(stable_id.clone()),
+		};
+		if let Some(defect) = config.structural_defect(&minimums) {
+			return Err(Error::<T>::InvalidBranchConfig(defect).into());
+		}
+		if let Some(violation) = T::BranchConfigBounds::get().violation(config) {
+			return Err(Error::<T>::ConfigOutsideEnvelope(violation).into());
+		}
+		Ok(())
+	}
+
 	/// Creates a market after checking its limits, assets, and oracle price.
 	///
 	/// The market record, deposit, asset roles, and lifecycle state are created together.
@@ -344,9 +371,9 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		admins: BranchAdmins<T::AccountId>,
 		config: BranchConfig<BalanceOf<T>>,
+		lifecycle_config: RegistrationConfigOf<T>,
 		depositor: Option<T::AccountId>,
 	) -> DispatchResult {
-		ensure!(T::BranchConfigBounds::get().permits(&config), Error::<T>::ConfigOutsideEnvelope);
 		// A market needs a valid collateral price.
 		T::Oracle::provide_price(&collateral_id)
 			.map_err(|_| Error::<T>::OraclePriceNotAvailable)?;
@@ -359,6 +386,7 @@ impl<T: Config> Pallet<T> {
 			Error::<T>::UnknownCollateral
 		);
 		ensure!(T::StableAssets::asset_exists(stable_id.clone()), Error::<T>::UnknownStable);
+		Self::ensure_config_allowed(&collateral_id, &stable_id, &config)?;
 		// A stable asset cannot also be collateral, or its issuer could create unbacked collateral.
 		let stablecoin_markets = Self::claim_market_roles(&collateral_id, &stable_id)?;
 		let deposit = match depositor {
@@ -385,14 +413,14 @@ impl<T: Config> Pallet<T> {
 		Branches::<T>::insert(
 			&collateral_id,
 			&stable_id,
-			crate::types::Branch {
-				state: BranchState::fresh(&config, now),
-				config,
-				admins,
-				deposit,
-			},
+			crate::types::Branch { state: BranchState::fresh(now), config, admins, deposit },
 		);
-		T::OnBranchLifecycle::on_registered(&collateral_id, &stable_id, stablecoin_markets)?;
+		T::OnBranchLifecycle::on_registered(
+			&collateral_id,
+			&stable_id,
+			stablecoin_markets,
+			lifecycle_config,
+		)?;
 		Self::deposit_event(Event::BranchRegistered { collateral_id, stable_id });
 		Ok(())
 	}
@@ -421,10 +449,7 @@ impl<T: Config> Pallet<T> {
 		let removed_outstanding = Branches::<T>::take(&collateral_id, &stable_id)
 			.map(|removed| removed.state.debt.outstanding())
 			.unwrap_or_default();
-		defensive_assert!(
-			removed_outstanding.is_zero(),
-			"market removal must leave the CollateralRisks aggregate untouched"
-		);
+		defensive_assert!(removed_outstanding.is_zero(), "market removal requires zero debt");
 		// The refund kills the collateral account, so its consumer references are gone before the
 		// provider reference is released.
 		Self::refund_redistribution_custody(
@@ -474,15 +499,16 @@ impl<T: Config> Pallet<T> {
 		update: BranchConfigUpdate<BalanceOf<T>>,
 		level: AdminLevel,
 	) -> DispatchResult {
-		let bounds = T::BranchConfigBounds::get();
 		Branches::<T>::try_mutate_exists(&collateral_id, &stable_id, |maybe| -> DispatchResult {
 			let branch = maybe.as_mut().ok_or(Error::<T>::BranchNotFound)?;
-			let config = &mut branch.config;
 			if matches!(level, AdminLevel::Emergency) {
-				ensure!(update.is_defensive(config), Error::<T>::DefensiveActionNotDefensive);
+				ensure!(
+					update.is_defensive(&branch.config),
+					Error::<T>::DefensiveActionNotDefensive
+				);
 			}
-			update.clone().apply_to(config);
-			ensure!(bounds.permits(config), Error::<T>::ConfigOutsideEnvelope);
+			update.clone().apply_to(&mut branch.config);
+			Self::ensure_config_allowed(&collateral_id, &stable_id, &branch.config)?;
 			Ok(())
 		})?;
 		Self::deposit_event(Event::ParameterUpdated { collateral_id, stable_id, update });
@@ -510,21 +536,16 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Sets the global debt limit for one collateral asset.
+	/// Sets the global debt limit across every market issuing one stable asset.
 	///
 	/// An empty record is removed from storage.
-	pub(crate) fn do_set_global_debt_ceiling(
-		collateral_id: CollateralIdOf<T>,
-		ceiling: BalanceOf<T>,
-	) {
-		CollateralRisks::<T>::mutate_exists(&collateral_id, |maybe| {
-			let risk = maybe.get_or_insert_default();
-			risk.debt_ceiling = ceiling;
-			if risk.is_empty() {
-				maybe.take();
-			}
-		});
-		Self::deposit_event(Event::GlobalDebtCeilingSet { collateral_id, ceiling });
+	pub(crate) fn do_set_global_debt_ceiling(stable_id: StableIdOf<T>, ceiling: BalanceOf<T>) {
+		if ceiling.is_zero() {
+			GlobalDebtCeilings::<T>::remove(&stable_id);
+		} else {
+			GlobalDebtCeilings::<T>::insert(&stable_id, ceiling);
+		}
+		Self::deposit_event(Event::GlobalDebtCeilingSet { stable_id, ceiling });
 	}
 
 	/// Changes the stored freeze state and emits the market mode change.
@@ -590,23 +611,5 @@ impl<T: Config> Pallet<T> {
 			},
 			_ => Ok(()),
 		}
-	}
-
-	/// Updates a market's automatic debt limit. Anyone may call this.
-	///
-	/// Storage is unchanged when automatic updates are disabled or the limit is already current.
-	pub(crate) fn do_poke_ceiling(
-		collateral_id: CollateralIdOf<T>,
-		stable_id: StableIdOf<T>,
-	) -> DispatchResult {
-		let mut branch = Self::branch_of(&collateral_id, &stable_id)?;
-		if branch.config.ceiling_gap.is_zero() {
-			return Ok(());
-		}
-		let now = T::TimeProvider::now();
-		if Self::ratchet_ceiling(&mut branch.state, &branch.config, now) {
-			Branches::<T>::insert(&collateral_id, &stable_id, branch);
-		}
-		Ok(())
 	}
 }
