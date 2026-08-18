@@ -1,4 +1,5 @@
-//! `deposit`: transfer, entry-delay queueing, and merging.
+//! `deposit`: what leaves the wallet, what queues behind the entry delay, and what happens when a
+//! second deposit arrives.
 
 use crate::{mock::*, Error};
 

@@ -1,8 +1,8 @@
-//! `request_withdraw` / `withdraw`: Normal-Mode flow end to end, plus the
-//! amount and timing boundaries of Safety-Mode resolution. Requests only
-//! exist in Safety Mode (a Normal-Mode request forwards to the direct
-//! withdrawal, `tests/mode.rs`), so the request tests below enter Safety
-//! through the mock's debt fixture first.
+//! `request_withdraw` and `withdraw`.
+//!
+//! The Normal-Mode path runs end to end, and the Safety-Mode path is checked at its amount and
+//! timing boundaries. A request only exists in Safety Mode, so those tests enter it through the
+//! debt fixture of the mock first. `mode` covers what a Normal-Mode request does instead.
 
 use crate::{
 	mock::*,

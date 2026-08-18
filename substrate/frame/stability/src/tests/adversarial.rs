@@ -1,5 +1,6 @@
-//! Adversarial boundaries: stale user intent, corrupted FIFO/storage
-//! disagreement, and failed value movement after planning.
+//! What the pallet does when something goes wrong: a caller acting on a stale reading, storage
+//! that disagrees with itself, and value that fails to move after the arithmetic is already
+//! done.
 
 use crate::{mock::*, types::Leg};
 use frame::{

@@ -1,4 +1,115 @@
-//! # Stability Pool Pallet
+//! # Stability Pool
+//!
+//! Cancels the debt of liquidated vaults with depositor stablecoin, and pays the seized collateral
+//! to those depositors.
+//!
+//! ## Overview
+//!
+//! A market is one collateral asset paired with one stablecoin. Every market has one pool.
+//! `pallet-vaults` creates the pool when it registers the market, and removes the pool when it
+//! removes the market.
+//!
+//! Depositors supply stablecoin to a pool. The liquidation engine spends that stablecoin to cancel
+//! the debt of unhealthy vaults, and gives the pool the collateral of those vaults in exchange. The
+//! collateral is worth more than the debt it cancels, so a depositor holds less stablecoin and more
+//! collateral after each liquidation, for a net gain. The pool also takes a share of the interest
+//! and the fees that the market collects, and pays that share to depositors as stablecoin yield.
+//!
+//! Depositors keep control of their funds. They leave with [`Pallet::withdraw`] and collect their
+//! gains with [`Pallet::claim_collateral`] and [`Pallet::claim_yield`].
+//!
+//! ### The deposit lifecycle
+//!
+//! New stablecoin does not become active at once. It waits out `entry_delay` as a *pending
+//! deposit*, and earns no yield while it waits. The delay stops an account from joining the pool
+//! just before a liquidation, taking the collateral bonus, and leaving again.
+//!
+//! A pending deposit still carries risk. When the active pool cannot absorb a liquidation in full,
+//! the liquidation engine takes the remainder from all pending deposits, in proportion to their
+//! size. Pending capital is the last-resort backstop of the market, and it cannot avoid a
+//! liquidation by waiting.
+//!
+//! A matured pending deposit becomes active on the next write to its row. Any account can supply
+//! that write with [`Pallet::poke_deposit`], so a depositor never depends on another party.
+//!
+//! ### Gains
+//!
+//! Every write to a deposit row *realizes* it: the row settles its share of all liquidations and
+//! all yield since its last write. Losses reduce the active deposit. Gains become claimable
+//! balances, which stay on the row until the depositor asks for them.
+//!
+//! Claimable yield is stablecoin, but it is not part of the active deposit. It absorbs no
+//! liquidations and earns nothing. [`Pallet::compound_yield`] moves it into the active deposit,
+//! where it starts to absorb liquidations and to earn gains. Only the depositor can make that
+//! move.
+//!
+//! ### Operating modes
+//!
+//! [`Config::BranchModes`] reports the operating mode of a market:
+//!
+//! - `Normal`: all calls are available, and a withdrawal pays out at once.
+//! - `Safety`: a withdrawal needs a prior [`Pallet::request_withdraw`] and a wait of
+//!   `safety_withdrawal_delay`. The wait keeps the pool available to absorb liquidations while the
+//!   market is under stress.
+//! - `Frozen`: every call that moves value fails. A market with no usable price is frozen too,
+//!   because the mode provider fails closed.
+//!
+//! ### Recovery offsets
+//!
+//! A vault in `FinalRecovery` is wound down at a settlement price that `pallet-redemptions` owns.
+//! Any account can call [`Pallet::offset_recovery`] to burn active pool stablecoin against the
+//! head of that queue at the same price. Depositors receive the collateral, as they do from a
+//! liquidation.
+//!
+//! [`Pallet::deposit`] runs the same settlement on the incoming stablecoin before the remainder
+//! becomes a pending deposit. The settled part never enters the pool, and its collateral goes
+//! straight to the depositor. A head below par rejects the deposit, because settlement at a
+//! discount stays exclusive to the explicit redemption path.
+//!
+//! ## Pallet API
+//!
+//! See the [`pallet`] module for more information about the interfaces this pallet exposes,
+//! including its configuration trait, dispatchables, storage items, events and errors.
+//!
+//! ## Low Level / Implementation Details
+//!
+//! ### Design goals
+//!
+//! A liquidation must cost the same whether the pool holds ten depositors or ten million. The
+//! pallet therefore never iterates over depositors. A liquidation writes a fixed number of global
+//! values, and each depositor derives its own share from those values on its next touch.
+//!
+//! ### Product-sum accounting
+//!
+//! Each pool keeps three global accumulators:
+//!
+//! - `P`, the fraction of a deposit that survives all liquidations so far;
+//! - `S`, the collateral paid per unit of deposit;
+//! - `G`, the stablecoin yield paid per unit of deposit.
+//!
+//! A deposit stores the values of `P`, `S` and `G` that were current when it was last written.
+//! The distance between the stored values and the live values is the loss and the gains of that
+//! deposit. The `math` module holds the formulas.
+//!
+//! `P` only falls. A large liquidation drives it towards zero and costs the smaller deposits their
+//! precision. Two counters protect against this:
+//!
+//! - `scale` increases when `P` falls below `p_min`. `P` is multiplied back up by `scale_factor`,
+//!   and a later read divides by that factor once per boundary crossed.
+//! - `epoch` increases when a liquidation empties the pool. `P` returns to one. A deposit from an
+//!   earlier epoch compounds to zero and keeps only the gains it had already earned.
+//!
+//! ### The two legs
+//!
+//! Active deposits and pending deposits each own a `P` and `S` pair, stored in [`PoolSumsStore`]
+//! under a [`types::Leg`] key. Both legs run the same code. Pending deposits earn no yield, so
+//! their `G` is always zero.
+//!
+//! ### Rounding
+//!
+//! Every payout to a user rounds down. The remainder stays inside the pool totals, so the pool
+//! account balance always equals the sum of what the pool owes. Market teardown sweeps whatever is
+//! left to [`Config::StableDustHandler`] and [`Config::CollateralDustHandler`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -45,6 +156,7 @@ pub mod pallet {
 	};
 	use pusd_primitives::{BranchModeProvider, Millis, OnBranchLifecycle, RecoveryOffsetInterface};
 
+	/// Balance of both the stablecoin and the collateral surface.
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
 		<T as frame_system::Config>::AccountId,
 	>>::Balance;
@@ -59,20 +171,27 @@ pub mod pallet {
 		<T as frame_system::Config>::AccountId,
 	>>::AssetId;
 
+	/// Stablecoin taken out of issuance, and not yet placed back into it.
 	pub type StableCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
 
+	/// Collateral taken out of issuance, and not yet placed back into it.
 	pub type CollateralCreditOf<T> =
 		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::CollateralAssets>;
 
+	/// One row of [`Deposits`].
 	pub type DepositOf<T> = Deposit<BalanceOf<T>>;
 
+	/// The accounting state of one pool.
 	pub type PoolStateOf<T> = PoolState<BalanceOf<T>>;
 
+	/// The governance parameters of one pool.
 	pub type StabilityPoolConfigOf<T> = StabilityPoolConfig<BalanceOf<T>>;
 
+	/// One row of [`Pools`].
 	pub type StabilityPoolOf<T> = StabilityPool<BalanceOf<T>>;
 
+	/// The storage layout this pallet writes.
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
 	#[pallet::pallet]
@@ -81,8 +200,7 @@ pub mod pallet {
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
-		/// Product-sum math needs a fungibles balance type that can enter
-		/// fixed-point calculations without lossy adapters.
+		/// The stablecoin surface the pool takes deposits in and pays yield from.
 		type StableAssets: fungibles::Inspect<
 				Self::AccountId,
 				AssetId: Parameter + Member + Ord + MaxEncodedLen,
@@ -90,25 +208,21 @@ pub mod pallet {
 			> + fungibles::Mutate<Self::AccountId>
 			+ fungibles::Balanced<Self::AccountId>;
 
-		/// Collateral surface the pool receives offset gains on and pays depositor claims from.
+		/// The collateral surface the pool receives gains on and pays claims from.
 		type CollateralAssets: fungibles::Mutate<
 				Self::AccountId,
 				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance = BalanceOf<Self>,
 			> + fungibles::Balanced<Self::AccountId>;
 
-		/// Time source the entry delay and the Safety-Mode withdrawal delay
-		/// are measured against.
+		/// The clock that the entry delay and the Safety-Mode withdrawal delay are measured
+		/// against.
 		type TimeProvider: Time<Moment = Millis>;
 
-		/// Branch operating-mode source of truth (point it at the vault
-		/// pallet). Frozen branches reject every value-moving pool operation;
-		/// Safety Mode turns withdrawals two-step.
+		/// The source of truth for the operating mode of a market.
 		type BranchModes: BranchModeProvider<CollateralIdOf<Self>, StableIdOf<Self>>;
 
-		/// Shared `FinalRecovery` settlement pricing and execution (point it
-		/// at the redemptions pallet, which owns that pricing) — recovery
-		/// offsets can never diverge from recovery-redemption pricing.
+		/// Settlement pricing and execution for vaults in `FinalRecovery`.
 		type RecoveryOffsets: RecoveryOffsetInterface<
 			CollateralId = CollateralIdOf<Self>,
 			AccountId = Self::AccountId,
@@ -116,30 +230,29 @@ pub mod pallet {
 			Credit = StableCreditOf<Self>,
 		>;
 
-		/// TODO: Doc
+		/// Where the stablecoin left in a pool account at market teardown goes.
 		type StableDustHandler: OnUnbalanced<StableCreditOf<Self>>;
 
-		/// TODO: Doc
+		/// Where the collateral left in a pool account at market teardown goes. See
+		/// [`Config::StableDustHandler`].
 		type CollateralDustHandler: OnUnbalanced<CollateralCreditOf<Self>>;
 
-		/// Authorizes [`Pallet::set_stability_pool_config`] for the market
-		/// given as argument. Point this at the market's admin authority
-		/// (e.g. vaults' `EnsureBranchFullAdmin`) and compose a governance
-		/// override with `EitherOf`.
+		/// Authorizes [`Pallet::set_stability_pool_config`] for the market given as the argument.
 		type UpdateOrigin: EnsureOriginWithArg<
 			Self::RuntimeOrigin,
 			(CollateralIdOf<Self>, StableIdOf<Self>),
 			Success = (),
 		>;
 
-		/// Seed for the per-market pool sub-accounts.
+		/// The seed the per-market pool accounts are derived from. See [`Pallet::pool_account`].
 		#[pallet::constant]
 		type PalletId: Get<PalletId>;
 
+		/// Weight information for the calls of this pallet.
 		type WeightInfo: WeightInfo;
 	}
 
-	/// Per-branch depositor rows.
+	/// What one account holds in one market.
 	#[pallet::storage]
 	pub type Deposits<T: Config> = StorageNMap<
 		_,
@@ -152,9 +265,10 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// The registered markets' pools: governance parameters and hot
-	/// accounting state in one record, so the pieces can never partially
-	/// exist. Existence of the row is what "registered" means.
+	/// The pool of one registered market.
+	///
+	/// The row carries the governance parameters and the accounting state together, so neither can
+	/// exist without the other. A market is registered exactly while its row exists.
 	#[pallet::storage]
 	pub type Pools<T: Config> = StorageDoubleMap<
 		_,
@@ -166,12 +280,10 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Historical and current `S`/`G` sums of both legs, keyed by
-	/// `(leg, epoch, scale)`. The [`Leg::Pending`] rows are the
-	/// backstop's own `P`/`S` domain — pending deposits are consumed pro-rata
-	/// through it — and carry a structurally zero `g_yield`, kept only so both
-	/// legs share one realization implementation. Rows may be pruned only when
-	/// no snapshot on their leg references them.
+	/// The `S` and `G` sums of one leg at one `(epoch, scale)` coordinate.
+	///
+	/// A deposit realizes against the row its snapshot points at, so a row may only be removed once
+	/// no snapshot on its leg still refers to it.
 	#[pallet::storage]
 	pub type PoolSumsStore<T: Config> = StorageNMap<
 		_,
@@ -189,9 +301,8 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// Stablecoin entered the pool. `used_for_recovery`
-		/// was burned immediately against a `FinalRecovery` vault;
-		/// `pending_amount` queued behind the entry delay.
+		/// Stablecoin entered the pool. `used_for_recovery` settled against a `FinalRecovery`
+		/// vault at once; `pending_amount` waits out the entry delay.
 		DepositReceived {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -200,8 +311,7 @@ pub mod pallet {
 			used_for_recovery: BalanceOf<T>,
 			pending_amount: BalanceOf<T>,
 		},
-		/// A pending deposit passed its entry delay and became active on the
-		/// next touch of its row.
+		/// A pending deposit passed its entry delay and joined the active pool.
 		PendingDepositActivated {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -216,8 +326,8 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 			executable_at: Millis,
 		},
-		/// Active stablecoin left the pool. `amount` is what was actually
-		/// taken, which may be less than requested.
+		/// Active stablecoin left the pool. `amount` is what the pool paid, which can be less than
+		/// the caller asked for.
 		WithdrawalExecuted {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -225,7 +335,7 @@ pub mod pallet {
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Realized collateral gains were paid out.
+		/// Claimable collateral was paid out.
 		CollateralClaimed {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -233,7 +343,7 @@ pub mod pallet {
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Realized stablecoin yield was paid out.
+		/// Claimable stablecoin yield was paid out.
 		YieldClaimed {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -241,21 +351,21 @@ pub mod pallet {
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Branch yield was distributed to active depositors through `G`.
+		/// Market yield was shared out to the active depositors.
 		YieldDistributed {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 		},
-		/// Claimable yield was moved into the active deposit.
+		/// Claimable yield moved into the active deposit.
 		YieldCompounded {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Active-pool stablecoin was burned against liquidation debt.
-		/// `epoch`/`scale` are the post-offset coordinates.
+		/// Active stablecoin cancelled liquidation debt. `epoch` and `scale` are the coordinates
+		/// the active pool holds after the offset.
 		PoolOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -264,9 +374,9 @@ pub mod pallet {
 			epoch: u32,
 			scale: u32,
 		},
-		/// Pending deposits were consumed pro-rata as the last-resort
-		/// liquidation backstop. `epoch`/`scale` are the
-		/// post-offset PENDING accumulator coordinates.
+		/// Pending deposits cancelled liquidation debt as the last-resort backstop, in proportion
+		/// to their size. `epoch` and `scale` are the coordinates the pending leg holds after the
+		/// offset.
 		PendingDepositOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -275,10 +385,9 @@ pub mod pallet {
 			epoch: u32,
 			scale: u32,
 		},
-		/// Stablecoin was burned against the `FinalRecovery` FIFO head at
-		/// the shared settlement pricing. The
-		/// `source` distinguishes active-pool capital (gains through `S`)
-		/// from an incoming deposit (gains credited directly).
+		/// Stablecoin settled against the head of the `FinalRecovery` queue. `source` says whether
+		/// the stablecoin came from the active pool, which takes the collateral through `S`, or
+		/// from an incoming deposit, which takes it directly.
 		RecoveryOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -286,10 +395,9 @@ pub mod pallet {
 			collateral_gain: BalanceOf<T>,
 			source: RecoveryOffsetSource,
 		},
-		/// Governance replaced a market's stability-pool config.
+		/// Governance replaced the pool parameters of a market.
 		StabilityPoolConfigUpdated { collateral_id: CollateralIdOf<T>, stable_id: StableIdOf<T> },
-		/// Market teardown swept the pool account's residual dust to
-		/// [`Config::StableDustHandler`] / [`Config::CollateralDustHandler`].
+		/// Market teardown swept the amounts left in the pool account to the dust handlers.
 		DustSwept {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -300,52 +408,54 @@ pub mod pallet {
 
 	#[pallet::error]
 	pub enum Error<T> {
-		/// No stability pool is registered for this market.
+		/// This market has no stability pool. Check that the market is registered.
 		PoolNotRegistered,
-		/// The deposit is below the branch `minimum_deposit`.
+		/// The deposit is below the `minimum_deposit` of the market. Deposit more.
 		DepositTooSmall,
-		/// The caller has no deposit row on this market.
+		/// The caller holds no deposit in this market.
 		DepositNotFound,
 		/// The requested amount is zero.
 		ZeroAmount,
-		/// The withdrawal resolved to zero stablecoin: an exhausted request,
-		/// or no active deposit to draw from.
+		/// The withdrawal resolved to zero stablecoin, because the request is used up or the
+		/// active deposit is empty.
 		NoActiveDeposit,
-		/// Safety Mode withdrawals need a prior [`Pallet::request_withdraw`].
+		/// A Safety-Mode withdrawal needs a prior [`Pallet::request_withdraw`].
 		WithdrawalRequestMissing,
-		/// The withdrawal request has not passed the Safety delay yet.
+		/// The withdrawal request has not passed its `safety_withdrawal_delay` yet. Wait longer.
 		SafetyWithdrawalDelayActive,
-		/// The branch is halted; no user operation may change pool risk.
+		/// The market is frozen, so no call may change the risk the pool carries.
 		BranchFrozen,
-		/// No realized collateral gains to claim.
+		/// The caller has no claimable collateral.
 		NoClaimableCollateral,
-		/// No realized stablecoin yield to claim.
+		/// The caller has no claimable yield.
 		NoClaimableYield,
-		/// No realized claimable yield to compound.
+		/// The caller has no claimable yield to compound.
 		NoYieldToCompound,
-		/// The offset would push `P` across more scale boundaries than
-		/// supported (`new_total / total < 1e-18`) or overflow the
-		/// accumulator math; only reachable with a misconfigured
-		/// `minimum_active_pool_balance` on a gigantic pool.
+		/// The offset would move `P` across more scale boundaries than the pallet supports, or it
+		/// would overflow the accumulator math. This needs a `minimum_active_pool_balance` far too
+		/// small for the size of the pool. Raise that parameter.
 		UnsupportedOffsetPrecision,
-		/// A debt reservation could not be settled exactly.
+		/// The pool could not burn the exact debt the caller reserved. Read the reducible amounts
+		/// again and retry.
 		OffsetSettlementFailed,
-		/// No `FinalRecovery` vault is queued on this market.
+		/// This market has no vault in `FinalRecovery`.
 		RecoveryVaultNotFound,
-		/// The `FinalRecovery` head is below par (`CR < 100%`): deposits
-		/// are rejected and recovery offsets unavailable — discounted
-		/// settlement stays exclusive to the explicit redemption pathway.
+		/// The head of the `FinalRecovery` queue is below par, so the pool rejects deposits and
+		/// offers no recovery offset. Settlement at a discount stays exclusive to the redemption
+		/// path.
 		RecoveryOffsetBelowPar,
-		/// The recovery offset resolved to zero burnable stablecoin (empty
-		/// active pool, the post-offset floor, or a zero request).
+		/// The recovery offset would burn no stablecoin, because the active pool is empty, the
+		/// post-offset floor blocks it, or the request is zero.
 		NoRecoveryOffsetPerformed,
-		/// The supplied stability-pool config is internally inconsistent.
+		/// The pool parameters contradict each other. See
+		/// [`types::StabilityPoolConfig::is_valid`].
 		InvalidStabilityPoolConfig,
-		/// The `precision` pair is frozen at registration: deposits left
-		/// behind a scale boundary realize against the factor that was live
-		/// when the boundary was crossed, so changing it would misprice them.
+		/// The `precision` parameters cannot change after registration. A deposit left behind a
+		/// scale boundary realizes against the factor that was live when it crossed that boundary,
+		/// so a new factor would misprice it.
 		AccumulatorParamsImmutable,
-		/// The pool still holds depositor rows; the branch cannot be removed.
+		/// The pool still holds deposits, so the market cannot be removed. Ask the depositors to
+		/// withdraw first.
 		PoolNotEmpty,
 	}
 
@@ -359,12 +469,19 @@ pub mod pallet {
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// Supply `amount` stablecoin to the market's stability pool. The
-		/// funds queue as a pending deposit until `entry_delay` has passed,
-		/// and fold into the active pool on the next touch of the row — one
-		/// of the owner's own calls, or anyone's [`Pallet::poke_deposit`]. A
-		/// second deposit merges into the existing pending amount and
-		/// restarts its delay.
+		/// Supply stablecoin to the stability pool of a market.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed.
+		///
+		/// ## Details
+		///
+		/// The amount settles against the head of the `FinalRecovery` queue first, if the market
+		/// has one. That part never enters the pool, and its collateral becomes claimable at once.
+		/// The rest queues as a pending deposit and joins the active pool once `entry_delay` has
+		/// passed and something writes the row again. A later deposit merges into the pending
+		/// amount and restarts the delay for the whole of it.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::deposit())]
 		pub fn deposit(
@@ -377,9 +494,17 @@ pub mod pallet {
 			Self::do_deposit(who, collateral_id, stable_id, amount)
 		}
 
-		/// Safety Mode: create or replace a withdrawal request for up to
-		/// `amount` active stablecoin, executable `safety_withdrawal_delay`
-		/// after the request.
+		/// Announce a withdrawal of up to `amount` active stablecoin.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed.
+		///
+		/// ## Details
+		///
+		/// In Safety Mode the request becomes executable `safety_withdrawal_delay` later, and a
+		/// new request replaces any earlier one. In Normal Mode a withdrawal needs no announcement,
+		/// so the call withdraws to the caller instead.
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::request_withdraw())]
 		pub fn request_withdraw(
@@ -392,11 +517,20 @@ pub mod pallet {
 			Self::do_request_withdraw(who, collateral_id, stable_id, amount)
 		}
 
-		/// Withdraw up to `amount` active stablecoin — immediately in Normal
-		/// Mode, against a matured withdrawal request in Safety Mode. Takes
-		/// `min(amount, active)` rather than failing when the active deposit
-		/// shrank since the caller last looked. A `None` recipient pays the
-		/// caller.
+		/// Withdraw up to `amount` active stablecoin.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed.
+		///
+		/// ## Details
+		///
+		/// Normal Mode pays out at once. Safety Mode needs a [`Pallet::request_withdraw`] that has
+		/// passed its delay.
+		///
+		/// The call pays out the smaller of `amount` and the active deposit. A liquidation between
+		/// the last read and this call therefore shrinks the payout instead of failing it. Set
+		/// `recipient` to send the stablecoin elsewhere; `None` pays the caller.
 		#[pallet::call_index(2)]
 		#[pallet::weight(T::WeightInfo::withdraw())]
 		pub fn withdraw(
@@ -411,8 +545,15 @@ pub mod pallet {
 			Self::do_withdraw(who, collateral_id, stable_id, amount, recipient)
 		}
 
-		/// Pay the caller's realized collateral gains out; a `None` recipient
-		/// pays the caller.
+		/// Pay out all claimable collateral of the caller.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed.
+		///
+		/// ## Details
+		///
+		/// Set `recipient` to send the collateral elsewhere; `None` pays the caller.
 		#[pallet::call_index(3)]
 		#[pallet::weight(T::WeightInfo::claim_collateral())]
 		pub fn claim_collateral(
@@ -426,9 +567,17 @@ pub mod pallet {
 			Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Collateral)
 		}
 
-		/// Pay the caller's realized stablecoin yield out; a `None` recipient
-		/// pays the caller. Yield stays claimable — never offsettable — until
-		/// explicitly compounded.
+		/// Pay out all claimable stablecoin yield of the caller.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed.
+		///
+		/// ## Details
+		///
+		/// Claimable yield absorbs no liquidations until [`Pallet::compound_yield`] moves it into
+		/// the active deposit. Set `recipient` to send the stablecoin elsewhere; `None` pays the
+		/// caller.
 		#[pallet::call_index(4)]
 		#[pallet::weight(T::WeightInfo::claim_yield())]
 		pub fn claim_yield(
@@ -442,11 +591,18 @@ pub mod pallet {
 			Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Yield)
 		}
 
-		/// Permissionlessly burn active pool stablecoin against the current
-		/// `FinalRecovery` FIFO head at the shared recovery-settlement
-		/// pricing. Active depositors receive the priced
-		/// collateral through `S`, exactly like an ordinary liquidation
-		/// offset. Available whenever the head is at or above par.
+		/// Settle up to `max_stable_in` active pool stablecoin against the head of the
+		/// `FinalRecovery` queue.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed. Any account may call it.
+		///
+		/// ## Details
+		///
+		/// The settlement uses the price that `pallet-redemptions` owns, and the active depositors
+		/// receive the collateral through `S`, as they do from a liquidation. The call is available
+		/// while the head of the queue is at or above par.
 		#[pallet::call_index(5)]
 		#[pallet::weight(T::WeightInfo::offset_recovery())]
 		pub fn offset_recovery(
@@ -459,10 +615,16 @@ pub mod pallet {
 			Self::do_offset_recovery(collateral_id, stable_id, max_stable_in)
 		}
 
-		/// Move up to `amount` of the caller's claimable yield into the
-		/// active deposit, where it starts absorbing offsets and earning
-		/// gains immediately. Yield never becomes
-		/// offsettable without this explicit step.
+		/// Move up to `amount` claimable yield of the caller into the active deposit.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed.
+		///
+		/// ## Details
+		///
+		/// The moved amount starts to absorb liquidations and to earn gains at once. Yield never
+		/// becomes exposed to liquidations without this call.
 		#[pallet::call_index(6)]
 		#[pallet::weight(T::WeightInfo::compound_yield())]
 		pub fn compound_yield(
@@ -475,11 +637,17 @@ pub mod pallet {
 			Self::do_compound_yield(who, collateral_id, stable_id, amount)
 		}
 
-		/// Permissionlessly realize `owner`'s deposit against the current
-		/// accumulators, without moving value, and fold in a matured pending
-		/// deposit. A matured pending deposit needs a touch to fold in; past
-		/// the entry delay the move is mechanical, so any caller may supply
-		/// that touch.
+		/// Realize the deposit of `owner` and activate a matured pending deposit of theirs.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed. Any account may call it.
+		///
+		/// ## Details
+		///
+		/// The call moves no value. Past the entry delay, activation is mechanical and its outcome
+		/// does not depend on who asks for it, so a depositor never has to wait for their own next
+		/// call.
 		#[pallet::call_index(7)]
 		#[pallet::weight(T::WeightInfo::poke_deposit())]
 		pub fn poke_deposit(
@@ -492,13 +660,16 @@ pub mod pallet {
 			Self::do_poke_deposit(owner, collateral_id, stable_id)
 		}
 
-		/// Replace a market's stability-pool parameters. The `precision`
-		/// pair must match the stored values — see
-		/// [`Error::AccumulatorParamsImmutable`].
+		/// Replace the pool parameters of a market.
 		///
-		/// Call indices 0-7 are reserved for the user-facing deposit
-		/// lifecycle so calls can land milestone by milestone without
-		/// renumbering.
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must satisfy [`Config::UpdateOrigin`] for the market.
+		///
+		/// ## Details
+		///
+		/// The `precision` parameters must equal the stored ones. See
+		/// [`Error::AccumulatorParamsImmutable`].
 		#[pallet::call_index(8)]
 		#[pallet::weight(T::WeightInfo::set_stability_pool_config())]
 		pub fn set_stability_pool_config(
@@ -513,9 +684,10 @@ pub mod pallet {
 	}
 
 	impl<T: Config> Pallet<T> {
-		/// Per-market account holding the pool's stablecoin (active and
-		/// pending deposits plus undistributed yield) and collateral
-		/// (unclaimed gains).
+		/// The account that holds everything a market's pool owes.
+		///
+		/// It holds stablecoin for the active deposits, the pending deposits and the undistributed
+		/// yield, and collateral for the unclaimed gains.
 		pub fn pool_account(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
@@ -523,13 +695,12 @@ pub mod pallet {
 			pusd_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
 		}
 
-		/// Sweep the pool account's residual balances to the dust handlers,
-		/// returning the swept amounts.
+		/// Sends everything left in a pool account to the dust handlers, and returns the amounts
+		/// sent.
 		///
-		/// Only called with no depositor rows left, so whatever remains is
-		/// unattributable flooring residue. It must not stay behind: the
-		/// balance↔totals invariant holds as an equality, so a re-registered
-		/// pair starting from fresh zero totals would inherit a divergence.
+		/// The caller runs this only once no deposit rows remain, so whatever is left belongs to
+		/// nobody. It cannot stay: the pool account balance must equal the pool totals, so a
+		/// market registered again on the same pair would start from totals it cannot match.
 		fn sweep_dust(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
@@ -568,8 +739,7 @@ pub mod pallet {
 	}
 
 	impl<T: Config> OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
-		/// One pool per `(collateral, stablecoin)` market, so every
-		/// registration carries its own parameters.
+		/// One pool per market, so every registration carries its own parameters.
 		type RegistrationConfig = StabilityPoolConfigOf<T>;
 
 		fn on_registered(
@@ -587,8 +757,8 @@ pub mod pallet {
 				);
 			}
 
-			// A provider reference keeps the sub-account alive across
-			// zero-balance moments without depositing an existential deposit.
+			// A provider reference keeps the pool account alive while it holds nothing, without
+			// locking up an existential deposit.
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			if frame_system::Pallet::<T>::providers(&pool_account) == 0 {
 				frame_system::Pallet::<T>::inc_providers(&pool_account);
@@ -601,12 +771,9 @@ pub mod pallet {
 			stable_id: &StableIdOf<T>,
 			_remaining_stablecoin_markets: u32,
 		) -> DispatchResult {
-			// Depositor rows are the user-funds guard: active, pending, and
-			// claimable value all live on them. Vaults rolls the whole
-			// `remove_branch` back on this error, so a market admin cannot
-			// strand depositor funds. With no rows left, any residual pool
-			// balance is unattributable flooring dust, swept to the runtime's
-			// dust handlers below.
+			// Deposit rows are what guards user funds: active, pending and claimable value all
+			// live on them. Vaults rolls the whole `remove_branch` back on this error, so a market
+			// admin cannot strand depositor funds.
 			ensure!(
 				Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
 					.next()
@@ -627,8 +794,8 @@ pub mod pallet {
 			}
 
 			Pools::<T>::remove(collateral_id, stable_id);
-			// Safe to clear wholesale: without deposit rows, no snapshot on
-			// either leg can reference a sums row.
+			// Safe to clear in full: with no deposit rows, no snapshot on either leg can still
+			// refer to a sums row.
 			let removal = PoolSumsStore::<T>::clear_prefix(
 				(collateral_id.clone(), stable_id.clone()),
 				u32::MAX,
@@ -637,18 +804,17 @@ pub mod pallet {
 			debug_assert!(removal.maybe_cursor.is_none());
 
 			if frame_system::Pallet::<T>::providers(&pool_account) > 0 {
-				// The sweep zeroed the market's own assets, but unrelated
-				// tokens a third party parked here may still hold consumer
-				// references; the account then just stays, which is harmless.
+				// The sweep emptied the market's own assets, but a third party may have parked
+				// another token here and left a consumer reference behind. The account then stays,
+				// which does no harm.
 				let _ = frame_system::Pallet::<T>::dec_providers(&pool_account);
 			}
 			Ok(())
 		}
 
-		/// One-unit thresholds and no delays, so nothing in the pool becomes
-		/// the binding constraint of a benchmark. `p_min * scale_factor` lands
-		/// exactly at one, the tightest rescale [`PoolPrecision::is_valid`]
-		/// accepts.
+		/// One-unit thresholds and no delays, so nothing in the pool becomes the binding
+		/// constraint of a benchmark. `p_min * scale_factor` lands exactly at one, the tightest
+		/// rescale that [`types::PoolPrecision::is_valid`] accepts.
 		#[cfg(feature = "runtime-benchmarks")]
 		fn benchmark_registration_config(_stablecoin_markets: u32) -> Self::RegistrationConfig {
 			StabilityPoolConfig {

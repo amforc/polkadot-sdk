@@ -1,3 +1,8 @@
+//! Worked examples with the numbers spelled out.
+//!
+//! Each test states the arithmetic it expects before it runs, so a reader can check the pallet
+//! against the model by hand rather than by trusting the assertions.
+
 use crate::{mock::*, types::Leg, Error};
 
 /// These vaults sit at CR 120%, above the default 110% MCR, so

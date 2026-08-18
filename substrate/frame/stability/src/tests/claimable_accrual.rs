@@ -1,10 +1,11 @@
-//! Realization-on-touch: every value-moving operation settles gains into the
-//! row's `claimable_*` fields — it never pays them to the wallet, and
-//! never folds yield back into the active deposit. Gains accumulate
-//! across successive touches and a single claim pays the total.
+//! Where gains go when a row is written.
 //!
-//! Offsets here price collateral at the 1.25 registration price: cancelling
-//! debt `D` seizes `D / 1.25 = 0.8 * D` collateral.
+//! Every operation that moves value settles the gains of the row into its claimable fields. It
+//! never pays them to a wallet, and it never folds yield back into the active deposit. Gains add
+//! up across writes, and one claim pays the total.
+//!
+//! Offsets here price collateral at the registration price of 1.25, so cancelling debt `D` seizes
+//! `0.8 * D` collateral.
 
 use crate::{mock::*, Error};
 

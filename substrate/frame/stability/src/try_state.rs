@@ -1,5 +1,8 @@
-//! `try-runtime` invariant checks: the accounting identities that must hold
-//! after every operation.
+//! `try-runtime` invariant checks that must hold after every operation.
+//!
+//! Three families of invariant live here. The accumulators stay inside the bounds that the
+//! precision parameters set. The pool account holds exactly what the pool reports owing. No set of
+//! rows adds up to more than its pool total.
 
 use crate::{
 	pallet::{BalanceOf, Config, Deposits, Pallet, PoolSumsStore, Pools},
@@ -36,9 +39,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				return Err("current `(epoch, scale)` has no sums row".into());
 			}
 		}
-		// Pending deposits earn no yield, so the pending leg's `G` is
-		// structurally zero — sharing the row type with the active leg must
-		// never smuggle a yield sum in.
+		// Pending deposits earn no yield. Sharing the row type with the active leg must never let
+		// a yield sum in through the back door.
 		for (_, sums) in PoolSumsStore::<T>::iter_prefix((
 			collateral_id.clone(),
 			stable_id.clone(),
@@ -49,9 +51,9 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			}
 		}
 
-		// Invariant 1 holds as an equality: every stablecoin flow into or
-		// out of the pool account mirrors exactly one aggregate, and
-		// flooring dust strands inside the unclaimed totals, never outside.
+		// This holds as an equality, not as an inequality: every stablecoin that enters or leaves
+		// the pool account moves exactly one total with it, and a rounding remainder stays inside
+		// those totals rather than outside them.
 		let pool_account = Pallet::<T>::pool_account(&collateral_id, &stable_id);
 		let stable_held = T::StableAssets::balance(stable_id.clone(), &pool_account);
 		let stable_owed = state
@@ -67,10 +69,9 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			return Err("pool collateral balance diverges from tracked totals".into());
 		}
 
-		// No realized deposit set may exceed its pool aggregate — on either
-		// leg. Flooring keeps realized values at or below the aggregate; the
-		// excess is stranded dust that leaves with an epoch reset or the
-		// teardown sweep.
+		// No set of rows may add up to more than its pool total, on either leg. Rounding keeps
+		// every realized value at or below the total, and the difference belongs to nobody; it
+		// leaves with an epoch reset or with the teardown sweep.
 		let mut pending_sum = BalanceOf::<T>::zero();
 		let mut compounded_sum = BalanceOf::<T>::zero();
 		for (_, deposit) in Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone())) {
@@ -117,7 +118,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		}
 	}
 
-	// Pool rows are the registration proxy: nothing may outlive them.
+	// A pool row is what makes a market registered, so nothing may outlive one.
 	for ((collateral_id, stable_id, _who), deposit) in Deposits::<T>::iter() {
 		let state = Pools::<T>::get(&collateral_id, &stable_id)
 			.ok_or("deposit row without a pool row")?
@@ -130,7 +131,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				return Err("deposit snapshot scale ahead of the pool".into());
 			}
 		}
-		// Pruning guard: realization reads the snapshot's sums row.
+		// Realization reads the sums row the snapshot points at, so that row must still exist.
 		if !PoolSumsStore::<T>::contains_key((
 			&collateral_id,
 			&stable_id,

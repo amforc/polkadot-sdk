@@ -1,12 +1,10 @@
-//! Epoch bumps and scale crossings: the product-sum coordinates under full
-//! depletion and extreme partial offsets.
+//! Epoch bumps and scale crossings: the coordinates under a full depletion and under offsets
+//! extreme enough to exhaust the precision of `P`.
 //!
-//! Scale crossings need survival ratios at or below `p_min` (1e-9 here), so
-//! these tests drop the `minimum_active_pool_balance` floor to single digits
-//! up front. A production floor never has to be large to stay clear of the
-//! precision limit: only `new_total / total < 1e-18` steps aside, so any
-//! floor above `total_supply / 1e18` suffices (see the bound derived on
-//! `StabilityPoolConfig::minimum_active_pool_balance`).
+//! A scale crossing needs `P` to fall to `p_min`, which is 1e-9 here, so these tests lower the
+//! post-offset floor to single digits first. A production floor never needs to be large: only a
+//! step that shrinks the pool by more than 1e18 is refused, so any floor above
+//! `total_supply / 1e18` is enough.
 
 use crate::{mock::*, types::Leg};
 

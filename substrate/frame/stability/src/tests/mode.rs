@@ -1,12 +1,11 @@
-//! Branch-mode gating through the real vaults-derived mode:
-//! oracle failure and governance freezes halt the pool, Safety Mode (low
-//! TCR) turns withdrawals two-step, everything else keeps working.
+//! What each operating mode allows, driven through the real vault pallet rather than a stub.
 //!
-//! Fixtures come from the mock: [`seed_branch_with_debt`] opens a
-//! 1000-collateral / 500-debt vault (TCR 250% at the 1.25 registration
-//! price) and activates a 400 deposit for user 1; [`enter_safety_mode`]
-//! drops DOT to 0.6 (TCR 120%, between the 110% MCR and the 130% Safety
-//! threshold).
+//! A lost oracle price and a governance freeze both halt the pool. Safety Mode makes withdrawals
+//! two-step and leaves everything else working.
+//!
+//! The fixtures come from the mock. [`seed_branch_with_debt`] opens one vault and activates a
+//! deposit at a TCR of 250%. [`enter_safety_mode`] then drops the price until the TCR reaches
+//! 120%, between the liquidation ratio and the Safety threshold.
 
 use crate::{mock::*, Error};
 
