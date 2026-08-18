@@ -281,31 +281,95 @@ fn frozen_stable_fails_fee_resolution_loudly() {
 	});
 }
 
-// A keeper leg below the collateral's ED to a fresh keeper reverts the whole
-// transactional liquidation — the planner must size non-zero legs to at
-// least the collateral asset's minimum balance.
+/// Prices the market so a 1_000 XBT vault is far under water — 10^13 × 10^-5 = 10^8 stable
+/// minor units against ~5_000 USDX of debt — and sizes keeper compensation as one flat value:
+/// at this price a value of `v` buys `v × 10^5` collateral minor units, so 500 is half the ED
+/// and 2_000 is twice it.
+fn crash_price_with_flat_keeper_value(value: Balance) {
+	set_price(XBT, FixedU128::from_rational(1u128, 100_000u128));
+	let set = |update| Vaults::set_param(RuntimeOrigin::signed(ADMIN), XBT, USDX, update);
+	assert_ok!(set(BranchConfigUpdate::KeeperPercentCompensation(Permill::zero())));
+	assert_ok!(set(BranchConfigUpdate::KeeperCompensationCapValue(value)));
+	assert_ok!(set(BranchConfigUpdate::KeeperFlatCompensationValue(value)));
+}
+
+// A keeper leg below the collateral's ED to a fresh keeper is planned out rather than failing
+// the liquidation: an unsafe vault left in the market is worse than an unpaid keeper, and
+// holding an account that can receive collateral is the keeper's own responsibility. The freed
+// reward falls through to the waterfall exactly as a skipped JIT leg does.
 #[test]
-fn liquidation_reverts_on_sub_ed_keeper_leg() {
+fn liquidation_plans_out_a_sub_ed_keeper_leg() {
 	build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		// 10^13 × 10^-5 = 10^8 stable minor units ≪ 110% of the debt.
-		// At this price a flat value of 500 pays 0.005 XBT, below the ED.
-		set_price(XBT, FixedU128::from_rational(1u128, 100_000u128));
+		crash_price_with_flat_keeper_value(500);
+		let custody = Vaults::redistribution_account(&XBT, &USDX);
+		let custody_before = held(XBT, custody);
 
-		let set_keeper_value = |value| {
-			let set = |update| Vaults::set_param(RuntimeOrigin::signed(ADMIN), XBT, USDX, update);
-			set(BranchConfigUpdate::KeeperPercentCompensation(Permill::zero()))?;
-			set(BranchConfigUpdate::KeeperCompensationCapValue(value))?;
-			set(BranchConfigUpdate::KeeperFlatCompensationValue(value))
-		};
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
-		assert_ok!(set_keeper_value(500));
-		assert_noop!(liquidate(998, XBT, USDX, 1, 0, 0), Error::<Test>::CollateralPayoutFailed);
-		assert!(
-			crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)),
-			"failed liquidation rolled back"
+		assert_ok!(liquidate(998, XBT, USDX, 1, 0, 0));
+		assert!(!crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)), "vault liquidated");
+		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper stayed unpaid");
+		// The vault is far under water, so its whole collateral is seized; with the reward
+		// planned out, all of it reaches redistribution custody.
+		assert_eq!(held(XBT, custody) - custody_before, 1_000 * XBT_UNIT);
+	});
+}
+
+// The JIT collateral share is the keeper's other collateral leg and follows the same rule: a
+// share a fresh keeper cannot receive drops the trade instead of failing the liquidation, and
+// the keeper's stablecoin stays untouched. The minimum contribution buys a share of ~2×10^5
+// minor units here, far below the 10^8 ED.
+#[test]
+fn liquidation_drops_a_jit_share_the_keeper_cannot_receive() {
+	build_and_execute(|| {
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		crash_price_with_flat_keeper_value(500);
+		mint_stable(USDX, 998, USD);
+		let custody = Vaults::redistribution_account(&XBT, &USDX);
+		let custody_before = held(XBT, custody);
+
+		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+		assert_ok!(liquidate(998, XBT, USDX, 1, 100, 0));
+		assert!(!crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)), "vault liquidated");
+		assert_eq!(
+			stable_balance(USDX, 998),
+			USD,
+			"no JIT burn for a share the keeper cannot take"
+		);
+		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper received nothing");
+		assert_eq!(held(XBT, custody) - custody_before, 1_000 * XBT_UNIT);
+	});
+}
+
+// Compensation settles before the JIT share, so a reward that clears the ED opens the keeper's
+// account and a sub-ED JIT share follows into it: the payability check reads the combined
+// intake, not each leg alone.
+#[test]
+fn reward_above_ed_carries_a_sub_ed_jit_share() {
+	build_and_execute(|| {
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		crash_price_with_flat_keeper_value(2_000);
+		mint_stable(USDX, 998, USD);
+		let custody = Vaults::redistribution_account(&XBT, &USDX);
+		let custody_before = held(XBT, custody);
+
+		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+		assert_ok!(liquidate(998, XBT, USDX, 1, 100, 0));
+		assert_eq!(stable_balance(USDX, 998), USD - 100, "the JIT trade executed");
+		let reward = 2 * XBT_ED;
+		let jit_share = collateral_balance(XBT, 998) - reward;
+		assert!(jit_share > 0, "the JIT share was paid");
+		assert!(jit_share < XBT_ED, "the JIT share alone would not have opened the account");
+		assert_eq!(
+			held(XBT, custody) - custody_before + reward + jit_share,
+			1_000 * XBT_UNIT,
+			"seized collateral is conserved across custody and the keeper"
 		);
 	});
 }

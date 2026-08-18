@@ -61,10 +61,10 @@ pub struct LiquidationConfig<Balance> {
 	pub keeper_percent_compensation: Permill,
 	/// Maximum keeper compensation, in stablecoin value.
 	pub keeper_compensation_cap_value: Balance,
-	/// Smallest direct keeper contribution; prevents dust burns.
+	/// Smallest keeper allowance or funding accepted for a direct contribution.
 	///
-	/// Binds the keeper's allowance and funding, not the residual the waterfall asks for: a
-	/// smaller system ask still executes.
+	/// A smaller keeper-side amount skips JIT without blocking liquidation. The limit does not
+	/// bind the residual the waterfall asks for: a smaller system ask still executes.
 	pub minimum_jit_contribution: Balance,
 	/// Extra collateral assigned to redistributed debt.
 	///

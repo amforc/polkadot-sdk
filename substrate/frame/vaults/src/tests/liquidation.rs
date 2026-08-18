@@ -356,30 +356,38 @@ fn remainder_follows_last_offset() {
 	});
 }
 
-// A keeper must not bypass the market minimum with a deliberately small JIT allowance.
+// A deliberately small JIT allowance must not block liquidation. It opts out of JIT and leaves
+// the keeper's stablecoin untouched while the debt continues through the waterfall.
 #[test]
-fn jit_below_minimum_rejected() {
+fn jit_below_minimum_skipped() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(PUSD, KEEPER, 500);
 
 		// A 50-unit allowance sits below the 100-unit `minimum_jit_contribution`.
-		// The keeper is fully funded, so the allowance alone triggers the reject.
-		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 50, 0), Error::<Test>::JitBelowMinimum);
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 50, 0));
+
+		assert_eq!(stable_balance(PUSD, KEEPER), 500, "no below-minimum JIT burn");
+		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 588);
+		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0));
 	});
 }
 
-// A keeper must not bypass the market minimum by underfunding a large allowance either.
+// Underfunding a large allowance below the market minimum follows the same fail-open rule: the
+// optional JIT leg is skipped and liquidation continues.
 #[test]
-fn jit_underfunded_below_minimum_rejected() {
+fn jit_underfunded_below_minimum_skipped() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(PUSD, KEEPER, 50);
 
 		// The 1_000 allowance clears the minimum, but the keeper's 50 of
-		// funding would clamp the contribution below it — the funding shortfall
-		// is keeper-side, so it rejects like a small allowance.
-		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 1_000, 0), Error::<Test>::JitBelowMinimum);
+		// funding would clamp the contribution below it.
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 1_000, 0));
+
+		assert_eq!(stable_balance(PUSD, KEEPER), 50, "no underfunded JIT burn");
+		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 588);
+		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0));
 	});
 }
 

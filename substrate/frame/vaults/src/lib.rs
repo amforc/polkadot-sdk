@@ -717,12 +717,6 @@ pub mod pallet {
 		RedistributionWouldOverflow,
 		/// The vault is not eligible for liquidation.
 		VaultNotLiquidatable,
-		/// A non-zero keeper allowance or its funding is below the market minimum.
-		JitBelowMinimum,
-		/// Direct-offset collateral fell below the keeper's submitted floor.
-		///
-		/// Defensive: planning skips the contribution instead of executing it.
-		JitSlippageExceeded,
 		/// Collateral could not be delivered to its recipient.
 		CollateralPayoutFailed,
 		/// Another dormant vault is already first in the redemption queue.
@@ -1440,11 +1434,18 @@ pub mod pallet {
 		/// keeper's optional direct contribution, pending pool capital, and
 		/// finally redistribution.
 		///
+		/// The caller's collateral legs — compensation and the JIT share — are paid only when the
+		/// caller's account can receive them; keeping such an account is the keeper's own
+		/// responsibility. An unpayable reward is planned into the waterfall and an unpayable JIT
+		/// share drops the trade, rather than failing the call. On collaterals whose minimum
+		/// balance exceeds the reward, a keeper holding none of the asset therefore goes unpaid
+		/// until it holds that minimum.
+		///
 		/// ## Parameters
 		///
 		/// - `jit.max_stable`: Maximum stable assets the keeper allows the call to burn for a
 		///   direct contribution. Zero disables the contribution; a non-zero allowance below the
-		///   market's minimum JIT contribution is rejected.
+		///   market's minimum JIT contribution skips JIT without blocking liquidation.
 		/// - `jit.min_collateral_out`: Minimum collateral allocated to an executed JIT slice,
 		///   excluding the keeper reward. This absolute floor is not scaled down for a partial JIT
 		///   execution, so it should reflect the smallest execution the keeper would accept. A
