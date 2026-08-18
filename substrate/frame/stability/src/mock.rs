@@ -489,7 +489,7 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
 		safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
 		// Large enough that it never binds unintentionally, including at the
-		// raw-unit scales the `numeric-examples.md` fixtures use. A test that
+		// raw-unit scales the fixtures use. A test that
 		// exercises the ceiling sets its own.
 		debt_ceiling: 1_000_000_000_000,
 		minimum_debt: 200,
@@ -717,8 +717,8 @@ pub fn seed_deposit(who: AccountId, amount: Balance) {
 }
 
 /// Advance past the default entry delay and fold every listed depositor's
-/// matured pending deposit into the (DOT, PUSD) active pool. Activation is
-/// automatic on any touch; the permissionless poke stands in for one.
+/// matured pending deposit into the (DOT, PUSD) active pool. Folding in
+/// takes a touch of the row; the permissionless poke stands in for one.
 pub fn activate_all(depositors: &[AccountId]) {
 	advance_time(5_000);
 	for who in depositors {
