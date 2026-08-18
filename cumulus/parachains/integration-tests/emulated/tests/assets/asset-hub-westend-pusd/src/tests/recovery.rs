@@ -63,7 +63,7 @@ fn example_03_final_recovery_redemption_above_par() {
 			RuntimeOrigin::signed(redeemer.clone()),
 			get_native_id(),
 			get_pusd_id(),
-			RedemptionTerms { max_stable_in: 2_000 * PUSD, min_collateral_out: 1_100 * WND },
+			RedemptionTerms { max_stable_to_spend: 2_000 * PUSD, min_collateral_out: 1_100 * WND },
 			redeemer.clone(),
 			16,
 		));
@@ -112,7 +112,7 @@ fn example_04_final_recovery_redemption_below_par_with_insurance_cover() {
 			RuntimeOrigin::signed(redeemer.clone()),
 			get_native_id(),
 			get_pusd_id(),
-			RedemptionTerms { max_stable_in: 3_000 * PUSD, min_collateral_out: 1_333 * WND },
+			RedemptionTerms { max_stable_to_spend: 3_000 * PUSD, min_collateral_out: 1_333 * WND },
 			redeemer.clone(),
 			16,
 		));
@@ -132,7 +132,7 @@ fn example_04_final_recovery_redemption_below_par_with_insurance_cover() {
 			RuntimeOrigin::signed(settler.clone()),
 			get_native_id(),
 			get_pusd_id(),
-			RedemptionTerms { max_stable_in: 6_000 * PUSD, min_collateral_out: 2_600 * WND },
+			RedemptionTerms { max_stable_to_spend: 6_000 * PUSD, min_collateral_out: 2_600 * WND },
 			settler.clone(),
 			16,
 		));
