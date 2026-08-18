@@ -628,10 +628,9 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// The exact-settlement core both accumulator domains share: burn the
-	/// reserved stable debit and resolve the whole collateral credit into the
-	/// pool account, aborting on any shortfall or leftover. Returns the
-	/// collateral amount consumed.
+	/// The value movement both legs share: burn the reserved stable
+	/// debit and resolve the whole collateral credit into the pool account.
+	/// Returns the collateral amount consumed.
 	fn settle_reservation_exact(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -640,21 +639,25 @@ impl<T: Config> Pallet<T> {
 		collateral: CollateralCreditOf<T>,
 	) -> Result<BalanceOf<T>, DispatchError> {
 		let collateral_amount = collateral.peek();
-		let remainder = Self::resolve_and_burn(
-			collateral_id,
-			stable_id,
+		let stable_credit = T::StableAssets::withdraw(
+			stable_id.clone(),
 			pool_account,
 			reservation.debt,
+			Precision::Exact,
 			reservation.preservation,
-			collateral_amount,
-			collateral,
+			Fortitude::Polite,
 		)
-		.map_err(|credit| {
-			drop(credit);
-			Error::<T>::OffsetSettlementFailed
-		})?;
-		ensure!(remainder.peek().is_zero(), Error::<T>::OffsetSettlementFailed);
-		drop(remainder);
+		.map_err(|_| Error::<T>::OffsetSettlementFailed)?;
+		debug_assert_eq!(stable_credit.peek(), reservation.debt);
+		// A zero credit is dropped without touching the account — a zero
+		// deposit into a not-yet-existing account is the only failure it
+		// could hit. A real failure means a sub-minimum first gain.
+		if let Err(collateral) = collateral.drop_zero() {
+			T::CollateralAssets::resolve(pool_account, collateral)
+				.map_err(|_| Error::<T>::OffsetSettlementFailed)?;
+		}
+		// Dropping the withdrawn credit is the debt-cancelling burn.
+		drop(stable_credit);
 		Ok(collateral_amount)
 	}
 
@@ -761,73 +764,6 @@ impl<T: Config> Pallet<T> {
 			Self::plan_offset(collateral_id, stable_id, Leg::Active, pool, debt, collateral)?;
 		Self::commit_offset(collateral_id, stable_id, Leg::Active, &mut pool.state, plan);
 		Ok(())
-	}
-
-	/// The §7 offset value movement. The stable debit is sized by
-	/// [`reducible_debit`] at the caller. If resolving the collateral fails,
-	/// the stable credit is returned and `Err` carries the full collateral
-	/// credit back to the caller.
-	fn resolve_and_burn(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		pool_account: &T::AccountId,
-		debt: BalanceOf<T>,
-		preservation: Preservation,
-		collateral_amount: BalanceOf<T>,
-		credit: CollateralCreditOf<T>,
-	) -> Result<CollateralCreditOf<T>, CollateralCreditOf<T>> {
-		debug_assert_eq!(credit.asset(), *collateral_id);
-		let stable_credit = match T::StableAssets::withdraw(
-			stable_id.clone(),
-			pool_account,
-			debt,
-			Precision::Exact,
-			preservation,
-			Fortitude::Polite,
-		) {
-			Ok(stable_credit) => stable_credit,
-			// Sized by the caller's `reducible_debit` with nothing
-			// interleaved; a refusal means the implementation disagrees with
-			// its own `reducible_balance`. Nothing has moved yet.
-			Err(_) => return Err(credit),
-		};
-		debug_assert_eq!(stable_credit.peek(), debt);
-		let (to_pool, mut remainder) = credit.split(collateral_amount);
-		match Self::resolve_pool_collateral(pool_account, to_pool) {
-			Ok(()) => {
-				// Dropping the withdrawn credit is the debt-cancelling burn.
-				drop(stable_credit);
-				Ok(remainder)
-			},
-			Err(returned) => {
-				let _ = T::StableAssets::resolve(pool_account, stable_credit)
-					.defensive_proof("stable credit returns to the account it came from");
-				Self::subsume_returned(&mut remainder, returned);
-				Err(remainder)
-			},
-		}
-	}
-
-	/// Resolve an offset's collateral slice into the pool account. A zero
-	/// slice is dropped without touching the account (a zero deposit into a
-	/// not-yet-existing account is the only failure it could hit); a real
-	/// failure means a sub-minimum first gain.
-	fn resolve_pool_collateral(
-		pool_account: &T::AccountId,
-		credit: CollateralCreditOf<T>,
-	) -> Result<(), CollateralCreditOf<T>> {
-		let credit = match credit.drop_zero() {
-			Ok(()) => return Ok(()),
-			Err(credit) => credit,
-		};
-		T::CollateralAssets::resolve(pool_account, credit)
-	}
-
-	/// Fold a returned credit back into the remainder. Both halves come
-	/// from one split, so a mismatch cannot happen; the defensive arm drops
-	/// (burns) the leftover, keeping issuance conservative.
-	fn subsume_returned(remainder: &mut CollateralCreditOf<T>, returned: CollateralCreditOf<T>) {
-		let _ = remainder.subsume(returned).defensive_proof("collateral credit halves diverged");
 	}
 
 	/// SPEC.md §6.3: distribute same-stablecoin yield to active depositors
