@@ -36,7 +36,8 @@ pub enum Leg {
 	/// offsets and receiving branch yield.
 	Active,
 	/// Pending deposits waiting out the entry delay: a `P`/`S` pair of their
-	/// own for the §6.8 backstop. Their `G` is structurally zero — pending
+	/// own for the liquidation backstop. Their `G` is structurally zero —
+	/// pending
 	/// deposits earn no yield.
 	Pending,
 }
@@ -46,7 +47,7 @@ impl Leg {
 	pub const ALL: [Self; 2] = [Self::Active, Self::Pending];
 }
 
-/// `S` and `G` for one `(epoch, scale)` coordinate (SPEC.md §5.2).
+/// `S` and `G` for one `(epoch, scale)` coordinate.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, Default)]
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct PoolSums {
@@ -139,7 +140,7 @@ pub enum PUpdate {
 	Depleted,
 }
 
-/// Per-branch depositor state (SPEC.md §5.1).
+/// Per-branch depositor state.
 ///
 /// `active_deposit` is the amount last realized against the accumulators; it
 /// may be stale relative to the live `P`. Every user operation realizes
@@ -184,10 +185,10 @@ impl<Balance: Zero> Deposit<Balance> {
 	}
 }
 
-/// Recently supplied stablecoin waiting out the entry delay (SPEC.md §5.1).
+/// Recently supplied stablecoin waiting out the entry delay.
 /// Not part of `total_active_deposits`; earns no yield, but may be consumed by
-/// the last-resort liquidation backstop (§6.8), which takes from all pending
-/// deposits pro-rata (design decision 2026-07-29, replacing the spec sketch's
+/// the last-resort liquidation backstop, which takes from all pending
+/// deposits pro-rata (design decision 2026-07-29, replacing an earlier
 /// oldest-first FIFO). Losses and the direct collateral gains are tracked
 /// lazily through the pool's pending `P`/`S` accumulator pair, exactly like
 /// active-side offsets.
@@ -204,7 +205,7 @@ pub struct PendingDeposit<Balance> {
 	pub snapshot: DepositSnapshot,
 }
 
-/// Two-step Safety-Mode withdrawal state (§6.9). Only recorded in Safety
+/// Two-step Safety-Mode withdrawal state. Only recorded in Safety
 /// Mode — a Normal-Mode `request_withdraw` forwards to the direct
 /// withdrawal — and ignored by Normal-Mode withdrawals should the branch
 /// recover before execution.
@@ -215,12 +216,11 @@ pub struct WithdrawalRequest<Balance> {
 	pub executable_at: Millis,
 }
 
-/// Branch pool totals and current product-sum coordinates (SPEC.md §5.2).
+/// Branch pool totals and current product-sum coordinates.
 ///
-/// Deviations from the spec sketch (design decisions, 2026-07-07 and
-/// 2026-07-29):
-/// - no pending-deposit FIFO — the §6.8 backstop consumes all pending deposits pro-rata, tracked by
-///   `pending_coords` (a second `P`/`S` accumulator pair) instead of a queue;
+/// Design decisions (2026-07-07 and 2026-07-29):
+/// - no pending-deposit FIFO — the liquidation backstop consumes all pending deposits pro-rata,
+///   tracked by `pending_coords` (a second `P`/`S` accumulator pair) instead of a queue;
 /// - no `*_rounding_surplus` fields — every flooring remainder stays inside the unclaimed totals,
 ///   so the fields would be identically zero. They arrive with their first writer.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
@@ -290,14 +290,14 @@ impl<Balance: Zero> PoolState<Balance> {
 }
 
 impl<Balance: FixedPointOperand> PoolState<Balance> {
-	/// `S`/`G` delta for distributing `distributed` over the active pool
-	/// (SPEC.md §6.3); `None` when the pool is empty or the product overflows.
+	/// `S`/`G` delta for distributing `distributed` over the active pool;
+	/// `None` when the pool is empty or the product overflows.
 	pub fn delta_sum(&self, distributed: Balance) -> Option<FixedU128> {
 		math::delta_sum(distributed, self.coords.p, self.total_active_deposits)
 	}
 }
 
-/// Per-branch governance parameters (SPEC.md §5.3, plus `yield_share`).
+/// Per-branch governance parameters.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
@@ -305,7 +305,7 @@ pub struct StabilityPoolConfig<Balance> {
 	/// Smallest accepted deposit; prevents dust rows.
 	pub minimum_deposit: Balance,
 	/// Post-offset floor for the active pool: an offset either leaves at
-	/// least this much active or fully depletes the pool (§6.5).
+	/// least this much active or fully depletes the pool.
 	pub minimum_active_pool_balance: Balance,
 	pub entry_delay: Millis,
 	pub safety_withdrawal_delay: Millis,
@@ -317,7 +317,7 @@ pub struct StabilityPoolConfig<Balance> {
 }
 
 impl<Balance: Zero> StabilityPoolConfig<Balance> {
-	/// Zero thresholds break dust protection and the §6.5 offset floor;
+	/// Zero thresholds break dust protection and the offset floor;
 	/// the precision bounds are [`PoolPrecision::is_valid`]'s.
 	pub fn is_valid(&self) -> bool {
 		if self.minimum_deposit.is_zero() {
@@ -348,7 +348,7 @@ impl<Balance: Zero> StabilityPool<Balance> {
 	}
 }
 
-/// Which capital funded a recovery offset (SPEC.md §10).
+/// Which capital funded a recovery offset.
 #[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub enum RecoveryOffsetSource {
 	ActivePool,

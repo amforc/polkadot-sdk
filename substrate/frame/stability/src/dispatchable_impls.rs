@@ -32,8 +32,8 @@ pub(crate) enum ClaimKind {
 	Yield,
 }
 
-/// The fully-materialized post-state of a product-sum offset (SPEC.md §6.4 /
-/// §7.1 / §7.2) on either leg: all fallible math runs in
+/// The fully-materialized post-state of a product-sum offset on either
+/// leg: all fallible math runs in
 /// [`Pallet::plan_offset`] before any value moves; [`Pallet::commit_offset`]
 /// then only writes.
 struct OffsetPlan<Balance> {
@@ -71,8 +71,8 @@ impl<T: Config> Pallet<T> {
 		Self::activate_matured_pending(collateral_id, stable_id, who, &mut pool.state, deposit, now)
 	}
 
-	/// SPEC.md §6.6: realize, activate any matured pending deposit, attempt
-	/// an incoming-deposit recovery offset (§7.4), and queue whatever the
+	/// Realize, activate any matured pending deposit, attempt an
+	/// incoming-deposit recovery offset, and queue whatever the
 	/// settlement did not use behind the entry delay.
 	pub(crate) fn do_deposit(
 		who: T::AccountId,
@@ -178,7 +178,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §7.4: settle up to the incoming deposit credit against an
+	/// Settle up to the incoming deposit credit against an
 	/// at-or-above-par `FinalRecovery` head, crediting the priced collateral
 	/// directly to the depositor. The used portion never touches the pool's
 	/// stablecoin balance or `P`/`S`/`G` (invariant 7); the unconsumed
@@ -229,7 +229,7 @@ impl<T: Config> Pallet<T> {
 		Ok(change)
 	}
 
-	/// SPEC.md §7.3: burn active pool stablecoin against the `FinalRecovery`
+	/// Burn active pool stablecoin against the `FinalRecovery`
 	/// head at the shared settlement pricing, then run the standard
 	/// active-pool accumulator update — the same code path as ordinary
 	/// liquidation offsets (invariant 8 by construction).
@@ -243,8 +243,8 @@ impl<T: Config> Pallet<T> {
 		// Mode, halted only by Frozen.
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 
-		// Size the burn before touching anything: pool depth and the §6.5
-		// floor cap the accounting, and the burnable amount caps that — a
+		// Size the burn before touching anything: pool depth and the
+		// post-offset floor cap the accounting, and the burnable amount caps that — a
 		// minimum-balance dead zone rounds the offset down instead of
 		// dusting the pool account.
 		let accounting_cap = math::clamp_offset_debt(
@@ -317,7 +317,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §6.9: create or replace the caller's Safety-Mode withdrawal
+	/// Create or replace the caller's Safety-Mode withdrawal
 	/// request, `executable_at` stamped `safety_withdrawal_delay` from now.
 	/// In Normal Mode a request has no purpose — the exit is immediate — so
 	/// the call forwards to [`Pallet::do_withdraw`] paying the caller.
@@ -369,7 +369,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §6.9: withdraw active stablecoin — immediately in Normal Mode,
+	/// Withdraw active stablecoin — immediately in Normal Mode,
 	/// against an executable request in Safety Mode.
 	pub(crate) fn do_withdraw(
 		who: T::AccountId,
@@ -425,7 +425,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §6.10: pay out the caller's realized gains — one flow for both
+	/// Pay out the caller's realized gains — one flow for both
 	/// claim sides, which differ only in the claimed field, its aggregate,
 	/// the paying asset surface, and the error/event pair.
 	pub(crate) fn do_claim(
@@ -499,10 +499,10 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// The debt an offset of at most `max_debt` on `leg` may burn: the
-	/// leg-depth and `minimum_active_pool_balance` clamp (§6.5), the pool
+	/// leg-depth and `minimum_active_pool_balance` clamp, the pool
 	/// account's minimum-balance dead zone (with `reserved` set aside for
-	/// another stage of the same transaction), and the `P`-precision guard
-	/// (§6.4). The guard matters on the capacity side too — without it a
+	/// another stage of the same transaction), and the `P`-precision guard.
+	/// The guard matters on the capacity side too — without it a
 	/// caller could allocate collateral to a stage that then steps aside,
 	/// stranding the slice. The returned `Preservation` sizes the burn debit;
 	/// with a non-zero `reserved` it is computed against the combined limit and
@@ -766,7 +766,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §6.3: distribute same-stablecoin yield to active depositors
+	/// Distribute same-stablecoin yield to active depositors
 	/// through `G`, returning whatever could not be distributed — the whole
 	/// credit when the active pool is empty, the branch is frozen, or the
 	/// deposit into the pool account fails — so the caller routes the
@@ -789,7 +789,7 @@ impl<T: Config> Pallet<T> {
 			return credit;
 		}
 		// A frozen (or mode-unreadable) branch takes no yield; the caller
-		// routes the credit to its fee destination (SPEC.md §8.1).
+		// routes the credit to its fee destination.
 		match T::BranchModes::branch_mode(collateral_id, stable_id) {
 			Ok(BranchMode::Normal) | Ok(BranchMode::Safety) => {},
 			Ok(BranchMode::Frozen) | Err(_) => return credit,
@@ -835,7 +835,7 @@ impl<T: Config> Pallet<T> {
 		credit
 	}
 
-	/// SPEC.md §6.11: move up to `amount` of realized claimable yield into
+	/// Move up to `amount` of realized claimable yield into
 	/// the active deposit. The funds already sit in the pool account, so
 	/// only the accounting moves; the realization that precedes this has
 	/// already reset the snapshots, so the compounded amount joins at the
@@ -926,7 +926,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// How much a withdrawal may take, per mode (SPEC.md §6.9 / §8.1):
+	/// How much a withdrawal may take, per mode:
 	/// - `Normal`: up to the active deposit, ignoring any outstanding request (requests are
 	///   Safety-Mode state; one left behind is bounded by the live active deposit and dies with the
 	///   row);
@@ -957,7 +957,7 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// SPEC.md §8.1: every value-moving pool operation halts while the
+	/// Every value-moving pool operation halts while the
 	/// branch is Frozen (which includes oracle failure — the provider fails
 	/// closed). Returns the live mode for operations that differentiate
 	/// Normal from Safety.
@@ -972,7 +972,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Settle accumulated losses and gains into the row — the active leg AND
 	/// the pending leg — and reset its snapshots to the pool's current
-	/// coordinates (SPEC.md §6.2). Never touches pool totals: offsets already
+	/// coordinates. Never touches pool totals: offsets already
 	/// updated the aggregates when the losses happened.
 	fn realize_deposit(
 		collateral_id: &CollateralIdOf<T>,
@@ -1001,8 +1001,8 @@ impl<T: Config> Pallet<T> {
 		Self::realize_pending(collateral_id, stable_id, pool, deposit)
 	}
 
-	/// The pending leg of [`Pallet::realize_deposit`]: settle §6.8 backstop
-	/// losses and direct collateral gains into the row and reset the pending
+	/// The pending leg of [`Pallet::realize_deposit`]: settle backstop losses
+	/// and direct collateral gains into the row and reset the pending
 	/// snapshot. A pending fully consumed by the backstop is dropped — its
 	/// flooring residue stays inside `total_pending_deposits` like every
 	/// other aggregate residue.
@@ -1065,9 +1065,9 @@ impl<T: Config> Pallet<T> {
 		(realized, pool.state.snapshot(leg, &current))
 	}
 
-	/// SPEC.md §6.7: fold a matured pending deposit into the active deposit.
+	/// Fold a matured pending deposit into the active deposit.
 	/// Must run after [`Self::realize_deposit`] — both legs join at the
-	/// current accumulators, so the activated amount is net of §6.8 backstop
+	/// current accumulators, so the activated amount is net of backstop
 	/// losses and cannot receive gains from offsets that predate its
 	/// activation. No-op while immature or absent; returns whether an
 	/// activation happened (i.e. whether `state` changed).

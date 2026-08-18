@@ -34,7 +34,7 @@ fn top_up_realizes_offset_gain_into_claimable_not_wallet() {
 		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
 		assert_eq!(deposit_row(DOT, PUSD, 1).expect("row exists").claimable_collateral, 0);
 
-		// A top-up is the first touch: it realizes the offset gain (§6.2)
+		// A top-up is the first touch: it realizes the offset gain
 		// gain = (D0/P0) * delta_S = (1000/1) * 0.4 = 400 into
 		// `claimable_collateral` and compounds the deposit to
 		// (D0/P0) * P = 1000 * 0.5 = 500 — but sends nothing to the wallet.
