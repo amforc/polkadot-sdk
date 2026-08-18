@@ -752,7 +752,7 @@ pub fn exit_safety_mode() {
 	set_price(DOT, FixedU128::from_rational(5u128, 4u128));
 }
 
-/// Replace the (DOT, PUSD) pool's `minimum_active_pool_balance` (the §6.5
+/// Replace the (DOT, PUSD) pool's `minimum_active_pool_balance` (the
 /// post-offset floor) via governance.
 pub fn set_min_active_pool(min: Balance) {
 	let mut config = default_pool_config();

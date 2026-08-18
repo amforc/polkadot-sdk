@@ -102,14 +102,13 @@ pub mod pallet {
 		type TimeProvider: Time<Moment = Millis>;
 
 		/// Branch operating-mode source of truth (point it at the vault
-		/// pallet). Frozen branches reject every value-moving pool operation
-		/// (SPEC.md §8.1); Safety Mode turns withdrawals two-step.
+		/// pallet). Frozen branches reject every value-moving pool operation;
+		/// Safety Mode turns withdrawals two-step.
 		type BranchModes: BranchModeProvider<CollateralIdOf<Self>, StableIdOf<Self>>;
 
 		/// Shared `FinalRecovery` settlement pricing and execution (point it
 		/// at the redemptions pallet, which owns that pricing) — recovery
-		/// offsets can never diverge from recovery-redemption pricing
-		/// (SPEC.md §12 invariant 9).
+		/// offsets can never diverge from recovery-redemption pricing.
 		type RecoveryOffsets: RecoveryOffsetInterface<
 			CollateralId = CollateralIdOf<Self>,
 			AccountId = Self::AccountId,
@@ -140,7 +139,7 @@ pub mod pallet {
 		type WeightInfo: WeightInfo;
 	}
 
-	/// Per-branch depositor rows (SPEC.md §5.4).
+	/// Per-branch depositor rows.
 	#[pallet::storage]
 	pub type Deposits<T: Config> = StorageNMap<
 		_,
@@ -190,7 +189,7 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// Stablecoin entered the pool (SPEC.md §6.6). `used_for_recovery`
+		/// Stablecoin entered the pool. `used_for_recovery`
 		/// was burned immediately against a `FinalRecovery` vault;
 		/// `pending_amount` queued behind the entry delay.
 		DepositReceived {
@@ -226,7 +225,7 @@ pub mod pallet {
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Realized collateral gains were paid out (SPEC.md §6.10).
+		/// Realized collateral gains were paid out.
 		CollateralClaimed {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -234,7 +233,7 @@ pub mod pallet {
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Realized stablecoin yield was paid out (SPEC.md §6.10).
+		/// Realized stablecoin yield was paid out.
 		YieldClaimed {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -242,22 +241,21 @@ pub mod pallet {
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Branch yield was distributed to active depositors through `G`
-		/// (SPEC.md §6.3).
+		/// Branch yield was distributed to active depositors through `G`.
 		YieldDistributed {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 		},
-		/// Claimable yield was moved into the active deposit (SPEC.md §6.11).
+		/// Claimable yield was moved into the active deposit.
 		YieldCompounded {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Active-pool stablecoin was burned against liquidation debt
-		/// (SPEC.md §7.1). `epoch`/`scale` are the post-offset coordinates.
+		/// Active-pool stablecoin was burned against liquidation debt.
+		/// `epoch`/`scale` are the post-offset coordinates.
 		PoolOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -267,7 +265,7 @@ pub mod pallet {
 			scale: u32,
 		},
 		/// Pending deposits were consumed pro-rata as the last-resort
-		/// liquidation backstop (SPEC.md §7.2). `epoch`/`scale` are the
+		/// liquidation backstop. `epoch`/`scale` are the
 		/// post-offset PENDING accumulator coordinates.
 		PendingDepositOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
@@ -278,7 +276,7 @@ pub mod pallet {
 			scale: u32,
 		},
 		/// Stablecoin was burned against the `FinalRecovery` FIFO head at
-		/// the shared settlement pricing (SPEC.md §7.3 / §7.4). The
+		/// the shared settlement pricing. The
 		/// `source` distinguishes active-pool capital (gains through `S`)
 		/// from an incoming deposit (gains credited directly).
 		RecoveryOffsetApplied {
@@ -339,7 +337,7 @@ pub mod pallet {
 		/// settlement stays exclusive to the explicit redemption pathway.
 		RecoveryOffsetBelowPar,
 		/// The recovery offset resolved to zero burnable stablecoin (empty
-		/// active pool, the §6.5 floor, or a zero request).
+		/// active pool, the post-offset floor, or a zero request).
 		NoRecoveryOffsetPerformed,
 		/// The supplied stability-pool config is internally inconsistent.
 		InvalidStabilityPoolConfig,
@@ -446,7 +444,7 @@ pub mod pallet {
 
 		/// Permissionlessly burn active pool stablecoin against the current
 		/// `FinalRecovery` FIFO head at the shared recovery-settlement
-		/// pricing (SPEC.md §7.3). Active depositors receive the priced
+		/// pricing. Active depositors receive the priced
 		/// collateral through `S`, exactly like an ordinary liquidation
 		/// offset. Available whenever the head is at or above par.
 		#[pallet::call_index(5)]
@@ -463,7 +461,7 @@ pub mod pallet {
 
 		/// Move up to `amount` of the caller's claimable yield into the
 		/// active deposit, where it starts absorbing offsets and earning
-		/// gains immediately (SPEC.md §6.11). Yield never becomes
+		/// gains immediately. Yield never becomes
 		/// offsettable without this explicit step.
 		#[pallet::call_index(6)]
 		#[pallet::weight(T::WeightInfo::compound_yield())]
