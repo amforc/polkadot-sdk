@@ -10,7 +10,7 @@
 //!   default coin, [`USDX`] the 6-decimals coin the scale tests use.
 
 use crate as pallet_stability;
-use crate::types::{PoolPrecision, StabilityPoolConfig};
+use crate::types::{Leg, PoolPrecision, StabilityPoolConfig};
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, One, Permill, Saturating, Zero},
 	prelude::DispatchError,
@@ -594,13 +594,6 @@ pub fn open_vault(
 	)
 }
 
-/// Native balance an account holds on hold, where every refundable deposit a
-/// market takes ends up.
-pub fn native_on_hold(who: AccountId) -> Balance {
-	use frame::traits::fungible::InspectHold;
-	<Balances as InspectHold<AccountId>>::total_balance_on_hold(&who)
-}
-
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
 	use frame::traits::fungibles::Mutate as FungiblesMutate;
 	<Assets as FungiblesMutate<AccountId>>::mint_into(stable, &who, amount).expect("mint stable");
@@ -879,7 +872,7 @@ pub fn realized_pending(collateral: AssetId, stable: StableId, who: AccountId) -
 		return 0;
 	};
 	let state = pool_state(collateral.clone(), stable);
-	let window = Stability::pending_sums_window(&collateral, &stable, &pending.snapshot);
+	let window = Stability::sums_window(&collateral, &stable, Leg::Pending, &pending.snapshot);
 	let config = crate::Pools::<Test>::get(collateral, stable).expect("pool registered").config;
 	crate::math::realize(
 		pending.amount,

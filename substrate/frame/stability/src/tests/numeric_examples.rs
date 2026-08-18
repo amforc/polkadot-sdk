@@ -1,4 +1,4 @@
-use crate::{mock::*, Error};
+use crate::{mock::*, types::Leg, Error};
 
 /// These vaults sit at CR 120%, above the default 110% MCR, so
 /// `FinalRecovery` would never admit them. This market's MCR is 130%; vaults
@@ -58,7 +58,7 @@ fn incoming_deposit_is_spent_on_a_recovery_head_above_par() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.coords.p, FixedU128::one());
 		assert_eq!(state.total_active_deposits, 0);
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::zero());
 		assert_eq!(sums.g_yield, FixedU128::zero());
 
@@ -109,7 +109,7 @@ fn active_pool_recovery_offset_and_realization() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 8_000);
 		assert_eq!(state.coords.p, FixedU128::from_rational(8, 10));
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(11, 100));
 
 		// The 1_000 depositor: compounded 1_000 * 0.8 = 800, collateral
@@ -140,7 +140,7 @@ fn offset_then_yield_then_realization() {
 
 		// Yield 400 over A = 8_000 at P = 0.8: G rises by 400 * 0.8 / 8_000 = 0.04.
 		drop(distribute_yield(DOT, PUSD, 400));
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(12, 100));
 		assert_eq!(sums.g_yield, FixedU128::from_rational(4, 100));
 
@@ -198,10 +198,12 @@ fn full_depletion_and_epoch_transition() {
 		assert_eq!(state.coords.epoch, epoch_before + 1);
 		assert_eq!(state.coords.scale, 0);
 		assert_eq!(state.coords.p, FixedU128::one());
-		let closing = crate::PoolSumsStore::<Test>::get((DOT, PUSD, epoch_before, 0u32));
+		let closing =
+			crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, epoch_before, 0u32));
 		assert_eq!(closing.s_collateral, FixedU128::from_rational(252, 1_000));
 		// The new epoch starts from zeroed sums.
-		let opening = crate::PoolSumsStore::<Test>::get((DOT, PUSD, epoch_before + 1, 0u32));
+		let opening =
+			crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, epoch_before + 1, 0u32));
 		assert_eq!(opening.s_collateral, FixedU128::zero());
 
 		// The 600 depositor: compounded is zero an epoch behind, but its

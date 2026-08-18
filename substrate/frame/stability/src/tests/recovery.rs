@@ -8,7 +8,7 @@
 //! min(1.04 - 1 - buffer(0.01), penalty(5%)) = 3%, and cancelling debt D
 //! pays floor(floor(D * 1.03) / 0.52) collateral.
 
-use crate::{mock::*, Error};
+use crate::{mock::*, types::Leg, Error};
 use frame::prelude::ArithmeticError;
 
 /// Open the standing vault (owner 5) and pin its exact debt.
@@ -68,7 +68,7 @@ fn active_pool_recovery_offset_settles_the_head() {
 		assert_eq!(state.total_active_deposits, 100);
 		assert_eq!(state.coords.p, FixedU128::from_rational(1, 4));
 		assert_eq!(state.total_collateral_gains_unclaimed, 594);
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::from_inner(1_485_000_000_000_000_000));
 
 		// The depositor realizes exactly the settled collateral:
@@ -301,7 +301,7 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		park_at_104_percent();
 
 		let state_before = pool_state(DOT, PUSD);
-		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 
 		// Full settlement burns the depositor payment and collects the terminal charge.
 		mint_stable(PUSD, 2, 800);
@@ -346,7 +346,10 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		assert_eq!(state.coords.p, state_before.coords.p);
 		assert_eq!(state.coords.epoch, state_before.coords.epoch);
 		assert_eq!(state.coords.scale, state_before.coords.scale);
-		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), sums_before);
+		assert_eq!(
+			crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32)),
+			sums_before
+		);
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert_eq!(stable_balance(PUSD, pool), 699);
 		assert_eq!(collateral_balance(DOT, pool), 992);

@@ -1,6 +1,10 @@
 //! Branch lifecycle seeding and `set_stability_pool_config` governance.
 
-use crate::{mock::*, types::PoolSums, Error};
+use crate::{
+	mock::*,
+	types::{Leg, PoolSums},
+	Error,
+};
 
 fn providers(who: AccountId) -> u32 {
 	System::providers(&who)
@@ -25,8 +29,11 @@ fn branch_registration_seeds_pool_rows() {
 		assert_eq!(state.coords.scale, 0);
 		assert_eq!(state.total_collateral_gains_unclaimed, 0);
 		assert_eq!(state.total_yield_unclaimed, 0);
-		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 0u32, 0u32)));
-		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), PoolSums::default());
+		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 0u32, 0u32)));
+		assert_eq!(
+			crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32)),
+			PoolSums::default()
+		);
 
 		let config = crate::Pools::<Test>::get(DOT, PUSD)
 			.expect("pool seeded on registration")
@@ -94,7 +101,7 @@ fn branch_removal_tears_down_pool_rows() {
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 
 		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
-		assert!(!crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 0u32, 0u32)));
+		assert!(!crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 0u32, 0u32)));
 		assert_eq!(providers(pool), providers_before - 1);
 		// A never-used pool holds no dust; the zero-dust path stays silent.
 		assert!(!System::events().iter().any(|record| matches!(

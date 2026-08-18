@@ -3,7 +3,7 @@
 //! the pending `P`/`S` accumulator pair. The active `P`/`S`/`G` are never
 //! touched (invariant 11).
 
-use crate::{math::pro_rata_floor, mock::*, Error};
+use crate::{math::pro_rata_floor, mock::*, types::Leg, Error};
 
 /// Queue a pending (unactivated) deposit for `who`.
 fn seed_pending(who: AccountId, amount: Balance) {
@@ -134,7 +134,7 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		drop(distribute_yield(DOT, PUSD, 60));
 
 		let before = pool_state(DOT, PUSD);
-		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 
 		let (debt_offset, leftover) = simulate_pending_offset(DOT, PUSD, 200, 100);
 		assert_eq!(debt_offset, 200);
@@ -148,7 +148,10 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		assert_eq!(after.coords.scale, before.coords.scale);
 		assert_eq!(after.total_active_deposits, 600);
 		assert_eq!(after.total_pending_deposits, 200);
-		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32)), sums_before);
+		assert_eq!(
+			crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32)),
+			sums_before
+		);
 		// The pending pair took the whole hit: P_pending = 200/400 = 0.5,
 		// so the row realizes floor(400 * 0.5) = 200.
 		assert_eq!(after.pending_coords.p, FixedU128::from_rational(1, 2));
@@ -331,7 +334,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		assert_eq!(state.coords.epoch, 1);
 		assert_eq!(state.coords.scale, 0);
 		assert_eq!(state.coords.p, FixedU128::one());
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(7_865_547_022_727, 1_501));
 
 		System::assert_has_event(

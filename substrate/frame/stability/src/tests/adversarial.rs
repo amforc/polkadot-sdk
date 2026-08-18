@@ -1,7 +1,7 @@
 //! Adversarial boundaries: stale user intent, corrupted FIFO/storage
 //! disagreement, and failed value movement after planning.
 
-use crate::mock::*;
+use crate::{mock::*, types::Leg};
 use frame::{
 	testing_prelude::hypothetically,
 	traits::{
@@ -35,7 +35,7 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 
 		let pool = Stability::pool_account(&DOT, &USDX);
 		let state_before = pool_state(DOT, USDX);
-		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, USDX, 0u32, 0u32));
+		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Active, 0u32, 0u32));
 
 		// USDX has a 10_000-unit minimum balance. Emptying the pool asset
 		// account makes a sub-minimum yield credit unresolvable, so the
@@ -48,7 +48,10 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 		drop(leftover);
 		assert_eq!(stable_balance(USDX, pool), 0);
 		assert_eq!(pool_state(DOT, USDX), state_before);
-		assert_eq!(crate::PoolSumsStore::<Test>::get((DOT, USDX, 0u32, 0u32)), sums_before);
+		assert_eq!(
+			crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Active, 0u32, 0u32)),
+			sums_before
+		);
 
 		// Restore the artificial corruption before the post-test try-state
 		// identity check runs.
