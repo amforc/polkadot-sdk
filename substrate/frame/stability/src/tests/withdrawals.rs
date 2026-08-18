@@ -207,7 +207,7 @@ fn deposit_leaves_request_unchanged() {
 		enter_safety_mode();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 
-		// SPEC.md §6.9: a new deposit leaves the request as it was.
+		// A new deposit leaves the request as it was.
 		advance_time(1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 300));
 

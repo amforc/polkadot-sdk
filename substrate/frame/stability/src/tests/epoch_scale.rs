@@ -110,7 +110,7 @@ fn scale_crossing_preserves_older_deposits() {
 		// P = floor(1e16 * 50 / 100) = 5e15.
 		assert_eq!(simulate_offset(DOT, PUSD, 50, 40).0, 50);
 
-		// The scale-0 deposit realizes one scale behind (§6.2): each scale
+		// The scale-0 deposit realizes one scale behind: each scale
 		// crossed adds a `scale_factor` divisor, so
 		// compounded = (D0/P0) * P / sf = 1e13 * 5e15 / (1e18 * 1e9) = 50;
 		// gain = (D0/P0) * (delta_S(0,0) + delta_S(0,1) / sf)

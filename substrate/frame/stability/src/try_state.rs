@@ -1,5 +1,5 @@
-//! `try-runtime` invariant checks: the accounting identities of SPEC.md §12
-//! that must hold after every operation.
+//! `try-runtime` invariant checks: the accounting identities that must hold
+//! after every operation.
 
 use crate::{
 	pallet::{BalanceOf, Config, Deposits, Pallet, PoolSumsStore, Pools},

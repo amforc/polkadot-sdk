@@ -1,4 +1,4 @@
-//! Recovery offsets (SPEC.md §7.3 / §7.4) against a real `FinalRecovery`
+//! Recovery offsets against a real `FinalRecovery`
 //! vault, priced by the real redemptions pallet — offset pricing and
 //! recovery-redemption pricing share one code path by construction.
 //!
@@ -90,7 +90,7 @@ fn recovery_offset_can_fully_deplete_the_pool() {
 		park_at_104_percent();
 
 		// capacity = min(500, 1000) = 500, but the pool holds 400: full
-		// depletion passes the §6.5 clamp and bumps the epoch.
+		// depletion passes the post-offset floor clamp and bumps the epoch.
 		assert_ok!(offset_recovery(DOT, PUSD, 1_000));
 
 		// collateral_out = floor(floor(400 * 1.03) / 0.52) = floor(412/0.52)
@@ -284,7 +284,7 @@ fn below_par_head_rejects_offsets_and_deposits() {
 		assert_noop!(offset_recovery(DOT, PUSD, 300), Error::<Test>::RecoveryOffsetBelowPar);
 
 		// Incoming deposits are rejected wholesale rather than settled at
-		// a discount (SPEC.md invariant 10).
+		// a discount.
 		mint_stable(PUSD, 2, 300);
 		assert_noop!(deposit(2, DOT, PUSD, 300), Error::<Test>::RecoveryOffsetBelowPar);
 		assert!(deposit_row(DOT, PUSD, 2).is_none());

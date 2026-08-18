@@ -1,4 +1,4 @@
-//! Branch-mode gating (SPEC.md §8.1) through the real vaults-derived mode:
+//! Branch-mode gating through the real vaults-derived mode:
 //! oracle failure and governance freezes halt the pool, Safety Mode (low
 //! TCR) turns withdrawals two-step, everything else keeps working.
 //!
