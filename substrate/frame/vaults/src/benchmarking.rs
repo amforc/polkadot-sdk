@@ -6,8 +6,8 @@
 
 use crate::{
 	pallet::{
-		AccountIdLookupOf, BalanceOf, BranchIdleCursor, Branches, CollateralIdOf, CollateralRisks,
-		Config, IdleCursor, Pallet, StableIdOf, Vaults,
+		AccountIdLookupOf, BalanceOf, BranchIdleCursor, Branches, CollateralIdOf, Config,
+		GlobalDebtCeilings, IdleCursor, Pallet, RegistrationConfigOf, StableIdOf, Vaults,
 	},
 	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
@@ -17,17 +17,19 @@ use frame::{
 	arithmetic::{FixedU128, Permill},
 	benchmarking::prelude::*,
 	traits::{
-		fungibles::{Balanced as FungiblesBalanced, Mutate as FungiblesMutate},
+		fungibles::{
+			Balanced as FungiblesBalanced, Inspect as FungiblesInspect, Mutate as FungiblesMutate,
+		},
 		tokens::Precision,
 		EnsureOrigin, EnsureOriginWithArg, SaturatedConversion, Time, Zero,
 	},
 };
 use frame_system::RawOrigin;
 use linked_list_interface::{Position, SortedListInterface};
-use pusd_primitives::{RedemptionSettlement, VaultInterface};
+use pusd_primitives::{OnBranchLifecycle, RedemptionSettlement, VaultInterface};
 
 const ORACLE_PRICE: u128 = 10;
-/// High per-collateral global ceiling so the systemic cap never binds in benches.
+/// High stablecoin-wide ceiling so the systemic cap never binds in benches.
 const GLOBAL_CEILING: u128 = 1_000_000_000_000_000;
 const ACCOUNT_FUNDING: u128 = 10_000_000;
 const SEED_COLL: u128 = 1_000_000;
@@ -55,21 +57,30 @@ fn rate(numerator: u128, denominator: u128) -> FixedU128 {
 
 fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
 	const DAY_MS: u64 = 24 * 3_600 * 1_000;
+	// Both vault floors have to clear their asset's minimum balance, which a runtime with a
+	// production existential deposit puts far above the raw units the mock works in.
+	let minimum_debt = balance::<T>(200).max(T::StableAssets::minimum_balance(stable::<T>()));
+	let minimum_collateral = balance::<T>(1)
+		.max(T::CollateralAssets::minimum_balance(T::BenchmarkHelper::collateral_asset_id()));
 	BranchConfig {
 		minimum_collateralization_ratio: rate(110, 100),
 		initial_collateralization_ratio: rate(120, 100),
 		safety_collateralization_ratio: rate(130, 100),
 		debt_ceiling: balance::<T>(100_000_000),
-		minimum_debt: balance::<T>(200),
-		minimum_collateral: balance::<T>(1),
+		minimum_debt,
+		minimum_collateral,
 		minimum_borrow_rate: rate(1, 1_000),
 		maximum_borrow_rate: rate(100, 100),
 		upfront_fee_period: 7 * DAY_MS,
 		rate_adjustment_cooldown: DAY_MS,
 		redistribution_penalty: Permill::from_percent(5),
-		ceiling_gap: balance::<T>(0),
-		ceiling_ttl: 0,
 	}
+}
+
+/// Every benchmark registers one market per stablecoin, so the lifecycle
+/// handlers always see the first one.
+fn first_market_lifecycle_config<T: Config>() -> RegistrationConfigOf<T> {
+	T::OnBranchLifecycle::benchmark_registration_config(1)
 }
 
 /// The accounts acting as full and emergency admin of every benchmarked market.
@@ -121,10 +132,11 @@ fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkEr
 		stable::<T>(),
 		branch_admins::<T>(),
 		default_branch_config::<T>(),
+		first_market_lifecycle_config::<T>(),
 	)?;
 	Pallet::<T>::set_global_debt_ceiling(
 		force_origin::<T>()?,
-		asset.clone(),
+		stable::<T>(),
 		balance::<T>(GLOBAL_CEILING),
 	)?;
 	Ok(asset)
@@ -700,7 +712,14 @@ mod benchmarks {
 		)?;
 
 		#[extrinsic_call]
-		_(origin, asset.clone(), stable::<T>(), admins, config);
+		_(
+			origin,
+			asset.clone(),
+			stable::<T>(),
+			admins,
+			config,
+			first_market_lifecycle_config::<T>(),
+		);
 
 		assert!(Branches::<T>::contains_key(&asset, &stable::<T>()));
 		Ok(())
@@ -743,14 +762,14 @@ mod benchmarks {
 
 	#[benchmark]
 	fn set_global_debt_ceiling() -> Result<(), BenchmarkError> {
-		let asset = T::BenchmarkHelper::collateral_asset_id();
+		let stable_id = stable::<T>();
 		let origin = force_origin::<T>()?;
 		let ceiling = balance::<T>(GLOBAL_CEILING);
 
 		#[extrinsic_call]
-		_(origin, asset.clone(), ceiling);
+		_(origin, stable_id.clone(), ceiling);
 
-		assert_eq!(CollateralRisks::<T>::get(&asset).debt_ceiling, ceiling);
+		assert_eq!(GlobalDebtCeilings::<T>::get(&stable_id), ceiling);
 		Ok(())
 	}
 
@@ -773,78 +792,12 @@ mod benchmarks {
 	}
 
 	#[benchmark]
-	fn poke_ceiling() -> Result<(), BenchmarkError> {
-		// An autoline-enabled market derived from the configuration bounds, so the
-		// worst case — a ratcheting `Branches` write — is constructible on
-		// any runtime. The gap stays below the line max: a gap at the line
-		// max starts the ceiling there and leaves the ratchet nothing to do.
-		let bounds = T::BranchConfigBounds::get();
-		let mut config = default_branch_config::<T>();
-		config.ceiling_ttl = bounds.min_ceiling_ttl;
-		config.ceiling_gap = {
-			let below_line = balance::<T>(50_000_000);
-			bounds.max_ceiling_gap.min(below_line)
-		};
-		if config.ceiling_gap.is_zero() {
-			return Err(BenchmarkError::Stop("configuration bounds disable the autoline"));
-		}
-		let asset = T::BenchmarkHelper::collateral_asset_id();
-		T::BenchmarkHelper::set_oracle_price(
-			asset.clone(),
-			FixedU128::saturating_from_integer(ORACLE_PRICE),
-		);
-		fund_collateral::<T>(
-			&asset,
-			&branch_admin_accounts::<T>().0,
-			balance::<T>(ACCOUNT_FUNDING),
-		)?;
-		Pallet::<T>::create_branch(
-			create_origin::<T>()?,
-			asset.clone(),
-			stable::<T>(),
-			branch_admins::<T>(),
-			config,
-		)?;
-		Pallet::<T>::set_global_debt_ceiling(
-			force_origin::<T>()?,
-			asset.clone(),
-			balance::<T>(GLOBAL_CEILING),
-		)?;
-		let owner = funded_account::<T>("owner", &asset)?;
-		Pallet::<T>::open_vault(
-			RawOrigin::Signed(owner).into(),
-			asset.clone(),
-			stable::<T>(),
-			balance::<T>(SEED_COLL),
-			balance::<T>(SEED_DEBT),
-			rate(5, 100),
-			Position::endpoints_only(),
-		)?;
-		// Raises are ttl-gated from registration; move past the gate so the
-		// poke performs the write.
-		T::BenchmarkHelper::advance_time(bounds.min_ceiling_ttl.saturating_add(1));
-		let before = Branches::<T>::get(&asset, &stable::<T>())
-			.expect("branch registered above")
-			.state
-			.effective_ceiling;
-		let caller: T::AccountId = whitelisted_caller();
-
-		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>());
-
-		let after = Branches::<T>::get(&asset, &stable::<T>())
-			.expect("branch registered above")
-			.state
-			.effective_ceiling;
-		assert!(after > before, "the poke ratcheted the ceiling up");
-		Ok(())
-	}
-
-	#[benchmark]
 	fn set_param() -> Result<(), BenchmarkError> {
 		let asset = register_default_branch::<T>()?;
 		let origin = full_admin_origin::<T>();
-		let new_value = rate(150, 100);
+		// A raise, but not past the market's 120% borrow ratio: a liquidation ratio above it
+		// would open every new vault liquidatable, which the config check rejects.
+		let new_value = rate(115, 100);
 
 		#[extrinsic_call]
 		set_param(

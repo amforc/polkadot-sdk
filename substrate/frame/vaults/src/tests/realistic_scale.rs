@@ -6,7 +6,7 @@
 //! `10^-3` stable-per-collateral minor unit = $10_000; against 5_000 USDX
 //! (5×10^9 minor units) of debt that is a 200% CR.
 
-use crate::{mock::*, tests::rate_pct};
+use crate::{mock::*, tests::rate_pct, types::BranchConfigUpdate, Error};
 use frame::{
 	arithmetic::Permill,
 	prelude::TokenError,
@@ -23,6 +23,12 @@ fn vault(owner: AccountId) -> crate::types::Vault<Balance> {
 	crate::pallet::Vaults::<Test>::get((XBT, USDX, owner)).expect("vault")
 }
 
+/// Settings denominated for `USDX`: the debt floor is a scale-appropriate 200
+/// coins, which is also what clears the stablecoin's own minimum balance.
+fn usdx_branch_config() -> BranchConfig<Balance> {
+	BranchConfig { minimum_debt: 200 * USD, ..default_branch_config() }
+}
+
 /// Register the realistic-scale `(XBT, USDX)` market: 10-decimals collateral
 /// against a 6-decimals stable, both with a 0.01 minimum balance.
 ///
@@ -35,9 +41,8 @@ fn register_realistic_market() {
 		FixedU128::from_rational(1u128, 1_000u128),
 		BranchConfig {
 			debt_ceiling: 100_000_000 * USD,
-			minimum_debt: 200 * USD,
 			minimum_collateral: XBT_ED,
-			..default_branch_config()
+			..usdx_branch_config()
 		},
 	);
 }
@@ -62,7 +67,8 @@ fn fee_account_pays_its_own_asset_account_deposit() {
 			TOKEN_X,
 			USDX,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config(),
+			usdx_branch_config(),
+			(),
 		));
 
 		assert_eq!(
@@ -127,32 +133,81 @@ fn lifecycle_exact_at_realistic_scale() {
 	});
 }
 
-// A config may set `minimum_debt` below the stable's ED (the guard floor is
-// 100), but opening in `[minimum_debt, ED)` then fails at the mint: the owner
-// has no stable account and the amount cannot create one. A sane realistic
-// config keeps `minimum_debt >= stable ED`.
+// The debt floor has to clear the stablecoin's minimum balance, or the smallest
+// vault the market admits could never be paid what it borrows. The floor is
+// judged against the coin, not against a number: the same 9_999 that is dust to
+// six-decimal USDX is a fine floor for PUSD, whose minimum balance is one unit.
 #[test]
-fn open_below_stable_ed_reverts() {
+fn create_branch_rejects_debt_floor_below_stable_minimum() {
 	build_and_execute(|| {
-		let config = BranchConfig { minimum_debt: 100, ..default_branch_config() };
 		set_price(TOKEN_X, FixedU128::from_rational(10u128, 1u128));
+		let config = BranchConfig { minimum_debt: USDX_ED - 1, ..usdx_branch_config() };
+		assert_noop!(
+			crate::Pallet::<Test>::create_branch(
+				RuntimeOrigin::root(),
+				TOKEN_X,
+				USDX,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				config.clone(),
+				(),
+			),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumDebtBelowStableMinimum)
+		);
+
 		assert_ok!(crate::Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			TOKEN_X,
-			USDX,
+			PUSD,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			config,
+			(),
 		));
-		assert_ok!(crate::Pallet::<Test>::set_global_debt_ceiling(
-			RuntimeOrigin::root(),
-			TOKEN_X,
-			GLOBAL_CEILING
-		));
+	});
+}
 
-		assert_eq!(stable_balance(USDX, 4), 0, "owner has no USDX account yet");
+// Collateral is held to the same rule, and neither floor can be walked back
+// after creation: the market that admits a vault is the market that has to
+// carry it.
+#[test]
+fn vault_floors_below_the_asset_minimum_are_rejected_on_every_write() {
+	build_and_execute(|| {
+		set_price(XBT, FixedU128::from_rational(1u128, 1_000u128));
+		let dust_collateral =
+			BranchConfig { minimum_collateral: XBT_ED - 1, ..usdx_branch_config() };
 		assert_noop!(
-			open(4, TOKEN_X, USDX, 10_000, 5_000, rate_pct(5, 100)),
-			TokenError::BelowMinimum
+			crate::Pallet::<Test>::create_branch(
+				RuntimeOrigin::root(),
+				XBT,
+				USDX,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				dust_collateral,
+				(),
+			),
+			Error::<Test>::InvalidBranchConfig(
+				BranchConfigDefect::MinimumCollateralBelowCollateralMinimum
+			)
+		);
+
+		register_realistic_market();
+		assert_noop!(
+			crate::Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(ADMIN),
+				XBT,
+				USDX,
+				BranchConfigUpdate::MinimumCollateral(XBT_ED - 1)
+			),
+			Error::<Test>::InvalidBranchConfig(
+				BranchConfigDefect::MinimumCollateralBelowCollateralMinimum
+			)
+		);
+		assert_noop!(
+			crate::Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(ADMIN),
+				XBT,
+				USDX,
+				BranchConfigUpdate::MinimumDebt(USDX_ED - 1)
+			),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumDebtBelowStableMinimum)
 		);
 	});
 }
