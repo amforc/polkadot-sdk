@@ -1,7 +1,8 @@
-//! `claim_collateral` / `claim_yield` / `poke_deposit`.
+//! `claim_collateral`, `claim_yield` and `poke_deposit`.
 //!
-//! Direct storage seeding isolates payout and pruning behavior from the offset
-//! and yield engines. Other modules cover claims earned through live flows.
+//! These tests write the claimable balances into storage directly, which separates payout and row
+//! pruning from the engines that produce the gains. Other modules cover claims earned through the
+//! live flows.
 
 use crate::{mock::*, Error};
 

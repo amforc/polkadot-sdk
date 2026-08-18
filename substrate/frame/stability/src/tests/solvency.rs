@@ -1,6 +1,7 @@
-//! Anchored end-to-end sequences that drive many operations and drain the
-//! pool to an exact zero, asserting every depositor is paid precisely its
-//! share.
+//! Long sequences that drive many operations and then drain the pool to zero.
+//!
+//! Each one checks that every depositor is paid its exact share and that nothing is left
+//! behind.
 
 use crate::mock::*;
 

@@ -1,3 +1,14 @@
+//! The bodies of the dispatchables, and the internals they share.
+//!
+//! Two rules shape almost every function here.
+//!
+//! A row is realized before it changes. Losses and gains are settled against the live
+//! accumulators, and the snapshot is reset, so the change that follows applies to a current
+//! amount.
+//!
+//! Value moves last. Every fallible step runs while the pool is untouched, so a failure leaves
+//! nothing half done.
+
 use crate::{
 	interfaces::OffsetReservation,
 	math,
@@ -24,17 +35,16 @@ use pusd_primitives::{
 	RecoveryOffsetInterface, RecoveryOffsetResult,
 };
 
-/// Which realized gain a claim pays out; the two sides share one flow
-/// ([`Pallet::do_claim`]).
+/// Which gain a claim pays out. The two sides share [`Pallet::do_claim`].
 #[derive(Clone, Copy)]
 pub(crate) enum ClaimKind {
 	Collateral,
 	Yield,
 }
 
-/// The fully-materialized post-state of a product-sum offset on either
-/// leg: all fallible math runs in
-/// [`Pallet::plan_offset`] before any value moves; [`Pallet::commit_offset`]
+/// The state an offset leaves behind, computed in full before anything is written.
+///
+/// [`Pallet::plan_offset`] does all the arithmetic that can fail, and [`Pallet::commit_offset`]
 /// then only writes.
 struct OffsetPlan<Balance> {
 	new_sums: PoolSums,
@@ -44,8 +54,7 @@ struct OffsetPlan<Balance> {
 }
 
 impl<T: Config> Pallet<T> {
-	/// The shared entry-point prologue: a branch is registered iff its pool
-	/// row exists.
+	/// The pool of a market. A market is registered exactly while its row exists.
 	fn load_pool(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -55,10 +64,11 @@ impl<T: Config> Pallet<T> {
 		Ok(pool)
 	}
 
-	/// The realization pair every value-moving entry point runs before its own
-	/// change: settle gains/losses into the row, then fold in a matured
-	/// pending deposit. Returns whether an activation happened (i.e. whether
-	/// `state` changed).
+	/// Brings a row up to date: settle its losses and gains, then activate a matured pending
+	/// deposit.
+	///
+	/// Every operation that moves value runs this before its own change. Returns whether an
+	/// activation happened, which is also whether `pool` needs to be written back.
 	fn realize_and_activate(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -71,9 +81,8 @@ impl<T: Config> Pallet<T> {
 		Self::activate_matured_pending(collateral_id, stable_id, who, &mut pool.state, deposit, now)
 	}
 
-	/// Realize, activate any matured pending deposit, attempt an
-	/// incoming-deposit recovery offset, and queue whatever the
-	/// settlement did not use behind the entry delay.
+	/// Takes stablecoin from `who`, settles what it can against a vault in `FinalRecovery`, and
+	/// queues the rest behind the entry delay.
 	pub(crate) fn do_deposit(
 		who: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
@@ -90,10 +99,10 @@ impl<T: Config> Pallet<T> {
 		Self::realize_and_activate(&collateral_id, &stable_id, &who, &mut pool, &mut deposit, now)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		// One withdrawal funds both halves: the recovery settlement consumes
-		// its slice from the credit and the change becomes the pending
-		// deposit. `Expendable` only on a full drain, so the withdrawal
-		// itself rejects a dead-zone amount instead of folding the dust in.
+		// One withdrawal funds both halves: the recovery settlement takes its slice from the
+		// credit, and the change becomes the pending deposit. `Expendable` only on a full drain,
+		// so the withdrawal itself rejects an amount that would leave the depositor below the
+		// minimum balance.
 		let preservation =
 			debit_preservation::<T::StableAssets, _>(stable_id.clone(), &who, amount);
 		let payment = T::StableAssets::withdraw(
@@ -112,8 +121,8 @@ impl<T: Config> Pallet<T> {
 			&mut deposit,
 			payment,
 		)?;
-		// Conservation by construction: the settlement can only have burned
-		// value the credit carried.
+		// The settlement can only spend value the credit carried, so the difference is what it
+		// spent.
 		let pending_amount = change.peek();
 		let used_for_recovery = amount.saturating_sub(pending_amount);
 
@@ -130,11 +139,10 @@ impl<T: Config> Pallet<T> {
 			let activatable_at = now.saturating_add(pool.config.entry_delay);
 			match deposit.pending_deposit.as_mut() {
 				Some(pending) => {
-					// The realization above settled earlier backstop losses
-					// and reset the snapshot, so the merged amount joins at
-					// the current pending accumulators. A top-up resets the
-					// whole pending amount's entry delay — it must never
-					// shorten the wait.
+					// The realization above settled earlier backstop losses and reset the
+					// snapshot, so the merged amount joins at the current pending accumulators. A
+					// top-up restarts the delay for the whole amount; it must never shorten the
+					// wait.
 					pending.amount = pending
 						.amount
 						.checked_add(&pending_amount)
@@ -162,9 +170,8 @@ impl<T: Config> Pallet<T> {
 				.ok_or(ArithmeticError::Overflow)?;
 		}
 
-		// A fully-settled deposit may leave nothing but the recovery
-		// collateral credit on the row (or, if that floored to zero,
-		// nothing at all).
+		// A deposit spent in full leaves nothing but the recovery collateral on the row, or
+		// nothing at all if that collateral rounded to zero.
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
 		Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		Self::deposit_event(Event::DepositReceived {
@@ -178,13 +185,13 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Settle up to the incoming deposit credit against an
-	/// at-or-above-par `FinalRecovery` head, crediting the priced collateral
-	/// directly to the depositor. The used portion never touches the pool's
-	/// stablecoin balance or `P`/`S`/`G` (invariant 7); the unconsumed
-	/// change returns to the caller to become the pending deposit. A
-	/// below-par head rejects the whole deposit. Returns only the unconsumed
-	/// change; the caller derives what the settlement used from it.
+	/// Settles as much of an incoming deposit as the `FinalRecovery` head can take, and returns
+	/// what is left.
+	///
+	/// The collateral goes straight to the depositor as a claimable balance. The settled
+	/// stablecoin never reaches the pool account and never touches `P`, `S` or `G`, so it earns no
+	/// share of anything the pool already holds. A head below par rejects the whole deposit,
+	/// because settlement at a discount stays exclusive to the redemption path.
 	fn try_incoming_recovery(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -207,8 +214,8 @@ impl<T: Config> Pallet<T> {
 			},
 			RecoveryOffsetResult::Applied { collateral_out } => collateral_out,
 		};
-		// Conservation by construction: the settlement can only have burned
-		// value the credit carried.
+		// The settlement can only spend value the credit carried, so the difference is what it
+		// spent.
 		let used_for_recovery = amount.saturating_sub(change.peek());
 
 		deposit.claimable_collateral = deposit
@@ -229,24 +236,23 @@ impl<T: Config> Pallet<T> {
 		Ok(change)
 	}
 
-	/// Burn active pool stablecoin against the `FinalRecovery`
-	/// head at the shared settlement pricing, then run the standard
-	/// active-pool accumulator update — the same code path as ordinary
-	/// liquidation offsets (invariant 8 by construction).
+	/// Settles active pool stablecoin against the `FinalRecovery` head, then runs the ordinary
+	/// active-leg offset.
+	///
+	/// Reusing the liquidation path is what keeps a recovery offset indistinguishable from a
+	/// liquidation for the depositors: same accumulators, same rounding, same events on the row.
 	pub(crate) fn do_offset_recovery(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 		max_stable_in: BalanceOf<T>,
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
-		// Recovery offsets are settlement operations: allowed in Safety
-		// Mode, halted only by Frozen.
+		// Settling recovery debt reduces risk, so Safety Mode allows it. Only a freeze stops it.
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 
-		// Size the burn before touching anything: pool depth and the
-		// post-offset floor cap the accounting, and the burnable amount caps that — a
-		// minimum-balance dead zone rounds the offset down instead of
-		// dusting the pool account.
+		// Size the burn before touching anything. Pool depth and the post-offset floor cap the
+		// accounting, and what the account may actually pay caps that in turn, so a minimum
+		// balance rounds the offset down instead of stranding the pool account.
 		let accounting_cap = math::clamp_offset_debt(
 			max_stable_in,
 			pool.state.total_active_deposits,
@@ -278,16 +284,15 @@ impl<T: Config> Pallet<T> {
 			},
 			RecoveryOffsetResult::Applied { collateral_out } => collateral_out,
 		};
-		// Conservation by construction: the settlement can only have burned
-		// value the credit carried.
+		// The settlement can only spend value the credit carried, so the difference is what it
+		// spent.
 		let debt_cancelled = funded.saturating_sub(change.peek());
 		ensure!(!debt_cancelled.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
 		if let Err(change) = change.drop_zero() {
-			// Return the unburned slice to the pool. Only a full-drain
-			// withdrawal whose head cancelled less, leaving a sub-minimum
-			// change, can be refused here: the revert asks the offsetter to
-			// size `max_stable_in` from the preview instead of dusting the
-			// pool.
+			// Put the unspent slice back. This can only fail after a full drain whose head took
+			// less than everything and left a change below the minimum balance. Failing here asks
+			// the caller to size `max_stable_in` from the preview, which is better than stranding
+			// the pool account.
 			T::StableAssets::can_deposit(
 				stable_id.clone(),
 				&pool_account,
@@ -317,10 +322,10 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Create or replace the caller's Safety-Mode withdrawal
-	/// request, `executable_at` stamped `safety_withdrawal_delay` from now.
-	/// In Normal Mode a request has no purpose — the exit is immediate — so
-	/// the call forwards to [`Pallet::do_withdraw`] paying the caller.
+	/// Records a Safety-Mode withdrawal request, or withdraws at once in Normal Mode.
+	///
+	/// A new request replaces any earlier one. In Normal Mode the exit is immediate, so a request
+	/// would serve no purpose and the call withdraws to the caller instead.
 	pub(crate) fn do_request_withdraw(
 		who: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
@@ -354,8 +359,7 @@ impl<T: Config> Pallet<T> {
 		deposit.withdrawal_request = Some(WithdrawalRequest { amount, executable_at });
 
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &who, deposit);
-		// Requests live on the row; the pool row only changed if a pending
-		// deposit activated along the way.
+		// The request lives on the row. The pool changed only if a pending deposit activated.
 		if activated {
 			Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		}
@@ -369,8 +373,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Withdraw active stablecoin — immediately in Normal Mode,
-	/// against an executable request in Safety Mode.
+	/// Pays active stablecoin out of the pool.
 	pub(crate) fn do_withdraw(
 		who: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
@@ -390,8 +393,8 @@ impl<T: Config> Pallet<T> {
 		let take = Self::resolve_withdrawal(mode, now, amount, &mut deposit)?;
 		ensure!(!take.is_zero(), Error::<T>::NoActiveDeposit);
 
-		// `resolve_withdrawal` bounds `take` by the realized active deposit,
-		// which flooring keeps at or below the pool aggregate.
+		// `resolve_withdrawal` bounds `take` by the realized active deposit, which rounding keeps
+		// at or below the pool total.
 		deposit.active_deposit =
 			deposit.active_deposit.checked_sub(&take).ok_or(ArithmeticError::Underflow)?;
 		pool.state.total_active_deposits = pool
@@ -401,8 +404,8 @@ impl<T: Config> Pallet<T> {
 			.ok_or(ArithmeticError::Underflow)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		// `Expendable` only on a full drain: the transfer itself then rejects
-		// a dead-zone payout instead of dusting the pool account.
+		// `Expendable` only on a full drain, so the transfer itself rejects a payout that would
+		// leave the pool account below the minimum balance.
 		let preservation =
 			debit_preservation::<T::StableAssets, _>(stable_id.clone(), &pool_account, take);
 		T::StableAssets::transfer(
@@ -425,9 +428,10 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Pay out the caller's realized gains — one flow for both
-	/// claim sides, which differ only in the claimed field, its aggregate,
-	/// the paying asset surface, and the error/event pair.
+	/// Pays a claimable balance out.
+	///
+	/// The two claim sides differ only in the field they empty, the total they reduce, the asset
+	/// they pay in, and the error and event they use.
 	pub(crate) fn do_claim(
 		who: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
@@ -498,20 +502,26 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// The debt an offset of at most `max_debt` on `leg` may burn: the
-	/// leg-depth and `minimum_active_pool_balance` clamp, the pool
-	/// account's minimum-balance dead zone (with `reserved` set aside for
-	/// another stage of the same transaction), and the `P`-precision guard.
-	/// The guard matters on the capacity side too — without it a
-	/// caller could allocate collateral to a stage that then steps aside,
-	/// stranding the slice. The returned `Preservation` sizes the burn debit;
-	/// with a non-zero `reserved` it is computed against the combined limit and
-	/// stays valid only if the reserved tranche is debited from the account
-	/// first (the exact offset call settles active before pending).
+	/// How much debt an offset of at most `max_debt` may cancel on `leg`, and the `Preservation`
+	/// that sizing proved valid for the burn.
 	///
-	/// The `minimum_active_pool_balance` floor applies to the pending leg
-	/// too — it is what sizes a leg against `P`-precision exhaustion, and the
-	/// pending `P` runs on the same precision parameters.
+	/// Four limits apply: the depth of the leg, the post-offset floor, what the pool account may
+	/// pay above its minimum balance, and the `P` precision guard. Set `reserved` to the debt
+	/// another leg of the same offset will take from the same account first.
+	///
+	/// The precision guard matters here and not only at settlement. Without it a caller could
+	/// allocate collateral to a leg that then declines the burn, and the collateral would be
+	/// stranded.
+	///
+	/// The returned `Preservation` is computed against the combined limit. With a non-zero
+	/// `reserved` it stays valid only if the reserved part leaves the account first, which is why
+	/// [`Pallet::offset`] settles active before pending.
+	///
+	/// `minimum_active_pool_balance` bounds the pending leg too. It is the parameter that sizes a
+	/// leg against `P` running out of precision, and the pending `P` uses the same precision
+	/// parameters as the active one.
+	///
+	/// [`Pallet::offset`]: pusd_primitives::StabilityPoolOffset::offset
 	pub(crate) fn size_offset(
 		pool: &StabilityPoolOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -526,8 +536,8 @@ impl<T: Config> Pallet<T> {
 		if accounting_cap.is_zero() {
 			return None;
 		}
-		// The burnable amount caps the accounting: a minimum-balance dead
-		// zone rounds the offset down instead of dusting the pool account.
+		// What the account may pay caps the accounting, so a minimum balance rounds the offset
+		// down instead of stranding the pool account.
 		let (headroom, preservation) = reducible_debit::<T::StableAssets, _>(
 			stable_id.clone(),
 			pool_account,
@@ -541,9 +551,9 @@ impl<T: Config> Pallet<T> {
 		Some((debt, preservation))
 	}
 
-	/// Zero a realized claimable field and remove it from its pool aggregate.
-	/// An underflow on the aggregate would mean a claimable exceeding the
-	/// tracked total.
+	/// Empties a claimable field and takes the same amount off its pool total.
+	///
+	/// An underflow would mean a row claiming more than the pool tracks.
 	fn take_claim(
 		claimable: &mut BalanceOf<T>,
 		unclaimed_total: &mut BalanceOf<T>,
@@ -557,9 +567,10 @@ impl<T: Config> Pallet<T> {
 		Ok(amount)
 	}
 
-	/// Pay a taken claim out of the pool account. `Expendable` only on a full
-	/// drain: the transfer itself then rejects a dead-zone payout instead of
-	/// dusting the pool.
+	/// Pays a claim out of the pool account.
+	///
+	/// `Expendable` only on a full drain, so the transfer itself rejects a payout that would leave
+	/// the pool account below the minimum balance.
 	fn pay_claim<Assets>(
 		asset_id: Assets::AssetId,
 		pool_account: &T::AccountId,
@@ -574,12 +585,11 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Settle one previously sized reservation on `leg`
-	/// exactly — burn the reserved stablecoin against liquidation debt and
-	/// resolve the assigned collateral credit into the pool account,
-	/// distributing it to that leg's depositors through its `S`. The
-	/// production liquidation contract: the collateral is consumed in full and
-	/// any disagreement with the reservation aborts the transaction.
+	/// Settles one sized reservation on `leg`: burn the stablecoin, take the collateral, and share
+	/// it out through that leg's `S`.
+	///
+	/// The liquidation engine hands over the collateral in full, so any disagreement with the
+	/// reservation aborts the whole transaction rather than keep part of it.
 	pub(crate) fn settle_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -598,13 +608,8 @@ impl<T: Config> Pallet<T> {
 			reservation.debt,
 			collateral.peek(),
 		)?;
-		let collateral_amount = Self::settle_reservation_exact(
-			collateral_id,
-			stable_id,
-			pool_account,
-			reservation,
-			collateral,
-		)?;
+		let collateral_amount =
+			Self::settle_reservation_exact(stable_id, pool_account, reservation, collateral)?;
 		Self::commit_offset(collateral_id, stable_id, leg, &mut pool.state, plan);
 		let coords = pool.state.coords(leg);
 		Self::deposit_event(match leg {
@@ -628,11 +633,9 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// The value movement both legs share: burn the reserved stable
-	/// debit and resolve the whole collateral credit into the pool account.
-	/// Returns the collateral amount consumed.
+	/// The value movement both legs share: burn the reserved stablecoin and take the whole
+	/// collateral credit into the pool account. Returns how much collateral arrived.
 	fn settle_reservation_exact(
-		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
 		reservation: OffsetReservation<BalanceOf<T>>,
@@ -649,22 +652,23 @@ impl<T: Config> Pallet<T> {
 		)
 		.map_err(|_| Error::<T>::OffsetSettlementFailed)?;
 		debug_assert_eq!(stable_credit.peek(), reservation.debt);
-		// A zero credit is dropped without touching the account — a zero
-		// deposit into a not-yet-existing account is the only failure it
-		// could hit. A real failure means a sub-minimum first gain.
+		// A zero credit is dropped without touching the account, whose only possible failure is a
+		// zero deposit into an account that does not exist yet. A real failure means a first gain
+		// below the minimum balance.
 		if let Err(collateral) = collateral.drop_zero() {
 			T::CollateralAssets::resolve(pool_account, collateral)
 				.map_err(|_| Error::<T>::OffsetSettlementFailed)?;
 		}
-		// Dropping the withdrawn credit is the debt-cancelling burn.
+		// Dropping the withdrawn credit is what cancels the debt.
 		drop(stable_credit);
 		Ok(collateral_amount)
 	}
 
-	/// The accumulator math shared by liquidation offsets on either leg and
-	/// by recovery offsets: `delta_S` from the pre-offset total FIRST, then
-	/// the `P` shrink. Read-only: the caller commits the plan once its value
-	/// movement is through.
+	/// Works out the state an offset leaves behind, without writing anything.
+	///
+	/// `S` grows against the total from before the offset, and only then does `P` shrink.
+	/// Reversing the order would pay the depositors a share computed from capital the offset has
+	/// already consumed.
 	fn plan_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -715,9 +719,9 @@ impl<T: Config> Pallet<T> {
 		Ok(OffsetPlan { new_sums: sums, new_unclaimed, new_total, new_coords })
 	}
 
-	/// Write an [`OffsetPlan`] into `leg`'s sums rows and `state`, seeding a
-	/// zero sums row for every new coordinate. Infallible: all arithmetic
-	/// already ran in [`Pallet::plan_offset`].
+	/// Writes an [`OffsetPlan`], seeding an empty sums row for every coordinate the offset opened.
+	///
+	/// Cannot fail: [`Pallet::plan_offset`] already did every calculation.
 	fn commit_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -749,10 +753,7 @@ impl<T: Config> Pallet<T> {
 		state.total_collateral_gains_unclaimed = plan.new_unclaimed;
 	}
 
-	/// Plan-and-commit in one step for the extrinsic-transactional recovery
-	/// path ([`Pallet::do_offset_recovery`]), which interleaves no value
-	/// ops. Accounting only: the settlement already moved the stablecoin
-	/// and the collateral.
+	/// Plans and commits in one step, for the recovery path, which moves no value in between.
 	fn apply_active_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -766,15 +767,15 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Distribute same-stablecoin yield to active depositors
-	/// through `G`, returning whatever could not be distributed — the whole
-	/// credit when the active pool is empty, the branch is frozen, or the
-	/// deposit into the pool account fails — so the caller routes the
-	/// remainder to its fee destination. Infallible by design: this runs on
-	/// the vault engine's commit paths, which must not fail over yield
-	/// routing. The vault engine reaches it through the `OnBranchYield`
-	/// impl (`interfaces.rs`), which loads `pool`, takes the `yield_share`
-	/// cut, and hands the row down so the branch is read once.
+	/// Shares stablecoin yield out to the active depositors through `G`, and returns what it could
+	/// not share.
+	///
+	/// Cannot fail. The vault engine mints yield on commit paths that must not roll a user
+	/// operation back over a routing problem. When the pool cannot take the credit, all of it
+	/// comes back and the caller sends it to its fee destination.
+	///
+	/// The vault engine reaches this through the `OnBranchYield` implementation in `interfaces`,
+	/// which reads the pool row once, takes the `yield_share` cut, and hands the row down.
 	pub(crate) fn do_distribute_yield(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -788,15 +789,14 @@ impl<T: Config> Pallet<T> {
 		if pool.state.total_active_deposits.is_zero() {
 			return credit;
 		}
-		// A frozen (or mode-unreadable) branch takes no yield; the caller
-		// routes the credit to its fee destination.
+		// A frozen market, or one whose mode cannot be read, takes no yield.
 		match T::BranchModes::branch_mode(collateral_id, stable_id) {
 			Ok(BranchMode::Normal) | Ok(BranchMode::Safety) => {},
 			Ok(BranchMode::Frozen) | Err(_) => return credit,
 		}
 
-		// Every fallible step runs before the credit is consumed; after
-		// `resolve` succeeds only plain writes remain.
+		// Every fallible step runs before the credit is consumed. Once `resolve` succeeds, only
+		// plain writes remain.
 		let Some(delta_g) = pool.state.delta_sum(amount) else {
 			return credit;
 		};
@@ -835,11 +835,11 @@ impl<T: Config> Pallet<T> {
 		credit
 	}
 
-	/// Move up to `amount` of realized claimable yield into
-	/// the active deposit. The funds already sit in the pool account, so
-	/// only the accounting moves; the realization that precedes this has
-	/// already reset the snapshots, so the compounded amount joins at the
-	/// current accumulators.
+	/// Moves claimable yield into the active deposit.
+	///
+	/// The stablecoin already sits in the pool account, so only the accounting moves. The
+	/// realization that runs first has reset the snapshot, so the amount joins at the live
+	/// accumulators and earns nothing that predates the move.
 	pub(crate) fn do_compound_yield(
 		who: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
@@ -871,7 +871,7 @@ impl<T: Config> Pallet<T> {
 			.total_active_deposits
 			.checked_add(&take)
 			.ok_or(ArithmeticError::Overflow)?;
-		// An underflow would mean a claimable exceeding the tracked total.
+		// An underflow would mean a row claiming more than the pool tracks.
 		pool.state.total_yield_unclaimed = pool
 			.state
 			.total_yield_unclaimed
@@ -889,12 +889,11 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Permissionlessly realize `owner`'s
-	/// deposit without moving value, and fold in a matured pending deposit.
-	/// A matured pending deposit needs a touch to fold in; past the entry
-	/// delay the move is mechanical, so any caller may supply that touch.
-	/// A frozen branch skips the activation (it changes offsettable risk,
-	/// which the freeze halts) but still realizes.
+	/// Realizes another account's deposit and activates a matured pending deposit of theirs.
+	///
+	/// Moves no value. Past the entry delay, activation is mechanical, so its outcome does not
+	/// depend on who asks for it. A frozen market still realizes but does not activate, because
+	/// activation changes how much risk the pool carries.
 	pub(crate) fn do_poke_deposit(
 		owner: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
@@ -918,20 +917,20 @@ impl<T: Config> Pallet<T> {
 			false
 		};
 		Self::store_or_prune_deposit(&collateral_id, &stable_id, &owner, deposit);
-		// Realization lives on the row; the pool row only changed if a
-		// pending deposit activated along the way.
+		// Realization lives on the row. The pool changed only if a pending deposit activated.
 		if activated {
 			Pools::<T>::insert(&collateral_id, &stable_id, pool);
 		}
 		Ok(())
 	}
 
-	/// How much a withdrawal may take, per mode:
-	/// - `Normal`: up to the active deposit, ignoring any outstanding request (requests are
-	///   Safety-Mode state; one left behind is bounded by the live active deposit and dies with the
-	///   row);
-	/// - `Safety`: requires a request past its `executable_at` and consumes it by the taken amount;
-	/// - `Frozen`: rejected outright.
+	/// How much stablecoin a withdrawal may take, per operating mode.
+	///
+	/// - `Normal`: up to the active deposit. Any outstanding request is ignored, because requests
+	///   are Safety-Mode state; one left behind is bounded by the live active deposit and goes with
+	///   the row.
+	/// - `Safety`: needs a request past its `executable_at`, and takes the amount off it.
+	/// - `Frozen`: rejected.
 	pub(crate) fn resolve_withdrawal(
 		mode: BranchMode,
 		now: Millis,
@@ -957,10 +956,9 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// Every value-moving pool operation halts while the
-	/// branch is Frozen (which includes oracle failure — the provider fails
-	/// closed). Returns the live mode for operations that differentiate
-	/// Normal from Safety.
+	/// Stops an operation while the market is frozen, and reports the live mode.
+	///
+	/// A market with no usable price is frozen too: the mode provider fails closed.
 	pub(crate) fn ensure_not_frozen(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -970,10 +968,10 @@ impl<T: Config> Pallet<T> {
 		Ok(mode)
 	}
 
-	/// Settle accumulated losses and gains into the row — the active leg AND
-	/// the pending leg — and reset its snapshots to the pool's current
-	/// coordinates. Never touches pool totals: offsets already
-	/// updated the aggregates when the losses happened.
+	/// Settles the losses and gains of both legs of a row, and resets its snapshots.
+	///
+	/// Never touches the pool totals. An offset already changed those when the loss happened; this
+	/// only works out which row carries which part of it.
 	fn realize_deposit(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -1001,11 +999,10 @@ impl<T: Config> Pallet<T> {
 		Self::realize_pending(collateral_id, stable_id, pool, deposit)
 	}
 
-	/// The pending leg of [`Pallet::realize_deposit`]: settle backstop losses
-	/// and direct collateral gains into the row and reset the pending
-	/// snapshot. A pending fully consumed by the backstop is dropped — its
-	/// flooring residue stays inside `total_pending_deposits` like every
-	/// other aggregate residue.
+	/// The pending leg of [`Pallet::realize_deposit`].
+	///
+	/// A pending deposit the backstop consumed in full is dropped. Its rounding remainder stays
+	/// inside `total_pending_deposits`, as every other remainder does.
 	fn realize_pending(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -1023,7 +1020,7 @@ impl<T: Config> Pallet<T> {
 			pending.amount,
 			&pending.snapshot,
 		);
-		// Pending deposits earn no yield: `G` is structurally zero here.
+		// Pending deposits earn no yield, so `G` is zero here by construction.
 		debug_assert!(realized.yield_gain.is_zero());
 		pending.amount = realized.compounded;
 		pending.snapshot = snapshot;
@@ -1038,9 +1035,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Realize `amount` (as of `snapshot`) on `leg` against the pool's live
-	/// coordinates: the settled values plus the reset snapshot at those
-	/// coordinates.
+	/// Realizes `amount` on one leg, and returns the settled values with the reset snapshot.
 	fn realize_leg(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -1051,9 +1046,9 @@ impl<T: Config> Pallet<T> {
 	) -> (Realized<BalanceOf<T>>, DepositSnapshot) {
 		let coords = pool.state.coords(leg);
 		let current = Self::sums_at(collateral_id, stable_id, leg, coords);
-		// A snapshot already at the live coordinates realizes against the
-		// current row alone — no row above the live scale can exist — which
-		// makes the snapshot-reset read cover the whole window.
+		// A snapshot already at the live coordinates realizes against the live row alone, because
+		// no row above the live scale can exist. The read for the snapshot reset then covers the
+		// whole window.
 		let window =
 			if snapshot.coords.epoch == coords.epoch && snapshot.coords.scale == coords.scale {
 				SumsWindow { snap: current, ahead: Default::default() }
@@ -1065,12 +1060,14 @@ impl<T: Config> Pallet<T> {
 		(realized, pool.state.snapshot(leg, &current))
 	}
 
-	/// Fold a matured pending deposit into the active deposit.
-	/// Must run after [`Self::realize_deposit`] — both legs join at the
-	/// current accumulators, so the activated amount is net of backstop
-	/// losses and cannot receive gains from offsets that predate its
-	/// activation. No-op while immature or absent; returns whether an
-	/// activation happened (i.e. whether `state` changed).
+	/// Moves a matured pending deposit into the active deposit.
+	///
+	/// Must run after [`Pallet::realize_deposit`]. Both legs then stand at their live
+	/// accumulators, so the amount that moves is already net of backstop losses and cannot collect
+	/// gains from offsets older than itself.
+	///
+	/// Does nothing while the pending deposit is absent or immature. Returns whether it moved,
+	/// which is also whether `state` changed.
 	fn activate_matured_pending(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -1096,8 +1093,8 @@ impl<T: Config> Pallet<T> {
 			.total_active_deposits
 			.checked_add(&amount)
 			.ok_or(ArithmeticError::Overflow)?;
-		// An underflow would mean a realized pending exceeding the tracked
-		// aggregate — flooring only ever leaves the rows at or below it.
+		// An underflow would mean a realized pending deposit above the pool total. Rounding only
+		// ever leaves the rows at or below it.
 		state.total_pending_deposits = state
 			.total_pending_deposits
 			.checked_sub(&amount)
@@ -1112,9 +1109,7 @@ impl<T: Config> Pallet<T> {
 		Ok(true)
 	}
 
-	/// Load the depositor's row, or start a fresh one snapshotted at the
-	/// pool's current coordinates (realization on a fresh row is the
-	/// identity).
+	/// The row of a depositor, or an empty one at the live coordinates.
 	fn load_or_fresh_deposit(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -1127,7 +1122,7 @@ impl<T: Config> Pallet<T> {
 		})
 	}
 
-	/// Validate and store a replacement pool config.
+	/// Checks and stores replacement pool parameters.
 	pub(crate) fn do_set_stability_pool_config(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -1142,7 +1137,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Write the row back, or remove it once it holds no user value.
+	/// Writes a row back, or removes it once it holds no user value.
 	fn store_or_prune_deposit(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -1156,8 +1151,8 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// The sums row of `leg` at `coords`; an absent row reads as zero,
-	/// which floors gains instead of overpaying them.
+	/// The sums row of `leg` at `coords`. An absent row reads as zero, which rounds gains down
+	/// rather than overpay them.
 	pub(crate) fn sums_at(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -1167,10 +1162,10 @@ impl<T: Config> Pallet<T> {
 		PoolSumsStore::<T>::get((collateral_id, stable_id, leg, coords.epoch, coords.scale))
 	}
 
-	/// The sums rows a snapshot on `leg` realizes against: its own
-	/// `(epoch, scale)` row plus the [`math::SCALE_SPAN`] scales after it.
-	/// Rows are seeded contiguously per epoch, so reading stops at the first
-	/// gap (`try_get` keeps absence observable through the `ValueQuery`).
+	/// The sums rows a snapshot realizes against: its own row plus the next `math::SCALE_SPAN`
+	/// scales.
+	///
+	/// Rows are seeded without gaps within an epoch, so the read stops at the first missing one.
 	pub(crate) fn sums_window(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,

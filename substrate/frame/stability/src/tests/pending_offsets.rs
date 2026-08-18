@@ -1,7 +1,8 @@
-//! `offset_pending_liquidation`: the last-resort backstop consuming ALL
-//! pending deposits pro-rata rather than oldest-first, tracked lazily through
-//! the pending `P`/`S` accumulator pair. The active `P`/`S`/`G` are never
-//! touched (invariant 11).
+//! Pending-deposit offsets: the last-resort backstop.
+//!
+//! The backstop takes from every pending deposit in proportion to its size, not from the oldest
+//! first, and the pending accumulators track that in constant time. The active accumulators are
+//! never touched.
 
 use crate::{math::pro_rata_floor, mock::*, types::Leg, Error};
 
@@ -140,8 +141,8 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		assert_eq!(debt_offset, 200);
 		assert_eq!(leftover, 0);
 
-		// Only pending capital moved: the active accumulators and the active
-		// side are bit-identical (invariant 11).
+		// Only pending capital moved, so the active side is unchanged down to the last
+		// digit.
 		let after = pool_state(DOT, PUSD);
 		assert_eq!(after.coords.p, before.coords.p);
 		assert_eq!(after.coords.epoch, before.coords.epoch);
