@@ -8,7 +8,7 @@
 //! floor above `total_supply / 1e18` suffices (see the bound derived on
 //! `StabilityPoolConfig::minimum_active_pool_balance`).
 
-use crate::mock::*;
+use crate::{mock::*, types::Leg};
 
 /// Deposit and immediately activate `amount` for `who`.
 fn seed_active(who: AccountId, amount: Balance) {
@@ -36,10 +36,10 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		assert_eq!(state.total_active_deposits, 0);
 		// The new epoch's sums row is seeded; the old one keeps the gains:
 		// delta_S = 800 * (1/1000) = 0.8.
-		let old = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let old = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 		assert_eq!(old.s_collateral, FixedU128::from_inner(800_000_000_000_000_000));
-		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 1u32, 0u32)));
-		let fresh = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 1u32, 0u32));
+		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 1u32, 0u32)));
+		let fresh = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 1u32, 0u32));
 		assert_eq!(fresh.s_collateral, FixedU128::zero());
 
 		// Old-epoch depositors realize to zero active but keep their epoch's
@@ -92,7 +92,7 @@ fn scale_crossing_preserves_older_deposits() {
 		assert_eq!(state.coords.scale, 1);
 		assert_eq!(state.coords.p, FixedU128::from_inner(10_000_000_000_000_000));
 		assert_eq!(state.total_active_deposits, 100);
-		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, 0u32, 1u32)));
+		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 0u32, 1u32)));
 		System::assert_has_event(
 			crate::Event::PoolOffsetApplied {
 				collateral_id: DOT,
