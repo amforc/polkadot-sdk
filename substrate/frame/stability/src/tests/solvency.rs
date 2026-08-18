@@ -29,10 +29,10 @@ fn assert_pool_fully_drained() {
 	assert_eq!(state.total_yield_unclaimed, 0);
 }
 
-/// Numeric example 11: three depositor cohorts across two yields and two
-/// offsets, then every one of them realized and the pool drained to zero.
+/// Three depositor cohorts across two yields and two offsets, then every one
+/// of them realized and the pool drained to zero.
 #[test]
-fn example_11_multiple_depositor_cohorts_reconcile_to_zero() {
+fn multiple_depositor_cohorts_reconcile_to_zero() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		seed_active(1, 1_000);
@@ -73,7 +73,7 @@ fn example_11_multiple_depositor_cohorts_reconcile_to_zero() {
 			assert!(deposit_row(DOT, PUSD, who).is_none());
 		}
 
-		// The example's reconciliation: collateral 350+175+225 = 750 (= 300+450),
+		// The reconciliation: collateral 350+175+225 = 750 (= 300+450),
 		// yield 160+80+90 = 330 (= 150+180), compounded 300+150+450 = 900. The
 		// pool holds nothing.
 		assert_pool_fully_drained();
