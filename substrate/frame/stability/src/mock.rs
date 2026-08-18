@@ -1,13 +1,12 @@
-//! Test runtime for `pallet-stability`.
+//! The test runtime for `pallet-stability`.
 //!
-//! The mock composes the real vault stack — registering a market through
-//! `pallet-vaults` seeds this pallet's pool rows via the `OnBranchLifecycle`
-//! hook, exactly as a production runtime would.
+//! The mock runs the real vault stack, so a market registered through `pallet-vaults` seeds the
+//! pool rows through the lifecycle hook, exactly as a production runtime does. Tests therefore
+//! exercise the wiring as well as the pallet.
 //!
-//! Conventions used in the tests:
-//! - Collateral `AssetId::Native` ([`DOT`]) routes to `Balances`; `AssetId::WithId(asset)` routes
-//!   to `AssetsHolder`. Stablecoins are plain `pallet-assets` ids: [`PUSD`] is the unit-scale
-//!   default coin, [`USDX`] the 6-decimals coin the scale tests use.
+//! Two conventions run through the tests. Collateral [`DOT`] is native and routes to `Balances`,
+//! while `AssetId::WithId` routes to `AssetsHolder`. Stablecoin [`PUSD`] holds to a unit, and
+//! [`USDX`] has six decimals, which the scale tests need.
 
 use crate as pallet_stability;
 use crate::types::{Leg, PoolPrecision, StabilityPoolConfig};
@@ -28,9 +27,6 @@ use frame::{
 };
 use pusd_primitives::{OffsetLegs, ProvidePrice, StabilityPoolInspect, StabilityPoolOffset};
 
-// 16 bytes so `into_sub_account_truncating` keeps the pallet id plus part of
-// the market seed: a `u64` would truncate every pusd-pallet sub-account to
-// the shared `"modl" + "pusd"` prefix, collapsing them into one account.
 pub type AccountId = u128;
 pub type Balance = u128;
 pub type AssetIdForAssets = u32;
@@ -138,20 +134,21 @@ impl pallet_linked_list::Config for Test {
 	type PriorityProvider = pallet_vaults::Pallet<Test>;
 }
 
-/// Unified collateral surface: `Balances` (native) on the left, `AssetsHolder`
-/// (multi-asset, hold-aware) on the right.
+/// The collateral surface the vault pallet uses: `Balances` for the native asset, `AssetsHolder`
+/// for the rest.
 pub type VaultCollateralAssets =
 	fungible::UnionOf<Balances, AssetsHolder, NativeFromLeft, AssetId, AccountId>;
 
-/// The pool's collateral surface: the same ledger, but through the plain
-/// mutate-capable `Assets` side — the pool holds nothing, it only receives
-/// offset collateral and pays claims, so it needs `Mutate`, not `MutateHold`
-/// (which is all `AssetsHolder` offers).
+/// The collateral surface the pool uses: the same ledger, reached through `Assets`.
+///
+/// The pool places nothing on hold. It receives offset collateral and pays claims, so it needs
+/// `Mutate`, which `AssetsHolder` does not offer.
 pub type PoolCollateralAssets =
 	fungible::UnionOf<Balances, Assets, NativeFromLeft, AssetId, AccountId>;
 
-/// Naive oracle: tests poke [`set_price`]. Prices are keyed by collateral
-/// alone — stablecoins are treated as $1-pegged at par.
+/// A price source the tests drive with [`set_price`].
+///
+/// Prices are keyed by collateral alone. Stablecoins are taken to hold to a dollar.
 pub struct MockOracle;
 parameter_types! {
 	pub static MockPrices: alloc::collections::BTreeMap<AssetId, FixedU128> =
@@ -189,8 +186,7 @@ pub const ADMIN: AccountId = 100;
 /// Emergency (tighten-only) admin of every market a test helper registers.
 pub const EMERGENCY_ADMIN: AccountId = 101;
 
-/// The `create_branch` admin bundle: `full` administers, `emergency` tightens.
-/// Admins are stored as origin callers, here plain signed origins.
+/// The admin pair a market registers with: `full` administers, `emergency` may only tighten.
 pub fn branch_admins(
 	full: AccountId,
 	emergency: AccountId,
@@ -198,8 +194,8 @@ pub fn branch_admins(
 	pallet_vaults::types::BranchAdmins { full_admin: full, emergency_admin: emergency }
 }
 
-/// `CreateOrigin`: Root creates deposit-free (`None`); the stable asset's owner
-/// creates with a deposit (`Some(who)`); anyone else is rejected.
+/// Who may register a market: Root pays no deposit, the owner of the stablecoin pays one, and
+/// anyone else is refused.
 pub struct EnsureAssetOwner;
 impl EnsureOriginWithArg<RuntimeOrigin, StableId> for EnsureAssetOwner {
 	type Success = Option<AccountId>;
@@ -223,7 +219,7 @@ impl EnsureOriginWithArg<RuntimeOrigin, StableId> for EnsureAssetOwner {
 	}
 }
 
-/// Flat 1_000-unit refundable creation deposit, held in native balance.
+/// A flat, refundable 1_000-unit registration deposit, held in native balance.
 pub type VaultsConsideration = HoldConsideration<
 	AccountId,
 	Balances,
@@ -232,7 +228,7 @@ pub type VaultsConsideration = HoldConsideration<
 >;
 
 parameter_types! {
-	/// Governance envelope the test default config sits comfortably inside.
+	/// Bounds wide enough that the default branch config never touches them.
 	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
 		pallet_vaults::types::BranchConfigBounds {
 			min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
@@ -248,12 +244,11 @@ impl pallet_vaults::Config for Test {
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
 	type FeeAccount = FeeAccounts;
-	// The pool takes its `yield_share` of every minted branch credit; the
-	// fee destination receives the remainder.
+	// The pool takes its `yield_share` of every minted credit, and the fee destination
+	// receives the rest.
 	type YieldHook = Stability;
-	// Registering a market seeds the siblings' per-market rows; redemptions
-	// first, so its config (which recovery-offset pricing reads) always
-	// exists whenever the pool rows do.
+	// Registration seeds the per-market rows of both siblings. Redemptions comes first, so
+	// the config that prices recovery offsets always exists once the pool rows do.
 	type OnBranchLifecycle = (Redemptions, Stability);
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
@@ -295,27 +290,27 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
 	}
 }
 
-/// Root (the governance override) or the market's stored full admin, the same
-/// composition a production runtime would use.
+/// Root as the governance override, or the stored full admin of the market. A production runtime
+/// composes the same pair.
 pub type StabilityUpdateOrigin = EitherOf<
 	AsEnsureOriginWithArg<frame_system::EnsureRoot<AccountId>>,
 	pallet_vaults::EnsureBranchFullAdmin<Test>,
 >;
 
-/// Account the redemption `FeeHandler` resolves pUSD fees into. Recovery
-/// offsets are fee-free, so it only collects from ordinary redemptions.
+/// Where redemption fees go. Recovery offsets charge no fee, so only ordinary redemptions pay
+/// into it.
 pub const FEE_DEST: AccountId = 888;
 
-/// Account market-teardown dust resolves into, standing in for the treasury.
-/// Distinct from [`FEE_DEST`] so tests can tell revenue streams apart.
+/// Where market teardown sends what is left in a pool account. It stands in for a treasury, and
+/// it is separate from [`FEE_DEST`] so that tests can tell the two streams apart.
 pub const DUST_DEST: AccountId = 889;
 
 parameter_types! {
 	pub const DustDestAccount: AccountId = DUST_DEST;
 }
 
-/// Each stablecoin's insurance cover lives at its own account; empty in
-/// these tests, so every below-par head prices as `BelowPar` regardless.
+/// One insurance account per stablecoin. All are empty here, so every below-par head prices as
+/// `BelowPar`.
 pub struct InsuranceFundAccounts;
 impl Convert<StableId, AccountId> for InsuranceFundAccounts {
 	fn convert(stable: StableId) -> AccountId {
@@ -323,7 +318,7 @@ impl Convert<StableId, AccountId> for InsuranceFundAccounts {
 	}
 }
 
-/// Routes all test stablecoin vault fees to [`FEE_DEST`].
+/// Sends the vault fees of every test stablecoin to [`FEE_DEST`].
 pub struct FeeAccounts;
 impl Convert<StableId, AccountId> for FeeAccounts {
 	fn convert(_stable: StableId) -> AccountId {
@@ -335,7 +330,7 @@ parameter_types! {
 	pub const FeeDestAccount: AccountId = FEE_DEST;
 }
 
-/// The redemption payload a stablecoin's first market registers.
+/// The redemption parameters the first market of a stablecoin registers with.
 pub fn default_redemption_config() -> pallet_redemptions::types::RedemptionConfig<Balance> {
 	pallet_redemptions::types::RedemptionConfig {
 		minimum_redemption_amount: 100,
@@ -387,11 +382,7 @@ impl pallet_redemptions::BenchmarkHelper<AssetId, StableId, AccountId, Balance>
 impl pallet_stability::Config for Test {
 	type StableAssets = Assets;
 	type CollateralAssets = PoolCollateralAssets;
-	// The real vault pallet derives the mode (persisted freeze, oracle
-	// health, live TCR), exactly as a production runtime would.
 	type BranchModes = Vaults;
-	// The real redemptions pallet prices recovery settlement, so offset
-	// pricing and recovery-redemption pricing share one code path.
 	type RecoveryOffsets = Redemptions;
 	type StableDustHandler = ResolveAssetTo<DustDestAccount, Assets>;
 	type CollateralDustHandler = ResolveAssetTo<DustDestAccount, PoolCollateralAssets>;
@@ -401,22 +392,22 @@ impl pallet_stability::Config for Test {
 	type WeightInfo = ();
 }
 
-/// DOT-equivalent native collateral asset id used across tests.
+/// The native collateral the tests use throughout.
 pub const DOT: AssetId = AssetId::Native;
 
-/// A non-native test collateral that lives in `pallet-assets`.
+/// A second collateral that lives in `pallet-assets` rather than in `Balances`.
 pub const TOKEN_X_ID: AssetIdForAssets = 1;
 pub const TOKEN_X: AssetId = AssetId::WithId(TOKEN_X_ID);
 
-/// Default unit-scale stablecoin every helper mints against.
+/// The stablecoin the helpers mint by default. One coin is one raw unit.
 pub const PUSD: StableId = 1_000;
 
-/// A 6-decimals stablecoin: 1 coin = [`USDX_UNIT`] raw units,
-/// with a realistic 0.01-coin minimum balance.
+/// A stablecoin with six decimals, so that the tests can check the pallet against a realistic
+/// denomination rather than against a unit.
 pub const USDX: StableId = 6_000;
-/// Raw units in one 6-decimals coin.
+/// The raw units in one [`USDX`] coin.
 pub const USDX_UNIT: Balance = 1_000_000;
-/// The [`USDX`] minimum balance: 0.01 coin.
+/// The minimum balance of [`USDX`]: one hundredth of a coin.
 pub const USDX_MIN_BALANCE: Balance = USDX_UNIT / 100;
 
 pub fn new_test_ext() -> TestState {
@@ -434,8 +425,8 @@ pub fn new_test_ext() -> TestState {
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
-			// The fee account needs native funds to pay its asset-account deposit.
-			// The full admin pays the custody seed of every Root-created market.
+			// The fee account needs native funds for its asset-account deposit, and the
+			// full admin pays the custody seed of every market Root registers.
 			balances: (1u128..=10u128)
 				.chain([FEE_DEST, ADMIN])
 				.map(|i| (i, 1_000_000_000_000))
@@ -455,7 +446,7 @@ pub fn new_test_ext() -> TestState {
 	ext
 }
 
-/// Run `test` and check post-state invariants under `try-runtime`.
+/// Runs `test`, then checks every invariant of the pallet against the state it left behind.
 pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
@@ -464,8 +455,8 @@ pub fn build_and_execute(test: impl FnOnce()) {
 	});
 }
 
-/// The reference pool config seeded into every registered branch: 5_000 ms
-/// entry delay, 600_000 ms safety withdrawal delay.
+/// The pool parameters every registered market starts with: a 5 second entry delay and a
+/// 10 minute Safety-Mode withdrawal delay.
 pub fn default_pool_config() -> StabilityPoolConfig<Balance> {
 	StabilityPoolConfig {
 		minimum_deposit: 100,
@@ -480,17 +471,15 @@ pub fn default_pool_config() -> StabilityPoolConfig<Balance> {
 	}
 }
 
-/// Default branch config: MCR=110%, ICR=120%, Safety=130%, ceiling 100M,
-/// MinDebt=200, MinColl=1, rate bounds 0.1%-100%, 7d upfront fee,
-/// 1d rate-cooldown, 5% redistribution penalty.
+/// The market parameters most tests use: liquidation at 110%, opening at 120%, Safety Mode
+/// below 130%.
 pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	pallet_vaults::BranchConfig {
 		minimum_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 		initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
 		safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
-		// Large enough that it never binds unintentionally, including at the
-		// raw-unit scales the fixtures use. A test that
-		// exercises the ceiling sets its own.
+		// High enough never to bind by accident, including at the raw-unit scales the
+		// fixtures use. A test about the ceiling sets its own.
 		debt_ceiling: 1_000_000_000_000,
 		minimum_debt: 200,
 		minimum_collateral: 1,
@@ -502,11 +491,11 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	}
 }
 
-/// [`default_branch_config`] rescaled to a pair that does not hold to a unit.
+/// [`default_branch_config`], with the floors raised to clear the minimum balances of a given
+/// pair.
 ///
-/// A market's vault floors have to clear its own assets' minimum balances, and
-/// the default's 1-unit floors only do that for the 1-unit assets most tests
-/// use. Everything else is left alone, so a test still reads as the default.
+/// The 1-unit defaults only clear them for the 1-unit assets. Everything else is left alone, so a
+/// test still reads as the default.
 pub fn branch_config_for(
 	collateral: AssetId,
 	stable: StableId,
@@ -523,10 +512,10 @@ pub fn branch_config_for(
 	}
 }
 
-/// The `(redemptions, stability)` payload a market on `stable` registers with.
+/// The registration payload of a market on `stable`.
 ///
-/// The redemption policy is stablecoin-wide, so only the coin's first market
-/// carries one; the pool is per market, so every market carries one.
+/// Redemption policy is set per stablecoin, so only its first market carries one. A pool is per
+/// market, so every market carries one.
 pub fn registration_config(
 	stable: StableId,
 ) -> (Option<pallet_redemptions::types::RedemptionConfig<Balance>>, StabilityPoolConfig<Balance>) {
@@ -535,18 +524,18 @@ pub fn registration_config(
 	(redemption_config, default_pool_config())
 }
 
-/// Registers the `(collateral, stable)` market at price 1.25$ with a high
-/// global debt ceiling. Creation also seeds this pallet's pool rows through
-/// the `OnBranchLifecycle` hook.
+/// Registers a market at a price of 1.25 and a debt ceiling high enough never to bind.
+///
+/// Registration also seeds the pool rows, through the lifecycle hook.
 pub fn register_branch(
 	collateral: AssetId,
 	stable: StableId,
 	config: pallet_vaults::BranchConfig<Balance>,
 ) {
-	// `create_branch` requires a live price, so set it before creating.
+	// A market cannot be registered without a live price.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
-	// A Root-created market has no depositor, so its full administrator pays the redistribution
-	// custody seed. The withdrawal preserves the payer, so it needs two minimum balances on hand.
+	// A market Root registers has no depositor, so its full admin pays the custody seed. The
+	// withdrawal keeps the payer alive, so the admin needs two minimum balances.
 	mint_collateral(
 		collateral.clone(),
 		ADMIN,
@@ -565,14 +554,12 @@ pub fn register_branch(
 	.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
-	// No ED pre-fund for the pool sub-account: the registration hook's
-	// provider reference keeps it alive, and pre-funding native balance
-	// would show up as untracked collateral in the DOT-market identity.
+	// The pool account gets no existential deposit. The provider reference from the
+	// registration hook keeps it alive, and native funds parked here would read as collateral
+	// the DOT market cannot account for.
 }
 
-/// Open a vault for `who` on the `(collateral, stable)` market with
-/// `(None, None)` rate-index hints, so mode tests can create real branch
-/// debt and drive the TCR.
+/// Opens a vault, so that a test can create real market debt and move the TCR.
 pub fn open_vault(
 	who: AccountId,
 	collateral: AssetId,
@@ -581,7 +568,7 @@ pub fn open_vault(
 	debt: Balance,
 ) -> DispatchResult {
 	use frame::traits::fungible::Mutate as FungibleMutate;
-	// Native ED first: fresh accounts need it before any other operation.
+	// A fresh account needs its existential deposit before anything else.
 	let _ = <Balances as FungibleMutate<AccountId>>::mint_into(&who, 1);
 	Vaults::open_vault(
 		RuntimeOrigin::signed(who),
@@ -613,27 +600,27 @@ pub fn mint_collateral(collateral: AssetId, who: AccountId, amount: Balance) {
 	}
 }
 
-/// Stablecoin balance of `(stable, who)` in `pallet-assets`.
+/// The stablecoin balance of an account.
 pub fn stable_balance(stable: StableId, who: AccountId) -> Balance {
 	use frame::traits::fungibles::Inspect as FungiblesInspect;
 	<Assets as FungiblesInspect<AccountId>>::balance(stable, &who)
 }
 
-/// Balance of `(collateral, who)` on the pool's collateral surface.
+/// The collateral balance of an account, on the surface the pool pays from.
 pub fn collateral_balance(collateral: AssetId, who: AccountId) -> Balance {
 	use frame::traits::fungibles::Inspect as FungiblesInspect;
 	<PoolCollateralAssets as FungiblesInspect<AccountId>>::balance(collateral, &who)
 }
 
-/// Advance mock time by `ms` milliseconds. The pallet is purely time-based;
-/// the block number stays at its genesis value of 1 (needed only so events
-/// are recorded).
+/// Moves the clock forward.
+///
+/// Every delay in this pallet is measured in time, so the block number stays at one. It matters
+/// only because events are not recorded at block zero.
 pub fn advance_time(ms: Moment) {
 	Timestamp::set_timestamp(Timestamp::get() + ms);
 }
 
-/// Deposit into the `(collateral, stable)` pool, mirroring the extrinsic's
-/// argument order with `who` as the signed origin.
+/// Deposits into a pool, signed by `who`.
 pub fn deposit(
 	who: AccountId,
 	collateral: AssetId,
@@ -652,8 +639,7 @@ pub fn request_withdraw(
 	Stability::request_withdraw(RuntimeOrigin::signed(who), collateral, stable, amount)
 }
 
-/// Withdraw to an explicit `recipient` (the extrinsic defaults a `None`
-/// recipient to the caller), with `who` as the signed origin.
+/// Withdraws to a named recipient, signed by `who`.
 pub fn withdraw(
 	who: AccountId,
 	collateral: AssetId,
@@ -682,7 +668,7 @@ pub fn claim_yield(
 	Stability::claim_yield(RuntimeOrigin::signed(who), collateral, stable, Some(recipient))
 }
 
-/// Poke `owner`'s deposit, signed by `caller` (permissionless).
+/// Pokes the deposit of `owner`, signed by any `caller`.
 pub fn poke(
 	caller: AccountId,
 	owner: AccountId,
@@ -701,17 +687,18 @@ pub fn compound(
 	Stability::compound_yield(RuntimeOrigin::signed(who), collateral, stable, amount)
 }
 
-/// Mint `amount` for `who` and deposit it into the default (DOT, PUSD) pool;
-/// the deposit stays pending until [`activate_all`] (or any other touch past
-/// the entry delay) folds it in.
+/// Mints for `who` and deposits into the default pool.
+///
+/// The deposit stays pending until [`activate_all`], or any other write past the entry delay,
+/// activates it.
 pub fn seed_deposit(who: AccountId, amount: Balance) {
 	mint_stable(PUSD, who, amount);
 	assert_ok!(deposit(who, DOT, PUSD, amount));
 }
 
-/// Advance past the default entry delay and fold every listed depositor's
-/// matured pending deposit into the (DOT, PUSD) active pool. Folding in
-/// takes a touch of the row; the permissionless poke stands in for one.
+/// Moves past the entry delay and activates the pending deposit of every listed account.
+///
+/// Activation needs a write to the row, and the permissionless poke supplies one.
 pub fn activate_all(depositors: &[AccountId]) {
 	advance_time(5_000);
 	for who in depositors {
@@ -719,9 +706,8 @@ pub fn activate_all(depositors: &[AccountId]) {
 	}
 }
 
-/// The canonical single-depositor fixture: register the default (DOT, PUSD)
-/// market, deposit 400 for user 1 at t = 1_000 (minting 1_000, so 600 stays
-/// in the wallet), active from t = 6_000.
+/// The single-depositor fixture: account 1 holds 400 active in the default market, and 600 in
+/// its wallet.
 pub fn seed_active_deposit() {
 	register_branch(DOT, PUSD, default_branch_config());
 	mint_stable(PUSD, 1, 1_000);
@@ -729,9 +715,8 @@ pub fn seed_active_deposit() {
 	activate_all(&[1]);
 }
 
-/// Register the default (DOT, PUSD) market, give it real branch debt (a
-/// 1000-collateral / 500-debt vault: TCR 250% at the 1.25 registration
-/// price), and activate a 400 deposit for user 1 — all still in Normal Mode.
+/// [`seed_active_deposit`] with real market debt behind it: one vault at a TCR of 250%, which
+/// leaves the market in Normal Mode and lets a test drive it into Safety Mode.
 pub fn seed_branch_with_debt() {
 	register_branch(DOT, PUSD, default_branch_config());
 	mint_collateral(DOT, 5, 2_000);
@@ -741,45 +726,42 @@ pub fn seed_branch_with_debt() {
 	activate_all(&[1]);
 }
 
-/// TCR = 1000 * 0.6 / 500 = 120%: below the 130% Safety threshold, above
-/// the 110% MCR. Needs [`seed_branch_with_debt`]'s vault to bite.
+/// Drops the price until the TCR reaches 120%, which is under the Safety threshold and over the
+/// liquidation ratio. Needs the vault of [`seed_branch_with_debt`].
 pub fn enter_safety_mode() {
 	set_price(DOT, FixedU128::from_rational(6u128, 10u128));
 }
 
-/// Restore the 1.25 registration price: TCR back above the Safety threshold.
+/// Restores the registration price, which lifts the TCR back over the Safety threshold.
 pub fn exit_safety_mode() {
 	set_price(DOT, FixedU128::from_rational(5u128, 4u128));
 }
 
-/// Replace the (DOT, PUSD) pool's `minimum_active_pool_balance` (the
-/// post-offset floor) via governance.
+/// Sets the post-offset floor of the default pool, through governance.
 pub fn set_min_active_pool(min: Balance) {
 	let mut config = default_pool_config();
 	config.minimum_active_pool_balance = min;
 	assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
 }
 
-/// Mint a fresh stablecoin credit (as the vault engine's yield minting does)
-/// and hand it to the pool for distribution, returning what the pool could
-/// not take.
+/// Mints stablecoin as the vault engine does and offers it to the pool, returning what the pool
+/// could not take.
 pub fn distribute_yield(
 	collateral: AssetId,
 	stable: StableId,
 	amount: Balance,
 ) -> crate::pallet::StableCreditOf<Test> {
 	let credit = <Assets as FungiblesBalanced<AccountId>>::issue(stable, amount);
-	// The engine fn, not the `OnBranchYield` impl: the full credit enters
-	// the pool, with no `yield_share` cut taken.
+	// This calls the engine directly rather than through `OnBranchYield`, so the whole
+	// credit reaches the pool and no `yield_share` cut is taken.
 	let Some(pool) = crate::Pools::<Test>::get(&collateral, &stable) else {
 		return credit;
 	};
 	Stability::do_distribute_yield(&collateral, &stable, pool, credit)
 }
 
-/// Issue a fresh collateral credit, standing in for liquidation-seized
-/// collateral. Dropping it (or a remainder split off it) only rescinds the
-/// issuance created here.
+/// Issues collateral, standing in for what a liquidation seizes. Dropping it, or any part split
+/// off it, only undoes the issuance made here.
 pub fn issue_collateral(
 	collateral: AssetId,
 	amount: Balance,
@@ -787,15 +769,12 @@ pub fn issue_collateral(
 	<PoolCollateralAssets as FungiblesBalanced<AccountId>>::issue(collateral, amount)
 }
 
-/// Run an active-pool offset against a freshly issued collateral credit,
-/// reproducing the vault engine's take-at-most stage over the exact offset
-/// API: the `reducible_active` read sizes the take, the pro-rata collateral
-/// slice funds it, and the rest is rescinded. Returns the cancelled debt and
-/// the unconsumed remainder's amount. The storage layer stands in for the
-/// transactional dispatch boundary every production extrinsic gets: commit on
-/// success, and on error the caller-side abort the trait contract demands, so
-/// a settlement refusal (e.g. a sub-minimum first collateral gain) rolls
-/// everything back into a clean step-aside.
+/// Runs an active-pool offset the way the liquidation engine will: read the reducible amount,
+/// cut the matching slice of collateral, and settle.
+///
+/// Returns the debt cancelled and the collateral left over. The storage layer stands in for the
+/// transaction every production extrinsic runs inside, so a refused settlement rolls back and the
+/// caller simply steps aside, as the trait requires.
 pub fn simulate_offset(
 	collateral: AssetId,
 	stable: StableId,
@@ -823,7 +802,7 @@ pub fn simulate_offset(
 	.unwrap_or((0, collateral_for_pool))
 }
 
-/// Run a pending-deposit backstop offset with the same probe plumbing.
+/// [`simulate_offset`] for the pending leg.
 pub fn simulate_pending_offset(
 	collateral: AssetId,
 	stable: StableId,
@@ -854,7 +833,7 @@ pub fn simulate_pending_offset(
 	.unwrap_or((0, remaining_collateral))
 }
 
-/// The caller's deposit row; `None` when pruned or never created.
+/// The deposit row of an account, or `None` if it was never created or has been removed.
 pub fn deposit_row(
 	collateral: AssetId,
 	stable: StableId,
@@ -863,8 +842,8 @@ pub fn deposit_row(
 	crate::Deposits::<Test>::get((collateral, stable, who))
 }
 
-/// The realized pending amount `who` currently holds: the row's pending leg
-/// settled against the live pending accumulators, without touching storage.
+/// What the pending deposit of `who` is worth right now, settled against the live pending
+/// accumulators without writing anything.
 pub fn realized_pending(collateral: AssetId, stable: StableId, who: AccountId) -> Balance {
 	let Some(pending) =
 		deposit_row(collateral.clone(), stable, who).and_then(|d| d.pending_deposit)
@@ -884,13 +863,13 @@ pub fn realized_pending(collateral: AssetId, stable: StableId, who: AccountId) -
 	.compounded
 }
 
-/// The branch's live pool state; panics when the branch is not registered.
+/// The live state of a pool. Panics if the market is not registered.
 pub fn pool_state(collateral: AssetId, stable: StableId) -> crate::types::PoolState<Balance> {
 	crate::Pools::<Test>::get(collateral, stable).expect("pool registered").state
 }
 
-/// Park `owner`'s vault in `FinalRecovery`. The call is permissionless, so
-/// an arbitrary keeper signs it; tests set the price preconditions.
+/// Moves the vault of `owner` into `FinalRecovery`. The call is permissionless, so any account
+/// may sign it; the test sets up the price first.
 pub fn enter_final_recovery(
 	collateral: AssetId,
 	stable: StableId,
@@ -899,14 +878,14 @@ pub fn enter_final_recovery(
 	Vaults::enter_final_recovery(RuntimeOrigin::signed(99), collateral, stable, owner)
 }
 
-/// The vault's stored debt (principal + settled interest); zero when absent.
+/// The stored debt of a vault, principal and settled interest together. Zero if it is absent.
 pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Balance {
 	pallet_vaults::Vaults::<Test>::get((collateral, stable, who))
 		.map(|v| v.debt.principal + v.debt.interest)
 		.unwrap_or_default()
 }
 
-/// Trigger an active-pool recovery offset, signed by an arbitrary keeper.
+/// Runs an active-pool recovery offset, signed by an arbitrary account.
 pub fn offset_recovery(
 	collateral: AssetId,
 	stable: StableId,

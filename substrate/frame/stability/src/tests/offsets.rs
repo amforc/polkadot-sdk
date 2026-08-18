@@ -1,5 +1,5 @@
-//! `offset_liquidation`: clamping, proportional `S` gains, `P` compounding,
-//! and the interplay with yield (invariant 12).
+//! Active-pool offsets: how an offset is capped, how the collateral is shared out through `S`,
+//! how `P` shrinks, and why none of it disturbs the yield already recorded in `G`.
 
 use crate::{mock::*, types::Leg, Error};
 use frame::testing_prelude::hypothetically;
@@ -169,10 +169,9 @@ fn offset_preserves_claimable_yield() {
 		activate_all(&[1]);
 		drop(distribute_yield(DOT, PUSD, 60));
 
-		// The offset halves the deposit but must not touch the yield
-		// already recorded in G (invariant 12): the claim still pays the
-		// full floor(600 * 0.1) = 60. The 300 debt seizes 300 / 1.25 = 240
-		// collateral.
+		// The offset halves the deposit but must leave the yield already recorded in `G`
+		// alone, so the claim still pays the full floor(600 * 0.1) = 60. The 300 debt seizes
+		// 300 / 1.25 = 240 collateral.
 		assert_eq!(simulate_offset(DOT, PUSD, 300, 240).0, 300);
 		assert_ok!(claim_yield(1, DOT, PUSD, 1));
 		System::assert_has_event(

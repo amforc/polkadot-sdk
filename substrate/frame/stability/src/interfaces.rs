@@ -1,5 +1,7 @@
-//! pUSD primitive trait implementations: the surfaces sibling pallets drive
-//! on the pool.
+//! What sibling pallets drive on the pool.
+//!
+//! The vault engine routes yield here, and the liquidation engine cancels debt here. Both
+//! surfaces are defined in `pusd-primitives`, so neither pallet needs to know the other.
 
 use crate::{
 	pallet::{
@@ -11,18 +13,18 @@ use crate::{
 use frame::{deps::frame_support::require_transactional, prelude::*, traits::tokens::Preservation};
 use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, StabilityPoolOffset};
 
-/// The vault engine hands every minted branch credit through here; the pool
-/// takes `floor(yield_share * credit)` and returns the rest for the fee
-/// destination. Infallible: whatever cannot be distributed (no pool row, a
-/// zero share, an empty or frozen pool) comes back with the remainder. The
-/// pool row is loaded once and handed down to the distribution engine.
+/// The pool takes `floor(yield_share * credit)` and returns the rest for the fee destination.
+///
+/// Cannot fail. Whatever the pool cannot take, because the market is unregistered, the share is
+/// zero, or the pool is empty or frozen, comes back with the remainder. The pool row is read once
+/// here and handed down.
 impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T> {
 	fn distribute_yield(
 		collateral_id: &CollateralIdOf<T>,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
-		// The credit's own asset names the market; an unregistered pair has
-		// no pool row and the credit comes back whole.
+		// The asset of the credit names the market; an unregistered pair has no pool row, and the
+		// credit comes back whole.
 		let stable_id = &credit.asset();
 		let Some(pool) = Pools::<T>::get(collateral_id, stable_id) else {
 			return credit;
@@ -34,8 +36,8 @@ impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T
 		let (taken, mut remainder) = credit.split(take);
 		let leftover = Self::do_distribute_yield(collateral_id, stable_id, pool, taken);
 		if let Err(leftover) = remainder.subsume(leftover) {
-			// Both halves came from one credit, so a mismatch cannot
-			// happen; burning the leftover keeps issuance conservative.
+			// Both halves came from one credit, so they cannot disagree. Burning the leftover
+			// keeps issuance on the conservative side.
 			debug_assert!(false, "yield credit halves diverged");
 			drop(leftover);
 		}
@@ -43,8 +45,8 @@ impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T
 	}
 }
 
-/// One sized offset leg: the debt to burn and the `Preservation` its sizing
-/// pass proved valid for the burn debit.
+/// One sized offset leg: the debt to cancel, and the `Preservation` its sizing proved valid for
+/// the burn.
 #[derive(Clone, Copy)]
 pub(crate) struct OffsetReservation<Balance> {
 	pub(crate) debt: Balance,
@@ -52,8 +54,10 @@ pub(crate) struct OffsetReservation<Balance> {
 }
 
 impl<T: Config> Pallet<T> {
-	/// The pool row offsets may draw on: `None` when the branch is missing or
-	/// frozen, which sizes every leg to zero and refuses every settlement.
+	/// The pool an offset may draw on.
+	///
+	/// Returns `None` for a market that is missing or frozen, which sizes every leg to zero and
+	/// refuses every settlement.
 	fn offset_pool(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -62,9 +66,10 @@ impl<T: Config> Pallet<T> {
 		Pools::<T>::get(collateral_id, stable_id)
 	}
 
-	/// Exact re-validation of one non-zero leg: the sizing pass must reproduce
-	/// precisely the requested debt, or the caller's inspection reads went
-	/// stale and the whole offset aborts with nothing moved.
+	/// Re-sizes one non-zero leg and demands the exact requested debt.
+	///
+	/// Anything else means the caller acted on a stale reading, so the whole offset aborts with
+	/// nothing moved.
 	fn size_leg_exact(
 		sized: Option<(BalanceOf<T>, Preservation)>,
 		requested: BalanceOf<T>,
@@ -124,8 +129,8 @@ impl<T: Config>
 		debt: OffsetLegs<BalanceOf<T>>,
 		collateral: OffsetLegs<CollateralCreditOf<T>>,
 	) -> DispatchResult {
-		// A zero-debt leg must carry a provably-zero credit: anything else
-		// would donate collateral to the pool without cancelling debt.
+		// A leg that cancels no debt must carry no collateral. Anything else would give the pool
+		// collateral for free and break the link between the two sides.
 		if debt.active.is_zero() {
 			ensure!(collateral.active.peek().is_zero(), crate::Error::<T>::OffsetSettlementFailed);
 		}
@@ -139,9 +144,9 @@ impl<T: Config>
 			.ok_or(crate::Error::<T>::OffsetSettlementFailed)?;
 		let pool_account = Self::pool_account(collateral_id, stable_id);
 
-		// Both legs re-size against the untouched pool in the inspection
-		// order — active first, pending reserved behind it — so a caller
-		// whose reads went stale fails here with nothing moved.
+		// Both legs re-size against the untouched pool, in the order the caller inspected them:
+		// active first, pending reserved behind it. A caller whose readings went stale therefore
+		// fails here, with nothing moved.
 		let active = if debt.active.is_zero() {
 			None
 		} else {
@@ -169,9 +174,8 @@ impl<T: Config>
 			Some(Self::size_leg_exact(sized, debt.pending)?)
 		};
 
-		// Active settles before pending: the pending `Preservation` was sized
-		// against the combined limit and holds only once the active tranche
-		// has left the pool account.
+		// Active settles first. The pending `Preservation` was sized against the combined limit,
+		// so it only holds once the active part has left the pool account.
 		if let Some(reservation) = active {
 			Self::settle_offset(
 				collateral_id,
