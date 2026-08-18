@@ -12,7 +12,7 @@ use crate::{
 pub use crate::{
 	pallet::{BalanceOf, CollateralCreditOf, StableCreditOf},
 	types::BranchAdmins,
-	BranchConfig, BranchMode, Error, Event, HoldReason, Pallet,
+	BoundViolation, BranchConfig, BranchConfigDefect, BranchMode, Error, Event, HoldReason, Pallet,
 };
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, Permill, Saturating},
@@ -260,10 +260,13 @@ parameter_types! {
 /// Records market lifecycle calls and supports forced failures.
 pub struct RecordingLifecycle;
 impl pusd_primitives::OnBranchLifecycle<AssetId, StableId> for RecordingLifecycle {
+	type RegistrationConfig = ();
+
 	fn on_registered(
 		collateral_id: &AssetId,
 		stable_id: &StableId,
 		stablecoin_markets: u32,
+		_config: Self::RegistrationConfig,
 	) -> DispatchResult {
 		LifecycleLog::mutate(|l| {
 			l.push((collateral_id.clone(), *stable_id, true, stablecoin_markets))
@@ -286,6 +289,9 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId> for RecordingLifecycl
 		}
 		Ok(())
 	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_registration_config(_stablecoin_markets: u32) -> Self::RegistrationConfig {}
 }
 
 /// Allows root or the stable asset owner to create a market.
@@ -331,17 +337,11 @@ pub type VaultsConsideration = HoldConsideration<
 parameter_types! {
 	pub const IdleMaxRefreshWeight: Option<Weight> = Some(Weight::MAX);
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
-	/// Global limits for test market settings.
-	pub TestBranchConfigBounds: BranchConfigBounds<Balance> = BranchConfigBounds {
+	pub TestBranchConfigBounds: BranchConfigBounds = BranchConfigBounds {
 		min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
 		min_initial_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
 		min_safety_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
-		min_minimum_debt: 100,
-		min_minimum_collateral: 1,
 		max_borrow_rate: FixedU128::from_rational(400u128, 100u128),
-		max_debt_ceiling: 1_000_000_000_000_000,
-		max_ceiling_gap: 1_000_000_000,
-		min_ceiling_ttl: 24 * 3_600 * 1_000,
 	};
 }
 
@@ -501,8 +501,6 @@ pub fn default_branch_config() -> BranchConfig<Balance> {
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
 		redistribution_penalty: Permill::from_percent(5),
-		ceiling_gap: 0,
-		ceiling_ttl: 0,
 	}
 }
 
@@ -526,6 +524,7 @@ pub fn create_market(
 		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
 		config,
+		(),
 	)
 	.expect("create_branch ok");
 }
@@ -538,7 +537,7 @@ pub fn register_market_with(
 	config: BranchConfig<Balance>,
 ) {
 	create_market(collateral.clone(), stable, price, config);
-	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), collateral, GLOBAL_CEILING)
+	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, GLOBAL_CEILING)
 		.expect("set global debt ceiling");
 }
 

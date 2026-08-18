@@ -3256,19 +3256,13 @@ parameter_types! {
 		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
 	pub const VaultsBranchCreationDeposit: Balance = 100 * DOLLARS;
 	/// Governance envelope every permissionlessly-created market config must sit
-	/// inside: floors on the collateralization ratios and minimums, caps on the
-	/// borrow rate and the static debt line.
-	pub VaultsBranchConfigBounds: pallet_vaults::types::BranchConfigBounds<Balance> =
+	/// inside.
+	pub VaultsBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
 		pallet_vaults::types::BranchConfigBounds {
 			min_minimum_collateralization_ratio: FixedU128::from_rational(105, 100),
 			min_initial_collateralization_ratio: FixedU128::from_rational(110, 100),
 			min_safety_collateralization_ratio: FixedU128::from_rational(120, 100),
-			min_minimum_debt: 10 * DOLLARS,
-			min_minimum_collateral: 1,
 			max_borrow_rate: FixedU128::from_rational(400, 100),
-			max_debt_ceiling: 1_000_000_000 * DOLLARS,
-			max_ceiling_gap: 100_000_000 * DOLLARS,
-			min_ceiling_ttl: 24 * 60 * 60 * 1_000,
 		};
 }
 
