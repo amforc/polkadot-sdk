@@ -14067,6 +14067,7 @@ dependencies = [
  "pallet-vaults",
  "parity-scale-codec",
  "polkadot-sdk-frame",
+ "proptest",
  "pusd-primitives",
  "scale-info",
 ]

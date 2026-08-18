@@ -25,9 +25,13 @@ pub enum RecoveryOffsetQuote<Balance> {
 	Available { debt: Balance },
 }
 
-/// The ordinary-redemption fee rate is
-/// `min(base_fee + decayed dynamic fee, fee_ceiling)`: a constant base every
-/// redemption pays plus a decaying component that redemption volume raises.
+/// Defines the ordinary-redemption fee policy.
+///
+/// The fee rate is `min(base_fee + dynamic fee, fee_ceiling)`. Each redemption pays the constant
+/// base fee and a dynamic component.
+///
+/// Time decreases the dynamic component, and redemption volume increases it. The fee integrates
+/// this component over the debt that the redemption cancels.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
@@ -41,8 +45,10 @@ pub struct RedemptionConfig<Balance> {
 	pub base_fee: Permill,
 	/// Cap on the total fee rate, base and dynamic components combined.
 	pub fee_ceiling: Permill,
-	/// Divides the redeemed stablecoin-wide debt fraction before it raises
-	/// the dynamic fee after an ordinary redemption.
+	/// Divisor applied to the redeemed share of the current stablecoin-wide debt.
+	///
+	/// Thus, redemption of debt fraction `u` increases the dynamic fee by `u / divisor`. The
+	/// redemption pays the mean of the arrival and terminal dynamic fees.
 	pub dynamic_fee_increase_divisor: FixedU128,
 	/// Prevents the recovery bonus from worsening a `CR >= 100%` recovery vault.
 	pub final_recovery_bonus_buffer: Permill,
@@ -68,24 +74,13 @@ impl<Balance: Zero> RedemptionConfig<Balance> {
 }
 
 /// Redeemer-supplied execution terms.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RedemptionTerms<Balance> {
-	/// Maximum stable assets whose corresponding vault debt may be cancelled.
-	pub max_stable_in: Balance,
-	/// Collateral floor at a full fill.
+	/// Maximum stable-asset amount that the redeemer spends, including the redemption fee.
+	pub max_stable_to_spend: Balance,
+	/// Collateral floor when the whole `max_stable_to_spend` is spent.
 	///
-	/// Partial fills scale this floor pro-rata to the debt actually cancelled.
+	/// Partial fills scale this floor pro rata to the stable amount spent.
 	pub min_collateral_out: Balance,
 }
 
