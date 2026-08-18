@@ -5,7 +5,9 @@
 //! The remainder rule then preserves exact collateral conservation.
 //!
 //! Planning drops a JIT trade under the keeper's slippage floor and re-plans once, so the
-//! liquidation proceeds without the optional contribution.
+//! liquidation proceeds without the optional contribution. The keeper's collateral legs — the
+//! compensation and the JIT share — are dropped the same way when the keeper's account cannot
+//! receive them.
 
 use crate::{
 	context::VaultOp,
@@ -24,9 +26,10 @@ use frame::{
 	traits::{
 		fungibles::{
 			Balanced as FungiblesBalanced, BalancedHold as FungiblesBalancedHold,
-			Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold,
+			Inspect as FungiblesInspect, Mutate as FungiblesMutate,
+			MutateHold as FungiblesMutateHold,
 		},
-		tokens::{Fortitude, Precision, Preservation},
+		tokens::{DepositConsequence, Fortitude, Precision, Preservation, Provenance},
 	},
 };
 use pusd_primitives::{
@@ -64,6 +67,22 @@ struct LiquidationPlan<Balance> {
 	seized: Balance,
 	keeper_reward: Balance,
 	owner_surplus: Balance,
+}
+
+impl<Balance: FixedPointOperand + AtLeast32BitUnsigned> LiquidationPlan<Balance> {
+	// Reallocates the plan with no keeper compensation. Debt, seizure, and owner surplus stay as
+	// sized, so the borrower's loss is unchanged and the freed reward flows to the resolution
+	// paths.
+	fn without_keeper_reward(self, config: &LiquidationConfig<Balance>) -> Option<Self> {
+		let collateral = allocate_collateral(self.seized, self.debt, config)?;
+		Some(Self { collateral, keeper_reward: Balance::zero(), ..self })
+	}
+}
+
+// A quoted plan with the account treatment its JIT stablecoin burn must use.
+struct LiquidationQuote<Balance> {
+	plan: LiquidationPlan<Balance>,
+	jit_preservation: Preservation,
 }
 
 impl<T: Config> Pallet<T> {
@@ -154,7 +173,7 @@ impl<T: Config> Pallet<T> {
 		collateral: CollateralCreditOf<T>,
 	) -> Result<LiquidationOutcome<BalanceOf<T>>, DispatchError> {
 		debug_assert!(snapshot.config.offset_penalty <= snapshot.config.redistribution_penalty);
-		let (plan, jit_preservation) = Self::plan_liquidation(
+		let LiquidationQuote { plan, jit_preservation } = Self::plan_liquidation(
 			keeper,
 			collateral_id,
 			stable_id,
@@ -165,21 +184,27 @@ impl<T: Config> Pallet<T> {
 
 		let (seized, owner_surplus) = collateral.split(plan.seized);
 		debug_assert_eq!(owner_surplus.peek(), plan.owner_surplus);
-		let (keeper_reward, mut resolution) = seized.split(plan.keeper_reward);
-		Self::resolve_collateral(keeper, keeper_reward)?;
+		let (mut keeper_collateral, mut resolution) = seized.split(plan.keeper_reward);
 
 		let has_pool_offset = !plan.debt.active_pool.is_zero() || !plan.debt.pending_pool.is_zero();
 		let active_collateral =
 			has_pool_offset.then(|| resolution.extract(plan.collateral.active_pool));
-		Self::apply_jit(
-			keeper,
-			stable_id,
-			jit,
-			plan.debt.keeper_jit,
-			jit_preservation,
-			plan.collateral.keeper_jit,
-			&mut resolution,
-		)?;
+		if plan.debt.keeper_jit.is_zero() {
+			debug_assert!(plan.collateral.keeper_jit.is_zero());
+		} else {
+			debug_assert!(plan.collateral.keeper_jit >= jit.min_collateral_out);
+		}
+		Self::burn_jit_stable(keeper, stable_id, plan.debt.keeper_jit, jit_preservation)?;
+		if let Err(jit_share) = keeper_collateral.subsume(resolution.extract(plan.collateral.keeper_jit))
+		{
+			// Both halves came from the seized credit, so the merge cannot fail; refuse the
+			// settlement and let the dispatch roll back.
+			drop(jit_share);
+			return Err(DispatchError::Corruption);
+		}
+		// The reward and the JIT share reach the keeper as one deposit: the deposit planning
+		// checked, so it cannot fail on the keeper's account state.
+		Self::resolve_collateral(keeper, keeper_collateral)?;
 		if let Some(active_collateral) = active_collateral {
 			let pending_collateral = resolution.extract(plan.collateral.pending_pool);
 
@@ -232,9 +257,9 @@ impl<T: Config> Pallet<T> {
 		Ok(outcome)
 	}
 
-	// Builds the ordinary waterfall plan, then retries once without JIT when its collateral share
-	// misses the keeper's floor. Pool custody is a branch-registration invariant, so no pool leg
-	// needs liquidation-time pruning.
+	// Builds the waterfall plan and prunes the keeper legs that cannot execute, retrying once
+	// without JIT. Pool custody is a branch-registration invariant, so no pool leg needs
+	// liquidation-time pruning.
 	fn plan_liquidation(
 		keeper: &T::AccountId,
 		collateral_id: &CollateralIdOf<T>,
@@ -242,8 +267,8 @@ impl<T: Config> Pallet<T> {
 		snapshot: &LiquidationSnapshot<BalanceOf<T>>,
 		jit: JitTerms<BalanceOf<T>>,
 		collateral_total: BalanceOf<T>,
-	) -> Result<(LiquidationPlan<BalanceOf<T>>, Preservation), DispatchError> {
-		let (candidate, candidate_preservation) = Self::quote_liquidation(
+	) -> Result<LiquidationQuote<BalanceOf<T>>, DispatchError> {
+		let quote = Self::quote_payable_liquidation(
 			keeper,
 			collateral_id,
 			stable_id,
@@ -251,19 +276,84 @@ impl<T: Config> Pallet<T> {
 			jit,
 			collateral_total,
 		)?;
-		if candidate.debt.keeper_jit.is_zero() ||
-			candidate.collateral.keeper_jit >= jit.min_collateral_out
-		{
-			return Ok((candidate, candidate_preservation));
+		if Self::jit_leg_executes(collateral_id, keeper, &quote.plan, jit)? {
+			return Ok(quote);
 		}
-		Self::quote_liquidation(
+		let retried = Self::quote_payable_liquidation(
 			keeper,
 			collateral_id,
 			stable_id,
 			snapshot,
 			JitTerms { max_stable: Zero::zero(), ..jit },
 			collateral_total,
-		)
+		)?;
+		debug_assert!(retried.plan.debt.keeper_jit.is_zero());
+		Ok(retried)
+	}
+
+	// Quotes the waterfall and plans compensation out when the keeper cannot receive it: the
+	// reward is the one leg paid to an account the protocol does not control, and an unpaid keeper
+	// is preferable to an unsafe vault left in the market.
+	fn quote_payable_liquidation(
+		keeper: &T::AccountId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		snapshot: &LiquidationSnapshot<BalanceOf<T>>,
+		jit: JitTerms<BalanceOf<T>>,
+		collateral_total: BalanceOf<T>,
+	) -> Result<LiquidationQuote<BalanceOf<T>>, DispatchError> {
+		let quote = Self::quote_liquidation(
+			keeper,
+			collateral_id,
+			stable_id,
+			snapshot,
+			jit,
+			collateral_total,
+		)?;
+		if Self::keeper_can_be_paid(collateral_id, keeper, quote.plan.keeper_reward) {
+			return Ok(quote);
+		}
+		let plan = quote
+			.plan
+			.without_keeper_reward(&snapshot.config)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		debug_assert!(plan.keeper_reward.is_zero());
+		Ok(LiquidationQuote { plan, jit_preservation: quote.jit_preservation })
+	}
+
+	// Whether a planned JIT trade executes: its collateral share must clear the keeper's floor and
+	// reach the keeper's account. The reward and the share settle as one deposit, so the check is
+	// that deposit.
+	fn jit_leg_executes(
+		collateral_id: &CollateralIdOf<T>,
+		keeper: &T::AccountId,
+		plan: &LiquidationPlan<BalanceOf<T>>,
+		jit: JitTerms<BalanceOf<T>>,
+	) -> Result<bool, DispatchError> {
+		if plan.debt.keeper_jit.is_zero() {
+			return Ok(true);
+		}
+		if plan.collateral.keeper_jit < jit.min_collateral_out {
+			return Ok(false);
+		}
+		let intake = plan
+			.keeper_reward
+			.checked_add(&plan.collateral.keeper_jit)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		Ok(Self::keeper_can_be_paid(collateral_id, keeper, intake))
+	}
+
+	// Whether the keeper's account could take a payout of already-existing collateral.
+	fn keeper_can_be_paid(
+		collateral_id: &CollateralIdOf<T>,
+		keeper: &T::AccountId,
+		amount: BalanceOf<T>,
+	) -> bool {
+		if amount.is_zero() {
+			return true;
+		}
+		T::CollateralAssets::can_deposit(collateral_id.clone(), keeper, amount, Provenance::Extant) ==
+			DepositConsequence::Success
 	}
 
 	// Quotes debt and converts that exact waterfall split into a collateral-conserving plan.
@@ -275,12 +365,12 @@ impl<T: Config> Pallet<T> {
 		snapshot: &LiquidationSnapshot<BalanceOf<T>>,
 		jit: JitTerms<BalanceOf<T>>,
 		collateral_total: BalanceOf<T>,
-	) -> Result<(LiquidationPlan<BalanceOf<T>>, Preservation), DispatchError> {
+	) -> Result<LiquidationQuote<BalanceOf<T>>, DispatchError> {
 		let (debt, jit_preservation) =
 			Self::size_debt(keeper, collateral_id, stable_id, snapshot, jit)?;
 		let plan = plan(collateral_total, debt, snapshot.price, &snapshot.config)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		Ok((plan, jit_preservation))
+		Ok(LiquidationQuote { plan, jit_preservation })
 	}
 
 	// Sizes debt in liquidation priority order: active pool, keeper JIT, pending pool, and
@@ -316,9 +406,10 @@ impl<T: Config> Pallet<T> {
 	}
 
 	// Limits keeper JIT to stablecoin that the keeper can burn. The limit uses residual debt, the
-	// allowance, and reducible balance. The market minimum binds on the keeper's side — the
-	// allowance and the funding — never on the system's residual ask, which the keeper did not
-	// select: a small residual still executes against a minimum-clearing allowance.
+	// allowance, and reducible balance. An allowance or funding shortfall below the market minimum
+	// skips JIT so an optional contribution cannot block liquidation. The minimum never binds on
+	// the system's residual ask, which the keeper did not select: a small residual still executes
+	// against a minimum-clearing allowance and funding.
 	fn size_jit(
 		keeper: &T::AccountId,
 		stable_id: &StableIdOf<T>,
@@ -329,36 +420,33 @@ impl<T: Config> Pallet<T> {
 		if remaining.is_zero() || jit.max_stable.is_zero() {
 			return Ok((Zero::zero(), Preservation::Preserve));
 		}
-		ensure!(jit.max_stable >= config.minimum_jit_contribution, Error::<T>::JitBelowMinimum);
+		if jit.max_stable < config.minimum_jit_contribution {
+			return Ok((Zero::zero(), Preservation::Preserve));
+		}
 		let target = remaining.min(jit.max_stable);
 		let (funded, preservation) =
 			reducible_debit::<T::StableAssets, _>(stable_id.clone(), keeper, target);
 		if funded.is_zero() {
 			return Ok((Zero::zero(), preservation));
 		}
-		if funded < target {
-			// The funding shortfall, not the system ask, sized this contribution.
-			ensure!(funded >= config.minimum_jit_contribution, Error::<T>::JitBelowMinimum);
+		if funded < target && funded < config.minimum_jit_contribution {
+			// The keeper's funding shortfall, not the system ask, sized this dust contribution.
+			return Ok((Zero::zero(), preservation));
 		}
 		Ok((funded, preservation))
 	}
 
-	// Burns stablecoin and pays collateral for an executed JIT trade. The output floor re-checks
-	// at the mutation site what planning already guaranteed; it has no effect when JIT debt is
-	// zero.
-	fn apply_jit(
+	// Burns the keeper's stablecoin for an executed JIT trade. Planning already sized the debt to
+	// what the keeper can burn.
+	fn burn_jit_stable(
 		keeper: &T::AccountId,
 		stable_id: &StableIdOf<T>,
-		jit: JitTerms<BalanceOf<T>>,
 		debt: BalanceOf<T>,
 		preservation: Preservation,
-		collateral_amount: BalanceOf<T>,
-		resolution: &mut CollateralCreditOf<T>,
 	) -> DispatchResult {
 		if debt.is_zero() {
 			return Ok(());
 		}
-		ensure!(collateral_amount >= jit.min_collateral_out, Error::<T>::JitSlippageExceeded);
 		T::StableAssets::burn_from(
 			stable_id.clone(),
 			keeper,
@@ -367,8 +455,6 @@ impl<T: Config> Pallet<T> {
 			Precision::Exact,
 			Fortitude::Polite,
 		)?;
-		let jit_credit = resolution.extract(collateral_amount);
-		Self::resolve_collateral(keeper, jit_credit)?;
 		Ok(())
 	}
 
