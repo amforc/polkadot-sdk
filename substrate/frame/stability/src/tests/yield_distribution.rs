@@ -1,6 +1,7 @@
-//! `distribute_yield` / `compound_yield`: the `G` accumulator end to end.
-//! First tests where realization is non-trivial — yield is earned through
-//! the accumulators rather than seeded by storage writes.
+//! `distribute_yield` and `compound_yield`: the `G` accumulator end to end.
+//!
+//! Yield is earned through the accumulators here rather than written into storage, so these are
+//! the first tests in which realization does real work.
 
 use crate::{mock::*, types::Leg, Error};
 

@@ -1,18 +1,11 @@
-//! Product-sum accounting for the Stability Pool: the pure functions that
-//! interpret the lazy accumulator model.
+//! The arithmetic behind the pool accounting.
 //!
-//! The pool tracks depositor state lazily through three global accumulators:
-//! - `P` (loss product): the surviving fraction of a unit deposited at `P = 1`;
-//! - `S` (collateral sum): collateral gain per unit of `P`-adjusted deposit;
-//! - `G` (yield sum): stablecoin yield per unit of `P`-adjusted deposit.
+//! These functions are pure: they read no storage and they write none. The pallet documentation
+//! describes the model they serve. This module states the formulas and the limits they hold
+//! within.
 //!
-//! `P` only shrinks within an epoch. When it would drop below `p_min`, it is
-//! rescaled by `scale_factor` and the scale index increments; full depletion
-//! starts a new epoch with `P = 1`. Deposits store `(P, S, G, epoch, scale)`
-//! snapshots and realize against the accumulators on their next touch.
-//!
-//! Rounding: user payouts (compounded deposits, collateral gains, yield
-//! gains) round down; the flooring dust stays inside pool-owned totals.
+//! Every payout to a user rounds down. The remainder stays with the pool, so the pool can always
+//! pay what it reports owing.
 
 use crate::types::{Accumulators, DepositSnapshot, PUpdate, PoolPrecision, Realized, SumsWindow};
 use frame::{
@@ -23,39 +16,41 @@ use frame::{
 	traits::Defensive,
 };
 
-/// A single offset may rescale `P` at most this many times before the pallet
-/// rejects it as unresolvable precision loss. Two crossings are only
-/// reachable when `new_total / total < 1e-18`, i.e. with a misconfigured
-/// `minimum_active_pool_balance` on a gigantic pool.
+/// How many times one offset may rescale `P` before the pallet refuses it.
+///
+/// A second crossing needs the pool to shrink by a factor of more than 1e18 in one step. Only a
+/// `minimum_active_pool_balance` far too small for the size of the pool allows that.
 pub const MAX_SCALE_CROSSINGS: u32 = 2;
 
-/// Lower bound on the integer value of `scale_factor`: rescaling by less
-/// buys back too little precision per crossing to be worth a scale index.
+/// The smallest `scale_factor` a market may set. A smaller one recovers too little precision to be
+/// worth a scale boundary.
 pub const SCALE_FACTOR_INT_MIN: u64 = 1_000;
 
-/// Upper bound on the integer value of `scale_factor` (1e10). Keeps the
-/// worst-case [`update_p_after_offset`] numerator inside `u128`:
+/// The largest `scale_factor` a market may set.
+///
+/// It keeps the worst case of [`update_p_after_offset`] inside `u128`:
 /// `P.inner * scale_factor^MAX_SCALE_CROSSINGS <= 1e18 * 1e20 = 1e38`.
 pub const SCALE_FACTOR_INT_MAX: u64 = 10_000_000_000;
 
-/// How many scales past its snapshot a deposit still realizes: the row at `snapshot.scale + k`
-/// contributes with an extra `scale_factor^k` divisor for `k <= SCALE_SPAN`. Anything further is
-/// below one part in `scale_factor^SCALE_SPAN` (>= 1e6) of the deposit and
-/// is deliberately ignored. Distinct from [`MAX_SCALE_CROSSINGS`], which bounds a single
-/// offset; this bounds realization lag.
+/// How many scale boundaries a deposit may lag the pool and still compound.
+///
+/// The row at `snapshot.scale + k` carries an extra `scale_factor^k` divisor. Past this span the
+/// deposit is worth less than one part in 1e6 of what it was, so the pallet drops the remainder
+/// rather than carry an unbounded window. [`MAX_SCALE_CROSSINGS`] bounds one offset; this bounds
+/// how far behind a deposit may fall.
 pub const SCALE_SPAN: u32 = 2;
 
-/// Realize a deposit of `d0` (as of its snapshot) against the current
-/// accumulators, with the epoch/scale rules folded in.
+/// Settles a deposit of `d0`, taken as of its `snapshot`, against the live accumulators.
 ///
-/// - `k <= SCALE_SPAN` scales behind in the same epoch: `compounded = floor(d0 * P / (P0 *
-///   scale_factor^k))`;
-/// - further behind, or an earlier epoch: compounded is zero.
+/// A deposit compounds while it is in the current epoch and at most [`SCALE_SPAN`] boundaries
+/// behind:
 ///
-/// Gains use one uniform formula across all cases:
-/// `floor(d0 * ((sum_snap - sum0) + Σ ahead[k] / scale_factor^(k+1)) / P0)`
-/// — in the same-scale case `sum_snap` is the live row and the look-ahead
-/// rows are zero.
+/// `compounded = floor(d0 * P / (P0 * scale_factor^k))`
+///
+/// Further behind, or in an earlier epoch, nothing is left of the capital. Gains use one formula
+/// in every case, so a deposit keeps what it earned even once its capital is gone:
+///
+/// `gain = floor(d0 * ((sum_snap - sum0) + Σ ahead[k] / scale_factor^(k+1)) / P0)`
 pub fn realize<Balance: FixedPointOperand>(
 	d0: Balance,
 	snapshot: &DepositSnapshot,
@@ -78,9 +73,8 @@ pub fn realize<Balance: FixedPointOperand>(
 	let sf_int = precision.scale_factor();
 
 	let compounded = if snapshot.coords.epoch == current.epoch {
-		// Each scale behind adds a `scale_factor` divisor; `is_valid` bounds
-		// keep the worst-case denominator
-		// `1e18 * (1e10)^SCALE_SPAN = 1e38` inside `u128`.
+		// Each boundary behind adds a `scale_factor` divisor. The `is_valid` bounds keep the worst
+		// case, `1e18 * (1e10)^SCALE_SPAN = 1e38`, inside `u128`.
 		let denominator = match current.scale.checked_sub(snapshot.coords.scale) {
 			Some(behind) if behind <= SCALE_SPAN => sf_int
 				.checked_pow(behind)
@@ -116,9 +110,8 @@ pub fn realize<Balance: FixedPointOperand>(
 	Realized { compounded, collateral_gain, yield_gain }
 }
 
-/// `floor(d * ((sum_snap - sum0) + Σ ahead[k] / sf_int^(k+1)) / p0)`, the
-/// shared gain leg of [`realize`] for both the collateral (`S`) and yield
-/// (`G`) sums.
+/// The gain leg of [`realize`], shared by the collateral sum `S` and the yield sum `G`:
+/// `floor(d * ((sum_snap - sum0) + Σ ahead[k] / sf_int^(k+1)) / p0)`.
 fn gain<Balance: FixedPointOperand>(
 	d: Balance,
 	sum_snap: FixedU128,
@@ -127,14 +120,13 @@ fn gain<Balance: FixedPointOperand>(
 	sf_int: u128,
 	p0: FixedU128,
 ) -> Balance {
-	// `scale_factor` guarantees `1 <= sf_int <= 1e10`, so every divisor
-	// (at most `sf_int^SCALE_SPAN = 1e20`) stays inside `u128`.
+	// `scale_factor` keeps `1 <= sf_int <= 1e10`, so the largest divisor, `sf_int^SCALE_SPAN =
+	// 1e20`, stays inside `u128`.
 	debug_assert!(sf_int >= 1);
 	let mut delta = sum_snap.saturating_sub(sum0);
 	let mut divisor = sf_int;
 	for row in ahead {
-		// The hot same-coordinate path carries zero look-ahead rows; skip
-		// their divisions outright.
+		// A deposit at the live coordinates carries no look-ahead rows. Skip their divisions.
 		if !row.is_zero() {
 			delta = delta.saturating_add(FixedU128::from_inner(row.into_inner() / divisor));
 		}
@@ -146,9 +138,12 @@ fn gain<Balance: FixedPointOperand>(
 	mul_ratio_floor(d, delta.into_inner(), p0.into_inner())
 }
 
-/// Cap an offset so it never leaves `0 < remaining < min_active_pool`.
-/// Full depletion is always allowed; when `total_active < min_active_pool` already, only full
-/// depletion can proceed (partial offsets clamp to zero).
+/// Caps an offset so that it never leaves an active pool below `min_active_pool`.
+///
+/// Such a pool would drive `P` towards zero on the next offset and cost the remaining deposits
+/// their precision. Emptying the pool stays allowed, because that starts a new epoch and returns
+/// `P` to one. A pool already below the floor can therefore only be emptied: a partial offset caps
+/// to zero.
 pub fn clamp_offset_debt<Balance: FixedPointOperand + Ord>(
 	max_debt: Balance,
 	total_active: Balance,
@@ -173,9 +168,10 @@ pub fn clamp_offset_debt<Balance: FixedPointOperand + Ord>(
 	clamped
 }
 
-/// `floor(amount * numerator / denominator)`: the pro-rata share of `amount`
-/// backing `numerator` out of `denominator`. Requires
-/// `numerator <= denominator`; zero when any input is zero.
+/// The share of `amount` that `numerator` out of `denominator` backs:
+/// `floor(amount * numerator / denominator)`.
+///
+/// `numerator` must not exceed `denominator`. Any zero input gives zero.
 #[cfg(test)]
 pub fn pro_rata_floor<Balance: FixedPointOperand>(
 	amount: Balance,
@@ -190,9 +186,11 @@ pub fn pro_rata_floor<Balance: FixedPointOperand>(
 		.defensive_unwrap_or_else(Balance::zero)
 }
 
-/// `floor(distributed * P / total_active)` as a `FixedU128` delta for `S`
-/// (collateral) or `G` (yield). `None` when the pool is
-/// empty or the product overflows (the caller surfaces an arithmetic error).
+/// How much `S` or `G` grows when `distributed` is shared out over `total_active`:
+/// `floor(distributed * P / total_active)`.
+///
+/// Returns `None` when the pool is empty or the product overflows. The caller reports an
+/// arithmetic error.
 pub fn delta_sum<Balance: FixedPointOperand>(
 	distributed: Balance,
 	p: FixedU128,
@@ -203,16 +201,17 @@ pub fn delta_sum<Balance: FixedPointOperand>(
 	pusd_primitives::mul_div_rate_floor(distributed, p, total_active)
 }
 
-/// Shrink `P` after an offset of `offset_debt` against `total_active`,
-/// folding any rescaling into the division itself.
+/// Shrinks `P` for an offset of `offset_debt` against `total_active`, and rescales it if needed.
 ///
-/// Computing `floor(P * new_total / total)` first and multiplying by
-/// `scale_factor` afterwards would discard exactly the precision the rescale
-/// exists to protect (and can floor to zero outright), so each candidate is
-/// the one-shot `floor(P.inner * scale_factor^k * new_total / total)` for
-/// `k = 0..=MAX_SCALE_CROSSINGS`, taking the first result at or above
-/// `p_min`. `None` means the offset must be rejected: more crossings than
-/// supported, an overflowed intermediate, or `offset_debt > total_active`.
+/// The rescale is part of the division, not a step after it. Computing `floor(P * new_total /
+/// total)` first and multiplying by `scale_factor` afterwards would discard exactly the precision
+/// the rescale exists to protect, and can floor `P` to zero outright. Each candidate is therefore
+/// the single expression `floor(P.inner * scale_factor^k * new_total / total)`, for `k` from zero
+/// to [`MAX_SCALE_CROSSINGS`], and the first result at or above `p_min` wins.
+///
+/// Returns `None` when the offset needs more crossings than the pallet supports, when an
+/// intermediate value overflows, or when `offset_debt` exceeds `total_active`. The caller must
+/// reject such an offset.
 pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	p: FixedU128,
 	total_active: Balance,
@@ -242,8 +241,8 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 			total_active,
 		)?;
 		if new_p >= precision.p_min {
-			// A crossing lands `P` in `[p_min, p_min * scale_factor]` and
-			// `is_valid` bounds `p_min * scale_factor <= 1`.
+			// A crossing lands `P` in `[p_min, p_min * scale_factor]`, and `is_valid` keeps
+			// `p_min * scale_factor` at or below one.
 			debug_assert!(new_p <= FixedU128::one());
 			return Some(PUpdate::Updated { new_p, scales_crossed });
 		}
@@ -252,8 +251,8 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	None
 }
 
-/// `floor(value * numerator / denominator)` at `Balance` precision, with the
-/// same defensive fallback used by the public payout paths.
+/// `floor(value * numerator / denominator)` at `Balance` precision, with the defensive fallback
+/// the payout paths share.
 fn mul_ratio_floor<Balance: FixedPointOperand>(
 	value: Balance,
 	numerator: u128,

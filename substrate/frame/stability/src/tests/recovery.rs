@@ -1,12 +1,9 @@
-//! Recovery offsets against a real `FinalRecovery`
-//! vault, priced by the real redemptions pallet — offset pricing and
-//! recovery-redemption pricing share one code path by construction.
+//! Recovery offsets against a real vault in `FinalRecovery`, priced by the real redemptions
+//! pallet, so an offset and a recovery redemption cannot be priced differently.
 //!
-//! Standing figures: the vault holds 1000 collateral against 500 debt (499
-//! borrowed + 1 upfront fee, pinned below). At the parked price 0.52 its
-//! CR is 520/500 = 104%, so the recovery bonus is
-//! min(1.04 - 1 - buffer(0.01), penalty(5%)) = 3%, and cancelling debt D
-//! pays floor(floor(D * 1.03) / 0.52) collateral.
+//! The standing figures: the vault holds 1000 collateral against 500 debt, which is 499 borrowed
+//! plus a 1 upfront fee. At the parked price of 0.52 its CR is 104%, so the recovery bonus is 3%
+//! and cancelling debt `D` pays `floor(floor(D * 1.03) / 0.52)` collateral.
 
 use crate::{mock::*, types::Leg, Error};
 use frame::prelude::ArithmeticError;
@@ -337,8 +334,8 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		assert_eq!(row.pending_deposit.expect("leftover queued").amount, 299);
 		assert_eq!(stable_balance(PUSD, 2), 0);
 
-		// The used portion never entered the pool's stablecoin balance and
-		// never touched the accumulators (invariant 7).
+		// The part spent on the recovery never entered the pool balance and never touched
+		// the accumulators.
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 400);
 		assert_eq!(state.total_pending_deposits, 299);

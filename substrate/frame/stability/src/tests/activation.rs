@@ -1,6 +1,8 @@
-//! Entry-delay maturity: a matured pending deposit folds into the active pool
-//! on the next touch of its row, with no owner-gated step. The permissionless
-//! poke is the completion path when the owner stays away.
+//! What happens when the entry delay runs out.
+//!
+//! A matured pending deposit joins the active pool on the next write to its row. The owner does
+//! not have to be the one who writes it, and the permissionless poke is what completes the move
+//! when the owner stays away.
 
 use crate::mock::*;
 

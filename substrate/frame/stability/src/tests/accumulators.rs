@@ -1,8 +1,11 @@
-//! Focused global-accumulator contracts: offsets compound `P` and add to
-//! `S`, while yield adds to `G` without changing the liquidation side; and
-//! the pending pair resets on depletion, not merely on an empty queue.
-//! Epoch/scale transitions and depositor snapshots are already covered by
-//! `epoch_scale.rs` and `claimable_accrual.rs`.
+//! What each accumulator responds to.
+//!
+//! An offset shrinks `P` and adds to `S`. Yield adds to `G` and leaves the loss side alone. The
+//! pending pair resets when an offset empties the pending stock, and not merely when the last
+//! pending deposit matures.
+//!
+//! `epoch_scale` covers the epoch and scale transitions, and `claimable_accrual` covers the
+//! depositor snapshots.
 
 use crate::{
 	mock::*,
@@ -64,10 +67,9 @@ fn offsets_move_p_and_s_yield_moves_g() {
 	});
 }
 
-/// The pending pair (`P_pending`, `S_pending`) resets only when an offset
-/// depletes the pending stock. Draining it any other way — every row
-/// maturing into the active pool — leaves the accumulators where they stand,
-/// which is what makes a later deposit's snapshot meaningful.
+/// The pending pair resets only when an offset empties the pending stock. Emptying it any other
+/// way, such as every row maturing, leaves the accumulators where they stand, which is what makes
+/// the snapshot of a later deposit mean anything.
 #[test]
 fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
 	build_and_execute(|| {
