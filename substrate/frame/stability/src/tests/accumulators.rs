@@ -4,14 +4,17 @@
 //! Epoch/scale transitions and depositor snapshots are already covered by
 //! `epoch_scale.rs` and `claimable_accrual.rs`.
 
-use crate::{mock::*, types::PoolSums};
+use crate::{
+	mock::*,
+	types::{Leg, PoolSums},
+};
 
 fn sums_at(epoch: u32, scale: u32) -> PoolSums {
-	crate::PoolSumsStore::<Test>::get((DOT, PUSD, epoch, scale))
+	crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, epoch, scale))
 }
 
 fn pending_sums_at(epoch: u32, scale: u32) -> PoolSums {
-	crate::PendingSumsStore::<Test>::get((DOT, PUSD, epoch, scale))
+	crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Pending, epoch, scale))
 }
 
 /// Queue a pending (unactivated) deposit for `who`.

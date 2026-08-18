@@ -1,9 +1,12 @@
 //! pUSD primitive trait implementations: the surfaces sibling pallets drive
 //! on the pool.
 
-use crate::pallet::{
-	BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Pallet, Pools, StabilityPoolOf,
-	StableCreditOf, StableIdOf,
+use crate::{
+	pallet::{
+		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Pallet, Pools, StabilityPoolOf,
+		StableCreditOf, StableIdOf,
+	},
+	types::Leg,
 };
 use frame::{deps::frame_support::require_transactional, prelude::*, traits::tokens::Preservation};
 use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, StabilityPoolOffset};
@@ -84,8 +87,15 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 			return BalanceOf::<T>::zero();
 		};
 		let pool_account = Self::pool_account(collateral_id, stable_id);
-		Self::size_active_offset(&pool, stable_id, &pool_account, max_debt, BalanceOf::<T>::zero())
-			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+		Self::size_offset(
+			&pool,
+			stable_id,
+			&pool_account,
+			Leg::Active,
+			max_debt,
+			BalanceOf::<T>::zero(),
+		)
+		.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
 	}
 
 	fn reducible_pending(
@@ -98,7 +108,7 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 			return BalanceOf::<T>::zero();
 		};
 		let pool_account = Self::pool_account(collateral_id, stable_id);
-		Self::size_pending_offset(&pool, stable_id, &pool_account, max_debt, active_debt)
+		Self::size_offset(&pool, stable_id, &pool_account, Leg::Pending, max_debt, active_debt)
 			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
 	}
 }
@@ -135,10 +145,11 @@ impl<T: Config>
 		let active = if debt.active.is_zero() {
 			None
 		} else {
-			let sized = Self::size_active_offset(
+			let sized = Self::size_offset(
 				&pool,
 				stable_id,
 				&pool_account,
+				Leg::Active,
 				debt.active,
 				BalanceOf::<T>::zero(),
 			);
@@ -147,10 +158,11 @@ impl<T: Config>
 		let pending = if debt.pending.is_zero() {
 			None
 		} else {
-			let sized = Self::size_pending_offset(
+			let sized = Self::size_offset(
 				&pool,
 				stable_id,
 				&pool_account,
+				Leg::Pending,
 				debt.pending,
 				debt.active,
 			);
@@ -161,20 +173,22 @@ impl<T: Config>
 		// against the combined limit and holds only once the active tranche
 		// has left the pool account.
 		if let Some(reservation) = active {
-			Self::settle_active_offset(
+			Self::settle_offset(
 				collateral_id,
 				stable_id,
 				&pool_account,
+				Leg::Active,
 				&mut pool,
 				reservation,
 				collateral.active,
 			)?;
 		}
 		if let Some(reservation) = pending {
-			Self::settle_pending_offset(
+			Self::settle_offset(
 				collateral_id,
 				stable_id,
 				&pool_account,
+				Leg::Pending,
 				&mut pool,
 				reservation,
 				collateral.pending,

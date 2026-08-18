@@ -1,7 +1,7 @@
 //! `offset_liquidation`: clamping, proportional `S` gains, `P` compounding,
 //! and the interplay with yield (invariant 12).
 
-use crate::{mock::*, Error};
+use crate::{mock::*, types::Leg, Error};
 use frame::testing_prelude::hypothetically;
 
 #[test]
@@ -24,7 +24,7 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 		assert_eq!(state.coords.p, FixedU128::from_rational(1, 2));
 		assert_eq!(state.total_collateral_gains_unclaimed, 400);
 		// delta_S = 400 * (1/1000) = 0.4.
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, 0u32, 0u32));
+		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
 		assert_eq!(sums.s_collateral, FixedU128::from_inner(400_000_000_000_000_000));
 
 		// 500 of the pool's 1000 stablecoin was burned.
@@ -270,11 +270,13 @@ fn combined_offset_settles_active_then_pending() {
 			assert_eq!(stable_balance(USDX, pool_account), 0);
 			assert_eq!(collateral_balance(DOT, pool_account), 400);
 			assert_eq!(
-				crate::PoolSumsStore::<Test>::get((DOT, USDX, 0u32, 0u32)).s_collateral,
+				crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Active, 0u32, 0u32))
+					.s_collateral,
 				FixedU128::from_rational(1, 250)
 			);
 			assert_eq!(
-				crate::PendingSumsStore::<Test>::get((DOT, USDX, 0u32, 0u32)).s_collateral,
+				crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Pending, 0u32, 0u32))
+					.s_collateral,
 				FixedU128::from_rational(1, 250)
 			);
 			System::assert_has_event(

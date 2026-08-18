@@ -1,7 +1,10 @@
 //! `try-runtime` invariant checks: the accounting identities of SPEC.md §12
 //! that must hold after every operation.
 
-use crate::pallet::{BalanceOf, Config, Deposits, Pallet, PendingSumsStore, PoolSumsStore, Pools};
+use crate::{
+	pallet::{BalanceOf, Config, Deposits, Pallet, PoolSumsStore, Pools},
+	types::Leg,
+};
 use frame::{
 	arithmetic::{FixedU128, One, Saturating, Zero},
 	deps::frame_support::traits::fungibles::Inspect as _,
@@ -15,36 +18,32 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if !config.is_valid() {
 			return Err("stored stability-pool config fails `is_valid`".into());
 		}
-		for coords in [&state.coords, &state.pending_coords] {
+		for leg in Leg::ALL {
+			let coords = state.coords(leg);
 			if coords.p > FixedU128::one() {
 				return Err("`P` above one".into());
 			}
 			if coords.p < config.precision.p_min {
 				return Err("`P` below the configured precision floor".into());
 			}
+			if !PoolSumsStore::<T>::contains_key((
+				&collateral_id,
+				&stable_id,
+				leg,
+				coords.epoch,
+				coords.scale,
+			)) {
+				return Err("current `(epoch, scale)` has no sums row".into());
+			}
 		}
-		if !PoolSumsStore::<T>::contains_key((
-			&collateral_id,
-			&stable_id,
-			state.coords.epoch,
-			state.coords.scale,
+		// Pending deposits earn no yield, so the pending leg's `G` is
+		// structurally zero — sharing the row type with the active leg must
+		// never smuggle a yield sum in.
+		for (_, sums) in PoolSumsStore::<T>::iter_prefix((
+			collateral_id.clone(),
+			stable_id.clone(),
+			Leg::Pending,
 		)) {
-			return Err("current `(epoch, scale)` has no sums row".into());
-		}
-		if !PendingSumsStore::<T>::contains_key((
-			&collateral_id,
-			&stable_id,
-			state.pending_coords.epoch,
-			state.pending_coords.scale,
-		)) {
-			return Err("current pending `(epoch, scale)` has no sums row".into());
-		}
-		// Pending deposits earn no yield, so the pending domain's `G` leg is
-		// structurally zero — reusing the active-side row type must never
-		// smuggle a yield sum in.
-		for (_, sums) in
-			PendingSumsStore::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
-		{
 			if !sums.g_yield.is_zero() {
 				return Err("pending sums row carries a nonzero `G`".into());
 			}
@@ -76,8 +75,12 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		let mut compounded_sum = BalanceOf::<T>::zero();
 		for (_, deposit) in Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone())) {
 			if let Some(pending) = &deposit.pending_deposit {
-				let window =
-					Pallet::<T>::pending_sums_window(&collateral_id, &stable_id, &pending.snapshot);
+				let window = Pallet::<T>::sums_window(
+					&collateral_id,
+					&stable_id,
+					Leg::Pending,
+					&pending.snapshot,
+				);
 				let realized = crate::math::realize(
 					pending.amount,
 					&pending.snapshot,
@@ -91,7 +94,12 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				pending_sum = pending_sum.saturating_add(realized.compounded);
 			}
 
-			let window = Pallet::<T>::sums_window(&collateral_id, &stable_id, &deposit.snapshot);
+			let window = Pallet::<T>::sums_window(
+				&collateral_id,
+				&stable_id,
+				Leg::Active,
+				&deposit.snapshot,
+			);
 			let realized = crate::math::realize(
 				deposit.active_deposit,
 				&deposit.snapshot,
@@ -126,6 +134,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if !PoolSumsStore::<T>::contains_key((
 			&collateral_id,
 			&stable_id,
+			Leg::Active,
 			deposit.snapshot.coords.epoch,
 			deposit.snapshot.coords.scale,
 		)) {
@@ -143,9 +152,10 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				return Err("pending snapshot scale ahead of the pending accumulators".into());
 			}
 		}
-		if !PendingSumsStore::<T>::contains_key((
+		if !PoolSumsStore::<T>::contains_key((
 			&collateral_id,
 			&stable_id,
+			Leg::Pending,
 			pending.snapshot.coords.epoch,
 			pending.snapshot.coords.scale,
 		)) {
