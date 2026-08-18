@@ -208,7 +208,7 @@ fn pending_offset_clamps_to_the_minimum_pool_floor() {
 		seed_pending(1, 200);
 
 		// Burning 150 of 200 would leave 50 < the 100
-		// `minimum_active_pool_balance` floor (the same §6.5 rule as the
+		// `minimum_active_pool_balance` floor (the same rule as the
 		// active side — it is what sizes a pool against `P`-precision
 		// exhaustion, and the pending `P` runs on the same precision
 		// parameters): the offset clamps to 100 and the collateral follows

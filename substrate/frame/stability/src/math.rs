@@ -1,8 +1,7 @@
 //! Product-sum accounting for the Stability Pool: the pure functions that
 //! interpret the lazy accumulator model.
 //!
-//! The pool tracks depositor state lazily through three global accumulators
-//! (SPEC.md §6):
+//! The pool tracks depositor state lazily through three global accumulators:
 //! - `P` (loss product): the surviving fraction of a unit deposited at `P = 1`;
 //! - `S` (collateral sum): collateral gain per unit of `P`-adjusted deposit;
 //! - `G` (yield sum): stablecoin yield per unit of `P`-adjusted deposit.
@@ -47,7 +46,7 @@ pub const SCALE_FACTOR_INT_MAX: u64 = 10_000_000_000;
 pub const SCALE_SPAN: u32 = 2;
 
 /// Realize a deposit of `d0` (as of its snapshot) against the current
-/// accumulators: SPEC.md §6.2 with the §6.4 epoch/scale rules folded in.
+/// accumulators, with the epoch/scale rules folded in.
 ///
 /// - `k <= SCALE_SPAN` scales behind in the same epoch: `compounded = floor(d0 * P / (P0 *
 ///   scale_factor^k))`;
@@ -147,9 +146,8 @@ fn gain<Balance: FixedPointOperand>(
 	mul_ratio_floor(d, delta.into_inner(), p0.into_inner())
 }
 
-/// SPEC.md §7.1: cap an offset so it never leaves
-/// `0 < remaining < min_active_pool` (§6.5). Full depletion is always
-/// allowed; when `total_active < min_active_pool` already, only full
+/// Cap an offset so it never leaves `0 < remaining < min_active_pool`.
+/// Full depletion is always allowed; when `total_active < min_active_pool` already, only full
 /// depletion can proceed (partial offsets clamp to zero).
 pub fn clamp_offset_debt<Balance: FixedPointOperand + Ord>(
 	max_debt: Balance,
@@ -193,7 +191,7 @@ pub fn pro_rata_floor<Balance: FixedPointOperand>(
 }
 
 /// `floor(distributed * P / total_active)` as a `FixedU128` delta for `S`
-/// (collateral) or `G` (yield) per SPEC.md §6.3. `None` when the pool is
+/// (collateral) or `G` (yield). `None` when the pool is
 /// empty or the product overflows (the caller surfaces an arithmetic error).
 pub fn delta_sum<Balance: FixedPointOperand>(
 	distributed: Balance,
@@ -206,7 +204,7 @@ pub fn delta_sum<Balance: FixedPointOperand>(
 }
 
 /// Shrink `P` after an offset of `offset_debt` against `total_active`,
-/// folding any rescaling into the division itself (SPEC.md §6.4).
+/// folding any rescaling into the division itself.
 ///
 /// Computing `floor(P * new_total / total)` first and multiplying by
 /// `scale_factor` afterwards would discard exactly the precision the rescale
