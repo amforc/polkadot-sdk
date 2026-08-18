@@ -11,18 +11,8 @@ use crate::math;
 
 /// Live product-sum coordinates of a pool. Embedded verbatim in every encoded
 /// [`DepositSnapshot`] and [`PoolState`], hence the codec derives.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct Accumulators {
 	pub p: FixedU128,
 	pub epoch: u32,
@@ -37,20 +27,28 @@ impl Accumulators {
 	}
 }
 
+/// Which accumulator pair — and which sums-store domain — a pool operation runs
+/// on. Both legs share one product-sum implementation; the leg only selects the
+/// coordinates, the total, and the sums rows it reads and writes.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
+pub enum Leg {
+	/// The active pool: `P`/`S`/`G`, absorbing liquidation and recovery
+	/// offsets and receiving branch yield.
+	Active,
+	/// Pending deposits waiting out the entry delay: a `P`/`S` pair of their
+	/// own for the §6.8 backstop. Their `G` is structurally zero — pending
+	/// deposits earn no yield.
+	Pending,
+}
+
+impl Leg {
+	/// Both legs, in the order the pool seeds and checks them.
+	pub const ALL: [Self; 2] = [Self::Active, Self::Pending];
+}
+
 /// `S` and `G` for one `(epoch, scale)` coordinate (SPEC.md §5.2).
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-	Default,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, Default)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct PoolSums {
 	pub s_collateral: FixedU128,
 	pub g_yield: FixedU128,
@@ -59,18 +57,7 @@ pub struct PoolSums {
 /// A deposit's stored snapshot at its last realization: the accumulator
 /// coordinates ([`Accumulators`]) plus the `(epoch, scale)` sums row they point
 /// at. Embedded in every [`Deposit`] storage row, hence the codec derives.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct DepositSnapshot {
 	pub coords: Accumulators,
 	pub sums: PoolSums,
@@ -87,7 +74,6 @@ impl DepositSnapshot {
 /// Gain sums a deposit realizes against: the row at its snapshot
 /// `(epoch, scale)` plus the [`SCALE_SPAN`](math::SCALE_SPAN) rows after it
 /// (zero when absent).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SumsWindow {
 	pub snap: PoolSums,
 	pub ahead: [PoolSums; math::SCALE_SPAN as usize],
@@ -98,16 +84,7 @@ pub struct SumsWindow {
 /// was live when their scale was crossed, so changing it would misprice
 /// every deposit left behind a scale boundary.
 #[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
+	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct PoolPrecision {
 	pub p_min: FixedU128,
@@ -148,7 +125,7 @@ impl PoolPrecision {
 }
 
 /// Outcome of realizing a deposit against the current accumulators.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct Realized<Balance> {
 	pub compounded: Balance,
 	pub collateral_gain: Balance,
@@ -156,7 +133,7 @@ pub struct Realized<Balance> {
 }
 
 /// Outcome of shrinking `P` after an active-pool offset.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub enum PUpdate {
 	Updated { new_p: FixedU128, scales_crossed: u32 },
 	Depleted,
@@ -168,9 +145,7 @@ pub enum PUpdate {
 /// may be stale relative to the live `P`. Every user operation realizes
 /// losses and gains through the snapshot first, then applies its change and
 /// resets it.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct Deposit<Balance> {
 	pub active_deposit: Balance,
 
@@ -216,9 +191,7 @@ impl<Balance: Zero> Deposit<Balance> {
 /// oldest-first FIFO). Losses and the direct collateral gains are tracked
 /// lazily through the pool's pending `P`/`S` accumulator pair, exactly like
 /// active-side offsets.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct PendingDeposit<Balance> {
 	/// Amount as of the last realization against `snapshot`; may be stale
 	/// relative to the live pending accumulators.
@@ -235,9 +208,8 @@ pub struct PendingDeposit<Balance> {
 /// Mode — a Normal-Mode `request_withdraw` forwards to the direct
 /// withdrawal — and ignored by Normal-Mode withdrawals should the branch
 /// recover before execution.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+#[cfg_attr(test, derive(Clone, PartialEq, Debug))]
 pub struct WithdrawalRequest<Balance> {
 	pub amount: Balance,
 	pub executable_at: Millis,
@@ -251,9 +223,8 @@ pub struct WithdrawalRequest<Balance> {
 ///   `pending_coords` (a second `P`/`S` accumulator pair) instead of a queue;
 /// - no `*_rounding_surplus` fields — every flooring remainder stays inside the unclaimed totals,
 ///   so the fields would be identically zero. They arrive with their first writer.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct PoolState<Balance> {
 	pub total_active_deposits: Balance,
 	pub total_pending_deposits: Balance,
@@ -264,16 +235,42 @@ pub struct PoolState<Balance> {
 }
 
 impl<Balance> PoolState<Balance> {
-	/// The deposit snapshot at the pool's current coordinates; `sums` is the
-	/// live `(epoch, scale)` sums row.
-	pub fn snapshot(&self, sums: &PoolSums) -> DepositSnapshot {
-		DepositSnapshot { coords: self.coords, sums: *sums }
+	/// The live accumulator coordinates of `leg`.
+	pub fn coords(&self, leg: Leg) -> &Accumulators {
+		match leg {
+			Leg::Active => &self.coords,
+			Leg::Pending => &self.pending_coords,
+		}
 	}
 
-	/// The pending-deposit snapshot at the pending accumulators' current
-	/// coordinates; `sums` is the live pending `(epoch, scale)` sums row.
-	pub fn pending_snapshot(&self, sums: &PoolSums) -> DepositSnapshot {
-		DepositSnapshot { coords: self.pending_coords, sums: *sums }
+	pub fn coords_mut(&mut self, leg: Leg) -> &mut Accumulators {
+		match leg {
+			Leg::Active => &mut self.coords,
+			Leg::Pending => &mut self.pending_coords,
+		}
+	}
+
+	pub fn total_mut(&mut self, leg: Leg) -> &mut Balance {
+		match leg {
+			Leg::Active => &mut self.total_active_deposits,
+			Leg::Pending => &mut self.total_pending_deposits,
+		}
+	}
+
+	/// The deposit snapshot at `leg`'s current coordinates; `sums` is that
+	/// leg's live `(epoch, scale)` sums row.
+	pub fn snapshot(&self, leg: Leg, sums: &PoolSums) -> DepositSnapshot {
+		DepositSnapshot { coords: *self.coords(leg), sums: *sums }
+	}
+}
+
+impl<Balance: Copy> PoolState<Balance> {
+	/// The aggregate deposit total of `leg`.
+	pub fn total(&self, leg: Leg) -> Balance {
+		match leg {
+			Leg::Active => self.total_active_deposits,
+			Leg::Pending => self.total_pending_deposits,
+		}
 	}
 }
 
@@ -335,9 +332,7 @@ impl<Balance: Zero> StabilityPoolConfig<Balance> {
 
 /// One registered market's pool in one record: created whole at branch
 /// registration, torn down whole at deregistration.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct StabilityPool<Balance> {
 	/// Governance parameters, moved only through `set_stability_pool_config`.
 	pub config: StabilityPoolConfig<Balance>,
@@ -354,18 +349,7 @@ impl<Balance: Zero> StabilityPool<Balance> {
 }
 
 /// Which capital funded a recovery offset (SPEC.md §10).
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub enum RecoveryOffsetSource {
 	ActivePool,
 	IncomingDeposit,

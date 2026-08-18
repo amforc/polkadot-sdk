@@ -3,11 +3,11 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, DepositOf, Deposits, Error, Event,
-		Pallet, PendingSumsStore, PoolStateOf, PoolSumsStore, Pools, StabilityPoolConfigOf,
-		StabilityPoolOf, StableCreditOf, StableIdOf,
+		Pallet, PoolStateOf, PoolSumsStore, Pools, StabilityPoolConfigOf, StabilityPoolOf,
+		StableCreditOf, StableIdOf,
 	},
 	types::{
-		Accumulators, Deposit, DepositSnapshot, PUpdate, PendingDeposit, PoolSums,
+		Accumulators, Deposit, DepositSnapshot, Leg, PUpdate, PendingDeposit, PoolSums, Realized,
 		RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
 	},
 };
@@ -33,9 +33,9 @@ pub(crate) enum ClaimKind {
 }
 
 /// The fully-materialized post-state of a product-sum offset (SPEC.md §6.4 /
-/// §7.1 / §7.2) on either accumulator domain: all fallible math runs in
-/// [`Pallet::plan_active_offset`] / [`Pallet::plan_pending_offset`] before any
-/// value moves; the matching commit then only writes.
+/// §7.1 / §7.2) on either leg: all fallible math runs in
+/// [`Pallet::plan_offset`] before any value moves; [`Pallet::commit_offset`]
+/// then only writes.
 struct OffsetPlan<Balance> {
 	new_sums: PoolSums,
 	new_unclaimed: Balance,
@@ -142,15 +142,16 @@ impl<T: Config> Pallet<T> {
 					pending.activatable_at = activatable_at;
 				},
 				None => {
-					let current = Self::pending_sums_at(
+					let current = Self::sums_at(
 						&collateral_id,
 						&stable_id,
+						Leg::Pending,
 						&pool.state.pending_coords,
 					);
 					deposit.pending_deposit = Some(PendingDeposit {
 						amount: pending_amount,
 						activatable_at,
-						snapshot: pool.state.pending_snapshot(&current),
+						snapshot: pool.state.snapshot(Leg::Pending, &current),
 					});
 				},
 			}
@@ -497,8 +498,8 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// The debt an active-pool offset of at most `max_debt` may burn: the
-	/// pool-depth and `minimum_active_pool_balance` clamp (§6.5), the pool
+	/// The debt an offset of at most `max_debt` on `leg` may burn: the
+	/// leg-depth and `minimum_active_pool_balance` clamp (§6.5), the pool
 	/// account's minimum-balance dead zone (with `reserved` set aside for
 	/// another stage of the same transaction), and the `P`-precision guard
 	/// (§6.4). The guard matters on the capacity side too — without it a
@@ -507,18 +508,21 @@ impl<T: Config> Pallet<T> {
 	/// with a non-zero `reserved` it is computed against the combined limit and
 	/// stays valid only if the reserved tranche is debited from the account
 	/// first (the exact offset call settles active before pending).
-	pub(crate) fn size_active_offset(
+	///
+	/// The `minimum_active_pool_balance` floor applies to the pending leg
+	/// too — it is what sizes a leg against `P`-precision exhaustion, and the
+	/// pending `P` runs on the same precision parameters.
+	pub(crate) fn size_offset(
 		pool: &StabilityPoolOf<T>,
 		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
+		leg: Leg,
 		max_debt: BalanceOf<T>,
 		reserved: BalanceOf<T>,
 	) -> Option<(BalanceOf<T>, Preservation)> {
-		let accounting_cap = math::clamp_offset_debt(
-			max_debt,
-			pool.state.total_active_deposits,
-			pool.config.minimum_active_pool_balance,
-		);
+		let total = pool.state.total(leg);
+		let accounting_cap =
+			math::clamp_offset_debt(max_debt, total, pool.config.minimum_active_pool_balance);
 		if accounting_cap.is_zero() {
 			return None;
 		}
@@ -533,52 +537,7 @@ impl<T: Config> Pallet<T> {
 		if debt.is_zero() {
 			return None;
 		}
-		math::update_p_after_offset(
-			pool.state.coords.p,
-			pool.state.total_active_deposits,
-			debt,
-			&pool.config.precision,
-		)?;
-		Some((debt, preservation))
-	}
-
-	/// Pending-domain twin of [`Pallet::size_active_offset`]: the debt a §6.8
-	/// backstop offset of at most `max_debt` may burn. The
-	/// `minimum_active_pool_balance` floor applies here too — it is what sizes
-	/// the pool against `P`-precision exhaustion, and the pending `P` runs on
-	/// the same precision parameters.
-	pub(crate) fn size_pending_offset(
-		pool: &StabilityPoolOf<T>,
-		stable_id: &StableIdOf<T>,
-		pool_account: &T::AccountId,
-		max_debt: BalanceOf<T>,
-		reserved: BalanceOf<T>,
-	) -> Option<(BalanceOf<T>, Preservation)> {
-		let accounting_cap = math::clamp_offset_debt(
-			max_debt,
-			pool.state.total_pending_deposits,
-			pool.config.minimum_active_pool_balance,
-		);
-		if accounting_cap.is_zero() {
-			return None;
-		}
-		// The burnable amount caps the accounting: a minimum-balance dead
-		// zone rounds the offset down instead of dusting the pool account.
-		let (headroom, preservation) = reducible_debit::<T::StableAssets, _>(
-			stable_id.clone(),
-			pool_account,
-			accounting_cap.saturating_add(reserved),
-		);
-		let debt = headroom.saturating_sub(reserved).min(accounting_cap);
-		if debt.is_zero() {
-			return None;
-		}
-		math::update_p_after_offset(
-			pool.state.pending_coords.p,
-			pool.state.total_pending_deposits,
-			debt,
-			&pool.config.precision,
-		)?;
+		math::update_p_after_offset(pool.state.coords(leg).p, total, debt, &pool.config.precision)?;
 		Some((debt, preservation))
 	}
 
@@ -615,24 +574,26 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// SPEC.md §7.1: settle one previously sized active-pool reservation
-	/// exactly — burn the reserved active-pool stablecoin against liquidation
-	/// debt and resolve the assigned collateral credit into the pool account,
-	/// distributing it to active depositors through `S`. The production
-	/// liquidation contract: the collateral is consumed in full and any
-	/// disagreement with the reservation aborts the transaction.
-	pub(crate) fn settle_active_offset(
+	/// Settle one previously sized reservation on `leg`
+	/// exactly — burn the reserved stablecoin against liquidation debt and
+	/// resolve the assigned collateral credit into the pool account,
+	/// distributing it to that leg's depositors through its `S`. The
+	/// production liquidation contract: the collateral is consumed in full and
+	/// any disagreement with the reservation aborts the transaction.
+	pub(crate) fn settle_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
+		leg: Leg,
 		pool: &mut StabilityPoolOf<T>,
 		reservation: OffsetReservation<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
 	) -> DispatchResult {
 		ensure!(collateral.asset() == *collateral_id, Error::<T>::OffsetSettlementFailed);
-		let plan = Self::plan_active_offset(
+		let plan = Self::plan_offset(
 			collateral_id,
 			stable_id,
+			leg,
 			pool,
 			reservation.debt,
 			collateral.peek(),
@@ -644,56 +605,25 @@ impl<T: Config> Pallet<T> {
 			reservation,
 			collateral,
 		)?;
-		Self::commit_active_offset(collateral_id, stable_id, &mut pool.state, plan);
-		Self::deposit_event(Event::PoolOffsetApplied {
-			collateral_id: collateral_id.clone(),
-			stable_id: stable_id.clone(),
-			debt_burned: reservation.debt,
-			collateral_gain: collateral_amount,
-			epoch: pool.state.coords.epoch,
-			scale: pool.state.coords.scale,
-		});
-		Ok(())
-	}
-
-	/// SPEC.md §7.2 / §6.8: the last-resort backstop — settle one previously
-	/// sized pending-deposit reservation exactly, burning pending-deposit
-	/// stablecoin against liquidation debt that survived the active pool and
-	/// JIT liquidity. Takes from ALL pending deposits pro-rata (design
-	/// decision 2026-07-29, replacing the spec sketch's oldest-first FIFO) on
-	/// the pending accumulator pair; the active `P`/`S`/`G` are never touched
-	/// (invariant 11).
-	pub(crate) fn settle_pending_offset(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		pool_account: &T::AccountId,
-		pool: &mut StabilityPoolOf<T>,
-		reservation: OffsetReservation<BalanceOf<T>>,
-		collateral: CollateralCreditOf<T>,
-	) -> DispatchResult {
-		ensure!(collateral.asset() == *collateral_id, Error::<T>::OffsetSettlementFailed);
-		let plan = Self::plan_pending_offset(
-			collateral_id,
-			stable_id,
-			pool,
-			reservation.debt,
-			collateral.peek(),
-		)?;
-		let collateral_amount = Self::settle_reservation_exact(
-			collateral_id,
-			stable_id,
-			pool_account,
-			reservation,
-			collateral,
-		)?;
-		Self::commit_pending_offset(collateral_id, stable_id, &mut pool.state, plan);
-		Self::deposit_event(Event::PendingDepositOffsetApplied {
-			collateral_id: collateral_id.clone(),
-			stable_id: stable_id.clone(),
-			debt_burned: reservation.debt,
-			collateral_gain: collateral_amount,
-			epoch: pool.state.pending_coords.epoch,
-			scale: pool.state.pending_coords.scale,
+		Self::commit_offset(collateral_id, stable_id, leg, &mut pool.state, plan);
+		let coords = pool.state.coords(leg);
+		Self::deposit_event(match leg {
+			Leg::Active => Event::PoolOffsetApplied {
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
+				debt_burned: reservation.debt,
+				collateral_gain: collateral_amount,
+				epoch: coords.epoch,
+				scale: coords.scale,
+			},
+			Leg::Pending => Event::PendingDepositOffsetApplied {
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
+				debt_burned: reservation.debt,
+				collateral_gain: collateral_amount,
+				epoch: coords.epoch,
+				scale: coords.scale,
+			},
 		});
 		Ok(())
 	}
@@ -728,74 +658,35 @@ impl<T: Config> Pallet<T> {
 		Ok(collateral_amount)
 	}
 
-	/// The shared active-pool accumulator math for ordinary liquidation and
-	/// recovery offsets: `delta_S` from the
-	/// pre-offset totals FIRST, then the `P` shrink. Read-only: the
-	/// caller commits the plan once its value movement is through.
-	fn plan_active_offset(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		pool: &StabilityPoolOf<T>,
-		debt: BalanceOf<T>,
-		collateral: BalanceOf<T>,
-	) -> Result<OffsetPlan<BalanceOf<T>>, DispatchError> {
-		let state = &pool.state;
-		let sums = Self::sums_at(collateral_id, stable_id, &state.coords);
-		Self::plan_offset(
-			&state.coords,
-			state.total_active_deposits,
-			sums,
-			state.total_collateral_gains_unclaimed,
-			debt,
-			collateral,
-			&pool.config,
-		)
-	}
-
-	/// Pending-domain twin of [`Pallet::plan_active_offset`], for the §6.8
-	/// pro-rata backstop: same math on `pending_coords`,
-	/// `total_pending_deposits`, and the pending sums store.
-	fn plan_pending_offset(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		pool: &StabilityPoolOf<T>,
-		debt: BalanceOf<T>,
-		collateral: BalanceOf<T>,
-	) -> Result<OffsetPlan<BalanceOf<T>>, DispatchError> {
-		let state = &pool.state;
-		let sums = Self::pending_sums_at(collateral_id, stable_id, &state.pending_coords);
-		Self::plan_offset(
-			&state.pending_coords,
-			state.total_pending_deposits,
-			sums,
-			state.total_collateral_gains_unclaimed,
-			debt,
-			collateral,
-			&pool.config,
-		)
-	}
-
-	/// The domain-agnostic accumulator update behind both plans: `delta_S`
-	/// against the pre-offset `total` FIRST, then the `P` shrink.
+	/// The accumulator math shared by liquidation offsets on either leg and
+	/// by recovery offsets: `delta_S` from the pre-offset total FIRST, then
+	/// the `P` shrink. Read-only: the caller commits the plan once its value
+	/// movement is through.
 	fn plan_offset(
-		coords: &Accumulators,
-		total: BalanceOf<T>,
-		mut sums: PoolSums,
-		unclaimed: BalanceOf<T>,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		leg: Leg,
+		pool: &StabilityPoolOf<T>,
 		debt: BalanceOf<T>,
 		collateral: BalanceOf<T>,
-		config: &StabilityPoolConfigOf<T>,
 	) -> Result<OffsetPlan<BalanceOf<T>>, DispatchError> {
+		let state = &pool.state;
+		let coords = state.coords(leg);
+		let total = state.total(leg);
 		debug_assert!(!debt.is_zero());
 		debug_assert!(debt <= total);
 
+		let mut sums = Self::sums_at(collateral_id, stable_id, leg, coords);
 		let delta_s =
 			math::delta_sum(collateral, coords.p, total).ok_or(ArithmeticError::Overflow)?;
 		sums.s_collateral =
 			sums.s_collateral.checked_add(&delta_s).ok_or(ArithmeticError::Overflow)?;
-		let new_unclaimed = unclaimed.checked_add(&collateral).ok_or(ArithmeticError::Overflow)?;
+		let new_unclaimed = state
+			.total_collateral_gains_unclaimed
+			.checked_add(&collateral)
+			.ok_or(ArithmeticError::Overflow)?;
 
-		let update = math::update_p_after_offset(coords.p, total, debt, &config.precision)
+		let update = math::update_p_after_offset(coords.p, total, debt, &pool.config.precision)
 			.ok_or(Error::<T>::UnsupportedOffsetPrecision)?;
 		let (new_coords, new_total) = match update {
 			PUpdate::Depleted => (
@@ -821,66 +712,37 @@ impl<T: Config> Pallet<T> {
 		Ok(OffsetPlan { new_sums: sums, new_unclaimed, new_total, new_coords })
 	}
 
-	/// Write an [`OffsetPlan`] into the active sums store and `state`,
-	/// seeding a zero sums row for every new coordinate. Infallible: all
-	/// arithmetic already ran in [`Pallet::plan_active_offset`].
-	fn commit_active_offset(
+	/// Write an [`OffsetPlan`] into `leg`'s sums rows and `state`, seeding a
+	/// zero sums row for every new coordinate. Infallible: all arithmetic
+	/// already ran in [`Pallet::plan_offset`].
+	fn commit_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		leg: Leg,
 		state: &mut PoolStateOf<T>,
 		plan: OffsetPlan<BalanceOf<T>>,
 	) {
+		let coords = *state.coords(leg);
 		PoolSumsStore::<T>::insert(
-			(collateral_id, stable_id, state.coords.epoch, state.coords.scale),
+			(collateral_id, stable_id, leg, coords.epoch, coords.scale),
 			plan.new_sums,
 		);
-		if plan.new_coords.epoch == state.coords.epoch {
+		if plan.new_coords.epoch == coords.epoch {
 			// Bounded by `math::MAX_SCALE_CROSSINGS`.
-			for scale in state.coords.scale.saturating_add(1)..=plan.new_coords.scale {
+			for scale in coords.scale.saturating_add(1)..=plan.new_coords.scale {
 				PoolSumsStore::<T>::insert(
-					(collateral_id, stable_id, state.coords.epoch, scale),
+					(collateral_id, stable_id, leg, coords.epoch, scale),
 					PoolSums::default(),
 				);
 			}
 		} else {
 			PoolSumsStore::<T>::insert(
-				(collateral_id, stable_id, plan.new_coords.epoch, 0u32),
+				(collateral_id, stable_id, leg, plan.new_coords.epoch, 0u32),
 				PoolSums::default(),
 			);
 		}
-		state.coords = plan.new_coords;
-		state.total_active_deposits = plan.new_total;
-		state.total_collateral_gains_unclaimed = plan.new_unclaimed;
-	}
-
-	/// Pending-domain twin of [`Pallet::commit_active_offset`], writing the
-	/// pending sums store, `pending_coords`, and `total_pending_deposits`.
-	fn commit_pending_offset(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		state: &mut PoolStateOf<T>,
-		plan: OffsetPlan<BalanceOf<T>>,
-	) {
-		PendingSumsStore::<T>::insert(
-			(collateral_id, stable_id, state.pending_coords.epoch, state.pending_coords.scale),
-			plan.new_sums,
-		);
-		if plan.new_coords.epoch == state.pending_coords.epoch {
-			// Bounded by `math::MAX_SCALE_CROSSINGS`.
-			for scale in state.pending_coords.scale.saturating_add(1)..=plan.new_coords.scale {
-				PendingSumsStore::<T>::insert(
-					(collateral_id, stable_id, state.pending_coords.epoch, scale),
-					PoolSums::default(),
-				);
-			}
-		} else {
-			PendingSumsStore::<T>::insert(
-				(collateral_id, stable_id, plan.new_coords.epoch, 0u32),
-				PoolSums::default(),
-			);
-		}
-		state.pending_coords = plan.new_coords;
-		state.total_pending_deposits = plan.new_total;
+		*state.coords_mut(leg) = plan.new_coords;
+		*state.total_mut(leg) = plan.new_total;
 		state.total_collateral_gains_unclaimed = plan.new_unclaimed;
 	}
 
@@ -895,8 +757,9 @@ impl<T: Config> Pallet<T> {
 		debt: BalanceOf<T>,
 		collateral: BalanceOf<T>,
 	) -> DispatchResult {
-		let plan = Self::plan_active_offset(collateral_id, stable_id, pool, debt, collateral)?;
-		Self::commit_active_offset(collateral_id, stable_id, &mut pool.state, plan);
+		let plan =
+			Self::plan_offset(collateral_id, stable_id, Leg::Active, pool, debt, collateral)?;
+		Self::commit_offset(collateral_id, stable_id, Leg::Active, &mut pool.state, plan);
 		Ok(())
 	}
 
@@ -1001,7 +864,7 @@ impl<T: Config> Pallet<T> {
 		let Some(delta_g) = pool.state.delta_sum(amount) else {
 			return credit;
 		};
-		let mut sums = Self::sums_at(collateral_id, stable_id, &pool.state.coords);
+		let mut sums = Self::sums_at(collateral_id, stable_id, Leg::Active, &pool.state.coords);
 		let Some(new_g) = sums.g_yield.checked_add(&delta_g) else {
 			return credit;
 		};
@@ -1017,7 +880,13 @@ impl<T: Config> Pallet<T> {
 
 		sums.g_yield = new_g;
 		PoolSumsStore::<T>::insert(
-			(collateral_id, stable_id, pool.state.coords.epoch, pool.state.coords.scale),
+			(
+				collateral_id,
+				stable_id,
+				Leg::Active,
+				pool.state.coords.epoch,
+				pool.state.coords.scale,
+			),
 			sums,
 		);
 		pool.state.total_yield_unclaimed = new_total_yield;
@@ -1175,28 +1044,14 @@ impl<T: Config> Pallet<T> {
 		pool: &StabilityPoolOf<T>,
 		deposit: &mut DepositOf<T>,
 	) -> DispatchResult {
-		let state = &pool.state;
-		let snapshot = deposit.snapshot;
-		let current = Self::sums_at(collateral_id, stable_id, &state.coords);
-		// A snapshot already at the live coordinates realizes against the
-		// current row alone — no row above the live scale can exist — which
-		// makes the snapshot-reset read below cover the whole window.
-		let window = if snapshot.coords.epoch == state.coords.epoch &&
-			snapshot.coords.scale == state.coords.scale
-		{
-			SumsWindow { snap: current, ahead: Default::default() }
-		} else {
-			Self::sums_window(collateral_id, stable_id, &snapshot)
-		};
-		let realized = math::realize(
+		let (realized, snapshot) = Self::realize_leg(
+			collateral_id,
+			stable_id,
+			Leg::Active,
+			pool,
 			deposit.active_deposit,
-			&snapshot,
-			&state.coords,
-			&window,
-			&pool.config.precision,
+			&deposit.snapshot,
 		);
-		debug_assert!(realized.compounded <= deposit.active_deposit);
-
 		deposit.active_deposit = realized.compounded;
 		deposit.claimable_collateral = deposit
 			.claimable_collateral
@@ -1206,8 +1061,7 @@ impl<T: Config> Pallet<T> {
 			.claimable_yield
 			.checked_add(&realized.yield_gain)
 			.ok_or(ArithmeticError::Overflow)?;
-
-		deposit.snapshot = state.snapshot(&current);
+		deposit.snapshot = snapshot;
 		Self::realize_pending(collateral_id, stable_id, pool, deposit)
 	}
 
@@ -1222,43 +1076,57 @@ impl<T: Config> Pallet<T> {
 		pool: &StabilityPoolOf<T>,
 		deposit: &mut DepositOf<T>,
 	) -> DispatchResult {
-		let Some(pending) = deposit.pending_deposit.clone() else {
+		let Some(pending) = deposit.pending_deposit.as_mut() else {
 			return Ok(());
 		};
-		let state = &pool.state;
-		let current = Self::pending_sums_at(collateral_id, stable_id, &state.pending_coords);
-		let window = if pending.snapshot.coords.epoch == state.pending_coords.epoch &&
-			pending.snapshot.coords.scale == state.pending_coords.scale
-		{
-			SumsWindow { snap: current, ahead: Default::default() }
-		} else {
-			Self::pending_sums_window(collateral_id, stable_id, &pending.snapshot)
-		};
-		let realized = math::realize(
+		let (realized, snapshot) = Self::realize_leg(
+			collateral_id,
+			stable_id,
+			Leg::Pending,
+			pool,
 			pending.amount,
 			&pending.snapshot,
-			&state.pending_coords,
-			&window,
-			&pool.config.precision,
 		);
-		debug_assert!(realized.compounded <= pending.amount);
 		// Pending deposits earn no yield: `G` is structurally zero here.
 		debug_assert!(realized.yield_gain.is_zero());
+		pending.amount = realized.compounded;
+		pending.snapshot = snapshot;
 
 		deposit.claimable_collateral = deposit
 			.claimable_collateral
 			.checked_add(&realized.collateral_gain)
 			.ok_or(ArithmeticError::Overflow)?;
-		deposit.pending_deposit = if realized.compounded.is_zero() {
-			None
-		} else {
-			Some(PendingDeposit {
-				amount: realized.compounded,
-				activatable_at: pending.activatable_at,
-				snapshot: state.pending_snapshot(&current),
-			})
-		};
+		if realized.compounded.is_zero() {
+			deposit.pending_deposit = None;
+		}
 		Ok(())
+	}
+
+	/// Realize `amount` (as of `snapshot`) on `leg` against the pool's live
+	/// coordinates: the settled values plus the reset snapshot at those
+	/// coordinates.
+	fn realize_leg(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		leg: Leg,
+		pool: &StabilityPoolOf<T>,
+		amount: BalanceOf<T>,
+		snapshot: &DepositSnapshot,
+	) -> (Realized<BalanceOf<T>>, DepositSnapshot) {
+		let coords = pool.state.coords(leg);
+		let current = Self::sums_at(collateral_id, stable_id, leg, coords);
+		// A snapshot already at the live coordinates realizes against the
+		// current row alone — no row above the live scale can exist — which
+		// makes the snapshot-reset read cover the whole window.
+		let window =
+			if snapshot.coords.epoch == coords.epoch && snapshot.coords.scale == coords.scale {
+				SumsWindow { snap: current, ahead: Default::default() }
+			} else {
+				Self::sums_window(collateral_id, stable_id, leg, snapshot)
+			};
+		let realized = math::realize(amount, snapshot, coords, &window, &pool.config.precision);
+		debug_assert!(realized.compounded <= amount);
+		(realized, pool.state.snapshot(leg, &current))
 	}
 
 	/// SPEC.md §6.7: fold a matured pending deposit into the active deposit.
@@ -1318,8 +1186,8 @@ impl<T: Config> Pallet<T> {
 		state: &PoolStateOf<T>,
 	) -> DepositOf<T> {
 		Deposits::<T>::get((collateral_id, stable_id, who)).unwrap_or_else(|| {
-			let current = Self::sums_at(collateral_id, stable_id, &state.coords);
-			Deposit::fresh(state.snapshot(&current))
+			let current = Self::sums_at(collateral_id, stable_id, Leg::Active, &state.coords);
+			Deposit::fresh(state.snapshot(Leg::Active, &current))
 		})
 	}
 
@@ -1352,66 +1220,39 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	/// The sums row at `coords`; an absent row reads as zero,
+	/// The sums row of `leg` at `coords`; an absent row reads as zero,
 	/// which floors gains instead of overpaying them.
 	pub(crate) fn sums_at(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		leg: Leg,
 		coords: &Accumulators,
 	) -> PoolSums {
-		PoolSumsStore::<T>::get((collateral_id, stable_id, coords.epoch, coords.scale))
+		PoolSumsStore::<T>::get((collateral_id, stable_id, leg, coords.epoch, coords.scale))
 	}
 
-	/// Pending-domain twin of [`Pallet::sums_at`].
-	pub(crate) fn pending_sums_at(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		coords: &Accumulators,
-	) -> PoolSums {
-		PendingSumsStore::<T>::get((collateral_id, stable_id, coords.epoch, coords.scale))
-	}
-
-	/// The sums rows a snapshot realizes against: its own `(epoch, scale)`
-	/// row plus the [`math::SCALE_SPAN`] scales after it. Rows are seeded
-	/// contiguously per epoch, so reading stops at the first gap (`try_get`
-	/// keeps absence observable through the `ValueQuery`).
+	/// The sums rows a snapshot on `leg` realizes against: its own
+	/// `(epoch, scale)` row plus the [`math::SCALE_SPAN`] scales after it.
+	/// Rows are seeded contiguously per epoch, so reading stops at the first
+	/// gap (`try_get` keeps absence observable through the `ValueQuery`).
 	pub(crate) fn sums_window(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		leg: Leg,
 		snapshot: &DepositSnapshot,
 	) -> SumsWindow {
-		let snap = Self::sums_at(collateral_id, stable_id, &snapshot.coords);
-		Self::window_from(snap, snapshot.coords.scale, |scale| {
-			PoolSumsStore::<T>::try_get((collateral_id, stable_id, snapshot.coords.epoch, scale))
-				.ok()
-		})
-	}
-
-	/// Pending-domain twin of [`Pallet::sums_window`].
-	pub(crate) fn pending_sums_window(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		snapshot: &DepositSnapshot,
-	) -> SumsWindow {
-		let snap = Self::pending_sums_at(collateral_id, stable_id, &snapshot.coords);
-		Self::window_from(snap, snapshot.coords.scale, |scale| {
-			PendingSumsStore::<T>::try_get((collateral_id, stable_id, snapshot.coords.epoch, scale))
-				.ok()
-		})
-	}
-
-	/// Assemble a [`SumsWindow`] from the snapshot-scale row and a per-scale
-	/// look-ahead reader, stopping at the first absent row.
-	fn window_from(
-		snap: PoolSums,
-		start_scale: u32,
-		read_ahead: impl Fn(u32) -> Option<PoolSums>,
-	) -> SumsWindow {
+		let snap = Self::sums_at(collateral_id, stable_id, leg, &snapshot.coords);
 		let mut ahead = [PoolSums::default(); math::SCALE_SPAN as usize];
-		let mut scale = start_scale;
+		let mut scale = snapshot.coords.scale;
 		for slot in &mut ahead {
 			scale = scale.saturating_add(1);
-			let Some(sums) = read_ahead(scale) else {
+			let Ok(sums) = PoolSumsStore::<T>::try_get((
+				collateral_id,
+				stable_id,
+				leg,
+				snapshot.coords.epoch,
+				scale,
+			)) else {
 				break;
 			};
 			*slot = sums;

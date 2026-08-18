@@ -27,7 +27,8 @@ pub mod pallet {
 	use crate::{
 		dispatchable_impls::ClaimKind,
 		types::{
-			Deposit, PoolState, PoolSums, RecoveryOffsetSource, StabilityPool, StabilityPoolConfig,
+			Deposit, Leg, PoolState, PoolSums, RecoveryOffsetSource, StabilityPool,
+			StabilityPoolConfig,
 		},
 	};
 	use frame::{
@@ -166,34 +167,19 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Historical and current `S`/`G` sums, keyed by `(epoch, scale)`.
-	/// Rows may be pruned only when no deposit snapshot
-	/// references them.
+	/// Historical and current `S`/`G` sums of both legs, keyed by
+	/// `(leg, epoch, scale)`. The [`Leg::Pending`] rows are the
+	/// backstop's own `P`/`S` domain — pending deposits are consumed pro-rata
+	/// through it — and carry a structurally zero `g_yield`, kept only so both
+	/// legs share one realization implementation. Rows may be pruned only when
+	/// no snapshot on their leg references them.
 	#[pallet::storage]
 	pub type PoolSumsStore<T: Config> = StorageNMap<
 		_,
 		(
 			NMapKey<Twox64Concat, CollateralIdOf<T>>,
 			NMapKey<Twox64Concat, StableIdOf<T>>,
-			NMapKey<Twox64Concat, u32>,
-			NMapKey<Twox64Concat, u32>,
-		),
-		PoolSums,
-		ValueQuery,
-	>;
-
-	/// Pending-side twin of [`PoolSumsStore`], keyed by the PENDING
-	/// accumulators' `(epoch, scale)`: the §6.8 backstop consumes all pending
-	/// deposits pro-rata through a `P`/`S` pair of their own. `g_yield` is structurally zero in
-	/// this domain — pending deposits earn no yield — and only kept so both domains share one
-	/// realization implementation. Rows may be pruned only when no pending
-	/// snapshot references them.
-	#[pallet::storage]
-	pub type PendingSumsStore<T: Config> = StorageNMap<
-		_,
-		(
-			NMapKey<Twox64Concat, CollateralIdOf<T>>,
-			NMapKey<Twox64Concat, StableIdOf<T>>,
+			NMapKey<Twox64Concat, Leg>,
 			NMapKey<Twox64Concat, u32>,
 			NMapKey<Twox64Concat, u32>,
 		),
@@ -596,11 +582,12 @@ pub mod pallet {
 		) -> DispatchResult {
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
 			Pools::<T>::insert(collateral_id, stable_id, StabilityPoolOf::<T>::fresh(config));
-			PoolSumsStore::<T>::insert((collateral_id, stable_id, 0u32, 0u32), PoolSums::default());
-			PendingSumsStore::<T>::insert(
-				(collateral_id, stable_id, 0u32, 0u32),
-				PoolSums::default(),
-			);
+			for leg in Leg::ALL {
+				PoolSumsStore::<T>::insert(
+					(collateral_id, stable_id, leg, 0u32, 0u32),
+					PoolSums::default(),
+				);
+			}
 
 			// A provider reference keeps the sub-account alive across
 			// zero-balance moments without depositing an existential deposit.
@@ -642,15 +629,9 @@ pub mod pallet {
 			}
 
 			Pools::<T>::remove(collateral_id, stable_id);
-			// Safe to clear wholesale: without deposit rows, no snapshot can
-			// reference a sums row.
+			// Safe to clear wholesale: without deposit rows, no snapshot on
+			// either leg can reference a sums row.
 			let removal = PoolSumsStore::<T>::clear_prefix(
-				(collateral_id.clone(), stable_id.clone()),
-				u32::MAX,
-				None,
-			);
-			debug_assert!(removal.maybe_cursor.is_none());
-			let removal = PendingSumsStore::<T>::clear_prefix(
 				(collateral_id.clone(), stable_id.clone()),
 				u32::MAX,
 				None,
