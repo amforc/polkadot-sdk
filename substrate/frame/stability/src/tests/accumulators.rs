@@ -1,5 +1,6 @@
-//! One focused global-accumulator contract: offsets compound `P` and add to
-//! `S`, while yield adds to `G` without changing the liquidation side.
+//! Focused global-accumulator contracts: offsets compound `P` and add to
+//! `S`, while yield adds to `G` without changing the liquidation side; and
+//! the pending pair resets on depletion, not merely on an empty queue.
 //! Epoch/scale transitions and depositor snapshots are already covered by
 //! `epoch_scale.rs` and `claimable_accrual.rs`.
 
@@ -7,6 +8,16 @@ use crate::{mock::*, types::PoolSums};
 
 fn sums_at(epoch: u32, scale: u32) -> PoolSums {
 	crate::PoolSumsStore::<Test>::get((DOT, PUSD, epoch, scale))
+}
+
+fn pending_sums_at(epoch: u32, scale: u32) -> PoolSums {
+	crate::PendingSumsStore::<Test>::get((DOT, PUSD, epoch, scale))
+}
+
+/// Queue a pending (unactivated) deposit for `who`.
+fn seed_pending(who: AccountId, amount: Balance) {
+	mint_stable(PUSD, who, amount);
+	assert_ok!(deposit(who, DOT, PUSD, amount));
 }
 
 /// Deposit and immediately activate `amount` for `who`.
@@ -47,5 +58,55 @@ fn offsets_move_p_and_s_yield_moves_g() {
 		// Coordinates never moved: everything above stayed on (0, 0).
 		assert_eq!(state.coords.epoch, 0);
 		assert_eq!(state.coords.scale, 0);
+	});
+}
+
+/// The pending pair (`P_pending`, `S_pending`) resets only when an offset
+/// depletes the pending stock. Draining it any other way — every row
+/// maturing into the active pool — leaves the accumulators where they stand,
+/// which is what makes a later deposit's snapshot meaningful.
+#[test]
+fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		seed_pending(1, 200);
+
+		// Burn 100 of the 200 pending: P_pending = 100/200 = 0.5 and
+		// delta_S = 50 * (1/200) = 0.25.
+		assert_eq!(simulate_pending_offset(DOT, PUSD, 100, 50).0, 100);
+		let state = pool_state(DOT, PUSD);
+		assert_eq!(state.pending_coords.p, FixedU128::from_rational(1, 2));
+		assert_eq!(pending_sums_at(0, 0).s_collateral, FixedU128::from_rational(1, 4));
+
+		// The surviving floor(200 * 0.5) = 100 matures into the active pool.
+		// The pending stock is empty, yet nothing resets: no depletion
+		// happened.
+		activate_all(&[1]);
+		let state = pool_state(DOT, PUSD);
+		assert_eq!(state.total_pending_deposits, 0);
+		assert_eq!(state.total_active_deposits, 100);
+		assert_eq!(state.pending_coords.p, FixedU128::from_rational(1, 2));
+		assert_eq!(state.pending_coords.epoch, 0);
+		assert_eq!(state.pending_coords.scale, 0);
+		assert_eq!(pending_sums_at(0, 0).s_collateral, FixedU128::from_rational(1, 4));
+
+		// A fresh deposit snapshots that `P_pending`, so it is measured from
+		// where the accumulators stand rather than from `P = 1`: untouched,
+		// it realizes its full 400.
+		seed_pending(2, 400);
+		assert_eq!(realized_pending(DOT, PUSD, 2), 400);
+
+		// Depletion is what resets the pair: a new epoch at `P = 1`, scale 0,
+		// with zeroed sums.
+		assert_eq!(simulate_pending_offset(DOT, PUSD, 400, 80).0, 400);
+		let state = pool_state(DOT, PUSD);
+		assert_eq!(state.total_pending_deposits, 0);
+		assert_eq!(state.pending_coords.epoch, 1);
+		assert_eq!(state.pending_coords.scale, 0);
+		assert_eq!(state.pending_coords.p, FixedU128::one());
+		assert_eq!(pending_sums_at(1, 0).s_collateral, FixedU128::zero());
+		// The closing epoch keeps its row: 0.25 + 80 * (0.5/400) = 0.35, the
+		// window user 2 still claims through.
+		assert_eq!(pending_sums_at(0, 0).s_collateral, FixedU128::from_rational(35, 100));
 	});
 }

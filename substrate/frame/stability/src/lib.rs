@@ -377,9 +377,10 @@ pub mod pallet {
 	impl<T: Config> Pallet<T> {
 		/// Supply `amount` stablecoin to the market's stability pool. The
 		/// funds queue as a pending deposit until `entry_delay` has passed,
-		/// then activate automatically on the next touch of the row. A second
-		/// deposit merges into the existing pending amount and restarts its
-		/// delay.
+		/// and fold into the active pool on the next touch of the row — one
+		/// of the owner's own calls, or anyone's [`Pallet::poke_deposit`]. A
+		/// second deposit merges into the existing pending amount and
+		/// restarts its delay.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::deposit())]
 		pub fn deposit(
@@ -492,9 +493,9 @@ pub mod pallet {
 
 		/// Permissionlessly realize `owner`'s deposit against the current
 		/// accumulators, without moving value, and fold in a matured pending
-		/// deposit. Activation is automatic once the entry delay has passed —
-		/// the owner committed risk capital at deposit time — so any caller
-		/// may complete the move.
+		/// deposit. A matured pending deposit needs a touch to fold in; past
+		/// the entry delay the move is mechanical, so any caller may supply
+		/// that touch.
 		#[pallet::call_index(7)]
 		#[pallet::weight(T::WeightInfo::poke_deposit())]
 		pub fn poke_deposit(
