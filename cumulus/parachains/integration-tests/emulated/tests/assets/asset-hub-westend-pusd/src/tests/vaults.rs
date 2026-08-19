@@ -23,12 +23,11 @@ use frame_support::{
 	traits::{fungible::InspectHold as FungibleInspectHold, fungibles::Refund},
 };
 
-/// A stablecoin minimum balance above one unit makes the fee account's
-/// stablecoin account mandatory before the first market registers.
+/// A stablecoin minimum balance above one unit requires the fee account's
+/// stablecoin account before the first market registers.
 ///
-/// The fee account owns that deposit because it outlives any single market, so
-/// it must hold native balance first — no stablecoin is needed, and none exists
-/// yet at that point.
+/// The fee account owns that deposit, because it outlives any single market. So
+/// it must hold native balance first. No stablecoin exists yet at that point.
 #[test]
 fn registration_creates_the_fee_account_stablecoin_account() {
 	AssetHubWestend::execute_with(|| {
@@ -45,22 +44,21 @@ fn registration_creates_the_fee_account_stablecoin_account() {
 				.expect("registration touched the fee account");
 		assert_eq!(depositor, fee_account, "the stablecoin-wide account owns its deposit");
 		assert!(deposit > 0);
-		// Touched, not funded: it can now receive a credit of any size.
+		// The account exists but is empty. It can now receive a credit of any size.
 		assert_eq!(pusd_balance(&fee_account), 0);
 	});
 }
 
-/// A native-collateral market opened by a regular signed origin.
+/// A signed origin, not Root, creates a native-collateral market.
 #[test]
 fn signed_user_registers_a_native_collateral_market() {
 	AssetHubWestend::execute_with(|| {
 		create_pusd();
 		feed_price(dot_price(2, 1));
 
-		// The stablecoin owner: a plain signed account, holding no privilege
-		// beyond owning the asset this market mints.
+		// The creator is the stablecoin owner. It has no privilege other than the asset ownership.
 		let creator = admin();
-		// Administration goes to accounts that take no part in the creation.
+		// The administrators take no part in the creation.
 		let full_admin = acct(7);
 		let emergency_admin = acct(8);
 		assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&creator, 1_000 * WND));
@@ -80,8 +78,7 @@ fn signed_user_registers_a_native_collateral_market() {
 
 		let branch = pallet_vaults::Branches::<Runtime>::get(get_native_id(), get_pusd_id())
 			.expect("the signed creation registered the market");
-		// The deposit is recorded against the creator, so removal refunds them
-		// rather than the administrators.
+		// The deposit is held from the creator, so a removal refunds the creator.
 		assert_eq!(branch.deposit.map(|(who, _)| who), Some(creator.clone()));
 		assert_eq!(
 			<Balances as FungibleInspectHold<AccountId>>::balance_on_hold(
@@ -104,8 +101,7 @@ fn signed_user_registers_a_native_collateral_market() {
 			pallet_vaults::BranchConfigUpdate::MinimumDebt(100 * PUSD),
 		));
 
-		// The stablecoin-wide limit is the one knob that stays with governance, so
-		// the market only borrows once Root opens it.
+		// The global ceiling stays with governance. The market can borrow only after Root opens it.
 		lift_global_ceiling(1_000_000_000 * PUSD);
 		let owner = acct(9);
 		// 10,000 WND at 2 pUSD against 10,000 pUSD debt: CR 200%.
@@ -113,14 +109,12 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_eq!(pusd_balance(&owner), 10_000 * PUSD);
 		assert_eq!(collateral_on_hold(&get_native_id(), &owner), 10_000 * WND);
 
-		// A second signed account borrows on its own terms:
-		// 3,000 WND = 6,000 pUSD value against 2,500
-		// pUSD debt at a 5% rate, CR 240%.
+		// A second borrower: 3,000 WND = 6,000 pUSD value against 2,500 pUSD debt at 5%, CR 240%.
 		let other_owner = acct(10);
 		open_vault(&other_owner, 3_000 * WND, 2_500 * PUSD, FixedU128::from_rational(5, 100));
 		assert_eq!(pusd_balance(&other_owner), 2_500 * PUSD);
 		assert_eq!(collateral_on_hold(&get_native_id(), &other_owner), 3_000 * WND);
-		// Each vault keeps its own rate, so neither borrower pays for the other.
+		// Each vault keeps its own rate.
 		assert_eq!(vault(&owner).annual_rate, FixedU128::zero());
 		assert_eq!(vault(&other_owner).annual_rate, FixedU128::from_rational(5, 100));
 
@@ -134,15 +128,15 @@ fn signed_user_registers_a_native_collateral_market() {
 	});
 }
 
-/// At 125% TCR against a 120% safety threshold, a withdrawal that would push
-/// the branch TCR to 115% is rejected even though the vault itself stays
-/// healthy, while a debt repayment (TCR-improving) goes through.
+/// The branch TCR is 125% and the safety threshold 120%. A withdrawal that moves
+/// the TCR to 115% is rejected although the vault stays healthy. A debt
+/// repayment improves the TCR and goes through.
 #[test]
 fn example_14_branch_mode_tcr_check() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(2, 1));
-		// A lower entry ratio leaves individual-vault headroom so the branch
-		// TCR check, not the vault check, is what rejects the withdrawal.
+		// Lower vault ratios leave the vault healthy, so the branch TCR check is
+		// what rejects the withdrawal.
 		create_branch(&BranchSpec {
 			mcr: FixedU128::from_rational(105, 100),
 			icr: FixedU128::from_rational(110, 100),
@@ -150,15 +144,14 @@ fn example_14_branch_mode_tcr_check() {
 			..Default::default()
 		});
 
-		// Branch totals: 62,500 WND = 125,000 pUSD value over 100,000 pUSD
-		// debt → TCR 125%.
+		// Branch totals: 62,500 WND = 125,000 pUSD value over 100,000 pUSD debt, TCR 125%.
 		let roomy_owner = acct(1); // 34,750 WND = 69,500 pUSD value, CR 139%
 		open_vault(&roomy_owner, 34_750 * WND, 50_000 * PUSD, FixedU128::zero());
 		let tight_owner = acct(2); // 27,750 WND = 55,500 pUSD value, CR 111%
 		open_vault(&tight_owner, 27_750 * WND, 50_000 * PUSD, FixedU128::zero());
 
-		// Withdrawing 5,000 WND = 10,000 pUSD value leaves the vault at 119%
-		// but the branch at 115,000 / 100,000 = 115% < 120%: rejected.
+		// A 5,000 WND = 10,000 pUSD withdrawal leaves the vault at 119%, but the
+		// branch at 115,000 / 100,000 = 115% < 120%.
 		assert_err!(
 			Vaults::withdraw_collateral(
 				RuntimeOrigin::signed(roomy_owner.clone()),
@@ -178,8 +171,7 @@ fn example_14_branch_mode_tcr_check() {
 			roomy_owner.clone(),
 			Some(10_000 * PUSD),
 		));
-		// 125,000 / 90,000 = 1.38888…, floored at the fixed point's 18
-		// decimals (`from_rational` would round the last digit up).
+		// 125,000 / 90,000 = 1.38888…, floored at 18 decimals. `from_rational` would round up.
 		assert_eq!(
 			Vaults::branch_tcr(get_native_id(), get_pusd_id()),
 			Ok(FixedU128::from_inner(1_388_888_888_888_888_888)),
@@ -187,15 +179,13 @@ fn example_14_branch_mode_tcr_check() {
 	});
 }
 
-/// The upfront fee prices `upfront_fee_period` (7 days) of interest on the
-/// newly drawn amount at the branch average rate and lands in
+/// The upfront fee is 7 days of interest on the newly drawn amount. It goes to
 /// `debt.interest`, not `debt.principal`.
 ///
-/// The document derives 3.8356 pUSD with a 365-day year; the implementation's
-/// year is 365.25 days (`MILLIS_PER_YEAR = 31,557,600,000`) with the fee
-/// rounded up:
-///   open fee = ceil(5,000e6 × 4% × 7/365.25)  = ceil(3,832,991.10) = 3,832,992
-///   draw fee = ceil(2,000e6 × 4% × 7/365.25)  = ceil(1,533,196.44) = 1,533,197
+/// The document uses a 365-day year and gets 3.8356 pUSD. The chain uses 365.25
+/// days (`MILLIS_PER_YEAR = 31,557,600,000`) and rounds up:
+///   open fee = ceil(5,000e6 × 4% × 7 / 365.25) = ceil(3,832,991.10) = 3,832,992
+///   draw fee = ceil(2,000e6 × 4% × 7 / 365.25) = ceil(1,533,196.44) = 1,533,197
 #[test]
 fn example_16_open_vault_and_increase_debt_with_upfront_fee() {
 	AssetHubWestend::execute_with(|| {
@@ -205,19 +195,17 @@ fn example_16_open_vault_and_increase_debt_with_upfront_fee() {
 			..Default::default()
 		});
 
-		// 10,000 WND = 20,000 pUSD value, drawing 5,000 pUSD at a 4% rate.
+		// 10,000 WND = 20,000 pUSD value, 5,000 pUSD drawn at 4%.
 		let borrower = acct(1);
 		open_vault(&borrower, 10_000 * WND, 5_000 * PUSD, FixedU128::from_rational(4, 100));
 
-		// The borrower receives the full draw; the fee is debt, not a
-		// deduction from the payout.
+		// The borrower receives the full draw. The fee is added to the debt.
 		assert_eq!(pusd_balance(&borrower), 5_000 * PUSD);
 		let opened = vault(&borrower);
 		assert_eq!(opened.debt.principal, 5_000 * PUSD);
 		assert_eq!(opened.debt.interest, 3_832_992);
 
-		// Drawing 2,000 pUSD more at the unchanged rate fees only the
-		// increase.
+		// A further 2,000 pUSD draw is charged only on the increase.
 		assert_ok!(Vaults::borrow(
 			RuntimeOrigin::signed(borrower.clone()),
 			get_native_id(),
