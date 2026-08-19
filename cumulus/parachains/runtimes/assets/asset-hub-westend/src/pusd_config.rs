@@ -228,19 +228,27 @@ impl pallet_vaults::Config for Runtime {
 	type BenchmarkHelper = VaultsBenchmarkHelper;
 }
 
+parameter_types! {
+	/// Seeds the per-stablecoin insurance-fund accounts of coins that no PSM
+	/// instance mints against.
+	pub const InsuranceFundPalletId: PalletId = PalletId(*b"pusd/ins");
+}
+
 /// Isolates each stablecoin's Insurance Fund cover in a separate account.
 ///
-/// The PSM's stablecoin maps to the flat PSM fee-destination account so PSM
-/// revenue directly funds that coin's insurance cover; any other stablecoin
-/// gets its own sub-account of the same pallet id.
+/// A stablecoin minted by a PSM instance already names the account that instance's
+/// fee revenue accrues to, and that revenue is exactly what funds the coin's
+/// insurance cover, so the instance's `fee_destination` is its insurance account.
+/// A stablecoin without a PSM gets its own sub-account of the insurance pallet id.
 pub struct StableInsuranceAccount;
 impl Convert<VaultsStableId, AccountId> for StableInsuranceAccount {
 	fn convert(stable_id: VaultsStableId) -> AccountId {
-		if stable_id == PsmStablecoinAssetId::get() {
-			PsmFeeDestination::get()
-		} else {
-			PsmFeeDestinationPalletId::get().into_sub_account_truncating(stable_id)
-		}
+		// PSM instances are keyed by the internal asset's location, which is how the
+		// collateral namespace names a trust-backed stablecoin.
+		TrustBackedAssetLocation::convert_back(&stable_id)
+			.and_then(pallet_psm::Psm::<Runtime>::get)
+			.map(|info| info.fee_destination)
+			.unwrap_or_else(|| InsuranceFundPalletId::get().into_sub_account_truncating(stable_id))
 	}
 }
 
@@ -282,6 +290,16 @@ impl pallet_stability::Config for Runtime {
 	type WeightInfo = ();
 }
 
+/// Trust-backed asset id the benchmarks mint their stablecoin under. Benchmarks
+/// create the asset themselves, so any id outside the well-known range works.
+#[cfg(feature = "runtime-benchmarks")]
+const BENCHMARK_STABLE_ASSET_ID: VaultsStableId = 50_000_342;
+
+/// One whole stablecoin unit, at the 6 decimals the benchmarks register it with.
+/// The runtime-wide constant went away with the single-PSM configuration.
+#[cfg(feature = "runtime-benchmarks")]
+const PUSD: Balance = 1_000_000;
+
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchmarkHelper;
 
@@ -292,7 +310,7 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 	}
 
 	fn stable_asset_id() -> VaultsStableId {
-		PsmStablecoinAssetId::get()
+		BENCHMARK_STABLE_ASSET_ID
 	}
 
 	fn set_oracle_price(asset_id: VaultsCollateralId, price: FixedU128) {
@@ -348,7 +366,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		use pallet_vaults::{pusd_primitives::OnBranchLifecycle as _, BenchmarkHelper as _};
 
 		let collateral_id = VaultsNativeCollateralId::get();
-		let stable_id: VaultsStableId = PsmStablecoinAssetId::get();
+		let stable_id: VaultsStableId = BENCHMARK_STABLE_ASSET_ID;
 
 		// The benchmark genesis does not create the stablecoin asset, so opening
 		// vaults (which mints stablecoin debt) and funding the redeemer would fail
