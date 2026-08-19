@@ -16,6 +16,7 @@
 use crate::imports::*;
 use asset_hub_westend_runtime::{Stability, Vaults};
 use frame_support::assert_err;
+use pallet_stability::types::Leg;
 use pallet_vaults::JitTerms;
 use pusd_primitives::VaultStatus;
 
@@ -47,7 +48,17 @@ fn active_sums() -> pallet_stability::types::PoolSums {
 }
 
 fn sums_at(epoch: u32, scale: u32) -> pallet_stability::types::PoolSums {
-	pallet_stability::PoolSumsStore::<Runtime>::get((get_native_id(), get_pusd_id(), epoch, scale))
+	sums_at_leg(Leg::Active, epoch, scale)
+}
+
+fn sums_at_leg(leg: Leg, epoch: u32, scale: u32) -> pallet_stability::types::PoolSums {
+	pallet_stability::PoolSumsStore::<Runtime>::get((
+		get_native_id(),
+		get_pusd_id(),
+		leg,
+		epoch,
+		scale,
+	))
 }
 
 fn park_in_final_recovery(owner: &AccountId, collateral: Balance, debt: Balance) {
@@ -92,15 +103,14 @@ fn example_05_1_incoming_deposit_recovery_offset_accepted() {
 		// = 550 WND, credited as claimable, not as a deposit.
 		let row = deposit_row(&depositor);
 		assert_eq!(row.active_deposit, 0);
-		assert_eq!(row.pending_deposit, None);
+		assert!(row.pending_deposit.is_none());
 		assert_eq!(row.claimable_collateral, 550 * WND);
 		assert_eq!(native_balance(&pool_account()), 550 * WND);
 
 		// P, S, G unchanged for this incoming-deposit offset.
 		let state = pool_state();
 		assert_eq!(state.coords.p, FixedU128::one());
-		let sums =
-			pallet_stability::PoolSumsStore::<Runtime>::get((get_native_id(), get_pusd_id(), 0, 0));
+		let sums = sums_at_leg(Leg::Active, 0, 0);
 		assert_eq!(sums.s_collateral, FixedU128::zero());
 		assert_eq!(sums.g_yield, FixedU128::zero());
 
@@ -181,8 +191,7 @@ fn example_06_active_pool_recovery_offset_and_realization() {
 		let state = pool_state();
 		assert_eq!(state.total_active_deposits, 8_000 * PUSD);
 		assert_eq!(state.coords.p, FixedU128::from_rational(8, 10));
-		let sums =
-			pallet_stability::PoolSumsStore::<Runtime>::get((get_native_id(), get_pusd_id(), 0, 0));
+		let sums = sums_at_leg(Leg::Active, 0, 0);
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(1_100 * WND, 10_000 * PUSD));
 
 		// Vault after: 3,000 pUSD debt, 1,900 WND.
@@ -243,12 +252,8 @@ fn example_09_pending_deposit_pro_rata_offset() {
 		// pending P = 1.0 × 400 / 1,400 = 2/7, floored at 18 decimals.
 		assert_eq!(state.pending_coords.p, FixedU128::from_inner(285_714_285_714_285_714));
 		// pending S += 500 WND × 1.0 / 1,400 pUSD, in planck per micro-pUSD.
-		let pending_sums = pallet_stability::PendingSumsStore::<Runtime>::get((
-			get_native_id(),
-			get_pusd_id(),
-			state.pending_coords.epoch,
-			state.pending_coords.scale,
-		));
+		let pending_sums =
+			sums_at_leg(Leg::Pending, state.pending_coords.epoch, state.pending_coords.scale);
 		assert_eq!(
 			pending_sums.s_collateral,
 			FixedU128::from_inner(357_142_857_142_857_142_857_142),
@@ -268,7 +273,7 @@ fn example_09_pending_deposit_pro_rata_offset() {
 		] {
 			poke_row(who);
 			let row = deposit_row(who);
-			assert_eq!(row.pending_deposit, None);
+			assert!(row.pending_deposit.is_none());
 			assert_eq!(row.active_deposit, pending_left);
 			assert_eq!(row.claimable_collateral, collateral);
 		}
@@ -527,7 +532,8 @@ fn example_12_full_depletion_and_epoch_transition() {
 		// keeps S += 900 × P / 1,500 at the pre-offset P = 0.5.
 		assert_eq!(sums_at(1, 1).s_collateral, FixedU128::from_rational(450 * WND, 1_500 * PUSD));
 		// The new epoch opens on a zeroed row.
-		assert_eq!(sums_at(2, 0), Default::default());
+		assert_eq!(sums_at(2, 0).s_collateral, FixedU128::zero());
+		assert_eq!(sums_at(2, 0).g_yield, FixedU128::zero());
 
 		// Realization crosses the epoch boundary: nothing compounds, and the
 		// gain still prices off the snapshot row — 600 × 0.3 / 0.5 = 360 WND.

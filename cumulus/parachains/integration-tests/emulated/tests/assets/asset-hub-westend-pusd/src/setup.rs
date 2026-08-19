@@ -20,7 +20,9 @@
 use crate::imports::*;
 use asset_hub_westend_runtime::{
 	governance,
-	pusd_config::{StabilityCollateral, VaultsCollateral, VaultsNativeCollateralId},
+	pusd_config::{
+		StabilityCollateral, StableInsuranceAccount, VaultsCollateral, VaultsNativeCollateralId,
+	},
 	Assets, Balances, MockOracle, Runtime, RuntimeHoldReason, Stability, Timestamp, Vaults,
 };
 pub(crate) const WND: Balance = 1_000_000_000_000;
@@ -29,8 +31,20 @@ pub(crate) const PUSD: Balance = 1_000_000;
 /// 0.01 pUSD, the minimum balance the stablecoin is registered with.
 pub(crate) const PUSD_MIN_BALANCE: Balance = PUSD / 100;
 
+/// Trust-backed asset id the tests register pUSD under. The runtime names no
+/// single stablecoin, so the id is the fixture's own choice; it only has to stay
+/// clear of the assets the emulated genesis already creates.
+pub(crate) const PUSD_ID: u32 = 50_000_342;
+
 pub(crate) fn get_pusd_id() -> u32 {
-	asset_hub_westend_runtime::PsmStablecoinAssetId::get()
+	PUSD_ID
+}
+
+/// pUSD's Insurance Fund account, derived exactly as the runtime derives it so a
+/// change to that mapping shows up here instead of silently funding a stray
+/// account.
+pub(crate) fn insurance_account() -> AccountId {
+	<StableInsuranceAccount as sp_runtime::traits::Convert<u32, AccountId>>::convert(get_pusd_id())
 }
 
 pub(crate) fn get_native_id() -> VaultsCollateralId {

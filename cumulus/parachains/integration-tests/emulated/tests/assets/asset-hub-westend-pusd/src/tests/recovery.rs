@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use crate::imports::*;
-use asset_hub_westend_runtime::{PsmFeeDestination, Redemptions, Vaults};
+use asset_hub_westend_runtime::{Redemptions, Vaults};
 use pallet_redemptions::RedemptionTerms;
 use pusd_primitives::VaultStatus;
 
@@ -100,7 +100,7 @@ fn example_04_final_recovery_redemption_below_par_with_insurance_cover() {
 		park_in_final_recovery(&parked_owner, 4_000 * WND, 10_000 * PUSD);
 
 		// Insurance Fund balance = 1,000 pUSD.
-		let insurance = PsmFeeDestination::get();
+		let insurance = insurance_account();
 		mint_pusd(&insurance, 1_000 * PUSD);
 
 		// Partial settlement: 3,000 pUSD at 8,000/9,000 buys
