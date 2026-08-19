@@ -266,8 +266,7 @@ mod tests {
 
 	/// Builds the default test policy.
 	///
-	/// The policy uses half of each unit's share, a 0.5% base fee, and 100% ceilings that do not
-	/// bind.
+	/// The policy uses each unit's full share, a 0.5% base fee, and 100% ceilings that do not bind.
 	fn curve(decayed: FixedU128, debt: u128) -> DynamicFeeCurve {
 		let config = RedemptionConfig {
 			minimum_redemption_amount: 1,
@@ -276,7 +275,7 @@ mod tests {
 			dynamic_fee_ceiling: FixedU128::one(),
 			base_fee: Permill::from_rational(5u32, 1_000u32),
 			fee_ceiling: Permill::one(),
-			dynamic_fee_increase_divisor: FixedU128::from_rational(2, 1),
+			dynamic_fee_increase_divisor: FixedU128::one(),
 			final_recovery_bonus_buffer: Permill::zero(),
 		};
 		DynamicFeeCurve::try_new(decayed, debt, &config).expect("u128 debt cannot overflow u128")
@@ -354,7 +353,8 @@ mod tests {
 	/// Verifies the rise for a debt of `1e18` units, where each unit is one `1e-18` of share.
 	#[test]
 	fn rise_is_the_redeemed_share_over_the_divisor() {
-		let curve = curve(FixedU128::zero(), FixedU128::DIV);
+		let mut curve = curve(FixedU128::zero(), FixedU128::DIV);
+		curve.divisor = FixedU128::from_rational(2, 1);
 		assert_eq!(curve.rise(0), Some(FixedU128::zero()));
 		assert_eq!(curve.rise(2), Some(FixedU128::from_inner(1)));
 		let third = FixedU128::DIV / 3;
@@ -368,47 +368,48 @@ mod tests {
 	#[test]
 	fn raised_dynamic_fee_caps_at_the_ceiling() {
 		let curve = curve(FixedU128::from_rational(90, 100), 1_000);
-		assert_eq!(curve.dynamic_fee_after(900), Some(FixedU128::from_rational(135, 100)));
+		assert_eq!(curve.dynamic_fee_after(900), Some(FixedU128::from_rational(180, 100)));
 		assert_eq!(curve.raised_dynamic_fee(900), FixedU128::one());
 	}
 
 	#[test]
 	fn raised_dynamic_fee_adds_the_share_over_the_divisor() {
 		let curve = curve(FixedU128::from_rational(10, 100), 1_000);
-		assert_eq!(curve.raised_dynamic_fee(400), FixedU128::from_rational(30, 100));
+		assert_eq!(curve.raised_dynamic_fee(400), FixedU128::from_rational(50, 100));
 	}
 
 	#[test]
 	fn charged_rate_is_base_plus_the_mean_dynamic_fee() {
-		// The dynamic fee climbs from 10% to 30%. Its mean is 20%.
+		// The dynamic fee climbs from 10% to 50%. Its mean is 30%.
 		let curve = curve(FixedU128::from_rational(10, 100), 1_000);
-		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(205, 1_000));
+		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(305, 1_000));
 	}
 
 	#[test]
 	fn charged_rate_climbs_to_the_ceiling_then_pays_it_flat() {
 		let mut curve = curve(FixedU128::zero(), 1_000_000);
 		curve.dynamic_fee_ceiling = FixedU128::from_rational(1, 100);
-		// The dynamic fee reaches 1% after the share `0.01 · 2`.
-		let climb = 20_000u128;
-		// Up to the crossing, the plain mean applies: `0.5% + 1.9999% / 4`.
+		// The dynamic fee reaches 1% after the share `0.01 · 1`.
+		let climb = 10_000u128;
+		// Up to the crossing, the plain mean applies: `0.5% + 0.9999% / 2`.
 		assert_eq!(
 			curve.charged_rate(climb - 1),
-			FixedU128::from_rational(9_999_750_000_000_000, FixedU128::DIV)
+			FixedU128::from_rational(9_999_500_000_000_000, FixedU128::DIV)
 		);
 		assert_eq!(curve.charged_rate(climb), FixedU128::from_rational(1, 100));
 		// After the crossing, the mean has the climb weighted at its share and the ceiling for the
-		// other share. A quarter of an 8% share climbs at a 0.5% mean, and the rest pays 1%.
+		// other share. A quarter of a 4% share climbs at a 0.5% mean, and the rest pays 1%.
 		assert_eq!(curve.charged_rate(4 * climb), FixedU128::from_rational(1_375, 100_000));
-		// The rate and its slope are continuous across the crossing. Before it, the rate is linear
-		// in the amount. After it, the rate is a hyperbola with the curvature
-		// `cap² · debt · divisor / climb³ = 2.5e-11` per unit at the crossing. Thus, no second
-		// difference exceeds that curvature plus the `1e-18` rounding of each rate.
+		// At the crossing, the dynamic-fee area is the triangle `climb · ceiling / 2`. After it,
+		// the rectangle `(redeemed − climb) · ceiling` is added. Dividing their sum by `redeemed`
+		// gives the mean dynamic fee. The two shapes meet without a jump in the rate or its slope.
+		// Thus, no second difference exceeds the curvature at the crossing plus the `1e-18`
+		// rounding of each rate.
 		let rates: [i128; 5] = core::array::from_fn(|i| {
 			i128::try_from(curve.charged_rate(climb - 2 + i as u128).into_inner())
 				.expect("a rate is at most one")
 		});
-		let curvature: i128 = 25_000_000;
+		let curvature: i128 = 100_000_000;
 		for window in rates.windows(3) {
 			let jump = (window[2] - window[1]) - (window[1] - window[0]);
 			assert!(jump.abs() <= curvature + 4, "slope jumps by {jump} around the crossing");
@@ -425,7 +426,7 @@ mod tests {
 		// The dynamic component can increase to 100%. The 20% fee ceiling includes the base fee and
 		// applies from the first unit.
 		assert_eq!(curve.charged_rate(500), FixedU128::from_rational(20, 100));
-		assert_eq!(curve.raised_dynamic_fee(500), FixedU128::from_rational(55, 100));
+		assert_eq!(curve.raised_dynamic_fee(500), FixedU128::from_rational(80, 100));
 	}
 
 	// These tests verify the curve-domain boundaries. Execution cannot reach most of them because a
@@ -440,13 +441,13 @@ mod tests {
 	#[test]
 	fn full_and_over_full_redemptions_rise_by_the_divisor_reciprocal() {
 		let mut curve = curve(FixedU128::zero(), 1_000);
-		assert_eq!(curve.raised_dynamic_fee(1_000), FixedU128::from_rational(1, 2));
-		assert_eq!(curve.raised_dynamic_fee(2_000), FixedU128::from_rational(1, 2));
-		// The mean of the climb is 25%. With the 0.5% base fee, the whole coin pays 25.5%.
-		assert_eq!(curve.charged_rate(1_000), FixedU128::from_rational(255, 1_000));
-		assert_eq!(curve.fee::<u128>(1_000), 255);
+		assert_eq!(curve.raised_dynamic_fee(1_000), FixedU128::one());
+		assert_eq!(curve.raised_dynamic_fee(2_000), FixedU128::one());
+		// The fee ceiling stops the dynamic climb at 99.5%, so the whole coin pays 50.49875%.
+		assert_eq!(curve.charged_rate(1_000), FixedU128::from_rational(40_399, 80_000));
+		assert_eq!(curve.fee::<u128>(1_000), 505);
 		assert_eq!(curve.charged_rate(2_000), curve.charged_rate(1_000));
-		assert_eq!(curve.fee::<u128>(2_000), 510);
+		assert_eq!(curve.fee::<u128>(2_000), 1_010);
 		// A large divisor keeps even the whole coin far below the ceiling.
 		curve.divisor = FixedU128::from_rational(1_000_000, 1);
 		assert_eq!(curve.raised_dynamic_fee(1_000), FixedU128::from_rational(1, 1_000_000));
@@ -464,7 +465,7 @@ mod tests {
 		assert_eq!(empty.raised_dynamic_fee(0), whole.raised_dynamic_fee(1_000));
 		assert_eq!(empty.charged_rate(1), whole.charged_rate(1_000));
 		assert_eq!(empty.fee::<u128>(1_000), whole.fee::<u128>(1_000));
-		assert_eq!(empty.raised_dynamic_fee(1), FixedU128::from_rational(1, 2));
+		assert_eq!(empty.raised_dynamic_fee(1), FixedU128::one());
 	}
 
 	/// Verifies the curve for a zero divisor that policy validation rejects.
@@ -514,7 +515,7 @@ mod tests {
 		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(5, 1_000));
 		assert_eq!(curve.fee::<u128>(400), 2);
 		let climbed = curve.raised_dynamic_fee(400);
-		assert_eq!(climbed, FixedU128::from_rational(20, 100));
+		assert_eq!(climbed, FixedU128::from_rational(40, 100));
 		curve.base_fee = Permill::from_percent(2);
 		curve.fee_ceiling = Permill::from_percent(1);
 		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(1, 100));
@@ -548,11 +549,11 @@ mod tests {
 		assert!(rate.into_inner().abs_diff(small.into_inner()) <= 4, "{rate:?} vs {small:?}");
 		let fee = vast.fee::<u128>(nearly_all);
 		assert!(fee <= nearly_all);
-		assert!(fee > nearly_all / 4);
-		let half = FixedU128::from_rational(1, 2);
+		assert!(fee > nearly_all / 2);
+		let full = FixedU128::one();
 		let raised = vast.raised_dynamic_fee(nearly_all);
-		assert!(raised.into_inner().abs_diff(half.into_inner()) <= 1, "{raised:?}");
-		assert_eq!(vast.raised_dynamic_fee(u128::MAX), half);
+		assert!(raised.into_inner().abs_diff(full.into_inner()) <= 1, "{raised:?}");
+		assert_eq!(vast.raised_dynamic_fee(u128::MAX), full);
 	}
 
 	/// Applies `tranches` in sequence against the debt that each prior tranche leaves.
@@ -572,25 +573,23 @@ mod tests {
 	/// Verifies the worked example: 20_000 of a 500_480 debt from a zero dynamic fee, at once and
 	/// in halves.
 	///
-	/// At once, the share is 3.996%, so the dynamic fee climbs by 1.998%. The redemption pays the
-	/// 0.999% mean above the 0.5% base fee: `ceil(20_000 · 1.499%) = 300`.
+	/// At once, the share is 3.996%, so the dynamic fee climbs by 3.996%. The redemption pays the
+	/// 1.998% mean above the 0.5% base fee: `ceil(20_000 · 2.498%) = 500`.
 	///
-	/// In halves, the first climbs to 0.999% and pays `ceil(99.90) = 100`. The second takes its
-	/// share of the remaining 490_480, climbs by 1.019% to 2.018%, and pays `ceil(200.85) = 201`.
-	/// Thus, the halves pay one unit more and leave a higher dynamic fee. Application of the
-	/// terminal rate to the full amount would instead charge 500 at once and let the halves pay
-	/// less.
+	/// In halves, the first climbs to 1.998% and pays `ceil(149.90) = 150`. The second takes its
+	/// share of the remaining 490_480, climbs by 2.039% to 4.037%, and pays `ceil(351.75) = 352`.
+	/// Thus, the halves pay two units more and leave a higher dynamic fee.
 	#[test]
 	fn the_worked_example_at_once_and_in_halves() {
 		let example = curve(FixedU128::zero(), 500_480);
-		assert_eq!(example.fee::<u128>(20_000), 300);
+		assert_eq!(example.fee::<u128>(20_000), 500);
 		let raised = example.raised_dynamic_fee(20_000);
-		assert!(raised.into_inner().abs_diff(19_980_818_414_322_250) <= 1, "{raised:?}");
-		assert_eq!(example.fee::<u128>(10_000), 100);
+		assert!(raised.into_inner().abs_diff(39_961_636_828_644_500) <= 1, "{raised:?}");
+		assert_eq!(example.fee::<u128>(10_000), 150);
 		let (split_fee, split_raised) = redeem_in_tranches(example, &[10_000, 10_000]);
-		assert_eq!(split_fee, 301);
+		assert_eq!(split_fee, 502);
 		assert!(
-			split_raised.into_inner().abs_diff(20_184_504_787_001_281) <= 2,
+			split_raised.into_inner().abs_diff(40_369_009_574_002_562) <= 2,
 			"{split_raised:?}"
 		);
 		assert!(split_raised > raised);
