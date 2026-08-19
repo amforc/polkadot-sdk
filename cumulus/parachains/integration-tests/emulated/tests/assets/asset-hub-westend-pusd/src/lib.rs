@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Scenario tests for the stablecoin framework (vaults, redemptions, stability
-//! pool) over the real Asset Hub Westend runtime.
+//! Scenario tests for the stablecoin vaults, redemptions, and stability pool on
+//! the real Asset Hub Westend runtime.
 
 #[cfg(test)]
 mod imports {
