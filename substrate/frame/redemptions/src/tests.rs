@@ -35,7 +35,7 @@ fn spend_for_debt(debt: Balance) -> Balance {
 		crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee_at(Timestamp::get(), &config);
 	let curve = crate::fees::DynamicFeeCurve::try_new(decayed, stablecoin_debt(PUSD), &config)
 		.expect("test debt fits u128");
-	debt + curve.fee::<Balance>(debt)
+	debt + curve.fee(debt)
 }
 
 /// Branch TCR as the vault pallet reports it, including pending interest.
@@ -611,8 +611,9 @@ fn balance_bound_uses_the_fee_raised_by_the_affordable_debt() {
 		assert_eq!(Assets::balance(PUSD, 3), 2, "the minimum balance and the spare unit stay");
 		// 825 debt pays one more unit of fee, and would need the whole balance.
 		let curve = fee_curve(FixedU128::zero(), coin_debt_before);
-		assert!(824 + curve.fee::<Balance>(824) <= 999);
-		assert!(825 + curve.fee::<Balance>(825) > 999);
+		let debt: Balance = 824;
+		assert!(debt + curve.fee(debt) <= 999);
+		assert!(debt + 1 + curve.fee(debt + 1) > 999);
 	});
 }
 

@@ -445,9 +445,9 @@ mod tests {
 		assert_eq!(curve.raised_dynamic_fee(2_000), FixedU128::one());
 		// The fee ceiling stops the dynamic climb at 99.5%, so the whole coin pays 50.49875%.
 		assert_eq!(curve.charged_rate(1_000), FixedU128::from_rational(40_399, 80_000));
-		assert_eq!(curve.fee::<u128>(1_000), 505);
+		assert_eq!(curve.fee(1_000u128), 505);
 		assert_eq!(curve.charged_rate(2_000), curve.charged_rate(1_000));
-		assert_eq!(curve.fee::<u128>(2_000), 1_010);
+		assert_eq!(curve.fee(2_000u128), 1_010);
 		// A large divisor keeps even the whole coin far below the ceiling.
 		curve.divisor = FixedU128::from_rational(1_000_000, 1);
 		assert_eq!(curve.raised_dynamic_fee(1_000), FixedU128::from_rational(1, 1_000_000));
@@ -461,10 +461,10 @@ mod tests {
 	fn a_coin_without_debt_prices_every_redemption_as_the_whole_coin() {
 		let empty = curve(FixedU128::zero(), 0);
 		let whole = curve(FixedU128::zero(), 1_000);
-		assert_eq!(empty.fee::<u128>(0), 0);
+		assert_eq!(empty.fee(0u128), 0);
 		assert_eq!(empty.raised_dynamic_fee(0), whole.raised_dynamic_fee(1_000));
 		assert_eq!(empty.charged_rate(1), whole.charged_rate(1_000));
-		assert_eq!(empty.fee::<u128>(1_000), whole.fee::<u128>(1_000));
+		assert_eq!(empty.fee(1_000u128), whole.fee(1_000u128));
 		assert_eq!(empty.raised_dynamic_fee(1), FixedU128::one());
 	}
 
@@ -478,7 +478,7 @@ mod tests {
 		curve.divisor = FixedU128::zero();
 		assert_eq!(curve.raised_dynamic_fee(1), FixedU128::one());
 		assert_eq!(curve.charged_rate(1), FixedU128::one());
-		assert_eq!(curve.fee::<u128>(100), 100);
+		assert_eq!(curve.fee(100u128), 100);
 		curve.dynamic_fee_ceiling = FixedU128::from_rational(10, 100);
 		assert_eq!(curve.raised_dynamic_fee(1), FixedU128::from_rational(10, 100));
 		assert_eq!(curve.charged_rate(1), FixedU128::from_rational(105, 1_000));
@@ -495,7 +495,7 @@ mod tests {
 		let mut curve = curve(ceiling, 1_000);
 		curve.dynamic_fee_ceiling = ceiling;
 		assert_eq!(curve.charged_rate(300), flat);
-		assert_eq!(curve.fee::<u128>(300), 32);
+		assert_eq!(curve.fee(300u128), 32);
 		assert_eq!(curve.raised_dynamic_fee(300), ceiling);
 		curve.decayed = FixedU128::from_rational(20, 100);
 		assert_eq!(curve.charged_rate(300), flat);
@@ -513,13 +513,13 @@ mod tests {
 		let mut curve = curve(FixedU128::zero(), 1_000);
 		curve.fee_ceiling = Permill::from_rational(5u32, 1_000u32);
 		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(5, 1_000));
-		assert_eq!(curve.fee::<u128>(400), 2);
+		assert_eq!(curve.fee(400u128), 2);
 		let climbed = curve.raised_dynamic_fee(400);
 		assert_eq!(climbed, FixedU128::from_rational(40, 100));
 		curve.base_fee = Permill::from_percent(2);
 		curve.fee_ceiling = Permill::from_percent(1);
 		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(1, 100));
-		assert_eq!(curve.fee::<u128>(400), 4);
+		assert_eq!(curve.fee(400u128), 4);
 		assert_eq!(curve.raised_dynamic_fee(400), climbed);
 	}
 
@@ -529,7 +529,7 @@ mod tests {
 	#[test]
 	fn a_redemption_of_nothing_pays_nothing_and_moves_nothing() {
 		let curve = curve(FixedU128::from_rational(3, 100), 1_000);
-		assert_eq!(curve.fee::<u128>(0), 0);
+		assert_eq!(curve.fee(0u128), 0);
 		assert_eq!(curve.charged_rate(0), FixedU128::from_rational(35, 1_000));
 		assert_eq!(curve.raised_dynamic_fee(0), FixedU128::from_rational(3, 100));
 	}
@@ -541,13 +541,13 @@ mod tests {
 	#[test]
 	fn the_largest_balances_stay_inside_the_arithmetic() {
 		let vast = curve(FixedU128::zero(), u128::MAX);
-		assert_eq!(vast.fee::<u128>(1), 1);
+		assert_eq!(vast.fee(1u128), 1);
 		assert_eq!(vast.raised_dynamic_fee(1), FixedU128::zero());
 		let nearly_all = u128::MAX - 1;
 		let rate = vast.charged_rate(nearly_all);
 		let small = curve(FixedU128::zero(), 1_000).charged_rate(1_000);
 		assert!(rate.into_inner().abs_diff(small.into_inner()) <= 4, "{rate:?} vs {small:?}");
-		let fee = vast.fee::<u128>(nearly_all);
+		let fee = vast.fee(nearly_all);
 		assert!(fee <= nearly_all);
 		assert!(fee > nearly_all / 2);
 		let full = FixedU128::one();
@@ -563,7 +563,7 @@ mod tests {
 	fn redeem_in_tranches(mut curve: DynamicFeeCurve, tranches: &[u128]) -> (u128, FixedU128) {
 		let mut fee = 0u128;
 		for &tranche in tranches {
-			fee += curve.fee::<u128>(tranche);
+			fee += curve.fee(tranche);
 			curve.decayed = curve.raised_dynamic_fee(tranche);
 			curve.debt -= tranche;
 		}
@@ -582,10 +582,10 @@ mod tests {
 	#[test]
 	fn the_worked_example_at_once_and_in_halves() {
 		let example = curve(FixedU128::zero(), 500_480);
-		assert_eq!(example.fee::<u128>(20_000), 500);
+		assert_eq!(example.fee(20_000u128), 500);
 		let raised = example.raised_dynamic_fee(20_000);
 		assert!(raised.into_inner().abs_diff(39_961_636_828_644_500) <= 1, "{raised:?}");
-		assert_eq!(example.fee::<u128>(10_000), 150);
+		assert_eq!(example.fee(10_000u128), 150);
 		let (split_fee, split_raised) = redeem_in_tranches(example, &[10_000, 10_000]);
 		assert_eq!(split_fee, 502);
 		assert!(
@@ -609,17 +609,17 @@ mod tests {
 
 	#[test]
 	fn redemption_fee_rounds_up() {
-		assert_eq!(redemption_fee::<u128>(100, FixedU128::from_rational(5, 1000)), 1);
-		assert_eq!(redemption_fee::<u128>(1000, FixedU128::from_rational(5, 1000)), 5);
-		assert_eq!(redemption_fee::<u128>(0, FixedU128::one()), 0);
+		assert_eq!(redemption_fee(100u128, FixedU128::from_rational(5, 1000)), 1);
+		assert_eq!(redemption_fee(1000u128, FixedU128::from_rational(5, 1000)), 5);
+		assert_eq!(redemption_fee(0u128, FixedU128::one()), 0);
 	}
 
 	#[test]
 	fn max_debt_for_budget_accounts_for_fee() {
 		let at = |rate| move |debt| redemption_fee(debt, rate);
-		assert_eq!(max_debt_for_budget::<u128>(1000, at(FixedU128::zero())), 1000);
-		assert_eq!(max_debt_for_budget::<u128>(1000, at(FixedU128::one())), 500);
-		assert_eq!(max_debt_for_budget::<u128>(1000, at(FixedU128::from_rational(5, 1000))), 995);
+		assert_eq!(max_debt_for_budget(1000u128, at(FixedU128::zero())), 1000);
+		assert_eq!(max_debt_for_budget(1000u128, at(FixedU128::one())), 500);
+		assert_eq!(max_debt_for_budget(1000u128, at(FixedU128::from_rational(5, 1000))), 995);
 	}
 
 	/// Verifies budget-search boundaries.
@@ -629,11 +629,11 @@ mod tests {
 	#[test]
 	fn max_debt_for_budget_edge_inputs() {
 		let whole = |debt: u128| debt;
-		assert_eq!(max_debt_for_budget::<u128>(0, whole), 0);
-		assert_eq!(max_debt_for_budget::<u128>(1, whole), 0);
-		assert_eq!(max_debt_for_budget::<u128>(2, whole), 1);
-		assert_eq!(max_debt_for_budget::<u128>(u128::MAX, whole), u128::MAX / 2);
-		assert_eq!(max_debt_for_budget::<u128>(u128::MAX, |_| 0), u128::MAX);
+		assert_eq!(max_debt_for_budget(0, whole), 0);
+		assert_eq!(max_debt_for_budget(1, whole), 0);
+		assert_eq!(max_debt_for_budget(2, whole), 1);
+		assert_eq!(max_debt_for_budget(u128::MAX, whole), u128::MAX / 2);
+		assert_eq!(max_debt_for_budget(u128::MAX, |_| 0), u128::MAX);
 	}
 
 	#[test]
@@ -647,9 +647,9 @@ mod tests {
 
 	#[test]
 	fn scale_floor_basic() {
-		assert_eq!(scale_floor::<u128>(100, 1, 2), 50);
-		assert_eq!(scale_floor::<u128>(100, 3, 4), 75);
-		assert_eq!(scale_floor::<u128>(100, 1, 0), 0);
+		assert_eq!(scale_floor(100u128, 1, 2), 50);
+		assert_eq!(scale_floor(100u128, 3, 4), 75);
+		assert_eq!(scale_floor(100u128, 1, 0), 0);
 	}
 
 	/// Verifies curve properties across the full parameter space.
@@ -806,7 +806,7 @@ mod tests {
 				(curve, tranches) in curve_and_tranches()
 			) {
 				let total: u128 = tranches.iter().sum();
-				let at_once = curve.fee::<u128>(total);
+				let at_once = curve.fee(total);
 				let (split, _) = redeem_in_tranches(curve, &tranches);
 				let slack = fee_slack(total);
 				let count = tranches.len();
@@ -859,7 +859,7 @@ mod tests {
 				let redeemed: u128 = tranches.iter().sum();
 				let less = redeemed * less_ppm / 1_000_000;
 				let slack = fee_slack(redeemed);
-				prop_assert!(curve.fee::<u128>(less) <= curve.fee::<u128>(redeemed) + slack);
+				prop_assert!(curve.fee(less) <= curve.fee(redeemed) + slack);
 				prop_assert!(
 					curve.charged_rate(less) <=
 						curve.charged_rate(redeemed).saturating_add(rate_slack())
@@ -873,7 +873,7 @@ mod tests {
 				higher.decayed = curve
 					.decayed
 					.saturating_add(FixedU128::from_rational(higher_arrival_ppm, 1_000_000));
-				prop_assert!(higher.fee::<u128>(redeemed) + slack >= curve.fee::<u128>(redeemed));
+				prop_assert!(higher.fee(redeemed) + slack >= curve.fee(redeemed));
 				prop_assert!(
 					higher.charged_rate(redeemed).saturating_add(rate_slack()) >=
 						curve.charged_rate(redeemed)
