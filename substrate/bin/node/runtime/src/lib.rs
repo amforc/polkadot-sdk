@@ -3368,6 +3368,11 @@ impl pallet_vaults::Config for Runtime {
 	type BenchmarkHelper = VaultsBenchmarkHelper;
 }
 
+/// Trust-backed asset id the vault benchmarks mint their stablecoin under. The
+/// benchmarks create the asset themselves, so any free id works.
+#[cfg(feature = "runtime-benchmarks")]
+const BENCHMARK_STABLE_ASSET_ID: VaultsStableId = 50_000_342;
+
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchmarkHelper;
 
@@ -3378,7 +3383,7 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 	}
 
 	fn stable_asset_id() -> VaultsStableId {
-		PsmStablecoinAssetId::get()
+		BENCHMARK_STABLE_ASSET_ID
 	}
 
 	fn set_oracle_price(asset_id: VaultsCollateralId, price: FixedU128) {
