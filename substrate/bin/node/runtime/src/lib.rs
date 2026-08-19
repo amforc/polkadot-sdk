@@ -3197,15 +3197,7 @@ parameter_types! {
 	/// Per-byte deposit slope; PSM footprints are fixed-size, so this is zero.
 	pub const PsmDepositSlope: Balance = 0;
 	pub PsmHoldReason: RuntimeHoldReason = RuntimeHoldReason::Psm(pallet_psm::HoldReason::CreationDeposit);
-	/// PSM fee revenue funds the internal stablecoin's insurance cover: the
-	/// same per-stable account redemptions settlement draws from.
-	pub PsmInsuranceFundAccount: AccountId =
-		<StableInsuranceAccount as traits::Convert<VaultsStableId, AccountId>>::convert(
-			PsmStablecoinAssetId::get(),
-		);
 }
-
-type PsmInternalAsset = ItemOf<Assets, PsmStablecoinAssetId, AccountId>;
 
 parameter_types! {
 	/// No debt ceiling: maximum possible issuance.
@@ -3545,7 +3537,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		use pallet_vaults::{pusd_primitives::OnBranchLifecycle as _, BenchmarkHelper as _};
 
 		let collateral_id = VaultsCollateralId::Native;
-		let stable_id: VaultsStableId = PsmStablecoinAssetId::get();
+		let stable_id: VaultsStableId = BENCHMARK_STABLE_ASSET_ID;
 
 		// The benchmark genesis does not create the pUSD asset, so opening vaults
 		// (which mints pUSD debt) and funding the redeemer would fail without it.
