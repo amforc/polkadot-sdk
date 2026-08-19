@@ -13,9 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared arrange-phase helpers encoding the numerical-examples document's
-//! Shared Assumptions. All helpers must run inside
-//! `AssetHubWestend::execute_with`.
+//! Shared setup helpers. They apply the Shared Assumptions of the
+//! numerical-examples document. Call them inside `AssetHubWestend::execute_with`.
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
@@ -26,23 +25,21 @@ use asset_hub_westend_runtime::{
 	Assets, Balances, MockOracle, Runtime, RuntimeHoldReason, Stability, Timestamp, Vaults,
 };
 pub(crate) const WND: Balance = 1_000_000_000_000;
-/// The stablecoin uses 6 decimals, matching the runtime's PSM asset.
+/// The stablecoin has 6 decimals, the same as the runtime's PSM asset.
 pub(crate) const PUSD: Balance = 1_000_000;
-/// 0.01 pUSD, the minimum balance the stablecoin is registered with.
+/// 0.01 pUSD. The stablecoin registers with this minimum balance.
 pub(crate) const PUSD_MIN_BALANCE: Balance = PUSD / 100;
 
-/// Trust-backed asset id the tests register pUSD under. The runtime names no
-/// single stablecoin, so the id is the fixture's own choice; it only has to stay
-/// clear of the assets the emulated genesis already creates.
+/// Trust-backed asset id for pUSD. The runtime names no stablecoin, so the tests
+/// choose one. It must not collide with the assets the emulated genesis creates.
 pub(crate) const PUSD_ID: u32 = 50_000_342;
 
 pub(crate) fn get_pusd_id() -> u32 {
 	PUSD_ID
 }
 
-/// pUSD's Insurance Fund account, derived exactly as the runtime derives it so a
-/// change to that mapping shows up here instead of silently funding a stray
-/// account.
+/// The Insurance Fund account of pUSD, derived as the runtime derives it. A
+/// change to that mapping then fails here instead of funding a wrong account.
 pub(crate) fn insurance_account() -> AccountId {
 	<StableInsuranceAccount as sp_runtime::traits::Convert<u32, AccountId>>::convert(get_pusd_id())
 }
@@ -76,8 +73,8 @@ pub(crate) fn feed_price_for(collateral_id: VaultsCollateralId, price: FixedU128
 	assert_ok!(MockOracle::set_price(RuntimeOrigin::root(), collateral_id, price));
 }
 
-/// Branch-configuration knobs the examples vary; everything else is pinned to
-/// the Shared Assumptions.
+/// Branch settings the examples vary. All other settings follow the Shared
+/// Assumptions.
 pub(crate) struct BranchSpec {
 	pub mcr: FixedU128,
 	pub icr: FixedU128,
@@ -95,8 +92,8 @@ impl Default for BranchSpec {
 			icr: FixedU128::from_rational(120, 100),
 			scr: FixedU128::from_rational(120, 100),
 			minimum_debt: 50 * PUSD,
-			// Zero keeps opened debt exactly at the drawn amount; example 16
-			// overrides this to price the upfront fee itself.
+			// Zero keeps the opened debt equal to the drawn amount. Example 16 sets
+			// the period itself.
 			upfront_fee_period_ms: 0,
 			keeper_flat_compensation_value: 2 * PUSD,
 			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
@@ -104,8 +101,8 @@ impl Default for BranchSpec {
 	}
 }
 
-/// The BranchSpec used by the liquidation examples: their vaults sit at
-/// CR 120% when the price halves, so eligibility needs MCR above that.
+/// Spec for the liquidation examples. Their vaults sit at CR 120% after the
+/// price halves, so the MCR must be above 120%.
 pub(crate) fn liquidation_spec() -> BranchSpec {
 	BranchSpec {
 		mcr: FixedU128::from_rational(125, 100),
@@ -115,8 +112,8 @@ pub(crate) fn liquidation_spec() -> BranchSpec {
 	}
 }
 
-/// [`liquidation_spec`] with keeper compensation zeroed, for the
-/// pool-accounting examples that omit it.
+/// [`liquidation_spec`] without keeper compensation, for the examples that
+/// omit it.
 pub(crate) fn accounting_spec() -> BranchSpec {
 	BranchSpec {
 		keeper_flat_compensation_value: 0,
@@ -125,13 +122,12 @@ pub(crate) fn accounting_spec() -> BranchSpec {
 	}
 }
 
-/// Creates the stablecoin and a native-WND market against it. Also lifts the
-/// global debt ceiling out of the way.
+/// Creates the stablecoin and a native-WND market for it, and lifts the global
+/// debt ceiling.
 pub(crate) fn create_branch(spec: &BranchSpec) {
 	create_pusd();
-	// A Root-created native market charges its full admin one ED, withdrawn under
-	// `Preserve`, so the admin needs two. `admin()` is not a well-known genesis
-	// account.
+	// Root creation charges the full admin one ED under `Preserve`, so the admin
+	// needs two ED. `admin()` has no genesis balance.
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(
 		&admin(),
 		get_native_ed().saturating_mul(2),
@@ -144,18 +140,17 @@ pub(crate) fn create_branch(spec: &BranchSpec) {
 		branch_config(&get_native_id(), spec),
 		registration_config(),
 	));
-	// The ceiling is denominated in the stablecoin's own units; a billion pUSD
-	// keeps it out of every example's way.
+	// A billion pUSD is above every example's debt.
 	lift_global_ceiling(1_000_000_000 * PUSD);
 }
 
-/// Creates the stablecoin asset, owned by [`admin`]: sufficient, so holders need
-/// no native provider reference, and with a real minimum balance.
+/// Creates the stablecoin asset, owned by [`admin`]. It is sufficient, so holders
+/// need no native provider reference, and it has a real minimum balance.
 ///
-/// A minimum balance above one unit makes the fee account's stablecoin account
-/// mandatory at the first market registration, and that account owns its own
-/// deposit, so it needs native balance to reserve against. On a live chain the
-/// treasury already holds some; the emulated genesis leaves it empty.
+/// With a minimum balance above one unit, the first market registration must
+/// create the fee account's stablecoin account. That account owns its deposit,
+/// so it needs native balance. A live treasury holds some. The emulated genesis
+/// does not, so the helper funds it.
 pub(crate) fn create_pusd() {
 	assert_ok!(Assets::force_create(
 		RuntimeOrigin::root(),
@@ -170,11 +165,11 @@ pub(crate) fn create_pusd() {
 	));
 }
 
-/// Creates a market from the stablecoin owner instead of Root, so the creator
-/// pays every refundable cost of registration rather than the full admin.
+/// Creates a market from the stablecoin owner instead of Root. The creator then
+/// pays every refundable registration cost, not the full admin.
 pub(crate) fn create_market_signed(collateral_id: VaultsCollateralId, spec: &BranchSpec) {
-	// The creator pays the market-creation deposit, the pool account's asset
-	// deposit, and the collateral custody seed.
+	// The creator pays the creation deposit, the pool account's asset deposit,
+	// and the custody seed.
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&admin(), 1_000 * WND));
 	fund_collateral(&collateral_id, &admin(), collateral_min_balance(&collateral_id));
 	assert_ok!(Vaults::create_branch(
@@ -187,9 +182,8 @@ pub(crate) fn create_market_signed(collateral_id: VaultsCollateralId, spec: &Bra
 	));
 }
 
-/// Test fixture for a pUSD market's `(redemptions, stability)` registration
-/// payload. The redemption policy is stablecoin-wide, so only the coin's first
-/// market carries it.
+/// Registration payload `(redemptions, stability)` for a pUSD market. The
+/// redemption policy is stablecoin-wide, so only the first market carries it.
 pub(crate) fn registration_config() -> (
 	Option<pallet_redemptions::RedemptionConfig<Balance>>,
 	pallet_stability::types::StabilityPoolConfig<Balance>,
@@ -227,8 +221,8 @@ fn test_stability_config() -> pallet_stability::types::StabilityPoolConfig<Balan
 	}
 }
 
-/// The global ceiling spans every collateral market issuing the coin, so one
-/// call covers them all. `amount` is in stablecoin units.
+/// One call covers every market of the coin, because the ceiling is
+/// stablecoin-wide. `amount` is in stablecoin units.
 pub(crate) fn lift_global_ceiling(amount: Balance) {
 	assert_ok!(Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), get_pusd_id(), amount));
 }
@@ -240,9 +234,8 @@ pub(crate) fn branch_admins() -> pallet_vaults::types::BranchAdmins<MultiAddress
 	}
 }
 
-/// A market's vault floors have to clear its own assets' minimum balances, so
-/// the collateral floor is derived from the collateral rather than pinned to a
-/// number that only suits one of them.
+/// The collateral floor comes from the collateral's own minimum balance, so one
+/// spec suits every collateral.
 pub(crate) fn branch_config(
 	collateral_id: &VaultsCollateralId,
 	spec: &BranchSpec,
@@ -269,8 +262,8 @@ pub(crate) fn branch_config(
 	}
 }
 
-/// Native collateral the owner can pledge. The extra ED keeps the account
-/// alive after a vault hold takes the pledged amount.
+/// Native collateral the owner can pledge, plus the ED that keeps the account
+/// alive under the vault hold.
 pub(crate) fn fund_dot(who: &AccountId, amount: Balance) {
 	fund_collateral(&get_native_id(), who, amount);
 }
@@ -282,8 +275,8 @@ pub(crate) fn fund_collateral(
 	who: &AccountId,
 	amount: Balance,
 ) {
-	// A non-sufficient asset account needs a provider reference to come into
-	// existence; native funding creates one on its own.
+	// A non-sufficient asset account needs a provider reference. Native funding
+	// supplies one.
 	if *collateral_id != get_native_id() {
 		if <Balances as FungibleInspect<AccountId>>::balance(who) < get_native_ed() {
 			assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(who, get_native_ed()));
@@ -301,9 +294,9 @@ pub(crate) fn collateral_min_balance(collateral_id: &VaultsCollateralId) -> Bala
 	<StabilityCollateral as Inspect<AccountId>>::minimum_balance(collateral_id.clone())
 }
 
-/// Collateral outside any vault hold, the multi-asset analogue of
-/// [`native_balance`]. Note this still counts the minimum-balance float, which a
-/// held account cannot spend.
+/// Collateral outside any vault hold, the multi-asset form of
+/// [`native_balance`]. It includes the minimum-balance float, which a held
+/// account cannot spend.
 pub(crate) fn collateral_free(collateral_id: &VaultsCollateralId, who: &AccountId) -> Balance {
 	<VaultsCollateral as Inspect<AccountId>>::balance(collateral_id.clone(), who)
 }
@@ -374,8 +367,8 @@ pub(crate) fn native_balance(who: &AccountId) -> Balance {
 	<Balances as FungibleInspect<AccountId>>::balance(who)
 }
 
-/// Jumps the emulated wall clock. Aura asserts that the timestamp matches its
-/// current slot, so the slot moves along with it.
+/// Moves the emulated clock forward. Aura requires the timestamp to match its
+/// slot, so the slot moves too.
 pub(crate) fn advance_time(ms: u64) {
 	let now = Timestamp::get() + ms;
 	let slot = now / asset_hub_westend_runtime::Aura::slot_duration();
@@ -391,7 +384,7 @@ pub(crate) fn pool_account_on(collateral_id: &VaultsCollateralId) -> AccountId {
 	Stability::pool_account(collateral_id, &get_pusd_id())
 }
 
-/// Mints and deposits, then rides out the entry delay so the funds are active.
+/// Mints and deposits, then passes the entry delay so the funds are active.
 pub(crate) fn sp_deposit_active(who: &AccountId, amount: Balance) {
 	sp_deposit_active_on(get_native_id(), who, amount);
 }
@@ -411,7 +404,7 @@ pub(crate) fn sp_deposit_active_on(
 	));
 }
 
-/// Mints and deposits, leaving the funds queued behind the entry delay.
+/// Mints and deposits. The funds stay pending behind the entry delay.
 pub(crate) fn sp_deposit_pending(who: &AccountId, amount: Balance) {
 	sp_deposit_pending_on(get_native_id(), who, amount);
 }
@@ -436,7 +429,7 @@ pub(crate) fn pool_state() -> pallet_stability::types::PoolState<Balance> {
 		.state
 }
 
-/// Rewrites the pool config through governance with the given tweaks.
+/// Changes the pool config through governance.
 pub(crate) fn mutate_pool_config(
 	tweak: impl FnOnce(&mut pallet_stability::types::StabilityPoolConfig<Balance>),
 ) {
@@ -452,9 +445,9 @@ pub(crate) fn mutate_pool_config(
 	));
 }
 
-/// Pins the redemption dynamic-fee state, standing in for whatever redemption
-/// history would have produced it. `last_fee_operation = now` means the value
-/// is already fully decayed.
+/// Sets the redemption dynamic fee directly, in place of the redemption history
+/// that would produce it. `last_fee_operation = now` means the value is already
+/// decayed.
 pub(crate) fn set_dynamic_fee(rate: FixedU128) {
 	pallet_redemptions::RedemptionStates::<Runtime>::insert(
 		get_pusd_id(),

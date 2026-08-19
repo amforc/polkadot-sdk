@@ -17,9 +17,8 @@ use crate::imports::*;
 use asset_hub_westend_runtime::Vaults;
 use pallet_vaults::JitTerms;
 
-/// Seizure is capped at debt × (1 + 5% offset penalty) in value; the keeper
-/// takes 2 pUSD flat (1 WND) plus 0.1% of the seizure, and the rest resolves
-/// against the pool.
+/// Seizure caps at debt × 1.05 in value. The keeper takes 2 pUSD flat plus 0.1%
+/// of the seizure. The rest goes to the pool.
 #[test]
 fn example_07_liquidation_fully_covered_by_active_stability_pool() {
 	AssetHubWestend::execute_with(|| {
@@ -49,17 +48,16 @@ fn example_07_liquidation_fully_covered_by_active_stability_pool() {
 			JitTerms { max_stable: 0, min_collateral_out: 0 },
 		));
 
-		// seized = min(6,000, 10,000 × 1.05 / 2) = 5,250 WND; the 750 WND
+		// seized = min(6,000, 10,000 × 1.05 / 2) = 5,250 WND. The 750 WND
 		// surplus returns to the owner.
 		assert_eq!(native_balance(&liquidated_owner) - owner_free_before, 750 * WND);
 		// keeper = 2 pUSD flat / 2 + 5,250 × 0.1% = 1 + 5.25 = 6.25 WND.
 		assert_eq!(native_balance(&keeper) - get_native_ed(), 6_250_000_000_000);
-		// The pool burned the full 10,000 pUSD debt and received the
-		// 5,250 − 6.25 = 5,243.75 WND resolution collateral.
+		// The pool burns the full 10,000 pUSD debt and receives 5,250 − 6.25 = 5,243.75 WND.
 		assert_eq!(pusd_balance(&pool_account()), 10_000 * PUSD);
 		assert_eq!(native_balance(&pool_account()), 5_243_750_000_000_000);
 		assert_eq!(pool_state().total_active_deposits, 10_000 * PUSD);
-		// The liquidated vault is gone from the branch.
+		// The liquidated vault is removed.
 		assert_eq!(
 			Vaults::vault_status(get_native_id(), get_pusd_id(), liquidated_owner.clone()),
 			None
@@ -67,10 +65,10 @@ fn example_07_liquidation_fully_covered_by_active_stability_pool() {
 	});
 }
 
-/// The 1,000 pUSD debt splits 500 active / 200 JIT / 100 pending /
-/// 200 redistributed; seizure weighs offsets at 1.05 and redistribution at
-/// 1.10, and collateral follows the same penalty weights. Keeper
-/// compensation is configured to zero, as the example omits it.
+/// The 1,000 pUSD debt splits into 500 active, 200 JIT, 100 pending, and 200
+/// redistributed. Seizure weighs offsets at 1.05 and redistribution at 1.10.
+/// Collateral follows the same weights. Keeper compensation is zero, because
+/// the example omits it.
 #[test]
 fn example_08_liquidation_active_jit_pending_and_redistribution() {
 	AssetHubWestend::execute_with(|| {
@@ -92,10 +90,9 @@ fn example_08_liquidation_active_jit_pending_and_redistribution() {
 		let pending_depositor = acct(5);
 		sp_deposit_pending(&pending_depositor, 100 * PUSD);
 
-		// The redistribution recipient. Redistribution prices its debt at the
-		// recipient-average rate, so the rate must be non-zero; opening after
-		// the deposit activation's time jump keeps its accrued interest at
-		// exactly zero.
+		// The redistribution recipient. Its rate must be non-zero, because
+		// redistribution prices debt at the recipient-average rate. It opens
+		// after the time jump, so it accrues no interest.
 		let recipient_owner = acct(2);
 		open_vault(&recipient_owner, 10_000 * WND, 1_000 * PUSD, FixedU128::from_rational(1, 100));
 
@@ -103,8 +100,7 @@ fn example_08_liquidation_active_jit_pending_and_redistribution() {
 
 		let keeper = acct(4);
 		fund_dot(&keeper, 0);
-		// Keeper JIT allowance = 200 pUSD, plus 1 pUSD so the burn does not
-		// have to empty the account.
+		// JIT allowance = 200 pUSD, plus 1 pUSD so the burn does not empty the account.
 		mint_pusd(&keeper, 201 * PUSD);
 		assert_ok!(Vaults::liquidate(
 			RuntimeOrigin::signed(keeper.clone()),
@@ -114,20 +110,18 @@ fn example_08_liquidation_active_jit_pending_and_redistribution() {
 			JitTerms { max_stable: 200 * PUSD, min_collateral_out: 0 },
 		));
 
-		// total weight = 800 × 1.05 + 200 × 1.10 = 1,060 pUSD → 530 WND
-		// seized; 70 WND surplus to the owner (plus the hold-headroom unit).
+		// total weight = 800 × 1.05 + 200 × 1.10 = 1,060 pUSD, so 530 WND is
+		// seized. The 70 WND surplus returns to the owner.
 		assert_eq!(native_balance(&liquidated_owner), 70 * WND + get_native_ed());
 		// JIT: burns 200 pUSD, receives 210 / 2 = 105 WND.
 		assert_eq!(pusd_balance(&keeper), PUSD);
 		assert_eq!(native_balance(&keeper) - get_native_ed(), 105 * WND);
-		// Pool: burned 500 active + 100 pending, received
-		// 262.5 + 52.5 = 315 WND.
+		// Pool: burns 500 active + 100 pending, receives 262.5 + 52.5 = 315 WND.
 		assert_eq!(pusd_balance(&pool_account()), 0);
 		assert_eq!(native_balance(&pool_account()), 315 * WND);
 		assert_eq!(pool_state().total_active_deposits, 0);
 		assert_eq!(pool_state().total_pending_deposits, 0);
-		// Redistribution: 200 pUSD debt and 110 WND land on the recipient
-		// vault once poked.
+		// Redistribution: 200 pUSD debt and 110 WND reach the recipient after a poke.
 		assert_ok!(Vaults::poke(
 			RuntimeOrigin::signed(keeper.clone()),
 			get_native_id(),

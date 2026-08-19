@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Collateral drawn from every asset pallet on Asset Hub: the native token, a
-//! trust-backed local asset, and a bridged foreign asset.
+//! Collateral from every asset pallet on Asset Hub: the native token, a
+//! trust-backed asset, and a bridged foreign asset.
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
@@ -33,12 +33,11 @@ use xcm::v5::{Junction::GlobalConsensus, Location, NetworkId};
 const ETH: Balance = 1_000_000_000_000_000_000;
 const USDT: Balance = 1_000_000;
 
-/// Total ether bridged to live Westend Asset Hub, rounded down. Vault sizes stay
-/// inside it so the scenario is one the chain could actually fund.
+/// Ether bridged to live Westend Asset Hub, rounded down. Vault sizes stay inside
+/// it, so the live chain could fund the scenario.
 const ETHER_SUPPLY_LIVE: Balance = 21 * ETH;
 
-/// Sepolia ether as Snowbridge names it on Asset Hub. Registered in the
-/// emulated genesis, so these tests take the bridge's own asset.
+/// Sepolia ETH on Asset Hub. The emulated genesis registers it.
 fn eth_id() -> VaultsCollateralId {
 	Location::new(2, [GlobalConsensus(NetworkId::Ethereum { chain_id: SEPOLIA_ID })])
 }
@@ -51,7 +50,7 @@ fn eth_price(pusd_per_eth: u128) -> FixedU128 {
 	FixedU128::from_rational(pusd_per_eth * PUSD, ETH)
 }
 
-/// Liquidates with no JIT allowance, using a throwaway keeper.
+/// Liquidates without JIT, with a throwaway keeper.
 fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId) {
 	let keeper = acct(0xEE);
 	fund_collateral(&collateral_id, &keeper, 0);
@@ -72,11 +71,11 @@ fn deposit_row_on(
 		.expect("deposit row exists")
 }
 
-/// Pays a depositor's realized gains out and asserts the collateral crossed
-/// from the pool account to the depositor in the collateral's own pallet.
+/// Pays out a depositor's realized gains and asserts the collateral moved from
+/// the pool account to the depositor in the collateral's own pallet.
 ///
-/// The outgoing leg is where the asset union has to route a payment the pool
-/// never chose the shape of, so it is checked per collateral pallet.
+/// The payout is where the asset union must route to a pallet the pool did not
+/// choose, so each collateral pallet is checked.
 fn claim_collateral_out(
 	collateral_id: &VaultsCollateralId,
 	depositor: &AccountId,
@@ -95,7 +94,7 @@ fn claim_collateral_out(
 
 	assert_eq!(collateral_free(collateral_id, depositor) - depositor_before, expected);
 	assert_eq!(pool_before - collateral_free(collateral_id, &pool), expected);
-	// The payout zeroed the row rather than mirroring it.
+	// The payout zeroes the claimable row.
 	assert_err!(
 		Stability::claim_collateral(
 			RuntimeOrigin::signed(depositor.clone()),
@@ -109,9 +108,8 @@ fn claim_collateral_out(
 
 /// One stablecoin, three markets: native WND, trust-backed USDT, bridged ETH.
 ///
-/// Each vault pledges 20,000 pUSD of value against 10,000 pUSD of debt, so the
-/// three differ only in which pallet issues the collateral and how many
-/// decimals it carries.
+/// Each vault pledges 20,000 pUSD of value against 10,000 pUSD of debt. The
+/// three differ only in the collateral pallet and the decimals.
 #[test]
 fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 	AssetHubWestend::execute_with(|| {
@@ -139,8 +137,7 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 		assert_eq!(pusd_balance(&usdt_owner), 10_000 * PUSD);
 		assert_eq!(pusd_balance(&eth_owner), 10_000 * PUSD);
 
-		// Custody is a hold in the collateral's own pallet, leaving only the
-		// minimum-balance float free.
+		// Custody is a hold in the collateral's own pallet. Only the minimum-balance float is free.
 		assert_eq!(collateral_on_hold(&get_native_id(), &native_owner), 10_000 * WND);
 		assert_eq!(collateral_on_hold(&usdt_id(), &usdt_owner), 20_000 * USDT);
 		assert_eq!(collateral_free(&usdt_id(), &usdt_owner), collateral_min_balance(&usdt_id()));
@@ -149,14 +146,13 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 	});
 }
 
-/// Ether is a sufficient asset, so its accounts exist without a deposit — but
-/// registering a market for it still needs one.
+/// Ether is a sufficient asset, so its accounts need no deposit. A market for it
+/// still needs one.
 ///
-/// The stability pool must be able to take an offset gain below the collateral's
-/// minimum balance, which needs a zero-balance account created up front, which
-/// needs someone to charge the asset-account deposit to. Root supplies no
-/// depositor, so that charge lands on the market's full admin — the same account
-/// Root creation already charges for collateral custody.
+/// The stability pool must accept an offset gain below the collateral's minimum
+/// balance. That needs a pool account created in advance, and someone must pay
+/// its asset-account deposit. Root supplies no depositor, so the full admin pays.
+/// Root creation already charges that account for collateral custody.
 #[test]
 fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 	AssetHubWestend::execute_with(|| {
@@ -177,8 +173,8 @@ fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 		));
 		assert!(pallet_vaults::Branches::<Runtime>::get(eth_id(), get_pusd_id()).is_some());
 
-		// The pool can now take an offset gain below the collateral's minimum balance.
-		// Root supplies no depositor, so the asset-account deposit lands on the full admin.
+		// The pool can now take a gain below the collateral's minimum balance. The
+		// full admin paid the deposit.
 		let pool = pallet_stability::Pallet::<Runtime>::pool_account(&eth_id(), &get_pusd_id());
 		let (depositor, deposit) =
 			<StabilityCollateral as Refund<AccountId>>::deposit_held(eth_id(), pool.clone())
@@ -195,10 +191,9 @@ fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 	});
 }
 
-/// Same figures as the native example scaled by the ETH price: seizure caps at
-/// debt × (1 + 5% offset penalty) in value, the keeper takes 2 pUSD flat plus
-/// 0.1% of the seizure, and the rest resolves against the pool — from where
-/// the sole depositor claims all of it.
+/// The native example's figures, scaled by the ETH price. Seizure caps at
+/// debt × 1.05 in value. The keeper takes 2 pUSD flat plus 0.1% of the seizure.
+/// The rest goes to the pool, and the sole depositor claims all of it.
 #[test]
 fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 	AssetHubWestend::execute_with(|| {
@@ -211,7 +206,7 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 		let liquidated_owner = acct(1);
 		open_vault_on(eth_id(), &liquidated_owner, 6 * ETH, 10_000 * PUSD, FixedU128::zero());
 		// A healthy vault keeps the branch populated after the liquidation. Both
-		// vaults together stay under the ether actually bridged to Westend.
+		// vaults stay under the ether bridged to Westend.
 		let filler_owner = acct(2);
 		open_vault_on(
 			eth_id(),
@@ -237,7 +232,7 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 			JitTerms { max_stable: 0, min_collateral_out: 0 },
 		));
 
-		// seized = min(6, 10,000 × 1.05 / 2,000) = 5.25 ETH; the 0.75 ETH
+		// seized = min(6, 10,000 × 1.05 / 2,000) = 5.25 ETH. The 0.75 ETH
 		// surplus returns to the owner.
 		assert_eq!(
 			collateral_free(&eth_id(), &liquidated_owner) - owner_free_before,
@@ -248,23 +243,21 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 			collateral_free(&eth_id(), &keeper) - collateral_min_balance(&eth_id()),
 			6_250_000_000_000_000,
 		);
-		// The pool burned the full 10,000 pUSD debt and took the
-		// 5.25 − 0.00625 = 5.24375 ETH resolution collateral.
+		// The pool burns the full 10,000 pUSD debt and receives 5.25 − 0.00625 = 5.24375 ETH.
 		let pool = pool_account_on(&eth_id());
 		assert_eq!(pusd_balance(&pool), 10_000 * PUSD);
 		assert_eq!(collateral_free(&eth_id(), &pool), 5_243_750_000_000_000_000);
-		// The liquidated vault is gone from the branch.
+		// The liquidated vault is removed.
 		assert_eq!(Vaults::vault_status(eth_id(), get_pusd_id(), liquidated_owner.clone()), None);
 
-		// The sole depositor's gain is the pool's whole resolution collateral.
+		// The sole depositor's gain is the whole pool collateral.
 		claim_collateral_out(&eth_id(), &depositor, 5_243_750_000_000_000_000);
-		// Claiming realized the row on the way through: half the 20,000 pUSD
-		// deposit burned, so P halved and the deposit compounded with it.
+		// The claim realizes the row. Half of the 20,000 pUSD deposit burned, so P halved.
 		assert_eq!(deposit_row_on(&eth_id(), &depositor).active_deposit, 10_000 * PUSD);
 	});
 }
 
-/// The same offset-and-claim round trip over a trust-backed local asset.
+/// The same offset and claim over a trust-backed asset.
 #[test]
 fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 	AssetHubWestend::execute_with(|| {
@@ -273,8 +266,7 @@ fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 		create_market_signed(usdt_id(), &accounting_spec());
 		lift_global_ceiling(1_000_000_000 * PUSD);
 
-		// 14,000 USDT against 10,000 pUSD debt: CR 140% at par, 117.6% once
-		// USDT trades at 0.84.
+		// 14,000 USDT against 10,000 pUSD debt: CR 140% at par, 117.6% at 0.84.
 		let liquidated_owner = acct(1);
 		open_vault_on(
 			usdt_id(),
@@ -283,13 +275,11 @@ fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 			10_000 * PUSD,
 			FixedU128::zero(),
 		);
-		// A healthy vault keeps the branch populated and its TCR out of
-		// Safety Mode after the liquidation.
+		// A healthy vault keeps the branch populated and out of Safety Mode after the liquidation.
 		let filler_owner = acct(2);
 		open_vault_on(usdt_id(), &filler_owner, 1_000_000 * USDT, 10_000 * PUSD, FixedU128::zero());
 
-		// The depositor holds no USDT at all: the stablecoin side of the pool
-		// is all it takes to earn collateral gains.
+		// The depositor holds no USDT. A stablecoin deposit is enough to earn collateral gains.
 		let depositor = acct(3);
 		sp_deposit_active_on(usdt_id(), &depositor, 25_000 * PUSD);
 		assert_eq!(collateral_free(&usdt_id(), &depositor), 0);
@@ -297,15 +287,14 @@ fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 		feed_price_for(usdt_id(), FixedU128::from_rational(84 * PUSD, 100 * USDT));
 		liquidate_on(usdt_id(), &liquidated_owner);
 
-		// seized = min(14,000, 10,000 × 1.05 / 0.84) = 12,500 USDT, all of it
-		// to the pool: this spec pays the keeper nothing.
+		// seized = min(14,000, 10,000 × 1.05 / 0.84) = 12,500 USDT, all to the
+		// pool. This spec pays the keeper nothing.
 		assert_eq!(
 			collateral_free(&usdt_id(), &liquidated_owner),
 			1_500 * USDT + collateral_min_balance(&usdt_id()),
 		);
 		claim_collateral_out(&usdt_id(), &depositor, 12_500 * USDT);
-		// Claiming realized the row on the way through: 10,000 of the
-		// 25,000 pUSD deposit burned, so P = 0.6.
+		// The claim realizes the row. 10,000 of the 25,000 pUSD deposit burned, so P = 0.6.
 		assert_eq!(deposit_row_on(&usdt_id(), &depositor).active_deposit, 15_000 * PUSD);
 	});
 }
