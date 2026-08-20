@@ -33,7 +33,7 @@ fn example_07_liquidation_fully_covered_by_active_stability_pool() {
 		open_vault(&filler_owner, 100_000 * WND, 10_000 * PUSD, FixedU128::zero());
 
 		let depositor = acct(3);
-		sp_deposit_active(&depositor, 20_000 * PUSD);
+		sp_deposit_matured(&depositor, 20_000 * PUSD);
 
 		feed_price(dot_price(2, 1)); // CR 120% < MCR 125%: liquidatable
 
@@ -86,7 +86,7 @@ fn example_08_liquidation_active_jit_pending_and_redistribution() {
 		open_vault(&liquidated_owner, 600 * WND, 1_000 * PUSD, FixedU128::zero());
 
 		let active_depositor = acct(3);
-		sp_deposit_active(&active_depositor, 500 * PUSD);
+		sp_deposit_matured(&active_depositor, 500 * PUSD);
 		let pending_depositor = acct(5);
 		sp_deposit_pending(&pending_depositor, 100 * PUSD);
 

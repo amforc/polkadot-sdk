@@ -33,8 +33,8 @@ fn liquidate(owner: &AccountId) {
 	));
 }
 
-fn poke_row(who: &AccountId) {
-	assert_ok!(Stability::poke_deposit(
+fn settle_row(who: &AccountId) {
+	assert_ok!(Stability::settle_deposit(
 		RuntimeOrigin::signed(who.clone()),
 		who.clone(),
 		get_native_id(),
@@ -171,9 +171,9 @@ fn example_06_active_pool_recovery_offset_and_realization() {
 		// Deposits activate before the vault enters the FIFO. Otherwise the pool
 		// would use them as incoming recovery offsets.
 		let big_depositor = acct(2);
-		sp_deposit_active(&big_depositor, 9_000 * PUSD);
+		sp_deposit_matured(&big_depositor, 9_000 * PUSD);
 		let small_depositor = acct(3);
-		sp_deposit_active(&small_depositor, 1_000 * PUSD);
+		sp_deposit_matured(&small_depositor, 1_000 * PUSD);
 
 		feed_price(dot_price(2, 1));
 		park_in_final_recovery(&parked_owner, 3_000 * WND, 5_000 * PUSD);
@@ -199,7 +199,7 @@ fn example_06_active_pool_recovery_offset_and_realization() {
 		assert_eq!(parked.collateral, 1_900 * WND);
 
 		// The 1,000 pUSD depositor realizes 800 pUSD and 1,000 × 0.11 = 110 WND.
-		assert_ok!(Stability::poke_deposit(
+		assert_ok!(Stability::settle_deposit(
 			RuntimeOrigin::signed(small_depositor.clone()),
 			small_depositor.clone(),
 			get_native_id(),
@@ -265,7 +265,7 @@ fn example_09_pending_deposit_pro_rata_offset() {
 			// floor(500e6 × 2/7) = 142,857,142; floor(500e6 × S).
 			(&cara, 142_857_142, 178_571_428_571_428),
 		] {
-			poke_row(who);
+			settle_row(who);
 			let row = deposit_row(who);
 			assert!(row.pending_deposit.is_none());
 			assert_eq!(row.active_deposit, pending_left);
@@ -289,9 +289,9 @@ fn example_10_offset_yield_and_depositor_realization() {
 		open_vault(&liquidated_owner, 1_300 * WND, 2_000 * PUSD, FixedU128::zero());
 
 		let big_depositor = acct(2);
-		sp_deposit_active(&big_depositor, 9_000 * PUSD);
+		sp_deposit_matured(&big_depositor, 9_000 * PUSD);
 		let small_depositor = acct(3);
-		sp_deposit_active(&small_depositor, 1_000 * PUSD);
+		sp_deposit_matured(&small_depositor, 1_000 * PUSD);
 
 		// The yield source: 10,000 pUSD at 4% accrues 400 pUSD in one 365.25-day
 		// year. It opens after the deposit activations, so accrual starts here.
@@ -323,7 +323,7 @@ fn example_10_offset_yield_and_depositor_realization() {
 		assert_eq!(active_sums().g_yield, FixedU128::from_rational(4, 100));
 
 		// The 1,000 pUSD depositor realizes 800 pUSD, 120 WND, and 40 pUSD of yield.
-		poke_row(&small_depositor);
+		settle_row(&small_depositor);
 		let row = deposit_row(&small_depositor);
 		assert_eq!(row.active_deposit, 800 * PUSD);
 		assert_eq!(row.claimable_collateral, 120 * WND);
@@ -359,10 +359,8 @@ fn example_11_multiple_depositor_cohorts() {
 
 		let depositor_1 = acct(4);
 		sp_deposit_pending(&depositor_1, 1_000 * PUSD);
-		poke_row(&depositor_1);
 		let depositor_2 = acct(5);
 		sp_deposit_pending(&depositor_2, 500 * PUSD);
-		poke_row(&depositor_2);
 		assert_eq!(pool_state().total_active_deposits, 1_500 * PUSD);
 
 		// Year one: 150 pUSD yield, G = 150 / 1,500 = 0.1.
@@ -384,7 +382,6 @@ fn example_11_multiple_depositor_cohorts() {
 		// The third cohort joins at P = 0.6, S = 0.2, G = 0.1.
 		let depositor_3 = acct(6);
 		sp_deposit_pending(&depositor_3, 900 * PUSD);
-		poke_row(&depositor_3);
 		assert_eq!(pool_state().total_active_deposits, 1_800 * PUSD);
 
 		// 1.2 more years: 180 pUSD yield, G += 180 × 0.6 / 1,800 = 0.06.
@@ -412,7 +409,7 @@ fn example_11_multiple_depositor_cohorts() {
 			(&depositor_2, 150 * PUSD, 175 * WND, 80 * PUSD),
 			(&depositor_3, 450 * PUSD, 225 * WND, 90 * PUSD),
 		] {
-			poke_row(who);
+			settle_row(who);
 			let row = deposit_row(who);
 			assert_eq!(row.active_deposit, compounded);
 			assert_eq!(row.claimable_collateral, collateral);
@@ -468,7 +465,7 @@ fn example_12_full_depletion_and_epoch_transition() {
 
 		// Epoch 0 to 1: the offset equals the pool, so the pool depletes.
 		let epoch_depositor = acct(5);
-		sp_deposit_active(&epoch_depositor, 1_000 * PUSD);
+		sp_deposit_matured(&epoch_depositor, 1_000 * PUSD);
 		feed_price(dot_price(36, 10));
 		liquidate(&epoch_casualty);
 		let state = pool_state();
@@ -481,7 +478,7 @@ fn example_12_full_depletion_and_epoch_transition() {
 		// the 1e-9 floor. The pallet rescales by 1e9 and lands at P = 0.5 on the
 		// next scale.
 		let scale_depositor = acct(6);
-		sp_deposit_active(&scale_depositor, scale_pool);
+		sp_deposit_matured(&scale_depositor, scale_pool);
 		liquidate(&scale_casualty);
 		let state = pool_state();
 		assert_eq!(state.total_active_deposits, PUSD_MIN_BALANCE);
@@ -498,10 +495,14 @@ fn example_12_full_depletion_and_epoch_transition() {
 			None,
 		));
 		let watched_depositor = acct(7);
-		sp_deposit_active(&watched_depositor, 600 * PUSD);
+		sp_deposit_matured(&watched_depositor, 600 * PUSD);
 		let other_depositor = acct(8);
-		sp_deposit_active(&other_depositor, 900 * PUSD);
-		assert_eq!(pool_state().total_active_deposits, 1_500 * PUSD);
+		sp_deposit_matured(&other_depositor, 900 * PUSD);
+		// The 900 deposit activated the 600 cohort on its way in, and its own cohort has
+		// matured. The liquidation below activates that one, so the offset sizes against 1,500.
+		let state = pool_state();
+		assert_eq!(state.total_active_deposits, 600 * PUSD);
+		assert_eq!(state.total_pending_deposits, 900 * PUSD);
 
 		// At 1.75 pUSD/WND the 1.05-weighted seizure for 1,500 pUSD is exactly 900 WND.
 		feed_price(dot_price(7, 4));
@@ -521,12 +522,12 @@ fn example_12_full_depletion_and_epoch_transition() {
 
 		// Realization crosses the epoch boundary. Nothing compounds, and the gain
 		// prices off the snapshot row: 600 × 0.3 / 0.5 = 360 WND.
-		poke_row(&watched_depositor);
+		settle_row(&watched_depositor);
 		let row = deposit_row(&watched_depositor);
 		assert_eq!(row.active_deposit, 0);
 		assert_eq!(row.claimable_collateral, 360 * WND);
 		// The other depositor gets the rest: 900 × 0.3 / 0.5 = 540 WND.
-		poke_row(&other_depositor);
+		settle_row(&other_depositor);
 		assert_eq!(deposit_row(&other_depositor).claimable_collateral, 540 * WND);
 	});
 }

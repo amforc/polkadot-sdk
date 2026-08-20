@@ -217,7 +217,7 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 		);
 
 		let depositor = acct(3);
-		sp_deposit_active_on(eth_id(), &depositor, 20_000 * PUSD);
+		sp_deposit_matured_on(eth_id(), &depositor, 20_000 * PUSD);
 
 		feed_price_for(eth_id(), eth_price(2_000)); // CR 120% < MCR 125%
 
@@ -281,7 +281,7 @@ fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 
 		// The depositor holds no USDT. A stablecoin deposit is enough to earn collateral gains.
 		let depositor = acct(3);
-		sp_deposit_active_on(usdt_id(), &depositor, 25_000 * PUSD);
+		sp_deposit_matured_on(usdt_id(), &depositor, 25_000 * PUSD);
 		assert_eq!(collateral_free(&usdt_id(), &depositor), 0);
 
 		feed_price_for(usdt_id(), FixedU128::from_rational(84 * PUSD, 100 * USDT));
