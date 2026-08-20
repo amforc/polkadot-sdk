@@ -19,8 +19,9 @@ fn deposit_moves_funds_and_queues_pending() {
 		assert_eq!(row.active_deposit, 0);
 		let pending = row.pending_deposit.expect("queued as pending");
 		assert_eq!(pending.amount, 400);
-		// Deposited at t = 1_000 with the 5_000 ms entry delay.
-		assert_eq!(pending.activatable_at, 6_000);
+		// Deposited at t = 1_000 with the 5_000 ms entry delay: 6_000, rounded up to the cohort
+		// boundary at 10_000.
+		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(10_000));
 		// Queued at the fresh pending accumulators.
 		assert_eq!(pending.snapshot.coords.p, FixedU128::one());
 		assert_eq!(pending.snapshot.coords.epoch, 0);
@@ -95,9 +96,9 @@ fn second_deposit_merges_and_resets_delay() {
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		let pending = row.pending_deposit.expect("still pending");
 		assert_eq!(pending.amount, 700);
-		// The merge restarts the whole amount's delay: deposited at 1_000,
-		// topped up 2_000 later, plus the fresh 5_000 delay.
-		assert_eq!(pending.activatable_at, 1_000 + 2_000 + 5_000);
+		// The merge restarts the whole amount's delay: topped up at t = 3_000, so the earliest
+		// activation is 8_000, rounded up to the cohort boundary at 10_000.
+		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(10_000));
 		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 700);
 
 		System::assert_last_event(
@@ -121,16 +122,17 @@ fn deposit_auto_activates_matured_pending() {
 		mint_stable(PUSD, 1, 1_000);
 
 		assert_ok!(deposit(1, DOT, PUSD, 400));
-		// Matured at t = 6_000; the next deposit activates it first.
-		advance_time(5_000);
+		// The cohort matures at t = 10_000; the next deposit advances it and settles the row
+		// before queueing its own amount.
+		advance_time(9_000);
 		assert_ok!(deposit(1, DOT, PUSD, 300));
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		assert_eq!(row.active_deposit, 400);
 		let pending = row.pending_deposit.expect("new amount queued");
 		assert_eq!(pending.amount, 300);
-		// Fresh delay for the new amount: t = 6_000 + 5_000.
-		assert_eq!(pending.activatable_at, 11_000);
+		// Fresh delay for the new amount: t = 10_000 + 5_000, already on a cohort boundary.
+		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(15_000));
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 400);

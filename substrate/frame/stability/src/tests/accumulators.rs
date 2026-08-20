@@ -20,23 +20,11 @@ fn pending_sums_at(epoch: u32, scale: u32) -> PoolSums {
 	crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Pending, epoch, scale))
 }
 
-/// Queue a pending (unactivated) deposit for `who`.
-fn seed_pending(who: AccountId, amount: Balance) {
-	mint_stable(PUSD, who, amount);
-	assert_ok!(deposit(who, DOT, PUSD, amount));
-}
-
-/// Deposit and immediately activate `amount` for `who`.
-fn seed_active(who: AccountId, amount: Balance) {
-	seed_deposit(who, amount);
-	activate_all(&[who]);
-}
-
 #[test]
 fn offsets_move_p_and_s_yield_moves_g() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 1_000);
+		seed_matured_deposit(1, 1_000);
 
 		// Offset 1: P = 800/1000 = 0.8, delta_S = 160 * (1/1000) = 0.16;
 		// G is untouched.
@@ -74,7 +62,7 @@ fn offsets_move_p_and_s_yield_moves_g() {
 fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_pending(1, 200);
+		seed_deposit(1, 200);
 
 		// Burn 100 of the 200 pending: P_pending = 100/200 = 0.5 and
 		// delta_S = 50 * (1/200) = 0.25.
@@ -86,7 +74,8 @@ fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
 		// The surviving floor(200 * 0.5) = 100 matures into the active pool.
 		// The pending stock is empty, yet nothing resets: no depletion
 		// happened.
-		activate_all(&[1]);
+		advance_time(10_000);
+		advance_matured_cohorts(DOT, PUSD);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.total_active_deposits, 100);
@@ -98,7 +87,7 @@ fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
 		// A fresh deposit snapshots that `P_pending`, so it is measured from
 		// where the accumulators stand rather than from `P = 1`: untouched,
 		// it realizes its full 400.
-		seed_pending(2, 400);
+		seed_deposit(2, 400);
 		assert_eq!(realized_pending(DOT, PUSD, 2), 400);
 
 		// Depletion is what resets the pair: a new epoch at `P = 1`, scale 0,

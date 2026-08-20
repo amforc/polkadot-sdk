@@ -1,4 +1,4 @@
-//! `claim_collateral`, `claim_yield` and `poke_deposit`.
+//! `claim_collateral`, `claim_yield` and `settle_deposit`.
 //!
 //! These tests write the claimable balances into storage directly, which separates payout and row
 //! pruning from the engines that produce the gains. Other modules cover claims earned through the
@@ -6,32 +6,10 @@
 
 use crate::{mock::*, Error};
 
-/// Credit `who` with claimable gains the way an offset / yield distribution
-/// would: row claimable + pool unclaimed total + backing pool balance.
-fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Balance) {
-	let pool = Stability::pool_account(&DOT, &PUSD);
-	crate::Deposits::<Test>::mutate((DOT, PUSD, who), |row| {
-		let row = row.as_mut().expect("deposit row exists");
-		row.claimable_collateral += collateral_gain;
-		row.claimable_yield += yield_gain;
-	});
-	crate::Pools::<Test>::mutate(DOT, PUSD, |pool| {
-		let state = &mut pool.as_mut().expect("pool registered").state;
-		state.total_collateral_gains_unclaimed += collateral_gain;
-		state.total_yield_unclaimed += yield_gain;
-	});
-	if collateral_gain > 0 {
-		mint_collateral(DOT, pool, collateral_gain);
-	}
-	if yield_gain > 0 {
-		mint_stable(PUSD, pool, yield_gain);
-	}
-}
-
 #[test]
 fn claim_collateral_pays_out_and_clears() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 		seed_claimables(1, 70, 0);
 
 		let before = collateral_balance(DOT, 1);
@@ -62,7 +40,7 @@ fn claim_collateral_pays_out_and_clears() {
 #[test]
 fn claim_yield_pays_out_to_recipient_and_clears() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 		seed_claimables(1, 0, 55);
 
 		assert_ok!(claim_yield(1, DOT, PUSD, 9));
@@ -90,7 +68,7 @@ fn claim_yield_pays_out_to_recipient_and_clears() {
 #[test]
 fn claims_leave_active_and_pending_untouched() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 		// A fresh immature pending amount on top of the 400 active.
 		assert_ok!(deposit(1, DOT, PUSD, 300));
 		seed_claimables(1, 70, 55);
@@ -110,7 +88,7 @@ fn claims_leave_active_and_pending_untouched() {
 #[test]
 fn final_claim_prunes_an_otherwise_empty_row() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 		seed_claimables(1, 70, 55);
 		// Drain the active deposit; only the two claimables keep the row.
 		assert_ok!(withdraw(1, DOT, PUSD, 400, 1));
@@ -140,13 +118,13 @@ fn claims_without_row_or_branch_revert() {
 #[test]
 fn claim_activates_matured_pending() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 		assert_ok!(deposit(1, DOT, PUSD, 300));
 		seed_claimables(1, 70, 0);
 
 		// The claim is a caller-initiated operation, so it performs the
 		// standard housekeeping: the matured 300 becomes active.
-		advance_time(5_000);
+		advance_time(9_000);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
@@ -159,17 +137,17 @@ fn claim_activates_matured_pending() {
 }
 
 #[test]
-fn poke_activates_matured_pending() {
+fn settle_activates_matured_pending() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 
 		// Nothing folds a matured pending leg in on its own: the row needs a
-		// touch. Long past maturity a third party supplies one, and the poke
+		// touch. Long past maturity a third party supplies one, and settlement
 		// completes the move.
 		advance_time(49_000);
-		assert_ok!(poke(7, 1, DOT, PUSD));
+		assert_ok!(settle(7, 1, DOT, PUSD));
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
 		assert_eq!(row.active_deposit, 400);
@@ -181,7 +159,7 @@ fn poke_activates_matured_pending() {
 #[test]
 fn claim_recipient_defaults_to_caller() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 		seed_claimables(1, 70, 55);
 
 		// A `None` recipient pays the caller on both claim sides.
@@ -196,10 +174,10 @@ fn claim_recipient_defaults_to_caller() {
 }
 
 #[test]
-fn poke_without_row_or_branch_reverts() {
+fn settle_without_row_or_branch_reverts() {
 	build_and_execute(|| {
-		assert_noop!(poke(7, 1, DOT, PUSD), Error::<Test>::PoolNotRegistered);
+		assert_noop!(settle(7, 1, DOT, PUSD), Error::<Test>::PoolNotRegistered);
 		register_branch(DOT, PUSD, default_branch_config());
-		assert_noop!(poke(7, 1, DOT, PUSD), Error::<Test>::DepositNotFound);
+		assert_noop!(settle(7, 1, DOT, PUSD), Error::<Test>::DepositNotFound);
 	});
 }

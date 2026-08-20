@@ -15,8 +15,8 @@ fn frozen_branch_blocks_every_value_moving_operation() {
 		seed_branch_with_debt();
 		assert_ok!(deposit(1, DOT, PUSD, 300));
 		drop(distribute_yield(DOT, PUSD, 60));
-		// Let the 300 mature, so the freeze provably blocks its activation.
-		advance_time(5_000);
+		// Let the 300's cohort mature, so the freeze provably blocks its advancement.
+		advance_time(9_000);
 
 		// A failing oracle reads as Frozen (fail closed).
 		MockOracleAvailable::set(false);
@@ -39,10 +39,10 @@ fn frozen_branch_blocks_every_value_moving_operation() {
 		let leftover = distribute_yield(DOT, PUSD, 40);
 		assert_eq!(leftover.peek(), 40);
 		drop(leftover);
-		// Poke moves no value and stays available for housekeeping, but the
+		// Settlement moves no value and stays available for housekeeping, but the
 		// matured pending amount stays put: activation changes offsettable
 		// risk, which the freeze halts.
-		assert_ok!(poke(7, 1, DOT, PUSD));
+		assert_ok!(settle(7, 1, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
 		assert_eq!(row.active_deposit, 400);
 		assert_eq!(row.pending_deposit.expect("still pending").amount, 300);

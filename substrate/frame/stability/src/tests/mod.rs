@@ -3,6 +3,7 @@ mod activation;
 mod adversarial;
 mod claimable_accrual;
 mod claims;
+mod cohorts;
 mod deposit;
 mod epoch_scale;
 mod governance;

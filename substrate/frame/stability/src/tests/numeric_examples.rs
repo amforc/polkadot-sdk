@@ -4,6 +4,7 @@
 //! against the model by hand rather than by trusting the assertions.
 
 use crate::{mock::*, types::Leg, Error};
+use pusd_primitives::StabilityPoolInspect;
 
 /// These vaults sit at CR 120%, above the default 110% MCR, so
 /// `FinalRecovery` would never admit them. This market's MCR is 130%; vaults
@@ -29,12 +30,6 @@ fn open_at_120_percent(owner: AccountId, collateral: Balance, debt: Balance) {
 	assert_ok!(open_vault(owner, DOT, PUSD, collateral, debt));
 	assert_eq!(vault_debt(DOT, PUSD, owner), debt);
 	set_price(DOT, FixedU128::from_rational(2, 1));
-}
-
-/// Deposit `amount` for `who` and fold it into the active pool.
-fn seed_active(who: AccountId, amount: Balance) {
-	seed_deposit(who, amount);
-	activate_all(&[who]);
 }
 
 /// An incoming deposit meets a `FinalRecovery` head at CR >= 100%, so it is
@@ -102,9 +97,9 @@ fn active_pool_recovery_offset_and_realization() {
 		open_at_120_percent(5, 3_000, 5_000);
 
 		// 10_000 of active deposits, of which this follows the 1_000 leg.
-		seed_active(1, 1_000);
-		seed_active(2, 9_000);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 10_000);
+		seed_matured_deposit(1, 1_000);
+		seed_matured_deposit(2, 9_000);
+		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 10_000), 10_000);
 		assert_ok!(enter_final_recovery(DOT, PUSD, 5));
 
 		assert_ok!(offset_recovery(DOT, PUSD, 2_000));
@@ -132,9 +127,9 @@ fn active_pool_recovery_offset_and_realization() {
 fn offset_then_yield_then_realization() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 1_000);
-		seed_active(2, 9_000);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 10_000);
+		seed_matured_deposit(1, 1_000);
+		seed_matured_deposit(2, 9_000);
+		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 10_000), 10_000);
 
 		// Offset 2_000 of debt for 1_200 DOT: S rises by 1_200/10_000 = 0.12,
 		// the pool drops to 8_000 and P to 0.8.
@@ -180,7 +175,7 @@ fn offset_then_yield_then_realization() {
 fn full_depletion_and_epoch_transition() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 1_000);
+		seed_matured_deposit(1, 1_000);
 
 		// Two offsets that take no collateral, purely to compound P: 1_000 →
 		// 600 gives P = 0.6, then 600 → 420 gives P = 0.6 * 0.7 = 0.42.
@@ -190,9 +185,9 @@ fn full_depletion_and_epoch_transition() {
 
 		// The depositor this follows joins at P = 0.42 with 600, and a third
 		// tops the pool up to 1_500.
-		seed_active(2, 600);
-		seed_active(3, 480);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 1_500);
+		seed_matured_deposit(2, 600);
+		seed_matured_deposit(3, 480);
+		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 1_500), 1_500);
 		let epoch_before = pool_state(DOT, PUSD).coords.epoch;
 
 		// Deplete: S rises by 900 * 0.42 / 1_500 = 0.252 on the closing epoch,

@@ -1,57 +1,57 @@
-//! The storage types of the stability pool, and the rules that keep them consistent.
+//! Storage types and accounting invariants of the stability pool.
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::arithmetic::{
-	FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Saturating, Zero,
+use frame::{
+	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Saturating, Zero},
+	prelude::{BoundedVec, ConstU32},
 };
 use pusd_primitives::Millis;
 use scale_info::TypeInfo;
 
 use crate::math;
 
-/// Where one leg of a pool stands in its loss history.
+/// Loss coordinates of one pool leg.
 ///
-/// A deposit keeps a copy of these coordinates and realizes against the live ones. Both a
-/// [`DepositSnapshot`] and a [`PoolState`] embed the type, hence the codec derives.
+/// A deposit stores these coordinates in its snapshot. Their change measures the deposit loss
+/// without an update to every deposit row.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct Accumulators {
 	/// The fraction of a deposit that survives every offset applied so far.
 	pub p: FixedU128,
-	/// Counts the offsets that emptied the leg. Each one resets `p` to one.
+	/// Number of offsets that emptied the leg. Each new epoch starts with `p` equal to one.
 	pub epoch: u32,
-	/// Counts the times `p` fell below `p_min` and was multiplied back up by `scale_factor`.
+	/// Number of rescale operations that kept a small `p` within the supported precision.
 	pub scale: u32,
 }
 
 impl Accumulators {
-	/// The coordinates of a leg that has taken no loss: `P = 1`, epoch and scale zero.
+	/// Returns loss-free coordinates with `P = 1`, epoch zero, and scale zero.
 	///
-	/// Realizing against them changes nothing, so a new deposit can start from them.
+	/// A new pool leg uses these coordinates so its first deposit has no prior loss.
 	pub fn fresh() -> Self {
 		Self { p: FixedU128::one(), epoch: 0, scale: 0 }
 	}
 }
 
-/// Which pool of capital an operation runs on.
+/// Accounting domain of a pool operation.
 ///
-/// Both legs share one set of accumulators and one implementation. The leg selects the
-/// coordinates, the total and the [`PoolSums`] rows that the operation reads and writes.
+/// Active and pending capital use separate loss coordinates because they have different risk
+/// priority. Only active capital receives yield.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
 pub enum Leg {
 	/// Deposits that absorb offsets and earn yield.
 	Active,
-	/// Deposits still waiting out the entry delay. They earn no yield, but they absorb what the
-	/// active pool cannot.
+	/// Deposits within the entry delay. They earn no yield and serve as the final pool backstop.
 	Pending,
 }
 
 impl Leg {
-	/// Both legs, in the order the pool seeds and checks them.
+	/// Both legs in risk-priority order.
 	pub const ALL: [Self; 2] = [Self::Active, Self::Pending];
 }
 
-/// What one `(epoch, scale)` coordinate of a leg has paid out per unit of deposit.
+/// Gains per deposit unit at one `(epoch, scale)` coordinate.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, Default)]
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct PoolSums {
@@ -61,11 +61,11 @@ pub struct PoolSums {
 	pub g_yield: FixedU128,
 }
 
-/// Where a deposit stood when it was last realized.
+/// Accounting position of a deposit at its last settlement.
 ///
-/// The distance between the snapshot and the live values is the loss and the gains that the
-/// deposit has not settled yet. Every [`Deposit`] row embeds one, hence the codec derives.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+/// The difference between this snapshot and the current accumulators gives the unsettled loss and
+/// gains of the deposit.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
 pub struct DepositSnapshot {
 	/// The accumulator coordinates at the time of the last realization.
 	pub coords: Accumulators,
@@ -74,16 +74,103 @@ pub struct DepositSnapshot {
 }
 
 impl DepositSnapshot {
-	/// The snapshot of a leg that has taken no loss. Realizing against it changes nothing.
+	/// Returns a snapshot for a leg with no prior loss or gain.
 	pub fn fresh() -> Self {
 		Self { coords: Accumulators::fresh(), sums: PoolSums::default() }
 	}
 }
 
-/// The sums rows one realization needs.
+/// Stable identifier of one maturity cohort in one market.
 ///
-/// A deposit can lag the pool by up to `math::SCALE_SPAN` scale boundaries, and it earns a share
-/// of every row in between, so one read of its own row is not enough.
+/// Identifiers increase from zero, and the pallet does not reuse them. The identifier remains
+/// valid if governance causes a cohort deadline to move later.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	MaxEncodedLen,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	PartialOrd,
+	Ord,
+	Debug,
+)]
+pub struct CohortId(pub u64);
+
+/// Pending capital with one activation deadline.
+///
+/// The aggregate lets the pallet activate all members with bounded work. A
+/// [`CohortCheckpoint`] preserves each member's later settlement.
+///
+/// The pool keeps at most two in [`PoolState::open_cohorts`].
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
+pub struct OpenCohort<Balance> {
+	/// Stable identifier referenced by member rows.
+	pub id: CohortId,
+	/// Time when the capital becomes active. A configuration change can move it later but not
+	/// earlier.
+	pub deadline: Millis,
+	/// Deposit rows that reference this cohort.
+	pub members: u32,
+	/// Aggregate capital at `coords`, with upward rounding.
+	///
+	/// It is not less than the sum of the member claims. Thus, activation cannot create an
+	/// underfunded active deposit. The rounding difference remains unowned in the pool totals.
+	pub amount: Balance,
+	/// Pending-leg coordinates of `amount`. A member snapshot cannot be ahead of these
+	/// coordinates.
+	pub coords: Accumulators,
+}
+
+/// Open maturity cohorts of one pool, ordered by deadline.
+///
+/// Deadline grouping permits at most two open cohorts. This bound keeps activation work
+/// independent of the depositor count.
+pub type OpenCohorts<Balance> = BoundedVec<OpenCohort<Balance>, ConstU32<2>>;
+
+impl<Balance: FixedPointOperand> OpenCohort<Balance> {
+	/// Returns an empty cohort at `deadline` and the current pending coordinates.
+	pub fn fresh(id: CohortId, deadline: Millis, coords: Accumulators) -> Self {
+		Self { id, deadline, members: 0, amount: Balance::zero(), coords }
+	}
+
+	/// Revalues the aggregate at the `live` pending coordinates.
+	///
+	/// Upward rounding keeps the aggregate sufficient for all downward-rounded member claims. The
+	/// coordinate update also keeps each member snapshot at or behind the aggregate.
+	pub fn revalue(&mut self, live: &Accumulators, sf_int: u128) {
+		self.amount = math::compound_ceil(self.amount, &self.coords, live, sf_int);
+		self.coords = *live;
+	}
+}
+
+/// Accounting boundary of an activated cohort.
+///
+/// The boundary ends pending exposure at `pending_end` and starts active exposure at
+/// `active_start`. This split preserves both phases until each member row settles.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+pub struct CohortCheckpoint<Balance> {
+	/// End of each member's pending phase.
+	pub pending_end: DepositSnapshot,
+	/// Start of each member's active phase.
+	pub active_start: DepositSnapshot,
+	/// Cohort value at activation, before the pool-total clamp.
+	///
+	/// This value is an upper bound for all member claims and keeps their sum at or below
+	/// activated capital.
+	pub activated: Balance,
+	/// Deposit rows that still require this boundary. The last settlement removes the checkpoint.
+	pub members: u32,
+}
+
+/// Accumulator rows required to settle one deposit.
+///
+/// A deposit can lag by `math::SCALE_SPAN` scale boundaries. Settlement includes each applicable
+/// row so the depositor keeps all supported gains.
 pub struct SumsWindow {
 	/// The row at the coordinates of the snapshot.
 	pub snap: PoolSums,
@@ -91,30 +178,28 @@ pub struct SumsWindow {
 	pub ahead: [PoolSums; math::SCALE_SPAN as usize],
 }
 
-/// How far `P` may fall before the pool rescales it.
+/// Precision parameters for the product accumulator `P`.
 ///
-/// These parameters cannot change after registration. A deposit left behind a scale boundary
-/// realizes against the `scale_factor` that was live when it crossed that boundary, so a new
-/// factor would misprice it.
+/// These parameters cannot change after registration. Stored snapshots depend on the original
+/// `scale_factor`, and a different value would produce incorrect deposit amounts.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct PoolPrecision {
 	/// The value of `P` that triggers a rescale.
 	pub p_min: FixedU128,
-	/// What a rescale multiplies `P` by.
+	/// Factor that a rescale applies to `P`.
 	///
-	/// Read it through [`PoolPrecision::scale_factor`], which widens it for the accumulator math
-	/// and guards against a zero decoded from corrupt storage. The field itself is public because
-	/// governance passes a whole [`StabilityPoolConfig`] as a call argument.
+	/// [`PoolPrecision::scale_factor`] converts this value for accumulator arithmetic and protects
+	/// division from corrupt zero values.
 	pub scale_factor: u64,
 }
 
 impl PoolPrecision {
-	/// Returns whether these parameters keep the accumulator math sound.
+	/// Returns `true` when the parameters keep accumulator arithmetic within its limits.
 	///
-	/// `scale_factor` must sit between `math::SCALE_FACTOR_INT_MIN` and
-	/// `math::SCALE_FACTOR_INT_MAX`, and a rescale must leave `P` at or below one, which needs
+	/// `scale_factor` must be between `math::SCALE_FACTOR_INT_MIN` and
+	/// `math::SCALE_FACTOR_INT_MAX`. A rescale must also leave `P` at or below one, which requires
 	/// `p_min * scale_factor <= 1`.
 	pub fn is_valid(&self) -> bool {
 		if self.p_min.is_zero() {
@@ -130,9 +215,9 @@ impl PoolPrecision {
 			FixedU128::one()
 	}
 
-	/// `scale_factor` widened for the `u128` accumulator math.
+	/// Returns `scale_factor` as a `u128` for accumulator arithmetic.
 	///
-	/// The result is at least one, so a value decoded from corrupt storage cannot divide by zero.
+	/// The result is at least one, which prevents division by zero after corrupt storage input.
 	pub fn scale_factor(&self) -> u128 {
 		debug_assert!(self.scale_factor >= math::SCALE_FACTOR_INT_MIN);
 		debug_assert!(self.scale_factor <= math::SCALE_FACTOR_INT_MAX);
@@ -140,10 +225,10 @@ impl PoolPrecision {
 	}
 }
 
-/// What realizing a deposit against the live accumulators produced.
+/// Settlement result for a deposit at the current accumulators.
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct Realized<Balance> {
-	/// What is left of the deposit after every offset it lived through.
+	/// Deposit principal that remains after all applicable offsets.
 	pub compounded: Balance,
 	/// The collateral it earned.
 	pub collateral_gain: Balance,
@@ -151,41 +236,41 @@ pub struct Realized<Balance> {
 	pub yield_gain: Balance,
 }
 
-/// What an offset did to `P`.
+/// Effect of an offset on `P`.
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub enum PUpdate {
-	/// The leg survives with a smaller `P`. `scales_crossed` counts the rescales it took to keep
-	/// `P` at or above `p_min`.
+	/// The leg remains with a smaller `P`. `scales_crossed` counts the rescale operations that
+	/// keep `P` at or above `p_min`.
 	Updated { new_p: FixedU128, scales_crossed: u32 },
-	/// The offset consumed the whole leg. The caller starts a new epoch.
+	/// The offset consumed the leg. A new epoch must start with `P` equal to one.
 	Depleted,
 }
 
-/// What one account holds in one market.
+/// Position of one account in one market.
 ///
-/// `active_deposit` is the amount as of the last realization, so it can lag the live `P`. Every
-/// operation on the row realizes it first, then applies its own change.
+/// `active_deposit` is the amount at the last settlement. Each row operation must first apply the
+/// current loss and gain accumulators.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct Deposit<Balance> {
 	/// Stablecoin that absorbs offsets and earns yield.
 	pub active_deposit: Balance,
 
-	/// Where `active_deposit` stood when it was last realized.
+	/// Accounting position of `active_deposit` at its last settlement.
 	pub snapshot: DepositSnapshot,
 
-	/// Collateral earned and not yet paid out. Realizations add to it; a claim empties it.
+	/// Collateral earned and not yet paid.
 	pub claimable_collateral: Balance,
 	/// Stablecoin yield earned and not yet paid out or compounded.
 	pub claimable_yield: Balance,
 
-	/// Stablecoin still waiting out the entry delay.
+	/// Stablecoin within the entry delay.
 	pub pending_deposit: Option<PendingDeposit<Balance>>,
-	/// An announced Safety-Mode withdrawal.
+	/// A Safety-mode withdrawal request.
 	pub withdrawal_request: Option<WithdrawalRequest<Balance>>,
 }
 
 impl<Balance: Zero> Deposit<Balance> {
-	/// An empty row at the given snapshot. Realizing it changes nothing.
+	/// Returns an empty position at the specified snapshot.
 	pub fn fresh(snapshot: DepositSnapshot) -> Self {
 		Self {
 			active_deposit: Balance::zero(),
@@ -197,10 +282,10 @@ impl<Balance: Zero> Deposit<Balance> {
 		}
 	}
 
-	/// Returns whether the row holds no user value and can be removed.
+	/// Returns `true` when the row has no user value and the pallet can remove it.
 	///
-	/// A leftover `withdrawal_request` does not count. With nothing left to withdraw it is dead
-	/// state, and it goes with the row.
+	/// A withdrawal request does not keep an empty row. Without an active deposit, the request has
+	/// no value and cannot authorize a payment.
 	pub fn is_empty(&self) -> bool {
 		self.active_deposit.is_zero() &&
 			self.claimable_collateral.is_zero() &&
@@ -209,61 +294,81 @@ impl<Balance: Zero> Deposit<Balance> {
 	}
 }
 
-/// Stablecoin supplied recently and still waiting out the entry delay.
+/// Stablecoin within the entry delay.
 ///
-/// It is not part of `total_active_deposits` and it earns no yield. It is still at risk: an offset
-/// that the active pool cannot absorb takes from every pending deposit, in proportion to its size.
-/// The pending leg tracks that loss through its own accumulators, exactly as the active leg does.
+/// Pending capital earns no yield and is not part of `total_active_deposits`. It remains exposed as
+/// the final pool backstop, in proportion to each pending deposit.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct PendingDeposit<Balance> {
-	/// The amount as of the last realization, so it can lag the live pending `P`.
+	/// Amount at the last settlement. It can lag the current pending `P`.
 	pub amount: Balance,
-	/// When the amount may join the active pool.
-	pub activatable_at: Millis,
-	/// Where the amount stood on the pending leg when it was last realized. Its `g_yield` is
-	/// always zero; the type is shared with the active leg so that one implementation serves both.
+	/// Maturity cohort of the amount. It identifies an [`OpenCohort`] before activation and a
+	/// [`CohortCheckpoint`] after activation.
+	pub cohort: CohortId,
+	/// Pending-leg position at the last settlement. Its `g_yield` is always zero because pending
+	/// capital earns no yield.
 	pub snapshot: DepositSnapshot,
 }
 
-/// An announced withdrawal, waiting out the Safety-Mode delay.
+/// Withdrawal request subject to the Safety-mode delay.
 ///
-/// Only Safety Mode records one. A Normal-Mode request withdraws instead, and a Normal-Mode
-/// withdrawal ignores any request left over from an earlier period of stress.
+/// Only Safety mode stores this request. Normal mode permits a withdrawal without one.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 #[cfg_attr(test, derive(Clone, PartialEq, Debug))]
 pub struct WithdrawalRequest<Balance> {
-	/// How much active stablecoin the request still covers.
+	/// Active stablecoin amount that the request still authorizes.
 	pub amount: Balance,
-	/// When the withdrawal may run.
+	/// Earliest time of the withdrawal.
 	pub executable_at: Millis,
 }
 
-/// What a pool holds, and where both of its legs stand.
+/// Aggregate balances and accumulator positions of one pool.
 ///
-/// The pending leg has no queue. An offset that reaches it takes from every pending deposit in
-/// proportion to its size, which a second pair of accumulators tracks in constant time.
+/// Separate active and pending accumulators preserve their risk priority. A pending offset applies
+/// proportionally to all pending deposits without iteration over deposit rows.
 ///
-/// The totals carry the rounding remainders of every payout, so the pool never reports owing more
-/// than its account holds. Separate surplus fields would be zero by construction.
+/// The totals include downward-rounding remainders. Thus, user positions cannot exceed the pool
+/// totals, and the totals remain equal to pool custody.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct PoolState<Balance> {
-	/// Stablecoin in the active pool, as the pool tracks it.
+	/// Stablecoin tracked for the active pool.
 	pub total_active_deposits: Balance,
-	/// Stablecoin in pending deposits, as the pool tracks it.
+	/// Stablecoin tracked for pending deposits.
 	pub total_pending_deposits: Balance,
 	/// The live coordinates of [`Leg::Active`].
 	pub coords: Accumulators,
 	/// The live coordinates of [`Leg::Pending`].
 	pub pending_coords: Accumulators,
-	/// Collateral the pool holds for depositors who have not claimed it.
+	/// Collateral tracked for unclaimed gains.
 	pub total_collateral_gains_unclaimed: Balance,
-	/// Stablecoin yield the pool holds for depositors who have not claimed or compounded it.
+	/// Stablecoin tracked for yield not yet claimed or compounded.
 	pub total_yield_unclaimed: Balance,
+	/// Open cohorts ordered from the earliest deadline to the latest deadline.
+	pub open_cohorts: OpenCohorts<Balance>,
+	/// Identifier reserved for the next cohort.
+	pub next_cohort_id: CohortId,
 }
 
 impl<Balance> PoolState<Balance> {
-	/// The live coordinates of `leg`.
+	/// Returns the open cohort with `id`.
+	pub fn cohort(&self, id: CohortId) -> Option<&OpenCohort<Balance>> {
+		self.open_cohorts.iter().find(|cohort| cohort.id == id)
+	}
+
+	/// Returns the open cohort with `id` for mutation.
+	pub fn cohort_mut(&mut self, id: CohortId) -> Option<&mut OpenCohort<Balance>> {
+		self.open_cohorts.iter_mut().find(|cohort| cohort.id == id)
+	}
+
+	/// Removes the open cohort with `id`.
+	pub fn remove_cohort(&mut self, id: CohortId) {
+		if let Some(index) = self.open_cohorts.iter().position(|cohort| cohort.id == id) {
+			self.open_cohorts.remove(index);
+		}
+	}
+
+	/// Returns the current coordinates of `leg`.
 	pub fn coords(&self, leg: Leg) -> &Accumulators {
 		match leg {
 			Leg::Active => &self.coords,
@@ -271,7 +376,7 @@ impl<Balance> PoolState<Balance> {
 		}
 	}
 
-	/// The live coordinates of `leg`, for update.
+	/// Returns the current coordinates of `leg` for mutation.
 	pub fn coords_mut(&mut self, leg: Leg) -> &mut Accumulators {
 		match leg {
 			Leg::Active => &mut self.coords,
@@ -279,7 +384,7 @@ impl<Balance> PoolState<Balance> {
 		}
 	}
 
-	/// The deposit total of `leg`, for update.
+	/// Returns the deposit total of `leg` for mutation.
 	pub fn total_mut(&mut self, leg: Leg) -> &mut Balance {
 		match leg {
 			Leg::Active => &mut self.total_active_deposits,
@@ -287,14 +392,14 @@ impl<Balance> PoolState<Balance> {
 		}
 	}
 
-	/// A snapshot at the live coordinates of `leg`. Pass that leg's live sums row as `sums`.
+	/// Returns a snapshot of `leg` with its current coordinates and `sums`.
 	pub fn snapshot(&self, leg: Leg, sums: &PoolSums) -> DepositSnapshot {
 		DepositSnapshot { coords: *self.coords(leg), sums: *sums }
 	}
 }
 
 impl<Balance: Copy> PoolState<Balance> {
-	/// The deposit total of `leg`.
+	/// Returns the deposit total of `leg`.
 	pub fn total(&self, leg: Leg) -> Balance {
 		match leg {
 			Leg::Active => self.total_active_deposits,
@@ -304,7 +409,7 @@ impl<Balance: Copy> PoolState<Balance> {
 }
 
 impl<Balance: Zero> PoolState<Balance> {
-	/// The state a market starts from: an empty pool at `P = 1` on both legs.
+	/// Returns an empty pool state with `P = 1` on both legs.
 	pub fn fresh() -> Self {
 		Self {
 			total_active_deposits: Balance::zero(),
@@ -313,12 +418,14 @@ impl<Balance: Zero> PoolState<Balance> {
 			pending_coords: Accumulators::fresh(),
 			total_collateral_gains_unclaimed: Balance::zero(),
 			total_yield_unclaimed: Balance::zero(),
+			open_cohorts: Default::default(),
+			next_cohort_id: CohortId(0),
 		}
 	}
 }
 
 impl<Balance: FixedPointOperand> PoolState<Balance> {
-	/// How much `S` or `G` grows when `distributed` is shared out over the active pool.
+	/// Returns the increase of `S` or `G` for `distributed` over the active pool.
 	///
 	/// Returns `None` when the active pool is empty or the product overflows.
 	pub fn delta_sum(&self, distributed: Balance) -> Option<FixedU128> {
@@ -326,33 +433,32 @@ impl<Balance: FixedPointOperand> PoolState<Balance> {
 	}
 }
 
-/// What governance sets per market.
+/// Governance parameters of one market's stability pool.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct StabilityPoolConfig<Balance> {
-	/// The smallest deposit the pool accepts. Keeps rows worth more than they cost to store.
+	/// Smallest accepted deposit. This limit prevents positions with storage cost above their
+	/// value.
 	pub minimum_deposit: Balance,
-	/// The smallest active pool an offset may leave behind. An offset either respects this floor
-	/// or empties the pool.
+	/// Smallest active balance that a partial offset can leave. A full offset can empty the pool.
+	/// This limit protects the precision of `P`.
 	pub minimum_active_pool_balance: Balance,
-	/// How long a new deposit waits before it joins the active pool.
+	/// Minimum time before new capital can join the active pool.
 	pub entry_delay: Millis,
-	/// How long a Safety-Mode withdrawal waits after its announcement.
+	/// Delay between a Safety-mode withdrawal request and its execution.
 	pub safety_withdrawal_delay: Millis,
-	/// How far `P` may fall before a rescale. Cannot change after registration.
+	/// Precision policy for `P`. It cannot change after registration.
 	pub precision: PoolPrecision,
-	/// The share of market yield the active pool takes. The rest goes to the fee destination of
-	/// the vault engine.
+	/// Share of market yield for active depositors. The yield caller retains the remainder.
 	pub yield_share: Permill,
 }
 
 impl<Balance: Zero> StabilityPoolConfig<Balance> {
-	/// Returns whether these parameters can be stored.
+	/// Returns `true` when the parameters satisfy all pool invariants.
 	///
-	/// A zero `minimum_deposit` admits rows too small to be worth their storage, and a zero
-	/// `minimum_active_pool_balance` removes the floor that keeps `P` precise. The precision
-	/// bounds are those of [`PoolPrecision::is_valid`].
+	/// `minimum_deposit` and `minimum_active_pool_balance` must be nonzero. The precision
+	/// parameters must satisfy [`PoolPrecision::is_valid`].
 	pub fn is_valid(&self) -> bool {
 		if self.minimum_deposit.is_zero() {
 			return false;
@@ -364,30 +470,30 @@ impl<Balance: Zero> StabilityPoolConfig<Balance> {
 	}
 }
 
-/// The pool of one market, parameters and state together.
+/// Configuration and accounting state of one market's pool.
 ///
-/// The two halves are created and removed as one, so neither can exist without the other.
+/// Both parts share one lifecycle so configuration cannot exist without its accounting state.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct StabilityPool<Balance> {
-	/// What governance sets. Only `set_stability_pool_config` changes it.
+	/// Parameters controlled by the authorized update origin.
 	pub config: StabilityPoolConfig<Balance>,
-	/// What the pool holds. Every pool operation rewrites it.
+	/// Aggregate balances and accumulator positions of the pool.
 	pub state: PoolState<Balance>,
 }
 
 impl<Balance: Zero> StabilityPool<Balance> {
-	/// The record a market starts from: the given parameters over an empty [`PoolState`].
+	/// Returns a registered pool with the specified parameters and an empty [`PoolState`].
 	pub fn fresh(config: StabilityPoolConfig<Balance>) -> Self {
 		Self { config, state: PoolState::fresh() }
 	}
 }
 
-/// Which stablecoin paid for a recovery offset.
+/// Source of stablecoin for a recovery offset.
 #[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
 pub enum RecoveryOffsetSource {
-	/// The active pool paid. Its depositors take the collateral through `S`.
+	/// The active pool paid, so its depositors receive the collateral through `S`.
 	ActivePool,
-	/// An incoming deposit paid. The depositor takes the collateral directly.
+	/// An incoming deposit paid, so that depositor receives the collateral directly.
 	IncomingDeposit,
 }
 #[cfg(test)]
@@ -458,7 +564,7 @@ mod tests {
 
 		deposit.pending_deposit = Some(PendingDeposit {
 			amount: 1,
-			activatable_at: 6_000,
+			cohort: CohortId(0),
 			snapshot: DepositSnapshot::fresh(),
 		});
 		assert!(!deposit.is_empty());
