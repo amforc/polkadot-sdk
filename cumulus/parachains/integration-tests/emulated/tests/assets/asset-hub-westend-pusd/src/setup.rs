@@ -384,24 +384,44 @@ pub(crate) fn pool_account_on(collateral_id: &VaultsCollateralId) -> AccountId {
 	Stability::pool_account(collateral_id, &get_pusd_id())
 }
 
-/// Mints and deposits, then passes the entry delay so the funds are active.
-pub(crate) fn sp_deposit_active(who: &AccountId, amount: Balance) {
-	sp_deposit_active_on(get_native_id(), who, amount);
+/// Mints and deposits, then waits out the entry delay.
+///
+/// The deposit is left matured rather than active. Activation belongs to the next pool
+/// operation the test performs, which is how it happens on chain.
+pub(crate) fn sp_deposit_matured(who: &AccountId, amount: Balance) {
+	sp_deposit_matured_on(get_native_id(), who, amount);
 }
 
-pub(crate) fn sp_deposit_active_on(
+pub(crate) fn sp_deposit_matured_on(
 	collateral_id: VaultsCollateralId,
 	who: &AccountId,
 	amount: Balance,
 ) {
 	sp_deposit_pending_on(collateral_id.clone(), who, amount);
-	advance_time(6_000); // past the 5s default entry delay
-	assert_ok!(Stability::poke_deposit(
-		RuntimeOrigin::signed(who.clone()),
-		who.clone(),
-		collateral_id,
+	// A deposit matures at its cohort's deadline, which lands anywhere in
+	// `[entry_delay, 2 * entry_delay)`, so wait out the cohort it actually joined. A zero
+	// entry delay activates on deposit and leaves no cohort to wait for.
+	let Some(deadline) = sp_pending_deadline(&collateral_id, who) else {
+		return;
+	};
+	let now = Timestamp::get();
+	if deadline > now {
+		advance_time(deadline - now);
+	}
+}
+
+/// The deadline of the cohort that the pending deposit of `who` waits out.
+fn sp_pending_deadline(collateral_id: &VaultsCollateralId, who: &AccountId) -> Option<u64> {
+	let pending = pallet_stability::Deposits::<Runtime>::get((
+		collateral_id.clone(),
 		get_pusd_id(),
-	));
+		who.clone(),
+	))?
+	.pending_deposit?;
+	pallet_stability::Pools::<Runtime>::get(collateral_id.clone(), get_pusd_id())?
+		.state
+		.cohort(pending.cohort)
+		.map(|cohort| cohort.deadline)
 }
 
 /// Mints and deposits. The funds stay pending behind the entry delay.
