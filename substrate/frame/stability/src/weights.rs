@@ -11,7 +11,7 @@ pub trait WeightInfo {
 	fn claim_yield() -> Weight;
 	fn compound_yield() -> Weight;
 	fn offset_recovery() -> Weight;
-	fn poke_deposit() -> Weight;
+	fn settle_deposit() -> Weight;
 	fn set_stability_pool_config() -> Weight;
 }
 
@@ -44,7 +44,7 @@ impl WeightInfo for () {
 		Weight::zero()
 	}
 
-	fn poke_deposit() -> Weight {
+	fn settle_deposit() -> Weight {
 		Weight::zero()
 	}
 

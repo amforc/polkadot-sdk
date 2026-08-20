@@ -1,11 +1,10 @@
-//! The arithmetic behind the pool accounting.
+//! Pure arithmetic and precision limits for stability-pool accounting.
 //!
-//! These functions are pure: they read no storage and they write none. The pallet documentation
-//! describes the model they serve. This module states the formulas and the limits they hold
-//! within.
+//! Pure functions keep accounting results independent of storage access order. The limits in this
+//! module prevent accumulator overflow and unsupported precision loss.
 //!
-//! Every payout to a user rounds down. The remainder stays with the pool, so the pool can always
-//! pay what it reports owing.
+//! User payouts round down. The pool keeps each remainder so recorded obligations do not exceed
+//! custody.
 
 use crate::types::{Accumulators, DepositSnapshot, PUpdate, PoolPrecision, Realized, SumsWindow};
 use frame::{
@@ -15,42 +14,101 @@ use frame::{
 	},
 	traits::Defensive,
 };
+use pusd_primitives::Millis;
 
-/// How many times one offset may rescale `P` before the pallet refuses it.
+/// Maximum number of `P` rescale operations in one offset.
 ///
-/// A second crossing needs the pool to shrink by a factor of more than 1e18 in one step. Only a
-/// `minimum_active_pool_balance` far too small for the size of the pool allows that.
+/// More crossings indicate that `minimum_active_pool_balance` is too small relative to the pool.
 pub const MAX_SCALE_CROSSINGS: u32 = 2;
 
-/// The smallest `scale_factor` a market may set. A smaller one recovers too little precision to be
-/// worth a scale boundary.
+/// Smallest permitted `scale_factor`. A smaller factor does not restore sufficient precision.
 pub const SCALE_FACTOR_INT_MIN: u64 = 1_000;
 
-/// The largest `scale_factor` a market may set.
+/// Largest permitted `scale_factor`.
 ///
 /// It keeps the worst case of [`update_p_after_offset`] inside `u128`:
 /// `P.inner * scale_factor^MAX_SCALE_CROSSINGS <= 1e18 * 1e20 = 1e38`.
 pub const SCALE_FACTOR_INT_MAX: u64 = 10_000_000_000;
 
-/// How many scale boundaries a deposit may lag the pool and still compound.
+/// Maximum scale distance at which a deposit retains compounded principal.
 ///
-/// The row at `snapshot.scale + k` carries an extra `scale_factor^k` divisor. Past this span the
-/// deposit is worth less than one part in 1e6 of what it was, so the pallet drops the remainder
-/// rather than carry an unbounded window. [`MAX_SCALE_CROSSINGS`] bounds one offset; this bounds
-/// how far behind a deposit may fall.
+/// Each scale adds a `scale_factor` divisor. Beyond this span, the deposit is worth less than one
+/// part in 1e6 of its initial value.
+///
+/// The finite span also bounds the accumulator rows required for one settlement.
 pub const SCALE_SPAN: u32 = 2;
 
-/// Settles a deposit of `d0`, taken as of its `snapshot`, against the live accumulators.
+/// Applies the principal formula used by [`realize`] and cohort aggregates:
+/// `amount * p_to / (p_from * scale_factor^behind)`, rounded per `rounding`.
 ///
-/// A deposit compounds while it is in the current epoch and at most [`SCALE_SPAN`] boundaries
-/// behind:
+/// An earlier epoch or a distance above [`SCALE_SPAN`] leaves no principal. Within the supported
+/// span, the result cannot exceed `amount`, even with upward rounding.
+fn compound<Balance: FixedPointOperand>(
+	amount: Balance,
+	from: &Accumulators,
+	to: &Accumulators,
+	sf_int: u128,
+	rounding: Rounding,
+) -> Balance {
+	debug_assert!(!from.p.is_zero());
+	debug_assert!(to.p <= FixedU128::one());
+	debug_assert!(from.epoch <= to.epoch);
+	if amount.is_zero() {
+		return Balance::zero();
+	}
+	if from.epoch != to.epoch {
+		return Balance::zero();
+	}
+	// Each boundary behind adds a `scale_factor` divisor. The `is_valid` bounds keep the worst
+	// case, `1e18 * (1e10)^SCALE_SPAN = 1e38`, inside `u128`.
+	let denominator = match to.scale.checked_sub(from.scale) {
+		Some(behind) if behind <= SCALE_SPAN => sf_int
+			.checked_pow(behind)
+			.and_then(|factor| from.p.into_inner().checked_mul(factor)),
+		Some(_) | None => None,
+	};
+	let compounded = match denominator {
+		Some(denominator) => mul_ratio(amount, to.p.into_inner(), denominator, rounding),
+		None => Balance::zero(),
+	};
+	debug_assert!(compounded <= amount);
+	compounded
+}
+
+/// Applies [`compound`] with upward rounding for a cohort aggregate.
 ///
-/// `compounded = floor(d0 * P / (P0 * scale_factor^k))`
+/// Member settlement rounds down. Upward aggregate rounding therefore keeps activated capital at
+/// or above the sum of all member claims.
+pub fn compound_ceil<Balance: FixedPointOperand>(
+	amount: Balance,
+	from: &Accumulators,
+	to: &Accumulators,
+	sf_int: u128,
+) -> Balance {
+	compound(amount, from, to, sf_int, Rounding::Up)
+}
+
+/// Returns `now + entry_delay`, rounded up to the next multiple of `entry_delay`.
 ///
-/// Further behind, or in an earlier epoch, nothing is left of the capital. Gains use one formula
-/// in every case, so a deposit keeps what it earned even once its capital is gone:
+/// Deadline grouping bounds the number of open cohorts. Upward rounding keeps the wait in
+/// `[entry_delay, 2 * entry_delay)` and never below the configured delay.
+pub fn cohort_deadline(now: Millis, entry_delay: Millis) -> Millis {
+	debug_assert!(entry_delay > 0);
+	let width = entry_delay.max(1);
+	let earliest = now.saturating_add(entry_delay);
+	earliest.checked_next_multiple_of(width).unwrap_or(Millis::MAX)
+}
+
+/// Settles deposit `d0` from its `snapshot` to the specified accumulator state.
 ///
-/// `gain = floor(d0 * ((sum_snap - sum0) + Σ ahead[k] / scale_factor^(k+1)) / P0)`
+/// Within its current epoch, a deposit compounds across at most [`SCALE_SPAN`] boundaries.
+///
+/// `compounded = floor(d0 * P / (P0 * scale_factor^k))`.
+///
+/// An earlier epoch or a distance above [`SCALE_SPAN`] leaves no principal. The gain formula
+/// preserves gains earned before the principal reached zero.
+///
+/// `gain = floor(d0 * ((sum_snap - sum0) + Σ ahead[k] / scale_factor^(k+1)) / P0)`.
 pub fn realize<Balance: FixedPointOperand>(
 	d0: Balance,
 	snapshot: &DepositSnapshot,
@@ -72,22 +130,7 @@ pub fn realize<Balance: FixedPointOperand>(
 	}
 	let sf_int = precision.scale_factor();
 
-	let compounded = if snapshot.coords.epoch == current.epoch {
-		// Each boundary behind adds a `scale_factor` divisor. The `is_valid` bounds keep the worst
-		// case, `1e18 * (1e10)^SCALE_SPAN = 1e38`, inside `u128`.
-		let denominator = match current.scale.checked_sub(snapshot.coords.scale) {
-			Some(behind) if behind <= SCALE_SPAN => sf_int
-				.checked_pow(behind)
-				.and_then(|factor| snapshot.coords.p.into_inner().checked_mul(factor)),
-			Some(_) | None => None,
-		};
-		match denominator {
-			Some(denom) => mul_ratio_floor(d0, current.p.into_inner(), denom),
-			None => Balance::zero(),
-		}
-	} else {
-		Balance::zero()
-	};
+	let compounded = compound(d0, &snapshot.coords, current, sf_int, Rounding::Down);
 	debug_assert!(compounded <= d0);
 
 	let collateral_gain = gain(
@@ -110,7 +153,7 @@ pub fn realize<Balance: FixedPointOperand>(
 	Realized { compounded, collateral_gain, yield_gain }
 }
 
-/// The gain leg of [`realize`], shared by the collateral sum `S` and the yield sum `G`:
+/// Applies the gain formula of [`realize`] to collateral sum `S` or yield sum `G`:
 /// `floor(d * ((sum_snap - sum0) + Σ ahead[k] / sf_int^(k+1)) / p0)`.
 fn gain<Balance: FixedPointOperand>(
 	d: Balance,
@@ -135,15 +178,15 @@ fn gain<Balance: FixedPointOperand>(
 	if delta.is_zero() {
 		return Balance::zero();
 	}
-	mul_ratio_floor(d, delta.into_inner(), p0.into_inner())
+	mul_ratio(d, delta.into_inner(), p0.into_inner(), Rounding::Down)
 }
 
-/// Caps an offset so that it never leaves an active pool below `min_active_pool`.
+/// Caps a partial offset at the `min_active_pool` floor.
 ///
-/// Such a pool would drive `P` towards zero on the next offset and cost the remaining deposits
-/// their precision. Emptying the pool stays allowed, because that starts a new epoch and returns
-/// `P` to one. A pool already below the floor can therefore only be emptied: a partial offset caps
-/// to zero.
+/// The floor protects the precision of deposits that remain. Full depletion remains valid because
+/// a new epoch resets `P` to one.
+///
+/// If the pool is already below the floor, the function permits only full depletion.
 pub fn clamp_offset_debt<Balance: FixedPointOperand + Ord>(
 	max_debt: Balance,
 	total_active: Balance,
@@ -168,25 +211,7 @@ pub fn clamp_offset_debt<Balance: FixedPointOperand + Ord>(
 	clamped
 }
 
-/// The share of `amount` that `numerator` out of `denominator` backs:
-/// `floor(amount * numerator / denominator)`.
-///
-/// `numerator` must not exceed `denominator`. Any zero input gives zero.
-#[cfg(test)]
-pub fn pro_rata_floor<Balance: FixedPointOperand>(
-	amount: Balance,
-	numerator: Balance,
-	denominator: Balance,
-) -> Balance {
-	debug_assert!(numerator <= denominator);
-	if amount.is_zero() || numerator.is_zero() || denominator.is_zero() {
-		return Balance::zero();
-	}
-	pusd_primitives::mul_div_floor(amount, numerator, denominator)
-		.defensive_unwrap_or_else(Balance::zero)
-}
-
-/// How much `S` or `G` grows when `distributed` is shared out over `total_active`:
+/// Returns the increase of `S` or `G` for a distribution over `total_active`:
 /// `floor(distributed * P / total_active)`.
 ///
 /// Returns `None` when the pool is empty or the product overflows. The caller reports an
@@ -201,13 +226,14 @@ pub fn delta_sum<Balance: FixedPointOperand>(
 	pusd_primitives::mul_div_rate_floor(distributed, p, total_active)
 }
 
-/// Shrinks `P` for an offset of `offset_debt` against `total_active`, and rescales it if needed.
+/// Returns `P` after `offset_debt` reduces `total_active`.
 ///
-/// The rescale is part of the division, not a step after it. Computing `floor(P * new_total /
-/// total)` first and multiplying by `scale_factor` afterwards would discard exactly the precision
-/// the rescale exists to protect, and can floor `P` to zero outright. Each candidate is therefore
-/// the single expression `floor(P.inner * scale_factor^k * new_total / total)`, for `k` from zero
-/// to [`MAX_SCALE_CROSSINGS`], and the first result at or above `p_min` wins.
+/// Each rescale uses one division to prevent an intermediate loss of precision. Candidate `k` is:
+///
+/// `floor(P.inner * scale_factor^k * new_total / total)`.
+///
+/// The function selects the first candidate at or above `p_min`, for `k` from zero through
+/// [`MAX_SCALE_CROSSINGS`].
 ///
 /// Returns `None` when the offset needs more crossings than the pallet supports, when an
 /// intermediate value overflows, or when `offset_debt` exceeds `total_active`. The caller must
@@ -251,18 +277,19 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	None
 }
 
-/// `floor(value * numerator / denominator)` at `Balance` precision, with the defensive fallback
-/// the payout paths share.
-fn mul_ratio_floor<Balance: FixedPointOperand>(
+/// Returns `value * numerator / denominator` at `Balance` precision with the specified rounding.
+/// Invalid arithmetic returns the conservative fallback used by payout calculations.
+fn mul_ratio<Balance: FixedPointOperand>(
 	value: Balance,
 	numerator: u128,
 	denominator: u128,
+	rounding: Rounding,
 ) -> Balance {
 	multiply_by_rational_with_rounding(
 		value.unique_saturated_into(),
 		numerator,
 		denominator,
-		Rounding::Down,
+		rounding,
 	)
 	.and_then(|raw| Balance::try_from(raw).ok())
 	.defensive_unwrap_or_else(Balance::zero)
@@ -479,15 +506,6 @@ mod tests {
 	}
 
 	#[test]
-	fn pro_rata_floor_floors() {
-		// floor(100 * 1 / 3) = 33.
-		assert_eq!(pro_rata_floor::<u128>(100, 1, 3), 33);
-		assert_eq!(pro_rata_floor::<u128>(100, 3, 3), 100);
-		assert_eq!(pro_rata_floor::<u128>(100, 0, 3), 0);
-		assert_eq!(pro_rata_floor::<u128>(0, 1, 3), 0);
-	}
-
-	#[test]
 	fn delta_sum_basic_and_floors() {
 		// floor(300 * 0.5 / 1000) = 0.15 → inner 1.5e17.
 		let got = delta_sum::<u128>(300, FixedU128::from_rational(1, 2), 1_000).expect("fits");
@@ -594,6 +612,89 @@ mod tests {
 			update_p_after_offset::<u128>(FixedU128::one(), 1_000, 0, &PRECISION),
 			Some(PUpdate::Updated { new_p: FixedU128::one(), scales_crossed: 0 })
 		);
+	}
+
+	#[test]
+	fn compound_rounds_per_caller_and_is_exact_on_clean_ratios() {
+		// 1000 from P0 = 0.3 to P = 0.2: the true value 666.66... floors for a member and ceils
+		// for a cohort aggregate.
+		let from = accumulators(FixedU128::from_rational(3, 10), 0, 0);
+		let to = accumulators(FixedU128::from_rational(1, 5), 0, 0);
+		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Down), 666);
+		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Up), 667);
+		// An exact ratio neither gains nor loses under either rounding.
+		let to = accumulators(FixedU128::from_rational(3, 20), 0, 0);
+		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Down), 500);
+		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Up), 500);
+		assert_eq!(compound::<u128>(0, &from, &to, SF as u128, Rounding::Up), 0);
+	}
+
+	#[test]
+	fn compound_divides_per_scale_behind_and_truncates_outside_the_window() {
+		let from = accumulators(FixedU128::one(), 0, 0);
+		let half = FixedU128::from_rational(1, 2);
+		let sf = SF as u128;
+		// One scale behind at P = 0.5 with sf = 1e9: floor(2e12 * 0.5 / 1e9) = 1000.
+		let to = accumulators(half, 0, 1);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Down), 1_000);
+		// Two behind: the floor drops the last sliver, the ceiling still carries it.
+		let to = accumulators(half, 0, 2);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Down), 0);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Up), 1);
+		// Beyond the span, or into a later epoch, nothing is left under either rounding.
+		let to = accumulators(half, 0, 3);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Up), 0);
+		let to = accumulators(half, 1, 0);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Up), 0);
+	}
+
+	/// A cohort aggregate uses upward rounding at each update. Thus, it cannot fall below the sum
+	/// of member claims that [`realize`] rounds down.
+	#[test]
+	fn aggregate_ceiling_covers_member_floors() {
+		let amounts: [u128; 6] = [1, 3, 99, 1_000, 123_457, 999_999_999_999];
+		// Where the pending leg stands at each member's join, in the order it moves.
+		let joins = [
+			accumulators(FixedU128::one(), 0, 0),
+			accumulators(FixedU128::from_rational(2, 3), 0, 0),
+			accumulators(FixedU128::from_rational(1, 7), 0, 0),
+			accumulators(FixedU128::from_inner(1_000_000_001), 0, 0),
+			accumulators(FixedU128::from_rational(1, 2), 0, 1),
+			accumulators(FixedU128::from_rational(1, 3), 0, 1),
+		];
+		let end = accumulators(FixedU128::from_rational(1, 4), 0, 1);
+		let sf = SF as u128;
+
+		let mut aggregate: u128 = 0;
+		let mut coords = joins[0];
+		let mut claims: u128 = 0;
+		for (amount, joined) in amounts.into_iter().zip(joins) {
+			// The revaluation a join performs, then the member claim as `realize` floors it.
+			aggregate = compound(aggregate, &coords, &joined, sf, Rounding::Up) + amount;
+			coords = joined;
+			claims += compound(amount, &joined, &end, sf, Rounding::Down);
+		}
+		let activated = compound::<u128>(aggregate, &coords, &end, sf, Rounding::Up);
+		assert!(claims <= activated);
+		// Each ceiling and each floor costs less than one raw unit of dust.
+		assert!(activated - claims <= 2 * amounts.len() as u128);
+	}
+
+	#[test]
+	fn cohort_deadline_rounds_up_never_down() {
+		// Mid-window: 1_000 + 5_000 = 6_000 rounds up to 10_000.
+		assert_eq!(cohort_deadline(1_000, 5_000), 10_000);
+		// On the boundary the wait is exactly the delay.
+		assert_eq!(cohort_deadline(5_000, 5_000), 10_000);
+		assert_eq!(cohort_deadline(0, 5_000), 5_000);
+		// One past the boundary rolls a whole width forward.
+		assert_eq!(cohort_deadline(5_001, 5_000), 15_000);
+		// The wait always lands in [delay, 2 * delay).
+		for now in [0, 1, 999, 4_999, 5_000, 7_331] {
+			let deadline = cohort_deadline(now, 5_000);
+			assert!(deadline - now >= 5_000);
+			assert!(deadline - now < 10_000);
+		}
 	}
 
 	#[test]

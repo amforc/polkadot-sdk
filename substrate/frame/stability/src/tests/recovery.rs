@@ -16,12 +16,11 @@ fn open_standing_vault() {
 	assert_eq!(vault_debt(DOT, PUSD, 5), 500);
 }
 
-/// Deposit-and-activate 400 for user 1 while the branch is still Normal.
-fn seed_active_pool() {
+/// Deposit 400 for user 1 while the branch is still Normal and move to its deadline. This also
+/// establishes the recovery examples' standing timestamp and accrued-interest figures.
+fn prepare_active_pool() {
 	mint_stable(PUSD, 1, 1_000);
-	assert_ok!(deposit(1, DOT, PUSD, 400));
-	advance_time(5_000);
-	assert_ok!(poke(1, 1, DOT, PUSD));
+	assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
 }
 
 /// Drop to 0.52 (CR = 104%) and park the vault in `FinalRecovery`.
@@ -35,7 +34,7 @@ fn active_pool_recovery_offset_settles_the_head() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		open_standing_vault();
-		seed_active_pool();
+		prepare_active_pool();
 		park_at_104_percent();
 
 		assert_ok!(offset_recovery(DOT, PUSD, 300));
@@ -83,7 +82,7 @@ fn recovery_offset_can_fully_deplete_the_pool() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		open_standing_vault();
-		seed_active_pool();
+		prepare_active_pool();
 		park_at_104_percent();
 
 		// capacity = min(500, 1000) = 500, but the pool holds 400: full
@@ -112,7 +111,7 @@ fn recovery_offset_clamps_at_the_pool_floor() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		open_standing_vault();
-		seed_active_pool();
+		prepare_active_pool();
 		park_at_104_percent();
 
 		// 350 would leave 50 < the 100 floor: clamped to 300, and the
@@ -136,7 +135,7 @@ fn recovery_offset_clamps_at_the_pool_floor() {
 fn recovery_offset_error_paths() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active_pool();
+		prepare_active_pool();
 
 		// No FinalRecovery vault queued.
 		assert_noop!(offset_recovery(DOT, PUSD, 300), Error::<Test>::RecoveryVaultNotFound);
@@ -159,7 +158,7 @@ fn active_recovery_rolls_back_when_pool_accounting_fails_after_settlement() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		open_standing_vault();
-		seed_active_pool();
+		prepare_active_pool();
 		park_at_104_percent();
 
 		crate::Pools::<Test>::mutate(DOT, PUSD, |pool| {
@@ -224,7 +223,7 @@ fn par_band_head_settles_at_face_value() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		open_standing_vault();
-		seed_active_pool();
+		prepare_active_pool();
 
 		// CR = 1000 * 0.5025 / 500 = 100.5%: at or above par, but inside the
 		// 1% bonus buffer, where the raw excess CR - 100% - buffer would be
@@ -272,7 +271,7 @@ fn below_par_head_rejects_offsets_and_deposits() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		open_standing_vault();
-		seed_active_pool();
+		prepare_active_pool();
 		// CR = 400/500 = 80%: below par. The (empty) Insurance Fund plays
 		// no role — any split prices as BelowPar for the pool.
 		set_price(DOT, FixedU128::from_rational(4u128, 10u128));
@@ -294,7 +293,7 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		open_standing_vault();
-		seed_active_pool();
+		prepare_active_pool();
 		park_at_104_percent();
 
 		let state_before = pool_state(DOT, PUSD);
@@ -369,7 +368,7 @@ fn incoming_deposit_fully_used_leaves_no_pending() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		open_standing_vault();
-		seed_active_pool();
+		prepare_active_pool();
 		park_at_104_percent();
 
 		// used = min(200, capacity 500) = 200 — nothing left to queue;

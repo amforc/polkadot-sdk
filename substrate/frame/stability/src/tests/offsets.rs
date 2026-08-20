@@ -8,9 +8,8 @@ use frame::testing_prelude::hypothetically;
 fn offset_burns_debt_and_distributes_gains_proportionally() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_deposit(1, 600);
-		seed_deposit(2, 400);
-		activate_all(&[1, 2]);
+		seed_matured_deposit(1, 600);
+		seed_matured_deposit(2, 400);
 
 		// 500 debt seizes 500 / 1.25 = 400 collateral at the registration
 		// price.
@@ -64,8 +63,7 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 fn offset_clamps_at_the_floor_then_only_depletion_passes() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_deposit(1, 1_000);
-		activate_all(&[1]);
+		seed_matured_deposit(1, 1_000);
 
 		// A first offset moves P off one, so the later equations exercise
 		// P0 != 1: P = 800/1000 = 0.8, delta_S = 160 * (1/1000) = 0.16.
@@ -121,9 +119,10 @@ fn offset_zero_request_or_empty_pool_noops() {
 		assert_eq!(debt_offset, 0);
 		assert_eq!(leftover, 50);
 
-		// Zero request against a funded pool: same.
-		seed_deposit(1, 1_000);
-		activate_all(&[1]);
+		// Zero request against a funded pool: same. A zero request never reaches settlement, so
+		// the activation must already stand; a real settlement commits it.
+		seed_matured_deposit(1, 1_000);
+		assert_ok!(settle(7, 1, DOT, PUSD));
 		let (debt_offset, leftover) = simulate_offset(DOT, PUSD, 0, 50);
 		assert_eq!(debt_offset, 0);
 		assert_eq!(leftover, 50);
@@ -146,8 +145,7 @@ fn offset_on_unregistered_branch_noops_and_returns_the_credit() {
 fn sequential_offsets_compound_p() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_deposit(1, 1_000);
-		activate_all(&[1]);
+		seed_matured_deposit(1, 1_000);
 
 		// Two collateral-free offsets with distinct ratios:
 		// P = 1 * (500/1000) = 0.5, then 0.5 * (300/500) = 0.3.
@@ -165,8 +163,7 @@ fn sequential_offsets_compound_p() {
 fn offset_preserves_claimable_yield() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_deposit(1, 600);
-		activate_all(&[1]);
+		seed_matured_deposit(1, 600);
 		drop(distribute_yield(DOT, PUSD, 60));
 
 		// The offset halves the deposit but must leave the yield already recorded in `G`
@@ -202,8 +199,7 @@ fn offset_api_trait_surface_matches_the_engine() {
 		use pusd_primitives::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
 
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_deposit(1, 1_000);
-		activate_all(&[1]);
+		seed_matured_deposit(1, 1_000);
 
 		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 500), 500);
 		// Everything is activated: the pending leg sizes to zero even behind
@@ -234,9 +230,7 @@ fn combined_offset_settles_active_then_pending() {
 
 		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		mint_stable(USDX, 1, 60_000);
-		assert_ok!(deposit(1, DOT, USDX, 60_000));
-		advance_time(5_000);
-		assert_ok!(poke(1, 1, DOT, USDX));
+		assert_ok!(deposit_and_mature(1, DOT, USDX, 60_000));
 		mint_stable(USDX, 2, 40_000);
 		assert_ok!(deposit(2, DOT, USDX, 40_000));
 
@@ -310,8 +304,7 @@ fn combined_offset_rolls_back_active_when_pending_fails() {
 		use pusd_primitives::{OffsetLegs, StabilityPoolOffset};
 
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_deposit(1, 600);
-		activate_all(&[1]);
+		seed_matured_deposit(1, 600);
 		seed_deposit(2, 400);
 
 		assert_noop!(
@@ -336,8 +329,7 @@ fn offset_refuses_stale_sizing_reads() {
 
 		register_branch(DOT, PUSD, default_branch_config());
 		set_min_active_pool(100);
-		seed_deposit(1, 1_000);
-		activate_all(&[1]);
+		seed_matured_deposit(1, 1_000);
 
 		// 950 would strand 50 below the 100 minimum: the read clamps to 900,
 		// and demanding the unclamped 950 anyway fails exactly. The probe
@@ -381,9 +373,8 @@ fn offset_with_sub_minimum_collateral_gain_steps_aside() {
 		let coll = AssetId::WithId(77);
 		register_branch(coll.clone(), PUSD, branch_config_for(coll.clone(), PUSD));
 		mint_stable(PUSD, 1, 1_000);
-		assert_ok!(deposit(1, coll.clone(), PUSD, 1_000));
-		advance_time(5_000);
-		assert_ok!(poke(1, 1, coll.clone(), PUSD));
+		assert_ok!(deposit_and_mature(1, coll.clone(), PUSD, 1_000));
+		assert_ok!(settle(7, 1, coll.clone(), PUSD));
 
 		// 500 collateral for 500 debt: gain 500 < the 1_000 minimum on an
 		// empty account — the whole offset steps aside, nothing moves.
@@ -409,8 +400,7 @@ fn compounded_yield_absorbs_offsets() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		set_min_active_pool(20);
-		seed_deposit(1, 600);
-		activate_all(&[1]);
+		seed_matured_deposit(1, 600);
 		drop(distribute_yield(DOT, PUSD, 60));
 		assert_ok!(compound(1, DOT, PUSD, 60));
 
@@ -434,9 +424,7 @@ fn offset_rounds_down_at_the_pool_minimum_balance_dead_zone() {
 		// the pool balance exceeds the active total by less than the
 		// 10_000-unit USDX minimum.
 		mint_stable(USDX, 1, 100_000);
-		assert_ok!(deposit(1, DOT, USDX, 100_000));
-		advance_time(5_000);
-		assert_ok!(poke(1, 1, DOT, USDX));
+		assert_ok!(deposit_and_mature(1, DOT, USDX, 100_000));
 		mint_stable(USDX, 2, 16_000);
 		assert_ok!(deposit(2, DOT, USDX, 6_000));
 

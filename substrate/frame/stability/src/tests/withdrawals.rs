@@ -21,7 +21,7 @@ fn active_row(active: Balance, request: Option<WithdrawalRequest<Balance>>) -> D
 #[test]
 fn withdraw_full_amount_prunes_row() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 
 		assert_ok!(withdraw(1, DOT, PUSD, 400, 1));
 
@@ -49,7 +49,7 @@ fn withdraw_full_amount_prunes_row() {
 #[test]
 fn withdraw_partial_keeps_row() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 
 		assert_ok!(withdraw(1, DOT, PUSD, 150, 1));
 
@@ -63,7 +63,7 @@ fn withdraw_partial_keeps_row() {
 #[test]
 fn withdraw_clamps_to_active_deposit() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 
 		// Requesting more than the 400 active takes exactly the 400 — paid
 		// to an empty-handed recipient, so the amount is visible on its own
@@ -98,7 +98,7 @@ fn withdraw_with_nothing_active_reverts() {
 #[test]
 fn withdraw_to_third_party_recipient() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 
 		assert_ok!(withdraw(1, DOT, PUSD, 100, 9));
 		assert_eq!(stable_balance(PUSD, 9), 100);
@@ -109,7 +109,7 @@ fn withdraw_to_third_party_recipient() {
 #[test]
 fn withdraw_leaves_pending_untouched() {
 	build_and_execute(|| {
-		seed_active_deposit();
+		seed_pool_with_matured_deposit();
 		// A fresh pending amount on top of the 400 active.
 		assert_ok!(deposit(1, DOT, PUSD, 300));
 
@@ -147,13 +147,14 @@ fn request_withdraw_records_exact_executable_at() {
 		seed_branch_with_debt();
 		enter_safety_mode();
 
+		let requested_at = Timestamp::get();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
+		let executable_at = requested_at + 600_000;
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		let request = row.withdrawal_request.expect("request recorded");
 		assert_eq!(request.amount, 250);
-		// Requested at t = 6_000 with the 600_000 ms Safety delay.
-		assert_eq!(request.executable_at, 606_000);
+		assert_eq!(request.executable_at, executable_at);
 
 		System::assert_last_event(
 			crate::Event::WithdrawalRequested {
@@ -161,7 +162,7 @@ fn request_withdraw_records_exact_executable_at() {
 				stable_id: PUSD,
 				depositor: 1,
 				amount: 250,
-				executable_at: 606_000,
+				executable_at,
 			}
 			.into(),
 		);
@@ -176,6 +177,7 @@ fn new_request_replaces_old() {
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 
 		advance_time(4_000);
+		let requested_at = Timestamp::get();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 100));
 
 		let request = deposit_row(DOT, PUSD, 1)
@@ -183,8 +185,7 @@ fn new_request_replaces_old() {
 			.withdrawal_request
 			.expect("request recorded");
 		assert_eq!(request.amount, 100);
-		// Re-requested at t = 10_000: the delay restarts.
-		assert_eq!(request.executable_at, 610_000);
+		assert_eq!(request.executable_at, requested_at + 600_000);
 	});
 }
 
@@ -205,6 +206,7 @@ fn deposit_leaves_request_unchanged() {
 	build_and_execute(|| {
 		seed_branch_with_debt();
 		enter_safety_mode();
+		let requested_at = Timestamp::get();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 
 		// A new deposit leaves the request as it was.
@@ -216,7 +218,7 @@ fn deposit_leaves_request_unchanged() {
 			.withdrawal_request
 			.expect("request survives the deposit");
 		assert_eq!(request.amount, 250);
-		assert_eq!(request.executable_at, 606_000);
+		assert_eq!(request.executable_at, requested_at + 600_000);
 	});
 }
 

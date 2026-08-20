@@ -4,20 +4,14 @@
 //! first, and the pending accumulators track that in constant time. The active accumulators are
 //! never touched.
 
-use crate::{math::pro_rata_floor, mock::*, types::Leg, Error};
-
-/// Queue a pending (unactivated) deposit for `who`.
-fn seed_pending(who: AccountId, amount: Balance) {
-	mint_stable(PUSD, who, amount);
-	assert_ok!(deposit(who, DOT, PUSD, amount));
-}
+use crate::{mock::*, types::Leg, Error};
 
 #[test]
 fn pending_offset_is_proportional_across_depositors() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_pending(1, 200);
-		seed_pending(2, 300);
+		seed_deposit(1, 200);
+		seed_deposit(2, 300);
 
 		// One O(1) accumulator update covers both rows: burning 350 of the
 		// 500 total leaves P_pending = 150/500 = 0.3 and distributes the 175
@@ -54,9 +48,9 @@ fn pending_offset_is_proportional_across_depositors() {
 			.into(),
 		);
 
-		// A poke settles the loss and the direct credit onto the row; the
+		// Settlement realizes the loss and the direct credit onto the row; the
 		// gain is claimable through the normal path.
-		assert_ok!(poke(1, 1, DOT, PUSD));
+		assert_ok!(settle(1, 1, DOT, PUSD));
 		let row1 = deposit_row(DOT, PUSD, 1).expect("kept: pending remainder + claimable");
 		assert_eq!(row1.pending_deposit.as_ref().expect("partially consumed").amount, 60);
 		assert_eq!(row1.claimable_collateral, 70);
@@ -71,7 +65,7 @@ fn pending_offset_full_depletion_bumps_the_pending_epoch() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		for who in 1..=3 {
-			seed_pending(who, 100);
+			seed_deposit(who, 100);
 		}
 
 		// The request exceeds the 300 pending total: full depletion, one
@@ -98,7 +92,7 @@ fn pending_offset_full_depletion_bumps_the_pending_epoch() {
 		}
 
 		// A fresh deposit joins the new epoch cleanly.
-		seed_pending(1, 100);
+		seed_deposit(1, 100);
 		let row = deposit_row(DOT, PUSD, 1).expect("row created");
 		assert_eq!(row.pending_deposit.expect("queued").snapshot.coords.epoch, 1);
 	});
@@ -115,7 +109,7 @@ fn pending_offset_noop_cases_pass_remainders_through() {
 		assert_eq!(leftover, 50);
 
 		// Zero remaining debt with a populated pending pool.
-		seed_pending(1, 200);
+		seed_deposit(1, 200);
 		let (debt_offset, leftover) = simulate_pending_offset(DOT, PUSD, 0, 50);
 		assert_eq!(debt_offset, 0);
 		assert_eq!(leftover, 50);
@@ -128,10 +122,8 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 600);
-		assert_ok!(deposit(1, DOT, PUSD, 600));
-		advance_time(5_000);
-		assert_ok!(poke(1, 1, DOT, PUSD));
-		seed_pending(2, 400);
+		assert_ok!(deposit_and_mature(1, DOT, PUSD, 600));
+		seed_deposit(2, 400);
 		drop(distribute_yield(DOT, PUSD, 60));
 
 		let before = pool_state(DOT, PUSD);
@@ -177,7 +169,7 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 fn pending_offset_flooring_credits_zero_and_prunes_on_next_touch() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_pending(1, 100);
+		seed_deposit(1, 100);
 
 		// floor(1 * 100 / 1000) = 0: the whole pending amount burns for a
 		// zero collateral credit. The flooring loss is bounded by one
@@ -197,7 +189,7 @@ fn pending_offset_flooring_credits_zero_and_prunes_on_next_touch() {
 		// The row still holds the stale pending leg; realization is lazy.
 		// The next touch settles it to nothing and prunes the empty row.
 		assert!(deposit_row(DOT, PUSD, 1).is_some());
-		assert_ok!(poke(7, 1, DOT, PUSD));
+		assert_ok!(settle(7, 1, DOT, PUSD));
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 	});
 }
@@ -206,7 +198,7 @@ fn pending_offset_flooring_credits_zero_and_prunes_on_next_touch() {
 fn pending_offset_clamps_to_the_minimum_pool_floor() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_pending(1, 200);
+		seed_deposit(1, 200);
 
 		// Burning 150 of 200 would leave 50 < the 100
 		// `minimum_active_pool_balance` floor (the same rule as the
@@ -265,7 +257,7 @@ fn pending_offset_on_unregistered_branch_noops_and_returns_the_credit() {
 fn merged_top_up_shares_earlier_backstop_losses() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_pending(1, 200);
+		seed_deposit(1, 200);
 
 		// Backstop halves the pending pool: P_pending = 100/200 = 0.5.
 		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 100, 0);
@@ -287,7 +279,7 @@ fn merged_top_up_shares_earlier_backstop_losses() {
 
 		// Activation folds the post-loss amount into the active pool.
 		advance_time(10_000);
-		assert_ok!(poke(1, 1, DOT, PUSD));
+		assert_ok!(settle(1, 1, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		assert_eq!(row.active_deposit, 200);
 		assert!(row.pending_deposit.is_none());
@@ -312,10 +304,9 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		const DOT_E10: Balance = 10_000_000_000;
 
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_deposit(1, 1_501); // active pool = 1501 pUSD, P = 1, epoch 0.
-		activate_all(&[1]);
-		seed_pending(2, 250); // pending pool, alongside ...
-		seed_pending(3, 100); // ... user 3 — consumed pro-rata, not in order.
+		seed_matured_deposit(1, 1_501); // active pool = 1501 pUSD, P = 1, epoch 0.
+		seed_deposit(2, 250); // pending pool, alongside ...
+		seed_deposit(3, 100); // ... user 3 — consumed pro-rata, not in order.
 
 		// Stage 1 — active offset. The vault owes 2200 pUSD; its post-keeper
 		// resolution collateral is 1152.845 DOT (keeper comp is external, so we
@@ -457,7 +448,7 @@ fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 		// gain floor(50_000 * 40_000/50_000) = 40_000.
 		assert_eq!(stable_balance(USDX, pool), USDX_MIN_BALANCE);
 		assert_eq!(pool_state(DOT, USDX).total_pending_deposits, 10_000);
-		assert_ok!(poke(1, 1, DOT, USDX));
+		assert_ok!(settle(1, 1, DOT, USDX));
 		let row = deposit_row(DOT, USDX, 1).expect("row survives");
 		assert_eq!(row.pending_deposit.expect("pending remainder").amount, 10_000);
 		assert_eq!(row.claimable_collateral, 40_000);
@@ -472,9 +463,9 @@ fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 fn pending_deposit_offset_is_shared_pro_rata() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_pending(1, 300); // Alice.
-		seed_pending(2, 600); // Bob.
-		seed_pending(3, 500); // Cara.
+		seed_deposit(1, 300); // Alice.
+		seed_deposit(2, 600); // Bob.
+		seed_deposit(3, 500); // Cara.
 
 		// Burn 1_000 of 1_400: P_pending = 400/1_400 = 2/7 (inner
 		// floor(400e18/1_400) = 285_714_285_714_285_714) and

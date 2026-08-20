@@ -122,9 +122,8 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		// per-row flooring strands residue in the pool aggregates.
 		mint_stable(PUSD, 1, 150);
 		mint_stable(PUSD, 2, 150);
-		assert_ok!(deposit(1, DOT, PUSD, 150));
-		assert_ok!(deposit(2, DOT, PUSD, 150));
-		activate_all(&[1, 2]);
+		assert_ok!(deposit_and_mature(1, DOT, PUSD, 150));
+		assert_ok!(deposit_and_mature(2, DOT, PUSD, 150));
 		let leftover = distribute_yield(DOT, PUSD, 101);
 		assert_eq!(leftover.peek(), 0);
 		drop(leftover);

@@ -5,13 +5,6 @@
 
 use crate::{mock::*, types::Leg, Error};
 
-/// Deposit `amount` for `who`, minting 10_000 so later top-up deposits in
-/// the same test have wallet head-room (unlike [`seed_deposit`]).
-fn seed_active(who: AccountId, amount: Balance) {
-	mint_stable(PUSD, who, 10_000);
-	assert_ok!(deposit(who, DOT, PUSD, amount));
-}
-
 #[test]
 fn distribute_to_empty_or_unknown_pool_returns_the_credit() {
 	build_and_execute(|| {
@@ -42,8 +35,7 @@ fn distribute_to_empty_or_unknown_pool_returns_the_credit() {
 fn distribute_updates_g_exactly() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 1_000);
-		activate_all(&[1]);
+		seed_matured_deposit_from_balance(1, 10_000, 1_000);
 
 		let leftover = distribute_yield(DOT, PUSD, 100);
 		assert!(leftover.peek().is_zero());
@@ -70,9 +62,8 @@ fn distribute_updates_g_exactly() {
 fn depositors_realize_yield_proportionally() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 600);
-		seed_active(2, 400);
-		activate_all(&[1, 2]);
+		seed_matured_deposit_from_balance(1, 10_000, 600);
+		seed_matured_deposit_from_balance(2, 10_000, 400);
 
 		drop(distribute_yield(DOT, PUSD, 100));
 
@@ -108,9 +99,8 @@ fn depositors_realize_yield_proportionally() {
 fn flooring_dust_accumulates_until_teardown() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 600);
-		seed_active(2, 2_400);
-		activate_all(&[1, 2]);
+		seed_matured_deposit_from_balance(1, 10_000, 600);
+		seed_matured_deposit_from_balance(2, 10_000, 2_400);
 
 		drop(distribute_yield(DOT, PUSD, 100));
 
@@ -160,16 +150,15 @@ fn flooring_dust_accumulates_until_teardown() {
 fn late_depositor_earns_only_after_their_snapshot() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 600);
-		activate_all(&[1]);
+		seed_matured_deposit_from_balance(1, 10_000, 600);
 
 		// First distribution belongs to user 1 alone: G = 60/600 = 0.1.
 		drop(distribute_yield(DOT, PUSD, 60));
 
-		// User 2 joins at G0 = 0.1.
-		seed_active(2, 400);
-		advance_time(5_000);
-		assert_ok!(poke(2, 2, DOT, PUSD));
+		// User 2 waits behind the ordinary delay at G0 = 0.1. The second distribution itself
+		// activates the matured cohort before sharing the new yield.
+		seed_deposit_from_balance(2, 10_000, 400);
+		advance_time(9_000);
 
 		// Second distribution splits over A = 1000: G = 0.1 + 0.1 = 0.2.
 		drop(distribute_yield(DOT, PUSD, 100));
@@ -206,8 +195,7 @@ fn late_depositor_earns_only_after_their_snapshot() {
 fn compound_moves_yield_into_active_and_it_earns() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 600);
-		activate_all(&[1]);
+		seed_matured_deposit_from_balance(1, 10_000, 600);
 		drop(distribute_yield(DOT, PUSD, 60));
 
 		assert_ok!(compound(1, DOT, PUSD, 60));
@@ -252,8 +240,7 @@ fn compound_moves_yield_into_active_and_it_earns() {
 fn compound_clamps_to_claimable() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 600);
-		activate_all(&[1]);
+		seed_matured_deposit_from_balance(1, 10_000, 600);
 		drop(distribute_yield(DOT, PUSD, 60));
 
 		// Asking for more than the 60 claimable compounds exactly the 60.
@@ -274,8 +261,7 @@ fn compound_clamps_to_claimable() {
 fn compound_with_nothing_claimable_reverts() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 600);
-		activate_all(&[1]);
+		seed_matured_deposit_from_balance(1, 10_000, 600);
 
 		assert_noop!(compound(1, DOT, PUSD, 60), Error::<Test>::NoYieldToCompound);
 		// A zero request is equally nothing to compound.
@@ -297,8 +283,7 @@ fn compound_without_row_or_branch_reverts() {
 fn vault_interest_flows_to_pool_through_the_hook() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 400);
-		activate_all(&[1]);
+		seed_matured_deposit_from_balance(1, 10_000, 400);
 
 		// A vault accruing 5%/yr on exactly 500 debt (499 borrowed + 1
 		// upfront fee; the fee's 75% share floors to zero, so the whole
@@ -352,18 +337,14 @@ fn vault_interest_flows_to_pool_through_the_hook() {
 fn pending_deposits_earn_no_yield() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 600);
-		activate_all(&[1]);
+		seed_matured_deposit_from_balance(1, 10_000, 600);
 		// User 2's deposit is still pending when the yield arrives.
-		seed_active(2, 400);
+		seed_deposit_from_balance(2, 10_000, 400);
 
 		drop(distribute_yield(DOT, PUSD, 60));
 
-		// The whole distribution went to the 600 active: G = 0.1, and user
-		// 2 snapshots G at deposit time, so nothing accrues to them even
-		// after activation.
-		advance_time(5_000);
-		assert_ok!(poke(2, 2, DOT, PUSD));
+		// The whole distribution went to the 600 active: G = 0.1. User 2 remains pending and has
+		// no yield to claim.
 		assert_noop!(claim_yield(2, DOT, PUSD, 2), Error::<Test>::NoClaimableYield);
 
 		assert_ok!(claim_yield(1, DOT, PUSD, 1));
