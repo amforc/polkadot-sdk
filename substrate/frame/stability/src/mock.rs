@@ -668,14 +668,14 @@ pub fn claim_yield(
 	Stability::claim_yield(RuntimeOrigin::signed(who), collateral, stable, Some(recipient))
 }
 
-/// Pokes the deposit of `owner`, signed by any `caller`.
-pub fn poke(
+/// Settles the deposit of `owner`, signed by any `caller`.
+pub fn settle(
 	caller: AccountId,
 	owner: AccountId,
 	collateral: AssetId,
 	stable: StableId,
 ) -> DispatchResult {
-	Stability::poke_deposit(RuntimeOrigin::signed(caller), owner, collateral, stable)
+	Stability::settle_deposit(RuntimeOrigin::signed(caller), owner, collateral, stable)
 }
 
 pub fn compound(
@@ -688,42 +688,105 @@ pub fn compound(
 }
 
 /// Mints for `who` and deposits into the default pool.
-///
-/// The deposit stays pending until [`activate_all`], or any other write past the entry delay,
-/// activates it.
+/// The deposit follows the configured entry delay and therefore starts pending.
 pub fn seed_deposit(who: AccountId, amount: Balance) {
-	mint_stable(PUSD, who, amount);
+	seed_deposit_from_balance(who, amount, amount);
+}
+
+/// Mints `balance` for `who`, then deposits `amount` behind the configured entry delay.
+pub fn seed_deposit_from_balance(who: AccountId, balance: Balance, amount: Balance) {
+	mint_stable(PUSD, who, balance);
 	assert_ok!(deposit(who, DOT, PUSD, amount));
 }
 
-/// Moves past the entry delay and activates the pending deposit of every listed account.
+/// Deposits through the configured entry delay, then moves the clock to that deposit's deadline.
 ///
-/// Activation needs a write to the row, and the permissionless poke supplies one.
-pub fn activate_all(depositors: &[AccountId]) {
-	advance_time(5_000);
-	for who in depositors {
-		assert_ok!(poke(*who, *who, DOT, PUSD));
+/// This does not advance the cohort or realize the row. The next ordinary pool operation must do
+/// that itself, exactly as it does in production.
+pub fn deposit_and_mature(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	amount: Balance,
+) -> DispatchResult {
+	let result = deposit(who, collateral.clone(), stable, amount);
+	if result.is_ok() {
+		if let Some(deadline) = pending_deadline(collateral, stable, who) {
+			let now = Timestamp::get();
+			if deadline > now {
+				advance_time(deadline - now);
+			}
+		}
+	}
+	result
+}
+
+/// Mints and deposits a position whose entry delay has elapsed in the default pool.
+pub fn seed_matured_deposit(who: AccountId, amount: Balance) {
+	seed_matured_deposit_from_balance(who, amount, amount);
+}
+
+/// Mints `balance` for `who`, deposits `amount`, then moves the clock to its cohort deadline.
+pub fn seed_matured_deposit_from_balance(who: AccountId, balance: Balance, amount: Balance) {
+	mint_stable(PUSD, who, balance);
+	assert_ok!(deposit_and_mature(who, DOT, PUSD, amount));
+}
+
+/// Gives an existing default-pool row backed claimable balances without exercising their source.
+pub fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Balance) {
+	let pool = Stability::pool_account(&DOT, &PUSD);
+	crate::Deposits::<Test>::mutate((DOT, PUSD, who), |row| {
+		let row = row.as_mut().expect("deposit row exists");
+		row.claimable_collateral += collateral_gain;
+		row.claimable_yield += yield_gain;
+	});
+	crate::Pools::<Test>::mutate(DOT, PUSD, |pool| {
+		let state = &mut pool.as_mut().expect("pool registered").state;
+		state.total_collateral_gains_unclaimed += collateral_gain;
+		state.total_yield_unclaimed += yield_gain;
+	});
+	if collateral_gain > 0 {
+		mint_collateral(DOT, pool, collateral_gain);
+	}
+	if yield_gain > 0 {
+		mint_stable(PUSD, pool, yield_gain);
 	}
 }
 
-/// The single-depositor fixture: account 1 holds 400 active in the default market, and 600 in
-/// its wallet.
-pub fn seed_active_deposit() {
-	register_branch(DOT, PUSD, default_branch_config());
-	mint_stable(PUSD, 1, 1_000);
-	assert_ok!(deposit(1, DOT, PUSD, 400));
-	activate_all(&[1]);
+/// Commits aggregate cohort advancement without realizing any depositor row.
+///
+/// Most tests should let their subject operation do this. This narrower fixture exists for tests
+/// of the advancement bookkeeping itself, where adding an offset or yield would change the state
+/// under examination.
+pub fn advance_matured_cohorts(collateral: AssetId, stable: StableId) {
+	let mut pool = crate::Pools::<Test>::get(&collateral, stable).expect("pool registered");
+	assert_ok!(Stability::advance_cohorts(&collateral, &stable, &mut pool, Timestamp::get()));
+	crate::Pools::<Test>::insert(&collateral, stable, pool);
 }
 
-/// [`seed_active_deposit`] with real market debt behind it: one vault at a TCR of 250%, which
-/// leaves the market in Normal Mode and lets a test drive it into Safety Mode.
+/// The cohort deadline the pending deposit of `who` waits out, read from the open slots.
+pub fn pending_deadline(collateral: AssetId, stable: StableId, who: AccountId) -> Option<Moment> {
+	let pending = deposit_row(collateral.clone(), stable, who)?.pending_deposit?;
+	let state = pool_state(collateral, stable);
+	state.cohort(pending.cohort).map(|cohort| cohort.deadline)
+}
+
+/// The single-depositor fixture: account 1 has 400 ready to activate in the default market, and
+/// 600 in its wallet.
+pub fn seed_pool_with_matured_deposit() {
+	register_branch(DOT, PUSD, default_branch_config());
+	mint_stable(PUSD, 1, 1_000);
+	assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
+}
+
+/// [`seed_pool_with_matured_deposit`] with real market debt behind it: one vault at a TCR of 250%,
+/// which leaves the market in Normal Mode and lets a test drive it into Safety Mode.
 pub fn seed_branch_with_debt() {
 	register_branch(DOT, PUSD, default_branch_config());
 	mint_collateral(DOT, 5, 2_000);
 	assert_ok!(open_vault(5, DOT, PUSD, 1_000, 500));
 	mint_stable(PUSD, 1, 1_000);
-	assert_ok!(deposit(1, DOT, PUSD, 400));
-	activate_all(&[1]);
+	assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
 }
 
 /// Drops the price until the TCR reaches 120%, which is under the Safety threshold and over the
@@ -769,6 +832,15 @@ pub fn issue_collateral(
 	<PoolCollateralAssets as FungiblesBalanced<AccountId>>::issue(collateral, amount)
 }
 
+/// The proportional share of `amount`: `floor(amount * numerator / denominator)`.
+///
+/// The offset simulations use it to slice collateral pro rata to the debt they burn.
+pub fn pro_rata_floor(amount: Balance, numerator: Balance, denominator: Balance) -> Balance {
+	assert!(numerator <= denominator);
+	assert!(denominator > 0);
+	pusd_primitives::mul_div_floor(amount, numerator, denominator).expect("share of amount fits")
+}
+
 /// Runs an active-pool offset the way the liquidation engine will: read the reducible amount,
 /// cut the matching slice of collateral, and settle.
 ///
@@ -788,8 +860,7 @@ pub fn simulate_offset(
 				return Ok((0, collateral_for_pool));
 			}
 			let mut credit = issue_collateral(collateral.clone(), collateral_for_pool);
-			let slice =
-				credit.extract(crate::math::pro_rata_floor(collateral_for_pool, debt, max_debt));
+			let slice = credit.extract(pro_rata_floor(collateral_for_pool, debt, max_debt));
 			Stability::offset(
 				&collateral,
 				&stable,
@@ -816,11 +887,8 @@ pub fn simulate_pending_offset(
 				return Ok((0, remaining_collateral));
 			}
 			let mut credit = issue_collateral(collateral.clone(), remaining_collateral);
-			let slice = credit.extract(crate::math::pro_rata_floor(
-				remaining_collateral,
-				debt,
-				max_debt_to_offset,
-			));
+			let slice =
+				credit.extract(pro_rata_floor(remaining_collateral, debt, max_debt_to_offset));
 			Stability::offset(
 				&collateral,
 				&stable,

@@ -8,21 +8,14 @@
 
 use crate::{mock::*, types::Leg};
 
-/// Deposit and immediately activate `amount` for `who`.
-fn seed_active(who: AccountId, amount: Balance) {
-	seed_deposit(who, amount);
-	activate_all(&[who]);
-}
-
 #[test]
 fn full_depletion_pays_old_epoch_and_starts_fresh() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 600);
 		mint_stable(PUSD, 2, 400);
-		assert_ok!(deposit(1, DOT, PUSD, 600));
-		assert_ok!(deposit(2, DOT, PUSD, 400));
-		activate_all(&[1, 2]);
+		assert_ok!(deposit_and_mature(1, DOT, PUSD, 600));
+		assert_ok!(deposit_and_mature(2, DOT, PUSD, 400));
 
 		let (debt_offset, _) = simulate_offset(DOT, PUSD, 1_000, 800);
 		assert_eq!(debt_offset, 1_000);
@@ -59,8 +52,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		// P = floor(P * new_A / A) = floor(1 * 250/500) = 0.5,
 		// delta_S(1,0) = 200 * (1/500) = 0.4.
 		mint_stable(PUSD, 3, 500);
-		assert_ok!(deposit(3, DOT, PUSD, 500));
-		activate_all(&[3]);
+		assert_ok!(deposit_and_mature(3, DOT, PUSD, 500));
 		let before_3 = collateral_balance(DOT, 3);
 		assert_eq!(simulate_offset(DOT, PUSD, 250, 200).0, 250);
 		assert_ok!(claim_collateral(3, DOT, PUSD, 3));
@@ -78,7 +70,7 @@ fn scale_crossing_preserves_older_deposits() {
 		// One floor for the whole scenario, set before any capital moves.
 		set_min_active_pool(10);
 		let unit: Balance = 10_000_000_000_000; // 1e13
-		seed_active(1, unit);
+		seed_matured_deposit(1, unit);
 
 		// Offset all but 100: the survival ratio 1e-11 pushes P below p_min
 		// once, so it crosses one scale:
@@ -131,7 +123,7 @@ fn deposit_two_scales_behind_realizes_through_the_squared_divisor() {
 		register_branch(DOT, PUSD, default_branch_config());
 		set_min_active_pool(5);
 		let unit: Balance = 10_000_000_000_000_000_000; // 1e19
-		seed_active(1, unit);
+		seed_matured_deposit(1, unit);
 
 		// Leaving 5 of 1e19 is a survival ratio of 5e-19 < 1e-18: two
 		// crossings in one offset, P = floor(1e36 * 5 / 1e19) = 5e17 (0.5).
@@ -164,7 +156,8 @@ fn offset_beyond_supported_precision_steps_aside_untouched() {
 		register_branch(DOT, PUSD, default_branch_config());
 		set_min_active_pool(1);
 		let unit: Balance = 10_000_000_000_000_000_000_000_000_000; // 1e28
-		seed_active(1, unit);
+		seed_matured_deposit(1, unit);
+		advance_matured_cohorts(DOT, PUSD);
 
 		// A survival ratio of 1e-28 needs more than two crossings:
 		// floor(1e36 * 1 / 1e28) = 1e8 < p_min even at the cap. The pool

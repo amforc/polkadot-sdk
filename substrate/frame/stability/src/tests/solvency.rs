@@ -5,12 +5,6 @@
 
 use crate::mock::*;
 
-/// Deposit-and-activate `amount` for `who`, minting exactly `amount`.
-fn seed_active(who: AccountId, amount: Balance) {
-	seed_deposit(who, amount);
-	activate_all(&[who]);
-}
-
 /// Claim `who`'s collateral to itself and assert the exact payout.
 fn assert_claim_collateral(who: AccountId, expected: Balance) {
 	let before = collateral_balance(DOT, who);
@@ -36,8 +30,8 @@ fn assert_pool_fully_drained() {
 fn multiple_depositor_cohorts_reconcile_to_zero() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 1_000);
-		seed_active(2, 500);
+		seed_matured_deposit(1, 1_000);
+		seed_matured_deposit(2, 500);
 
 		// Yield 1 over A = 1500: G = 150/1500 = 0.1.
 		drop(distribute_yield(DOT, PUSD, 150));
@@ -47,7 +41,7 @@ fn multiple_depositor_cohorts_reconcile_to_zero() {
 		assert_eq!(pool_state(DOT, PUSD).coords.p, FixedU128::from_rational(3, 5));
 
 		// A third depositor joins at P = 0.6, S = 0.2, G = 0.1: A = 900 + 900.
-		seed_active(3, 900);
+		seed_matured_deposit(3, 900);
 
 		// Yield 2 over A = 1800: delta_G = floor(180 * 0.6 / 1800) = 6e16,
 		// so G = 0.16.
@@ -85,7 +79,7 @@ fn multiple_depositor_cohorts_reconcile_to_zero() {
 fn full_depletion_epoch_boundary_stays_solvent() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 1_000);
+		seed_matured_deposit(1, 1_000);
 
 		// Yield 1: G(0,0) = 100/1000 = 0.1.
 		drop(distribute_yield(DOT, PUSD, 100));
@@ -95,7 +89,7 @@ fn full_depletion_epoch_boundary_stays_solvent() {
 		assert_eq!(pool_state(DOT, PUSD).coords.epoch, 1);
 
 		// A fresh epoch-1 depositor is untouched by epoch-0 history.
-		seed_active(2, 1_000);
+		seed_matured_deposit(2, 1_000);
 		// Yield 2 on epoch 1: G(1,0) = 50/1000 = 0.05.
 		drop(distribute_yield(DOT, PUSD, 50));
 		// Offset on epoch 1: A = 1000 → 600, P = 0.6, delta_S =

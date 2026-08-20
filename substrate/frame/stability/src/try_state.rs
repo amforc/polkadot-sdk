@@ -1,18 +1,35 @@
-//! `try-runtime` invariant checks that must hold after every operation.
+//! `try-runtime` checks for stability-pool accounting invariants.
 //!
-//! Three families of invariant live here. The accumulators stay inside the bounds that the
-//! precision parameters set. The pool account holds exactly what the pool reports owing. No set of
-//! rows adds up to more than its pool total.
+//! These checks protect four contracts:
+//!
+//! - Accumulators stay within the configured precision limits.
+//! - Pool custody equals the recorded stablecoin and collateral totals.
+//! - The sum of user positions does not exceed each pool total.
+//! - Cohort aggregates and checkpoints cover all member rows that reference them.
 
 use crate::{
-	pallet::{BalanceOf, Config, Deposits, Pallet, PoolSumsStore, Pools},
-	types::Leg,
+	pallet::{BalanceOf, CohortCheckpoints, Config, Deposits, Pallet, PoolSumsStore, Pools},
+	types::{CohortId, Leg},
 };
+use alloc::collections::BTreeMap;
 use frame::{
 	arithmetic::{FixedU128, One, Saturating, Zero},
 	deps::frame_support::traits::fungibles::Inspect as _,
 	try_runtime::TryRuntimeError,
 };
+
+/// Member counts and claims derived from the deposit rows of one market.
+///
+/// The checks compare these values with cohort aggregates and checkpoints.
+#[derive(Default)]
+struct CohortTallies<Balance> {
+	/// Number of rows that reference each open cohort or checkpoint.
+	members: BTreeMap<CohortId, u32>,
+	/// Sum of downward-rounded member claims for each cohort.
+	///
+	/// An open cohort uses the current pending leg. An activated cohort uses its checkpoint.
+	claims: BTreeMap<CohortId, Balance>,
+}
 
 pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	for (collateral_id, stable_id, pool) in Pools::<T>::iter() {
@@ -69,30 +86,115 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			return Err("pool collateral balance diverges from tracked totals".into());
 		}
 
+		// The open cohorts themselves: live ids, increasing deadlines, no memberless row, and an
+		// aggregate valued at coordinates the pending leg has actually reached.
+		for cohort in &state.open_cohorts {
+			if cohort.id >= state.next_cohort_id {
+				return Err("open cohort id at or past `next_cohort_id`".into());
+			}
+			if cohort.members == 0 {
+				return Err("open cohort with no members was not cleared".into());
+			}
+			if (cohort.coords.epoch, cohort.coords.scale) >
+				(state.pending_coords.epoch, state.pending_coords.scale)
+			{
+				return Err("open cohort coordinates ahead of the pending leg".into());
+			}
+		}
+		if state
+			.open_cohorts
+			.windows(2)
+			.any(|pair| pair[0].id == pair[1].id || pair[0].deadline > pair[1].deadline)
+		{
+			return Err("open cohorts have duplicate ids or unordered deadlines".into());
+		}
+
 		// No set of rows may add up to more than its pool total, on either leg. Rounding keeps
 		// every realized value at or below the total, and the difference belongs to nobody; it
 		// leaves with an epoch reset or with the teardown sweep.
 		let mut pending_sum = BalanceOf::<T>::zero();
 		let mut compounded_sum = BalanceOf::<T>::zero();
+		let mut tallies = CohortTallies::<BalanceOf<T>>::default();
 		for (_, deposit) in Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone())) {
 			if let Some(pending) = &deposit.pending_deposit {
-				let window = Pallet::<T>::sums_window(
-					&collateral_id,
-					&stable_id,
-					Leg::Pending,
-					&pending.snapshot,
-				);
-				let realized = crate::math::realize(
-					pending.amount,
-					&pending.snapshot,
-					&state.pending_coords,
-					&window,
-					&config.precision,
-				);
-				if !realized.yield_gain.is_zero() {
-					return Err("pending deposit realized a yield gain".into());
+				let open = state.cohort(pending.cohort);
+				let checkpoint =
+					CohortCheckpoints::<T>::get((&collateral_id, &stable_id, pending.cohort));
+				match (open, checkpoint) {
+					(Some(_), Some(_)) => {
+						return Err("cohort is both open and checkpointed".into());
+					},
+					(None, None) => {
+						return Err("pending row references an unknown cohort".into());
+					},
+					(Some(cohort), None) => {
+						let coords = pending.snapshot.coords;
+						if (coords.epoch, coords.scale) > (cohort.coords.epoch, cohort.coords.scale)
+						{
+							return Err("member snapshot ahead of its cohort's coordinates".into());
+						}
+						let window = Pallet::<T>::sums_window(
+							&collateral_id,
+							&stable_id,
+							Leg::Pending,
+							&pending.snapshot,
+						);
+						let realized = crate::math::realize(
+							pending.amount,
+							&pending.snapshot,
+							&state.pending_coords,
+							&window,
+							&config.precision,
+						);
+						if !realized.yield_gain.is_zero() {
+							return Err("pending deposit realized a yield gain".into());
+						}
+						pending_sum = pending_sum.saturating_add(realized.compounded);
+
+						let claims = tallies.claims.entry(pending.cohort).or_default();
+						*claims = claims.saturating_add(realized.compounded);
+					},
+					(None, Some(checkpoint)) => {
+						let window = Pallet::<T>::checkpoint_window(
+							&collateral_id,
+							&stable_id,
+							&pending.snapshot,
+							&checkpoint.pending_end,
+						);
+						let phase_one = crate::math::realize(
+							pending.amount,
+							&pending.snapshot,
+							&checkpoint.pending_end.coords,
+							&window,
+							&config.precision,
+						);
+						if !phase_one.yield_gain.is_zero() {
+							return Err("checkpointed tranche realized a yield gain".into());
+						}
+						let claims = tallies.claims.entry(pending.cohort).or_default();
+						*claims = claims.saturating_add(phase_one.compounded);
+						if *claims > checkpoint.activated {
+							return Err("member claims exceed the activated cohort capital".into());
+						}
+						// The survivor is active capital since the checkpoint: it counts against
+						// the active total, not the pending one.
+						let window = Pallet::<T>::sums_window(
+							&collateral_id,
+							&stable_id,
+							Leg::Active,
+							&checkpoint.active_start,
+						);
+						let phase_two = crate::math::realize(
+							phase_one.compounded,
+							&checkpoint.active_start,
+							&state.coords,
+							&window,
+							&config.precision,
+						);
+						compounded_sum = compounded_sum.saturating_add(phase_two.compounded);
+					},
 				}
-				pending_sum = pending_sum.saturating_add(realized.compounded);
+				*tallies.members.entry(pending.cohort).or_default() += 1;
 			}
 
 			let window = Pallet::<T>::sums_window(
@@ -115,6 +217,44 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		}
 		if compounded_sum > state.total_active_deposits {
 			return Err("realized deposits exceed `total_active_deposits`".into());
+		}
+
+		// The cohort bookkeeping must cover the rows that reference it: member counts move in
+		// step with the rows, and the ceiling-compounded aggregate never falls below the floored
+		// member claims it will have to pay at advancement.
+		for cohort in &state.open_cohorts {
+			if tallies.members.get(&cohort.id).copied().unwrap_or(0) != cohort.members {
+				return Err("open cohort member count diverges from its rows".into());
+			}
+			let cover = crate::math::compound_ceil(
+				cohort.amount,
+				&cohort.coords,
+				&state.pending_coords,
+				config.precision.scale_factor(),
+			);
+			let claims =
+				tallies.claims.get(&cohort.id).copied().unwrap_or_else(BalanceOf::<T>::zero);
+			if claims > cover {
+				return Err("member claims exceed the cohort aggregate".into());
+			}
+		}
+		for (id, checkpoint) in
+			CohortCheckpoints::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
+		{
+			if checkpoint.members == 0 {
+				return Err("memberless checkpoint was not removed".into());
+			}
+			if tallies.members.get(&id).copied().unwrap_or(0) != checkpoint.members {
+				return Err("checkpoint member count diverges from its rows".into());
+			}
+			if state.cohort(id).is_some() {
+				return Err("checkpointed cohort is still open".into());
+			}
+			for snapshot in [&checkpoint.pending_end, &checkpoint.active_start] {
+				if snapshot.coords.epoch > state.coords.epoch.max(state.pending_coords.epoch) {
+					return Err("checkpoint snapshot epoch ahead of the pool".into());
+				}
+			}
 		}
 	}
 
@@ -161,6 +301,14 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			pending.snapshot.coords.scale,
 		)) {
 			return Err("pending snapshot references a pruned sums row".into());
+		}
+	}
+
+	// No checkpoint may outlive the rows that reference it: every stored checkpoint belongs to a
+	// registered market, and the per-market loop above already matched member counts.
+	for ((collateral_id, stable_id, _id), _checkpoint) in CohortCheckpoints::<T>::iter() {
+		if Pools::<T>::get(&collateral_id, &stable_id).is_none() {
+			return Err("cohort checkpoint without a pool row".into());
 		}
 	}
 	Ok(())
