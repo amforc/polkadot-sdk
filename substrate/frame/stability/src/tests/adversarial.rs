@@ -30,12 +30,9 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 	build_and_execute(|| {
 		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		mint_stable(USDX, 1, USDX_MIN_BALANCE);
-		assert_ok!(deposit(1, DOT, USDX, USDX_MIN_BALANCE));
-		advance_time(5_000);
-		assert_ok!(poke(1, 1, DOT, USDX));
+		assert_ok!(deposit_and_mature(1, DOT, USDX, USDX_MIN_BALANCE));
 
 		let pool = Stability::pool_account(&DOT, &USDX);
-		let state_before = pool_state(DOT, USDX);
 		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Active, 0u32, 0u32));
 
 		// USDX has a 10_000-unit minimum balance. Emptying the pool asset
@@ -48,7 +45,13 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 		assert_eq!(leftover.peek(), USDX_MIN_BALANCE - 1);
 		drop(leftover);
 		assert_eq!(stable_balance(USDX, pool), 0);
-		assert_eq!(pool_state(DOT, USDX), state_before);
+		// The due cohort still advanced — that transition does not depend on the
+		// distribution — while the distribution itself left no trace.
+		let state = pool_state(DOT, USDX);
+		assert_eq!(state.total_active_deposits, USDX_MIN_BALANCE);
+		assert_eq!(state.total_pending_deposits, 0);
+		assert!(state.open_cohorts.is_empty());
+		assert_eq!(state.total_yield_unclaimed, 0);
 		assert_eq!(
 			crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Active, 0u32, 0u32)),
 			sums_before
@@ -65,8 +68,7 @@ fn yield_distribution_routes_by_the_credits_own_asset() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 400);
-		assert_ok!(deposit(1, DOT, PUSD, 400));
-		activate_all(&[1]);
+		assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
 
 		// The credit's asset names the market: a USDX credit targets the
 		// unregistered (DOT, USDX) pair and comes back whole, while the
@@ -89,8 +91,7 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 400);
-		assert_ok!(deposit(1, DOT, PUSD, 400));
-		activate_all(&[1]);
+		assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
 		mint_stable(PUSD, 2, 200);
 		assert_ok!(deposit(2, DOT, PUSD, 200));
 
@@ -129,9 +130,7 @@ fn stable_shortfall_steps_aside_without_consuming_collateral() {
 	build_and_execute(|| {
 		register_branch(TOKEN_X, PUSD, default_branch_config());
 		mint_stable(PUSD, 1, 400);
-		assert_ok!(deposit(1, TOKEN_X, PUSD, 400));
-		advance_time(5_000);
-		assert_ok!(poke(1, 1, TOKEN_X, PUSD));
+		assert_ok!(deposit_and_mature(1, TOKEN_X, PUSD, 400));
 
 		let pool = Stability::pool_account(&TOKEN_X, &PUSD);
 		// Break the stable-balance identity so offset sizing finds nothing

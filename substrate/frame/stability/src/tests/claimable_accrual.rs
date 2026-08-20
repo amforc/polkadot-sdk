@@ -9,25 +9,11 @@
 
 use crate::{mock::*, Error};
 
-/// Deposit-and-activate `amount` for `who`, minting exactly `amount`.
-fn seed_active(who: AccountId, amount: Balance) {
-	seed_deposit(who, amount);
-	activate_all(&[who]);
-}
-
-/// Mint `headroom` stablecoin for `who` and deposit `amount`, leaving the rest
-/// in the wallet so later top-ups have funds; then activate.
-fn seed_active_with_headroom(who: AccountId, amount: Balance, headroom: Balance) {
-	mint_stable(PUSD, who, headroom);
-	assert_ok!(deposit(who, DOT, PUSD, amount));
-	activate_all(&[who]);
-}
-
 #[test]
 fn top_up_realizes_offset_gain_into_claimable_not_wallet() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active_with_headroom(1, 1_000, 2_000);
+		seed_matured_deposit_from_balance(1, 2_000, 1_000);
 
 		// Offset halves the pool: P = 500/1000 = 0.5, delta_S = C_sp * P/A =
 		// 400 * (1/1000) = 0.4. The gain stays latent — offsets never touch
@@ -63,8 +49,8 @@ fn sequential_offsets_accumulate_claimable_across_touches() {
 		register_branch(DOT, PUSD, default_branch_config());
 		// Two depositors, so distributed gains actually split: only user 1
 		// is touched below; user 2's share stays latent until the end.
-		seed_active_with_headroom(1, 1_000, 2_000);
-		seed_active(2, 1_000);
+		seed_matured_deposit_from_balance(1, 2_000, 1_000);
+		seed_matured_deposit(2, 1_000);
 
 		// Offset 1 over A = 2000: P = 1 -> 0.5, delta_S = 800 * (1/2000) = 0.4.
 		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).0, 1_000);
@@ -94,7 +80,7 @@ fn sequential_offsets_accumulate_claimable_across_touches() {
 
 		// User 2, untouched the whole time, realizes its complement:
 		// gain = (1000/1) * (0.6 - 0) = 600 — together the full 800 + 400.
-		assert_ok!(poke(7, 2, DOT, PUSD));
+		assert_ok!(settle(7, 2, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 2).expect("row survives");
 		assert_eq!(row.claimable_collateral, 600);
 		assert_eq!(row.active_deposit, 250);
@@ -105,7 +91,7 @@ fn sequential_offsets_accumulate_claimable_across_touches() {
 fn withdraw_realizes_yield_into_claimable_never_compounds() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 600);
+		seed_matured_deposit(1, 600);
 
 		// delta_G = Y * (P/A) = 60 * (1/600) = 0.1.
 		drop(distribute_yield(DOT, PUSD, 60));
@@ -135,7 +121,7 @@ fn claim_after_full_withdrawal_pays_earned_gains() {
 	// directly, here it is earned through an offset.
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 1_000);
+		seed_matured_deposit(1, 1_000);
 
 		// Offset: P = 500/1000 = 0.5, delta_S = 400 * (1/1000) = 0.4;
 		// gain = (D0/P0) * delta_S = (1000/1) * 0.4 = 400.
@@ -160,23 +146,23 @@ fn claim_after_full_withdrawal_pays_earned_gains() {
 }
 
 #[test]
-fn permissionless_poke_realizes_gain_into_owner_claimable() {
+fn permissionless_settlement_realizes_gain_into_owner_claimable() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
-		seed_active(1, 1_000);
+		seed_matured_deposit(1, 1_000);
 
 		// P = 0.5, delta_S = 400 * (1/1000) = 0.4.
 		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
 
-		// A third party pokes: realization is permissionless, so gain =
+		// A third party settles the row: realization is permissionless, so gain =
 		// (1000/1) * 0.4 = 400 lands in the owner's claimable and the
 		// deposit compounds to 500.
-		assert_ok!(poke(7, 1, DOT, PUSD));
+		assert_ok!(settle(7, 1, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
 		assert_eq!(row.claimable_collateral, 400);
 		assert_eq!(row.active_deposit, 500);
 
-		// The owner still owns the payout: the poker has no row to claim from.
+		// The owner still owns the payout: the caller has no row to claim from.
 		assert_noop!(claim_collateral(7, DOT, PUSD, 7), Error::<Test>::DepositNotFound);
 		let before = collateral_balance(DOT, 1);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));

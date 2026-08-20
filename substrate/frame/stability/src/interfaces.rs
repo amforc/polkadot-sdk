@@ -1,7 +1,7 @@
-//! What sibling pallets drive on the pool.
+//! Cross-pallet yield and liquidation contracts of the stability pool.
 //!
-//! The vault engine routes yield here, and the liquidation engine cancels debt here. Both
-//! surfaces are defined in `pusd-primitives`, so neither pallet needs to know the other.
+//! `pusd-primitives` defines these contracts so callers depend on protocol behavior, not on this
+//! pallet's storage model.
 
 use crate::{
 	pallet::{
@@ -10,14 +10,17 @@ use crate::{
 	},
 	types::Leg,
 };
-use frame::{deps::frame_support::require_transactional, prelude::*, traits::tokens::Preservation};
+use frame::{
+	deps::frame_support::require_transactional,
+	prelude::*,
+	traits::{tokens::Preservation, Time},
+};
 use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, StabilityPoolOffset};
 
-/// The pool takes `floor(yield_share * credit)` and returns the rest for the fee destination.
+/// Allocates `floor(yield_share * credit)` to active depositors and returns the remainder.
 ///
-/// Cannot fail. Whatever the pool cannot take, because the market is unregistered, the share is
-/// zero, or the pool is empty or frozen, comes back with the remainder. The pool row is read once
-/// here and handed down.
+/// Yield routing must not fail the operation that produced the yield. Therefore, an unavailable
+/// pool returns all credit to the caller.
 impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T> {
 	fn distribute_yield(
 		collateral_id: &CollateralIdOf<T>,
@@ -45,8 +48,7 @@ impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T
 	}
 }
 
-/// One sized offset leg: the debt to cancel, and the `Preservation` its sizing proved valid for
-/// the burn.
+/// Exact debt amount of one offset leg and its validated asset-preservation rule.
 #[derive(Clone, Copy)]
 pub(crate) struct OffsetReservation<Balance> {
 	pub(crate) debt: Balance,
@@ -54,10 +56,10 @@ pub(crate) struct OffsetReservation<Balance> {
 }
 
 impl<T: Config> Pallet<T> {
-	/// The pool an offset may draw on.
+	/// Returns the pool available for an offset.
 	///
-	/// Returns `None` for a market that is missing or frozen, which sizes every leg to zero and
-	/// refuses every settlement.
+	/// A missing or frozen market returns `None`. This result gives zero capacity and prevents
+	/// settlement.
 	fn offset_pool(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -66,10 +68,23 @@ impl<T: Config> Pallet<T> {
 		Pools::<T>::get(collateral_id, stable_id)
 	}
 
-	/// Re-sizes one non-zero leg and demands the exact requested debt.
+	/// Returns the offset pool with all due cohort activations applied in memory.
 	///
-	/// Anything else means the caller acted on a stale reading, so the whole offset aborts with
-	/// nothing moved.
+	/// This simulation gives inspection and settlement the same capital classification without a
+	/// storage change.
+	fn offset_pool_advanced(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> Option<StabilityPoolOf<T>> {
+		let mut pool = Self::offset_pool(collateral_id, stable_id)?;
+		Self::roll_due_cohorts(&mut pool, T::TimeProvider::now()).ok()?;
+		Some(pool)
+	}
+
+	/// Confirms that one nonzero offset leg still has its quoted capacity.
+	///
+	/// A mismatch means that the quote is stale. The complete offset must then fail without value
+	/// movement.
 	fn size_leg_exact(
 		sized: Option<(BalanceOf<T>, Preservation)>,
 		requested: BalanceOf<T>,
@@ -88,7 +103,7 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 		stable_id: &StableIdOf<T>,
 		max_debt: BalanceOf<T>,
 	) -> BalanceOf<T> {
-		let Some(pool) = Self::offset_pool(collateral_id, stable_id) else {
+		let Some(pool) = Self::offset_pool_advanced(collateral_id, stable_id) else {
 			return BalanceOf::<T>::zero();
 		};
 		let pool_account = Self::pool_account(collateral_id, stable_id);
@@ -109,7 +124,7 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 		max_debt: BalanceOf<T>,
 		active_debt: BalanceOf<T>,
 	) -> BalanceOf<T> {
-		let Some(pool) = Self::offset_pool(collateral_id, stable_id) else {
+		let Some(pool) = Self::offset_pool_advanced(collateral_id, stable_id) else {
 			return BalanceOf::<T>::zero();
 		};
 		let pool_account = Self::pool_account(collateral_id, stable_id);
@@ -142,6 +157,9 @@ impl<T: Config>
 		}
 		let mut pool = Self::offset_pool(collateral_id, stable_id)
 			.ok_or(crate::Error::<T>::OffsetSettlementFailed)?;
+		// The same advancement the read-only sizing simulated, committed for real: inspection and
+		// settlement must agree on which capital is active.
+		Self::advance_cohorts(collateral_id, stable_id, &mut pool, T::TimeProvider::now())?;
 		let pool_account = Self::pool_account(collateral_id, stable_id);
 
 		// Both legs re-size against the untouched pool, in the order the caller inspected them:
