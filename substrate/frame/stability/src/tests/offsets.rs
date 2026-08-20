@@ -15,8 +15,9 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 		register_branch(DOT, PUSD, config);
 		assert_ok!(open_vault(1, DOT, PUSD, 600, 500));
 		assert_ok!(open_vault(2, DOT, PUSD, 2_000, 500));
-		seed_deposit(3, 500);
-		activate_all(&[3]);
+		// The deposit only matures here: the liquidation itself activates it, so no row touch
+		// stands between a depositor and the offset that spends their capital.
+		seed_matured_deposit(3, 500);
 		set_price(DOT, FixedU128::from_rational(9u128, 10u128));
 
 		let owner_before = collateral_balance(DOT, 1);
@@ -60,9 +61,7 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 		// `Protect` preservation keeps free.
 		let redistribution = Vaults::redistribution_account(&collateral, &PUSD);
 		mint_stable(PUSD, 3, 100);
-		assert_ok!(deposit(3, collateral.clone(), PUSD, 100));
-		advance_time(5_000);
-		assert_ok!(poke(3, 3, collateral.clone(), PUSD));
+		assert_ok!(deposit_and_mature(3, collateral.clone(), PUSD, 100));
 		// floor(0.18 * 3_000) = 540 of value: CR 1.08 sits below the 1.10 MCR.
 		set_price(collateral.clone(), FixedU128::from_rational(9u128, 50u128));
 
