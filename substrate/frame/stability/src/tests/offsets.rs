@@ -119,16 +119,19 @@ fn offset_zero_request_or_empty_pool_noops() {
 		assert_eq!(debt_offset, 0);
 		assert_eq!(leftover, 50);
 
-		// Zero request against a funded pool: same. A zero request never reaches settlement, so
-		// the activation must already stand; a real settlement commits it.
+		// Zero request against a funded pool: same. A zero request returns before it can advance
+		// anything, so the later deposit is what activates the matured cohort.
 		seed_matured_deposit(1, 1_000);
-		assert_ok!(settle(7, 1, DOT, PUSD));
+		seed_deposit(2, 100);
+		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 1_000);
+
 		let (debt_offset, leftover) = simulate_offset(DOT, PUSD, 0, 50);
 		assert_eq!(debt_offset, 0);
 		assert_eq!(leftover, 50);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.coords.p, FixedU128::one());
 		assert_eq!(state.total_active_deposits, 1_000);
+		assert_eq!(state.total_pending_deposits, 100);
 	});
 }
 
@@ -367,6 +370,8 @@ fn offset_refuses_stale_sizing_reads() {
 #[test]
 fn offset_with_sub_minimum_collateral_gain_steps_aside() {
 	build_and_execute(|| {
+		use pusd_primitives::StabilityPoolInspect;
+
 		// A collateral whose pallet-assets minimum balance exceeds the gain:
 		// resolving the first-ever gain into the empty pool account fails.
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
@@ -374,23 +379,28 @@ fn offset_with_sub_minimum_collateral_gain_steps_aside() {
 		register_branch(coll.clone(), PUSD, branch_config_for(coll.clone(), PUSD));
 		mint_stable(PUSD, 1, 1_000);
 		assert_ok!(deposit_and_mature(1, coll.clone(), PUSD, 1_000));
-		assert_ok!(settle(7, 1, coll.clone(), PUSD));
+		// The sizing pass advances the matured cohort in memory, so the offset is quoted
+		// against active capital with the row untouched.
+		assert_eq!(Stability::reducible_active(&coll, &PUSD, 500), 500);
 
 		// 500 collateral for 500 debt: gain 500 < the 1_000 minimum on an
 		// empty account — the whole offset steps aside, nothing moves.
 		let (debt_offset, leftover) = simulate_offset(coll.clone(), PUSD, 500, 500);
 		assert_eq!(debt_offset, 0);
 		assert_eq!(leftover, 500);
+		// The refusal rolled back the advancement with everything else, so the capital is
+		// still pending.
 		let state = pool_state(coll.clone(), PUSD);
-		assert_eq!(state.total_active_deposits, 1_000);
+		assert_eq!(state.total_pending_deposits, 1_000);
 		assert_eq!(state.coords.p, FixedU128::one());
 		let pool = Stability::pool_account(&coll, &PUSD);
 		assert_eq!(stable_balance(PUSD, pool), 1_000);
 
-		// A gain clearing the minimum lands normally.
+		// A gain clearing the minimum lands normally, committing the activation it sized against.
 		let (debt_offset, leftover) = simulate_offset(coll.clone(), PUSD, 500, 1_500);
 		assert_eq!(debt_offset, 500);
 		assert_eq!(leftover, 0);
+		assert_eq!(pool_state(coll.clone(), PUSD).total_active_deposits, 500);
 		assert_eq!(collateral_balance(coll, pool), 1_500);
 	});
 }
