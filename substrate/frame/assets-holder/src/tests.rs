@@ -556,3 +556,287 @@ mod impl_hold_mutate {
 		});
 	}
 }
+
+mod consideration {
+	use super::*;
+	use frame_support::{
+		parameter_types,
+		traits::{
+			fungibles::{
+				AssetFootprintPrice, AtLeastMinimumBalance, HoldConsideration, Mutate,
+				SufficientAssets,
+			},
+			tokens::{ConversionToAssetBalance, FallbackOnUnavailable, Fortitude, Precision},
+			AssetFootprint, Consideration, ConstU64, Contains, Footprint, LinearStoragePrice,
+			MaybeConsideration,
+		},
+	};
+	use sp_runtime::{traits::Convert, DispatchError, TokenError};
+
+	/// This sufficient asset has a minimum balance of ten.
+	const SUFFICIENT: AssetId = 2;
+	const INSUFFICIENT: AssetId = 3;
+	const UNKNOWN: AssetId = 99;
+	const POOR: AccountId = 2;
+
+	parameter_types! {
+		pub const GovernanceReason: DummyHoldReason = DummyHoldReason::Governance;
+		pub const FallbackAsset: AssetId = ASSET_ID;
+	}
+
+	struct TimesTen;
+	impl ConversionToAssetBalance<Balance, AssetId, Balance> for TimesTen {
+		type Error = DispatchError;
+		fn to_asset_balance(balance: Balance, _: AssetId) -> Result<Balance, DispatchError> {
+			Ok(balance * 10)
+		}
+	}
+
+	struct Unavailable;
+	impl ConversionToAssetBalance<Balance, AssetId, Balance> for Unavailable {
+		type Error = DispatchError;
+		fn to_asset_balance(_: Balance, _: AssetId) -> Result<Balance, DispatchError> {
+			Err(DispatchError::Unavailable)
+		}
+	}
+
+	struct Unsupported;
+	impl ConversionToAssetBalance<Balance, AssetId, Balance> for Unsupported {
+		type Error = DispatchError;
+		fn to_asset_balance(_: Balance, _: AssetId) -> Result<Balance, DispatchError> {
+			Err(TokenError::Unsupported.into())
+		}
+	}
+
+	struct Worthless;
+	impl ConversionToAssetBalance<Balance, AssetId, Balance> for Worthless {
+		type Error = DispatchError;
+		fn to_asset_balance(_: Balance, _: AssetId) -> Result<Balance, DispatchError> {
+			Ok(0)
+		}
+	}
+
+	/// The price is one balance unit per byte.
+	type Price = LinearStoragePrice<ConstU64<0>, ConstU64<1>, Balance>;
+	type Policy<Repricing> = AssetFootprintPrice<
+		SufficientAssets<AssetsHolder, AccountId>,
+		FallbackAsset,
+		Price,
+		Repricing,
+	>;
+	type Ticket = HoldConsideration<AccountId, AssetsHolder, GovernanceReason, Policy<TimesTen>>;
+
+	fn footprint(asset: AssetId, bytes: usize) -> AssetFootprint<AssetId> {
+		AssetFootprint::new(asset, Footprint::from_parts(1, bytes))
+	}
+
+	fn held(asset: AssetId, who: AccountId) -> Balance {
+		<AssetsHolder as InspectHold<AccountId>>::balance_on_hold(
+			asset,
+			&DummyHoldReason::Governance,
+			&who,
+		)
+	}
+
+	fn new_test_ext() -> sp_io::TestExternalities {
+		super::new_test_ext(|| {
+			assert_ok!(Assets::force_create(RuntimeOrigin::root(), SUFFICIENT, 0, true, 10));
+			assert_ok!(Assets::force_create(RuntimeOrigin::root(), INSUFFICIENT, 0, false, 1));
+			assert_ok!(<Assets as Mutate<AccountId>>::mint_into(SUFFICIENT, &WHO, 1_000));
+		})
+	}
+
+	#[test]
+	fn sufficient_assets_works() {
+		new_test_ext().execute_with(|| {
+			type Filter = SufficientAssets<AssetsHolder, AccountId>;
+			assert!(Filter::contains(&ASSET_ID));
+			assert!(Filter::contains(&SUFFICIENT));
+			assert!(!Filter::contains(&INSUFFICIENT));
+			assert!(!Filter::contains(&UNKNOWN));
+		});
+	}
+
+	#[test]
+	fn asset_footprint_price_works() {
+		// The policy selects the asset and reprices it.
+		new_test_ext().execute_with(|| {
+			assert_eq!(Policy::<TimesTen>::convert(footprint(SUFFICIENT, 5)), Ok((SUFFICIENT, 50)));
+			// The policy does not reprice the fallback asset.
+			assert_eq!(Policy::<TimesTen>::convert(footprint(ASSET_ID, 5)), Ok((ASSET_ID, 5)));
+		});
+
+		// The policy returns the conversion error. The fallback does not use the converter.
+		new_test_ext().execute_with(|| {
+			assert_eq!(
+				Policy::<Unavailable>::convert(footprint(SUFFICIENT, 5)),
+				Err(DispatchError::Unavailable)
+			);
+			assert_eq!(
+				Policy::<Unavailable>::convert(footprint(INSUFFICIENT, 5)),
+				Ok((ASSET_ID, 5))
+			);
+		});
+
+		// The policy never waives a priced deposit, but a zero footprint price creates a free
+		// ticket.
+		new_test_ext().execute_with(|| {
+			assert_eq!(
+				Policy::<Worthless>::convert(footprint(SUFFICIENT, 5)),
+				Err(TokenError::BelowMinimum.into())
+			);
+			assert_eq!(Policy::<Worthless>::convert(footprint(SUFFICIENT, 0)), Ok((ASSET_ID, 0)));
+		});
+	}
+
+	#[test]
+	fn at_least_minimum_balance_works() {
+		new_test_ext().execute_with(|| {
+			type Floored<Inner> = AtLeastMinimumBalance<AssetsHolder, Inner, AccountId>;
+			// The quote is floored to the minimum balance of the asset.
+			assert_eq!(Floored::<Worthless>::to_asset_balance(5, SUFFICIENT), Ok(10));
+			assert_eq!(Floored::<TimesTen>::to_asset_balance(5, SUFFICIENT), Ok(50));
+			assert_eq!(
+				Floored::<Unavailable>::to_asset_balance(5, SUFFICIENT),
+				Err(DispatchError::Unavailable)
+			);
+		});
+	}
+
+	#[test]
+	fn fallback_on_unavailable_works() {
+		// The secondary is consulted only when the primary has no quote.
+		type Fallback = FallbackOnUnavailable<Unavailable, TimesTen>;
+		type NoFallback = FallbackOnUnavailable<Unsupported, TimesTen>;
+		type BothUnavailable = FallbackOnUnavailable<Unavailable, Unavailable>;
+		assert_eq!(Fallback::to_asset_balance(5, SUFFICIENT), Ok(50));
+		assert_eq!(
+			NoFallback::to_asset_balance(5, SUFFICIENT),
+			Err(TokenError::Unsupported.into())
+		);
+		assert_eq!(
+			BothUnavailable::to_asset_balance(5, SUFFICIENT),
+			Err(DispatchError::Unavailable)
+		);
+	}
+
+	#[test]
+	fn hold_consideration_new_works() {
+		// Creating a ticket holds the deposit in the selected asset.
+		new_test_ext().execute_with(|| {
+			let ticket = Ticket::new(&WHO, footprint(SUFFICIENT, 5)).expect("WHO is funded");
+			assert!(!ticket.is_none());
+			assert_eq!(held(SUFFICIENT, WHO), 50);
+			assert_eq!(held(ASSET_ID, WHO), 0);
+		});
+
+		// Creating a ticket without funds fails without leaving a hold.
+		new_test_ext().execute_with(|| {
+			assert_noop!(
+				Ticket::new(&POOR, footprint(SUFFICIENT, 5)),
+				TokenError::FundsUnavailable
+			);
+		});
+
+		// Creating a ticket for a free footprint creates a ticket that holds nothing.
+		new_test_ext().execute_with(|| {
+			let ticket = Ticket::new(&WHO, footprint(SUFFICIENT, 0)).expect("free ticket");
+			assert!(ticket.is_none());
+			assert_ok!(ticket.drop(&WHO));
+		});
+	}
+
+	#[test]
+	fn hold_consideration_update_works() {
+		// Updating the ticket adjusts the hold in the selected asset without touching an
+		// unrelated hold for the same reason.
+		new_test_ext().execute_with(|| {
+			assert_ok!(<AssetsHolder as MutateHold<AccountId>>::hold(
+				SUFFICIENT,
+				&DummyHoldReason::Governance,
+				&WHO,
+				7
+			));
+			let ticket = Ticket::new(&WHO, footprint(SUFFICIENT, 5)).expect("WHO is funded");
+			assert_eq!(held(SUFFICIENT, WHO), 57);
+
+			let ticket = ticket.update(&WHO, footprint(SUFFICIENT, 8)).expect("WHO is funded");
+			assert_eq!(held(SUFFICIENT, WHO), 87);
+			let ticket = ticket.update(&WHO, footprint(SUFFICIENT, 3)).expect("WHO is funded");
+			assert_eq!(held(SUFFICIENT, WHO), 37);
+
+			// The policy selects a different asset and moves the complete deposit.
+			let ticket = ticket.update(&WHO, footprint(INSUFFICIENT, 3)).expect("WHO is funded");
+			assert_eq!(held(SUFFICIENT, WHO), 7);
+			assert_eq!(held(ASSET_ID, WHO), 3);
+
+			assert_ok!(ticket.drop(&WHO));
+			assert_eq!(held(SUFFICIENT, WHO), 7);
+			assert_eq!(held(ASSET_ID, WHO), 0);
+		});
+
+		// Switching asset is all or nothing: the fallback asset has only 100 units, so it
+		// cannot hold 500 units and the original hold is preserved.
+		new_test_ext().execute_with(|| {
+			let ticket = Ticket::new(&WHO, footprint(SUFFICIENT, 5)).expect("WHO is funded");
+			assert_noop!(
+				ticket.update(&WHO, footprint(INSUFFICIENT, 500)),
+				TokenError::FundsUnavailable
+			);
+		});
+
+		// Switching asset after the hold was partially burned fails.
+		new_test_ext().execute_with(|| {
+			let ticket = Ticket::new(&WHO, footprint(SUFFICIENT, 5)).expect("WHO is funded");
+			assert_ok!(<AssetsHolder as MutateHold<AccountId>>::burn_held(
+				SUFFICIENT,
+				&DummyHoldReason::Governance,
+				&WHO,
+				1,
+				Precision::Exact,
+				Fortitude::Force,
+			));
+			assert_noop!(
+				ticket.update(&WHO, footprint(INSUFFICIENT, 3)),
+				TokenError::FundsUnavailable
+			);
+		});
+	}
+
+	#[test]
+	fn hold_consideration_drop_works() {
+		// Dropping the ticket after the hold was partially burned fails.
+		new_test_ext().execute_with(|| {
+			let ticket = Ticket::new(&WHO, footprint(SUFFICIENT, 5)).expect("WHO is funded");
+			assert_ok!(<AssetsHolder as MutateHold<AccountId>>::burn_held(
+				SUFFICIENT,
+				&DummyHoldReason::Governance,
+				&WHO,
+				1,
+				Precision::Exact,
+				Fortitude::Force,
+			));
+			assert_eq!(held(SUFFICIENT, WHO), 49);
+
+			assert_noop!(ticket.drop(&WHO), TokenError::FundsUnavailable);
+		});
+	}
+
+	#[test]
+	fn hold_consideration_burn_works() {
+		// Burning the ticket destroys the held amount, reducing `total_balance`.
+		new_test_ext().execute_with(|| {
+			let total_before = <Assets as Inspect<AccountId>>::total_balance(ASSET_ID, &WHO);
+			let ticket = Ticket::new(&WHO, footprint(INSUFFICIENT, 5)).expect("WHO is funded");
+			assert_eq!(held(ASSET_ID, WHO), 5);
+
+			ticket.burn(&WHO);
+
+			assert_eq!(held(ASSET_ID, WHO), 0);
+			assert_eq!(
+				<Assets as Inspect<AccountId>>::total_balance(ASSET_ID, &WHO),
+				total_before - 5
+			);
+		});
+	}
+}
