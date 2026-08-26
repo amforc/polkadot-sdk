@@ -312,6 +312,39 @@ pub trait ConversionFromAssetBalance<AssetBalance, AssetId, OutBalance> {
 	fn ensure_successful(asset_id: AssetId);
 }
 
+/// Converts with `Primary`, and with `Secondary` only when `Primary` has no quote.
+///
+/// [`DispatchError::Unavailable`] from `Primary` means it has no price for the asset, so
+/// `Secondary` is consulted. Every other error means `Primary` has a price that must not be used
+/// (stale, invalid, or overflowing), so it is returned unchanged and `Secondary` is never
+/// consulted. A converter that fails closed therefore stays closed when wrapped.
+pub struct FallbackOnUnavailable<Primary, Secondary>(
+	core::marker::PhantomData<(Primary, Secondary)>,
+);
+impl<InBalance, AssetId, AssetBalance, Primary, Secondary>
+	ConversionToAssetBalance<InBalance, AssetId, AssetBalance>
+	for FallbackOnUnavailable<Primary, Secondary>
+where
+	InBalance: Clone,
+	AssetId: Clone,
+	Primary: ConversionToAssetBalance<InBalance, AssetId, AssetBalance, Error: Into<DispatchError>>,
+	Secondary:
+		ConversionToAssetBalance<InBalance, AssetId, AssetBalance, Error: Into<DispatchError>>,
+{
+	type Error = DispatchError;
+	fn to_asset_balance(
+		balance: InBalance,
+		asset_id: AssetId,
+	) -> Result<AssetBalance, Self::Error> {
+		match Primary::to_asset_balance(balance.clone(), asset_id.clone()).map_err(Into::into) {
+			Err(DispatchError::Unavailable) => {
+				Secondary::to_asset_balance(balance, asset_id).map_err(Into::into)
+			},
+			result => result,
+		}
+	}
+}
+
 /// Implements [`ConversionFromAssetBalance`] and [`ConversionToAssetBalance`],
 /// enabling a 1:1 conversion between the asset balance and the native balance.
 pub struct UnityAssetBalanceConversion;
