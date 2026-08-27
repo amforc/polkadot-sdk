@@ -17,7 +17,15 @@
 //! redemptions and the stability pool.
 
 use super::*;
-use frame_support::traits::{tokens::imbalance::ResolveAssetTo, EitherOf, EnsureOriginWithArg};
+use frame_support::traits::{
+	fungibles::{
+		AssetFootprintPrice, AtLeastMinimumBalance,
+		HoldConsideration as FungiblesHoldConsideration, SufficientAssets,
+	},
+	tokens::imbalance::ResolveAssetTo,
+	EitherOf, EnsureOriginWithArg, LinearStoragePrice,
+};
+use pallet_vaults::pusd_primitives::OraclePriceConversion;
 use sp_runtime::{
 	traits::{AccountIdConversion, Convert, MaybeEquivalence},
 	FixedU128,
@@ -122,6 +130,13 @@ parameter_types! {
 	pub const VaultsMarketCreationHoldReason: RuntimeHoldReason =
 		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
 	pub const VaultsBranchCreationDeposit: Balance = 100 * UNITS;
+	pub const VaultsVaultCreationHoldReason: RuntimeHoldReason =
+		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::VaultCreationDeposit);
+	/// Per-vault storage deposit at JAM parity: the whole supply (2.1 billion) against the
+	/// state it can hold (21 million kilobytes) values one kilobyte at 100 units, so a byte
+	/// costs 100 / 1024. Keys and rows are priced alike, with no per-item component.
+	pub const VaultsVaultDepositBase: Balance = 0;
+	pub const VaultsVaultDepositPerByte: Balance = 100 * UNITS / 1024;
 	/// Governance envelope every permissionlessly-created market config must sit
 	/// inside: floors on the collateralization ratios and a cap on the borrow
 	/// rate. Amounts are denominated in the market's own assets, so the creator
@@ -144,7 +159,7 @@ impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
 		collateral_id: &VaultsCollateralId,
 	) -> Result<FixedU128, sp_runtime::DispatchError> {
 		pallet_mock_oracle::Prices::<Runtime>::get(collateral_id)
-			.ok_or(pallet_vaults::Error::<Runtime>::OraclePriceNotAvailable.into())
+			.ok_or(sp_runtime::DispatchError::Unavailable)
 	}
 }
 
@@ -201,6 +216,41 @@ impl Convert<VaultsStableId, AccountId> for VaultsFeeAccount {
 	}
 }
 
+/// Settles a vault deposit in the collateral when it is native or sufficient, else in WND.
+///
+/// A pool quote is deliberately not used as a fallback: it is an instantaneous spot price that
+/// anyone can skew within a block, so it must not be able to gut an anti-spam deposit. Should a
+/// runtime want to price collaterals the oracle does not cover, wrap the oracle conversion in
+/// [`FallbackOnUnavailable`](frame_support::traits::tokens::FallbackOnUnavailable) with
+/// [`PoolQuoteConversion`](pallet_asset_conversion::PoolQuoteConversion) as the secondary:
+///
+/// ```ignore
+/// FallbackOnUnavailable<
+///     OraclePriceConversion<VaultsOracleAdapter, VaultsNativeCollateralId>,
+///     PoolQuoteConversion<AssetConversion, WestendLocation>,
+/// >
+/// ```
+///
+/// and pair it with a floor that preserves the native storage value (e.g. a time-weighted quote
+/// or a fixed minimum in WND terms) rather than relying on the minimum-balance floor alone.
+pub type VaultsDepositPolicy = AssetFootprintPrice<
+	SufficientAssets<VaultsCollateral, AccountId>,
+	VaultsNativeCollateralId,
+	LinearStoragePrice<VaultsVaultDepositBase, VaultsVaultDepositPerByte, Balance>,
+	AtLeastMinimumBalance<
+		VaultsCollateral,
+		OraclePriceConversion<VaultsOracleAdapter, VaultsNativeCollateralId>,
+		AccountId,
+	>,
+>;
+
+pub type VaultsVaultConsideration = FungiblesHoldConsideration<
+	AccountId,
+	VaultsCollateral,
+	VaultsVaultCreationHoldReason,
+	VaultsDepositPolicy,
+>;
+
 impl pallet_vaults::Config for Runtime {
 	type StableToCollateralId = VaultsStableToCollateralId;
 	type CollateralAssets = VaultsCollateral;
@@ -212,12 +262,13 @@ impl pallet_vaults::Config for Runtime {
 	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
-	type Consideration = HoldConsideration<
+	type BranchConsideration = HoldConsideration<
 		AccountId,
 		Balances,
 		VaultsMarketCreationHoldReason,
 		ConstantStoragePrice<VaultsBranchCreationDeposit, Balance>,
 	>;
+	type VaultConsideration = VaultsVaultConsideration;
 	type BranchConfigBounds = VaultsBranchConfigBounds;
 	type ForceOrigin = EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
