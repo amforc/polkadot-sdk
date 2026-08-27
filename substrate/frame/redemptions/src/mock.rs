@@ -244,7 +244,8 @@ impl pallet_vaults::Config for Test {
 	type OnBranchLifecycle = Redemptions;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
-	type Consideration = VaultsConsideration;
+	type BranchConsideration = VaultsConsideration;
+	type VaultConsideration = ();
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
@@ -818,7 +819,7 @@ pub fn held(collateral: AssetId, who: AccountId) -> Balance {
 /// The vault's stored debt (principal + settled interest); zero when absent.
 pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Balance {
 	pallet_vaults::Vaults::<Test>::get((collateral, stable, who))
-		.map(|v| v.debt.principal + v.debt.interest)
+		.map(|record| record.vault.debt.principal + record.vault.debt.interest)
 		.unwrap_or_default()
 }
 

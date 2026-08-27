@@ -1113,7 +1113,7 @@ fn insurance_adjusted_settlement_with_partial_fund() {
 
 		// Full settlement leaves a debt-free Dormant husk keeping the flooring
 		// dust; the cover was paid inside the same settlement.
-		let husk = pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept");
+		let husk = pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept").vault;
 		assert_eq!(husk.debt.total(), 0);
 		assert_eq!(husk.collateral, 3);
 		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
@@ -1761,6 +1761,7 @@ fn redeem_and_preview_report_zero_price() {
 fn vault_interest_time(who: AccountId) -> Moment {
 	pallet_vaults::Vaults::<Test>::get((DOT, PUSD, who))
 		.expect("vault")
+		.vault
 		.last_interest_time
 }
 
@@ -1909,7 +1910,8 @@ fn full_wipe_execution_matches_the_quote_and_leaves_the_pending_complement() {
 		assert_eq!(executed_stable - executed_fee, quote.debt_cancelled);
 
 		// The husks own no debt but keep their stake, so the complement stays pending.
-		let vault = |owner| pallet_vaults::pallet::Vaults::<Test>::get((DOT, PUSD, owner)).unwrap();
+		let vault =
+			|owner| pallet_vaults::pallet::Vaults::<Test>::get((DOT, PUSD, owner)).unwrap().vault;
 		let state = || pallet_vaults::pallet::Branches::<Test>::get(DOT, PUSD).unwrap().state;
 		assert_eq!(state().debt.principal, 0);
 		assert_eq!(state().debt.pending_redistribution_principal, 2);
@@ -2309,7 +2311,7 @@ fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_not_coins() {
 
 		assert_ok!(redeem(3, DOT, USDX, market_cancel, 0, 4, 0));
 
-		let husk = pallet_vaults::Vaults::<Test>::get((DOT, USDX, 1)).expect("husk kept");
+		let husk = pallet_vaults::Vaults::<Test>::get((DOT, USDX, 1)).expect("husk kept").vault;
 		assert_eq!(husk.debt.total(), 0, "vault settled");
 		assert_eq!(husk.collateral, 3, "raw-unit dust stays with the husk");
 		// 400e6/450_479_124 yields value floor(market_cancel · rate) =
