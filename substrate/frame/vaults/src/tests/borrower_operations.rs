@@ -1,4 +1,4 @@
-use crate::{mock::*, pallet::Vaults, tests::rate_pct};
+use crate::{mock::*, tests::rate_pct};
 
 // `close_vault` requires zero debt; with debt outstanding it returns
 // `DebtOutstanding`. The separate "system needs at least one vault" guard
@@ -77,14 +77,14 @@ fn zero_amount_repay_is_rejected_without_touching_the_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		let before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let before = vault(DOT, PUSD, 1);
 		advance_time(86_400_000);
 
 		assert_noop!(
 			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(0)),
 			crate::Error::<Test>::ZeroAmount
 		);
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
+		assert_eq!(try_vault(DOT, PUSD, 1), Some(before));
 		assert_eq!(held(DOT, 1), 1_000);
 	});
 }
@@ -94,7 +94,7 @@ fn zero_amount_withdrawal_is_rejected_without_touching_the_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		let before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let before = vault(DOT, PUSD, 1);
 		advance_time(86_400_000);
 		MockOracleAvailable::set(false);
 
@@ -109,7 +109,7 @@ fn zero_amount_withdrawal_is_rejected_without_touching_the_vault() {
 			crate::Error::<Test>::ZeroAmount
 		);
 		MockOracleAvailable::set(true);
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
+		assert_eq!(try_vault(DOT, PUSD, 1), Some(before));
 		assert_eq!(held(DOT, 1), 1_000);
 	});
 }
@@ -119,7 +119,7 @@ fn zero_amount_deposit_is_rejected_without_touching_the_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		let before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let before = vault(DOT, PUSD, 1);
 		advance_time(86_400_000);
 
 		assert_noop!(
@@ -132,7 +132,7 @@ fn zero_amount_deposit_is_rejected_without_touching_the_vault() {
 			),
 			crate::Error::<Test>::ZeroAmount
 		);
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
+		assert_eq!(try_vault(DOT, PUSD, 1), Some(before));
 		assert_eq!(held(DOT, 1), 1_000);
 	});
 }
@@ -142,7 +142,7 @@ fn zero_amount_borrow_is_rejected_without_touching_the_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		let before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let before = vault(DOT, PUSD, 1);
 		advance_time(86_400_000);
 
 		assert_noop!(
@@ -169,7 +169,7 @@ fn zero_amount_borrow_is_rejected_without_touching_the_vault() {
 			0,
 			"the quote must reflect that a zero borrow is not executable"
 		);
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(before));
+		assert_eq!(try_vault(DOT, PUSD, 1), Some(before));
 	});
 }
 
@@ -207,7 +207,7 @@ fn change_rate_to_same_rate_is_no_op() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 5_000, 10_000, rate_pct(5, 100)));
-		let pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let pre = vault(DOT, PUSD, 1);
 		advance_time(86_400_000); // one day of pending interest
 		let now = pallet_timestamp::Pallet::<Test>::get();
 		assert_eq!(
@@ -223,7 +223,7 @@ fn change_rate_to_same_rate_is_no_op() {
 			rate_pct(5, 100),
 			Position::endpoints_only()
 		));
-		let post = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let post = vault(DOT, PUSD, 1);
 		// Rate, principal and cooldown clock are untouched (no real rate change).
 		assert_eq!(post.annual_rate, pre.annual_rate);
 		assert_eq!(post.debt.principal, pre.debt.principal);

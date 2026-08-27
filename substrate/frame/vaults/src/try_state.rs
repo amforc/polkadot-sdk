@@ -73,7 +73,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		)?;
 		// The slot exposes redemption dust, so a debt-free Dormant vault cannot occupy it.
 		if let Some(owner) = branch.state.dormant_redemption_target.clone() {
-			let Some(vault) = Vaults::<T>::get((collateral_id, stable_id, &owner)) else {
+			let Ok(vault) = Pallet::<T>::vault_of(collateral_id, stable_id, &owner) else {
 				return Err("dormant_redemption_target points at missing vault".into());
 			};
 			if !Pallet::<T>::vault_status_of(collateral_id, stable_id, &owner).is_dormant() {
@@ -219,7 +219,8 @@ fn check_branch_identities<T: Config>(
 	let mut sum_eligible_collateral = BalanceOf::<T>::zero();
 	let mut vault_count: u32 = 0;
 
-	for (owner, vault) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
+	for (owner, record) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
+		let vault = record.vault;
 		vault_count = vault_count.checked_add(1).ok_or("branch vault count overflow")?;
 		if vault.last_interest_time > tau {
 			return Err("vault last_interest_time ahead of interest_time(now)".into());

@@ -20,7 +20,7 @@ use frame::{
 use pusd_primitives::{collateralization_ratio, MILLIS_PER_YEAR};
 
 fn vault(owner: AccountId) -> crate::types::Vault<Balance> {
-	crate::pallet::Vaults::<Test>::get((XBT, USDX, owner)).expect("vault")
+	crate::mock::vault(XBT, USDX, owner)
 }
 
 /// Settings denominated for `USDX`: the debt floor is a scale-appropriate 200

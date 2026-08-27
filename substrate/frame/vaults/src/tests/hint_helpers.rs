@@ -106,7 +106,7 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		seed_long_rate_index();
 
-		let vault_pre = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).expect("vault stored");
+		let vault_pre = vault(DOT, PUSD, 21);
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(
 				RuntimeOrigin::signed(99),
@@ -118,7 +118,7 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 			crate::Error::<Test>::InvalidPositionHints
 		);
 		assert!(vault_status(DOT, PUSD, 21).is_final_recovery());
-		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).unwrap(), vault_pre);
+		assert_eq!(vault(DOT, PUSD, 21), vault_pre);
 		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), alloc::vec![21]);
 	});
 }
@@ -145,7 +145,7 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 			crate::Error::<Test>::InvalidPositionHints
 		);
 
-		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 21)).is_none());
+		assert!(!vault_exists(DOT, PUSD, 21));
 		assert_eq!(held(DOT, 21), 0);
 		assert_eq!(collateral_balance(DOT, 21), collateral_pre);
 		assert_eq!(stable_balance(PUSD, 21), pusd_pre);
@@ -157,7 +157,7 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		seed_long_rate_index();
-		let vault_pre = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).expect("vault stored");
+		let vault_pre = vault(DOT, PUSD, 20);
 		let branch_pre = branch_state(DOT, PUSD).expect("branch state");
 		let order_pre = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 25);
 
@@ -172,7 +172,7 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 			crate::Error::<Test>::InvalidPositionHints
 		);
 
-		assert_eq!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 20)).unwrap(), vault_pre);
+		assert_eq!(vault(DOT, PUSD, 20), vault_pre);
 		assert_eq!(branch_state(DOT, PUSD).unwrap(), branch_pre);
 		let order_post = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 25);
 		assert_eq!(order_post, order_pre);
