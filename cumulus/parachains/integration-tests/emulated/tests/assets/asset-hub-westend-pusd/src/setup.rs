@@ -20,7 +20,8 @@ use crate::imports::*;
 use asset_hub_westend_runtime::{
 	governance,
 	pusd_config::{
-		StabilityCollateral, StableInsuranceAccount, VaultsCollateral, VaultsNativeCollateralId,
+		StabilityCollateral, StableInsuranceAccount, VaultsCollateral, VaultsDepositPolicy,
+		VaultsNativeCollateralId,
 	},
 	Assets, Balances, MockOracle, Runtime, RuntimeHoldReason, Stability, Timestamp, Vaults,
 };
@@ -290,6 +291,33 @@ pub(crate) fn fund_collateral(
 	));
 }
 
+/// The asset and amount the runtime charges as storage deposit for a vault on `collateral_id`.
+pub(crate) fn expected_vault_deposit(
+	collateral_id: &VaultsCollateralId,
+	owner: &AccountId,
+) -> (VaultsCollateralId, Balance) {
+	<VaultsDepositPolicy as sp_runtime::traits::Convert<_, _>>::convert(Vaults::vault_footprint(
+		collateral_id,
+		&get_pusd_id(),
+		owner,
+	))
+	.expect("vault deposit priced")
+}
+
+/// Mints the owner's vault deposit, so the examples' vault sizes stay round.
+pub(crate) fn fund_vault_deposit(collateral_id: &VaultsCollateralId, who: &AccountId) {
+	let (asset, amount) = expected_vault_deposit(collateral_id, who);
+	assert_ok!(<StabilityCollateral as Mutate<AccountId>>::mint_into(asset, who, amount));
+}
+
+pub(crate) fn vault_deposit_on_hold(asset: &VaultsCollateralId, who: &AccountId) -> Balance {
+	<VaultsCollateral as InspectHold<AccountId>>::balance_on_hold(
+		asset.clone(),
+		&RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::VaultCreationDeposit),
+		who,
+	)
+}
+
 pub(crate) fn collateral_min_balance(collateral_id: &VaultsCollateralId) -> Balance {
 	<StabilityCollateral as Inspect<AccountId>>::minimum_balance(collateral_id.clone())
 }
@@ -325,6 +353,7 @@ pub(crate) fn open_vault_on(
 	rate: FixedU128,
 ) {
 	fund_collateral(&collateral_id, owner, collateral);
+	fund_vault_deposit(&collateral_id, owner);
 	assert_ok!(Vaults::open_vault(
 		RuntimeOrigin::signed(owner.clone()),
 		collateral_id,
@@ -346,6 +375,7 @@ pub(crate) fn vault_on(
 ) -> pallet_vaults::types::Vault<Balance> {
 	pallet_vaults::Vaults::<Runtime>::get((collateral_id, get_pusd_id(), owner))
 		.expect("vault exists for owner")
+		.vault
 }
 
 pub(crate) fn pusd_balance(who: &AccountId) -> Balance {
