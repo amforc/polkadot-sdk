@@ -293,7 +293,7 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
-		let interest_before = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest;
+		let interest_before = vault(DOT, PUSD, 1).debt.interest;
 		let predicted_fee =
 			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 200, None)
 				.expect("touch projection and fee calculation succeed");
@@ -307,7 +307,7 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 			Position::endpoints_only()
 		));
 		assert_eq!(
-			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest,
+			vault(DOT, PUSD, 1).debt.interest,
 			interest_before + predicted_fee,
 			"the prediction and execution paths share the pending-touch kernel",
 		);
@@ -392,7 +392,11 @@ fn liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 			collateral_balance(DOT, SP_ACCOUNT) - pool_before,
 			outcome.active_pool.collateral
 		);
-		assert_eq!(collateral_balance(DOT, 1) - owner_before, outcome.owner_surplus);
+		// The removed row's storage deposit returns to the owner alongside any surplus.
+		assert_eq!(
+			collateral_balance(DOT, 1) - owner_before,
+			outcome.owner_surplus + VAULT_DEPOSIT
+		);
 	});
 }
 

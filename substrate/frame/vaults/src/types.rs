@@ -73,18 +73,7 @@ pub struct LiquidationConfig<Balance> {
 }
 
 /// Keeper-supplied terms for the direct contribution to one liquidation.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct JitTerms<Balance> {
 	/// Maximum stable assets the keeper allows the call to burn for a direct contribution.
 	///

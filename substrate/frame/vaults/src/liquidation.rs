@@ -195,7 +195,8 @@ impl<T: Config> Pallet<T> {
 			debug_assert!(plan.collateral.keeper_jit >= jit.min_collateral_out);
 		}
 		Self::burn_jit_stable(keeper, stable_id, plan.debt.keeper_jit, jit_preservation)?;
-		if let Err(jit_share) = keeper_collateral.subsume(resolution.extract(plan.collateral.keeper_jit))
+		if let Err(jit_share) =
+			keeper_collateral.subsume(resolution.extract(plan.collateral.keeper_jit))
 		{
 			// Both halves came from the seized credit, so the merge cannot fail; refuse the
 			// settlement and let the dispatch roll back.

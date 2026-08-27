@@ -442,7 +442,7 @@ fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
 
 		assert_eq!(stable_balance(USDX, 3), USDX_ED, "keeper account survives at ED");
 		assert_eq!(issuance_before - total_stable(USDX), funded, "exact rounded burn");
-		assert!(crate::pallet::Vaults::<Test>::get((XBT, USDX, 1)).is_none());
+		assert!(!vault_exists(XBT, USDX, 1));
 	});
 }
 
