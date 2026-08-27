@@ -49,8 +49,9 @@ fn example_07_liquidation_fully_covered_by_active_stability_pool() {
 		));
 
 		// seized = min(6,000, 10,000 × 1.05 / 2) = 5,250 WND. The 750 WND
-		// surplus returns to the owner.
-		assert_eq!(native_balance(&liquidated_owner) - owner_free_before, 750 * WND);
+		// surplus returns to the owner, with the vault's storage deposit.
+		let (_, deposit) = expected_vault_deposit(&get_native_id(), &liquidated_owner);
+		assert_eq!(native_balance(&liquidated_owner) - owner_free_before, 750 * WND + deposit);
 		// keeper = 2 pUSD flat / 2 + 5,250 × 0.1% = 1 + 5.25 = 6.25 WND.
 		assert_eq!(native_balance(&keeper) - get_native_ed(), 6_250_000_000_000);
 		// The pool burns the full 10,000 pUSD debt and receives 5,250 − 6.25 = 5,243.75 WND.
@@ -111,8 +112,9 @@ fn example_08_liquidation_active_jit_pending_and_redistribution() {
 		));
 
 		// total weight = 800 × 1.05 + 200 × 1.10 = 1,060 pUSD, so 530 WND is
-		// seized. The 70 WND surplus returns to the owner.
-		assert_eq!(native_balance(&liquidated_owner), 70 * WND + get_native_ed());
+		// seized. The 70 WND surplus returns to the owner, with the vault's storage deposit.
+		let (_, deposit) = expected_vault_deposit(&get_native_id(), &liquidated_owner);
+		assert_eq!(native_balance(&liquidated_owner), 70 * WND + get_native_ed() + deposit);
 		// JIT: burns 200 pUSD, receives 210 / 2 = 105 WND.
 		assert_eq!(pusd_balance(&keeper), PUSD);
 		assert_eq!(native_balance(&keeper) - get_native_ed(), 105 * WND);
