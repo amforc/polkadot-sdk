@@ -3102,3 +3102,54 @@ fn per_pool_fee_is_applied_to_swaps() {
 		assert_eq!(balance(user, token_1), with_pool_fee + ed);
 	});
 }
+
+#[test]
+fn pool_quote_conversion_prices_a_native_amount_by_the_pool() {
+	use frame_support::traits::tokens::ConversionToAssetBalance;
+
+	frame_support::parameter_types! {
+		pub const NativeTarget: NativeOrWithId<u32> = NativeOrWithId::Native;
+	}
+	type Conversion = PoolQuoteConversion<AssetConversion, NativeTarget>;
+
+	new_test_ext().execute_with(|| {
+		let user = 1;
+		let token_1 = NativeOrWithId::Native;
+		let token_2 = NativeOrWithId::WithId(2);
+		let token_3 = NativeOrWithId::WithId(3);
+
+		create_tokens(user, vec![token_2.clone(), token_3.clone()]);
+		assert_ok!(AssetConversion::create_pool(
+			RuntimeOrigin::signed(user),
+			Box::new(token_1.clone()),
+			Box::new(token_2.clone())
+		));
+
+		assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), user, 100000));
+		assert_ok!(Assets::mint(RuntimeOrigin::signed(user), 2, user, 1000));
+
+		assert_ok!(AssetConversion::add_liquidity(
+			RuntimeOrigin::signed(user),
+			Box::new(token_1.clone()),
+			Box::new(token_2.clone()),
+			10000,
+			200,
+			1,
+			1,
+			user,
+		));
+
+		// The target is the identity and needs no pool.
+		assert_eq!(Conversion::to_asset_balance(3000, token_1), Ok(3000));
+		// Nothing costs nothing, even without a pool.
+		assert_eq!(Conversion::to_asset_balance(0, token_3.clone()), Ok(0));
+		// Otherwise it is the spot-ratio amount of `asset` for the native amount, no fee,
+		// rounded up: 3000 * 200 / 10000 exactly, 3001 * 200 / 10000 = 60.02 → 61.
+		assert_eq!(Conversion::to_asset_balance(3000, token_2.clone()), Ok(60));
+		assert_eq!(Conversion::to_asset_balance(3001, token_2.clone()), Ok(61));
+		// An amount the spot ratio truncates to nothing (10 * 200 / 10000) still costs a unit.
+		assert_eq!(Conversion::to_asset_balance(10, token_2), Ok(1));
+		// A pool-less asset cannot be priced.
+		assert_eq!(Conversion::to_asset_balance(3000, token_3), Err(DispatchError::Unavailable));
+	});
+}
