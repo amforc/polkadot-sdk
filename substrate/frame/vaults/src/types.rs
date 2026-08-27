@@ -21,17 +21,7 @@ use scale_info::TypeInfo;
 /// The runtime uses this value as a storage key for its `pallet-linked-list` instance. Each variant
 /// identifies one `(collateral, stable)` market and one list.
 #[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	PartialEq,
-	Eq,
-	PartialOrd,
-	Ord,
-	Debug,
+	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub enum VaultListId<CollateralId, StableId> {
 	/// Identifies the borrow-rate index, which sorts vaults by annual rate.
@@ -191,7 +181,7 @@ impl WeightTime {
 /// Groups pending redistribution weight with its time anchor.
 ///
 /// Both values must move together to keep the claimed and remaining time anchors valid.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct RedistributionAttribution<Balance> {
 	weight: InterestWeight<Balance>,
 	weight_time: WeightTime,
@@ -302,12 +292,23 @@ pub struct Vault<Balance> {
 	pub redistribution_checkpoint: RedistributionAccumulators,
 }
 
+/// Stored form of one vault: the accounting row and the deposit that pays for it.
+///
+/// The deposit is kept out of [`Vault`] so accounting code can copy and compare rows freely; a
+/// consideration ticket must be moved, never duplicated.
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+pub struct VaultRecord<Balance, Deposit> {
+	/// Accounting state.
+	pub vault: Vault<Balance>,
+	/// Refundable storage deposit, released when the row is removed.
+	pub deposit: Deposit,
+}
+
 /// The part of one vault represented in branch-wide accounting.
 ///
 /// Replacing this value is the single ordinary vault-to-branch accounting
 /// primitive. Collateral is intentionally absent: it is managed separately
 /// because redistributed collateral is already included in the branch total.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct VaultContribution<Balance> {
 	principal: Balance,
 	interest: Balance,
@@ -439,7 +440,6 @@ pub struct BranchConfig<Balance> {
 /// eighteen-decimal one disagree about what "one" is. Both agree that a balance under the
 /// asset's minimum cannot be held, which is what makes it the one floor every market can be
 /// judged against.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AssetMinimums<Balance> {
 	/// Smallest collateral balance an account can hold.
 	pub collateral: Balance,
@@ -448,9 +448,7 @@ pub struct AssetMinimums<Balance> {
 }
 
 /// A way one [`BranchConfig`] contradicts itself or the assets it names.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, TypeInfo, PalletError, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, PalletError, PartialEq, Eq, Debug)]
 pub enum BranchConfigDefect {
 	/// The liquidation ratio is above the borrow ratio, so every new vault opens liquidatable.
 	LiquidationRatioAboveInitial,
@@ -1265,7 +1263,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 }
 
 /// Limits for market configuration.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
+#[derive(Encode, TypeInfo)]
 pub struct BranchConfigBounds {
 	/// Lowest allowed liquidation and final recovery ratio.
 	pub min_minimum_collateralization_ratio: FixedU128,
@@ -1277,9 +1275,7 @@ pub struct BranchConfigBounds {
 	pub max_borrow_rate: FixedU128,
 }
 
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, TypeInfo, PalletError, Clone, PartialEq, Eq, Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, PalletError, PartialEq, Eq, Debug)]
 pub enum BoundViolation {
 	/// The liquidation ratio is below the runtime's floor.
 	MinimumCollateralizationRatioTooLow,
@@ -1311,7 +1307,6 @@ impl BranchConfigBounds {
 }
 
 /// Administrator role for one market.
-#[derive(Clone, Copy)]
 pub enum AdminLevel {
 	/// May manage all market settings and lifecycle actions.
 	Full,
@@ -1346,7 +1341,7 @@ impl<AccountId> BranchAdmins<AccountId> {
 /// Complete record for one registered market.
 ///
 /// It is created and removed as one record.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct Branch<AccountId, Balance, Consideration> {
 	/// Market risk parameters.
 	pub config: BranchConfig<Balance>,

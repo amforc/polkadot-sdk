@@ -6,7 +6,7 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, Config, Error, IdleCursor,
-		Millis, Pallet, StableCreditOf, StableIdOf, StablecoinDebt, Vaults,
+		Millis, Pallet, StableCreditOf, StableIdOf, StablecoinDebt, VaultRecordOf, Vaults,
 	},
 	recovery,
 	types::{
@@ -25,7 +25,7 @@ use frame::{
 	traits::{
 		fungibles::{Balanced as FungiblesBalanced, Inspect as FungiblesInspect, InspectHold as _},
 		tokens::{Fortitude, Precision, Preservation, Provenance},
-		AccountTouch, DefensiveOption, Time,
+		AccountTouch, AssetFootprint, DefensiveOption, Footprint, Time,
 	},
 };
 use linked_list_interface::{ListError, SortedListInterface};
@@ -339,14 +339,47 @@ impl<T: Config> Pallet<T> {
 			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 	}
 
-	/// Read a vault row, returning `VaultNotFound` when missing.
-	pub(crate) fn vault_of(
+	/// Returns a vault, or `VaultNotFound` if it does not exist.
+	pub fn vault_of(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Vault<BalanceOf<T>>, DispatchError> {
+		Self::record_of(collateral_id, stable_id, owner).map(|record| record.vault)
+	}
+
+	/// Returns a vault record, or `VaultNotFound` if it does not exist.
+	pub(crate) fn record_of(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		owner: &T::AccountId,
+	) -> Result<VaultRecordOf<T>, DispatchError> {
 		Vaults::<T>::get((collateral_id, stable_id, owner))
 			.ok_or_else(|| Error::<T>::VaultNotFound.into())
+	}
+
+	/// Returns the per-vault storage footprint, quoted in the collateral asset.
+	///
+	/// It includes the `Vaults` key, the record, the rate-list node, and the node key. The ticket
+	/// uses the collateral ID's encoded size. This
+	/// avoids the large maximum length of location-based IDs. The data is one blob because
+	/// [`LinearStoragePrice`](frame::traits::LinearStoragePrice) multiplies the count by the size.
+	///
+	/// It excludes shared rate-list metadata, which the branch deposit covers. FRAME charges no
+	/// deposit for account hold data.
+	pub fn vault_footprint(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		owner: &T::AccountId,
+	) -> AssetFootprint<CollateralIdOf<T>> {
+		let key = Vaults::<T>::hashed_key_for((collateral_id, stable_id, owner)).len();
+		let ticket = collateral_id.encoded_size().saturating_add(BalanceOf::<T>::max_encoded_len());
+		let row = Vault::<BalanceOf<T>>::max_encoded_len().saturating_add(ticket);
+		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
+		let node = T::VaultLists::node_footprint(&rate_list, owner);
+		let local = Footprint::from_parts(1, key.saturating_add(row));
+		let size = local.size.saturating_add(node.size);
+		AssetFootprint::new(collateral_id.clone(), Footprint { count: 1, size })
 	}
 
 	/// Ensure a vault's collateralization ratio is at or above the branch ICR.
@@ -867,7 +900,7 @@ impl<T: Config> Pallet<T> {
 		now: Millis,
 	) -> Option<BalanceOf<T>> {
 		let mut state = accrued_state.clone();
-		let mut vault = Vaults::<T>::get((collateral_id, stable_id, owner))?;
+		let mut vault = Self::vault_of(collateral_id, stable_id, owner).ok()?;
 		let status = Self::vault_status_of(collateral_id, stable_id, owner);
 		Self::apply_vault_touch(&mut state, &mut vault, status, now).ok()?;
 		Some(vault.debt.total())

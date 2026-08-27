@@ -25,7 +25,7 @@ fn open_vault_emits_canonical_events() {
 		assert!(predicted_fee > 0);
 		// The charged fee equals the vault's recorded interest; assert the
 		// event carries that amount.
-		let v = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v = vault(DOT, PUSD, 1);
 		assert_event(crate::Event::UpfrontFeeCharged {
 			collateral_id: DOT,
 			stable_id: PUSD,

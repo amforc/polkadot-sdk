@@ -7,7 +7,9 @@ use alloc::collections::BTreeMap;
 
 use crate as pallet_vaults;
 use crate::{
-	pallet::Branches, types::BranchConfigBounds, BranchState, LiquidationSettlement, VaultListId,
+	pallet::Branches,
+	types::{BranchConfigBounds, Vault},
+	BranchState, LiquidationSettlement, VaultListId,
 };
 pub use crate::{
 	pallet::{BalanceOf, CollateralCreditOf, StableCreditOf},
@@ -25,15 +27,16 @@ use frame::{
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
 		fungibles::{
-			roles::Inspect as FungiblesRolesInspect, Balanced as FungiblesBalanced, Credit,
-			Inspect as FungiblesInspect, InspectHold,
+			roles::Inspect as FungiblesRolesInspect, AssetFootprintPrice, AtLeastMinimumBalance,
+			Balanced as FungiblesBalanced, Credit, HoldConsideration as FungiblesHoldConsideration,
+			Inspect as FungiblesInspect, InspectHold, SufficientAssets,
 		},
-		tokens::fungible,
+		tokens::{fungible, ConversionToAssetBalance, FallbackOnUnavailable},
 		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
 pub use pallet_linked_list::Position;
-use pusd_primitives::{RedemptionSettlement, VaultInterface};
+use pusd_primitives::{OraclePriceConversion, RedemptionSettlement, VaultInterface};
 
 pub type AccountId = u64;
 pub type Balance = u128;
@@ -211,10 +214,7 @@ impl pusd_primitives::ProvidePrice for MockOracle {
 		if !MockOracleAvailable::get() {
 			return Err(Error::<Test>::OraclePriceNotAvailable.into());
 		}
-		MockPrices::get()
-			.get(collateral)
-			.copied()
-			.ok_or_else(|| Error::<Test>::OraclePriceNotAvailable.into())
+		MockPrices::get().get(collateral).copied().ok_or(DispatchError::Unavailable)
 	}
 }
 
@@ -334,6 +334,54 @@ pub type VaultsConsideration = HoldConsideration<
 	LinearStoragePrice<MarketDepositBase, ConstU128<0>, Balance>,
 >;
 
+/// Refundable per-vault deposit in native units, distinct from [`MarketDepositBase`] so the two
+/// holds cannot be confused in assertions.
+pub const VAULT_DEPOSIT: Balance = 250;
+
+parameter_types! {
+	pub const VaultDepositReason: RuntimeHoldReason =
+		RuntimeHoldReason::Vaults(HoldReason::VaultCreationDeposit);
+	pub const VaultDepositBase: Balance = VAULT_DEPOSIT;
+	pub const NativeCollateral: AssetId = DOT;
+	/// Units of an asset that one native unit buys through the mock fallback quote.
+	pub static MockFallbackRate: Option<FixedU128> = Some(FixedU128::one());
+}
+
+pub struct MockFallbackConversion;
+impl ConversionToAssetBalance<Balance, AssetId, Balance> for MockFallbackConversion {
+	type Error = DispatchError;
+
+	fn to_asset_balance(balance: Balance, _asset: AssetId) -> Result<Balance, Self::Error> {
+		MockFallbackRate::get()
+			.map(|rate| rate.saturating_mul_int(balance))
+			.ok_or(DispatchError::Unavailable)
+	}
+}
+
+/// Settles in the collateral when it is native or sufficient, else in native; re-prices through
+/// the oracle first and the mock quote only when the oracle has no feed, never below the asset's
+/// minimum balance.
+pub type VaultDepositPolicy = AssetFootprintPrice<
+	SufficientAssets<VaultCollateralAssets, AccountId>,
+	NativeCollateral,
+	LinearStoragePrice<VaultDepositBase, ConstU128<0>, Balance>,
+	AtLeastMinimumBalance<
+		VaultCollateralAssets,
+		FallbackOnUnavailable<
+			OraclePriceConversion<MockOracle, NativeCollateral>,
+			MockFallbackConversion,
+		>,
+		AccountId,
+	>,
+>;
+
+pub type VaultDepositConsideration = FungiblesHoldConsideration<
+	AccountId,
+	VaultCollateralAssets,
+	VaultDepositReason,
+	VaultDepositPolicy,
+>;
+
 parameter_types! {
 	pub const IdleMaxRefreshWeight: Option<Weight> = Some(Weight::MAX);
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
@@ -355,7 +403,8 @@ impl pallet_vaults::Config for Test {
 	type OnBranchLifecycle = RecordingLifecycle;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
-	type Consideration = VaultsConsideration;
+	type BranchConsideration = VaultsConsideration;
+	type VaultConsideration = VaultDepositConsideration;
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
@@ -461,6 +510,7 @@ pub fn new_test_ext() -> TestState {
 		LifecycleLog::set(Vec::new());
 		FailOnRegistered::set(false);
 		FailOnDeregistered::set(false);
+		MockFallbackRate::set(Some(FixedU128::one()));
 	});
 	ext
 }
@@ -860,4 +910,32 @@ pub fn creation_deposit_held(who: AccountId) -> Balance {
 		&RuntimeHoldReason::Vaults(HoldReason::BranchCreationDeposit),
 		&who,
 	)
+}
+
+/// Returns the vault deposit an account has on hold in one asset.
+pub fn vault_deposit_held(asset: AssetId, who: AccountId) -> Balance {
+	<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
+		asset,
+		&HoldReason::VaultCreationDeposit.into(),
+		&who,
+	)
+}
+
+/// Returns a vault's accounting row, panicking when the vault is missing.
+pub fn vault(collateral: AssetId, stable: StableId, owner: AccountId) -> Vault<Balance> {
+	Vaults::vault_of(&collateral, &stable, &owner).expect("vault stored")
+}
+
+/// Returns a vault's accounting row, or `None` when the vault is missing.
+pub fn try_vault(
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+) -> Option<Vault<Balance>> {
+	Vaults::vault_of(&collateral, &stable, &owner).ok()
+}
+
+/// Whether a vault row exists.
+pub fn vault_exists(collateral: AssetId, stable: StableId, owner: AccountId) -> bool {
+	crate::pallet::Vaults::<Test>::contains_key((collateral, stable, owner))
 }

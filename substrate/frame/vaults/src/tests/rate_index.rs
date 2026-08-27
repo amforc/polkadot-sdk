@@ -63,7 +63,7 @@ fn repay_to_zero_drops_vault_from_rate_index() {
 			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Repay vault 3 fully (top up the accrued interest from acct 4).
-		let v = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 3)).unwrap();
+		let v = vault(DOT, PUSD, 3);
 		let total = v.debt.principal + v.debt.interest;
 		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&4,
@@ -88,7 +88,7 @@ fn repay_to_zero_drops_vault_from_rate_index() {
 		assert_eq!(order, alloc::vec![1, 2, 4, 5]);
 		// The explicit close removes the row entirely.
 		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(3), DOT, PUSD, None));
-		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 3)).is_none());
+		assert!(!vault_exists(DOT, PUSD, 3));
 	});
 }
 

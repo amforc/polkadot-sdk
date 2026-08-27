@@ -69,7 +69,7 @@ fn debt_free_husk_keeps_the_branch_out_of_final_recovery() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		assert_ok!(redeem(DOT, PUSD, 4, 501));
-		let husk_before = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk");
+		let husk_before = vault(DOT, PUSD, 1);
 		assert_eq!(husk_before.debt.total(), 0);
 		assert_eq!(husk_before.collateral, 950);
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
@@ -84,7 +84,7 @@ fn debt_free_husk_keeps_the_branch_out_of_final_recovery() {
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
 
 		// The sole recipient must drain both pending pools.
-		let husk = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept");
+		let husk = vault(DOT, PUSD, 1);
 		assert_eq!(husk.debt.principal, 501);
 		assert_eq!(husk.collateral, 950 + 1_000);
 		let state = branch_state(DOT, PUSD).expect("state");
@@ -226,10 +226,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 		enter_recovery(1, rate_pct(5, 100));
 		// Restore the price so the recipient's collateral payout is affordable.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		let full = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1))
-			.expect("vault stored")
-			.debt
-			.total();
+		let full = vault(DOT, PUSD, 1).debt.total();
 
 		assert_ok!(redeem_from(DOT, PUSD, 1, 7, full));
 
@@ -242,7 +239,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 		}));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
-		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.debt.total(), 0);
 		assert_eq!(vault.collateral, 950);
 		assert_eq!(held(DOT, 1), 950, "the residual stays held until the owner closes the husk");
@@ -309,7 +306,7 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 		// Redeem most of vault 1's debt — pulls it below MinimumDebt (200) but
 		// leaves a non-zero residual, so it stays in the FR FIFO.
 		assert_ok!(redeem_from(DOT, PUSD, 1, 99, 350));
-		let v = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let v = vault(DOT, PUSD, 1);
 		assert!(v.debt.total() > 0);
 		assert!(v.debt.total() < 200);
 		// The Dormant-exit branch never re-inserts into the rate index, so the
@@ -388,7 +385,7 @@ fn deposit_into_final_recovery_keeps_stake_zero() {
 
 		// The collateral lands on the hold and in the branch total, but the
 		// vault stays excluded from stake accounting while in the FIFO.
-		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.redistribution_stake, 0);
 		let after = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(after.stakes.total, before.stakes.total);
@@ -423,7 +420,7 @@ fn final_recovery_rescue_deposit_then_exit() {
 		));
 
 		assert!(vault_status(DOT, PUSD, 1).is_active());
-		let vault = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.redistribution_stake, held(DOT, 1));
 		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
 	});

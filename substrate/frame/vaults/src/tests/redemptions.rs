@@ -1,6 +1,5 @@
 use crate::{
 	mock::*,
-	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
 use pallet_linked_list::SortedListInterface;
@@ -31,7 +30,7 @@ fn fully_redeemed_vault_becomes_dormant_and_leaves_rate_index() {
 		let target = redeem(DOT, PUSD, 3, 1_000).expect("redeem ok");
 		assert_eq!(target, 1);
 
-		let v = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v = vault(DOT, PUSD, 1);
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_eq!(v.debt.principal + v.debt.interest, 0);
 		// The redemption poked the target: its interest clock advanced to now.
@@ -56,7 +55,7 @@ fn redeemed_below_min_debt_becomes_dormant() {
 		// MinimumDebt = 200 (from default_branch_config). Redeem so acct 1
 		// has < 200 left.
 		assert_ok!(redeem(DOT, PUSD, 3, 350));
-		let v = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v = vault(DOT, PUSD, 1);
 		let total = v.debt.principal + v.debt.interest;
 		// Open fee 1 (500 @ 1%) → total 501; redeem 350 cancels interest-first (1) then
 		// 349 principal, leaving exactly 151, below MinimumDebt 200.
@@ -119,7 +118,7 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 		advance_time(pusd_primitives::MILLIS_PER_YEAR + 1);
 
 		let branch_before = branch_state(DOT, PUSD).expect("branch stored");
-		let vault_before = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let vault_before = vault(DOT, PUSD, 1);
 		let held_before = held(DOT, 1);
 		let events_before = System::events();
 
@@ -127,7 +126,7 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
 		// Projection is a pure read.
 		assert_eq!(branch_state(DOT, PUSD), Some(branch_before));
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)), Some(vault_before.clone()));
+		assert_eq!(try_vault(DOT, PUSD, 1), Some(vault_before.clone()));
 		assert_eq!(held(DOT, 1), held_before);
 		assert_eq!(System::events(), events_before);
 		// The projection includes the year of pending interest the row lacks.
@@ -144,7 +143,7 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 			projected.debt + projected.terminal_interest_charge,
 			projected.collateral,
 		));
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 		assert_eq!(v_post.debt.total(), 0);
 		assert_eq!(held(DOT, 1), held_before - projected.collateral);
 	});
@@ -178,7 +177,7 @@ fn redeem_step_rejects_invalid_settlements_without_state_change() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		let vault_pre = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let vault_pre = vault(DOT, PUSD, 1);
 		let held_pre = held(DOT, 1);
 		let snapshot =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
@@ -224,7 +223,7 @@ fn redeem_step_rejects_invalid_settlements_without_state_change() {
 			);
 		}
 
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap(), vault_pre);
+		assert_eq!(vault(DOT, PUSD, 1), vault_pre);
 		assert_eq!(held(DOT, 1), held_pre);
 	});
 }
@@ -247,7 +246,7 @@ fn redeem_step_burns_exactly_the_debt_payment() {
 		let issuance_pre = total_stable(PUSD);
 		let redeemer_pre = stable_balance(PUSD, 3);
 		let recipient_coll_pre = collateral_balance(DOT, 3);
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 
 		let snapshot =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
@@ -271,7 +270,7 @@ fn redeem_step_burns_exactly_the_debt_payment() {
 
 		assert_eq!(total_stable(PUSD), issuance_pre - 300);
 		assert_eq!(stable_balance(PUSD, 3), redeemer_pre - 300);
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 		let cancelled = (v_pre.debt.principal + v_pre.debt.interest) -
 			(v_post.debt.principal + v_post.debt.interest);
 		assert_eq!(cancelled, 300);
@@ -291,7 +290,7 @@ fn dormant_pointer_clears_when_last_dormant_fully_redeemed() {
 		assert_eq!(state.dormant_redemption_target, Some(1));
 		// Now redeem acct 1's full residual. next_redemption_target prefers
 		// dormant_redemption_target, so this hits acct 1 again.
-		let v = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v = vault(DOT, PUSD, 1);
 		let residual = v.debt.principal + v.debt.interest;
 		let target = redeem(DOT, PUSD, 3, residual).expect("redeem residual ok");
 		assert_eq!(target, 1);
@@ -394,13 +393,13 @@ fn dormant_vault_with_residual_accrues_interest() {
 		// then 345 principal, leaving a 155 residual below MinimumDebt 200 → Dormant.
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 		assert_eq!(v_pre.debt.principal, 155);
 		assert_eq!(v_pre.debt.interest, 0);
 
 		advance_time(365 * ONE_DAY_MS); // ~1 year (365 days)
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 		// The Dormant residual keeps accruing: floor(155 * 0.5 * 365days / year) = 77.
 		assert_eq!(v_post.debt.interest, 77);
 	});
@@ -419,7 +418,7 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 		assert_ok!(open(3, DOT, PUSD, 200, 200, rate_pct(5, 100)));
 		assert_ok!(redeem(DOT, PUSD, 4, 350)); // leaves acct 1 Dormant with debt
 
-		let vault_dormant_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let vault_dormant_pre = vault(DOT, PUSD, 1);
 		// At 1.0 vault 3 (200 collateral, ~200 debt) sits under MCR while 1 and 2 stay above it.
 		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
 		// Redistribute vault 3's whole debt across the recipients (no offset).
@@ -430,12 +429,12 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
 		assert_eq!(
-			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.principal,
+			vault(DOT, PUSD, 1).debt.principal,
 			vault_dormant_pre.debt.principal,
 			"the allocation stays lazy until this vault is touched",
 		);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
-		let vault_dormant_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let vault_dormant_post = vault(DOT, PUSD, 1);
 		// Dormant debt must not remove a vault from redistribution.
 		let gained = vault_dormant_post.debt.principal - vault_dormant_pre.debt.principal;
 		assert_eq!(gained, 98);
@@ -454,7 +453,7 @@ fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 		assert_ok!(open(3, DOT, PUSD, 200, 200, rate_pct(5, 100)));
 		assert_ok!(redeem(DOT, PUSD, 4, 700));
 
-		let husk_before = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let husk_before = vault(DOT, PUSD, 1);
 		assert_eq!(husk_before.debt.total(), 0);
 		assert_eq!(husk_before.collateral, 950);
 		assert_eq!(husk_before.redistribution_stake, 950, "a debt-free husk stays eligible");
@@ -465,7 +464,7 @@ fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
 
 		// The liquidated vault leaves the recipient set before allocation.
-		let husk_after = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let husk_after = vault(DOT, PUSD, 1);
 		assert_eq!(husk_after.debt.principal, 97);
 		assert_eq!(husk_after.collateral, 950 + 97);
 		// Snapshot correction does not let new collateral increase this allocation weight.
@@ -597,8 +596,8 @@ fn redemption_is_path_independent_across_chunks() {
 		// Identical vaults on the two markets (same owner, collateral, debt, rate).
 		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
 		assert_ok!(open(1, TOKEN_X, PUSD, 1_000, 1_000, rate_pct(5, 100)));
-		let dot_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		let tokenx_pre = Vaults::<Test>::get((TOKEN_X, PUSD, 1)).unwrap();
+		let dot_pre = vault(DOT, PUSD, 1);
+		let tokenx_pre = vault(TOKEN_X, PUSD, 1);
 		assert_eq!(dot_pre.debt.total(), tokenx_pre.debt.total());
 		let dot_held_pre = held(DOT, 1);
 		let tokenx_held_pre = held(TOKEN_X, 1);
@@ -612,8 +611,8 @@ fn redemption_is_path_independent_across_chunks() {
 		// One: a single 300-unit redemption against the identical TOKEN_X vault.
 		assert_eq!(redeem(TOKEN_X, PUSD, 3, 300).expect("redeem ok"), 1);
 
-		let dot_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-		let tokenx_post = Vaults::<Test>::get((TOKEN_X, PUSD, 1)).unwrap();
+		let dot_post = vault(DOT, PUSD, 1);
+		let tokenx_post = vault(TOKEN_X, PUSD, 1);
 		// Exactly 300 debt cancelled on each path, leaving identical residual debt
 		// (including the interest-first split of principal vs interest).
 		assert_eq!(dot_pre.debt.total() - dot_post.debt.total(), 300);

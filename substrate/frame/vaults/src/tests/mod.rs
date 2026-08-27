@@ -19,6 +19,7 @@ mod realistic_scale;
 mod redemptions;
 mod redistribution_accounting;
 mod risk_controls;
+mod vault_deposit;
 
 use crate::mock::{AccountId, AssetId, FixedU128, StableId, Test};
 
