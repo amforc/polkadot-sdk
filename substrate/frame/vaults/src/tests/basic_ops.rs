@@ -362,9 +362,11 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 	});
 }
 
-// A liability-free market has no collateralization ratio to protect.
+// Husks normally go through the ratio check because closing one is a TCR-worsening action that
+// safety mode disallows. Once the market is liability-free there is no ratio left to protect,
+// so the last husks close without it.
 #[test]
-fn liability_free_husks_close_without_ratio_math() {
+fn liability_free_market_closes_husks_without_ratio_math() {
 	use frame::traits::fungible::Mutate;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
@@ -440,6 +442,8 @@ fn stale_payoff_quote_reverts_while_an_uncapped_repay_settles() {
 			crate::Error::<Test>::TerminalChargeUnpaid
 		);
 
+		// `None` is uncapped: it settles whatever the payoff is at execution, so the extra unit of
+		// interest accrued since the quote is paid rather than rejected.
 		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
 		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.debt.total(), 0);
