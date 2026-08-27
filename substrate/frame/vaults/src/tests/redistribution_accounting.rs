@@ -365,7 +365,11 @@ fn liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 			collateral_balance(DOT, SP_ACCOUNT) - pool_before,
 			outcome.active_pool.collateral
 		);
-		assert_eq!(collateral_balance(DOT, 1) - owner_before, outcome.owner_surplus);
+		// The removed row's storage deposit returns to the owner alongside any surplus.
+		assert_eq!(
+			collateral_balance(DOT, 1) - owner_before,
+			outcome.owner_surplus + VAULT_DEPOSIT
+		);
 	});
 }
 
