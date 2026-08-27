@@ -18,8 +18,9 @@
 use super::*;
 use codec::{Decode, Encode, MaxEncodedLen};
 use core::marker::PhantomData;
+use frame_support::traits::tokens::ConversionToAssetBalance;
 use scale_info::TypeInfo;
-use sp_runtime::traits::TryConvert;
+use sp_runtime::{traits::TryConvert, ArithmeticError};
 
 /// Represents a swap path with associated asset amounts indicating how much of the asset needs to
 /// be deposited to get the following asset's amount withdrawn (this is inclusive of fees).
@@ -167,5 +168,52 @@ where
 	fn try_convert(id: &PoolId) -> Result<AccountId, &PoolId> {
 		sp_io::hashing::blake2_256(&Encode::encode(id)[..])
 			.using_encoded(|e| Decode::decode(&mut TrailingZeroInput::new(e)).map_err(|_| id))
+	}
+}
+
+/// Converts a `Target` amount to an asset amount at the pool spot price.
+///
+/// If `asset` is `Target` or `balance` is zero, this conversion returns `balance` unchanged.
+/// Other conversions return the ceiled spot-ratio amount and exclude the swap fee. This is not an
+/// executable swap quote: price impact is deliberately ignored. If the pool does not exist, they
+/// return [`DispatchError::Unavailable`].
+///
+/// `S` must quote without fee as [`Pallet`](crate::Pallet) does: the two
+/// [`QuotePrice`] methods are reciprocal, floor-rounded spot-ratio quotes of the same reserves,
+/// so that quoting the forward result back never exceeds the original amount. The conversion
+/// relies on this to detect a floor-rounded forward quote and round it up.
+pub struct PoolQuoteConversion<S, Target>(PhantomData<(S, Target)>);
+
+impl<S, Target> ConversionToAssetBalance<S::Balance, S::AssetKind, S::Balance>
+	for PoolQuoteConversion<S, Target>
+where
+	S: QuotePrice,
+	S::AssetKind: Clone + Eq,
+	Target: Get<S::AssetKind>,
+{
+	type Error = DispatchError;
+
+	fn to_asset_balance(
+		balance: S::Balance,
+		asset: S::AssetKind,
+	) -> Result<S::Balance, DispatchError> {
+		let target = Target::get();
+		if asset == target || balance.is_zero() {
+			return Ok(balance);
+		}
+		// Increase a rounded-down quote if its spot value does not cover `balance`.
+		// The first quote confirms the pool. A reverse quote of `floor` cannot exceed `balance`,
+		// so a failed reverse quote is treated as covering nothing: the charge rounds up to
+		// `floor + 1`, which is never below the ceiled spot-ratio amount.
+		let floor =
+			S::quote_price_tokens_for_exact_tokens(asset.clone(), target.clone(), balance, false)
+				.ok_or(DispatchError::Unavailable)?;
+		let covered = S::quote_price_exact_tokens_for_tokens(asset, target, floor, false)
+			.unwrap_or_else(Zero::zero);
+		if covered < balance {
+			floor.checked_add(&One::one()).ok_or(ArithmeticError::Overflow.into())
+		} else {
+			Ok(floor)
+		}
 	}
 }

@@ -30,7 +30,7 @@ pub mod yield_routing;
 
 pub use branch_mode::{BranchMode, BranchModeProvider};
 pub use debit::{debit_preservation, reducible_debit};
-pub use oracle::ProvidePrice;
+pub use oracle::{OraclePriceConversion, ProvidePrice, ZERO_ORACLE_PRICE};
 pub use recovery_offset::{RecoveryOffsetInterface, RecoveryOffsetResult};
 pub use recovery_pricing::InsuranceAdjusted;
 pub use registration::OnBranchLifecycle;
