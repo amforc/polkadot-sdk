@@ -4,7 +4,7 @@
 
 use crate::{
 	mock::*,
-	pallet::{BranchIdleCursor, Branches, IdleCursor, Vaults},
+	pallet::{BranchIdleCursor, Branches, IdleCursor},
 	tests::rate_pct,
 	weights::WeightInfo,
 	Config,
@@ -85,7 +85,7 @@ fn on_idle_walk_budgets_touches_and_wraps_the_cursor() {
 			"draining the map wraps by clearing the cursor"
 		);
 		for owner in 1..=5u64 {
-			let vault = Vaults::<Test>::get((DOT, PUSD, owner)).expect("vault stored");
+			let vault = vault(DOT, PUSD, owner);
 			assert!(vault.debt.interest > 0, "every vault was touched across the two passes");
 		}
 	});
@@ -126,7 +126,7 @@ fn branch_walk_cannot_starve_the_vault_walk() {
 			BranchIdleCursor::<Test>::get().is_some(),
 			"branch walk parked mid-registry at its half share"
 		);
-		let vault = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let vault = vault(DOT, PUSD, 1);
 		assert!(vault.debt.interest > 0, "the vault walk was not starved");
 	});
 }

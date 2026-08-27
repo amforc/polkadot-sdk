@@ -404,7 +404,7 @@ impl<T: Config> Pallet<T> {
 					AssetRoleUsage,
 					AssetRoleUsage,
 				)>();
-				let ticket = T::Consideration::new(&who, footprint)?;
+				let ticket = T::BranchConsideration::new(&who, footprint)?;
 				Some((who, ticket))
 			},
 			None => None,

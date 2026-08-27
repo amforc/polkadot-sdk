@@ -25,7 +25,7 @@ fn debt_in_front_sums_lower_rate_vaults_only() {
 		// `principal + FEE`.
 		const FEE: Balance = 1;
 		for who in 1u64..=8 {
-			let v = crate::pallet::Vaults::<Test>::get((DOT, PUSD, who)).expect("vault stored");
+			let v = vault(DOT, PUSD, who);
 			assert_eq!(v.debt.interest, FEE, "upfront fee ceils to 1 at these magnitudes");
 		}
 		let debt_in_front =
@@ -73,7 +73,7 @@ fn debt_in_front_projects_pending_interest_poke_independent() {
 		// Poking vault 1 moves its pending interest into recorded debt; the
 		// total must not change.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		let v1 = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).expect("v1");
+		let v1 = vault(DOT, PUSD, 1);
 		assert_eq!(v1.debt.interest, 3, "fee 1 + year interest 2 settled by the poke");
 		assert_eq!(debt_in_front(), 503 + 705, "projection unchanged by the poke");
 	});

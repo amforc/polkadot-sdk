@@ -11,7 +11,8 @@ use crate::{
 		Pallet, StableIdOf, Vaults,
 	},
 	types::{
-		BranchConfig, BranchState, DebtBreakdown, DebtCollateral, Vault, VaultListId, VaultStatus,
+		BranchConfig, BranchState, DebtBreakdown, DebtCollateral, Vault, VaultListId, VaultRecord,
+		VaultStatus,
 	},
 };
 use frame::{
@@ -19,7 +20,7 @@ use frame::{
 	traits::{
 		fungibles::MutateHold as FungiblesMutateHold,
 		tokens::{Fortitude, Precision, Restriction},
-		DefensiveOption, Time,
+		Consideration, DefensiveOption, Time,
 	},
 };
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
@@ -45,6 +46,7 @@ pub struct VaultOp<T: Config> {
 	ctx: Context<T>,
 	owner: T::AccountId,
 	vault: Vault<BalanceOf<T>>,
+	deposit: T::VaultConsideration,
 	status: VaultStatus,
 }
 
@@ -154,9 +156,15 @@ impl<T: Config> Context<T> {
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		self.state.total_collateral = total_collateral;
 		self.charge_upfront_fee(owner, upfront_fee);
+		// Charged only after every in-memory check, so a rejected open reports the validation
+		// error rather than the deposit's.
+		let deposit = T::VaultConsideration::new(
+			owner,
+			Pallet::<T>::vault_footprint(&self.collateral_id, &self.stable_id, owner),
+		)?;
 		T::VaultLists::insert(self.rate_list(), owner.clone(), annual_rate, hint)
 			.map_err(Pallet::<T>::map_error)?;
-		self.attach_new(owner, vault)
+		self.attach_new(owner, vault, deposit)
 	}
 
 	fn apply_checked_borrow(
@@ -230,7 +238,8 @@ impl<T: Config> Context<T> {
 	/// Applies pending interest and redistribution to a vault in memory.
 	fn touch(mut self, owner: &T::AccountId) -> Result<VaultOp<T>, DispatchError> {
 		debug_assert!(self.pending_fee.is_zero(), "fee charged before touch");
-		let mut vault = Pallet::<T>::vault_of(&self.collateral_id, &self.stable_id, owner)?;
+		let VaultRecord { mut vault, deposit } =
+			Pallet::<T>::record_of(&self.collateral_id, &self.stable_id, owner)?;
 		let status = Pallet::<T>::vault_status_of(&self.collateral_id, &self.stable_id, owner);
 		let (pending, interest_to_mint) =
 			Pallet::<T>::apply_vault_touch(&mut self.state, &mut vault, status, self.now)?;
@@ -260,7 +269,7 @@ impl<T: Config> Context<T> {
 			});
 		}
 		// A touch only realizes accrued interest, so it does not change the TCR.
-		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, status })
+		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, deposit, status })
 	}
 
 	/// Attaches a new vault without touching an existing row.
@@ -270,11 +279,17 @@ impl<T: Config> Context<T> {
 		mut self,
 		owner: &T::AccountId,
 		vault: Vault<BalanceOf<T>>,
+		deposit: T::VaultConsideration,
 	) -> Result<VaultOp<T>, DispatchError> {
 		self.state.vault_count =
 			self.state.vault_count.checked_add(1).ok_or(Error::<T>::ArithmeticOverflow)?;
-		let mut op =
-			VaultOp { ctx: self, owner: owner.clone(), vault, status: VaultStatus::Active };
+		let mut op = VaultOp {
+			ctx: self,
+			owner: owner.clone(),
+			vault,
+			deposit,
+			status: VaultStatus::Active,
+		};
 		op.sync_stake()?;
 		Ok(op)
 	}
@@ -592,13 +607,17 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	fn persist(self, remove: bool) -> DispatchResult {
-		let collateral_id = self.ctx.collateral_id.clone();
-		let stable_id = self.ctx.stable_id.clone();
-		let key = (&collateral_id, &stable_id, &self.owner);
+		let VaultOp { ctx, owner, vault, deposit, .. } = self;
+		let collateral_id = ctx.collateral_id.clone();
+		let stable_id = ctx.stable_id.clone();
+		let key = (&collateral_id, &stable_id, &owner);
 		if remove {
 			Vaults::<T>::remove(key);
+			// The row is gone, so its deposit returns to the owner: on close and on liquidation
+			// alike, as the ticket is attributable to the owner only.
+			deposit.drop(&owner)?;
 		} else {
-			Vaults::<T>::insert(key, &self.vault);
+			Vaults::<T>::insert(key, &VaultRecord { vault, deposit });
 		}
 		let Context {
 			now,
@@ -607,7 +626,7 @@ impl<T: Config> VaultOp<T> {
 			pending_rounding_fee_mint,
 			pending_fee,
 			..
-		} = self.ctx;
+		} = ctx;
 		Pallet::<T>::commit_branch(&collateral_id, &stable_id, now, state)?;
 
 		// Mint after writing state. Keep both amounts separate to preserve fee rounding.

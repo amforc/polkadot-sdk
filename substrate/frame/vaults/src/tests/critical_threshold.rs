@@ -1,6 +1,5 @@
 use crate::{
 	mock::*,
-	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
 
@@ -239,7 +238,7 @@ fn safety_mode_blocks_close_with_collateral() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// Top up acct 2's pUSD so the repay can cover principal + upfront fee.
-		let v = Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault stored");
+		let v = vault(DOT, PUSD, 2);
 		let total = v.debt.principal + v.debt.interest;
 		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&1,
@@ -279,7 +278,7 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// Top up acct 2's pUSD so the repay can cover principal + upfront fee.
-		let v = Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault stored");
+		let v = vault(DOT, PUSD, 2);
 		let total = v.debt.principal + v.debt.interest;
 		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&1,
@@ -321,9 +320,9 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 			1_000,
 			None
 		));
-		assert!(Vaults::<Test>::get((DOT, PUSD, 2)).is_none(), "zero/zero vault auto-closed");
+		assert!(!vault_exists(DOT, PUSD, 2), "zero/zero vault auto-closed");
 		assert_eq!(held(DOT, 2), 0, "hold fully released");
-		assert_eq!(collateral_balance(DOT, 2), collateral_before + 1_000);
+		assert_eq!(collateral_balance(DOT, 2), collateral_before + 1_000 + VAULT_DEPOSIT);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultClosed {
 			collateral_id: DOT,
 			stable_id: PUSD,

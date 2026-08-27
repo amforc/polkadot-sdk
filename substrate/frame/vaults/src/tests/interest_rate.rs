@@ -1,6 +1,5 @@
 use crate::{
 	mock::*,
-	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 };
 use frame::traits::{
@@ -34,8 +33,8 @@ fn open_sets_annual_rate() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(37, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 2_000, rate_pct(100, 100)));
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().annual_rate, rate_pct(37, 100));
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().annual_rate, rate_pct(100, 100));
+		assert_eq!(vault(DOT, PUSD, 1).annual_rate, rate_pct(37, 100));
+		assert_eq!(vault(DOT, PUSD, 2).annual_rate, rate_pct(100, 100));
 	});
 }
 
@@ -45,28 +44,16 @@ fn open_sets_last_interest_time_to_now() {
 		register_market(DOT, PUSD);
 		let t0 = pallet_timestamp::Pallet::<Test>::get();
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_eq!(
-			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().last_interest_time,
-			interest_time_at(DOT, t0)
-		);
+		assert_eq!(vault(DOT, PUSD, 1).last_interest_time, interest_time_at(DOT, t0));
 		advance_time(1_000);
 		let t1 = pallet_timestamp::Pallet::<Test>::get();
 		assert_ok!(open(2, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_eq!(
-			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().last_interest_time,
-			interest_time_at(DOT, t0)
-		);
-		assert_eq!(
-			Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().last_interest_time,
-			interest_time_at(DOT, t1)
-		);
+		assert_eq!(vault(DOT, PUSD, 1).last_interest_time, interest_time_at(DOT, t0));
+		assert_eq!(vault(DOT, PUSD, 2).last_interest_time, interest_time_at(DOT, t1));
 		// Vault 1 was untouched by vault 2's open; poking it now settles it to the
 		// current interest time (t1), confirming a poke advances the clock.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		assert_eq!(
-			Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().last_interest_time,
-			interest_time_at(DOT, t1)
-		);
+		assert_eq!(vault(DOT, PUSD, 1).last_interest_time, interest_time_at(DOT, t1));
 	});
 }
 
@@ -149,9 +136,9 @@ fn change_rate_sets_new_rate() {
 			rate_pct(100, 100),
 			Position::endpoints_only()
 		));
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().annual_rate, rate_pct(1, 200));
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().annual_rate, rate_pct(60, 100));
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 3)).unwrap().annual_rate, rate_pct(100, 100));
+		assert_eq!(vault(DOT, PUSD, 1).annual_rate, rate_pct(1, 200));
+		assert_eq!(vault(DOT, PUSD, 2).annual_rate, rate_pct(60, 100));
+		assert_eq!(vault(DOT, PUSD, 3).annual_rate, rate_pct(100, 100));
 	});
 }
 
@@ -167,12 +154,12 @@ fn change_rate_post_cooldown_full_state() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(50, 100)));
-		let interest_at_open = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest;
+		let interest_at_open = vault(DOT, PUSD, 1).debt.interest;
 		// Advance one full cooldown, then poke so the elapsed interest is settled
 		// before the rate change (which then has nothing left to materialise).
 		advance_time(ONE_DAY_MS);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 		assert!(
 			v_pre.debt.interest > interest_at_open,
 			"a day of interest was folded in by the poke"
@@ -197,7 +184,7 @@ fn change_rate_post_cooldown_full_state() {
 			rate_pct(75, 100),
 			Position::endpoints_only()
 		));
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
@@ -221,7 +208,7 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 		// Settle pending interest into accrued first so the change_rate
 		// delta isolates the upfront-fee component.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 
 		let predicted =
 			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(75, 100))
@@ -235,7 +222,7 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 			rate_pct(75, 100),
 			Position::endpoints_only()
 		));
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted);
 	});
@@ -294,7 +281,7 @@ fn borrow_full_state_changes() {
 		// upfront fee.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
 
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 		let predicted_fee =
 			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 500, None)
 				.expect("registered market and vault");
@@ -309,7 +296,7 @@ fn borrow_full_state_changes() {
 			None,
 			Position::endpoints_only()
 		));
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
@@ -324,7 +311,7 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 		for (who, pct) in [(1u64, 20), (2, 10), (3, 30)] {
 			assert_ok!(open(who, DOT, PUSD, 5_000, 2_000, rate_pct(pct, 100)));
 		}
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 		// The upfront fee is charged at the branch *average* borrow rate (via
 		// `simulate_borrow`), not the vault's own rate — confirmed by the exact
 		// `assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted)` below.
@@ -349,7 +336,7 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 			Position::endpoints_only()
 		));
 
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 		assert_eq!(v_post.annual_rate, rate_pct(5, 100));
 		assert_eq!(v_post.last_rate_update, now_before_call);
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
@@ -371,7 +358,7 @@ fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 5_000, 2_000, rate_pct(20, 100)));
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 		let balance_pre = stable_balance(PUSD, 1);
 
 		assert_noop!(
@@ -388,7 +375,7 @@ fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
 			crate::Error::<Test>::RateOutOfBounds
 		);
 
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap(), v_pre);
+		assert_eq!(vault(DOT, PUSD, 1), v_pre);
 		assert_eq!(stable_balance(PUSD, 1), balance_pre);
 	});
 }
@@ -401,7 +388,7 @@ fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 5_000, 2_000, rate_pct(20, 100)));
-		let opened_at = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().last_rate_update;
+		let opened_at = vault(DOT, PUSD, 1).last_rate_update;
 
 		// Advance only part-way into the rate-adjustment cooldown so a (buggy)
 		// rate-change fee would still apply if the rate were treated as changed.
@@ -429,7 +416,7 @@ fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 			Position::endpoints_only()
 		));
 
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 		assert_eq!(v_post.annual_rate, rate_pct(20, 100));
 		assert_eq!(v_post.last_rate_update, opened_at, "no-op rate must not reset the cooldown");
 		assert!(
@@ -456,7 +443,7 @@ fn repay_full_state_changes() {
 		// the borrower's pUSD so they have enough to repay both principal
 		// and accrued.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 		// Borrow more pUSD into a second account so we can shuttle some over.
 		assert_ok!(open(2, DOT, PUSD, 5_000, 3_000, rate_pct(25, 100)));
 		top_up_pusd(1, 2, v_pre.debt.interest + 500);
@@ -469,7 +456,7 @@ fn repay_full_state_changes() {
 			1,
 			Some(500)
 		));
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 
@@ -507,13 +494,13 @@ fn poke_full_state_changes() {
 		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(25, 100)));
 		advance_time(ONE_DAY_MS);
 
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 
 		// Permissionless: any signed origin (here, account 2) can poke
 		// account 1's vault.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
@@ -535,7 +522,7 @@ fn poke_after_full_repayment_pokes_dormant_husk() {
 		// Repay all of vault 1's debt — first poke to settle accrued, then
 		// transfer accrued from vault 2 to cover the residual.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
-		let v = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v = vault(DOT, PUSD, 1);
 		let total = v.debt.principal + v.debt.interest;
 		top_up_pusd(1, 2, v.debt.interest);
 		assert_ok!(crate::Pallet::<Test>::repay_for(
@@ -548,7 +535,7 @@ fn poke_after_full_repayment_pokes_dormant_husk() {
 		// The husk survives as a Dormant zero-debt row and remains pokeable.
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(3), DOT, PUSD, 1));
-		assert_eq!(Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.total(), 0);
+		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 0);
 	});
 }
 
@@ -571,7 +558,7 @@ fn redemption_full_state_changes() {
 		// entire-debt arithmetic below would not close), and we pin the exact
 		// accrued amount rather than relying on a floor-to-zero coincidence.
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		let v_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_pre = vault(DOT, PUSD, 1);
 		advance_time(pusd_primitives::MILLIS_PER_YEAR);
 		// Exact simple interest on acct 1 over the year: 500 principal * 1% = 5.
 		let accrued_year: Balance = 5;
@@ -585,7 +572,7 @@ fn redemption_full_state_changes() {
 		let target = redeem(DOT, PUSD, 5, 200).expect("redeem ok");
 		assert_eq!(target, 1);
 
-		let v_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v_post = vault(DOT, PUSD, 1);
 		// The redemption refreshed acct 1's interest clock — it poked the target.
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 
@@ -642,7 +629,7 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 		let total_post = <Pusd as FungibleInspect<AccountId>>::total_issuance();
 		assert_eq!(total_post, total_pre + 2_000 + fee_residual);
 		assert_eq!(<Pusd as FungibleInspect<AccountId>>::balance(&1), 2_000);
-		let v = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let v = vault(DOT, PUSD, 1);
 		assert_eq!(v.debt.interest, predicted_fee);
 		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.debt.minted_interest, predicted_fee);
@@ -659,7 +646,7 @@ fn liquidation_assigns_redistribution_before_later_poke() {
 		assert_ok!(open(3, DOT, PUSD, 1_000, 2_000, rate_pct(25, 100)));
 		set_price(DOT, FixedU128::from_rational(15u128, 10u128));
 
-		let vault_a_pre = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let vault_a_pre = vault(DOT, PUSD, 1);
 		assert_eq!(vault_a_pre.debt.principal, 2_000);
 
 		let redistributed = redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)).expect("liquidated");
@@ -668,7 +655,7 @@ fn liquidation_assigns_redistribution_before_later_poke() {
 		advance_time(pusd_primitives::MILLIS_PER_YEAR);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
 
-		let vault_a_post = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
+		let vault_a_post = vault(DOT, PUSD, 1);
 		// A sole recipient receives the complete pending amount.
 		assert_eq!(vault_a_post.debt.principal, vault_a_pre.debt.principal + redistributed);
 		assert_eq!(vault_a_post.collateral, vault_a_pre.collateral + 1_000);
@@ -719,7 +706,7 @@ fn open_fee_matches_post_open_average_rate_closed_form() {
 			expected
 		);
 		assert_ok!(open(2, DOT, PUSD, 20_000, new_debt, new_rate));
-		let vault = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
+		let vault = vault(DOT, PUSD, 2);
 		assert_eq!(vault.debt.interest, expected, "charged fee matches the quote");
 	});
 }
@@ -732,16 +719,16 @@ fn poke_cadence_cannot_change_accrued_state() {
 			register_market(DOT, PUSD);
 			assert_ok!(open(1, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
 			assert_ok!(open(2, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
-			let base1 = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap().debt.interest;
-			let base2 = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap().debt.interest;
+			let base1 = vault(DOT, PUSD, 1).debt.interest;
+			let base2 = vault(DOT, PUSD, 2).debt.interest;
 			for gap in poke_gaps_ms {
 				advance_time(*gap);
 				assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
 			}
 			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
 
-			let vault_1 = Vaults::<Test>::get((DOT, PUSD, 1)).unwrap();
-			let vault_2 = Vaults::<Test>::get((DOT, PUSD, 2)).unwrap();
+			let vault_1 = vault(DOT, PUSD, 1);
+			let vault_2 = vault(DOT, PUSD, 2);
 			// Both schedules cover the same ten-day simple-interest period.
 			assert_eq!(vault_1.debt.interest - base1, 13_689);
 			assert_eq!(vault_2.debt.interest - base2, 13_689);

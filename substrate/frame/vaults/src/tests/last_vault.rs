@@ -155,9 +155,9 @@ fn execute_liquidation_pays_keeper_and_derives_redistributed_debt() {
 		// Vault 2 is the sole recipient with stake 1_000, so the share it absorbs
 		// on touch is exactly the derived redistributed debt (0.301 × 1_000 — no
 		// flooring loss).
-		let v_pre = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault 2");
+		let v_pre = vault(DOT, PUSD, 2);
 		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
-		let v_post = crate::pallet::Vaults::<Test>::get((DOT, PUSD, 2)).expect("vault 2");
+		let v_post = vault(DOT, PUSD, 2);
 		assert_eq!(v_post.debt.principal - v_pre.debt.principal, post_touch_debt - 200);
 	});
 }
@@ -180,7 +180,7 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
 		assert_ok!(liquidate(DOT, PUSD, 1));
 
-		assert!(crate::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert!(!vault_exists(DOT, PUSD, 1));
 		let state = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(state.dormant_redemption_target, None, "pointer cleared with the row");
 	});

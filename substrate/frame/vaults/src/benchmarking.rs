@@ -21,7 +21,7 @@ use frame::{
 			Balanced as FungiblesBalanced, Inspect as FungiblesInspect, Mutate as FungiblesMutate,
 		},
 		tokens::Precision,
-		EnsureOrigin, EnsureOriginWithArg, SaturatedConversion, Time, Zero,
+		Consideration as _, EnsureOrigin, EnsureOriginWithArg, SaturatedConversion, Time, Zero,
 	},
 };
 use frame_system::RawOrigin;
@@ -158,6 +158,10 @@ fn fund_collateral<T: Config>(
 	)
 	.map_err(|_| BenchmarkError::Stop("collateral funding failed"))?;
 	drop(debt);
+	T::VaultConsideration::ensure_successful(
+		who,
+		Pallet::<T>::vault_footprint(asset, &stable::<T>(), who),
+	);
 	Ok(())
 }
 
@@ -892,7 +896,8 @@ mod benchmarks {
 			Pallet::<T>::idle_vault_step(&collateral_id, &stable_id, &walked_owner);
 		}
 
-		let vault = Vaults::<T>::get((&asset, &stable::<T>(), &owner)).expect("vault opened above");
+		let vault =
+			Pallet::<T>::vault_of(&asset, &stable::<T>(), &owner).expect("vault opened above");
 		let branch = Branches::<T>::get(&asset, &stable::<T>()).expect("branch registered above");
 		assert_eq!(
 			vault.last_interest_time,

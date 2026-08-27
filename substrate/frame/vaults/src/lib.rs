@@ -13,6 +13,8 @@
 //!
 //! A user opens a vault by locking collateral and borrowing the stable asset. Each vault has an
 //! annual interest rate chosen by its owner. Interest is added when the market or vault is updated.
+//! Opening also takes a refundable storage deposit, settled
+//! according to the runtime policy.
 //!
 //! Vaults are ordered by rate for redemptions. Lower-rate vaults are redeemed first. A final
 //! recovery queue is served before the rate list when a market has only one eligible vault left.
@@ -51,7 +53,7 @@ pub use types::{
 	AssetMinimums, BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate,
 	BranchDebt, BranchMode, BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState,
 	LiquidationSettlement, LiquidationSnapshot, RedistributionAccumulators, RedistributionCarry,
-	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultStatus,
+	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
 };
 pub use weights::WeightInfo;
 
@@ -86,7 +88,7 @@ pub mod pallet {
 				Balanced as FungiblesBalanced, Inspect as FungiblesInspect,
 				Mutate as FungiblesMutate, MutateHold as FungiblesMutateHold,
 			},
-			AccountTouch, Consideration, EnsureOriginWithArg, Footprint, Time,
+			AccountTouch, AssetFootprint, Consideration, EnsureOriginWithArg, Footprint, Time,
 		},
 	};
 	use linked_list_interface::{Position, PriorityProvider, SortedListInterface};
@@ -132,8 +134,12 @@ pub mod pallet {
 	pub type BranchOf<T> = crate::types::Branch<
 		<T as frame_system::Config>::AccountId,
 		BalanceOf<T>,
-		<T as Config>::Consideration,
+		<T as Config>::BranchConsideration,
 	>;
+
+	/// Stored vault record: the accounting row with its storage deposit.
+	pub type VaultRecordOf<T> =
+		crate::types::VaultRecord<BalanceOf<T>, <T as Config>::VaultConsideration>;
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
@@ -201,7 +207,13 @@ pub mod pallet {
 		>;
 
 		/// Refundable deposit charged for creating a market.
-		type Consideration: Consideration<Self::AccountId, Footprint>;
+		type BranchConsideration: Consideration<Self::AccountId, Footprint>;
+
+		/// Refundable deposit charged for opening a vault.
+		type VaultConsideration: Consideration<
+			Self::AccountId,
+			AssetFootprint<CollateralIdOf<Self>>,
+		>;
 
 		/// Runtime-owned, scale-independent limits for every market.
 		#[pallet::constant]
@@ -242,6 +254,8 @@ pub mod pallet {
 		VaultCollateral,
 		/// Refundable deposit held while a market exists.
 		BranchCreationDeposit,
+		/// Refundable deposit held while a vault exists.
+		VaultCreationDeposit,
 	}
 
 	/// Authoritative vault state keyed by collateral, stable asset, and owner.
@@ -253,7 +267,7 @@ pub mod pallet {
 			NMapKey<Blake2_128Concat, StableIdOf<T>>,
 			NMapKey<Blake2_128Concat, T::AccountId>,
 		),
-		Vault<BalanceOf<T>>,
+		VaultRecordOf<T>,
 		OptionQuery,
 	>;
 
@@ -1370,7 +1384,9 @@ pub mod pallet {
 		) -> Option<FixedU128> {
 			match list_id {
 				VaultListId::Rate(collateral_id, stable_id) => {
-					Vaults::<T>::get((collateral_id, stable_id, item)).map(|v| v.annual_rate)
+					Pallet::<T>::vault_of(collateral_id, stable_id, item)
+						.ok()
+						.map(|vault| vault.annual_rate)
 				},
 				// FIFO order does not change after insertion. Thus, the stored insertion priority
 				// remains authoritative.

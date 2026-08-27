@@ -1,4 +1,4 @@
-use crate::{mock::*, pallet::Vaults, tests::rate_pct, types::BranchConfigUpdate};
+use crate::{mock::*, tests::rate_pct, types::BranchConfigUpdate};
 use frame::traits::fungibles::Mutate as FungiblesMutate;
 
 /// Replacement admins used by the reassignment test.
@@ -14,13 +14,13 @@ fn market_exists(collateral: AssetId, stable: StableId) -> bool {
 /// principal is covered. Repay-to-zero leaves a Dormant husk that still holds the
 /// collateral, so an explicit `close_vault` is needed to empty the market.
 fn repay_to_close(owner: AccountId) {
-	let total = Vaults::<Test>::get((DOT, PUSD, owner)).expect("vault stored").debt.total();
+	let total = vault(DOT, PUSD, owner).debt.total();
 	// The terminal charge can put the payoff one unit past the recorded debt.
 	<VaultStableAssets as FungiblesMutate<AccountId>>::mint_into(PUSD, &owner, total + 1)
 		.expect("mint repay buffer");
 	assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(owner), DOT, PUSD, owner, None));
 	assert_ok!(Pallet::<Test>::close_vault(RuntimeOrigin::signed(owner), DOT, PUSD, None));
-	assert!(Vaults::<Test>::get((DOT, PUSD, owner)).is_none(), "close removed the vault");
+	assert!(!vault_exists(DOT, PUSD, owner), "close removed the vault");
 }
 
 // A signed asset-owner create locks the refundable deposit; removing the empty

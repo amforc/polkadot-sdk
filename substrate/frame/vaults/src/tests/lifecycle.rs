@@ -5,7 +5,6 @@
 
 use crate::{
 	mock::*,
-	pallet::Vaults,
 	tests::{rate_pct, vault_status},
 	types::BranchConfigUpdate,
 };
@@ -30,7 +29,7 @@ fn open_vault_count_is_not_capped_by_redistribution() {
 		assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&owner, 2_000));
 		assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate_pct(65, 100)));
 		assert_eq!(branch_state(DOT, PUSD).unwrap().vault_count, 65);
-		assert!(Vaults::<Test>::get((DOT, PUSD, owner)).is_some());
+		assert!(vault_exists(DOT, PUSD, owner));
 	});
 }
 
@@ -115,7 +114,7 @@ fn open_vault_holds_collateral_and_mints_pusd() {
 		register_market(DOT, PUSD);
 		// 1000 DOT @ $10 = $10000 collateral; borrow 1000 pUSD with 5% rate.
 		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
-		let v = Vaults::<Test>::get((DOT, PUSD, 1)).expect("vault stored");
+		let v = vault(DOT, PUSD, 1);
 		assert_eq!(v.debt.principal, 1_000);
 		assert!(vault_status(DOT, PUSD, 1).is_active());
 		assert_eq!(stable_balance(PUSD, 1), 1_000);
