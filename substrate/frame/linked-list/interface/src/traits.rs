@@ -18,7 +18,10 @@
 //! Consumer-facing trait surface for the sorted list.
 
 use crate::{ListError, Outcome, Position};
-use frame::arithmetic::{FixedU128, Zero};
+use frame::{
+	arithmetic::{FixedU128, Zero},
+	traits::Footprint,
+};
 
 /// Authoritative source of the priority for `(list_id, item)`. Consulted by
 /// the list pallet's `reprioritize` dispatchable to detect drift against
@@ -169,6 +172,9 @@ pub trait SortedListInterface<ListId, ItemId> {
 
 	/// Returns `true` if `(list_id, item)` is in the list.
 	fn contains(list_id: &ListId, item: &ItemId) -> bool;
+
+	/// Returns the maximum storage footprint of the node and its key.
+	fn node_footprint(list_id: &ListId, item: &ItemId) -> Footprint;
 
 	/// Current `(prev, next)` neighbors of `(list_id, item)`, if present.
 	fn neighbors(list_id: &ListId, item: &ItemId) -> Option<Position<ItemId>> {

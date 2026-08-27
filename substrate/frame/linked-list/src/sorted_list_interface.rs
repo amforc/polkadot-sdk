@@ -23,11 +23,15 @@
 
 use crate::{list, pallet::*, view_helpers, ListError, Outcome, Position, SortedListInterface};
 use frame::{
-	deps::frame_support::{
-		storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
-		traits::DefensiveOption,
+	deps::{
+		codec::MaxEncodedLen,
+		frame_support::{
+			storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
+			traits::DefensiveOption,
+		},
 	},
 	prelude::*,
+	traits::Footprint,
 };
 
 impl<T: Config> Pallet<T> {
@@ -199,6 +203,12 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 
 	fn contains(list_id: &T::ListId, item: &T::ItemId) -> bool {
 		ListNodes::<T>::contains_key(list_id, item)
+	}
+
+	fn node_footprint(list_id: &T::ListId, item: &T::ItemId) -> Footprint {
+		let key = ListNodes::<T>::hashed_key_for(list_id, item).len();
+		let node = crate::list::Node::<T::ItemId, T::Priority>::max_encoded_len();
+		Footprint::from_parts(1, key.saturating_add(node))
 	}
 
 	fn node(list_id: &T::ListId, item: &T::ItemId) -> Option<(T::Priority, Position<T::ItemId>)> {
