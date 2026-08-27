@@ -1602,9 +1602,10 @@ fn insurance_adjusted_recovery_burns_fund_only_when_market_debt_exhausted() {
 		// At 0.30, the final 301 debt has `1_000 − 442 = 558` collateral units with a value of 167.
 		// The shortfall increases to 134.
 		//
-		// The Insurance Fund covers only 50, so the market-side debt to be cancelled is 251. This
-		// amount matches the stale view. The live price changes the recovery rate from `400 / 451`
-		// to `167 / 251`.
+		// The Insurance Fund still covers only 50, so the market side cancels the other
+		// `301 − 50 = 251` debt. This split does not depend on the price: the first step's view
+		// left `451 − 200 = 251` as well. Only the recovery rate moves with the price, from
+		// `400 / 451` under the stale view to `167 / 251` under the live one.
 		//
 		// Cancellation pays `floor(floor(251 · 167 / 251) / 0.30) = 553` collateral units. The
 		// stale rate would incorrectly pay all 558 units.
