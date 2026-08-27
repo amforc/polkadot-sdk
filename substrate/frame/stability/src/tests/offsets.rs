@@ -108,6 +108,7 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 		assert_eq!(
 			pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 2))
 				.unwrap()
+				.vault
 				.collateral,
 			3_000
 		);
