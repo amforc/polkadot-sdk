@@ -252,7 +252,9 @@ impl pallet_vaults::Config for Test {
 	type OnBranchLifecycle = (Redemptions, Stability);
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
-	type Consideration = VaultsConsideration;
+	type BranchConsideration = VaultsConsideration;
+	// These suites assert raw balances; vault deposits are the vaults suite's concern.
+	type VaultConsideration = ();
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type PalletId = VaultsPalletId;
@@ -949,7 +951,7 @@ pub fn enter_final_recovery(
 /// The stored debt of a vault, principal and settled interest together. Zero if it is absent.
 pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Balance {
 	pallet_vaults::Vaults::<Test>::get((collateral, stable, who))
-		.map(|v| v.debt.principal + v.debt.interest)
+		.map(|record| record.vault.debt.principal + record.vault.debt.interest)
 		.unwrap_or_default()
 }
 
