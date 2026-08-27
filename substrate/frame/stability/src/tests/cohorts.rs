@@ -169,37 +169,40 @@ fn settlement_splits_losses_and_gains_at_the_checkpoint() {
 		mint_stable(PUSD, 1, 400);
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 
-		// A backstop offset while pending: P_pending = 300/400 = 0.75 and
-		// delta_S_pending = 50 * (1/400) = 0.125.
+		// Two backstop offsets while pending compose through the accumulators:
+		// P_pending = 300/400 = 0.75, delta_S_pending = 50 * (1/400) = 0.125; then
+		// P_pending = 0.75 * 240/300 = 0.6, delta_S_pending = 30 * (0.75/300) = 0.075.
 		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 100, 50);
 		assert_eq!(debt_offset, 100);
+		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 60, 30);
+		assert_eq!(debt_offset, 60);
 
-		// Advancement resolves the cohort's units at maturity: floor(400 * 0.75) = 300 moves
+		// Advancement resolves the cohort's units at maturity: floor(400 * 0.6) = 240 moves
 		// into the active pool, and the yield distributes over exactly that:
-		// delta_G = 60 / 300 = 0.2.
+		// delta_G = 60 / 240 = 0.25.
 		advance_time(9_000);
 		drop(distribute_yield(DOT, PUSD, 60));
 		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.total_active_deposits, 300);
+		assert_eq!(state.total_active_deposits, 240);
 		assert_eq!(state.total_pending_deposits, 0);
 
-		// An active offset after activation: P = 150/300 = 0.5, delta_S = 90 * (1/300) = 0.3.
-		assert_eq!(simulate_offset(DOT, PUSD, 150, 90).0, 150);
+		// An active offset after activation: P = 120/240 = 0.5, delta_S = 90 * (1/240) = 0.375.
+		assert_eq!(simulate_offset(DOT, PUSD, 120, 90).0, 120);
 
-		// One call settles both phases: the pending leg up to the checkpoint (300 survive, 50
-		// collateral), then the survivor as active capital (150 survive, 90 collateral, 60
-		// yield).
+		// One call settles both phases: the pending leg up to the checkpoint (240 survive,
+		// 400 * 0.2 = 80 collateral), then the survivor as active capital (120 survive, 90
+		// collateral, 60 yield).
 		assert_ok!(settle(7, 1, DOT, PUSD));
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
-		assert_eq!(row.active_deposit, 150);
-		assert_eq!(row.claimable_collateral, 50 + 90);
+		assert_eq!(row.active_deposit, 120);
+		assert_eq!(row.claimable_collateral, 80 + 90);
 		assert_eq!(row.claimable_yield, 60);
 		System::assert_has_event(
 			crate::Event::PendingDepositActivated {
 				collateral_id: DOT,
 				stable_id: PUSD,
 				depositor: 1,
-				amount: 300,
+				amount: 240,
 			}
 			.into(),
 		);
@@ -207,10 +210,10 @@ fn settlement_splits_losses_and_gains_at_the_checkpoint() {
 		// Every tracked total reconciles against the claims.
 		let before = collateral_balance(DOT, 1);
 		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 140);
+		assert_eq!(collateral_balance(DOT, 1) - before, 170);
 		assert_ok!(claim_yield(1, DOT, PUSD, 1));
 		assert_ok!(withdraw(1, DOT, PUSD, 1_000, 1));
-		assert_eq!(stable_balance(PUSD, 1), 60 + 150);
+		assert_eq!(stable_balance(PUSD, 1), 60 + 120);
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 		assert_eq!(crate::CohortCheckpoints::<Test>::iter().count(), 0);
 	});
@@ -353,10 +356,20 @@ fn freeze_halts_advancement_but_settles_committed_checkpoints() {
 		drop(distribute_yield(DOT, PUSD, 70));
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 700);
 
+		// A later cohort matures during the freeze and stays pending until the market thaws.
+		mint_stable(PUSD, 3, 200);
+		assert_ok!(deposit(3, DOT, PUSD, 200));
+		assert_eq!(pending_deadline(DOT, PUSD, 3), Some(25_000));
+
 		// A frozen market cannot advance cohorts, but settling a row through a checkpoint that
 		// was committed before the freeze is pure bookkeeping and stays available.
 		MockOracleAvailable::set(false);
+		advance_time(10_000);
 		assert_ok!(settle(7, 2, DOT, PUSD));
+		let state = pool_state(DOT, PUSD);
+		assert_eq!(state.total_active_deposits, 700);
+		assert_eq!(state.total_pending_deposits, 200);
+		assert_eq!(pending_deadline(DOT, PUSD, 3), Some(25_000));
 		let row = deposit_row(DOT, PUSD, 2).expect("row exists");
 		assert_eq!(row.active_deposit, 300);
 		assert!(row.pending_deposit.is_none());
@@ -366,6 +379,10 @@ fn freeze_halts_advancement_but_settles_committed_checkpoints() {
 		assert_noop!(claim_yield(2, DOT, PUSD, 2), Error::<Test>::BranchFrozen);
 		MockOracleAvailable::set(true);
 		assert_ok!(claim_yield(2, DOT, PUSD, 2));
+		// The thaw lets the first operation activate the overdue cohort.
+		let state = pool_state(DOT, PUSD);
+		assert_eq!(state.total_active_deposits, 900);
+		assert_eq!(state.total_pending_deposits, 0);
 	});
 }
 
@@ -377,9 +394,9 @@ fn aggregate_tracks_an_epoch_bump_inside_one_cohort() {
 		mint_stable(PUSD, 2, 500);
 
 		// User 1 joins at pending epoch 0; the backstop then consumes the whole stock, bumping
-		// the pending epoch with no collateral to show for it.
+		// the pending epoch: delta_S_pending = 90 * (1/300) = 0.3 before the bump.
 		assert_ok!(deposit(1, DOT, PUSD, 300));
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 300, 0);
+		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 300, 90);
 		assert_eq!(debt_offset, 300);
 
 		// User 2 joins the same cohort in the same window, at epoch 1. The join revalues the
@@ -410,9 +427,17 @@ fn aggregate_tracks_an_epoch_bump_inside_one_cohort() {
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(deposit_row(DOT, PUSD, 2).expect("row exists").active_deposit, 500);
 
-		// User 1's capital is gone with the depletion; its settlement realizes nothing and
-		// prunes the row and, as the last member, the checkpoint.
+		// User 1's capital is gone with the depletion, but the collateral it earned before the
+		// bump survives: floor(300 * 0.3) = 90. Paying it out prunes the row and, as the last
+		// member, the checkpoint.
 		assert_ok!(settle(7, 1, DOT, PUSD));
+		let row = deposit_row(DOT, PUSD, 1).expect("row carries the gain");
+		assert_eq!(row.active_deposit, 0);
+		assert!(row.pending_deposit.is_none());
+		assert_eq!(row.claimable_collateral, 90);
+		let before = collateral_balance(DOT, 1);
+		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
+		assert_eq!(collateral_balance(DOT, 1) - before, 90);
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 		assert_eq!(crate::CohortCheckpoints::<Test>::iter().count(), 0);
 	});
@@ -429,12 +454,18 @@ fn pending_scale_crossing_reprices_the_aggregate_through_the_divisor() {
 		assert_ok!(deposit(1, DOT, PUSD, unit));
 
 		// The backstop burns all but 100 of the 1e13 pending stock: the survival ratio 1e-11
-		// forces one rescale, P_pending = 0.01 at scale 1 — as on the active side.
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, unit - 100, 0);
+		// forces one rescale, P_pending = 0.01 at scale 1 — as on the active side. The
+		// collateral lands in the row of the pre-crossing scale: delta_S_pending = 1e12 / 1e13.
+		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, unit - 100, 1_000_000_000_000);
 		assert_eq!(debt_offset, unit - 100);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.pending_coords.scale, 1);
 		assert_eq!(state.pending_coords.p, FixedU128::from_inner(10_000_000_000_000_000));
+		let pending_sums = |scale| {
+			crate::PoolSumsStore::<Test>::get((DOT, PUSD, crate::types::Leg::Pending, 0, scale))
+		};
+		assert_eq!(pending_sums(0).s_collateral, FixedU128::from_rational(1, 10));
+		assert_eq!(pending_sums(1).s_collateral, FixedU128::zero());
 
 		// User 2 joins the same cohort one scale later: the join revalues the aggregate through
 		// the crossing's divisor — ceil(1e13 * 0.01 / 1e9) = 100 — and adds the 200 on top.
@@ -452,7 +483,12 @@ fn pending_scale_crossing_reprices_the_aggregate_through_the_divisor() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 300);
 		assert_eq!(state.total_pending_deposits, 0);
-		assert_eq!(deposit_row(DOT, PUSD, 1).expect("row exists").active_deposit, 100);
-		assert_eq!(deposit_row(DOT, PUSD, 2).expect("row exists").active_deposit, 200);
+		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
+		assert_eq!(row.active_deposit, 100);
+		// User 1 alone held the stock when the collateral was paid: floor(1e13 * 0.1) = 1e12.
+		assert_eq!(row.claimable_collateral, 1_000_000_000_000);
+		let row = deposit_row(DOT, PUSD, 2).expect("row exists");
+		assert_eq!(row.active_deposit, 200);
+		assert_eq!(row.claimable_collateral, 0);
 	});
 }
