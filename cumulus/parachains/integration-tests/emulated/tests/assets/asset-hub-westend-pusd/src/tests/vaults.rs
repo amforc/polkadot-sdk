@@ -16,11 +16,14 @@
 use crate::imports::*;
 use asset_hub_westend_runtime::{
 	governance, pusd_config::VaultsBranchCreationDeposit, Assets, Balances, RuntimeHoldReason,
-	Vaults,
+	TrustBackedAssetsInstance, Vaults,
 };
 use frame_support::{
-	assert_err,
-	traits::{fungible::InspectHold as FungibleInspectHold, fungibles::Refund},
+	assert_err, assert_noop,
+	traits::{
+		fungible::InspectHold as FungibleInspectHold,
+		fungibles::{roles::Inspect as RolesInspect, Refund},
+	},
 };
 
 /// A stablecoin minimum balance above one unit requires the fee account's
@@ -49,14 +52,15 @@ fn registration_creates_the_fee_account_stablecoin_account() {
 	});
 }
 
-/// A signed origin, not Root, creates a native-collateral market.
+/// Creates a native-collateral market as the asset owner, then transfers control to governance.
 #[test]
 fn signed_user_registers_a_native_collateral_market() {
 	AssetHubWestend::execute_with(|| {
 		create_pusd();
 		feed_price(dot_price(2, 1));
 
-		// The creator is the stablecoin owner. It has no privilege other than the asset ownership.
+		// Asset ownership authorizes market creation and redemption configuration.
+		// The vault system uses fungibles traits to mint and burn.
 		let creator = admin();
 		// The administrators take no part in the creation.
 		let full_admin = acct(7);
@@ -100,8 +104,49 @@ fn signed_user_registers_a_native_collateral_market() {
 			get_pusd_id(),
 			pallet_vaults::BranchConfigUpdate::MinimumDebt(100 * PUSD),
 		));
+		// The full admin controls only the branch ceiling.
+		assert_ok!(Vaults::set_param(
+			RuntimeOrigin::signed(full_admin.clone()),
+			get_native_id(),
+			get_pusd_id(),
+			pallet_vaults::BranchConfigUpdate::DebtCeiling(50_000_000 * PUSD),
+		));
 
-		// The global ceiling stays with governance. The market can borrow only after Root opens it.
+		// The treasury takes all asset roles and ownership. Only Root can reassign them
+		// through `force_asset_status`.
+		let custodian = governance::TreasuryAccount::get();
+		assert_ok!(Assets::set_team(
+			RuntimeOrigin::signed(creator.clone()),
+			get_pusd_id().into(),
+			MultiAddress::Id(custodian.clone()),
+			MultiAddress::Id(custodian.clone()),
+			MultiAddress::Id(custodian.clone()),
+		));
+		assert_ok!(Assets::transfer_ownership(
+			RuntimeOrigin::signed(creator.clone()),
+			get_pusd_id().into(),
+			MultiAddress::Id(custodian.clone()),
+		));
+		assert_eq!(<Assets as RolesInspect<AccountId>>::owner(get_pusd_id()), Some(custodian));
+		// The former owner cannot freeze the asset or register another market.
+		assert_noop!(
+			Assets::freeze_asset(RuntimeOrigin::signed(creator.clone()), get_pusd_id().into()),
+			pallet_assets::Error::<Runtime, TrustBackedAssetsInstance>::NoPermission,
+		);
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::signed(creator.clone()),
+				get_native_id(),
+				get_pusd_id(),
+				branch_admins(),
+				branch_config(&get_native_id(), &BranchSpec::default()),
+				registration_config(),
+			),
+			sp_runtime::DispatchError::BadOrigin,
+		);
+
+		// The stablecoin-wide ceiling uses governance `ForceOrigin`. Root lifts it before
+		// users can borrow.
 		lift_global_ceiling(1_000_000_000 * PUSD);
 		let owner = acct(9);
 		// 10,000 WND at 2 pUSD against 10,000 pUSD debt: CR 200%.
@@ -132,7 +177,7 @@ fn signed_user_registers_a_native_collateral_market() {
 /// the TCR to 115% is rejected although the vault stays healthy. A debt
 /// repayment improves the TCR and goes through.
 #[test]
-fn example_14_branch_mode_tcr_check() {
+fn branch_safety_ratio_gates_withdrawals_not_repayments() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(2, 1));
 		// Lower vault ratios leave the vault healthy, so the branch TCR check is
@@ -182,12 +227,12 @@ fn example_14_branch_mode_tcr_check() {
 /// The upfront fee is 7 days of interest on the newly drawn amount. It goes to
 /// `debt.interest`, not `debt.principal`.
 ///
-/// The document uses a 365-day year and gets 3.8356 pUSD. The chain uses 365.25
-/// days (`MILLIS_PER_YEAR = 31,557,600,000`) and rounds up:
+/// The year is 365.25 days (`MILLIS_PER_YEAR = 31,557,600,000`) and the fee
+/// rounds up:
 ///   open fee = ceil(5,000e6 × 4% × 7 / 365.25) = ceil(3,832,991.10) = 3,832,992
 ///   draw fee = ceil(2,000e6 × 4% × 7 / 365.25) = ceil(1,533,196.44) = 1,533,197
 #[test]
-fn example_16_open_vault_and_increase_debt_with_upfront_fee() {
+fn upfront_fee_is_charged_on_open_and_on_each_draw() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(2, 1));
 		create_branch(&BranchSpec {

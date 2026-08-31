@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use crate::imports::*;
-use asset_hub_westend_runtime::{Redemptions, Vaults};
+use asset_hub_westend_runtime::{Redemptions, RuntimeEvent, System, Vaults};
 use pallet_redemptions::RedemptionTerms;
 use pusd_primitives::VaultStatus;
 
@@ -38,9 +38,9 @@ fn park_in_final_recovery(owner: &AccountId, collateral: Balance, debt: Balance)
 /// At CR 120% the raw bonus is 120% − 100% − 1% = 19%. It caps at the 10%
 /// redistribution penalty, so 2,000 pUSD buys 2,200 pUSD of collateral value.
 #[test]
-fn example_03_final_recovery_redemption_above_par() {
+fn final_recovery_redemption_above_par() {
 	AssetHubWestend::execute_with(|| {
-		// Open at 4 pUSD/WND, so the halving gives the example's CR.
+		// A 50% price decrease sets the vault CR to 120%.
 		feed_price(dot_price(4, 1));
 		// MCR 125% makes the CR 120% vault eligible for final recovery.
 		create_branch(&BranchSpec {
@@ -84,9 +84,9 @@ fn example_03_final_recovery_redemption_above_par() {
 
 /// A 2,000 pUSD shortfall with 1,000 pUSD of insurance cover leaves 9,000 pUSD
 /// to cancel externally, at recovery rate 8,000 / 9,000. The full settlement
-/// pays out all collateral and burns the cover.
+/// pays out all collateral, burns the cover, and closes the vault.
 #[test]
-fn example_04_final_recovery_redemption_below_par_with_insurance_cover() {
+fn final_recovery_redemption_below_par_with_insurance_cover() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
 		create_branch(&BranchSpec {
@@ -117,12 +117,14 @@ fn example_04_final_recovery_redemption_below_par_with_insurance_cover() {
 			16,
 		));
 		assert_eq!(pusd_balance(&redeemer), 0);
-		// The value floors in stable units first: floor(3,000e6 × 8/9)
-		// = 2,666,666,666 µpUSD. At 2 pUSD/WND that is 1,333,333,333 × 1e6 planck.
+		// The value first floors to 2,666,666,666 pUSD. At 2 pUSD/WND,
+		// the result is 1,333,333,333 × 1e6 planck.
 		let partial_out = native_balance(&redeemer) - get_native_ed();
 		assert_eq!(partial_out, 1_333_333_333_000_000);
 
 		// Full settlement: the remaining 6,000 pUSD takes all collateral and burns the cover.
+		let deposit_held_before = vault_deposit_on_hold(&get_native_id(), &parked_owner);
+		let owner_free_before = native_balance(&parked_owner);
 		let settler = acct(4);
 		fund_dot(&settler, 0);
 		mint_pusd(&settler, 6_000 * PUSD);
@@ -139,13 +141,31 @@ fn example_04_final_recovery_redemption_below_par_with_insurance_cover() {
 		assert_eq!(native_balance(&settler) - get_native_ed(), 4_000 * WND - partial_out);
 		// Insurance Fund burn = 1,000 pUSD.
 		assert_eq!(pusd_balance(&insurance), 0);
-		// A full settlement leaves an empty Dormant vault. It does not delete the vault.
-		let husk = vault(&parked_owner);
-		assert_eq!(husk.debt.total(), 0);
-		assert_eq!(husk.collateral, 0);
+		// Full settlement removes the vault, releases its holds, and refunds its storage deposit.
+		assert!(pallet_vaults::Vaults::<Runtime>::get((
+			get_native_id(),
+			get_pusd_id(),
+			parked_owner.clone(),
+		))
+		.is_none());
 		assert_eq!(
 			Vaults::vault_status(get_native_id(), get_pusd_id(), parked_owner.clone()),
-			Some(VaultStatus::Dormant),
+			None
 		);
+		assert_eq!(collateral_on_hold(&get_native_id(), &parked_owner), 0);
+		assert_eq!(vault_deposit_on_hold(&get_native_id(), &parked_owner), 0);
+		assert_eq!(
+			native_balance(&parked_owner) - owner_free_before,
+			deposit_held_before,
+			"the close refunded the vault's storage deposit",
+		);
+		assert_eq!(branch_state().vault_count, 0);
+		System::assert_has_event(RuntimeEvent::Vaults(pallet_vaults::Event::VaultClosed {
+			collateral_id: get_native_id(),
+			stable_id: get_pusd_id(),
+			owner: parked_owner.clone(),
+			recipient: parked_owner.clone(),
+			collateral: 0,
+		}));
 	});
 }

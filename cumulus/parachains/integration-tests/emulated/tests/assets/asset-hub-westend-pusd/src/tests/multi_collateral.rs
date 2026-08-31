@@ -18,13 +18,16 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
-	pusd_config::{StabilityCollateral, TrustBackedAssetLocation},
-	Balances, Stability, Vaults,
+	pusd_config::{StabilityCollateral, TrustBackedAssetLocation, VaultsCollateral},
+	Balances, Vaults,
 };
 use emulated_integration_tests_common::{snowbridge::SEPOLIA_ID, USDT_ID};
 use frame_support::{
 	assert_err,
-	traits::{fungibles::Refund, tokens::Provenance},
+	traits::{
+		fungibles::Refund,
+		tokens::{Fortitude, Preservation, Provenance},
+	},
 };
 use pallet_vaults::JitTerms;
 use sp_runtime::traits::MaybeEquivalence;
@@ -63,49 +66,6 @@ fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId) {
 	));
 }
 
-fn deposit_row_on(
-	collateral_id: &VaultsCollateralId,
-	who: &AccountId,
-) -> pallet_stability::types::Deposit<Balance> {
-	pallet_stability::Deposits::<Runtime>::get((collateral_id, get_pusd_id(), who.clone()))
-		.expect("deposit row exists")
-}
-
-/// Pays out a depositor's realized gains and asserts the collateral moved from
-/// the pool account to the depositor in the collateral's own pallet.
-///
-/// The payout is where the asset union must route to a pallet the pool did not
-/// choose, so each collateral pallet is checked.
-fn claim_collateral_out(
-	collateral_id: &VaultsCollateralId,
-	depositor: &AccountId,
-	expected: Balance,
-) {
-	let pool = pool_account_on(collateral_id);
-	let depositor_before = collateral_free(collateral_id, depositor);
-	let pool_before = collateral_free(collateral_id, &pool);
-
-	assert_ok!(Stability::claim_collateral(
-		RuntimeOrigin::signed(depositor.clone()),
-		collateral_id.clone(),
-		get_pusd_id(),
-		None,
-	));
-
-	assert_eq!(collateral_free(collateral_id, depositor) - depositor_before, expected);
-	assert_eq!(pool_before - collateral_free(collateral_id, &pool), expected);
-	// The payout zeroes the claimable row.
-	assert_err!(
-		Stability::claim_collateral(
-			RuntimeOrigin::signed(depositor.clone()),
-			collateral_id.clone(),
-			get_pusd_id(),
-			None,
-		),
-		pallet_stability::Error::<Runtime>::NoClaimableCollateral,
-	);
-}
-
 /// One stablecoin, three markets: native WND, trust-backed USDT, bridged ETH.
 ///
 /// Each vault pledges 20,000 pUSD of value against 10,000 pUSD of debt. The
@@ -137,12 +97,29 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 		assert_eq!(pusd_balance(&usdt_owner), 10_000 * PUSD);
 		assert_eq!(pusd_balance(&eth_owner), 10_000 * PUSD);
 
-		// Custody is a hold in the collateral's own pallet. Only the minimum-balance float is free.
-		assert_eq!(collateral_on_hold(&get_native_id(), &native_owner), 10_000 * WND);
-		assert_eq!(collateral_on_hold(&usdt_id(), &usdt_owner), 20_000 * USDT);
-		assert_eq!(collateral_free(&usdt_id(), &usdt_owner), collateral_min_balance(&usdt_id()));
-		assert_eq!(collateral_on_hold(&eth_id(), &eth_owner), 10 * ETH);
-		assert_eq!(collateral_free(&eth_id(), &eth_owner), collateral_min_balance(&eth_id()));
+		// Each asset pallet holds exactly the vault collateral. The minimum-balance float
+		// is free but not reducible while the hold keeps the account alive.
+		for (collateral_id, owner) in
+			[(get_native_id(), native_owner), (usdt_id(), usdt_owner), (eth_id(), eth_owner)]
+		{
+			assert_eq!(
+				collateral_on_hold(&collateral_id, &owner),
+				vault_on(&collateral_id, &owner).collateral,
+			);
+			assert_eq!(
+				collateral_free(&collateral_id, &owner),
+				collateral_min_balance(&collateral_id)
+			);
+			assert_eq!(
+				<VaultsCollateral as Inspect<AccountId>>::reducible_balance(
+					collateral_id.clone(),
+					&owner,
+					Preservation::Expendable,
+					Fortitude::Polite,
+				),
+				0,
+			);
+		}
 	});
 }
 
@@ -191,7 +168,7 @@ fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 	});
 }
 
-/// The native example's figures, scaled by the ETH price. Seizure caps at
+/// Repeats the native liquidation scenario with ETH collateral. Seizure caps at
 /// debt × 1.05 in value. The keeper takes 2 pUSD flat plus 0.1% of the seizure.
 /// The rest goes to the pool, and the sole depositor claims all of it.
 #[test]
