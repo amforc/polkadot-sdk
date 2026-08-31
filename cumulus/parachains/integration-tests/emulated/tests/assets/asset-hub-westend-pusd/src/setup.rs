@@ -13,8 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared setup helpers. They apply the Shared Assumptions of the
-//! numerical-examples document. Call them inside `AssetHubWestend::execute_with`.
+//! Shared setup for a six-decimal stablecoin, runtime asset markets, and a Root-fed oracle.
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
@@ -25,6 +24,7 @@ use asset_hub_westend_runtime::{
 	},
 	Assets, Balances, MockOracle, Runtime, RuntimeHoldReason, Stability, Timestamp, Vaults,
 };
+use frame_support::assert_err;
 pub(crate) const WND: Balance = 1_000_000_000_000;
 /// The stablecoin has 6 decimals, the same as the runtime's PSM asset.
 pub(crate) const PUSD: Balance = 1_000_000;
@@ -61,7 +61,7 @@ pub(crate) fn admin() -> AccountId {
 	acct(0xAD)
 }
 
-/// Price of one WND in pUSD, as the runtime's planck-to-micro-pUSD rate.
+/// Returns a pUSD/WND price as pUSD base units per WND planck.
 pub(crate) fn dot_price(pusd_num: u128, pusd_den: u128) -> FixedU128 {
 	FixedU128::from_rational(pusd_num * PUSD, pusd_den * WND)
 }
@@ -74,8 +74,7 @@ pub(crate) fn feed_price_for(collateral_id: VaultsCollateralId, price: FixedU128
 	assert_ok!(MockOracle::set_price(RuntimeOrigin::root(), collateral_id, price));
 }
 
-/// Branch settings the examples vary. All other settings follow the Shared
-/// Assumptions.
+/// Settings that vary between scenarios. [`branch_config`] supplies the other settings.
 pub(crate) struct BranchSpec {
 	pub mcr: FixedU128,
 	pub icr: FixedU128,
@@ -93,8 +92,7 @@ impl Default for BranchSpec {
 			icr: FixedU128::from_rational(120, 100),
 			scr: FixedU128::from_rational(120, 100),
 			minimum_debt: 50 * PUSD,
-			// Zero keeps the opened debt equal to the drawn amount. Example 16 sets
-			// the period itself.
+			// Zero disables the upfront fee.
 			upfront_fee_period_ms: 0,
 			keeper_flat_compensation_value: 2 * PUSD,
 			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
@@ -102,8 +100,7 @@ impl Default for BranchSpec {
 	}
 }
 
-/// Spec for the liquidation examples. Their vaults sit at CR 120% after the
-/// price halves, so the MCR must be above 120%.
+/// Sets MCR above the scenario vaults' 120% CR.
 pub(crate) fn liquidation_spec() -> BranchSpec {
 	BranchSpec {
 		mcr: FixedU128::from_rational(125, 100),
@@ -113,8 +110,7 @@ pub(crate) fn liquidation_spec() -> BranchSpec {
 	}
 }
 
-/// [`liquidation_spec`] without keeper compensation, for the examples that
-/// omit it.
+/// Disables keeper compensation in [`liquidation_spec`] to keep amounts round.
 pub(crate) fn accounting_spec() -> BranchSpec {
 	BranchSpec {
 		keeper_flat_compensation_value: 0,
@@ -141,7 +137,7 @@ pub(crate) fn create_branch(spec: &BranchSpec) {
 		branch_config(&get_native_id(), spec),
 		registration_config(),
 	));
-	// A billion pUSD is above every example's debt.
+	// This ceiling exceeds all scenario debt.
 	lift_global_ceiling(1_000_000_000 * PUSD);
 }
 
@@ -304,7 +300,7 @@ pub(crate) fn expected_vault_deposit(
 	.expect("vault deposit priced")
 }
 
-/// Mints the owner's vault deposit, so the examples' vault sizes stay round.
+/// Mints the owner's vault deposit to keep vault amounts round.
 pub(crate) fn fund_vault_deposit(collateral_id: &VaultsCollateralId, who: &AccountId) {
 	let (asset, amount) = expected_vault_deposit(collateral_id, who);
 	assert_ok!(<StabilityCollateral as Mutate<AccountId>>::mint_into(asset, who, amount));
@@ -479,7 +475,54 @@ pub(crate) fn pool_state() -> pallet_stability::types::PoolState<Balance> {
 		.state
 }
 
-/// Changes the pool config through governance.
+pub(crate) fn deposit_row_on(
+	collateral_id: &VaultsCollateralId,
+	who: &AccountId,
+) -> pallet_stability::types::Deposit<Balance> {
+	pallet_stability::Deposits::<Runtime>::get((collateral_id, get_pusd_id(), who.clone()))
+		.expect("deposit row exists")
+}
+
+/// Claims realized collateral and checks transfers in the collateral asset pallet.
+pub(crate) fn claim_collateral_out(
+	collateral_id: &VaultsCollateralId,
+	depositor: &AccountId,
+	expected: Balance,
+) {
+	let pool = pool_account_on(collateral_id);
+	let depositor_before = collateral_free(collateral_id, depositor);
+	let pool_before = collateral_free(collateral_id, &pool);
+
+	assert_ok!(Stability::claim_collateral(
+		RuntimeOrigin::signed(depositor.clone()),
+		collateral_id.clone(),
+		get_pusd_id(),
+		None,
+	));
+
+	assert_eq!(collateral_free(collateral_id, depositor) - depositor_before, expected);
+	assert_eq!(pool_before - collateral_free(collateral_id, &pool), expected);
+	// A second claim fails because the row has no claimable collateral or no longer exists.
+	let expected_error = match pallet_stability::Deposits::<Runtime>::get((
+		collateral_id,
+		get_pusd_id(),
+		depositor.clone(),
+	)) {
+		Some(_) => pallet_stability::Error::<Runtime>::NoClaimableCollateral,
+		None => pallet_stability::Error::<Runtime>::DepositNotFound,
+	};
+	assert_err!(
+		Stability::claim_collateral(
+			RuntimeOrigin::signed(depositor.clone()),
+			collateral_id.clone(),
+			get_pusd_id(),
+			None,
+		),
+		expected_error,
+	);
+}
+
+/// Changes the pool configuration through its full-admin `UpdateOrigin`.
 pub(crate) fn mutate_pool_config(
 	tweak: impl FnOnce(&mut pallet_stability::types::StabilityPoolConfig<Balance>),
 ) {
@@ -488,7 +531,7 @@ pub(crate) fn mutate_pool_config(
 		.config;
 	tweak(&mut config);
 	assert_ok!(Stability::set_stability_pool_config(
-		RuntimeOrigin::root(),
+		RuntimeOrigin::signed(admin()),
 		get_native_id(),
 		get_pusd_id(),
 		config,

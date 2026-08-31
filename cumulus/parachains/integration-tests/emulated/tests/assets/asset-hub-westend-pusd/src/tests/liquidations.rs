@@ -20,7 +20,7 @@ use pallet_vaults::JitTerms;
 /// Seizure caps at debt × 1.05 in value. The keeper takes 2 pUSD flat plus 0.1%
 /// of the seizure. The rest goes to the pool.
 #[test]
-fn example_07_liquidation_fully_covered_by_active_stability_pool() {
+fn liquidation_fully_covered_by_the_active_stability_pool() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
 		create_branch(&liquidation_spec());
@@ -68,10 +68,9 @@ fn example_07_liquidation_fully_covered_by_active_stability_pool() {
 
 /// The 1,000 pUSD debt splits into 500 active, 200 JIT, 100 pending, and 200
 /// redistributed. Seizure weighs offsets at 1.05 and redistribution at 1.10.
-/// Collateral follows the same weights. Keeper compensation is zero, because
-/// the example omits it.
+/// Collateral uses the same weights. Zero keeper compensation keeps the split round.
 #[test]
-fn example_08_liquidation_active_jit_pending_and_redistribution() {
+fn liquidation_splits_across_active_jit_pending_and_redistribution() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
 		create_branch(&BranchSpec {
@@ -91,9 +90,8 @@ fn example_08_liquidation_active_jit_pending_and_redistribution() {
 		let pending_depositor = acct(5);
 		sp_deposit_pending(&pending_depositor, 100 * PUSD);
 
-		// The redistribution recipient. Its rate must be non-zero, because
-		// redistribution prices debt at the recipient-average rate. It opens
-		// after the time jump, so it accrues no interest.
+		// Redistribution pricing requires a nonzero recipient rate. The recipient opens
+		// after the entry delay, which prevents interest before liquidation.
 		let recipient_owner = acct(2);
 		open_vault(&recipient_owner, 10_000 * WND, 1_000 * PUSD, FixedU128::from_rational(1, 100));
 

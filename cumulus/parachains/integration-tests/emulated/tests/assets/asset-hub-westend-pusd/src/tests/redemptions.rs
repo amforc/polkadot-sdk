@@ -48,11 +48,8 @@ fn vault_status(owner: &AccountId) -> Option<VaultStatus> {
 /// 1,000 pUSD against 100,000 pUSD of market debt raises the 1.5% dynamic fee by
 /// 1,000 / 100,000 / 2 = 0.5%. The redemption pays the 1.75% mean of the 1.5%
 /// arrival and 2.0% terminal fees, plus the 0.5% base fee.
-///
-/// The document applies the terminal rate and gets 25 pUSD. The chain charges
-/// the mean, so the fee is 22.5 pUSD.
 #[test]
-fn example_01_ordinary_redemption_with_dynamic_fee_update_and_fee() {
+fn ordinary_redemption_updates_the_dynamic_fee_and_charges_the_mean() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(2, 1));
 		create_branch(&BranchSpec::default());
@@ -94,11 +91,9 @@ fn example_01_ordinary_redemption_with_dynamic_fee_update_and_fee() {
 	});
 }
 
-/// §2's setup: a 3,000 pUSD vault at the redeemable head of a 10,000 pUSD
-/// market, redeemed down to 200 pUSD, below the 2,000 pUSD branch minimum.
+/// Creates a 200 pUSD dormant continuation target before an ordinary rate-index vault.
 ///
-/// Returns the parked continuation target and the ordinary vault behind it in
-/// the rate index.
+/// Returns the continuation target and the rate-index vault.
 fn park_dormant_continuation() -> (AccountId, AccountId) {
 	feed_price(dot_price(2, 1));
 	create_branch(&BranchSpec { minimum_debt: 2_000 * PUSD, ..Default::default() });
@@ -128,10 +123,9 @@ fn park_dormant_continuation() -> (AccountId, AccountId) {
 
 /// 200 pUSD of residual debt is below the 2,000 pUSD branch minimum. The vault
 /// leaves the rate index as Dormant instead of closing, and the branch records
-/// it as the continuation target. The document calls this
-/// `last_dormant_vault_owner`.
+/// it as the continuation target.
 #[test]
-fn example_02_ordinary_redemption_creates_dormant_continuation_vault() {
+fn ordinary_redemption_parks_a_dormant_continuation_vault() {
 	AssetHubWestend::execute_with(|| {
 		let (target_owner, _) = park_dormant_continuation();
 
@@ -140,19 +134,15 @@ fn example_02_ordinary_redemption_creates_dormant_continuation_vault() {
 		assert_eq!(target_vault.debt.total(), 200 * PUSD);
 		assert_eq!(target_vault.collateral, 600 * WND);
 		assert_eq!(vault_status(&target_owner), Some(VaultStatus::Dormant));
-		// last_dormant_vault_owner = Vault owner.
 		assert_eq!(branch_state().dormant_redemption_target, Some(target_owner));
 	});
 }
 
-/// §2's redemption order, tiers two and three. With the FinalRecovery FIFO
-/// empty, the continuation target is served before the rate index. The rate
-/// index receives only what the continuation cannot cover.
+/// Serves the continuation target before the rate index when `FinalRecovery` is empty.
 ///
-/// The continuation holds 200 pUSD and is out of the rate index. Without tier
-/// two, the whole 288 pUSD would land on the filler.
+/// The continuation takes 200 pUSD, and the rate index takes the other 88 pUSD.
 #[test]
-fn example_02_continuation_precedes_the_ordinary_rate_index() {
+fn continuation_precedes_the_ordinary_rate_index() {
 	AssetHubWestend::execute_with(|| {
 		let (target_owner, filler_owner) = park_dormant_continuation();
 
@@ -259,11 +249,9 @@ fn park_continuation_behind_final_recovery_head() -> (AccountId, AccountId) {
 	(continuation_owner, head_owner)
 }
 
-/// §2's redemption order, tiers one and two. The FinalRecovery FIFO head is
-/// served before the continuation target. The continuation is served only after
-/// the FIFO is empty.
+/// Serves the `FinalRecovery` FIFO before the continuation target.
 #[test]
-fn example_02_final_recovery_head_precedes_the_continuation() {
+fn final_recovery_head_precedes_the_continuation() {
 	AssetHubWestend::execute_with(|| {
 		let (continuation_owner, head_owner) = park_continuation_behind_final_recovery_head();
 
