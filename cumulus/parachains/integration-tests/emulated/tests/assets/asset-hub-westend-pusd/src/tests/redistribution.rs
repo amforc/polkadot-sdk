@@ -49,7 +49,7 @@ fn poke(owner: &AccountId) {
 /// recipients with their pending gains: effective stakes 6,330 / 4,220 / 5,000.
 /// No poke happens between the two.
 #[test]
-fn example_13_redistribution_with_vault_joining_between_events() {
+fn redistribution_with_a_vault_joining_between_events() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
 		create_branch(&accounting_spec());
@@ -95,31 +95,32 @@ fn example_13_redistribution_with_vault_joining_between_events() {
 		let vault_b = vault(&owner_b);
 		assert_eq!(vault_b.debt.total(), 2_822 * PUSD);
 		assert_eq!(vault_b.collateral, 4_452 * WND + 100_000_000_000);
-		// C: 2,500 + 500; 5,000 + 275, each one unit short. The per-stake indexes
-		// floor per recipient, and the remainder stays in branch accounting.
+		// C receives one unit less of debt and collateral because its stake and shares round down.
 		let vault_c = vault(&owner_c);
 		assert_eq!(vault_c.debt.total(), 3_000 * PUSD - 1);
 		assert_eq!(vault_c.collateral, 5_275 * WND - 1);
+
+		// The units remain in pending redistribution custody and totals until a sole
+		// stake bearer sweeps them.
+		let state = branch_state();
+		assert_eq!(state.debt.pending_redistribution_principal, 1);
+		assert_eq!(state.pending_redistribution_collateral, 1);
+		assert_eq!(
+			state.debt.outstanding(),
+			vault_a.debt.total() + vault_b.debt.total() + vault_c.debt.total() + 1,
+		);
+		assert_eq!(
+			state.total_collateral,
+			vault_a.collateral + vault_b.collateral + vault_c.collateral + 1,
+		);
 	});
 }
 
-/// Between the redistribution and a touch, the branch accrues the pending debt
-/// at the recipient-average rate (6,000 × 4% + 4,000 × 10%) / 10,000 = 6.4%,
-/// posted as 1,000 × 6.4% = 64 of rate-weighted principal. A touch moves the
-/// vault's share from the pending weight to its own principal at its own rate.
-/// This is the document's actual-rate contribution: A 600 × 4% = 24,
-/// B 400 × 10% = 40.
+/// Adds 1,000 × 6.4% = 64 pUSD of pending weight at the recipient-average rate.
 ///
-/// The chain splits the pending weight by rate-weighted stake, so each share
-/// equals its actual-rate contribution from the start and the aggregate stays
-/// at 64. The document reaches the same result through average-rate shares of
-/// 38.4 / 25.6, which the touch corrects by −14.4 / +14.4. The chain stores no
-/// such intermediate.
-///
-/// `touch_order` picks which recipient reconciles first. Each share depends only
-/// on that vault's stake and rate, so both orders must give the same rows and
-/// totals.
-fn run_example_15(touch_order: [usize; 2]) {
+/// A touch moves A's 600 × 4% = 24 or B's 400 × 10% = 40 to its principal weight.
+/// The total remains 64 pUSD and does not depend on `touch_order`.
+fn run_weight_per_stake_reconciliation(touch_order: [usize; 2]) {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
 		create_branch(&accounting_spec());
@@ -195,12 +196,12 @@ fn run_example_15(touch_order: [usize; 2]) {
 }
 
 #[test]
-fn example_15_weight_per_stake_reconciliation() {
-	run_example_15([0, 1]);
+fn weight_per_stake_reconciliation() {
+	run_weight_per_stake_reconciliation([0, 1]);
 }
 
 /// The result must not depend on which recipient touches first.
 #[test]
-fn example_15_reconciliation_is_touch_order_independent() {
-	run_example_15([1, 0]);
+fn reconciliation_is_touch_order_independent() {
+	run_weight_per_stake_reconciliation([1, 0]);
 }
