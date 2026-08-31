@@ -527,10 +527,11 @@ mod benchmarks {
 			Position::endpoints_only(),
 		)?;
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
-		// `close_vault` requires zero debt. Clearing debt (via a full repayment or,
-		// as here, a full redemption) leaves a Dormant husk — zero debt, row
-		// intact, collateral still held, out of the rate index — which is the
-		// state this extrinsic acts on.
+		// `close_vault` requires zero debt. Clearing debt while collateral remains
+		// (via a full repayment or, as here, a redemption that pays out no
+		// collateral) leaves a Dormant husk — zero debt, row intact, collateral
+		// still held, out of the rate index — which is the state this extrinsic
+		// acts on.
 		let recipient: T::AccountId = whitelisted_caller();
 		let snapshot = <Pallet<T> as VaultInterface>::project_redemption_snapshot(
 			&asset,

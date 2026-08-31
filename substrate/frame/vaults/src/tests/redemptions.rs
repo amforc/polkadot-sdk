@@ -143,8 +143,8 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 			projected.debt + projected.terminal_interest_charge,
 			projected.collateral,
 		));
-		let v_post = vault(DOT, PUSD, 1);
-		assert_eq!(v_post.debt.total(), 0);
+		// The settlement drained the position completely, so the vault closed.
+		assert!(!vault_exists(DOT, PUSD, 1));
 		assert_eq!(held(DOT, 1), held_before - projected.collateral);
 	});
 }
