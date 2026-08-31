@@ -1515,11 +1515,19 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		let redeemer_before_1 = Assets::balance(PUSD, 3);
 		let recipient_before_1 = collateral_balance(DOT, 4);
 
-		// First transaction settles only the FIFO head (vault 1), leaving it a
-		// debt-free Dormant husk out of the FIFO.
+		// First transaction settles only the FIFO head (vault 1). The full payout leaves
+		// neither debt nor collateral, so the vault closes and its row is removed.
 		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
-		assert_eq!(vault_debt(DOT, PUSD, 1), 0, "head settled");
-		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		assert_eq!(Vaults::vault_status(DOT, PUSD, 1), None, "head settled and closed");
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert_eq!(held(DOT, 1), 0);
+		System::assert_has_event(RuntimeEvent::Vaults(pallet_vaults::Event::VaultClosed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 1,
+			collateral: 0,
+		}));
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "head 1 drained the fund");
 		// Head-only: vault 2 is untouched and becomes the new FIFO head.
@@ -1541,8 +1549,10 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		// pUSD holders absorb the shortfall.
 		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
 		// With the fund empty there is no cover to merge, so the redeemer alone
-		// cancels the debt — the vault ends in the same husk state as vault 1.
+		// cancels the debt. The double-floored payout leaves collateral behind, so this
+		// vault stays a Dormant husk instead of closing like vault 1.
 		assert_eq!(vault_debt(DOT, PUSD, 2), 0, "second head fully settled");
+		assert!(Vaults::vault_status(DOT, PUSD, 2).expect("vault 2").is_dormant());
 		assert!(Vaults::final_recovery_queue(DOT, PUSD, 10).is_empty(), "FIFO drained");
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "no fund left to burn");
@@ -2640,7 +2650,17 @@ fn final_recovery_redemption_below_par_settles_with_insurance_cover() {
 		assert_ok!(redeem(3, DOT, PUSD, 6_000 * UNIT, 0, 4, 0));
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 4_000 * UNIT);
 		assert_eq!(if_before - Assets::balance(PUSD, insurance_account(PUSD)), 1_000 * UNIT);
-		assert_eq!(vault_debt(DOT, PUSD, 1), 0, "vault fully settled");
-		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		// The settlement leaves neither debt nor collateral, so the vault closes and the
+		// branch empties.
+		assert_eq!(Vaults::vault_status(DOT, PUSD, 1), None, "vault fully settled and closed");
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert_eq!(held(DOT, 1), 0);
+		assert_eq!(
+			pallet_vaults::Branches::<Test>::get(DOT, PUSD)
+				.expect("branch")
+				.state
+				.vault_count,
+			0
+		);
 	});
 }
