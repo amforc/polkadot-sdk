@@ -16,6 +16,14 @@ use frame::{
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
 use pusd_primitives::{collateralization_ratio, RedemptionStepSnapshot};
 
+/// Whether a close runs the collateralization mode gate before persisting.
+enum CloseCommit {
+	/// Enforce the mode rules, as borrower operations must.
+	Checked,
+	/// Skip the gate, for callers that are already exempt from it.
+	Exempt,
+}
+
 impl<T: Config> VaultOp<T> {
 	/// Attributes terminal interest and returns validated liquidation inputs.
 	pub(crate) fn prepare_liquidation(
@@ -205,7 +213,20 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	/// Closes a debt-free vault and commits its collateral release.
-	pub(crate) fn finish_close(mut self, recipient: &T::AccountId) -> DispatchResult {
+	pub(crate) fn finish_close(self, recipient: &T::AccountId) -> DispatchResult {
+		self.close(recipient, CloseCommit::Checked)
+	}
+
+	/// [`Self::finish_close`] without the mode gate, for callers that are already exempt.
+	///
+	/// A redemption settlement answers to no collateralization gate and carries no oracle
+	/// price. It closes only a vault with neither debt nor collateral, so the branch ratio
+	/// cannot move.
+	pub(crate) fn finish_close_exempt(self, recipient: &T::AccountId) -> DispatchResult {
+		self.close(recipient, CloseCommit::Exempt)
+	}
+
+	fn close(mut self, recipient: &T::AccountId, commit: CloseCommit) -> DispatchResult {
 		ensure!(self.vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 		// A debt-free vault must not retain fractional interest.
 		ensure!(self.vault.interest_remainder == 0, DispatchError::Corruption);
@@ -253,7 +274,7 @@ impl<T: Config> VaultOp<T> {
 			collateral,
 		});
 		// An empty branch has no collateralization ratio to protect.
-		if !branch_empties {
+		if matches!(commit, CloseCommit::Checked) && !branch_empties {
 			self.ensure_checked_commit()?;
 		}
 		self.persist(true)

@@ -216,6 +216,12 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			collateral_to_recipient,
 			vault_annual_rate: op.vault().annual_rate,
 		});
+		// A settlement that leaves neither debt nor collateral has nothing to keep the row
+		// for: the vault closes and its deposit returns to the owner. Residual collateral
+		// keeps a Dormant husk that only the owner may close.
+		if op.vault().debt.total().is_zero() && op.vault().collateral.is_zero() {
+			return op.finish_close_exempt(owner);
+		}
 		op.commit_exempt()
 	}
 

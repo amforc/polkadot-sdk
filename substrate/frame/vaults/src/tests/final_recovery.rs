@@ -217,8 +217,8 @@ fn frozen_branch_rejects_exit_final_recovery() {
 	});
 }
 
-// Final recovery is the only status that suspends redistribution eligibility. Full settlement
-// returns the residual collateral to the recipient set as a Dormant vault.
+// Final recovery is the only status that suspends redistribution eligibility. A settlement
+// that leaves residual collateral keeps the owner's claim on it as a Dormant vault.
 #[test]
 fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 	build_and_execute(|| {
@@ -491,5 +491,40 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 		let p2 = <LinkedList as SortedListInterface<VaultList, AccountId>>::priority(&list, &2)
 			.expect("member");
 		assert!(p1 > p2, "re-entered vault must carry a strictly greater priority");
+	});
+}
+
+// A settlement that pays out the whole collateral against the whole debt leaves an empty row.
+// The pallet closes it: the row is removed, the deposit returns to the owner, and the branch
+// forgets the vault. The close skips the mode gate, so it works in the stressed branch a
+// recovery settlement usually runs in.
+#[test]
+fn full_settlement_of_a_final_recovery_vault_closes_it() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		assert!(vault_deposit_held(DOT, 1) > 0);
+
+		let full =
+			<crate::Pallet<Test> as VaultInterface>::project_redemption_snapshot(&DOT, &PUSD, &1)
+				.expect("snapshot")
+				.debt;
+		let all_collateral = vault(DOT, PUSD, 1).collateral;
+		assert_ok!(redeem_step(DOT, PUSD, 1, 7, full, all_collateral));
+
+		assert!(!vault_exists(DOT, PUSD, 1));
+		assert_eq!(held(DOT, 1), 0);
+		assert_eq!(vault_deposit_held(DOT, 1), 0);
+		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		let state = branch_state(DOT, PUSD).expect("state");
+		assert_eq!(state.vault_count, 0);
+		assert_eq!(state.dormant_redemption_target, None);
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultClosed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 1,
+			collateral: 0,
+		}));
 	});
 }
