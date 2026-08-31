@@ -198,16 +198,10 @@ fn active_pool_recovery_offset_and_realization() {
 		assert_eq!(parked.debt.total(), 3_000 * PUSD);
 		assert_eq!(parked.collateral, 1_900 * WND);
 
-		// The 1,000 pUSD depositor realizes 800 pUSD and 1,000 × 0.11 = 110 WND.
-		assert_ok!(Stability::settle_deposit(
-			RuntimeOrigin::signed(small_depositor.clone()),
-			small_depositor.clone(),
-			get_native_id(),
-			get_pusd_id(),
-		));
-		let row = deposit_row(&small_depositor);
-		assert_eq!(row.active_deposit, 800 * PUSD);
-		assert_eq!(row.claimable_collateral, 110 * WND);
+		// The claim settles the 1,000 pUSD depositor's row: 800 pUSD stay active and
+		// 1,000 × 0.11 = 110 WND pay out.
+		claim_collateral_out(&get_native_id(), &small_depositor, 110 * WND);
+		assert_eq!(deposit_row(&small_depositor).active_deposit, 800 * PUSD);
 	});
 }
 
@@ -333,12 +327,17 @@ fn offset_yield_and_depositor_realization() {
 		));
 		assert_eq!(active_sums().g_yield, FixedU128::from_rational(4, 100));
 
-		// The 1,000 pUSD depositor realizes 800 pUSD, 120 WND, and 40 pUSD of yield.
-		settle_row(&small_depositor);
-		let row = deposit_row(&small_depositor);
-		assert_eq!(row.active_deposit, 800 * PUSD);
-		assert_eq!(row.claimable_collateral, 120 * WND);
-		assert_eq!(row.claimable_yield, 40 * PUSD);
+		// The claims settle the 1,000 pUSD depositor's row: 800 pUSD stay active,
+		// 120 WND and 40 pUSD of yield pay out.
+		claim_collateral_out(&get_native_id(), &small_depositor, 120 * WND);
+		assert_ok!(Stability::claim_yield(
+			RuntimeOrigin::signed(small_depositor.clone()),
+			get_native_id(),
+			get_pusd_id(),
+			None,
+		));
+		assert_eq!(pusd_balance(&small_depositor), 40 * PUSD);
+		assert_eq!(deposit_row(&small_depositor).active_deposit, 800 * PUSD);
 	});
 }
 
@@ -414,20 +413,8 @@ fn multiple_depositor_cohorts() {
 			FixedU128::from_inner(350_000_000_000_000_000_000_000),
 		);
 
-		// Cohort realizations: (compounded, collateral, yield).
-		for (who, compounded, collateral, yield_gain) in [
-			(&depositor_1, 300 * PUSD, 350 * WND, 160 * PUSD),
-			(&depositor_2, 150 * PUSD, 175 * WND, 80 * PUSD),
-			(&depositor_3, 450 * PUSD, 225 * WND, 90 * PUSD),
-		] {
-			settle_row(who);
-			let row = deposit_row(who);
-			assert_eq!(row.active_deposit, compounded);
-			assert_eq!(row.claimable_collateral, collateral);
-			assert_eq!(row.claimable_yield, yield_gain);
-		}
-
-		// The pool holds 900 pUSD of deposits, 330 pUSD of yield, and 750 WND of gains.
+		// The pool holds 900 pUSD of deposits, 330 pUSD of yield, and 750 WND of gains
+		// before any row settles: offsets and yield credit the totals eagerly.
 		let state = pool_state();
 		assert_eq!(state.total_active_deposits, 900 * PUSD);
 		assert_eq!(state.total_pending_deposits, 0);
@@ -435,6 +422,30 @@ fn multiple_depositor_cohorts() {
 		assert_eq!(state.total_yield_unclaimed, 330 * PUSD);
 		assert_eq!(native_balance(&pool_account()), 750 * WND);
 		assert_eq!(pusd_balance(&pool_account()), 1_230 * PUSD);
+
+		// Cohort realizations: (compounded, collateral, yield). The claims settle each
+		// row and pay its gains out, draining the pool's collateral and yield exactly.
+		for (who, compounded, collateral, yield_gain) in [
+			(&depositor_1, 300 * PUSD, 350 * WND, 160 * PUSD),
+			(&depositor_2, 150 * PUSD, 175 * WND, 80 * PUSD),
+			(&depositor_3, 450 * PUSD, 225 * WND, 90 * PUSD),
+		] {
+			claim_collateral_out(&get_native_id(), who, collateral);
+			let pusd_before = pusd_balance(who);
+			assert_ok!(Stability::claim_yield(
+				RuntimeOrigin::signed(who.clone()),
+				get_native_id(),
+				get_pusd_id(),
+				None,
+			));
+			assert_eq!(pusd_balance(who) - pusd_before, yield_gain);
+			assert_eq!(deposit_row(who).active_deposit, compounded);
+		}
+		let state = pool_state();
+		assert_eq!(state.total_collateral_gains_unclaimed, 0);
+		assert_eq!(state.total_yield_unclaimed, 0);
+		assert_eq!(native_balance(&pool_account()), 0);
+		assert_eq!(pusd_balance(&pool_account()), 900 * PUSD);
 	});
 }
 
@@ -548,17 +559,17 @@ fn full_depletion_and_scale_crossing_then_realization() {
 		assert_eq!(sums_at(2, 0).s_collateral, FixedU128::zero());
 		assert_eq!(sums_at(2, 0).g_yield, FixedU128::zero());
 
-		// Across the epoch boundary, 600e6 × 600 planck / P(1e-3) = 360 WND.
-		settle_row(&watched_depositor);
-		let row = deposit_row(&watched_depositor);
-		assert_eq!(row.active_deposit, 0);
-		assert_eq!(row.claimable_collateral, 360 * WND);
-		// The other depositor receives 900e6 × 600 planck / P(1e-3) = 540 WND.
-		settle_row(&other_depositor);
-		assert_eq!(deposit_row(&other_depositor).claimable_collateral, 540 * WND);
-		// Both claims drain all offset collateral.
+		// The claims settle the rows across the epoch boundary: nothing compounds, and
+		// each gain is deposit × 600 planck / P(1e-3) — 360 WND and 540 WND. Both rows
+		// empty and prune, draining all offset collateral.
 		claim_collateral_out(&get_native_id(), &watched_depositor, 360 * WND);
 		claim_collateral_out(&get_native_id(), &other_depositor, 540 * WND);
+		assert!(pallet_stability::Deposits::<Runtime>::get((
+			get_native_id(),
+			get_pusd_id(),
+			watched_depositor.clone(),
+		))
+		.is_none());
 		assert_eq!(pool_state().total_collateral_gains_unclaimed, 0);
 		assert_eq!(native_balance(&pool_account()), 0);
 	});
