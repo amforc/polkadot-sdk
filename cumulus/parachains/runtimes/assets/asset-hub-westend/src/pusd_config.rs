@@ -283,7 +283,7 @@ impl pallet_vaults::Config for Runtime {
 	type YieldHook = Stability;
 	type OnBranchLifecycle = (Redemptions, Stability);
 	type StabilityPool = Stability;
-	type TimeProvider = Timestamp;
+	type TimeProvider = RelayTimestamp;
 	type CreateOrigin = VaultsCreateOrigin;
 	type BranchConsideration = HoldConsideration<
 		AccountId,
@@ -337,7 +337,7 @@ impl pallet_redemptions::Config for Runtime {
 	type Vaults = Vaults;
 	type InsuranceFundAccount = StableInsuranceAccount;
 	type FeeHandler = ResolveAssetTo<governance::TreasuryAccount, Assets>;
-	type TimeProvider = Timestamp;
+	type TimeProvider = RelayTimestamp;
 	type UpdateOrigin = VaultsCreateOrigin;
 	type MaxRedemptionSteps = RedemptionsMaxSteps;
 	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
@@ -352,7 +352,7 @@ parameter_types! {
 impl pallet_stability::Config for Runtime {
 	type StableAssets = Assets;
 	type CollateralAssets = StabilityCollateral;
-	type TimeProvider = Timestamp;
+	type TimeProvider = RelayTimestamp;
 	type BranchModes = Vaults;
 	type RecoveryOffsets = Redemptions;
 	type StableDustHandler = ResolveAssetTo<governance::TreasuryAccount, Assets>;
