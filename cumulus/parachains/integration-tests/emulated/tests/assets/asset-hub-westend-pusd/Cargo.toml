@@ -20,6 +20,7 @@ pallet-assets = { workspace = true, default-features = true }
 pallet-aura = { workspace = true, default-features = true }
 pallet-balances = { workspace = true, default-features = true }
 pallet-linked-list = { workspace = true, default-features = true }
+pallet-psm = { workspace = true, default-features = true }
 pallet-redemptions = { workspace = true, default-features = true }
 pallet-stability = { workspace = true, default-features = true }
 pallet-timestamp = { workspace = true, default-features = true }

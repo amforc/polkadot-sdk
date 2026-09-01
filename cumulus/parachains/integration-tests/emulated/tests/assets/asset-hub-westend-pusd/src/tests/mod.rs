@@ -15,6 +15,7 @@
 
 mod liquidations;
 mod multi_collateral;
+mod psm;
 mod recovery;
 mod redemptions;
 mod redistribution;
