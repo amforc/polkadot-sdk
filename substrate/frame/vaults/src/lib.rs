@@ -219,8 +219,11 @@ pub mod pallet {
 		#[pallet::constant]
 		type BranchConfigBounds: Get<BranchConfigBounds>;
 
-		/// Origin allowed to manage global limits and override market administrators.
+		/// Origin allowed to override market administrators.
 		type ForceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+
+		/// Effective stablecoin-wide limit for new borrowing, in stable units.
+		type GlobalDebtCeiling: Convert<StableIdOf<Self>, BalanceOf<Self>>;
 
 		/// Sorted lists used for redemption order and final recovery.
 		type VaultLists: SortedListInterface<
@@ -362,6 +365,18 @@ pub mod pallet {
 		) -> Result<OriginFor<T>, ()> {
 			let branch = Branches::<T>::get(collateral_id, stable_id).ok_or(())?;
 			Ok(frame_system::RawOrigin::Signed(branch.admins.full_admin).into())
+		}
+	}
+
+	/// Ceiling provider backed by the pallet's own [`GlobalDebtCeilings`] storage.
+	///
+	/// The default choice for [`Config::GlobalDebtCeiling`]: the stored value is the
+	/// effective limit, exactly as [`Pallet::set_global_debt_ceiling`] wrote it.
+	pub struct StoredCeiling<T>(core::marker::PhantomData<T>);
+
+	impl<T: Config> Convert<StableIdOf<T>, BalanceOf<T>> for StoredCeiling<T> {
+		fn convert(stable_id: StableIdOf<T>) -> BalanceOf<T> {
+			GlobalDebtCeilings::<T>::get(&stable_id)
 		}
 	}
 
@@ -1359,7 +1374,9 @@ pub mod pallet {
 		///
 		/// ## Dispatch Origin
 		///
-		/// Requires [`Config::ForceOrigin`].
+		/// Requires [`Config::CreateOrigin`] for `stable_id`: the authority that can open
+		/// markets for a stablecoin also bounds its total issuance. The depositor the origin
+		/// resolves has no meaning here and is discarded.
 		///
 		/// The limit is measured in the stable asset's units and spans all of its collateral
 		/// markets. A limit of zero blocks new debt.
@@ -1370,7 +1387,7 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			ceiling: BalanceOf<T>,
 		) -> DispatchResult {
-			T::ForceOrigin::ensure_origin(origin)?;
+			let _ = T::CreateOrigin::ensure_origin(origin, &stable_id)?;
 			Self::do_set_global_debt_ceiling(stable_id, ceiling);
 			Ok(())
 		}
