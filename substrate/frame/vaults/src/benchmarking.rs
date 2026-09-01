@@ -21,7 +21,7 @@ use frame::{
 			Balanced as FungiblesBalanced, Inspect as FungiblesInspect, Mutate as FungiblesMutate,
 		},
 		tokens::Precision,
-		Consideration as _, EnsureOrigin, EnsureOriginWithArg, SaturatedConversion, Time, Zero,
+		Consideration as _, EnsureOriginWithArg, SaturatedConversion, Time, Zero,
 	},
 };
 use frame_system::RawOrigin;
@@ -109,11 +109,6 @@ fn full_admin_origin<T: Config>() -> T::RuntimeOrigin {
 	RawOrigin::Signed(branch_admin_accounts::<T>().0).into()
 }
 
-fn force_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {
-	T::ForceOrigin::try_successful_origin()
-		.map_err(|_| BenchmarkError::Stop("force origin unavailable"))
-}
-
 fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkError> {
 	let asset = T::BenchmarkHelper::collateral_asset_id();
 	// `create_branch` validates the oracle price, so set it first.
@@ -135,7 +130,7 @@ fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkEr
 		first_market_lifecycle_config::<T>(),
 	)?;
 	Pallet::<T>::set_global_debt_ceiling(
-		force_origin::<T>()?,
+		create_origin::<T>()?,
 		stable::<T>(),
 		balance::<T>(GLOBAL_CEILING),
 	)?;
@@ -768,7 +763,7 @@ mod benchmarks {
 	#[benchmark]
 	fn set_global_debt_ceiling() -> Result<(), BenchmarkError> {
 		let stable_id = stable::<T>();
-		let origin = force_origin::<T>()?;
+		let origin = create_origin::<T>()?;
 		let ceiling = balance::<T>(GLOBAL_CEILING);
 
 		#[extrinsic_call]

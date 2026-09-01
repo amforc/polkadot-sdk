@@ -262,3 +262,22 @@ fn zero_ceiling_reset_leaves_no_record() {
 		assert_eq!(crate::pallet::StablecoinDebt::<Test>::get(PUSD).outstanding, 501);
 	});
 }
+
+// The ceiling shares `CreateOrigin` with market registration: the stablecoin's
+// owner manages its own limit, every other signer stays locked out.
+#[test]
+fn asset_owner_sets_the_global_ceiling() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(
+			RuntimeOrigin::signed(PUSD_OWNER),
+			PUSD,
+			2_000
+		));
+		assert_ok!(open(1, DOT, PUSD, 100_000, 1_500, rate_pct(5, 100)));
+		assert_noop!(
+			Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::signed(2), PUSD, Balance::MAX),
+			DispatchError::BadOrigin
+		);
+	});
+}

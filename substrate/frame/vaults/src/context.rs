@@ -7,8 +7,8 @@ mod lifecycle;
 
 use crate::{
 	pallet::{
-		BalanceOf, CollateralIdOf, Config, Error, Event, GlobalDebtCeilings, HoldReason, Millis,
-		Pallet, StableIdOf, Vaults,
+		BalanceOf, CollateralIdOf, Config, Error, Event, HoldReason, Millis, Pallet, StableIdOf,
+		Vaults,
 	},
 	types::{
 		BranchConfig, BranchState, DebtBreakdown, DebtCollateral, Vault, VaultListId, VaultRecord,
@@ -20,7 +20,7 @@ use frame::{
 	traits::{
 		fungibles::MutateHold as FungiblesMutateHold,
 		tokens::{Fortitude, Precision, Restriction},
-		Consideration, DefensiveOption, Time,
+		Consideration, Convert, DefensiveOption, Time,
 	},
 };
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
@@ -121,7 +121,7 @@ impl<T: Config> Context<T> {
 			self.now,
 		)?;
 		ensure!(
-			projected_total <= GlobalDebtCeilings::<T>::get(&self.stable_id),
+			projected_total <= T::GlobalDebtCeiling::convert(self.stable_id.clone()),
 			Error::<T>::GlobalDebtCeilingExceeded
 		);
 		Ok(())
