@@ -3398,6 +3398,7 @@ impl pallet_vaults::Config for Runtime {
 	>;
 	type BranchConfigBounds = VaultsBranchConfigBounds;
 	type ForceOrigin = EnsureRoot<AccountId>;
+	type GlobalDebtCeiling = pallet_vaults::StoredCeiling<Runtime>;
 	type PalletId = VaultsPalletId;
 	type IdleMaxRefreshWeight = VaultsIdleMaxRefreshWeight;
 	type VaultLists = LinkedList;
