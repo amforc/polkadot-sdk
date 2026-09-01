@@ -1,6 +1,5 @@
 //! `pallet-vaults` test suite.
 
-mod asset_roles;
 mod basic_ops;
 mod borrower_operations;
 mod critical_threshold;
@@ -19,6 +18,7 @@ mod realistic_scale;
 mod redemptions;
 mod redistribution_accounting;
 mod risk_controls;
+mod stablecoin_markets;
 mod vault_deposit;
 
 use crate::mock::{AccountId, AssetId, FixedU128, StableId, Test};
