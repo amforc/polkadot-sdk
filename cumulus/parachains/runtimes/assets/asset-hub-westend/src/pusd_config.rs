@@ -216,6 +216,29 @@ impl Convert<VaultsStableId, AccountId> for VaultsFeeAccount {
 	}
 }
 
+/// Vault borrowing yields to live PSM debt: the stored ceiling is the
+/// stablecoin's total supply cap, and vaults mint only into what its PSM
+/// instance has not already issued. PSM headroom flows back to vaults as PSM
+/// debt is redeemed.
+///
+/// A stablecoin without a PSM instance keeps its stored ceiling unmodified.
+/// PSM instances are keyed by the internal asset's location, the same bridge
+/// [`StableInsuranceAccount`] uses; the converters must stay aligned or a
+/// coin's PSM debt would silently read as zero. The debt walk is bounded by
+/// the PSM's `MaxExternals` approved assets.
+pub struct VaultsGlobalDebtCeiling;
+impl Convert<VaultsStableId, Balance> for VaultsGlobalDebtCeiling {
+	fn convert(stable_id: VaultsStableId) -> Balance {
+		let psm_debt = TrustBackedAssetLocation::convert_back(&stable_id)
+			.map(|internal_asset| {
+				pallet_psm::PsmDebt::<Runtime>::iter_prefix_values(internal_asset)
+					.fold(0, |acc: Balance, debt| acc.saturating_add(debt))
+			})
+			.unwrap_or(0);
+		pallet_vaults::StoredCeiling::<Runtime>::convert(stable_id).saturating_sub(psm_debt)
+	}
+}
+
 /// Settles a vault deposit in the collateral when it is native or sufficient, else in WND.
 ///
 /// A pool quote is deliberately not used as a fallback: it is an instantaneous spot price that
@@ -271,6 +294,7 @@ impl pallet_vaults::Config for Runtime {
 	type VaultConsideration = VaultsVaultConsideration;
 	type BranchConfigBounds = VaultsBranchConfigBounds;
 	type ForceOrigin = EnsureRoot<AccountId>;
+	type GlobalDebtCeiling = VaultsGlobalDebtCeiling;
 	type PalletId = VaultsPalletId;
 	type IdleMaxRefreshWeight = VaultsIdleMaxRefreshWeight;
 	type VaultLists = LinkedList;
