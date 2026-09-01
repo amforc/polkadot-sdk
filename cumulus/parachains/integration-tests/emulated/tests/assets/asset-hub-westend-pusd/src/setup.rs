@@ -22,7 +22,8 @@ use asset_hub_westend_runtime::{
 		StabilityCollateral, StableInsuranceAccount, VaultsCollateral, VaultsDepositPolicy,
 		VaultsNativeCollateralId,
 	},
-	Assets, Balances, MockOracle, Runtime, RuntimeHoldReason, Stability, Timestamp, Vaults,
+	Assets, AuraExt, Balances, MockOracle, Runtime, RuntimeHoldReason, Stability, Timestamp,
+	Vaults,
 };
 use frame_support::assert_err;
 pub(crate) const WND: Balance = 1_000_000_000_000;
@@ -396,12 +397,22 @@ pub(crate) fn native_balance(who: &AccountId) -> Balance {
 }
 
 /// Moves the emulated clock forward by at least `ms`, landing on the next Aura slot
-/// boundary.
+/// boundary. Also raises the relay-derived clock.
 pub(crate) fn advance_time(ms: u64) {
 	let slot_duration = asset_hub_westend_runtime::Aura::slot_duration();
 	let slot = (Timestamp::get() + ms).div_ceil(slot_duration);
 	pallet_aura::CurrentSlot::<Runtime>::put(sp_consensus_slots::Slot::from(slot));
 	Timestamp::set_timestamp(slot * slot_duration);
+	set_relay_slot_at_least(slot * slot_duration / RELAY_CHAIN_SLOT_DURATION_MILLIS);
+}
+
+/// Raises the stored relay chain slot to `relay_slot` if it is behind. The consensus
+/// hook rejects backwards relay slots, so the bump must stay monotone.
+fn set_relay_slot_at_least(relay_slot: u64) {
+	let stored = AuraExt::relay_slot_info().map_or(0, |(slot, _)| *slot);
+	if relay_slot > stored {
+		AuraExt::set_relay_slot_info(sp_consensus_slots::Slot::from(relay_slot), 0);
+	}
 }
 
 pub(crate) fn pool_account() -> AccountId {
