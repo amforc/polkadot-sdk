@@ -78,7 +78,7 @@ pub mod pallet {
 	use crate::{
 		context::VaultOp,
 		recovery,
-		types::{AdminLevel, AssetRoleUsage, BranchAdmins, BranchConfigBounds},
+		types::{AdminLevel, BranchAdmins, BranchConfigBounds},
 	};
 	use alloc::{vec, vec::Vec};
 	use frame::{
@@ -285,13 +285,16 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Role and market count for each registered asset.
+	/// Number of live markets issuing each stablecoin, keyed by the stablecoin's name in the
+	/// collateral namespace. The entry is removed with its last market.
 	///
-	/// An asset cannot be both collateral and stable. The entry is removed when its count reaches
-	/// zero.
+	/// This is the stable half of the role-exclusivity index: registration reads it to reject a
+	/// stablecoin proposed as collateral, a second-key question [`Branches`] cannot answer with a
+	/// bounded probe. The collateral half needs no index at all — [`Branches`] is keyed
+	/// collateral-first, so "is this asset a collateral?" is one prefix probe on the registry.
 	#[pallet::storage]
-	pub type AssetRoles<T: Config> =
-		StorageMap<_, Blake2_128Concat, CollateralIdOf<T>, AssetRoleUsage, OptionQuery>;
+	pub type StablecoinMarkets<T: Config> =
+		StorageMap<_, Blake2_128Concat, CollateralIdOf<T>, u32, OptionQuery>;
 
 	/// Governance debt limit across every market issuing one stable asset.
 	///

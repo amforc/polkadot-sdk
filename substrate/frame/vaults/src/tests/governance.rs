@@ -605,7 +605,7 @@ fn create_branch_rejects_unknown_stable() {
 
 // A market whose stablecoin is also its own collateral is rejected — otherwise
 // the freely-minted coin could be posted as backing. The cross-market
-// directions live in `tests::asset_roles::cross_role_reuse_rejected_in_both_directions`.
+// directions live in `tests::stablecoin_markets::cross_role_reuse_rejected_in_both_directions`.
 #[test]
 fn create_branch_rejects_stable_collateral_collision() {
 	build_and_execute(|| {
