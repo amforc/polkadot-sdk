@@ -257,6 +257,7 @@ impl pallet_vaults::Config for Test {
 	type VaultConsideration = ();
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
+	type GlobalDebtCeiling = pallet_vaults::StoredCeiling<Test>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
 	type IdleMaxRefreshWeight = IdleMaxRefreshWeight;
