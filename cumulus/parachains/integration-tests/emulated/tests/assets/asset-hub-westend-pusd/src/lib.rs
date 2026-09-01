@@ -31,7 +31,9 @@ mod imports {
 		FixedU128, MultiAddress, Permill,
 	};
 
-	pub(crate) use emulated_integration_tests_common::xcm_emulator::TestExt;
+	pub(crate) use emulated_integration_tests_common::xcm_emulator::{
+		TestExt, RELAY_CHAIN_SLOT_DURATION_MILLIS,
+	};
 	pub(crate) use westend_system_emulated_network::{
 		asset_hub_westend_emulated_chain::asset_hub_westend_runtime::{
 			self, pusd_config::VaultsCollateralId, Runtime, RuntimeOrigin,

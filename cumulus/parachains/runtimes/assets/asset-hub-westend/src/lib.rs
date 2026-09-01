@@ -150,7 +150,7 @@ const BLOCK_PROCESSING_VELOCITY: u32 = 3;
 const UNINCLUDED_SEGMENT_CAPACITY: u32 = (3 + RELAY_PARENT_OFFSET) * BLOCK_PROCESSING_VELOCITY;
 
 /// Relay chain slot duration, in milliseconds.
-const RELAY_CHAIN_SLOT_DURATION_MILLIS: u32 = 6000;
+pub const RELAY_CHAIN_SLOT_DURATION_MILLIS: u32 = 6000;
 
 impl_opaque_keys! {
 	pub struct SessionKeys {
@@ -1081,6 +1081,9 @@ type ConsensusHook = cumulus_pallet_aura_ext::FixedVelocityConsensusHook<
 	BLOCK_PROCESSING_VELOCITY,
 	UNINCLUDED_SEGMENT_CAPACITY,
 >;
+
+/// Relay-chain-derived time source, advancing every relay chain slot.
+pub type RelayTimestamp = cumulus_pallet_aura_ext::RelayTimestamp<ConsensusHook>;
 
 impl parachain_info::Config for Runtime {}
 
