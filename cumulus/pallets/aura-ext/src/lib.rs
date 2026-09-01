@@ -40,11 +40,13 @@ use sp_runtime::traits::{Block as BlockT, Header as HeaderT, LazyBlock};
 
 pub mod consensus_hook;
 pub mod migration;
+pub mod relay_timestamp;
 pub mod signature_verifier;
 #[cfg(test)]
 mod test;
 
 pub use consensus_hook::FixedVelocityConsensusHook;
+pub use relay_timestamp::RelayTimestamp;
 pub use signature_verifier::AuraSchedulingVerifier;
 
 type Aura<T> = pallet_aura::Pallet<T>;
