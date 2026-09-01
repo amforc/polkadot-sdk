@@ -3,16 +3,19 @@
 use crate::{
 	context::VaultOp,
 	pallet::{
-		AssetRoles, BalanceOf, Branches, CollateralIdOf, Config, Error, Event, GlobalDebtCeilings,
-		HoldReason, Pallet, RegistrationConfigOf, StableIdOf, Vaults,
+		BalanceOf, Branches, CollateralIdOf, Config, Error, Event, GlobalDebtCeilings, HoldReason,
+		Pallet, RegistrationConfigOf, StableIdOf, StablecoinMarkets, Vaults,
 	},
 	types::{
-		AdminLevel, AssetMinimums, AssetRole, AssetRoleUsage, BranchAdmins, BranchConfig,
-		BranchConfigUpdate, BranchMode, BranchState, FrozenReason, FrozenState,
+		AdminLevel, AssetMinimums, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode,
+		BranchState, FrozenReason, FrozenState,
 	},
 };
 use frame::{
-	prelude::*,
+	prelude::{
+		storage::{StorageDoubleMap as _, StorageNMap as _},
+		*,
+	},
 	traits::{
 		fungibles::{
 			Inspect as FungiblesInspect, Mutate as FungiblesMutate,
@@ -284,64 +287,53 @@ impl<T: Config> Pallet<T> {
 		op.commit_exempt()
 	}
 
-	/// Adds one market reference for an asset role.
-	fn claim_asset_role(asset: &CollateralIdOf<T>, role: AssetRole) -> Result<u32, DispatchError> {
-		AssetRoles::<T>::try_mutate(asset, |maybe| match maybe {
-			None => {
-				*maybe = Some(AssetRoleUsage { role, markets: 1 });
-				Ok(1)
-			},
-			Some(usage) if usage.role == role => {
-				usage.markets =
-					usage.markets.checked_add(1).ok_or(Error::<T>::ArithmeticOverflow)?;
-				Ok(usage.markets)
-			},
-			Some(_) => Err(Error::<T>::StableCollateralCollision.into()),
-		})
-	}
-
-	/// Removes one market reference for an asset role.
+	/// Checks role exclusivity for a new market and counts it against its stablecoin.
 	///
-	/// The entry is removed with its last reference.
-	fn release_asset_role(
-		asset: &CollateralIdOf<T>,
-		role: AssetRole,
-	) -> Result<u32, DispatchError> {
-		AssetRoles::<T>::try_mutate(asset, |maybe| match maybe {
-			Some(usage) if usage.role == role && usage.markets > 0 => {
-				usage.markets -= 1;
-				let remaining = usage.markets;
-				if usage.markets == 0 {
-					*maybe = None;
-				}
-				Ok(remaining)
-			},
-			_ => {
-				defensive!("asset role missing, mismatched, or under-counted on release");
-				Err(DispatchError::Corruption)
-			},
-		})
-	}
-
-	/// Records the collateral and stable roles used by a market.
-	fn claim_market_roles(
+	/// A stable asset cannot also be collateral, or its issuer could create unbacked collateral.
+	/// The stable direction — "is this collateral someone's stablecoin?" — reads
+	/// [`StablecoinMarkets`]; the collateral direction — "is this stablecoin someone's
+	/// collateral?" — is a prefix probe on the collateral-first-keyed registry itself.
+	fn claim_stablecoin_market(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 	) -> Result<u32, DispatchError> {
 		let stable_key = T::StableToCollateralId::convert(stable_id.clone());
 		ensure!(*collateral_id != stable_key, Error::<T>::StableCollateralCollision);
-		Self::claim_asset_role(collateral_id, AssetRole::Collateral)?;
-		Self::claim_asset_role(&stable_key, AssetRole::Stable)
+		ensure!(
+			!StablecoinMarkets::<T>::contains_key(collateral_id),
+			Error::<T>::StableCollateralCollision
+		);
+		ensure!(
+			!Branches::<T>::contains_prefix(&stable_key),
+			Error::<T>::StableCollateralCollision
+		);
+		StablecoinMarkets::<T>::try_mutate(&stable_key, |maybe| {
+			let markets =
+				maybe.unwrap_or_default().checked_add(1).ok_or(Error::<T>::ArithmeticOverflow)?;
+			*maybe = Some(markets);
+			Ok(markets)
+		})
 	}
 
-	/// Removes the asset roles used by a market.
-	fn release_market_roles(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-	) -> Result<u32, DispatchError> {
+	/// Removes one market reference for its stablecoin.
+	///
+	/// The entry is removed with its last market.
+	fn release_stablecoin_market(stable_id: &StableIdOf<T>) -> Result<u32, DispatchError> {
 		let stable_key = T::StableToCollateralId::convert(stable_id.clone());
-		Self::release_asset_role(collateral_id, AssetRole::Collateral)?;
-		Self::release_asset_role(&stable_key, AssetRole::Stable)
+		StablecoinMarkets::<T>::try_mutate(&stable_key, |maybe| match maybe {
+			Some(markets) if *markets > 0 => {
+				*markets -= 1;
+				let remaining = *markets;
+				if remaining == 0 {
+					*maybe = None;
+				}
+				Ok(remaining)
+			},
+			_ => {
+				defensive!("stablecoin market count missing or under-counted on release");
+				Err(DispatchError::Corruption)
+			},
+		})
 	}
 
 	/// Rejects a configuration that contradicts itself or breaches the runtime's limits.
@@ -373,7 +365,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Creates a market after checking its limits, assets, and oracle price.
 	///
-	/// The market record, deposit, asset roles, and lifecycle state are created together.
+	/// The market record, deposit, stablecoin market count, and lifecycle state are created
+	/// together.
 	pub(crate) fn do_create_branch(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -395,15 +388,10 @@ impl<T: Config> Pallet<T> {
 		);
 		ensure!(T::StableAssets::asset_exists(stable_id.clone()), Error::<T>::UnknownStable);
 		Self::ensure_config_allowed(&collateral_id, &stable_id, &config)?;
-		// A stable asset cannot also be collateral, or its issuer could create unbacked collateral.
-		let stablecoin_markets = Self::claim_market_roles(&collateral_id, &stable_id)?;
+		let stablecoin_markets = Self::claim_stablecoin_market(&collateral_id, &stable_id)?;
 		let deposit = match depositor {
 			Some(who) => {
-				let footprint = Footprint::from_mel::<(
-					crate::pallet::BranchOf<T>,
-					AssetRoleUsage,
-					AssetRoleUsage,
-				)>();
+				let footprint = Footprint::from_mel::<(crate::pallet::BranchOf<T>, u32)>();
 				let ticket = T::BranchConsideration::new(&who, footprint)?;
 				Some((who, ticket))
 			},
@@ -435,7 +423,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Removes an empty market and refunds its deposit and custody seed.
 	///
-	/// This also releases its asset roles and provider reference, and calls the lifecycle hook.
+	/// This also releases its stablecoin market count and provider reference, and calls the
+	/// lifecycle hook.
 	/// The seed follows [`Self::custody_funder`] on the stored record, so a privileged market
 	/// refunds its current full administrator.
 	pub(crate) fn do_remove_branch(
@@ -445,10 +434,10 @@ impl<T: Config> Pallet<T> {
 		let branch = Self::branch_of(&collateral_id, &stable_id)?;
 		ensure!(branch.state.is_removable(), Error::<T>::BranchNotEmpty);
 		ensure!(
-			Vaults::<T>::iter_prefix((&collateral_id, &stable_id)).next().is_none(),
+			!Vaults::<T>::contains_prefix((&collateral_id, &stable_id)),
 			Error::<T>::BranchNotEmpty
 		);
-		let remaining_stablecoin_markets = Self::release_market_roles(&collateral_id, &stable_id)?;
+		let remaining_stablecoin_markets = Self::release_stablecoin_market(&stable_id)?;
 		T::OnBranchLifecycle::on_deregistered(
 			&collateral_id,
 			&stable_id,

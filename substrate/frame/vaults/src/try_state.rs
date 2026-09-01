@@ -5,12 +5,12 @@
 
 use crate::{
 	pallet::{
-		AssetRoles, BalanceOf, BranchOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings,
-		HoldReason, Millis, Pallet, StableIdOf, StablecoinDebt, Vaults,
+		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings, HoldReason,
+		Millis, Pallet, StableIdOf, StablecoinDebt, StablecoinMarkets, Vaults,
 	},
-	types::{AssetRole, AssetRoleUsage, InterestWeight, PendingInterest, VaultListId},
+	types::{InterestWeight, PendingInterest, VaultListId},
 };
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use frame::{
 	arithmetic::{CheckedAdd, FixedPointNumber, FixedU128, Zero},
 	traits::{
@@ -28,18 +28,18 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	let mut owner_collateral: BTreeMap<(CollateralIdOf<T>, T::AccountId), BalanceOf<T>> =
 		BTreeMap::new();
 	// Derived-index accumulators, recomputed in full from the authoritative registry.
-	let mut roles: BTreeMap<CollateralIdOf<T>, AssetRoleUsage> = BTreeMap::new();
+	let mut collaterals: BTreeSet<CollateralIdOf<T>> = BTreeSet::new();
+	let mut stablecoin_markets: BTreeMap<CollateralIdOf<T>, u32> = BTreeMap::new();
 	let mut stablecoin_debt: BTreeMap<
 		StableIdOf<T>,
 		(BalanceOf<T>, InterestWeight<BalanceOf<T>>, PendingInterest<BalanceOf<T>>),
 	> = BTreeMap::new();
 	for (collateral_id, stable_id, branch) in Branches::<T>::iter() {
-		claim_role::<T>(&mut roles, collateral_id.clone(), AssetRole::Collateral)?;
-		claim_role::<T>(
-			&mut roles,
-			T::StableToCollateralId::convert(stable_id.clone()),
-			AssetRole::Stable,
-		)?;
+		collaterals.insert(collateral_id.clone());
+		let markets = stablecoin_markets
+			.entry(T::StableToCollateralId::convert(stable_id.clone()))
+			.or_default();
+		*markets = markets.checked_add(1).ok_or("stablecoin market count overflow")?;
 		let branch_outstanding = branch.state.debt.outstanding();
 		let stable_entry = stablecoin_debt.entry(stable_id.clone()).or_default();
 		stable_entry.0 = stable_entry
@@ -86,7 +86,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	}
 
 	check_owner_holds::<T>(owner_collateral)?;
-	check_asset_roles::<T>(roles)?;
+	check_stablecoin_markets::<T>(&collaterals, stablecoin_markets)?;
 	if GlobalDebtCeilings::<T>::iter_values().any(|ceiling| ceiling.is_zero()) {
 		return Err("zero GlobalDebtCeilings record stored".into());
 	}
@@ -136,29 +136,20 @@ fn check_stablecoin_debt<T: Config>(
 	Ok(())
 }
 
-/// Accumulate one market reference for `asset` in `role`, rejecting an asset
-/// that appears on both sides of the registry.
-fn claim_role<T: Config>(
-	roles: &mut BTreeMap<CollateralIdOf<T>, AssetRoleUsage>,
-	asset: CollateralIdOf<T>,
-	role: AssetRole,
+/// Role exclusivity and the stable-side index: no stablecoin key may appear
+/// among `Branches`' collateral keys, and `StablecoinMarkets` must equal its
+/// full recomputation from `Branches` — same entries, same counts, nothing
+/// extra.
+fn check_stablecoin_markets<T: Config>(
+	collaterals: &BTreeSet<CollateralIdOf<T>>,
+	counts: BTreeMap<CollateralIdOf<T>, u32>,
 ) -> Result<(), TryRuntimeError> {
-	let usage = roles.entry(asset).or_insert(AssetRoleUsage { role, markets: 0 });
-	if usage.role != role {
+	if counts.keys().any(|stable_key| collaterals.contains(stable_key)) {
 		return Err("asset used as both collateral and stablecoin across markets".into());
 	}
-	usage.markets = usage.markets.checked_add(1).ok_or("asset role reference count overflow")?;
-	Ok(())
-}
-
-/// `AssetRoles` must equal its full recomputation from `Branches` — same
-/// entries, same roles, same reference counts, nothing extra.
-fn check_asset_roles<T: Config>(
-	roles: BTreeMap<CollateralIdOf<T>, AssetRoleUsage>,
-) -> Result<(), TryRuntimeError> {
-	let stored: BTreeMap<CollateralIdOf<T>, AssetRoleUsage> = AssetRoles::<T>::iter().collect();
-	if stored != roles {
-		return Err("AssetRoles diverges from its recomputation over Branches".into());
+	let stored: BTreeMap<CollateralIdOf<T>, u32> = StablecoinMarkets::<T>::iter().collect();
+	if stored != counts {
+		return Err("StablecoinMarkets diverges from its recomputation over Branches".into());
 	}
 	Ok(())
 }

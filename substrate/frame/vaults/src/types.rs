@@ -86,26 +86,6 @@ pub struct FrozenState {
 	pub entered_at: Millis,
 }
 
-/// Role of an asset in registered markets.
-///
-/// An asset cannot be both collateral and stable.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AssetRole {
-	/// The asset backs stable debt.
-	Collateral,
-	/// The asset is minted when debt is created.
-	Stable,
-}
-
-/// Role and market count for an asset.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, PartialEq, Eq, Debug)]
-pub struct AssetRoleUsage {
-	/// Role shared by all market references.
-	pub role: AssetRole,
-	/// Number of markets using the asset in this role.
-	pub markets: u32,
-}
-
 /// A debt amount split into principal and interest.
 ///
 /// Vaults store their current debt in this form, and [`Self::cancel`] returns
