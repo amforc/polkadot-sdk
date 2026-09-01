@@ -71,6 +71,7 @@ pub(crate) fn feed_price(price: FixedU128) {
 }
 
 pub(crate) fn feed_price_for(collateral_id: VaultsCollateralId, price: FixedU128) {
+	advance_time(0);
 	assert_ok!(MockOracle::set_price(RuntimeOrigin::root(), collateral_id, price));
 }
 
@@ -149,6 +150,7 @@ pub(crate) fn create_branch(spec: &BranchSpec) {
 /// so it needs native balance. A live treasury holds some. The emulated genesis
 /// does not, so the helper funds it.
 pub(crate) fn create_pusd() {
+	advance_time(0);
 	assert_ok!(Assets::force_create(
 		RuntimeOrigin::root(),
 		get_pusd_id().into(),
@@ -393,13 +395,13 @@ pub(crate) fn native_balance(who: &AccountId) -> Balance {
 	<Balances as FungibleInspect<AccountId>>::balance(who)
 }
 
-/// Moves the emulated clock forward. Aura requires the timestamp to match its
-/// slot, so the slot moves too.
+/// Moves the emulated clock forward by at least `ms`, landing on the next Aura slot
+/// boundary.
 pub(crate) fn advance_time(ms: u64) {
-	let now = Timestamp::get() + ms;
-	let slot = now / asset_hub_westend_runtime::Aura::slot_duration();
+	let slot_duration = asset_hub_westend_runtime::Aura::slot_duration();
+	let slot = (Timestamp::get() + ms).div_ceil(slot_duration);
 	pallet_aura::CurrentSlot::<Runtime>::put(sp_consensus_slots::Slot::from(slot));
-	Timestamp::set_timestamp(now);
+	Timestamp::set_timestamp(slot * slot_duration);
 }
 
 pub(crate) fn pool_account() -> AccountId {
@@ -426,7 +428,9 @@ pub(crate) fn sp_deposit_matured_on(
 	sp_deposit_pending_on(collateral_id.clone(), who, amount);
 	// A deposit matures at its cohort's deadline, which lands anywhere in
 	// `[entry_delay, 2 * entry_delay)`, so wait out the cohort it actually joined. A zero
-	// entry delay activates on deposit and leaves no cohort to wait for.
+	// entry delay activates on deposit and leaves no cohort to wait for. The wait lands
+	// on the first slot boundary at or after the deadline — the first instant a real
+	// block can observe maturity — not on the deadline itself.
 	let Some(deadline) = sp_pending_deadline(&collateral_id, who) else {
 		return;
 	};
