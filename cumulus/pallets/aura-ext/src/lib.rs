@@ -115,6 +115,20 @@ pub mod pallet {
 			Authorities::<T>::put(authorities);
 		}
 	}
+
+	impl<T: Config> Pallet<T> {
+		/// The current relay chain slot and the number of authored blocks in it, or `None`
+		/// before the first block is validated against a relay chain state proof.
+		pub fn relay_slot_info() -> Option<(Slot, u32)> {
+			RelaySlotInfo::<T>::get()
+		}
+
+		/// Set the relay slot info to something in particular. Only used for tests.
+		#[cfg(feature = "std")]
+		pub fn set_relay_slot_info(slot: Slot, authored: u32) {
+			RelaySlotInfo::<T>::put((slot, authored));
+		}
+	}
 }
 
 /// The block executor used when validating a PoV at the relay chain.
