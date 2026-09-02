@@ -117,8 +117,8 @@ fn final_recovery_redemption_below_par_with_insurance_cover() {
 			16,
 		));
 		assert_eq!(pusd_balance(&redeemer), 0);
-		// The value first floors to 2,666,666,666 pUSD. At 2 pUSD/WND,
-		// the result is 1,333,333,333 × 1e6 planck.
+		// The value first floors to 2,666,666,666 pUSD base units, that is
+		// 2,666.67 pUSD. At 2 pUSD/WND, the result is 1,333,333,333 × 1e6 planck.
 		let partial_out = native_balance(&redeemer) - get_native_ed();
 		assert_eq!(partial_out, 1_333_333_333_000_000);
 
