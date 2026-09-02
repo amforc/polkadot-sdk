@@ -21,27 +21,16 @@ use frame_support::traits::{Time, UnixTime};
 
 /// A [`Time`] and [`UnixTime`] provider that reports the start of the relay parent's slot.
 ///
-/// The reported time is `relay_chain_slot * RELAY_CHAIN_SLOT_DURATION_MILLIS` — a Unix timestamp,
-/// since BABE derives slot numbers from Unix time and [`FixedVelocityConsensusHook`] validates
-/// the slot against the relay chain state proof. It advances every relay chain slot rather than
-/// once per parachain slot.
+/// `pallet_timestamp` is pinned to the start of the parachain slot, so with a parachain slot
+/// longer than the relay chain slot every block in that slot carries the same timestamp. This
+/// provider returns `relay_chain_slot * RELAY_CHAIN_SLOT_DURATION_MILLIS` instead, which advances
+/// with every relay chain slot. The slot is taken from the relay chain state proof as validated by
+/// [`FixedVelocityConsensusHook`].
 ///
-/// # Guarantees
-///
-/// After the validation-data inherent runs, with `dur` the parachain slot duration and
-/// `para_slot` the current parachain slot:
-///
-/// - `para_slot * dur <= Self::now() < (para_slot + 1) * dur`
-/// - Differs from the `pallet_timestamp` value by less than one parachain slot.
-/// - Does not decrease across blocks of the same chain branch.
-/// - Trails wall clock by at least one relay chain block plus the configured relay parent offset.
-/// - Blocks sharing a relay chain slot report the same value.
-///
-/// # Fallback
-///
-/// Before the validation-data inherent invokes the hook for the first time, no relay chain slot
-/// is recorded and the latest parachain timestamp is returned instead — the same staleness
-/// `pallet_timestamp` itself has at that point.
+/// The value lies within the current parachain slot, never decreases along a chain branch and
+/// trails wall clock by up to one relay chain slot plus the relay parent offset. Like
+/// `pallet_timestamp::Now` it is only updated by the inherent, so in `on_initialize` it belongs to
+/// the previous block. Before the first state proof it falls back to `pallet_timestamp::Now`.
 ///
 /// # Example Configuration
 ///
