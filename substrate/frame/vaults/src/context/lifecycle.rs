@@ -227,6 +227,9 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	fn close(mut self, recipient: &T::AccountId, commit: CloseCommit) -> DispatchResult {
+		// A close is a lifecycle exit that the freeze holds back, whatever its reason. Only the
+		// frozen-tolerant repayment path can reach here on a frozen branch.
+		self.ctx.ensure_not_frozen()?;
 		ensure!(self.vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 		// A debt-free vault must not retain fractional interest.
 		ensure!(self.vault.interest_remainder == 0, DispatchError::Corruption);

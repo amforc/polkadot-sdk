@@ -251,7 +251,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 }
 
 #[test]
-fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
+fn final_recovery_blocks_borrow_withdraw_and_change_rate() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		enter_recovery(1, rate_pct(5, 100));
@@ -266,10 +266,6 @@ fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
 				None,
 				Position::endpoints_only()
 			),
-			crate::Error::<Test>::VaultInFinalRecovery
-		);
-		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(100)),
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
@@ -292,6 +288,152 @@ fn final_recovery_blocks_borrow_repay_withdraw_and_change_rate() {
 			),
 			crate::Error::<Test>::InvalidVaultStatus
 		);
+	});
+}
+
+// Repayment burns stablecoin and can only raise the vault's ratio, the same reason it stays open
+// in Safety Mode. A partial payoff leaves the vault queued and outside stake accounting.
+#[test]
+fn final_recovery_accepts_partial_repayment_and_stays_queued() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		let debt_before = vault(DOT, PUSD, 1).debt.total();
+
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(200)
+		));
+
+		let vault = vault(DOT, PUSD, 1);
+		assert_eq!(vault.debt.total(), debt_before - 200);
+		assert_eq!(vault.redistribution_stake, 0, "still excluded from redistribution");
+		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
+		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), vec![1]);
+	});
+}
+
+// The minimum-debt floor applies to a recovery vault as to any other: a payoff cannot leave dust.
+#[test]
+fn final_recovery_repayment_cannot_leave_dust() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		let debt = vault(DOT, PUSD, 1).debt.total();
+
+		assert_noop!(
+			crate::Pallet::<Test>::repay_for(
+				RuntimeOrigin::signed(1),
+				DOT,
+				PUSD,
+				1,
+				Some(debt - 199)
+			),
+			crate::Error::<Test>::DebtWouldBecomeDust
+		);
+	});
+}
+
+// Repaying enough to clear the MCR is a legitimate rescue: the vault can then exit and rejoin
+// the rate index with its stake restored.
+#[test]
+fn final_recovery_repayment_then_exit_rejoins_rate_index() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		// 1_000 of collateral at 0.5 is worth 500 against 501 of debt: still below the 110% MCR.
+		set_price(DOT, FixedU128::from_rational(1u128, 2u128));
+		assert_noop!(
+			crate::Pallet::<Test>::exit_final_recovery(
+				RuntimeOrigin::signed(99),
+				DOT,
+				PUSD,
+				1,
+				Position::endpoints_only()
+			),
+			crate::Error::<Test>::CollateralizationRatioTooLow
+		);
+
+		// 500 of value over 301 of debt clears the MCR.
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(200)
+		));
+		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
+			RuntimeOrigin::signed(99),
+			DOT,
+			PUSD,
+			1,
+			Position::endpoints_only()
+		));
+
+		assert!(vault_status(DOT, PUSD, 1).is_active());
+		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, held(DOT, 1));
+		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+	});
+}
+
+// A full payoff resolves the vault the same way a full redemption does: it leaves the queue as a
+// debt-free Dormant husk that keeps its collateral and rejoins stake accounting.
+#[test]
+fn final_recovery_full_repayment_leaves_dormant_husk() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		// Cover the upfront fee that the borrowed principal does not include.
+		mint_stable(PUSD, 1, 10);
+
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
+
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultStatusChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			old_status: crate::types::VaultStatus::FinalRecovery,
+			new_status: crate::types::VaultStatus::Dormant,
+		}));
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		let vault = vault(DOT, PUSD, 1);
+		assert_eq!(vault.debt.total(), 0);
+		assert_eq!(vault.collateral, 1_000);
+		assert_eq!(held(DOT, 1), 1_000, "the residual stays held until the owner closes the husk");
+		assert_eq!(vault.redistribution_stake, 1_000);
+		assert_eq!(branch_state(DOT, PUSD).expect("state").stakes.total, 1_000);
+		assert!(vault_exists(DOT, PUSD, 1), "a husk with collateral is not closed");
+	});
+}
+
+// A freeze must not lock owners out of the one action that can still rescue a recovery vault.
+#[test]
+fn frozen_branch_accepts_deposit_into_final_recovery_vault() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			true
+		));
+
+		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
+			RuntimeOrigin::signed(2),
+			DOT,
+			PUSD,
+			1,
+			10_000
+		));
+
+		assert_eq!(held(DOT, 1), 11_000);
+		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
+		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, 0);
 	});
 }
 
