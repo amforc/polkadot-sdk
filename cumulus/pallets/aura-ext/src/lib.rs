@@ -40,11 +40,13 @@ use sp_runtime::traits::{Block as BlockT, Header as HeaderT, LazyBlock};
 
 pub mod consensus_hook;
 pub mod migration;
+pub mod relay_timestamp;
 pub mod signature_verifier;
 #[cfg(test)]
 mod test;
 
 pub use consensus_hook::FixedVelocityConsensusHook;
+pub use relay_timestamp::RelayTimestamp;
 pub use signature_verifier::AuraSchedulingVerifier;
 
 type Aura<T> = pallet_aura::Pallet<T>;
@@ -111,6 +113,20 @@ pub mod pallet {
 		fn build(&self) {
 			let authorities = pallet_aura::Authorities::<T>::get();
 			Authorities::<T>::put(authorities);
+		}
+	}
+
+	impl<T: Config> Pallet<T> {
+		/// The current relay chain slot and the number of authored blocks in it, or `None`
+		/// before the first block is validated against a relay chain state proof.
+		pub fn relay_slot_info() -> Option<(Slot, u32)> {
+			RelaySlotInfo::<T>::get()
+		}
+
+		/// Set the relay slot info to something in particular. Only used for tests.
+		#[cfg(feature = "std")]
+		pub fn set_relay_slot_info(slot: Slot, authored: u32) {
+			RelaySlotInfo::<T>::put((slot, authored));
 		}
 	}
 }
