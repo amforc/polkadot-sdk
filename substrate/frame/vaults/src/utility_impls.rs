@@ -940,7 +940,8 @@ impl<T: Config> Pallet<T> {
 	/// Apply a borrow to a branch/vault draft pair and return the upfront fee.
 	///
 	/// A borrow that also changes the rate inside the cooldown charges the
-	/// upfront fee over both the debt increase and the existing principal.
+	/// upfront fee over both the debt increase and the existing principal. A
+	/// zero increase is a pure rate change, priced on the same rule.
 	pub(crate) fn apply_borrow_unchecked(
 		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
 		config: &BranchConfig<BalanceOf<T>>,
@@ -973,39 +974,6 @@ impl<T: Config> Pallet<T> {
 			avg,
 			config.upfront_fee_period,
 		);
-		if !fee.is_zero() {
-			let before_fee = vault.clone();
-			vault.debt.interest =
-				vault.debt.interest.checked_add(&fee).ok_or(Error::<T>::ArithmeticOverflow)?;
-			state.replace_vault(Some(&before_fee), Some(vault))?;
-		}
-		Ok(fee)
-	}
-
-	/// Apply a rate change's branch-side accounting to `state` and return the
-	/// upfront fee; see [`Self::apply_borrow_unchecked`] for the caller contract.
-	pub(crate) fn apply_rate_change(
-		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
-		config: &BranchConfig<BalanceOf<T>>,
-		vault: &mut Vault<BalanceOf<T>>,
-		new_rate: FixedU128,
-		now: Millis,
-	) -> Result<BalanceOf<T>, DispatchError> {
-		let old_rate = vault.annual_rate;
-		if new_rate == old_rate {
-			return Ok(BalanceOf::<T>::zero());
-		}
-		let cooldown_elapsed = vault.cooldown_elapsed(config, now);
-		let before = vault.clone();
-		vault.annual_rate = new_rate;
-		vault.last_rate_update = now;
-		state.replace_vault(Some(&before), Some(vault))?;
-		let fee = if cooldown_elapsed {
-			BalanceOf::<T>::zero()
-		} else {
-			let avg = Self::avg_rate(state);
-			math::simple_interest_ceil(vault.debt.principal, avg, config.upfront_fee_period)
-		};
 		if !fee.is_zero() {
 			let before_fee = vault.clone();
 			vault.debt.interest =

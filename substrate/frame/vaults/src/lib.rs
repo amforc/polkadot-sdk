@@ -961,10 +961,11 @@ pub mod pallet {
 			let mut draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
 			ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
 			Self::validate_rate(&draft.config, new_rate)?;
-			Self::apply_rate_change(
+			Self::apply_borrow_unchecked(
 				&mut draft.state,
 				&draft.config,
 				&mut draft.vault,
+				Zero::zero(),
 				new_rate,
 				draft.now,
 			)
