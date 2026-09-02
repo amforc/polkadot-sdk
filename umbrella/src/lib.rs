@@ -313,6 +313,10 @@ pub use mmr_gadget;
 #[cfg(feature = "mmr-rpc")]
 pub use mmr_rpc;
 
+/// Consumer-facing interface of the FRAME linked-list pallet.
+#[cfg(feature = "linked-list-interface")]
+pub use linked_list_interface;
+
 /// FRAME pallet for periodic accumulation and forwarding of native token funds.
 #[cfg(feature = "pallet-accumulate-and-forward")]
 pub use pallet_accumulate_and_forward;
@@ -535,6 +539,10 @@ pub use pallet_indices;
 /// Insecure do not use in production: FRAME randomness collective flip pallet.
 #[cfg(feature = "pallet-insecure-randomness-collective-flip")]
 pub use pallet_insecure_randomness_collective_flip;
+
+/// FRAME linked-list pallet.
+#[cfg(feature = "pallet-linked-list")]
+pub use pallet_linked_list;
 
 /// FRAME Participation Lottery Pallet.
 #[cfg(feature = "pallet-lottery")]

@@ -1,0 +1,160 @@
+// This file is part of Substrate.
+
+// Copyright (C) Amforc AG.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::{mock::*, ListNodes, Node, Position};
+
+#[test]
+fn find_position_empty_list_returns_none_none() {
+	build_and_execute(|| {
+		assert_eq!(LinkedList::find_position(1, 50), Position::endpoints_only());
+	});
+}
+
+#[test]
+fn find_position_above_all_returns_none_some_head() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		// priority 100 is greater than head (90), so prev=None, next=head=1.
+		assert_eq!(LinkedList::find_position(1, 100), Position::at_head(1));
+	});
+}
+
+#[test]
+fn find_position_below_all_returns_some_tail_none() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		// priority 5 is less than tail (50), so prev=tail=2, next=None.
+		assert_eq!(LinkedList::find_position(1, 5), Position::at_tail(2));
+	});
+}
+
+#[test]
+fn find_position_middle() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		insert(1, 3, 10);
+		assert_eq!(LinkedList::find_position(1, 70), Position::between(1, 2));
+	});
+}
+
+#[test]
+fn find_position_same_priority_lands_at_tail_side() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		insert(1, 3, 10);
+		// priority 50 == 2's priority. Asymmetric rule: prev.priority >= 50 (1 has 90, 2
+		// has 50; both qualify), but next.priority < 50 (3 has 10). Walking from
+		// the head, we step past 1, then past 2 (since 50 > 50 is false → keep
+		// walking), and stop at 3.
+		assert_eq!(LinkedList::find_position(1, 50), Position::between(2, 3));
+	});
+}
+
+#[test]
+fn find_re_insert_position_treats_item_as_logically_removed() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		insert(1, 3, 10);
+		// Re-insert 2 (currently 50) at priority 95: should be at head, prev=None,
+		// next=1. The algorithm must skip 2 itself.
+		assert_eq!(LinkedList::find_re_insert_position(1, 2, 95), Some(Position::at_head(1)));
+	});
+}
+
+/// A cyclic corrupt list must terminate the head→tail walk (capped at
+/// `len + 1` visits) instead of hanging the caller.
+#[test]
+fn find_position_terminates_on_cyclic_corruption() {
+	build_and_execute_no_post_check(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		// Forge a cycle through the head: 2.next = 1.
+		ListNodes::<Test>::insert(
+			1,
+			2,
+			Node { prev: Some(1u64), next: Some(1u64), priority: 50u32 },
+		);
+		// Priority 5 never satisfies `priority > node.priority`, so an
+		// unbounded walk would loop forever chasing the cycle.
+		let position = LinkedList::find_position(1, 5);
+		assert_eq!(position.next, None);
+		// The skip-aware variant shares the same bounded walk.
+		let re_insert_position = LinkedList::find_re_insert_position(1, 1, 5);
+		assert!(re_insert_position.is_some());
+	});
+}
+
+#[test]
+fn neighbors_returns_none_for_unknown_item() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		assert_eq!(LinkedList::neighbors(1, 999), None);
+	});
+}
+
+#[test]
+fn neighbors_returns_links_for_known_item() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		insert(1, 3, 10);
+		assert_eq!(LinkedList::neighbors(1, 2), Some(Position::between(1, 3)));
+	});
+}
+
+#[test]
+fn priority_returns_none_for_unknown_item() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		assert_eq!(LinkedList::priority(1, 999), None);
+	});
+}
+
+#[test]
+fn priority_returns_stored_priority_for_known_item() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		assert_eq!(LinkedList::priority(1, 1), Some(90));
+		assert_eq!(LinkedList::priority(1, 2), Some(50));
+	});
+}
+
+#[test]
+fn node_returns_priority_and_position_for_known_item() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		insert(1, 2, 50);
+		insert(1, 3, 10);
+		assert_eq!(LinkedList::node(1, 1), Some((90, Position::at_head(2))));
+		assert_eq!(LinkedList::node(1, 2), Some((50, Position::between(1, 3))));
+		assert_eq!(LinkedList::node(1, 3), Some((10, Position::at_tail(2))));
+	});
+}
+
+#[test]
+fn node_returns_none_for_unknown_item() {
+	build_and_execute(|| {
+		insert(1, 1, 90);
+		assert_eq!(LinkedList::node(1, 999), None);
+	});
+}

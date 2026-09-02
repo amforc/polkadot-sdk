@@ -398,6 +398,8 @@ members = [
 	"substrate/frame/im-online",
 	"substrate/frame/indices",
 	"substrate/frame/insecure-randomness-collective-flip",
+	"substrate/frame/linked-list",
+	"substrate/frame/linked-list/interface",
 	"substrate/frame/lottery",
 	"substrate/frame/membership",
 	"substrate/frame/merkle-mountain-range",
@@ -930,6 +932,7 @@ libp2p-kad = { version = "0.46.2", default-features = false }
 libsecp256k1 = { version = "0.7.0", default-features = false }
 libsqlite3-sys = { version = "0.30", default-features = false }
 linked-hash-map = { version = "0.5.4" }
+linked-list-interface = { path = "substrate/frame/linked-list/interface", default-features = false }
 linked_hash_set = { version = "0.1.4" }
 linregress = { version = "0.5.1" }
 lite-json = { version = "0.2.0", default-features = false }
@@ -1038,6 +1041,7 @@ pallet-identity = { path = "substrate/frame/identity", default-features = false 
 pallet-im-online = { path = "substrate/frame/im-online", default-features = false }
 pallet-indices = { path = "substrate/frame/indices", default-features = false }
 pallet-insecure-randomness-collective-flip = { path = "substrate/frame/insecure-randomness-collective-flip", default-features = false }
+pallet-linked-list = { path = "substrate/frame/linked-list", default-features = false }
 pallet-message-queue = { path = "substrate/frame/message-queue", default-features = false }
 pallet-meta-tx = { path = "substrate/frame/meta-tx", default-features = false }
 pallet-migrations = { path = "substrate/frame/migrations", default-features = false }
