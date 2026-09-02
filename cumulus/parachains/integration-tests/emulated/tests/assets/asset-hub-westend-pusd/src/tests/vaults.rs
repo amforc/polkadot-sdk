@@ -104,17 +104,34 @@ fn signed_user_registers_a_native_collateral_market() {
 			get_pusd_id(),
 			pallet_vaults::BranchConfigUpdate::MinimumDebt(100 * PUSD),
 		));
-		// The full admin controls only the branch ceiling.
+		// The full admin controls every market parameter. Lowering the branch
+		// ceiling reduces risk, so the emergency admin may do it too. Raising it
+		// does not, so only the full admin can.
 		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(full_admin.clone()),
+			RuntimeOrigin::signed(emergency_admin.clone()),
 			get_native_id(),
 			get_pusd_id(),
 			pallet_vaults::BranchConfigUpdate::DebtCeiling(50_000_000 * PUSD),
 		));
+		assert_noop!(
+			Vaults::set_param(
+				RuntimeOrigin::signed(emergency_admin.clone()),
+				get_native_id(),
+				get_pusd_id(),
+				pallet_vaults::BranchConfigUpdate::DebtCeiling(200_000_000 * PUSD),
+			),
+			pallet_vaults::Error::<Runtime>::DefensiveActionNotDefensive,
+		);
+		assert_ok!(Vaults::set_param(
+			RuntimeOrigin::signed(full_admin.clone()),
+			get_native_id(),
+			get_pusd_id(),
+			pallet_vaults::BranchConfigUpdate::DebtCeiling(200_000_000 * PUSD),
+		));
 
-		// The treasury takes all asset roles and ownership. Only Root can reassign them
-		// through `force_asset_status`.
-		let custodian = governance::TreasuryAccount::get();
+		// The full admin takes all asset roles and ownership. Only Root can reassign
+		// them through `force_asset_status`.
+		let custodian = full_admin.clone();
 		assert_ok!(Assets::set_team(
 			RuntimeOrigin::signed(creator.clone()),
 			get_pusd_id().into(),
@@ -145,9 +162,21 @@ fn signed_user_registers_a_native_collateral_market() {
 			sp_runtime::DispatchError::BadOrigin,
 		);
 
-		// The stablecoin-wide ceiling uses governance `ForceOrigin`. Root lifts it before
-		// users can borrow.
-		lift_global_ceiling(1_000_000_000 * PUSD);
+		// The stablecoin-wide ceiling belongs to the stablecoin owner, now the `custodian`,
+		// through `CreateOrigin`.
+		assert_noop!(
+			Vaults::set_global_debt_ceiling(
+				RuntimeOrigin::signed(creator.clone()),
+				get_pusd_id(),
+				1_000_000_000 * PUSD,
+			),
+			sp_runtime::DispatchError::BadOrigin,
+		);
+		assert_ok!(Vaults::set_global_debt_ceiling(
+			RuntimeOrigin::signed(full_admin.clone()),
+			get_pusd_id(),
+			1_000_000_000 * PUSD,
+		));
 		let owner = acct(9);
 		// 10,000 WND at 2 pUSD against 10,000 pUSD debt: CR 200%.
 		open_vault(&owner, 10_000 * WND, 10_000 * PUSD, FixedU128::zero());
