@@ -174,7 +174,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		settlement: RedemptionSettlement<StableCreditOf<T>, BalanceOf<T>>,
 	) -> Result<(), DispatchError> {
 		let RedemptionSettlement { debt_payment, collateral_to_recipient } = settlement;
-		let mut op = VaultOp::<T>::load(collateral_id.clone(), stable_id.clone(), owner)?;
+		let mut op = VaultOp::<T>::load_unfrozen(collateral_id.clone(), stable_id.clone(), owner)?;
 		let snapshot = op.redemption_snapshot();
 
 		// The owned payment determines settlement size and prevents an unsupported close request.

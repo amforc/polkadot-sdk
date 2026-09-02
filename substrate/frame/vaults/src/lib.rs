@@ -1012,7 +1012,8 @@ pub mod pallet {
 		/// Must be signed by the account providing the collateral.
 		///
 		/// Any account may add collateral for a vault owner. The amount must be non-zero. Deposits
-		/// are allowed during final recovery.
+		/// are allowed during final recovery and while the market is frozen, because they need no
+		/// price and only lower risk.
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::deposit_collateral_for())]
 		pub fn deposit_collateral_for(
@@ -1080,7 +1081,8 @@ pub mod pallet {
 		///
 		/// Any account may repay for a vault owner. `None` settles the full payoff at execution.
 		/// A `Some` amount must be non-zero and cannot leave only the terminal charge unpaid.
-		/// A vault in final recovery must leave final recovery before repayment.
+		/// Repayment is allowed during final recovery, where a full payoff leaves a debt-free
+		/// dormant vault, and while the market is frozen, where it may not close the vault.
 		#[pallet::call_index(4)]
 		#[pallet::weight(T::WeightInfo::repay_for())]
 		pub fn repay_for(
