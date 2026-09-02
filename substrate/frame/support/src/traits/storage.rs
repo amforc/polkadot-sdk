@@ -225,6 +225,24 @@ where
 	}
 }
 
+/// A [`Footprint`] with the proposed asset for the deposit.
+///
+/// The [`Consideration`] can select a different asset.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct AssetFootprint<AssetId> {
+	/// Proposed asset for the deposit.
+	pub asset: AssetId,
+	/// Storage footprint covered by the deposit.
+	pub footprint: Footprint,
+}
+
+impl<AssetId> AssetFootprint<AssetId> {
+	/// Creates an `AssetFootprint` from the proposed `asset` and `footprint`.
+	pub fn new(asset: AssetId, footprint: Footprint) -> Self {
+		Self { asset, footprint }
+	}
+}
+
 /// Placeholder marking functionality disabled. Useful for disabling various (sub)features.
 #[derive(CloneNoBound, Debug, Encode, Eq, Decode, TypeInfo, MaxEncodedLen, PartialEq)]
 pub struct Disabled;
