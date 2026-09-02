@@ -2209,6 +2209,20 @@ fn increasing_or_decreasing_destroying_asset_should_not_work() {
 }
 
 #[test]
+fn is_sufficient_reflects_asset_details() {
+	build_and_execute(|| {
+		use frame_support::traits::fungibles::Inspect;
+
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 0, 1, true, 1));
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 1, 1, false, 1));
+
+		assert!(Assets::is_sufficient(0));
+		assert!(!Assets::is_sufficient(1));
+		assert!(!Assets::is_sufficient(2));
+	});
+}
+
+#[test]
 fn asset_id_cannot_be_reused() {
 	build_and_execute(|| {
 		Balances::make_free_balance_be(&1, 100);
