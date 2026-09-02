@@ -286,6 +286,125 @@ fn frozen_branch_blocks_user_ops() {
 	});
 }
 
+fn freeze_by_governance() {
+	assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
+		RuntimeOrigin::signed(ADMIN),
+		DOT,
+		PUSD,
+		true
+	));
+	assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Frozen));
+}
+
+// A collateral deposit needs no price and only lowers risk, so a freeze must not block an owner
+// from protecting the vault before liquidations resume.
+#[test]
+fn frozen_branch_accepts_collateral_deposit() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		freeze_by_governance();
+
+		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
+			RuntimeOrigin::signed(2),
+			DOT,
+			PUSD,
+			1,
+			100
+		));
+
+		assert_eq!(held(DOT, 1), 1_100);
+		assert_eq!(vault(DOT, PUSD, 1).collateral, 1_100);
+		assert_eq!(branch_state(DOT, PUSD).expect("state").total_collateral, 1_100);
+		assert_eq!(
+			branch_mode(DOT, PUSD),
+			Some(BranchMode::Frozen),
+			"the deposit does not unfreeze"
+		);
+	});
+}
+
+// A partial repayment burns stablecoin without a price, so it stays available while frozen.
+#[test]
+fn frozen_branch_accepts_partial_repayment() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		let debt_before = vault(DOT, PUSD, 1).debt.total();
+		freeze_by_governance();
+
+		assert_ok!(crate::Pallet::<Test>::repay_for(
+			RuntimeOrigin::signed(1),
+			DOT,
+			PUSD,
+			1,
+			Some(100)
+		));
+
+		assert_eq!(vault(DOT, PUSD, 1).debt.total(), debt_before - 100);
+		assert!(vault_status(DOT, PUSD, 1).is_active());
+		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Frozen));
+	});
+}
+
+// A full payoff that leaves collateral behind only parks a husk; it closes nothing, so the freeze
+// does not stand in its way.
+#[test]
+fn frozen_branch_accepts_full_repayment_that_leaves_a_husk() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		// Cover the upfront fee that the borrowed principal does not include.
+		mint_stable(PUSD, 1, 10);
+		freeze_by_governance();
+
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
+
+		let husk = vault(DOT, PUSD, 1);
+		assert_eq!(husk.debt.total(), 0);
+		assert_eq!(husk.collateral, 1_000);
+		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert!(
+			!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
+				&rate_list(DOT, PUSD),
+				&1
+			),
+			"the husk left the rate index"
+		);
+		assert!(vault_exists(DOT, PUSD, 1), "a frozen branch never closes a row");
+	});
+}
+
+// Closing a vault is a lifecycle exit the freeze must hold back, whatever the freeze reason. The
+// only repayment that closes is one on a vault that already lost all its collateral.
+#[test]
+fn frozen_branch_rejects_repayment_that_would_close_the_vault() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		// Drain the collateral through a settlement that keeps the debt above the minimum, leaving
+		// a debt-bearing row with nothing held.
+		assert_ok!(redeem_step(DOT, PUSD, 1, 7, 200, 1_000));
+		assert_eq!(vault(DOT, PUSD, 1).collateral, 0);
+		freeze_by_governance();
+
+		assert_noop!(
+			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None),
+			crate::Error::<Test>::BranchFrozen
+		);
+
+		// Once the freeze lifts, the same payoff closes the empty row.
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			false
+		));
+		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
+		assert!(!vault_exists(DOT, PUSD, 1));
+	});
+}
+
 #[test]
 fn refresh_branch_persists_frozen_on_oracle_failure() {
 	build_and_execute(|| {

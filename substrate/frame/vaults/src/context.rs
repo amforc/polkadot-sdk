@@ -296,8 +296,21 @@ impl<T: Config> Context<T> {
 }
 
 impl<T: Config> VaultOp<T> {
-	/// Loads an existing vault from an unfrozen branch and applies its pending changes.
+	/// Loads an existing vault in any branch mode and applies its pending changes.
+	///
+	/// A frozen branch stops interest time, so the touch realizes nothing new. Only operations
+	/// that need no price and cannot raise risk, such as a collateral deposit or a repayment,
+	/// may load this way; the rest use [`Self::load_unfrozen`] or [`Self::load_priced`].
 	pub(crate) fn load(
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+		owner: &T::AccountId,
+	) -> Result<Self, DispatchError> {
+		Context::<T>::load(collateral_id, stable_id)?.touch(owner)
+	}
+
+	/// Loads an existing vault from an unfrozen branch and applies its pending changes.
+	pub(crate) fn load_unfrozen(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
@@ -305,7 +318,7 @@ impl<T: Config> VaultOp<T> {
 		Context::<T>::load_unfrozen(collateral_id, stable_id)?.touch(owner)
 	}
 
-	/// Loads an existing vault, caching its price before touching it.
+	/// Loads an existing vault from an unfrozen branch, caching its price before touching it.
 	pub(crate) fn load_priced(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -337,7 +350,7 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> DispatchResult {
-		Context::<T>::load(collateral_id, stable_id)?.touch(owner)?.commit_exempt()
+		Self::load(collateral_id, stable_id, owner)?.commit_exempt()
 	}
 
 	/// Returns the collateral asset ID.
@@ -545,12 +558,14 @@ impl<T: Config> VaultOp<T> {
 
 	/// Repays debt while enforcing the minimum remaining debt.
 	///
+	/// A `FinalRecovery` vault may repay too: the payment only lowers its debt, and a vault that
+	/// stays below par afterwards still settles under recovery pricing.
+	///
 	/// Returns the principal and interest removed.
 	pub(crate) fn repay(
 		&mut self,
 		amount: BalanceOf<T>,
 	) -> Result<crate::types::DebtBreakdown<BalanceOf<T>>, DispatchError> {
-		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		let payment = self.cancel_debt(amount)?;
 		let total_after = self.vault.debt.total();
 		ensure!(

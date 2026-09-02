@@ -77,6 +77,7 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
+		// A deposit needs no price and only lowers risk, so a frozen branch still accepts it.
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		op.add_collateral(amount)?;
 		T::CollateralAssets::transfer_and_hold(
@@ -174,6 +175,7 @@ impl<T: Config> Pallet<T> {
 		if let Some(amount) = amount {
 			ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		}
+		// A repayment needs no price and only lowers risk, so a frozen branch still accepts it.
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		let debt_before_terminal = op.vault().debt.total();
 		let full_payoff = debt_before_terminal
@@ -210,7 +212,8 @@ impl<T: Config> Pallet<T> {
 			amount: repay,
 		});
 
-		// Close a fully repaid vault when it has no collateral left.
+		// Close a fully repaid vault when it has no collateral left. The close itself refuses a
+		// frozen branch.
 		if new_total.is_zero() && op.vault().collateral.is_zero() {
 			op.load_price()?;
 			return op.finish_close(&owner);
@@ -228,7 +231,7 @@ impl<T: Config> Pallet<T> {
 		new_rate: FixedU128,
 		hint: Position<T::AccountId>,
 	) -> DispatchResult {
-		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
+		let mut op = VaultOp::<T>::load_unfrozen(collateral_id, stable_id, &owner)?;
 		if !op.change_rate(new_rate, hint)? {
 			return op.commit_exempt();
 		}
@@ -282,7 +285,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		hint: Position<T::AccountId>,
 	) -> DispatchResult {
-		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
+		let mut op = VaultOp::<T>::load_unfrozen(collateral_id, stable_id, &owner)?;
 		op.activate(hint)?;
 		op.commit_exempt()
 	}
