@@ -15,7 +15,7 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{Redemptions, RuntimeEvent, System, Vaults};
-use pallet_redemptions::RedemptionTerms;
+use pallet_redemptions::{RecoveryRegime, RedemptionTerms};
 use pusd_primitives::VaultStatus;
 
 /// Opens a vault at a healthy price, halves the price, and puts the vault in the
@@ -167,5 +167,91 @@ fn final_recovery_redemption_below_par_with_insurance_cover() {
 			recipient: parked_owner.clone(),
 			collateral: 0,
 		}));
+	});
+}
+
+/// A 2,000 pUSD shortfall against 3,000 pUSD of insurance cover is covered in
+/// full, so the market cancels the remaining 8,000 pUSD at recovery rate 1: the
+/// redeemer settles at par. A partial settlement leaves the fund untouched; the
+/// full settlement burns exactly the shortfall and leaves the surplus in the fund.
+#[test]
+fn final_recovery_redemption_below_par_with_full_insurance_cover() {
+	AssetHubWestend::execute_with(|| {
+		feed_price(dot_price(4, 1));
+		create_branch(&BranchSpec {
+			mcr: FixedU128::from_rational(125, 100),
+			icr: FixedU128::from_rational(130, 100),
+			scr: FixedU128::from_rational(130, 100),
+			..Default::default()
+		});
+		// 4,000 WND = 8,000 pUSD value against 10,000 pUSD debt: CR 80%.
+		let parked_owner = acct(1);
+		park_in_final_recovery(&parked_owner, 4_000 * WND, 10_000 * PUSD);
+
+		// Insurance Fund balance = 3,000 pUSD, above the 2,000 pUSD shortfall.
+		let insurance = insurance_account();
+		mint_pusd(&insurance, 3_000 * PUSD);
+
+		// Partial settlement at par: 3,000 pUSD buys 1,500 WND and draws no cover.
+		let redeemer = acct(3);
+		fund_dot(&redeemer, 0);
+		mint_pusd(&redeemer, 3_000 * PUSD);
+		assert_ok!(Redemptions::redeem(
+			RuntimeOrigin::signed(redeemer.clone()),
+			get_native_id(),
+			get_pusd_id(),
+			RedemptionTerms { max_stable_to_spend: 3_000 * PUSD, min_collateral_out: 1_500 * WND },
+			redeemer.clone(),
+			16,
+		));
+		assert_eq!(pusd_balance(&redeemer), 0);
+		assert_eq!(native_balance(&redeemer) - get_native_ed(), 1_500 * WND);
+		assert_eq!(pusd_balance(&insurance), 3_000 * PUSD, "a partial fill draws no cover");
+		let parked_vault = vault(&parked_owner);
+		assert_eq!(parked_vault.debt.total(), 7_000 * PUSD);
+		assert_eq!(parked_vault.collateral, 2_500 * WND);
+		assert_eq!(
+			Vaults::vault_status(get_native_id(), get_pusd_id(), parked_owner.clone()),
+			Some(VaultStatus::FinalRecovery),
+		);
+
+		// Full settlement: 5,000 pUSD from the market plus 2,000 pUSD of cover
+		// cancels the remaining 7,000 pUSD of debt and takes the last 2,500 WND.
+		let settler = acct(4);
+		fund_dot(&settler, 0);
+		mint_pusd(&settler, 5_000 * PUSD);
+		assert_ok!(Redemptions::redeem(
+			RuntimeOrigin::signed(settler.clone()),
+			get_native_id(),
+			get_pusd_id(),
+			RedemptionTerms { max_stable_to_spend: 5_000 * PUSD, min_collateral_out: 2_500 * WND },
+			settler.clone(),
+			16,
+		));
+		assert_eq!(pusd_balance(&settler), 0);
+		assert_eq!(native_balance(&settler) - get_native_ed(), 2_500 * WND);
+		// The fund burns only the shortfall and keeps the surplus.
+		assert_eq!(pusd_balance(&insurance), 1_000 * PUSD);
+		System::assert_has_event(RuntimeEvent::Redemptions(
+			pallet_redemptions::Event::RecoveryRedemptionExecuted {
+				collateral_id: get_native_id(),
+				stable_id: get_pusd_id(),
+				redeemer: settler.clone(),
+				recipient: settler.clone(),
+				vault_owner: parked_owner.clone(),
+				stable_burned: 5_000 * PUSD,
+				insurance_cover: 2_000 * PUSD,
+				collateral_out: 2_500 * WND,
+				regime: RecoveryRegime::InsuranceAdjusted,
+			},
+		));
+		assert!(pallet_vaults::Vaults::<Runtime>::get((
+			get_native_id(),
+			get_pusd_id(),
+			parked_owner.clone(),
+		))
+		.is_none());
+		assert_eq!(collateral_on_hold(&get_native_id(), &parked_owner), 0);
+		assert_eq!(branch_state().vault_count, 0);
 	});
 }
