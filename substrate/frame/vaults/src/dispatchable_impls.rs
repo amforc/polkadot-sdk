@@ -1,7 +1,7 @@
 //! Implementations for pallet extrinsics.
 
 use crate::{
-	context::VaultOp,
+	context::{Commit, VaultOp},
 	pallet::{
 		BalanceOf, Branches, CollateralIdOf, Config, Error, Event, GlobalDebtCeilings, HoldReason,
 		Pallet, RegistrationConfigOf, StableIdOf, StablecoinMarkets, Vaults,
@@ -63,7 +63,7 @@ impl<T: Config> Pallet<T> {
 			collateral: initial_collateral,
 			debt: initial_debt,
 		});
-		op.commit_checked()
+		op.commit(Commit::Checked)
 	}
 
 	/// Deposits collateral into a vault.
@@ -98,7 +98,7 @@ impl<T: Config> Pallet<T> {
 			from,
 			amount,
 		});
-		op.commit_exempt()
+		op.commit(Commit::Exempt)
 	}
 
 	/// Withdraws collateral and closes the vault if it becomes empty.
@@ -112,7 +112,7 @@ impl<T: Config> Pallet<T> {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
 		if op.apply_collateral_withdrawal(amount)? {
-			return op.finish_close(&recipient);
+			return op.finish_close(&recipient, Commit::Checked);
 		}
 
 		T::CollateralAssets::transfer_on_hold(
@@ -133,7 +133,7 @@ impl<T: Config> Pallet<T> {
 			recipient,
 			amount,
 		});
-		op.commit_checked()
+		op.commit(Commit::Checked)
 	}
 
 	/// Borrows stable assets and optionally changes the vault rate.
@@ -159,7 +159,7 @@ impl<T: Config> Pallet<T> {
 			recipient,
 			amount,
 		});
-		op.commit_checked()
+		op.commit(Commit::Checked)
 	}
 
 	/// Repays debt for a vault from another account.
@@ -216,11 +216,11 @@ impl<T: Config> Pallet<T> {
 		// frozen branch.
 		if new_total.is_zero() && op.vault().collateral.is_zero() {
 			op.load_price()?;
-			return op.finish_close(&owner);
+			return op.finish_close(&owner, Commit::Checked);
 		}
 
 		op.reconcile_after_debt_reduction()?;
-		op.commit_exempt()
+		op.commit(Commit::Exempt)
 	}
 
 	/// Changes a vault's interest rate.
@@ -233,11 +233,11 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let mut op = VaultOp::<T>::load_unfrozen(collateral_id, stable_id, &owner)?;
 		if !op.change_rate(new_rate, hint)? {
-			return op.commit_exempt();
+			return op.commit(Commit::Exempt);
 		}
 
 		op.load_price()?;
-		op.commit_checked()
+		op.commit(Commit::Checked)
 	}
 
 	/// Closes a debt-free vault and sends its collateral to the recipient.
@@ -250,7 +250,7 @@ impl<T: Config> Pallet<T> {
 		let op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
 		let recipient = recipient.unwrap_or(owner);
 
-		op.finish_close(&recipient)
+		op.finish_close(&recipient, Commit::Checked)
 	}
 
 	/// Moves the last unsafe eligible vault into final recovery.
@@ -261,7 +261,7 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
 		op.enter_final_recovery()?;
-		op.commit_exempt()
+		op.commit(Commit::Exempt)
 	}
 
 	/// Removes a vault from final recovery.
@@ -275,7 +275,7 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
 		op.exit_final_recovery(hint)?;
-		op.commit_exempt()
+		op.commit(Commit::Exempt)
 	}
 
 	/// Activates a dormant vault. Anyone may call this.
@@ -287,7 +287,7 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let mut op = VaultOp::<T>::load_unfrozen(collateral_id, stable_id, &owner)?;
 		op.activate(hint)?;
-		op.commit_exempt()
+		op.commit(Commit::Exempt)
 	}
 
 	/// Checks role exclusivity for a new market and counts it against its stablecoin.

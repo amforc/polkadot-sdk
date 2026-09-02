@@ -1,7 +1,7 @@
 //! Implementations of vault interfaces used by other pallets.
 
 use crate::{
-	context::VaultOp,
+	context::{Commit, VaultOp},
 	pallet::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
 		StableCreditOf, StableIdOf,
@@ -220,9 +220,9 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		// for: the vault closes and its deposit returns to the owner. Residual collateral
 		// keeps a Dormant husk that only the owner may close.
 		if op.vault().debt.total().is_zero() && op.vault().collateral.is_zero() {
-			return op.finish_close_exempt(owner);
+			return op.finish_close(owner, Commit::Exempt);
 		}
-		op.commit_exempt()
+		op.commit(Commit::Exempt)
 	}
 
 	fn stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {

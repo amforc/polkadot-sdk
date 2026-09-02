@@ -39,6 +39,14 @@ struct Context<T: Config> {
 	price: Option<FixedU128>,
 }
 
+/// Whether a commit runs the collateralization mode gate before persisting.
+pub(crate) enum Commit {
+	/// Enforce the mode rules, as borrower operations must.
+	Checked,
+	/// Skip the gate, for operations that cannot raise risk or are already exempt from it.
+	Exempt,
+}
+
 /// State for one vault operation.
 ///
 /// A commit can only write the vault loaded for `owner`.
@@ -162,9 +170,9 @@ impl<T: Config> Context<T> {
 			owner,
 			Pallet::<T>::vault_footprint(&self.collateral_id, &self.stable_id, owner),
 		)?;
-		T::VaultLists::insert(self.rate_list(), owner.clone(), annual_rate, hint)
-			.map_err(Pallet::<T>::map_error)?;
-		self.attach_new(owner, vault, deposit)
+		let op = self.attach_new(owner, vault, deposit)?;
+		op.index_insert(hint)?;
+		Ok(op)
 	}
 
 	fn apply_checked_borrow(
@@ -200,24 +208,6 @@ impl<T: Config> Context<T> {
 		self.ensure_global_ceiling()?;
 		Pallet::<T>::ensure_above_icr(&vault.position(), price, &self.config)?;
 		Ok(upfront_fee)
-	}
-
-	fn apply_checked_rate_change(
-		&mut self,
-		vault: &mut Vault<BalanceOf<T>>,
-		new_rate: FixedU128,
-	) -> Result<Option<BalanceOf<T>>, DispatchError> {
-		if vault.annual_rate == new_rate {
-			return Ok(None);
-		}
-		Pallet::<T>::validate_rate(&self.config, new_rate)?;
-		Ok(Some(Pallet::<T>::apply_rate_change(
-			&mut self.state,
-			&self.config,
-			vault,
-			new_rate,
-			self.now,
-		)?))
 	}
 
 	/// Records an upfront fee and defers minting until commit.
@@ -350,7 +340,7 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> DispatchResult {
-		Self::load(collateral_id, stable_id, owner)?.commit_exempt()
+		Self::load(collateral_id, stable_id, owner)?.commit(Commit::Exempt)
 	}
 
 	/// Returns the collateral asset ID.
@@ -403,12 +393,25 @@ impl<T: Config> VaultOp<T> {
 		if debt.is_zero() && collateral_after.is_zero() {
 			return Ok(true);
 		}
-		self.apply_collateral_removal(amount, collateral_after)?;
+		self.remove_collateral(amount)?;
 		Ok(false)
 	}
 
 	fn rate_list(&self) -> VaultListId<CollateralIdOf<T>, StableIdOf<T>> {
 		self.ctx.rate_list()
+	}
+
+	/// Places the vault in the rate index at its current rate.
+	pub(super) fn index_insert(&self, hint: ListPosition<T::AccountId>) -> DispatchResult {
+		T::VaultLists::insert(self.rate_list(), self.owner.clone(), self.vault.annual_rate, hint)
+			.map(|_| ())
+			.map_err(|e| Pallet::<T>::map_error(e).into())
+	}
+
+	/// Removes the vault from the rate index, where it must be present.
+	pub(super) fn index_remove(&self) -> DispatchResult {
+		T::VaultLists::remove(&self.rate_list(), &self.owner)
+			.map_err(|_| Error::<T>::RateIndexInvariantBroken.into())
 	}
 
 	/// Adds collateral to the vault and market totals.
@@ -434,20 +437,12 @@ impl<T: Config> VaultOp<T> {
 
 	/// Removes collateral from the vault and market totals.
 	pub(crate) fn remove_collateral(&mut self, amount: BalanceOf<T>) -> DispatchResult {
+		let before = self.vault.clone();
 		let vault_collateral = self
 			.vault
 			.collateral
 			.checked_sub(&amount)
 			.ok_or(Error::<T>::InsufficientCollateral)?;
-		self.apply_collateral_removal(amount, vault_collateral)
-	}
-
-	fn apply_collateral_removal(
-		&mut self,
-		amount: BalanceOf<T>,
-		vault_collateral: BalanceOf<T>,
-	) -> DispatchResult {
-		let before = self.vault.clone();
 		let branch_collateral = self
 			.ctx
 			.state
@@ -486,13 +481,7 @@ impl<T: Config> VaultOp<T> {
 			self.reindex(hint)?;
 		}
 		if rate_changed {
-			Pallet::<T>::deposit_event(Event::BorrowRateChanged {
-				collateral_id: self.ctx.collateral_id.clone(),
-				stable_id: self.ctx.stable_id.clone(),
-				owner: self.owner.clone(),
-				old_rate,
-				new_rate,
-			});
+			self.emit_rate_changed(old_rate);
 		}
 		Ok(())
 	}
@@ -507,20 +496,35 @@ impl<T: Config> VaultOp<T> {
 	) -> Result<bool, DispatchError> {
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
 		let old_rate = self.vault.annual_rate;
-		let Some(upfront_fee) = self.ctx.apply_checked_rate_change(&mut self.vault, new_rate)?
-		else {
+		if old_rate == new_rate {
 			return Ok(false);
-		};
+		}
+		Pallet::<T>::validate_rate(&self.ctx.config, new_rate)?;
+		// A rate change is a borrow of nothing, so both are priced by the same rule.
+		let upfront_fee = Pallet::<T>::apply_borrow_unchecked(
+			&mut self.ctx.state,
+			&self.ctx.config,
+			&mut self.vault,
+			BalanceOf::<T>::zero(),
+			new_rate,
+			self.ctx.now,
+		)?;
 		self.ctx.charge_upfront_fee(&self.owner, upfront_fee);
 		self.reindex(hint)?;
+		self.emit_rate_changed(old_rate);
+		Ok(true)
+	}
+
+	/// Reports the move from `old_rate` to the rate the vault now carries.
+	fn emit_rate_changed(&self, old_rate: FixedU128) {
+		debug_assert_ne!(old_rate, self.vault.annual_rate);
 		Pallet::<T>::deposit_event(Event::BorrowRateChanged {
 			collateral_id: self.ctx.collateral_id.clone(),
 			stable_id: self.ctx.stable_id.clone(),
 			owner: self.owner.clone(),
 			old_rate,
-			new_rate,
+			new_rate: self.vault.annual_rate,
 		});
-		Ok(true)
 	}
 
 	/// Charges the terminal unit before the vault stops owning the liability.
@@ -602,18 +606,16 @@ impl<T: Config> VaultOp<T> {
 		Ok(payment)
 	}
 
-	/// Commits the operation without checking the TCR change.
-	pub(crate) fn commit_exempt(self) -> DispatchResult {
+	/// Commits the operation, running the mode gate when `commit` asks for it.
+	pub(crate) fn commit(self, commit: Commit) -> DispatchResult {
+		match commit {
+			Commit::Checked => self.ensure_checked_commit()?,
+			Commit::Exempt => {},
+		}
 		self.persist(false)
 	}
 
-	/// Commits the operation after checking the TCR change.
-	pub(crate) fn commit_checked(self) -> DispatchResult {
-		self.ensure_checked_commit()?;
-		self.persist(false)
-	}
-
-	fn ensure_checked_commit(&self) -> DispatchResult {
+	pub(super) fn ensure_checked_commit(&self) -> DispatchResult {
 		let price = self.ctx.price()?;
 		let pre_tcr = Pallet::<T>::tcr_from_inputs(&self.ctx.tcr_baseline, price)?;
 		let post_tcr = Pallet::<T>::compute_tcr(&self.ctx.state, price, self.ctx.now)?;
