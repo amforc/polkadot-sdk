@@ -24,7 +24,7 @@ use frame::{
 	},
 };
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
-use pusd_primitives::ProvidePrice;
+use pusd_primitives::{collateralization_ratio, ProvidePrice};
 
 struct Context<T: Config> {
 	collateral_id: CollateralIdOf<T>,
@@ -383,13 +383,11 @@ impl<T: Config> VaultOp<T> {
 			.checked_sub(&amount)
 			.ok_or(Error::<T>::InsufficientCollateral)?;
 		let debt = self.vault.debt.total();
-		if !debt.is_zero() {
-			Pallet::<T>::ensure_above_icr(
-				&DebtCollateral { debt, collateral: collateral_after },
-				price,
-				&self.ctx.config,
-			)?;
-		}
+		Pallet::<T>::ensure_above_icr(
+			&DebtCollateral { debt, collateral: collateral_after },
+			price,
+			&self.ctx.config,
+		)?;
 		if debt.is_zero() && collateral_after.is_zero() {
 			return Ok(true);
 		}
@@ -617,7 +615,7 @@ impl<T: Config> VaultOp<T> {
 
 	pub(super) fn ensure_checked_commit(&self) -> DispatchResult {
 		let price = self.ctx.price()?;
-		let pre_tcr = Pallet::<T>::tcr_from_inputs(&self.ctx.tcr_baseline, price)?;
+		let pre_tcr = collateralization_ratio(&self.ctx.tcr_baseline, price)?;
 		let post_tcr = Pallet::<T>::compute_tcr(&self.ctx.state, price, self.ctx.now)?;
 		Pallet::<T>::enforce_mode_rules(&self.ctx.config, &self.ctx.state, pre_tcr, post_tcr)?;
 		Ok(())

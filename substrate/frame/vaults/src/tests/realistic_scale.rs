@@ -17,7 +17,7 @@ use frame::{
 		AccountTouch,
 	},
 };
-use pusd_primitives::{collateralization_ratio, MILLIS_PER_YEAR};
+use pusd_primitives::{collateralization_ratio, CollateralRatio, MILLIS_PER_YEAR};
 
 fn vault(owner: AccountId) -> crate::types::Vault<Balance> {
 	crate::mock::vault(XBT, USDX, owner)
@@ -105,8 +105,9 @@ fn lifecycle_exact_at_realistic_scale() {
 			},
 			FixedU128::from_rational(1u128, 1_000u128),
 		)
-		.expect("cr defined");
+		.expect("cr");
 		assert_eq!(cr, expected);
+		let CollateralRatio::Ratio(expected) = expected else { panic!("vault carries debt") };
 		assert_eq!(expected.trunc(), FixedU128::from_u32(1), "human CR just under 200%");
 
 		// One year at 5% on 5×10^9 minor units: exactly 250 USDX of interest.

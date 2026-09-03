@@ -1,23 +1,12 @@
 //! Branch operating-mode surface shared across pUSD pallets.
 
-use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
+use codec::{Decode, DecodeWithMemTracking, Encode};
 use frame::deps::sp_runtime::DispatchError;
 use scale_info::TypeInfo;
 
 /// Branch operating mode. `Normal` and `Safety` are derived from live TCR;
 /// `Frozen` is the only persisted mode.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BranchMode {
 	Normal,
 	Safety,

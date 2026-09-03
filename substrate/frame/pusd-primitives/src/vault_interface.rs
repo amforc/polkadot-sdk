@@ -20,7 +20,6 @@ pub struct RedemptionSettlement<Credit, Balance> {
 /// numbers the orchestrator sizes and prices a step against; `status`
 /// selects the pricing rules: `Active` and `Dormant` redeem at face value,
 /// `FinalRecovery` by recovery-settlement rules.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RedemptionStepSnapshot<Balance> {
 	pub status: VaultStatus,
 	/// Post-touch base debt, excluding the conditional terminal charge.
