@@ -211,7 +211,7 @@ fn test_stability_config() -> pallet_stability::types::StabilityPoolConfig<Balan
 	pallet_stability::types::StabilityPoolConfig {
 		minimum_deposit: 100 * PUSD,
 		minimum_active_pool_balance: 100 * PUSD,
-		entry_delay: 5_000,
+		entry_delay: u64::from(RELAY_CHAIN_SLOT_DURATION_MILLIS),
 		safety_withdrawal_delay: 10 * 60 * 1_000,
 		precision: pallet_stability::types::PoolPrecision {
 			p_min: FixedU128::from_inner(1_000_000_000),
