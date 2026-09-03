@@ -248,7 +248,9 @@ fn branch_safety_ratio_gates_withdrawals_not_repayments() {
 		// 125,000 / 90,000 = 1.38888…, floored at 18 decimals. `from_rational` would round up.
 		assert_eq!(
 			Vaults::branch_tcr(get_native_id(), get_pusd_id()),
-			Ok(FixedU128::from_inner(1_388_888_888_888_888_888)),
+			Ok(pusd_primitives::CollateralRatio::Ratio(FixedU128::from_inner(
+				1_388_888_888_888_888_888
+			))),
 		);
 	});
 }
