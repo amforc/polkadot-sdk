@@ -1,5 +1,5 @@
-//! Internal (non-dispatchable) `Pallet` helpers: storage accessors, safety
-//! gates, interest/fee accounting, mode rules, and the `on_idle` refresh walk.
+//! Internal (non-dispatchable) `Pallet` helpers: storage accessors,
+//! interest/fee accounting, branch modes, and the `on_idle` refresh walk.
 
 use crate::{
 	context::VaultOp,
@@ -382,51 +382,6 @@ impl<T: Config> Pallet<T> {
 		AssetFootprint::new(collateral_id.clone(), Footprint { count: 1, size })
 	}
 
-	/// Ensure a vault's collateralization ratio is at or above the branch ICR.
-	/// Used by the open/borrow/withdraw safety gates.
-	pub(crate) fn ensure_above_icr(
-		position: &DebtCollateral<BalanceOf<T>>,
-		price: FixedU128,
-		config: &BranchConfig<BalanceOf<T>>,
-	) -> DispatchResult {
-		let cr = collateralization_ratio(position, price)?;
-		ensure!(
-			cr >= config.initial_collateralization_ratio,
-			Error::<T>::UnsafeCollateralizationRatio
-		);
-		Ok(())
-	}
-
-	/// Ensure a vault's fully-accrued collateralization ratio is strictly below
-	/// the branch MCR. Used by the enter-final-recovery gate.
-	pub(crate) fn ensure_below_mcr(
-		position: &DebtCollateral<BalanceOf<T>>,
-		price: FixedU128,
-		config: &BranchConfig<BalanceOf<T>>,
-	) -> DispatchResult {
-		let cr = collateralization_ratio(position, price)?;
-		ensure!(
-			cr < config.minimum_collateralization_ratio,
-			Error::<T>::CollateralizationRatioTooHealthy
-		);
-		Ok(())
-	}
-
-	/// Ensure a vault's fully-accrued collateralization ratio is at or above the
-	/// branch MCR. Used by the exit-final-recovery gate.
-	pub(crate) fn ensure_at_or_above_mcr(
-		position: &DebtCollateral<BalanceOf<T>>,
-		price: FixedU128,
-		config: &BranchConfig<BalanceOf<T>>,
-	) -> DispatchResult {
-		let cr = collateralization_ratio(position, price)?;
-		ensure!(
-			cr >= config.minimum_collateralization_ratio,
-			Error::<T>::CollateralizationRatioTooLow
-		);
-		Ok(())
-	}
-
 	/// Derive a vault's lifecycle status from queue/index membership.
 	pub(crate) fn vault_status_in(
 		rate_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
@@ -500,29 +455,6 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		if rate < config.minimum_borrow_rate || rate > config.maximum_borrow_rate {
 			return Err(Error::<T>::RateOutOfBounds.into());
-		}
-		Ok(())
-	}
-
-	/// Apply Normal/Safety mode TCR rules. `state` is the operation's post
-	/// state; the frozen flag is operation-invariant, so it stands in for the
-	/// pre state too.
-	pub(crate) fn enforce_mode_rules(
-		config: &BranchConfig<BalanceOf<T>>,
-		state: &BranchState<T::AccountId, BalanceOf<T>>,
-		pre_tcr: CollateralRatio,
-		post_tcr: CollateralRatio,
-	) -> DispatchResult {
-		if state.is_frozen() {
-			return Err(Error::<T>::BranchFrozen.into());
-		}
-		if pre_tcr < config.safety_collateralization_ratio {
-			ensure!(post_tcr >= pre_tcr, Error::<T>::SafetyModeTcrWorsening);
-		} else {
-			ensure!(
-				post_tcr >= config.safety_collateralization_ratio,
-				Error::<T>::WouldEnterSafetyMode
-			);
 		}
 		Ok(())
 	}
