@@ -24,7 +24,7 @@ use frame::{
 	},
 };
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
-use pusd_primitives::{collateralization_ratio, ProvidePrice};
+use pusd_primitives::{collateralization_ratio, CollateralRatio, ProvidePrice};
 
 struct Context<T: Config> {
 	collateral_id: CollateralIdOf<T>,
@@ -120,6 +120,86 @@ impl<T: Config> Context<T> {
 		self.price.defensive_ok_or(DispatchError::Corruption)
 	}
 
+	fn collateralization_ratio(
+		&self,
+		position: &DebtCollateral<BalanceOf<T>>,
+	) -> Result<CollateralRatio, DispatchError> {
+		Ok(collateralization_ratio(position, self.price()?)?)
+	}
+
+	/// Ensures a vault's collateralization ratio is at or above this market's ICR.
+	fn ensure_above_icr(&self, position: &DebtCollateral<BalanceOf<T>>) -> DispatchResult {
+		let cr = self.collateralization_ratio(position)?;
+		ensure!(
+			cr >= self.config.initial_collateralization_ratio,
+			Error::<T>::UnsafeCollateralizationRatio
+		);
+		Ok(())
+	}
+
+	/// Ensures a vault's collateralization ratio is strictly below this market's MCR.
+	fn ensure_below_mcr(&self, position: &DebtCollateral<BalanceOf<T>>) -> DispatchResult {
+		let cr = self.collateralization_ratio(position)?;
+		ensure!(
+			cr < self.config.minimum_collateralization_ratio,
+			Error::<T>::CollateralizationRatioTooHealthy
+		);
+		Ok(())
+	}
+
+	/// Ensures a vault's collateralization ratio is at or above this market's MCR.
+	fn ensure_at_or_above_mcr(&self, position: &DebtCollateral<BalanceOf<T>>) -> DispatchResult {
+		let cr = self.collateralization_ratio(position)?;
+		ensure!(
+			cr >= self.config.minimum_collateralization_ratio,
+			Error::<T>::CollateralizationRatioTooLow
+		);
+		Ok(())
+	}
+
+	fn ensure_valid_rate(&self, rate: FixedU128) -> DispatchResult {
+		Pallet::<T>::validate_rate(&self.config, rate)
+	}
+
+	fn apply_borrow_transition(
+		&mut self,
+		vault: &mut Vault<BalanceOf<T>>,
+		debt_increase: BalanceOf<T>,
+		new_rate: FixedU128,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		Pallet::<T>::apply_borrow_unchecked(
+			&mut self.state,
+			&self.config,
+			vault,
+			debt_increase,
+			new_rate,
+			self.now,
+		)
+	}
+
+	fn post_tcr(&self) -> Result<CollateralRatio, DispatchError> {
+		Pallet::<T>::compute_tcr(&self.state, self.price()?, self.now)
+	}
+
+	/// Applies the Normal or Safety mode rule to this operation's post-state.
+	fn ensure_mode_rules(&self) -> DispatchResult {
+		let price = self.price()?;
+		let pre_tcr = collateralization_ratio(&self.tcr_baseline, price)?;
+		let post_tcr = self.post_tcr()?;
+		if self.state.is_frozen() {
+			return Err(Error::<T>::BranchFrozen.into());
+		}
+		if pre_tcr < self.config.safety_collateralization_ratio {
+			ensure!(post_tcr >= pre_tcr, Error::<T>::SafetyModeTcrWorsening);
+		} else {
+			ensure!(
+				post_tcr >= self.config.safety_collateralization_ratio,
+				Error::<T>::WouldEnterSafetyMode
+			);
+		}
+		Ok(())
+	}
+
 	/// Checks the stablecoin-wide debt limit against this operation's post-state.
 	fn ensure_global_ceiling(&self) -> DispatchResult {
 		let projected_total = Pallet::<T>::projected_stablecoin_debt(
@@ -144,7 +224,6 @@ impl<T: Config> Context<T> {
 		annual_rate: FixedU128,
 		hint: ListPosition<T::AccountId>,
 	) -> Result<VaultOp<T>, DispatchError> {
-		let price = self.price()?;
 		ensure!(
 			!Vaults::<T>::contains_key((&self.collateral_id, &self.stable_id, owner)),
 			Error::<T>::VaultAlreadyExists
@@ -155,8 +234,7 @@ impl<T: Config> Context<T> {
 		);
 		let mut vault =
 			Pallet::<T>::open_scratch_row(&self.state, annual_rate, initial_collateral, self.now);
-		let upfront_fee =
-			self.apply_checked_borrow(&mut vault, initial_debt, annual_rate, price)?;
+		let upfront_fee = self.apply_checked_borrow(&mut vault, initial_debt, annual_rate)?;
 		let total_collateral = self
 			.state
 			.total_collateral
@@ -180,9 +258,8 @@ impl<T: Config> Context<T> {
 		vault: &mut Vault<BalanceOf<T>>,
 		amount: BalanceOf<T>,
 		new_rate: FixedU128,
-		price: FixedU128,
 	) -> Result<BalanceOf<T>, DispatchError> {
-		Pallet::<T>::validate_rate(&self.config, new_rate)?;
+		self.ensure_valid_rate(new_rate)?;
 		let vault_principal_after = vault
 			.debt
 			.principal
@@ -197,16 +274,9 @@ impl<T: Config> Context<T> {
 			.checked_add(&amount)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		ensure!(principal_after <= self.config.debt_ceiling, Error::<T>::DebtCeilingExceeded);
-		let upfront_fee = Pallet::<T>::apply_borrow_unchecked(
-			&mut self.state,
-			&self.config,
-			vault,
-			amount,
-			new_rate,
-			self.now,
-		)?;
+		let upfront_fee = self.apply_borrow_transition(vault, amount, new_rate)?;
 		self.ensure_global_ceiling()?;
-		Pallet::<T>::ensure_above_icr(&vault.position(), price, &self.config)?;
+		self.ensure_above_icr(&vault.position())?;
 		Ok(upfront_fee)
 	}
 
@@ -375,7 +445,6 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 		amount: BalanceOf<T>,
 	) -> Result<bool, DispatchError> {
-		let price = self.ctx.price()?;
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		let collateral_after = self
 			.vault
@@ -383,11 +452,8 @@ impl<T: Config> VaultOp<T> {
 			.checked_sub(&amount)
 			.ok_or(Error::<T>::InsufficientCollateral)?;
 		let debt = self.vault.debt.total();
-		Pallet::<T>::ensure_above_icr(
-			&DebtCollateral { debt, collateral: collateral_after },
-			price,
-			&self.ctx.config,
-		)?;
+		self.ctx
+			.ensure_above_icr(&DebtCollateral { debt, collateral: collateral_after })?;
 		if debt.is_zero() && collateral_after.is_zero() {
 			return Ok(true);
 		}
@@ -460,14 +526,12 @@ impl<T: Config> VaultOp<T> {
 		maybe_new_rate: Option<FixedU128>,
 		hint: ListPosition<T::AccountId>,
 	) -> DispatchResult {
-		let price = self.ctx.price()?;
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		let old_rate = self.vault.annual_rate;
 		let new_rate = maybe_new_rate.unwrap_or(old_rate);
 		let dormant_to_active = self.status.is_dormant();
 		let rate_changed = old_rate != new_rate;
-		let upfront_fee =
-			self.ctx.apply_checked_borrow(&mut self.vault, amount, new_rate, price)?;
+		let upfront_fee = self.ctx.apply_checked_borrow(&mut self.vault, amount, new_rate)?;
 		self.ctx.charge_upfront_fee(&self.owner, upfront_fee);
 		if dormant_to_active {
 			debug_assert!(
@@ -497,16 +561,11 @@ impl<T: Config> VaultOp<T> {
 		if old_rate == new_rate {
 			return Ok(false);
 		}
-		Pallet::<T>::validate_rate(&self.ctx.config, new_rate)?;
+		self.ctx.ensure_valid_rate(new_rate)?;
 		// A rate change is a borrow of nothing, so both are priced by the same rule.
-		let upfront_fee = Pallet::<T>::apply_borrow_unchecked(
-			&mut self.ctx.state,
-			&self.ctx.config,
-			&mut self.vault,
-			BalanceOf::<T>::zero(),
-			new_rate,
-			self.ctx.now,
-		)?;
+		let upfront_fee =
+			self.ctx
+				.apply_borrow_transition(&mut self.vault, BalanceOf::<T>::zero(), new_rate)?;
 		self.ctx.charge_upfront_fee(&self.owner, upfront_fee);
 		self.reindex(hint)?;
 		self.emit_rate_changed(old_rate);
@@ -607,18 +666,10 @@ impl<T: Config> VaultOp<T> {
 	/// Commits the operation, running the mode gate when `commit` asks for it.
 	pub(crate) fn commit(self, commit: Commit) -> DispatchResult {
 		match commit {
-			Commit::Checked => self.ensure_checked_commit()?,
+			Commit::Checked => self.ctx.ensure_mode_rules()?,
 			Commit::Exempt => {},
 		}
 		self.persist(false)
-	}
-
-	pub(super) fn ensure_checked_commit(&self) -> DispatchResult {
-		let price = self.ctx.price()?;
-		let pre_tcr = collateralization_ratio(&self.ctx.tcr_baseline, price)?;
-		let post_tcr = Pallet::<T>::compute_tcr(&self.ctx.state, price, self.ctx.now)?;
-		Pallet::<T>::enforce_mode_rules(&self.ctx.config, &self.ctx.state, pre_tcr, post_tcr)?;
-		Ok(())
 	}
 
 	fn persist(self, remove: bool) -> DispatchResult {

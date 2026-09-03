@@ -14,7 +14,7 @@ use frame::{
 	},
 };
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
-use pusd_primitives::{collateralization_ratio, RedemptionStepSnapshot};
+use pusd_primitives::RedemptionStepSnapshot;
 
 impl<T: Config> VaultOp<T> {
 	/// Attributes terminal interest and returns validated liquidation inputs.
@@ -22,9 +22,8 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 	) -> Result<LiquidationSnapshot<BalanceOf<T>>, DispatchError> {
 		self.finalize_terminal_interest()?;
-		let price = self.ctx.price()?;
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
-		let cr = collateralization_ratio(&self.vault.position(), price)?;
+		let cr = self.ctx.collateralization_ratio(&self.vault.position())?;
 		ensure!(
 			cr < self.ctx.config.minimum_collateralization_ratio,
 			Error::<T>::VaultNotLiquidatable
@@ -72,9 +71,8 @@ impl<T: Config> VaultOp<T> {
 
 	/// Moves an unsafe last eligible vault into final recovery.
 	pub(crate) fn enter_final_recovery(&mut self) -> DispatchResult {
-		let price = self.ctx.price()?;
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
-		Pallet::<T>::ensure_below_mcr(&self.vault.position(), price, &self.ctx.config)?;
+		self.ctx.ensure_below_mcr(&self.vault.position())?;
 		ensure!(self.is_only_stake_bearer(), Error::<T>::NotLastEligibleVault);
 		self.index_remove()?;
 		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
@@ -86,9 +84,8 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 		hint: ListPosition<T::AccountId>,
 	) -> DispatchResult {
-		let price = self.ctx.price()?;
 		ensure!(self.status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
-		Pallet::<T>::ensure_at_or_above_mcr(&self.vault.position(), price, &self.ctx.config)?;
+		self.ctx.ensure_at_or_above_mcr(&self.vault.position())?;
 		let new_status = if self.vault.debt.total() >= self.ctx.config.minimum_debt {
 			VaultStatus::Active
 		} else {
@@ -250,7 +247,7 @@ impl<T: Config> VaultOp<T> {
 		});
 		// An empty branch has no collateralization ratio to protect.
 		match commit {
-			Commit::Checked if !branch_empties => self.ensure_checked_commit()?,
+			Commit::Checked if !branch_empties => self.ctx.ensure_mode_rules()?,
 			Commit::Checked | Commit::Exempt => {},
 		}
 		self.persist(true)
