@@ -12,7 +12,6 @@ use frame::deps::{
 /// Contains the active and pending values for a Stability Pool offset.
 ///
 /// `T` can hold debt amounts or collateral credits.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OffsetLegs<T> {
 	/// The value for the active-pool leg.
 	pub active: T,

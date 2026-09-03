@@ -7,7 +7,7 @@ use frame::deps::sp_runtime::DispatchError;
 
 /// Result of one execution attempt against the current `FinalRecovery` FIFO
 /// head.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Debug)]
 pub enum RecoveryOffsetResult<Balance> {
 	NoTarget,
 	BelowPar,
