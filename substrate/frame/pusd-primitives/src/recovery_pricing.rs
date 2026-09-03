@@ -96,7 +96,7 @@ pub fn recovery_bonus_collateral_out<Balance: FixedPointOperand>(
 }
 
 /// Contains an insurance-adjusted settlement split.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct InsuranceAdjusted<Balance> {
 	/// Debt that redeemers and offset providers can cancel against this vault's collateral.
 	pub market_cancel_debt: Balance,

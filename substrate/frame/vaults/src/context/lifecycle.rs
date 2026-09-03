@@ -24,8 +24,7 @@ impl<T: Config> VaultOp<T> {
 		self.finalize_terminal_interest()?;
 		let price = self.ctx.price()?;
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
-		let cr = collateralization_ratio(&self.vault.position(), price)
-			.ok_or(Error::<T>::VaultNotLiquidatable)?;
+		let cr = collateralization_ratio(&self.vault.position(), price)?;
 		ensure!(
 			cr < self.ctx.config.minimum_collateralization_ratio,
 			Error::<T>::VaultNotLiquidatable

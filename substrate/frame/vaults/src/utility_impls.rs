@@ -29,7 +29,7 @@ use frame::{
 	},
 };
 use linked_list_interface::{ListError, SortedListInterface};
-use pusd_primitives::{collateralization_ratio, OnBranchYield, ProvidePrice};
+use pusd_primitives::{collateralization_ratio, CollateralRatio, OnBranchYield, ProvidePrice};
 
 /// Exact changes the next vault touch would apply.
 pub(crate) struct PendingTouch<Balance> {
@@ -383,15 +383,13 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Ensure a vault's collateralization ratio is at or above the branch ICR.
-	/// Used by the open/borrow/withdraw safety gates. A `None` ratio (zero debt)
-	/// and a below-ICR ratio both surface as `UnsafeCollateralizationRatio`.
+	/// Used by the open/borrow/withdraw safety gates.
 	pub(crate) fn ensure_above_icr(
 		position: &DebtCollateral<BalanceOf<T>>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
-		let cr = collateralization_ratio(position, price)
-			.ok_or(Error::<T>::UnsafeCollateralizationRatio)?;
+		let cr = collateralization_ratio(position, price)?;
 		ensure!(
 			cr >= config.initial_collateralization_ratio,
 			Error::<T>::UnsafeCollateralizationRatio
@@ -400,15 +398,13 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Ensure a vault's fully-accrued collateralization ratio is strictly below
-	/// the branch MCR. Used by the enter-final-recovery gate. A `None` ratio
-	/// (zero debt) counts as too healthy.
+	/// the branch MCR. Used by the enter-final-recovery gate.
 	pub(crate) fn ensure_below_mcr(
 		position: &DebtCollateral<BalanceOf<T>>,
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
-		let cr = collateralization_ratio(position, price)
-			.ok_or(Error::<T>::CollateralizationRatioTooHealthy)?;
+		let cr = collateralization_ratio(position, price)?;
 		ensure!(
 			cr < config.minimum_collateralization_ratio,
 			Error::<T>::CollateralizationRatioTooHealthy
@@ -423,8 +419,7 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
-		let cr = collateralization_ratio(position, price)
-			.ok_or(Error::<T>::CollateralizationRatioTooLow)?;
+		let cr = collateralization_ratio(position, price)?;
 		ensure!(
 			cr >= config.minimum_collateralization_ratio,
 			Error::<T>::CollateralizationRatioTooLow
@@ -515,8 +510,8 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn enforce_mode_rules(
 		config: &BranchConfig<BalanceOf<T>>,
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
-		pre_tcr: FixedU128,
-		post_tcr: FixedU128,
+		pre_tcr: CollateralRatio,
+		post_tcr: CollateralRatio,
 	) -> DispatchResult {
 		if state.is_frozen() {
 			return Err(Error::<T>::BranchFrozen.into());
@@ -579,30 +574,20 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Compute TCR including aggregate interest accrued since the last update.
+	///
+	/// The operation gate's load-time baseline feeds the same
+	/// `collateralization_ratio` directly, so the pre and post sides of a gate
+	/// cannot diverge.
 	pub(crate) fn compute_tcr(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		price: FixedU128,
 		now: Millis,
-	) -> Result<FixedU128, DispatchError> {
+	) -> Result<CollateralRatio, DispatchError> {
 		let inputs = DebtCollateral {
 			collateral: state.total_collateral,
 			debt: Self::accrued_branch_debt(state, now),
 		};
-		Self::tcr_from_inputs(&inputs, price)
-	}
-
-	/// The single TCR formula, shared by [`Self::compute_tcr`] (live state) and
-	/// the operation gate's load-time baseline so the pre and post sides of a
-	/// gate cannot diverge.
-	pub(crate) fn tcr_from_inputs(
-		inputs: &DebtCollateral<BalanceOf<T>>,
-		price: FixedU128,
-	) -> Result<FixedU128, DispatchError> {
-		if inputs.debt.is_zero() {
-			// Branch with no debt is treated as "infinitely well-collateralized".
-			return Ok(FixedU128::max_value());
-		}
-		collateralization_ratio(inputs, price).ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
+		Ok(collateralization_ratio(&inputs, price)?)
 	}
 
 	/// Accrue aggregate branch interest in memory and return the new amount.

@@ -7,13 +7,17 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
+use codec::{Decode, DecodeWithMemTracking, Encode};
+use core::cmp::Ordering;
 use frame::{
 	arithmetic::{helpers_128bit::multiply_by_rational_with_rounding, Rounding, Zero},
 	deps::{
 		frame_support::PalletId,
 		sp_io::hashing::blake2_256,
-		sp_runtime::{traits::AccountIdConversion, FixedPointNumber, FixedPointOperand, FixedU128},
+		sp_runtime::{
+			traits::AccountIdConversion, ArithmeticError, FixedPointNumber, FixedPointOperand,
+			FixedU128,
+		},
 	},
 };
 use scale_info::TypeInfo;
@@ -48,18 +52,7 @@ pub const MILLIS_PER_YEAR: Millis = 31_557_600_000;
 /// derives it, target selection returns it, and step pricing keys off it
 /// (`Active` and `Dormant` redeem at face value, `FinalRecovery` at
 /// recovery-settlement pricing).
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VaultStatus {
 	/// Debt-bearing vault with `Debt >= MinimumDebt`. In the rate index.
 	Active,
@@ -92,18 +85,7 @@ impl VaultStatus {
 ///
 /// The pair is used both for live positions and for amounts assigned by a
 /// settlement path.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	Copy,
-	PartialEq,
-	Eq,
-	Debug,
-)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DebtCollateral<Balance> {
 	/// Debt side of the pair.
 	pub debt: Balance,
@@ -111,14 +93,53 @@ pub struct DebtCollateral<Balance> {
 	pub collateral: Balance,
 }
 
-/// `floor(price * collateral / debt)` as a collateralization ratio. `None` when
-/// `debt == 0` (CR undefined) or either step overflows.
+/// A position's collateralization ratio.
+///
+/// A debt-free position has no ratio to compute, yet it is safer than any
+/// position that does: the variant order makes `DebtFree` compare greater
+/// than every `Ratio`, and the [`FixedU128`] comparisons below let a threshold
+/// gate read `cr >= threshold` without special-casing it.
+#[derive(Encode, TypeInfo, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum CollateralRatio {
+	/// `floor(price * collateral / debt)` for a debt-bearing position.
+	Ratio(FixedU128),
+	/// The position carries no debt.
+	DebtFree,
+}
+
+impl PartialEq<FixedU128> for CollateralRatio {
+	fn eq(&self, threshold: &FixedU128) -> bool {
+		match self {
+			Self::Ratio(ratio) => ratio == threshold,
+			Self::DebtFree => false,
+		}
+	}
+}
+
+impl PartialOrd<FixedU128> for CollateralRatio {
+	fn partial_cmp(&self, threshold: &FixedU128) -> Option<Ordering> {
+		match self {
+			Self::Ratio(ratio) => ratio.partial_cmp(threshold),
+			Self::DebtFree => Some(Ordering::Greater),
+		}
+	}
+}
+
+/// The collateralization ratio of `position` at `price`.
+///
+/// `DebtFree` when `debt == 0`; `Overflow` when the value or the ratio does
+/// not fit.
 pub fn collateralization_ratio<Balance: FixedPointOperand>(
 	position: &DebtCollateral<Balance>,
 	price: FixedU128,
-) -> Option<FixedU128> {
-	let value = price.checked_mul_int(position.collateral)?;
+) -> Result<CollateralRatio, ArithmeticError> {
+	if position.debt.is_zero() {
+		return Ok(CollateralRatio::DebtFree);
+	}
+	let value = price.checked_mul_int(position.collateral).ok_or(ArithmeticError::Overflow)?;
 	FixedU128::checked_from_rational(value, position.debt)
+		.map(CollateralRatio::Ratio)
+		.ok_or(ArithmeticError::Overflow)
 }
 
 /// `floor(value * numerator / denominator)` at `Balance` precision — the

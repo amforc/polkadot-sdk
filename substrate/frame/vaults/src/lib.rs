@@ -93,7 +93,7 @@ pub mod pallet {
 	};
 	use linked_list_interface::{Position, PriorityProvider, SortedListInterface};
 	use pusd_primitives::{
-		collateralization_ratio, OnBranchLifecycle, OnBranchYield, ProvidePrice,
+		collateralization_ratio, CollateralRatio, OnBranchLifecycle, OnBranchYield, ProvidePrice,
 	};
 
 	/// Balance type used by collateral and stable assets.
@@ -714,19 +714,15 @@ pub mod pallet {
 		/// Returns the vault's collateral ratio after pending updates.
 		///
 		/// Missing rows, oracle failure, and arithmetic failure are reported
-		/// explicitly. A debt-free vault has the maximum representable ratio.
+		/// explicitly. A debt-free vault reports [`CollateralRatio::DebtFree`].
 		pub fn vault_cr(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
-		) -> Result<FixedU128, DispatchError> {
+		) -> Result<CollateralRatio, DispatchError> {
 			let draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
 			let price = T::Oracle::provide_price(&collateral_id)?;
-			if draft.vault.debt.total().is_zero() {
-				return Ok(FixedU128::max_value());
-			}
-			collateralization_ratio(&draft.vault.position(), price)
-				.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
+			Ok(collateralization_ratio(&draft.vault.position(), price)?)
 		}
 
 		/// Returns the current vault status.
@@ -742,11 +738,11 @@ pub mod pallet {
 		/// Returns the market's total collateral ratio after pending interest.
 		///
 		/// Missing markets, oracle failure, and arithmetic failure are reported
-		/// explicitly.
+		/// explicitly. A debt-free market reports [`CollateralRatio::DebtFree`].
 		pub fn branch_tcr(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-		) -> Result<FixedU128, DispatchError> {
+		) -> Result<CollateralRatio, DispatchError> {
 			let state = Self::branch_of(&collateral_id, &stable_id)?.state;
 			let price = T::Oracle::provide_price(&collateral_id)?;
 			let now = T::TimeProvider::now();
