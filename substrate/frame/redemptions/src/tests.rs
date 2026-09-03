@@ -6,7 +6,7 @@ use crate::{
 };
 use pallet_vaults::LiquidationSettlement;
 use pusd_primitives::{
-	collateralization_ratio, recovery_pricing, reducible_debit, DebtCollateral,
+	collateralization_ratio, recovery_pricing, reducible_debit, CollateralRatio, DebtCollateral,
 	RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
 };
 
@@ -39,7 +39,7 @@ fn spend_for_debt(debt: Balance) -> Balance {
 }
 
 /// Branch TCR as the vault pallet reports it, including pending interest.
-fn branch_tcr(collateral: AssetId, stable: StableId) -> FixedU128 {
+fn branch_tcr(collateral: AssetId, stable: StableId) -> CollateralRatio {
 	Vaults::branch_tcr(collateral, stable).expect("branch registered")
 }
 
@@ -999,11 +999,12 @@ fn recovery_bonus_buffer_keeps_redemption_cr_improving() {
 		setup_final_recovery(1, 1_000, 500, price);
 		mint_stable(PUSD, 3, 1_000_000);
 
-		let cr_before = collateralization_ratio(
+		let Ok(CollateralRatio::Ratio(cr_before)) = collateralization_ratio(
 			&DebtCollateral { debt: vault_debt(DOT, PUSD, 1), collateral: held(DOT, 1) },
 			price,
-		)
-		.expect("finite CR");
+		) else {
+			panic!("fixture must carry debt with a finite CR");
+		};
 		assert!(cr_before > rate_pct(101, 100), "fixture must clear the 1% buffer");
 		// The bonus this fixture produces sits strictly inside (0, penalty):
 		// the mid-range case, where only the buffer bounds it.
@@ -1019,11 +1020,12 @@ fn recovery_bonus_buffer_keeps_redemption_cr_improving() {
 
 		// The 1% buffer keeps the bonus strictly below CR − 100%, so paying it
 		// must leave the vault's CR strictly better than before the redemption.
-		let cr_after = collateralization_ratio(
+		let Ok(CollateralRatio::Ratio(cr_after)) = collateralization_ratio(
 			&DebtCollateral { debt: vault_debt(DOT, PUSD, 1), collateral: held(DOT, 1) },
 			price,
-		)
-		.expect("finite CR");
+		) else {
+			panic!("fixture must carry debt with a finite CR");
+		};
 		assert!(cr_after > cr_before, "recovery-bonus redemption must improve the vault's CR");
 	});
 }
@@ -1045,11 +1047,12 @@ fn recovery_has_priority_over_ordinary_vaults() {
 		// At the healthy price the head's CR ≈ 249%, far beyond the 106% at
 		// which the cap starts binding, so the bonus must come out clamped to
 		// exactly the 5% redistribution penalty rather than the raw excess.
-		let cr = collateralization_ratio(
+		let Ok(CollateralRatio::Ratio(cr)) = collateralization_ratio(
 			&DebtCollateral { debt: v1_before, collateral: held(DOT, 1) },
 			FixedU128::from_rational(5u128, 4u128),
-		)
-		.expect("finite CR");
+		) else {
+			panic!("fixture must carry debt with a finite CR");
+		};
 		assert!(cr > rate_pct(106, 100), "fixture must put the raw excess above the cap");
 		let bonus = recovery_pricing::recovery_bonus(
 			cr,

@@ -22,7 +22,8 @@ use frame::{
 	},
 };
 use pusd_primitives::{
-	recovery_pricing, reducible_debit, ProvidePrice, RedemptionSettlement, VaultInterface,
+	recovery_pricing, reducible_debit, CollateralRatio, ProvidePrice, RedemptionSettlement,
+	VaultInterface,
 };
 
 /// Inputs shared by ordinary and recovery redemptions.
@@ -321,10 +322,12 @@ impl<T: Config> Pallet<T> {
 		if snapshot.status.is_final_recovery() {
 			return Step::Stop;
 		}
-		let redeemable = matches!(
-			pusd_primitives::collateralization_ratio(&snapshot.position(), price),
-			Some(ratio) if ratio >= FixedU128::one()
-		);
+		let redeemable = match pusd_primitives::collateralization_ratio(&snapshot.position(), price)
+		{
+			Ok(CollateralRatio::Ratio(ratio)) => ratio >= FixedU128::one(),
+			// Nothing to redeem without debt, and an overflowing ratio is not guessed at.
+			Ok(CollateralRatio::DebtFree) | Err(_) => false,
+		};
 		if !redeemable {
 			return if snapshot.status.is_dormant() { Step::Stop } else { Step::Skip };
 		}

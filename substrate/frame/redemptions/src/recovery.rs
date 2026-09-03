@@ -19,8 +19,8 @@ use frame::{
 	},
 };
 use pusd_primitives::{
-	debit_preservation, recovery_pricing, reducible_debit, ProvidePrice, RecoveryOffsetInterface,
-	RecoveryOffsetResult, RedemptionSettlement, VaultInterface,
+	debit_preservation, recovery_pricing, reducible_debit, CollateralRatio, ProvidePrice,
+	RecoveryOffsetInterface, RecoveryOffsetResult, RedemptionSettlement, VaultInterface,
 };
 
 /// One authoritative price for a `FinalRecovery` head.
@@ -92,7 +92,11 @@ impl<T: Config> Pallet<T> {
 			return None;
 		}
 
-		let ratio = pusd_primitives::collateralization_ratio(&snapshot.position(), price)?;
+		let ratio = match pusd_primitives::collateralization_ratio(&snapshot.position(), price) {
+			Ok(CollateralRatio::Ratio(ratio)) => ratio,
+			// A head without debt has nothing to settle, and an overflowing ratio gets no plan.
+			Ok(CollateralRatio::DebtFree) | Err(_) => return None,
+		};
 		if ratio >= FixedU128::one() {
 			let bonus = recovery_pricing::recovery_bonus(
 				ratio,
