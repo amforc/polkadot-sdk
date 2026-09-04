@@ -164,10 +164,10 @@ fn final_recovery_redemption_below_par_with_insurance_cover() {
 			16,
 		));
 		assert_eq!(pusd_balance(&redeemer), 0);
-		// The value first floors to 2,666,666,666 pUSD base units, that is
-		// 2,666.67 pUSD. At 2 pUSD/WND, the result is 1,333,333,333 × 1e6 planck.
+		// 3,000 of the 9,000 pUSD market debt buys a third of the 4,000 WND,
+		// floored to the planck.
 		let partial_out = native_balance(&redeemer) - get_native_ed();
-		assert_eq!(partial_out, 1_333_333_333_000_000);
+		assert_eq!(partial_out, 1_333_333_333_333_333);
 
 		// Full settlement: the remaining 6,000 pUSD takes all collateral and burns the cover.
 		let deposit_held_before = vault_deposit_on_hold(&get_native_id(), &parked_owner);
