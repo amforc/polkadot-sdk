@@ -8,6 +8,9 @@
 //! liquidation proceeds without the optional contribution. The keeper's collateral legs — the
 //! compensation and the JIT share — are dropped the same way when the keeper's account cannot
 //! receive them.
+//!
+//! Final-recovery entry prices its keeper through the same seizure, so resolving an unsafe vault
+//! pays the same whichever path the market leaves open.
 
 use crate::{
 	context::VaultOp,
@@ -345,7 +348,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	// Whether the keeper's account could take a payout of already-existing collateral.
-	fn keeper_can_be_paid(
+	pub(crate) fn keeper_can_be_paid(
 		collateral_id: &CollateralIdOf<T>,
 		keeper: &T::AccountId,
 		amount: BalanceOf<T>,
@@ -581,6 +584,27 @@ fn plan<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	Some(LiquidationPlan { debt, collateral, seized, keeper_reward, owner_surplus })
 }
 
+/// The keeper compensation for moving the last eligible vault into final recovery: what the
+/// liquidation this vault would have had, were it not the last one, pays its keeper.
+///
+/// The whole debt is priced as one pool offset. The real split is unknowable at entry, and
+/// `offset_penalty` is the bound the keeper terms are validated against, so the reward stays
+/// inside what liquidation itself honors.
+pub(crate) fn final_recovery_keeper_reward<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
+	collateral: Balance,
+	debt: Balance,
+	price: FixedU128,
+	config: &LiquidationConfig<Balance>,
+) -> Option<Balance> {
+	let debt = LiquidationSplit {
+		active_pool: debt,
+		keeper_jit: Balance::zero(),
+		pending_pool: Balance::zero(),
+		redistribution: Balance::zero(),
+	};
+	Some(plan(collateral, debt, price, config)?.keeper_reward)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -690,6 +714,44 @@ mod tests {
 		assert_eq!(reward(5_000, Permill::zero(), 10_000, 29, 584), Some(29));
 		// Percent contributes above the flat: 100 + floor(10% of 500) = 150.
 		assert_eq!(reward(100, Permill::from_percent(10), 10_000, 10_000, 500), Some(150));
+	}
+
+	// The final-recovery entry reward on every bound it can take.
+	#[test]
+	fn final_recovery_reward_takes_the_binding_minimum() {
+		let mut terms = config();
+		terms.keeper_flat_compensation_value = 10;
+		terms.keeper_percent_compensation = Permill::from_percent(1);
+		terms.keeper_compensation_cap_value = 10_000;
+		let one = FixedU128::one();
+		let cases = [
+			// Flat plus percent binds: 10 + floor(1% of 525) = 15.
+			(600, 500, one, terms, 15),
+			// Below par the seized lot is the whole collateral: 10 + floor(1% of 400) = 14.
+			(400, 500, one, terms, 14),
+			// The cap binds.
+			(600, 500, one, LiquidationConfig { keeper_compensation_cap_value: 12, ..terms }, 12),
+			// The penalty this vault carries (25) binds on terms sized for a larger debt.
+			(
+				600,
+				500,
+				one,
+				LiquidationConfig {
+					keeper_flat_compensation_value: 100,
+					keeper_percent_compensation: Permill::from_percent(10),
+					..terms
+				},
+				25,
+			),
+			// Values convert at the price: flat ceil(10 / 0.1) = 100, plus floor(1% of 1_000).
+			(1_000, 501, FixedU128::from_rational(1, 10), terms, 110),
+		];
+		for (collateral, debt, price, policy, expected) in cases {
+			assert_eq!(
+				final_recovery_keeper_reward(collateral, debt, price, &policy),
+				Some(expected)
+			);
+		}
 	}
 
 	// Separate penalties must make redistribution harsher than an offset. Zero penalties must

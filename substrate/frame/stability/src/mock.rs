@@ -602,6 +602,7 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(400u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
+		final_recovery_reward_cooldown: 3_600 * 1_000,
 		liquidation: pallet_vaults::LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			// The keeper is paid out of the offset penalty, which on the smallest
@@ -624,6 +625,16 @@ pub fn branch_config_for(stable: StableId) -> pallet_vaults::BranchConfig<Balanc
 	let stable_minimum = <Assets as FungiblesInspect<AccountId>>::minimum_balance(stable);
 	let config = default_branch_config();
 	pallet_vaults::BranchConfig { minimum_debt: config.minimum_debt.max(stable_minimum), ..config }
+}
+
+/// Keeper terms that make no just-in-time contribution.
+pub const NO_JIT: pallet_vaults::JitTerms<Balance> =
+	pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 };
+
+/// Liquidates the vault of `owner` in the `collateral`/[`STABLE`] branch, signed by `keeper`, with
+/// [`NO_JIT`] terms.
+pub fn liquidate(keeper: AccountId, collateral: AssetId, owner: AccountId) -> DispatchResult {
+	Vaults::liquidate(RuntimeOrigin::signed(keeper), collateral, STABLE, owner, NO_JIT)
 }
 
 /// Creates the `collateral`/[`STABLE`] branch as `origin`, with the default admins, branch
@@ -1199,7 +1210,12 @@ pub fn enter_final_recovery(
 	stable: StableId,
 	owner: AccountId,
 ) -> DispatchResult {
-	Vaults::enter_final_recovery(RuntimeOrigin::signed(99), collateral, stable, owner)
+	without_post_info(Vaults::enter_final_recovery(
+		RuntimeOrigin::signed(99),
+		collateral,
+		stable,
+		owner,
+	))
 }
 
 /// The stored debt of a vault, principal and settled interest together. Zero if it is absent.
