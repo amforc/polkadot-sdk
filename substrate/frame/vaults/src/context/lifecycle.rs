@@ -37,8 +37,7 @@ impl<T: Config> VaultOp<T> {
 
 	/// Returns the current values needed for one redemption step.
 	pub(crate) fn redemption_snapshot(&self) -> RedemptionStepSnapshot<BalanceOf<T>> {
-		self.vault
-			.redemption_snapshot(self.status, self.ctx.config.redistribution_penalty)
+		self.vault.redemption_snapshot(self.status, &self.ctx.config)
 	}
 
 	/// Moves a dormant vault back to the rate list.

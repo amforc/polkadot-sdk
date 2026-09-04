@@ -160,9 +160,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 	) -> Result<RedemptionStepSnapshot<BalanceOf<T>>, DispatchError> {
 		let draft = Self::touched_vault_draft(collateral_id, stable_id, owner)?;
 		ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
-		Ok(draft
-			.vault
-			.redemption_snapshot(draft.status, draft.config.redistribution_penalty))
+		Ok(draft.vault.redemption_snapshot(draft.status, &draft.config))
 	}
 
 	#[transactional]

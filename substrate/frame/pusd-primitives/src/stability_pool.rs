@@ -23,7 +23,7 @@ pub struct OffsetLegs<T> {
 ///
 /// Valid offset amounts do not form a contiguous range. Full depletion is always valid.
 /// A partial offset must not leave a remainder below the pool minimum.
-/// It also must not leave the stablecoin account in its minimum-balance dead zone.
+/// It also must not leave the stablecoin account holding less than its minimum balance.
 /// Thus, each limit depends on the requested debt.
 pub trait StabilityPoolInspect<CollateralId, StableId, Balance> {
 	/// Returns the active-pool debt that the pool can cancel, up to `max_debt`.
