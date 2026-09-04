@@ -383,6 +383,7 @@ impl<Balance: Ord + Saturating + Copy + Zero + One> Vault<Balance> {
 			collateral: self.collateral,
 			redistribution_penalty: config.redistribution_penalty,
 			initial_collateralization_ratio: config.initial_collateralization_ratio,
+			minimum_debt: config.minimum_debt,
 		}
 	}
 }

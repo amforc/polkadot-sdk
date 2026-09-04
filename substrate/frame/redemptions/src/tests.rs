@@ -1092,6 +1092,31 @@ fn recovery_settlement_stops_above_icr() {
 	});
 }
 
+/// A sub-minimum head past the gate may be unable to exit while another vault
+/// holds the Dormant slot, so it stays settleable, at face value.
+#[test]
+fn sub_minimum_head_past_the_exit_gate_settles_at_face_value() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(52u128, 100u128));
+		mint_stable(PUSD, 3, 1_000_000);
+		let debt = vault_debt(DOT, PUSD, 1);
+		assert_ok!(redeem(3, DOT, PUSD, debt - 150, 0, 4, 0));
+		assert_eq!(vault_debt(DOT, PUSD, 1), 150);
+
+		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		assert_eq!(preview_offset(100), Ok(RecoveryOffsetQuote::Available { debt: 100 }));
+		let recipient_before = collateral_balance(DOT, 4);
+		let fee_before = Assets::balance(PUSD, FEE_DEST);
+		assert_ok!(redeem(3, DOT, PUSD, 100, 0, 4, 0));
+		// No bonus: floor(100 / 1.25) = 80, and no fee.
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 80);
+		assert_eq!(Assets::balance(PUSD, FEE_DEST), fee_before);
+		assert_eq!(vault_debt(DOT, PUSD, 1), 50);
+		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
+	});
+}
+
 #[test]
 fn recovery_has_priority_over_ordinary_vaults() {
 	build_and_execute(|| {
@@ -1224,6 +1249,7 @@ fn partial_fill_with_zero_market_cancel_debt_pays_no_cover() {
 			collateral: 100,
 			redistribution_penalty: Permill::zero(),
 			initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
+			minimum_debt: 200,
 		};
 		// A zero budget selects the partial branch after collateral value floors to zero.
 		mint_stable(PUSD, insurance_account(PUSD), 400);
