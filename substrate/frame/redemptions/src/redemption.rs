@@ -150,16 +150,14 @@ impl<T: Config> Pallet<T> {
 			Self::reducible_stable(context.stable_id, context.redeemer, Preservation::Expendable);
 		let budget = terms.max_stable_to_spend.min(expendable);
 		let plan =
-			Self::price_recovery(context.stable_id, &snapshot, context.price, budget, config)
-				.ok_or(Error::<T>::NoRedeemableVault)?;
+			Self::price_recovery(context.stable_id, &snapshot, context.price, budget, config)?;
 		let (plan, preservation) = if plan.debt().is_zero() {
 			(plan, None)
 		} else {
 			let (funded, preservation) =
 				Self::fundable_budget(context.stable_id, context.redeemer, plan.debt())?;
 			let plan = if funded < plan.debt() {
-				Self::price_recovery(context.stable_id, &snapshot, context.price, funded, config)
-					.ok_or(Error::<T>::NoRedeemableVault)?
+				Self::price_recovery(context.stable_id, &snapshot, context.price, funded, config)?
 			} else {
 				plan
 			};
@@ -515,9 +513,11 @@ impl<T: Config> Pallet<T> {
 				inputs.price,
 				max_stable_to_spend,
 				&inputs.config,
-			)
-			.filter(|plan| !plan.debt().is_zero() || !plan.insurance_cover().is_zero())
-			.ok_or(Error::<T>::NoRedeemableVault)?;
+			)?;
+			ensure!(
+				!plan.debt().is_zero() || !plan.insurance_cover().is_zero(),
+				Error::<T>::NoRedeemableVault
+			);
 			return Ok(RedemptionQuoteOf::<T> {
 				debt_cancelled: plan.debt(),
 				collateral_out: plan.collateral(),

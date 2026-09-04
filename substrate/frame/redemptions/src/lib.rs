@@ -242,6 +242,8 @@ pub mod pallet {
 		BelowMinimumRedemptionAmount,
 		/// No redeemable vault made any progress.
 		NoRedeemableVault,
+		/// The `FinalRecovery` head is above ICR: call `exit_final_recovery`, then redeem.
+		FinalRecoveryExitRequired,
 		/// Output collateral fell short of `min_collateral_out`.
 		SlippageExceeded,
 		/// The redeemer cannot cover the stable asset the redemption requires.
@@ -285,7 +287,8 @@ pub mod pallet {
 		/// to guard against state changes after the quote.
 		///
 		/// Validation, oracle, and vault-projection failures are returned to the caller. An
-		/// empty or blocked queue returns [`Error::NoRedeemableVault`].
+		/// empty or blocked queue returns [`Error::NoRedeemableVault`]; a `FinalRecovery` head
+		/// above ICR returns [`Error::FinalRecoveryExitRequired`].
 		pub fn preview_redeem(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
