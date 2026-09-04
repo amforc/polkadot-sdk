@@ -18,6 +18,7 @@
 //!
 //! Vaults are ordered by rate for redemptions. Lower-rate vaults are redeemed first. A final
 //! recovery queue is served before the rate list when a market has only one eligible vault left.
+//! Moving that vault into recovery pays the keeper what liquidating it would have paid.
 //!
 //! A market may enter safety mode when its total collateral ratio is low. It may also be frozen by
 //! an administrator or when its oracle price is unavailable.
@@ -619,6 +620,20 @@ pub mod pallet {
 			/// Debt and collateral allocated through the liquidation waterfall.
 			outcome: LiquidationOutcome<BalanceOf<T>>,
 		},
+		/// The last eligible vault entered final recovery.
+		VaultEnteredFinalRecovery {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Owner of the recovering vault.
+			owner: T::AccountId,
+			/// Account that moved the vault into final recovery.
+			keeper: T::AccountId,
+			/// Collateral paid to the keeper out of the vault. Zero for a re-entry inside the
+			/// market's reward cooldown, or when the keeper's account cannot receive it.
+			keeper_reward: BalanceOf<T>,
+		},
 	}
 
 	#[pallet::error]
@@ -711,7 +726,7 @@ pub mod pallet {
 		InvalidRedemptionSettlement,
 		/// The last eligible vault cannot be liquidated.
 		///
-		/// Move it into final recovery instead.
+		/// Move it into final recovery instead; that call pays the same keeper compensation.
 		LastVaultCannotBeLiquidated,
 		/// The liquidation would overflow redistribution accounting.
 		RedistributionWouldOverflow,
@@ -1195,9 +1210,9 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
-		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
-			Self::do_enter_final_recovery(owner, collateral_id, stable_id)
+		) -> DispatchResultWithPostInfo {
+			let keeper = ensure_signed(origin)?;
+			Self::do_enter_final_recovery(keeper, owner, collateral_id, stable_id)
 		}
 
 		/// Removes a safe vault from final recovery.
@@ -1428,7 +1443,8 @@ pub mod pallet {
 		/// Must be signed by the keeper executing the liquidation.
 		///
 		/// The vault must be below the market's minimum collateralization ratio and must not be
-		/// the market's last eligible vault.
+		/// the market's last eligible vault. That vault enters final recovery through
+		/// [`Call::enter_final_recovery`] for the same compensation.
 		///
 		/// Active Stability Pool capital is used first, followed by the
 		/// keeper's optional direct contribution, pending pool capital, and

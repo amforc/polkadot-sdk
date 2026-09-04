@@ -73,6 +73,7 @@ fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
 		maximum_borrow_rate: rate(100, 100),
 		upfront_fee_period: 7 * DAY_MS,
 		rate_adjustment_cooldown: DAY_MS,
+		final_recovery_reward_cooldown: ONE_HOUR_MS,
 		liquidation: crate::LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			keeper_flat_compensation_value: balance::<T>(10),
@@ -601,14 +602,24 @@ mod benchmarks {
 			asset.clone(),
 			FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
 		);
-		let caller: T::AccountId = whitelisted_caller();
+		// A funded keeper can receive the entry reward, so the payout leg is measured.
+		let caller = funded_account::<T>("keeper", &asset)?;
+		let caller_before = <T::CollateralAssets as FungiblesInspect<T::AccountId>>::balance(
+			asset.clone(),
+			&caller,
+		);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone());
+		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), owner.clone());
 
 		assert_eq!(
-			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
+			Pallet::<T>::vault_status(asset.clone(), stable::<T>(), owner),
 			Some(VaultStatus::FinalRecovery)
+		);
+		assert!(
+			<T::CollateralAssets as FungiblesInspect<T::AccountId>>::balance(asset, &caller) >
+				caller_before,
+			"the entry paid its keeper"
 		);
 		Ok(())
 	}

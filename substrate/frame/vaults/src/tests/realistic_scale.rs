@@ -317,6 +317,30 @@ fn liquidation_plans_out_a_sub_ed_keeper_leg() {
 	});
 }
 
+// The entry reward is a keeper leg like any other: one a fresh keeper cannot receive is planned
+// out, the vault still enters recovery, and it keeps the collateral for its settlement.
+#[test]
+fn final_recovery_entry_plans_out_a_sub_ed_keeper_reward() {
+	build_and_execute(|| {
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		crash_price_with_flat_keeper_value(500);
+
+		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+		assert_ok!(Vaults::enter_final_recovery(RuntimeOrigin::signed(998), XBT, USDX, 1));
+		assert!(Vaults::vault_status(XBT, USDX, 1).expect("status").is_final_recovery());
+		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper stayed unpaid");
+		assert_eq!(vault(1).collateral, 1_000 * XBT_UNIT, "the vault kept its collateral");
+		System::assert_has_event(RuntimeEvent::Vaults(Event::VaultEnteredFinalRecovery {
+			collateral_id: XBT,
+			stable_id: USDX,
+			owner: 1,
+			keeper: 998,
+			keeper_reward: 0,
+		}));
+	});
+}
+
 // The JIT collateral share is the keeper's other collateral leg and follows the same rule: a
 // share a fresh keeper cannot receive drops the trade instead of failing the liquidation, and
 // the keeper's stablecoin stays untouched. The minimum contribution buys a share of ~2×10^5

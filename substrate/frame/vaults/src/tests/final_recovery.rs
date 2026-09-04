@@ -4,8 +4,19 @@ use crate::{
 	mock::*,
 	tests::{rate_pct, vault_status},
 };
+use frame::prelude::Pays;
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::VaultInterface;
+
+/// Signs every fixture entry. It has no genesis balance, so its collateral is exactly what
+/// recovery entries paid it.
+const KEEPER: AccountId = 99;
+
+/// What [`enter_recovery`] pays its keeper, priced as the pool-covered liquidation of the
+/// fixture vault: 501 of debt at 5% seizes up to 5_270 at the crash price, so the whole 1_000
+/// is seized, and the 10 flat converts to 100 plus 0.1% of the lot. The 260 penalty budget and
+/// the cap are both larger.
+const ENTRY_REWARD: Balance = 101;
 
 fn low_recovery_price() -> FixedU128 {
 	FixedU128::from_rational(1u128, 10u128)
@@ -16,11 +27,21 @@ fn enter_recovery(who: AccountId, rate: FixedU128) {
 	assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate));
 	set_price(DOT, low_recovery_price());
 	assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
-		RuntimeOrigin::signed(99),
+		RuntimeOrigin::signed(KEEPER),
 		DOT,
 		PUSD,
 		who
 	));
+}
+
+fn entered_event(owner: AccountId, keeper: AccountId, keeper_reward: Balance) -> RuntimeEvent {
+	RuntimeEvent::Vaults(crate::Event::VaultEnteredFinalRecovery {
+		collateral_id: DOT,
+		stable_id: PUSD,
+		owner,
+		keeper,
+		keeper_reward,
+	})
 }
 
 #[test]
@@ -41,6 +62,194 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 				.map(|(owner, _status)| owner),
 			Some(1)
 		);
+		// The timestamp and cooldown apply to the market. Thus, only the first entry pays.
+		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
+		assert_eq!(
+			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
+			Some(Timestamp::get())
+		);
+	});
+}
+
+#[test]
+fn enter_final_recovery_is_an_idempotent_noop() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			true
+		));
+
+		let queue_before = crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10);
+		let vault_before = vault(DOT, PUSD, 1);
+		let branch_before = branch_state(DOT, PUSD);
+		let issuance_before = total_stable(PUSD);
+		let keeper_before = collateral_balance(DOT, KEEPER);
+		let events_before = System::events();
+
+		let post_info = crate::Pallet::<Test>::enter_final_recovery(
+			RuntimeOrigin::signed(KEEPER),
+			DOT,
+			PUSD,
+			1,
+		)
+		.expect("a no-op succeeds");
+
+		// Nothing moved, so the caller is neither paid nor excused the fee.
+		assert_eq!(post_info.pays_fee, Pays::Yes);
+		assert_eq!(collateral_balance(DOT, KEEPER), keeper_before);
+		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), queue_before);
+		assert_eq!(vault(DOT, PUSD, 1), vault_before);
+		assert_eq!(branch_state(DOT, PUSD), branch_before);
+		assert_eq!(total_stable(PUSD), issuance_before);
+		assert_eq!(System::events(), events_before);
+	});
+}
+
+// Entering final recovery is the resolution a liquidation could not deliver, so it pays the
+// keeper the liquidation reward out of the vault, and the vault keeps only the rest.
+#[test]
+fn final_recovery_entry_pays_the_keeper_from_the_vault() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_eq!(collateral_balance(DOT, KEEPER), 0, "keeper is fresh");
+
+		enter_recovery(1, rate_pct(5, 100));
+
+		let remaining = 1_000 - ENTRY_REWARD;
+		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
+		let vault = vault(DOT, PUSD, 1);
+		assert_eq!(vault.collateral, remaining);
+		assert_eq!(held(DOT, 1), remaining);
+		assert_eq!(vault.redistribution_stake, 0);
+		let state = branch_state(DOT, PUSD).expect("state");
+		assert_eq!(state.total_collateral, remaining);
+		assert_eq!(state.stakes.total, 0);
+		assert_eq!(state.stakes.collateral_basis, 0);
+		System::assert_has_event(entered_event(1, KEEPER, ENTRY_REWARD));
+		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultStatusChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			old_status: crate::types::VaultStatus::Active,
+			new_status: crate::types::VaultStatus::FinalRecovery,
+		}));
+	});
+}
+
+// A keeper that meets `LastVaultCannotBeLiquidated` loses nothing by switching calls: the two
+// resolutions of identical vaults pay identical rewards.
+#[test]
+fn final_recovery_entry_pays_what_liquidation_pays() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		// The pool covers the first liquidation whole, so nothing redistributes onto vault 2.
+		ActiveSpCapacity::set(1_000);
+		set_price(DOT, low_recovery_price());
+		let liquidator_before = collateral_balance(DOT, 3);
+		let entrant_before = collateral_balance(DOT, 4);
+
+		assert_ok!(liquidate(3, DOT, PUSD, 1, 0, 0));
+		let post_info =
+			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(4), DOT, PUSD, 2)
+				.expect("last vault enters recovery");
+
+		let liquidation_reward = System::events()
+			.into_iter()
+			.find_map(|record| match record.event {
+				RuntimeEvent::Vaults(crate::Event::VaultLiquidated { outcome, .. }) => {
+					Some(outcome.keeper_reward)
+				},
+				_ => None,
+			})
+			.expect("vault 1 liquidated");
+		assert_eq!(liquidation_reward, ENTRY_REWARD);
+		assert_eq!(collateral_balance(DOT, 3) - liquidator_before, liquidation_reward);
+		assert_eq!(collateral_balance(DOT, 4) - entrant_before, liquidation_reward);
+		assert_eq!(post_info.pays_fee, Pays::No);
+		System::assert_has_event(entered_event(2, 4, ENTRY_REWARD));
+	});
+}
+
+// Exit is permissionless and unpaid. Without a cooldown, a caller can repeatedly move a vault
+// across the MCR and collect rewards. Every entry resets the market cooldown, including an unpaid
+// entry.
+#[test]
+fn final_recovery_reward_cooldown_blocks_flipping() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
+		let first_entry = branch_state(DOT, PUSD)
+			.expect("state")
+			.last_final_recovery_entry
+			.expect("stamped");
+		let cooldown = branch_config(DOT, PUSD).expect("config").final_recovery_reward_cooldown;
+		let flip = |keeper: AccountId| {
+			set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+			assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
+				RuntimeOrigin::signed(keeper),
+				DOT,
+				PUSD,
+				1,
+				Position::endpoints_only()
+			));
+			set_price(DOT, low_recovery_price());
+			crate::Pallet::<Test>::enter_final_recovery(RuntimeOrigin::signed(keeper), DOT, PUSD, 1)
+				.expect("eligible entry succeeds")
+		};
+
+		// Inside the cooldown the flip moves the vault, stays fee-free, and pays nothing.
+		advance_time(cooldown / 2);
+		let post_info = flip(KEEPER);
+		assert_eq!(post_info.pays_fee, Pays::No);
+		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
+		System::assert_has_event(entered_event(1, KEEPER, 0));
+		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
+		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD);
+		assert_eq!(
+			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
+			Some(first_entry + cooldown / 2)
+		);
+
+		// One cooldown from the first entry is not sufficient. The first unpaid entry reset the
+		// timestamp. This second unpaid entry resets it again.
+		advance_time(cooldown / 2);
+		flip(KEEPER);
+		System::assert_has_event(entered_event(1, KEEPER, 0));
+		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
+		assert_eq!(
+			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
+			Some(first_entry + cooldown)
+		);
+
+		// Once the cooldown elapses a re-entry pays again, priced on what the vault still holds:
+		// the flat 100 plus 0.1% of 899, which rounds to nothing.
+		advance_time(cooldown);
+		flip(KEEPER);
+		System::assert_has_event(entered_event(1, KEEPER, 100));
+		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD + 100);
+		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD - 100);
+		assert_eq!(
+			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
+			Some(first_entry + 2 * cooldown)
+		);
+
+		// A market may switch the protection off, after which every entry pays.
+		assert_ok!(crate::Pallet::<Test>::set_param(
+			RuntimeOrigin::signed(ADMIN),
+			DOT,
+			PUSD,
+			crate::types::BranchConfigUpdate::FinalRecoveryRewardCooldown(0)
+		));
+		flip(KEEPER);
+		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD + 100 + 100);
 	});
 }
 
@@ -239,13 +448,19 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 		}));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		// The redemption prices the collateral the entry reward left: 501 of debt at 10 takes 50.
+		let residual = 1_000 - ENTRY_REWARD - 50;
 		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.debt.total(), 0);
-		assert_eq!(vault.collateral, 950);
-		assert_eq!(held(DOT, 1), 950, "the residual stays held until the owner closes the husk");
-		assert_eq!(vault.redistribution_stake, 950);
+		assert_eq!(vault.collateral, residual);
+		assert_eq!(
+			held(DOT, 1),
+			residual,
+			"the residual stays held until the owner closes the husk"
+		);
+		assert_eq!(vault.redistribution_stake, residual);
 		let state = branch_state(DOT, PUSD).expect("state");
-		assert_eq!(state.stakes.total, 950);
+		assert_eq!(state.stakes.total, residual);
 		assert_eq!(state.debt.minted_interest, 0);
 	});
 }
@@ -344,7 +559,8 @@ fn final_recovery_repayment_then_exit_rejoins_rate_index() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		enter_recovery(1, rate_pct(5, 100));
-		// 1_000 of collateral at 0.5 is worth 500 against 501 of debt: still below the 110% MCR.
+		// The 899 of collateral left after the entry reward is worth 449 at 0.5 against 501 of
+		// debt: still below the 110% MCR.
 		set_price(DOT, FixedU128::from_rational(1u128, 2u128));
 		assert_noop!(
 			crate::Pallet::<Test>::exit_final_recovery(
@@ -357,7 +573,7 @@ fn final_recovery_repayment_then_exit_rejoins_rate_index() {
 			crate::Error::<Test>::CollateralizationRatioTooLow
 		);
 
-		// 500 of value over 301 of debt clears the MCR.
+		// 449 of value over 301 of debt clears the MCR.
 		assert_ok!(crate::Pallet::<Test>::repay_for(
 			RuntimeOrigin::signed(1),
 			DOT,
@@ -400,12 +616,17 @@ fn final_recovery_full_repayment_leaves_dormant_husk() {
 		}));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		let residual = 1_000 - ENTRY_REWARD;
 		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.debt.total(), 0);
-		assert_eq!(vault.collateral, 1_000);
-		assert_eq!(held(DOT, 1), 1_000, "the residual stays held until the owner closes the husk");
-		assert_eq!(vault.redistribution_stake, 1_000);
-		assert_eq!(branch_state(DOT, PUSD).expect("state").stakes.total, 1_000);
+		assert_eq!(vault.collateral, residual);
+		assert_eq!(
+			held(DOT, 1),
+			residual,
+			"the residual stays held until the owner closes the husk"
+		);
+		assert_eq!(vault.redistribution_stake, residual);
+		assert_eq!(branch_state(DOT, PUSD).expect("state").stakes.total, residual);
 		assert!(vault_exists(DOT, PUSD, 1), "a husk with collateral is not closed");
 	});
 }
@@ -431,7 +652,7 @@ fn frozen_branch_accepts_deposit_into_final_recovery_vault() {
 			10_000
 		));
 
-		assert_eq!(held(DOT, 1), 11_000);
+		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD + 10_000);
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
 		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, 0);
 	});
@@ -532,7 +753,7 @@ fn deposit_into_final_recovery_keeps_stake_zero() {
 		let after = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(after.stakes.total, before.stakes.total);
 		assert_eq!(after.total_collateral, before.total_collateral + 10_000);
-		assert_eq!(held(DOT, 1), 1_000 + 10_000);
+		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD + 10_000);
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
 	});
 }
@@ -617,7 +838,7 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 		));
 		set_price(DOT, low_recovery_price());
 		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
-			RuntimeOrigin::signed(99),
+			RuntimeOrigin::signed(KEEPER),
 			DOT,
 			PUSD,
 			1

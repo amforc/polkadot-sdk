@@ -491,6 +491,7 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(100u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
+		final_recovery_reward_cooldown: 3_600 * 1_000,
 		liquidation: pallet_vaults::LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			// The keeper is paid out of the offset penalty, which on the smallest
@@ -535,6 +536,16 @@ pub fn registration_config(
 	let redemption_config = (!pallet_redemptions::RedemptionConfigs::<Test>::contains_key(stable))
 		.then(default_redemption_config);
 	(redemption_config, default_pool_config())
+}
+
+/// [`default_branch_config`] with keeper compensation off, for tests that settle a
+/// final-recovery head. Entry pays the keeper out of the head's collateral, and these tests
+/// price the settlement of a collateral they state up front.
+pub fn recovery_branch_config() -> pallet_vaults::BranchConfig<Balance> {
+	let mut config = default_branch_config();
+	config.liquidation.keeper_flat_compensation_value = 0;
+	config.liquidation.keeper_percent_compensation = Permill::zero();
+	config
 }
 
 /// Registers a market at a price of 1.25 and a debt ceiling high enough never to bind.
@@ -963,6 +974,8 @@ pub fn enter_final_recovery(
 	owner: AccountId,
 ) -> DispatchResult {
 	Vaults::enter_final_recovery(RuntimeOrigin::signed(99), collateral, stable, owner)
+		.map(|_post_info| ())
+		.map_err(|error| error.error)
 }
 
 /// The stored debt of a vault, principal and settled interest together. Zero if it is absent.

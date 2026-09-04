@@ -634,6 +634,7 @@ pub fn default_branch_config() -> BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(400u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
+		final_recovery_reward_cooldown: 3_600 * 1_000,
 		liquidation: LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			// The keeper is paid out of the offset penalty, which on the smallest

@@ -2726,6 +2726,10 @@ fn final_recovery_redemption_above_par_pays_the_capped_bonus() {
 		config.initial_collateralization_ratio = FixedU128::from_rational(140u128, 100u128);
 		config.safety_collateralization_ratio = FixedU128::from_rational(150u128, 100u128);
 		config.liquidation.redistribution_penalty = Permill::from_percent(10);
+		// Keeper terms stay on here, so the settlement below prices the collateral the entry
+		// reward left in the vault.
+		config.liquidation.keeper_flat_compensation_value = 10;
+		config.liquidation.keeper_percent_compensation = Permill::from_rational(1u32, 1_000u32);
 		register_branch(DOT, PUSD, config);
 
 		// The test opens above the 140% ICR and then sets 1 DOT = 2 pUSD. At this price, 6_000 DOT
@@ -2733,7 +2737,11 @@ fn final_recovery_redemption_above_par_pays_the_capped_bonus() {
 		set_price(DOT, FixedU128::from_rational(4, 1));
 		assert_ok!(open(1, DOT, PUSD, 6_000 * UNIT, 10_000 * UNIT, rate_pct(1, 1_000)));
 		set_price(DOT, FixedU128::from_rational(2, 1));
+		// The keeper terms are in raw units, so the entry pays its keeper the cap: a 10_000 value
+		// is 5_000 units, or 5 DOT, at 2. The 5-unit flat plus 0.1% of the 5_250_000-unit
+		// seizure would be more.
 		assert_ok!(enter_final_recovery(DOT, PUSD, 1));
+		assert_eq!(held(DOT, 1), 6_000 * UNIT - 5_000);
 
 		mint_stable(PUSD, 3, 1_000_000 * UNIT);
 		let recipient_before = collateral_balance(DOT, 4);
@@ -2745,7 +2753,7 @@ fn final_recovery_redemption_above_par_pays_the_capped_bonus() {
 		// 2_000 * 1.10 = 2_200 pUSD of value, or 1_100 DOT.
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 1_100 * UNIT);
 		assert_eq!(vault_debt(DOT, PUSD, 1), 8_000 * UNIT);
-		assert_eq!(held(DOT, 1), 4_900 * UNIT);
+		assert_eq!(held(DOT, 1), 4_900 * UNIT - 5_000);
 		// Recovery redemptions are fee-free.
 		assert_eq!(Assets::balance(PUSD, FEE_DEST), fee_before);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
