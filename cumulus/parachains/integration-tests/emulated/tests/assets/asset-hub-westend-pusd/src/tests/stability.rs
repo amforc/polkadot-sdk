@@ -89,7 +89,8 @@ fn deposit_row(who: &AccountId) -> pallet_stability::types::Deposit<Balance> {
 fn incoming_deposit_recovery_offset_accepted() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
-		create_branch(&liquidation_spec());
+		// Zero keeper terms: the entry reward would otherwise leave the parked collateral.
+		create_branch(&accounting_spec());
 		// 3,000 WND = 6,000 pUSD value against 5,000 pUSD debt at 2: CR 120%.
 		let parked_owner = acct(1);
 		open_vault(&parked_owner, 3_000 * WND, 5_000 * PUSD, FixedU128::zero());
@@ -126,7 +127,7 @@ fn incoming_deposit_recovery_offset_accepted() {
 fn incoming_deposit_rejected_below_par() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
-		create_branch(&liquidation_spec());
+		create_branch(&accounting_spec());
 		// 2,000 WND = 4,000 pUSD value against 5,000 pUSD debt at 2: CR 80%.
 		let parked_owner = acct(1);
 		open_vault(&parked_owner, 2_000 * WND, 5_000 * PUSD, FixedU128::zero());
@@ -163,7 +164,7 @@ fn incoming_deposit_rejected_below_par() {
 fn active_pool_recovery_offset_and_realization() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
-		create_branch(&liquidation_spec());
+		create_branch(&accounting_spec());
 		// 3,000 WND = 6,000 pUSD value against 5,000 pUSD debt at 2: CR 120%.
 		let parked_owner = acct(1);
 		open_vault(&parked_owner, 3_000 * WND, 5_000 * PUSD, FixedU128::zero());
