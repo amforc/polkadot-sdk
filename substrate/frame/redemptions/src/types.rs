@@ -11,8 +11,9 @@ pub use pusd_primitives::Millis;
 /// ([`crate::Pallet::preview_recovery_offset`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecoveryOffsetQuote<Balance> {
-	/// No `FinalRecovery` vault is queued: deposits proceed as ordinary
-	/// pending deposits, and active-pool recovery offsets have no target.
+	/// No `FinalRecovery` vault is queued, or the head is exitable: deposits
+	/// proceed as ordinary pending deposits, and active-pool recovery offsets
+	/// have no target.
 	NoTarget,
 	/// The head is below par (`CR < 100%`). Recovery offsets are
 	/// unavailable and new pool deposits must be rejected — settlement at

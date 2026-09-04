@@ -3,7 +3,10 @@
 use crate::{DebtCollateral, VaultStatus};
 use frame::{
 	arithmetic::{One, Saturating, Zero},
-	deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill},
+	deps::{
+		frame_support::pallet_prelude::DispatchError,
+		sp_runtime::{FixedU128, Permill},
+	},
 };
 
 /// Settlement consumed by [`VaultInterface::redeem_step`]. Owning
@@ -31,6 +34,9 @@ pub struct RedemptionStepSnapshot<Balance> {
 	/// Branch redistribution penalty, bounding the recovery bonus. Only
 	/// consulted by `FinalRecovery` pricing.
 	pub redistribution_penalty: Permill,
+	/// Branch ICR, the end of recovery settlement. A `FinalRecovery` vault above
+	/// it is refused settlement and must exit. Only consulted by that pricing.
+	pub initial_collateralization_ratio: FixedU128,
 }
 
 impl<Balance: Copy> RedemptionStepSnapshot<Balance> {

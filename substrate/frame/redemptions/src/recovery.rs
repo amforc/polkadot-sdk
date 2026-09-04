@@ -87,29 +87,36 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		budget: BalanceOf<T>,
 		config: &RedemptionConfigOf<T>,
-	) -> Option<RecoveryPlan<BalanceOf<T>>> {
-		if !snapshot.status.is_final_recovery() {
-			return None;
-		}
+	) -> Result<RecoveryPlan<BalanceOf<T>>, Error<T>> {
+		ensure!(snapshot.status.is_final_recovery(), Error::<T>::NoRedeemableVault);
 
 		let ratio = match pusd_primitives::collateralization_ratio(&snapshot.position(), price) {
 			Ok(CollateralRatio::Ratio(ratio)) => ratio,
 			// A head without debt has nothing to settle, and an overflowing ratio gets no plan.
-			Ok(CollateralRatio::DebtFree) | Err(_) => return None,
+			Ok(CollateralRatio::DebtFree) | Err(_) => return Err(Error::<T>::NoRedeemableVault),
 		};
-		if ratio >= FixedU128::one() {
-			let bonus = recovery_pricing::recovery_bonus(
-				ratio,
-				config.final_recovery_bonus_buffer,
-				snapshot.redistribution_penalty,
-			);
-			let debt = snapshot.size_within(budget);
-			let collateral = recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)?
-				.min(snapshot.collateral);
-			return Some(RecoveryPlan::AbovePar { debt, collateral });
-		}
+		// The bonus keeps settlement attractive past MCR, so redeemers push the head up to ICR
+		// and it exits with the buffer a borrower opens with rather than one tick above the
+		// liquidation line. Above ICR only the exit remains.
+		ensure!(
+			ratio <= snapshot.initial_collateralization_ratio,
+			Error::<T>::FinalRecoveryExitRequired
+		);
 
-		Self::price_below_par(stable_id, snapshot, price, budget)
+		if ratio < FixedU128::one() {
+			return Self::price_below_par(stable_id, snapshot, price, budget)
+				.ok_or(Error::<T>::NoRedeemableVault);
+		}
+		let bonus = recovery_pricing::recovery_bonus(
+			ratio,
+			config.final_recovery_bonus_buffer,
+			snapshot.redistribution_penalty,
+		);
+		let debt = snapshot.size_within(budget);
+		let collateral = recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)
+			.ok_or(Error::<T>::NoRedeemableVault)?
+			.min(snapshot.collateral);
+		Ok(RecoveryPlan::AbovePar { debt, collateral })
 	}
 
 	/// Returns `None` if a calculation overflows.
@@ -219,10 +226,14 @@ impl<T: Config> Pallet<T> {
 		let snapshot = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?;
 		let plan = Self::price_recovery(stable_id, &snapshot, price, max_debt_to_cancel, &config);
 		Ok(match plan {
-			None => OffsetDecision::NoTarget,
-			Some(RecoveryPlan::BelowPar { .. }) => OffsetDecision::BelowPar,
-			Some(RecoveryPlan::AbovePar { debt, .. }) if debt.is_zero() => OffsetDecision::NoTarget,
-			Some(RecoveryPlan::AbovePar { debt, collateral }) => {
+			// An unpriceable or exitable head is no offset target; the pool sees an empty FIFO.
+			Err(Error::<T>::NoRedeemableVault | Error::<T>::FinalRecoveryExitRequired) => {
+				OffsetDecision::NoTarget
+			},
+			Err(error) => return Err(error.into()),
+			Ok(RecoveryPlan::BelowPar { .. }) => OffsetDecision::BelowPar,
+			Ok(RecoveryPlan::AbovePar { debt, .. }) if debt.is_zero() => OffsetDecision::NoTarget,
+			Ok(RecoveryPlan::AbovePar { debt, collateral }) => {
 				OffsetDecision::Available { owner, debt, collateral }
 			},
 		})
