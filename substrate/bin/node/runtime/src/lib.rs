@@ -60,7 +60,7 @@ use frame_support::{
 			GetSalary, PayFromAccount, PayWithFungibles,
 		},
 		AsEnsureOriginWithArg, ConstBool, ConstU128, ConstU16, ConstU32, ConstU64,
-		ConstantStoragePrice, Contains, Currency, EitherOfDiverse, EnsureOriginWithArg,
+		ConstantStoragePrice, Contains, Currency, EitherOf, EitherOfDiverse, EnsureOriginWithArg,
 		EqualPrivilegeOnly, InsideBoth, InstanceFilter, KeyOwnerProofSystem, LinearStoragePrice,
 		LockIdentifier, Nothing, OnUnbalanced, VariantCountOf, WithdrawReasons,
 	},
@@ -3008,6 +3008,9 @@ mod runtime {
 
 	#[runtime::pallet_index(98)]
 	pub type Redemptions = pallet_redemptions::Pallet<Runtime>;
+
+	#[runtime::pallet_index(99)]
+	pub type Stability = pallet_stability::Pallet<Runtime>;
 }
 
 /// The address format for describing accounts.
@@ -3321,6 +3324,9 @@ fn vaults_oracle_key(collateral_id: &VaultsCollateralId) -> u32 {
 pub type VaultsCollateral =
 	UnionOf<Balances, AssetsHolder, NativeFromLeft, VaultsCollateralId, AccountId>;
 
+pub type StabilityCollateral =
+	UnionOf<Balances, Assets, NativeFromLeft, VaultsCollateralId, AccountId>;
+
 pub type VaultsStableId = u32;
 
 /// Bridges `pallet-oracle` (u32 → u128) to the vault pallet's `ProvidePrice`
@@ -3408,8 +3414,8 @@ impl pallet_vaults::Config for Runtime {
 	type StableAssets = Assets;
 	type Oracle = VaultsOracleAdapter;
 	type FeeAccount = VaultsFeeAccount;
-	type YieldHook = ();
-	type OnBranchLifecycle = Redemptions;
+	type YieldHook = Stability;
+	type OnBranchLifecycle = (Redemptions, Stability);
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
 	type BranchConsideration = HoldConsideration<
@@ -3520,6 +3526,26 @@ impl pallet_redemptions::Config for Runtime {
 	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = RedemptionsBenchmarkHelper;
+}
+
+parameter_types! {
+	pub const StabilityPalletId: PalletId = PalletId(*b"py/stabl");
+}
+
+impl pallet_stability::Config for Runtime {
+	type StableAssets = Assets;
+	type CollateralAssets = StabilityCollateral;
+	type TimeProvider = Timestamp;
+	type BranchModes = Vaults;
+	type RecoveryOffsets = Redemptions;
+	type StableDustHandler = ResolveAssetTo<TreasuryAccount, Assets>;
+	type CollateralDustHandler = ResolveAssetTo<TreasuryAccount, StabilityCollateral>;
+	type UpdateOrigin = EitherOf<
+		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
+		pallet_vaults::EnsureBranchFullAdmin<Runtime>,
+	>;
+	type PalletId = StabilityPalletId;
+	type WeightInfo = ();
 }
 
 #[cfg(feature = "runtime-benchmarks")]

@@ -235,6 +235,11 @@ mod tests {
 		// buffer guarantees the bonus never reaches into CR − 100% itself.
 		let cr = FixedU128::from_rational(101, 100);
 		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::zero());
+		// CR = 100.5% sits inside the buffer band: the raw excess
+		// CR − 100% − buffer would be −0.5%, and the saturating max(0, ·)
+		// clamp yields zero — never a negative bonus.
+		let cr = FixedU128::from_rational(1_005, 1_000);
+		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::zero());
 		// CR = 100% → excess saturates to 0.
 		assert_eq!(recovery_bonus(FixedU128::one(), buffer, penalty), FixedU128::zero());
 		// CR below 100% (an underwater vault) → still 0, no underflow.
