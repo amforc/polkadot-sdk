@@ -75,7 +75,7 @@ impl<T: Config> VaultOp<T> {
 	/// liquidation of it would have paid, out of the vault's collateral.
 	///
 	/// Returns the reward paid. A re-entry inside the market's reward cooldown moves the vault
-	/// but pays nothing, and every entry restarts the cooldown.
+	/// but pays nothing. Only a paid entry restarts the cooldown.
 	pub(crate) fn enter_final_recovery(
 		&mut self,
 		keeper: &T::AccountId,
@@ -88,13 +88,15 @@ impl<T: Config> VaultOp<T> {
 		self.index_remove()?;
 		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
 		self.set_status(VaultStatus::FinalRecovery)?;
-		self.ctx.state.last_final_recovery_entry = Some(self.ctx.now);
 		debug_assert!(self.vault.redistribution_stake.is_zero());
-		if reward_due {
-			self.pay_final_recovery_reward(keeper, price)
-		} else {
-			Ok(BalanceOf::<T>::zero())
+		if !reward_due {
+			return Ok(BalanceOf::<T>::zero());
 		}
+		let reward = self.pay_final_recovery_reward(keeper, price)?;
+		if !reward.is_zero() {
+			self.ctx.state.last_final_recovery_entry = Some(self.ctx.now);
+		}
+		Ok(reward)
 	}
 
 	/// Pays the liquidation reward for this vault to `keeper` from its collateral, or nothing
