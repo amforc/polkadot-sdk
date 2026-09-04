@@ -452,6 +452,8 @@ pub struct BranchConfig<Balance> {
 	pub upfront_fee_period: Millis,
 	/// Minimum time between rate changes that do not charge an upfront fee.
 	pub rate_adjustment_cooldown: Millis,
+	/// Minimum time between a final-recovery entry and the next paid entry in this market.
+	pub final_recovery_reward_cooldown: Millis,
 	/// Penalties, keeper compensation, and direct-JIT limits used during liquidation.
 	pub liquidation: LiquidationConfig<Balance>,
 }
@@ -951,6 +953,8 @@ pub struct BranchState<AccountId, Balance> {
 	pub interest_epoch: Millis,
 	/// Dormant vault that must be redeemed before the rate list.
 	pub dormant_redemption_target: Option<AccountId>,
+	/// Time of the latest final-recovery entry in this market.
+	pub last_final_recovery_entry: Option<Millis>,
 	/// Frozen state, if the market is frozen.
 	pub frozen: Option<FrozenState>,
 }
@@ -969,6 +973,7 @@ impl<AccountId, Balance: Default + Zero> BranchState<AccountId, Balance> {
 			vault_count: 0,
 			interest_epoch: now,
 			dormant_redemption_target: None,
+			last_final_recovery_entry: None,
 			frozen: None,
 		}
 	}
@@ -978,6 +983,20 @@ impl<AccountId, Balance> BranchState<AccountId, Balance> {
 	/// Returns whether the market is frozen.
 	pub const fn is_frozen(&self) -> bool {
 		self.frozen.is_some()
+	}
+
+	/// Returns whether a new final-recovery entry pays its keeper at `now`.
+	pub(crate) const fn final_recovery_reward_due(
+		&self,
+		config: &BranchConfig<Balance>,
+		now: Millis,
+	) -> bool {
+		match self.last_final_recovery_entry {
+			None => true,
+			Some(entered_at) => {
+				now.saturating_sub(entered_at) >= config.final_recovery_reward_cooldown
+			},
+		}
 	}
 
 	/// Returns market interest time at `now`.
@@ -1245,6 +1264,8 @@ pub enum BranchConfigUpdate<Balance> {
 	UpfrontFeePeriod(Millis),
 	/// Sets the rate-change cooldown.
 	RateAdjustmentCooldown(Millis),
+	/// Sets the minimum time between a final-recovery entry and the next paid entry.
+	FinalRecoveryRewardCooldown(Millis),
 	/// Sets the extra collateral seized for debt cancelled by an offset.
 	OffsetPenalty(Permill),
 	/// Sets the flat keeper compensation, in stablecoin value.
@@ -1275,6 +1296,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			},
 			Self::UpfrontFeePeriod(v) => config.upfront_fee_period = v,
 			Self::RateAdjustmentCooldown(v) => config.rate_adjustment_cooldown = v,
+			Self::FinalRecoveryRewardCooldown(v) => config.final_recovery_reward_cooldown = v,
 			Self::OffsetPenalty(v) => config.liquidation.offset_penalty = v,
 			Self::KeeperFlatCompensationValue(v) => {
 				config.liquidation.keeper_flat_compensation_value = v
@@ -1302,6 +1324,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::MinimumCollateral(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
+			Self::FinalRecoveryRewardCooldown(_) |
 			Self::OffsetPenalty(_) |
 			Self::KeeperFlatCompensationValue(_) |
 			Self::KeeperPercentCompensation(_) |
@@ -1333,6 +1356,7 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::MinimumCollateral(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
+			Self::FinalRecoveryRewardCooldown(_) |
 			Self::OffsetPenalty(_) |
 			Self::KeeperFlatCompensationValue(_) |
 			Self::KeeperPercentCompensation(_) |
@@ -1459,6 +1483,7 @@ mod tests {
 			vault_count: 0,
 			interest_epoch: 0,
 			dormant_redemption_target: None,
+			last_final_recovery_entry: None,
 			frozen: None,
 		}
 	}

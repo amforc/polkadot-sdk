@@ -2,7 +2,7 @@
 
 use super::{Commit, VaultOp};
 use crate::{
-	liquidation::LiquidationSnapshot,
+	liquidation::{final_recovery_keeper_reward, LiquidationSnapshot},
 	pallet::{BalanceOf, Config, Error, Event, HoldReason, Pallet},
 	recovery,
 	types::{DebtCollateral, Vault, VaultStatus},
@@ -71,14 +71,72 @@ impl<T: Config> VaultOp<T> {
 			.map_err(|e| Pallet::<T>::map_error(e).into())
 	}
 
-	/// Moves an unsafe last eligible vault into final recovery.
-	pub(crate) fn enter_final_recovery(&mut self) -> DispatchResult {
+	/// Moves an unsafe last eligible vault into final recovery and pays `keeper` what a
+	/// liquidation of it would have paid, out of the vault's collateral.
+	///
+	/// Returns the reward paid. A re-entry inside the market's reward cooldown moves the vault
+	/// but pays nothing, and every entry restarts the cooldown.
+	pub(crate) fn enter_final_recovery(
+		&mut self,
+		keeper: &T::AccountId,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let price = self.ctx.price()?;
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
 		self.ctx.ensure_below_mcr(&self.vault.position())?;
 		ensure!(self.is_only_stake_bearer(), Error::<T>::NotLastEligibleVault);
+		let reward_due = self.ctx.state.final_recovery_reward_due(&self.ctx.config, self.ctx.now);
 		self.index_remove()?;
 		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
-		self.set_status(VaultStatus::FinalRecovery)
+		self.set_status(VaultStatus::FinalRecovery)?;
+		self.ctx.state.last_final_recovery_entry = Some(self.ctx.now);
+		debug_assert!(self.vault.redistribution_stake.is_zero());
+		if reward_due {
+			self.pay_final_recovery_reward(keeper, price)
+		} else {
+			Ok(BalanceOf::<T>::zero())
+		}
+	}
+
+	/// Pays the liquidation reward for this vault to `keeper` from its collateral, or nothing
+	/// when the keeper's account cannot take it: an unpaid keeper is preferable to an unsafe
+	/// vault left in the market.
+	fn pay_final_recovery_reward(
+		&mut self,
+		keeper: &T::AccountId,
+		price: FixedU128,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let full_payoff = self
+			.vault
+			.debt
+			.total()
+			.checked_add(&self.vault.terminal_interest_charge())
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		let reward = final_recovery_keeper_reward(
+			self.vault.collateral,
+			full_payoff,
+			price,
+			&self.ctx.config.liquidation,
+		)
+		.ok_or(Error::<T>::ArithmeticOverflow)?;
+		debug_assert!(reward <= self.vault.collateral);
+		if reward.is_zero() {
+			return Ok(reward);
+		}
+		if !Pallet::<T>::keeper_can_be_paid(self.collateral_id(), keeper, reward) {
+			return Ok(BalanceOf::<T>::zero());
+		}
+		T::CollateralAssets::transfer_on_hold(
+			self.collateral_id().clone(),
+			&HoldReason::VaultCollateral.into(),
+			&self.owner,
+			keeper,
+			reward,
+			Precision::Exact,
+			Restriction::Free,
+			Fortitude::Polite,
+		)?;
+		self.remove_collateral(reward)?;
+		Ok(reward)
 	}
 
 	/// Removes a safe vault from final recovery.
