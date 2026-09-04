@@ -253,15 +253,29 @@ impl<T: Config> Pallet<T> {
 		op.finish_close(&recipient, Commit::Checked)
 	}
 
-	/// Moves the last unsafe eligible vault into final recovery.
+	/// Moves the last unsafe eligible vault into final recovery and pays the keeper what a
+	/// liquidation of it would have paid. A vault already in final recovery is left untouched,
+	/// at the caller's expense.
 	pub(crate) fn do_enter_final_recovery(
+		keeper: T::AccountId,
 		owner: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
-	) -> DispatchResult {
+	) -> DispatchResultWithPostInfo {
+		if Self::vault_status_of(&collateral_id, &stable_id, &owner).is_final_recovery() {
+			return Ok(Pays::Yes.into());
+		}
 		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
-		op.enter_final_recovery()?;
-		op.commit(Commit::Exempt)
+		let keeper_reward = op.enter_final_recovery(&keeper)?;
+		Self::deposit_event(Event::VaultEnteredFinalRecovery {
+			collateral_id: op.collateral_id().clone(),
+			stable_id: op.stable_id().clone(),
+			owner,
+			keeper,
+			keeper_reward,
+		});
+		op.commit(Commit::Exempt)?;
+		Ok(Pays::No.into())
 	}
 
 	/// Removes a vault from final recovery.
@@ -400,14 +414,14 @@ impl<T: Config> Pallet<T> {
 			},
 			None => None,
 		};
+		// Every refundable setup cost this registration takes — Vaults' own custody seed and
+		// whatever the lifecycle handlers touch — is charged to the same account, so a
+		// governance-created market funds its handlers exactly as it funds custody.
+		let funder = Self::custody_funder(deposit.as_ref().map(|(who, _)| who), &admins);
 		Self::ensure_fee_account_receivable(&stable_id)?;
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		frame_system::Pallet::<T>::inc_providers(&redistribution_account);
-		Self::seed_redistribution_custody(
-			&collateral_id,
-			&stable_id,
-			&Self::custody_funder(deposit.as_ref().map(|(who, _)| who), &admins),
-		)?;
+		Self::seed_redistribution_custody(&collateral_id, &stable_id, &funder)?;
 		let now = T::TimeProvider::now();
 		Branches::<T>::insert(
 			&collateral_id,
@@ -419,6 +433,7 @@ impl<T: Config> Pallet<T> {
 			&stable_id,
 			stablecoin_markets,
 			lifecycle_config,
+			&funder,
 		)?;
 		Self::deposit_event(Event::BranchRegistered { collateral_id, stable_id });
 		Ok(())

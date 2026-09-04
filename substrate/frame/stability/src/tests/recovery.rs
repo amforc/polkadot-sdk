@@ -32,7 +32,7 @@ fn park_at_104_percent() {
 #[test]
 fn active_pool_recovery_offset_settles_the_head() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
@@ -80,7 +80,7 @@ fn active_pool_recovery_offset_settles_the_head() {
 #[test]
 fn recovery_offset_can_fully_deplete_the_pool() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
@@ -109,7 +109,7 @@ fn recovery_offset_can_fully_deplete_the_pool() {
 #[test]
 fn recovery_offset_clamps_at_the_pool_floor() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
@@ -134,7 +134,7 @@ fn recovery_offset_clamps_at_the_pool_floor() {
 #[test]
 fn recovery_offset_error_paths() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		prepare_active_pool();
 
 		// No FinalRecovery vault queued.
@@ -156,7 +156,7 @@ fn recovery_offset_error_paths() {
 #[test]
 fn active_recovery_rolls_back_when_pool_accounting_fails_after_settlement() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
@@ -181,7 +181,7 @@ fn active_recovery_rolls_back_when_pool_accounting_fails_after_settlement() {
 #[test]
 fn incoming_recovery_rolls_back_when_deposit_accounting_fails_after_settlement() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		mint_stable(PUSD, 2, 300);
 		assert_ok!(deposit(2, DOT, PUSD, 100));
@@ -209,7 +209,7 @@ fn incoming_recovery_rolls_back_when_deposit_accounting_fails_after_settlement()
 #[test]
 fn recovery_offset_with_empty_pool_is_rejected() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		park_at_104_percent();
 
@@ -221,7 +221,7 @@ fn recovery_offset_with_empty_pool_is_rejected() {
 #[test]
 fn par_band_head_settles_at_face_value() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 
@@ -269,7 +269,7 @@ fn par_band_head_settles_at_face_value() {
 #[test]
 fn below_par_head_rejects_offsets_and_deposits() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		// CR = 400/500 = 80%: below par. The (empty) Insurance Fund plays
@@ -291,7 +291,7 @@ fn below_par_head_rejects_offsets_and_deposits() {
 #[test]
 fn incoming_deposit_recovers_first_and_queues_the_rest() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
@@ -366,7 +366,7 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 #[test]
 fn incoming_deposit_fully_used_leaves_no_pending() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();

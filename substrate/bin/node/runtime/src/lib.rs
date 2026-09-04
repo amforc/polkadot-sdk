@@ -3416,6 +3416,7 @@ impl pallet_vaults::Config for Runtime {
 	type FeeAccount = VaultsFeeAccount;
 	type YieldHook = Stability;
 	type OnBranchLifecycle = (Redemptions, Stability);
+	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
 	type BranchConsideration = HoldConsideration<
@@ -3597,7 +3598,15 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 			maximum_borrow_rate: FixedU128::from_rational(1u128, 1u128),
 			upfront_fee_period: 7 * 24 * 60 * 60 * 1_000,
 			rate_adjustment_cooldown: 24 * 60 * 60 * 1_000,
-			redistribution_penalty: Permill::from_percent(5),
+			final_recovery_reward_cooldown: 60 * 60 * 1_000,
+			liquidation: pallet_vaults::LiquidationConfig {
+				offset_penalty: Permill::from_percent(5),
+				keeper_flat_compensation_value: 100,
+				keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+				keeper_compensation_cap_value: 10_000,
+				minimum_jit_contribution: 100,
+				redistribution_penalty: Permill::from_percent(5),
+			},
 		};
 		let full_admin: AccountId = frame_benchmarking::account("vaults_admin", 0, 0);
 		let emergency_admin: AccountId = frame_benchmarking::account("vaults_emergency", 0, 0);

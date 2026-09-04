@@ -250,6 +250,7 @@ impl pallet_vaults::Config for Test {
 	// Registration seeds the per-market rows of both siblings. Redemptions comes first, so
 	// the config that prices recovery offsets always exists once the pool rows do.
 	type OnBranchLifecycle = (Redemptions, Stability);
+	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type BranchConsideration = VaultsConsideration;
@@ -490,7 +491,17 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(100u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
-		redistribution_penalty: Permill::from_percent(5),
+		final_recovery_reward_cooldown: 3_600 * 1_000,
+		liquidation: pallet_vaults::LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			// The keeper is paid out of the offset penalty, which on the smallest
+			// vault here is 5% of a 200 debt.
+			keeper_flat_compensation_value: 10,
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: 10_000,
+			minimum_jit_contribution: 100,
+			redistribution_penalty: Permill::from_percent(5),
+		},
 	}
 }
 
@@ -527,6 +538,16 @@ pub fn registration_config(
 	(redemption_config, default_pool_config())
 }
 
+/// [`default_branch_config`] with keeper compensation off, for tests that settle a
+/// final-recovery head. Entry pays the keeper out of the head's collateral, and these tests
+/// price the settlement of a collateral they state up front.
+pub fn recovery_branch_config() -> pallet_vaults::BranchConfig<Balance> {
+	let mut config = default_branch_config();
+	config.liquidation.keeper_flat_compensation_value = 0;
+	config.liquidation.keeper_percent_compensation = Permill::zero();
+	config
+}
+
 /// Registers a market at a price of 1.25 and a debt ceiling high enough never to bind.
 ///
 /// Registration also seeds the pool rows, through the lifecycle hook.
@@ -537,17 +558,18 @@ pub fn register_branch(
 ) {
 	// A market cannot be registered without a live price.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
-	// A market Root registers has no depositor, so its full admin pays the custody seed. The
-	// withdrawal keeps the payer alive, so the admin needs two minimum balances.
+	// Account 1 owns every test stablecoin. The refundable deposit it pays for the market funds
+	// the collateral account the pool needs, and as the depositor it also pays the redistribution
+	// custody seed. That seed is withdrawn under `Preserve`, so it needs two minimum balances.
 	mint_collateral(
 		collateral.clone(),
-		ADMIN,
+		1,
 		2 * <VaultCollateralAssets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(
 			collateral.clone(),
 		),
 	);
 	Vaults::create_branch(
-		RuntimeOrigin::root(),
+		RuntimeOrigin::signed(1),
 		collateral.clone(),
 		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
@@ -557,9 +579,8 @@ pub fn register_branch(
 	.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
-	// The pool account gets no existential deposit. The provider reference from the
-	// registration hook keeps it alive, and native funds parked here would read as collateral
-	// the DOT market cannot account for.
+	// The pool account gets no collateral pre-fund. Registration creates a zero-balance asset
+	// account when one is needed, so every gain stays tracked as pool collateral.
 }
 
 /// Opens a vault, so that a test can create real market debt and move the TCR.
@@ -582,6 +603,12 @@ pub fn open_vault(
 		FixedU128::from_rational(5u128, 100u128),
 		pallet_linked_list::Position::endpoints_only(),
 	)
+}
+
+/// The native balance an account holds on hold, where every refundable market deposit ends up.
+pub fn native_on_hold(who: AccountId) -> Balance {
+	use frame::traits::fungible::InspectHold;
+	<Balances as InspectHold<AccountId>>::total_balance_on_hold(&who)
 }
 
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
@@ -947,6 +974,8 @@ pub fn enter_final_recovery(
 	owner: AccountId,
 ) -> DispatchResult {
 	Vaults::enter_final_recovery(RuntimeOrigin::signed(99), collateral, stable, owner)
+		.map(|_post_info| ())
+		.map_err(|error| error.error)
 }
 
 /// The stored debt of a vault, principal and settled interest together. Zero if it is absent.

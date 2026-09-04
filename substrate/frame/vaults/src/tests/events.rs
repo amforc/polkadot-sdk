@@ -334,5 +334,14 @@ fn enter_final_recovery_emits_status_change() {
 			old_status: crate::types::VaultStatus::Active,
 			new_status: crate::types::VaultStatus::FinalRecovery,
 		});
+		// The entry pays the liquidation reward: at 0.02 the 10 flat converts to 500, plus 0.1%
+		// of the 1_000 seized.
+		assert_event(crate::Event::VaultEnteredFinalRecovery {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			keeper: 2,
+			keeper_reward: 501,
+		});
 	});
 }

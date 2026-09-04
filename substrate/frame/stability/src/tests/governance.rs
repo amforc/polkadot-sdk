@@ -6,6 +6,10 @@ use crate::{
 	types::{Leg, PoolSums},
 	Error,
 };
+use frame::traits::{
+	fungibles::{Inspect as _, Refund as _},
+	tokens::Provenance,
+};
 
 fn providers(who: AccountId) -> u32 {
 	System::providers(&who)
@@ -48,6 +52,113 @@ fn branch_registration_seeds_pool_rows() {
 		// (`Consideration`), pricing the storage.
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert!(providers(pool) >= 1);
+	});
+}
+
+// Native collateral has no asset account to touch: `can_deposit(1)` fails
+// against a production ED and `Balances::touch` is a no-op. Registration must
+// still succeed because the provider reference lets the account receive its
+// own minimum.
+#[test]
+fn native_collateral_registration_does_not_need_a_touch() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		let pool = Stability::pool_account(&DOT, &PUSD);
+		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_some());
+		assert!(providers(pool) >= 1);
+		assert_ok!(PoolCollateralAssets::can_deposit(
+			DOT,
+			&pool,
+			PoolCollateralAssets::minimum_balance(DOT),
+			Provenance::Extant,
+		)
+		.into_result());
+	});
+}
+
+// The pool's asset-account deposit is charged to the same account Vaults charges for the
+// market's collateral custody: the depositor when a signed creation paid one, and the full
+// admin otherwise. Governance can therefore register an issued-collateral market too.
+#[test]
+fn issued_collateral_account_touch_follows_the_custody_funder() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		// The funder also seeds the market's redistribution custody, withdrawn under
+		// `Preserve`, so each candidate needs two minimum balances on hand.
+		mint_collateral(AssetId::WithId(77), 1, 2_000);
+		mint_collateral(AssetId::WithId(77), ADMIN, 2_000);
+		let collateral = AssetId::WithId(77);
+		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+		let pool = Stability::pool_account(&collateral, &PUSD);
+
+		// Root supplies no depositor, so the market's full admin pays.
+		let admin_held_before = native_on_hold(ADMIN);
+		assert_ok!(Vaults::create_branch(
+			RuntimeOrigin::root(),
+			collateral.clone(),
+			PUSD,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			branch_config_for(collateral.clone(), PUSD),
+			registration_config(PUSD),
+		));
+		assert_ok!(Assets::can_deposit(77, &pool, 1, Provenance::Extant).into_result());
+		let (payer, account_deposit) =
+			Assets::deposit_held(77, pool).expect("registration touched the pool account");
+		assert_eq!(payer, ADMIN);
+		assert!(account_deposit > 0);
+
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
+		assert!(Assets::deposit_held(77, pool).is_none());
+		assert_eq!(native_on_hold(ADMIN), admin_held_before);
+
+		// A signed creation pays its own deposit, so the depositor is charged instead.
+		let held_before = native_on_hold(1);
+		assert_ok!(Vaults::create_branch(
+			RuntimeOrigin::signed(1),
+			collateral.clone(),
+			PUSD,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			branch_config_for(collateral.clone(), PUSD),
+			registration_config(PUSD),
+		));
+		let (payer, account_deposit) =
+			Assets::deposit_held(77, pool).expect("registration touched the pool account");
+		assert_eq!(payer, 1);
+		assert!(account_deposit > 0);
+
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
+		assert!(Assets::deposit_held(77, pool).is_none());
+		assert_eq!(native_on_hold(1), held_before);
+	});
+}
+
+#[test]
+fn branch_registration_rejects_prefunded_pool_account() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		// Whoever creates the market funds its redistribution seed: the depositor when there is
+		// one, the full admin otherwise. The withdrawal preserves the payer, so both need two
+		// minimum balances on hand.
+		mint_collateral(AssetId::WithId(77), 1, 2_000);
+		mint_collateral(AssetId::WithId(77), ADMIN, 2_000);
+		let collateral = AssetId::WithId(77);
+		let pool = Stability::pool_account(&collateral, &PUSD);
+		mint_collateral(collateral.clone(), pool, 1_000);
+		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::signed(1),
+				collateral.clone(),
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				branch_config_for(collateral.clone(), PUSD),
+				registration_config(PUSD),
+			),
+			Error::<Test>::PoolAccountNotEmpty
+		);
+		assert!(crate::Pools::<Test>::get(collateral, PUSD).is_none());
+		assert_eq!(collateral_balance(AssetId::WithId(77), pool), 1_000);
 	});
 }
 

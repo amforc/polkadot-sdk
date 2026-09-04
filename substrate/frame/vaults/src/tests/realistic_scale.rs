@@ -281,34 +281,192 @@ fn frozen_stable_fails_fee_resolution_loudly() {
 	});
 }
 
-// A keeper leg below the collateral's ED to a fresh keeper reverts the whole
-// transactional liquidation — the orchestrator must size non-zero legs to at
-// least the collateral asset's minimum balance.
+/// Prices the market so a 1_000 XBT vault is far under water — 10^13 × 10^-5 = 10^8 stable
+/// minor units against ~5_000 USDX of debt — and sizes keeper compensation as one flat value:
+/// at this price a value of `v` buys `v × 10^5` collateral minor units, so 500 is half the ED
+/// and 2_000 is twice it.
+fn crash_price_with_flat_keeper_value(value: Balance) {
+	set_price(XBT, FixedU128::from_rational(1u128, 100_000u128));
+	let set = |update| Vaults::set_param(RuntimeOrigin::signed(ADMIN), XBT, USDX, update);
+	assert_ok!(set(BranchConfigUpdate::KeeperPercentCompensation(Permill::zero())));
+	assert_ok!(set(BranchConfigUpdate::KeeperCompensationCapValue(value)));
+	assert_ok!(set(BranchConfigUpdate::KeeperFlatCompensationValue(value)));
+}
+
+// A keeper leg below the collateral's ED to a fresh keeper is planned out rather than failing
+// the liquidation: an unsafe vault left in the market is worse than an unpaid keeper, and
+// holding an account that can receive collateral is the keeper's own responsibility. The freed
+// reward falls through to the waterfall exactly as a skipped JIT leg does.
 #[test]
-fn liquidation_reverts_on_sub_ed_keeper_leg() {
+fn liquidation_plans_out_a_sub_ed_keeper_leg() {
 	build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		// 10^13 × 5×10^-5 = 5×10^8 stable minor units ≪ 110% of the debt.
-		set_price(XBT, FixedU128::from_rational(5u128, 100_000u128));
+		crash_price_with_flat_keeper_value(500);
+		let custody = Vaults::redistribution_account(&XBT, &USDX);
+		let custody_before = held(XBT, custody);
 
-		let keeper_leg = |collateral: Balance| {
-			liquidate_with(XBT, USDX, 1, |_| LiquidationAllocation {
-				offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-				redistribution_collateral: 0,
-				keeper: KeeperCompensation { recipient: 998, collateral },
-			})
-		};
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
-		assert_noop!(keeper_leg(XBT_ED - 1), TokenError::CannotCreate);
-		assert!(
-			crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)),
-			"failed liquidation rolled back"
-		);
+		assert_ok!(liquidate(998, XBT, USDX, 1, 0, 0));
+		assert!(!crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)), "vault liquidated");
+		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper stayed unpaid");
+		// The vault is far under water, so its whole collateral is seized; with the reward
+		// planned out, all of it reaches redistribution custody.
+		assert_eq!(held(XBT, custody) - custody_before, 1_000 * XBT_UNIT);
+	});
+}
 
-		assert_ok!(keeper_leg(XBT_ED));
-		assert_eq!(collateral_balance(XBT, 998), XBT_ED, "ED-sized keeper leg paid");
+// The entry reward is a keeper leg like any other: one a fresh keeper cannot receive is planned
+// out, the vault still enters recovery, and it keeps the collateral for its settlement.
+#[test]
+fn final_recovery_entry_plans_out_a_sub_ed_keeper_reward() {
+	build_and_execute(|| {
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		crash_price_with_flat_keeper_value(500);
+
+		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+		assert_ok!(Vaults::enter_final_recovery(RuntimeOrigin::signed(998), XBT, USDX, 1));
+		assert!(Vaults::vault_status(XBT, USDX, 1).expect("status").is_final_recovery());
+		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper stayed unpaid");
+		assert_eq!(vault(1).collateral, 1_000 * XBT_UNIT, "the vault kept its collateral");
+		System::assert_has_event(RuntimeEvent::Vaults(Event::VaultEnteredFinalRecovery {
+			collateral_id: XBT,
+			stable_id: USDX,
+			owner: 1,
+			keeper: 998,
+			keeper_reward: 0,
+		}));
+	});
+}
+
+// The JIT collateral share is the keeper's other collateral leg and follows the same rule: a
+// share a fresh keeper cannot receive drops the trade instead of failing the liquidation, and
+// the keeper's stablecoin stays untouched. The minimum contribution buys a share of ~2×10^5
+// minor units here, far below the 10^8 ED.
+#[test]
+fn liquidation_drops_a_jit_share_the_keeper_cannot_receive() {
+	build_and_execute(|| {
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		crash_price_with_flat_keeper_value(500);
+		mint_stable(USDX, 998, USD);
+		let custody = Vaults::redistribution_account(&XBT, &USDX);
+		let custody_before = held(XBT, custody);
+
+		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+		assert_ok!(liquidate(998, XBT, USDX, 1, 100, 0));
+		assert!(!crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)), "vault liquidated");
+		assert_eq!(
+			stable_balance(USDX, 998),
+			USD,
+			"no JIT burn for a share the keeper cannot take"
+		);
+		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper received nothing");
+		assert_eq!(held(XBT, custody) - custody_before, 1_000 * XBT_UNIT);
+	});
+}
+
+// Compensation settles before the JIT share, so a reward that clears the ED opens the keeper's
+// account and a sub-ED JIT share follows into it: the payability check reads the combined
+// intake, not each leg alone.
+#[test]
+fn reward_above_ed_carries_a_sub_ed_jit_share() {
+	build_and_execute(|| {
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		crash_price_with_flat_keeper_value(2_000);
+		mint_stable(USDX, 998, USD);
+		let custody = Vaults::redistribution_account(&XBT, &USDX);
+		let custody_before = held(XBT, custody);
+
+		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+		assert_ok!(liquidate(998, XBT, USDX, 1, 100, 0));
+		assert_eq!(stable_balance(USDX, 998), USD - 100, "the JIT trade executed");
+		let reward = 2 * XBT_ED;
+		let jit_share = collateral_balance(XBT, 998) - reward;
+		assert!(jit_share > 0, "the JIT share was paid");
+		assert!(jit_share < XBT_ED, "the JIT share alone would not have opened the account");
+		assert_eq!(
+			held(XBT, custody) - custody_before + reward + jit_share,
+			1_000 * XBT_UNIT,
+			"seized collateral is conserved across custody and the keeper"
+		);
+	});
+}
+
+// Redistribution custody on an issued collateral: `pallet-assets` keeps the
+// minimum balance untouchable once an account holds anything, so seizing into
+// custody only works because registration seeded it. The rest of the suite
+// redistributes native collateral, where a provider reference waives the ED and
+// hides this.
+#[test]
+fn redistribution_custody_holds_issued_collateral() {
+	build_and_execute(|| {
+		register_realistic_market();
+		let custody = Vaults::redistribution_account(&XBT, &USDX);
+		assert_eq!(collateral_balance(XBT, custody), XBT_ED, "registration seeded custody");
+
+		// Vaults 1 and 2 sit at par, vault 3 at 400%, so two liquidations still
+		// leave an eligible recipient.
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(3, XBT, USDX, 4_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		set_price(XBT, FixedU128::from_rational(1u128, 2_000u128));
+
+		// No Stability capital, so the whole seizure lands in custody.
+		assert_ok!(liquidate(9, XBT, USDX, 1, 0, 0));
+		let first = held(XBT, custody);
+		assert!(first > 0, "seizure reached custody");
+		assert_eq!(first, branch_state(XBT, USDX).unwrap().pending_redistribution_collateral);
+		assert_eq!(collateral_balance(XBT, custody), XBT_ED, "the seed stays free");
+
+		// The seed is a float, not a consumable: the next seizure holds too.
+		assert_ok!(liquidate(9, XBT, USDX, 2, 0, 0));
+		assert!(held(XBT, custody) > first, "second seizure added to custody");
+		assert_eq!(collateral_balance(XBT, custody), XBT_ED);
+
+		// Materializing drains the hold and leaves the seed behind.
+		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 3));
+		assert_eq!(held(XBT, custody), 0);
+		assert_eq!(collateral_balance(XBT, custody), XBT_ED);
+	});
+}
+
+// A JIT target inside `(balance - ED, balance)` rounds down to the preserving
+// limit. The exact burn then succeeds under `Preserve` and leaves the keeper's
+// stable account alive at exactly the ED.
+#[test]
+fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
+	build_and_execute(|| {
+		register_realistic_market();
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(2, XBT, USDX, 2_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		// Vault 1 falls just below par while vault 2 remains healthy.
+		set_price(XBT, FixedU128::from_rational(1u128, 2_000u128));
+
+		let funded = 200 * USD;
+		let keeper_balance = funded + USDX_ED;
+		mint_stable(USDX, 3, keeper_balance);
+		// Settle the remainder through the pending pool so this test isolates
+		// the keeper debit from issued-collateral redistribution custody.
+		PendingSpCapacity::set(10_000 * USD);
+		let issuance_before = total_stable(USDX);
+
+		// `keeper_balance - 1` is above the preserving limit `funded` but below
+		// the full expendable balance, so `reducible_debit` must round it down.
+		assert_eq!(
+			pusd_primitives::reducible_debit::<Assets, _>(USDX, &3, keeper_balance - 1),
+			(funded, Preservation::Preserve)
+		);
+		assert_ok!(liquidate(3, XBT, USDX, 1, keeper_balance - 1, 0));
+
+		assert_eq!(stable_balance(USDX, 3), USDX_ED, "keeper account survives at ED");
+		assert_eq!(issuance_before - total_stable(USDX), funded, "exact rounded burn");
+		assert!(!vault_exists(XBT, USDX, 1));
 	});
 }
 
