@@ -1114,12 +1114,14 @@ fn insurance_adjusted_settlement_with_partial_fund() {
 
 		assert_ok!(redeem(3, DOT, PUSD, market_cancel, 0, 4, 0));
 
-		// Full settlement leaves a debt-free Dormant husk keeping the flooring
-		// dust; the cover was paid inside the same settlement.
-		let husk = pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).expect("husk kept").vault;
-		assert_eq!(husk.debt.total(), 0);
-		assert_eq!(husk.collateral, 3);
-		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		// D = 501 against C = 400 pUSD (1_000 units at 0.40) with IF = 50: the
+		// fund covers 50, leaving market debt 451. Supplying all 451 buys the
+		// whole 1_000 units pro rata, and the cover paid inside the same
+		// settlement cancels the rest, so the row closes with neither debt nor
+		// collateral left. A below-par owner has no equity claim on any of it.
+		assert_eq!(Vaults::vault_status(DOT, PUSD, 1), None, "vault settled and closed");
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert_eq!(held(DOT, 1), 0);
 		System::assert_has_event(RuntimeEvent::Redemptions(Event::RecoveryRedemptionExecuted {
 			collateral_id: DOT,
 			stable_id: PUSD,
@@ -1128,16 +1130,17 @@ fn insurance_adjusted_settlement_with_partial_fund() {
 			vault_owner: 1,
 			stable_burned: market_cancel,
 			insurance_cover: 50,
-			collateral_out: 997,
+			collateral_out: 1_000,
 			regime: RecoveryRegime::InsuranceAdjusted,
 		}));
-		// D = 501 against C = 400 pUSD (1_000 units at 0.40) with IF = 50: the
-		// fund covers 50, leaving market debt 451 at recovery rate 400/451. The
-		// fixed-point rate truncates just below the true ratio, so cancelling
-		// all 451 yields value floor(451·rate) = 399 (not 400) and collateral
-		// floor(399/0.40) = 997 (not 1_000): both floors round against the
-		// redeemer, and the 3-unit dust stays behind in the settlement.
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 997);
+		System::assert_has_event(RuntimeEvent::Vaults(pallet_vaults::Event::VaultClosed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 1,
+			collateral: 0,
+		}));
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 1_000);
 		assert_eq!(if_before - Assets::balance(PUSD, insurance_account(PUSD)), 50);
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), debt);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
@@ -1182,11 +1185,12 @@ fn insurance_adjusted_settlement_with_empty_fund() {
 
 		assert_ok!(redeem(3, DOT, PUSD, debt, 0, 4, 0));
 
-		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
-		// Empty fund: recovery rate = C/D = 400/501, truncated in fixed point,
-		// so value = floor(501·rate) = 399 and collateral = floor(399/0.40) =
-		// 997 — the same two floors against the redeemer as the test above.
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 997);
+		// Empty fund: the market debt is the whole 501, at an effective rate of
+		// C/D = 400/501. Cancelling all of it pays the entire 1_000 collateral
+		// and closes the row.
+		assert_eq!(Vaults::vault_status(DOT, PUSD, 1), None, "vault settled and closed");
+		assert_eq!(held(DOT, 1), 0);
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 1_000);
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), debt);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 	});
@@ -1194,7 +1198,7 @@ fn insurance_adjusted_settlement_with_empty_fund() {
 
 /// Near-twin of the empty-fund settlement above; the distinct path is that a
 /// *different* stablecoin's fund account is flush with pUSD, which must not
-/// count as cover for the `(DOT, PUSD)` market — same floors as an empty fund.
+/// count as cover for the `(DOT, PUSD)` market — the same settlement as an empty fund.
 #[test]
 fn insurance_fund_of_other_stable_is_not_cover() {
 	build_and_execute(|| {
@@ -1211,13 +1215,48 @@ fn insurance_fund_of_other_stable_is_not_cover() {
 
 		assert_ok!(redeem(3, DOT, PUSD, debt, 0, 4, 0));
 
-		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
-		// Settles exactly like the empty-fund case: value floor(501·400/501) =
-		// 399, collateral floor(399/0.40) = 997.
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 997);
+		// Settles exactly like the empty-fund case: the redeemer alone cancels
+		// the whole 501, and the full settlement pays all 1_000 collateral.
+		assert_eq!(Vaults::vault_status(DOT, PUSD, 1), None, "vault settled and closed");
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 1_000);
 		assert_eq!(Assets::balance(PUSD, insurance_account(other_stable)), 1_000_000);
 		assert_eq!(issuance_before - Assets::total_supply(PUSD), debt);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
+	});
+}
+
+/// The collateral value that sizes the Insurance Fund cover rounds up: the fund covers no more
+/// than the true shortfall, and the redeemer pays no less than the collateral is worth.
+#[test]
+fn insurance_cover_rounds_the_collateral_value_up() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		// 1_000 units at 0.4005 are worth 400.5 pUSD against 501 of debt.
+		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(4_005u128, 10_000u128));
+		assert_eq!(vault_debt(DOT, PUSD, 1), 501);
+		mint_stable(PUSD, insurance_account(PUSD), 1_000);
+		mint_stable(PUSD, 3, 1_000_000);
+		let if_before = Assets::balance(PUSD, insurance_account(PUSD));
+		let recipient_before = collateral_balance(DOT, 4);
+
+		// The value rounds up to 401, so the flush fund covers a shortfall of 100 rather than
+		// 101, and the redeemer pays 401 for collateral worth 400.5: the half unit rounds
+		// against the redeemer, never against the fund.
+		assert_ok!(redeem(3, DOT, PUSD, 1_000, 0, 4, 0));
+		System::assert_has_event(RuntimeEvent::Redemptions(Event::RecoveryRedemptionExecuted {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			redeemer: 3,
+			recipient: 4,
+			vault_owner: 1,
+			stable_burned: 401,
+			insurance_cover: 100,
+			collateral_out: 1_000,
+			regime: RecoveryRegime::InsuranceAdjusted,
+		}));
+		assert_eq!(if_before - Assets::balance(PUSD, insurance_account(PUSD)), 100);
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 1_000);
+		assert_eq!(Vaults::vault_status(DOT, PUSD, 1), None, "vault settled and closed");
 	});
 }
 
@@ -1538,10 +1577,10 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		assert!(Vaults::vault_status(DOT, PUSD, 2).expect("vault 2").is_final_recovery());
 		assert_eq!(Vaults::final_recovery_queue(DOT, PUSD, 10), vec![2u64]);
 		// The fund covered vault 1 exactly, so the redeemer paid only the
-		// collateral-backed (recovery_rate == 1.0) portion.
+		// collateral-backed portion, at par.
 		let pusd_in_1 = redeemer_before_1 - Assets::balance(PUSD, 3);
 		assert_eq!(pusd_in_1, collateral_value_1);
-		// recovery_rate == 1.0, so vault 1's entire 1_000 collateral is paid to the recipient.
+		// The full settlement pays vault 1's entire 1_000 collateral to the recipient.
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before_1, 1_000);
 
 		let redeemer_before_2 = Assets::balance(PUSD, 3);
@@ -1552,18 +1591,20 @@ fn multiple_final_recovery_vaults_settle_fifo_head_with_per_head_insurance_fund(
 		// pUSD holders absorb the shortfall.
 		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
 		// With the fund empty there is no cover to merge, so the redeemer alone
-		// cancels the debt. The double-floored payout leaves collateral behind, so this
-		// vault stays a Dormant husk instead of closing like vault 1.
-		assert_eq!(vault_debt(DOT, PUSD, 2), 0, "second head fully settled");
-		assert!(Vaults::vault_status(DOT, PUSD, 2).expect("vault 2").is_dormant());
+		// cancels the debt. A full settlement pays the whole collateral, so this
+		// vault closes exactly like vault 1 did.
+		assert_eq!(Vaults::vault_status(DOT, PUSD, 2), None, "second head settled and closed");
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 2)).is_none());
+		assert_eq!(held(DOT, 2), 0);
 		assert!(Vaults::final_recovery_queue(DOT, PUSD, 10).is_empty(), "FIFO drained");
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "no fund left to burn");
 		let pusd_in_2 = redeemer_before_2 - Assets::balance(PUSD, 3);
 		assert_eq!(pusd_in_2, debt2);
 		assert!(pusd_in_2 > pusd_in_1, "drained fund pushes the loss onto the redeemer");
-		// Empty fund: D=501, C=100, so C/D with double flooring pays 990.
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before_2, 990);
+		// Empty fund: D = 501 against C = 100, so the redeemer pays all 501 for
+		// the vault's 1_000 units.
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before_2, 1_000);
 
 		// Conservation: issuance falls by both vaults' full debt and no more
 		// (the redeemer's burns plus vault 1's Insurance-Fund cover, merged
@@ -1604,34 +1645,25 @@ fn insurance_adjusted_recovery_burns_fund_only_when_market_debt_exhausted() {
 		// Recovery has no fee and cannot exceed the spend. This step cancels exactly 200 debt
 		// because `200 < market_cancel_debt = 451`.
 		//
-		// The recovery rate is `C / (D − 50) = 400 / 451`. The collateral payment is
-		// `floor(floor(200 · 400 / 451) / 0.40) = floor(177 / 0.40) = 442`.
+		// The market debt is `D − 50 = 451`, so 200 buys `floor(200 · 1_000 / 451) = 443` of
+		// the 1_000 collateral units.
 		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 200);
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 442);
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 443);
 
-		// The price changes before the second transaction. Thus, live state must set a new
-		// market-side price instead of the first-step rate.
-		//
-		// At 0.30, the final 301 debt has `1_000 − 442 = 558` collateral units with a value of 167.
-		// The shortfall increases to 134.
-		//
-		// The Insurance Fund still covers only 50, so the market side cancels the other
-		// `301 − 50 = 251` debt. This split does not depend on the price: the first step's view
-		// left `451 − 200 = 251` as well. Only the recovery rate moves with the price, from
-		// `400 / 451` under the stale view to `167 / 251` under the live one.
-		//
-		// Cancellation pays `floor(floor(251 · 167 / 251) / 0.30) = 553` collateral units. The
-		// stale rate would incorrectly pay all 558 units.
-		//
-		// The same settlement uses the Insurance Fund cover of 50 and clears the final debt.
+		// The price changes before the second transaction, so the split is re-read from live
+		// state: at 0.30 the remaining 557 collateral units are valued at 168 (167.1 rounded
+		// up) against 301 of debt. The shortfall rises to 133, the fund still covers only 50,
+		// and the market side cancels the other 251. Supplying all of it is the full settlement: it
+		// burns the cover in the same step, pays every remaining collateral unit, and closes the
+		// row.
 		set_price(DOT, FixedU128::from_rational(30u128, 100u128));
 		let recipient_mid = collateral_balance(DOT, 4);
 		let redeemer_mid = Assets::balance(PUSD, 3);
 		assert_ok!(redeem(3, DOT, PUSD, 10_000, 0, 4, 0));
-		assert_eq!(redeemer_mid - Assets::balance(PUSD, 3), 251, "market portion re-priced");
-		assert_eq!(collateral_balance(DOT, 4) - recipient_mid, 553);
-		assert_eq!(vault_debt(DOT, PUSD, 1), 0, "vault settled");
-		assert!(Vaults::vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		assert_eq!(redeemer_mid - Assets::balance(PUSD, 3), 251, "market portion");
+		assert_eq!(collateral_balance(DOT, 4) - recipient_mid, 557);
+		assert_eq!(Vaults::vault_status(DOT, PUSD, 1), None, "vault settled and closed");
+		assert_eq!(held(DOT, 1), 0);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "cover burned on completion");
 		System::assert_has_event(RuntimeEvent::Redemptions(Event::RecoveryRedemptionExecuted {
@@ -1642,7 +1674,7 @@ fn insurance_adjusted_recovery_burns_fund_only_when_market_debt_exhausted() {
 			vault_owner: 1,
 			stable_burned: 251,
 			insurance_cover: 50,
-			collateral_out: 553,
+			collateral_out: 557,
 			regime: RecoveryRegime::InsuranceAdjusted,
 		}));
 		// Conservation: the full vault debt leaves issuance across the two txs.
@@ -2305,8 +2337,10 @@ fn recovery_offset_leaves_dynamic_fee_untouched() {
 	});
 }
 
+/// At six decimals, a partial below-par step floors raw units, never coins, and
+/// the full settlement pays every raw unit that is left.
 #[test]
-fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_not_coins() {
+fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_only_on_partial_steps() {
 	build_and_execute(|| {
 		register_branch(DOT, USDX, usdx_branch_config());
 		assert_ok!(open(1, DOT, USDX, 1_000 * USDX_UNIT, 500 * USDX_UNIT, rate_pct(5, 100)));
@@ -2317,21 +2351,31 @@ fn insurance_adjusted_flooring_at_six_decimals_costs_raw_units_not_coins() {
 		// ceil(479_123.88) = 479_124 raw units (≈ 0.48 coins).
 		assert_eq!(debt, 500 * USDX_UNIT + 479_124);
 		mint_stable(USDX, insurance_account(USDX), 50 * USDX_UNIT);
-		let market_cancel = debt - 50 * USDX_UNIT;
 		mint_stable(USDX, 3, 1_000 * USDX_UNIT);
 		let if_before = Assets::balance(USDX, insurance_account(USDX));
 		let recipient_before = collateral_balance(DOT, 4);
 		let issuance_before = Assets::total_supply(USDX);
 
-		assert_ok!(redeem(3, DOT, USDX, market_cancel, 0, 4, 0));
+		// C = 400e6 against D = 500_479_124 with 50e6 of cover leaves market
+		// debt 450_479_124. A partial 225e6 buys its share of the 1e9 units:
+		// floor(225e6 · 1e9 / 450_479_124) = floor(499_468_206.6) = 499_468_206.
+		assert_ok!(redeem(3, DOT, USDX, 225 * USDX_UNIT, 0, 4, 0));
+		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 499_468_206);
+		assert_eq!(vault_debt(DOT, USDX, 1), debt - 225 * USDX_UNIT);
+		assert_eq!(held(DOT, 1), 500_531_794);
+		assert_eq!(Assets::balance(USDX, insurance_account(USDX)), if_before, "fund untouched");
 
-		let husk = pallet_vaults::Vaults::<Test>::get((DOT, USDX, 1)).expect("husk kept").vault;
-		assert_eq!(husk.debt.total(), 0, "vault settled");
-		assert_eq!(husk.collateral, 3, "raw-unit dust stays with the husk");
-		// 400e6/450_479_124 yields value floor(market_cancel · rate) =
-		// 400·USDX_UNIT − 1, then collateral floor((400·USDX_UNIT − 1)/0.40) =
-		// 999_999_997 of the 1_000·USDX_UNIT held — a 3-raw-unit rounding loss.
-		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 999_999_997);
+		// The 500_531_794 units left are valued at 200_212_718 against 275_479_124
+		// of debt; the fund covers 50e6 of the shortfall, so the market side
+		// cancels 225_479_124. Supplying it is the full settlement: it pays all
+		// 500_531_794 units and closes the row.
+		let recipient_mid = collateral_balance(DOT, 4);
+		let redeemer_mid = Assets::balance(USDX, 3);
+		assert_ok!(redeem(3, DOT, USDX, 1_000 * USDX_UNIT, 0, 4, 0));
+		assert_eq!(redeemer_mid - Assets::balance(USDX, 3), 225_479_124);
+		assert_eq!(collateral_balance(DOT, 4) - recipient_mid, 500_531_794);
+		assert_eq!(Vaults::vault_status(DOT, USDX, 1), None, "vault settled and closed");
+		assert_eq!(held(DOT, 1), 0);
 		assert_eq!(if_before - Assets::balance(USDX, insurance_account(USDX)), 50 * USDX_UNIT);
 		assert_eq!(issuance_before - Assets::total_supply(USDX), debt);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
@@ -2639,10 +2683,9 @@ fn final_recovery_redemption_below_par_settles_with_insurance_cover() {
 		// The shortfall is `10_000 - 8_000 = 2_000`. The cover is
 		// `min(1_000, 2_000) = 1_000`.
 		//
-		// Thus, `market_cancel_debt = 9_000` and `recovery_rate = 8_000 / 9_000 = 0.888…`.
-		// A burn of 3_000 buys `3_000 * 8 / 9 = 2_666.66…` pUSD of value.
-		//
-		// This value equals 1_333.33… DOT, which the pallet rounds down to 1_333.333 tokens.
+		// Thus, `market_cancel_debt = 9_000`, an effective rate of `8_000 / 9_000 = 0.888…`.
+		// A burn of 3_000 buys `3_000 / 9_000` of the 4_000 DOT: 1_333.33… DOT, which the
+		// pallet rounds down to 1_333.333.
 		assert_ok!(redeem(3, DOT, PUSD, 3_000 * UNIT, 0, 4, 0));
 		assert_eq!(collateral_balance(DOT, 4) - recipient_before, 1_333_333);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
