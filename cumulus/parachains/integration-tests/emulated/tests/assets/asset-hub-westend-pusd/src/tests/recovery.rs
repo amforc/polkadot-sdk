@@ -42,13 +42,9 @@ fn final_recovery_redemption_above_par() {
 	AssetHubWestend::execute_with(|| {
 		// A 50% price decrease sets the vault CR to 120%.
 		feed_price(dot_price(4, 1));
-		// MCR 125% makes the CR 120% vault eligible for final recovery.
-		create_branch(&BranchSpec {
-			mcr: FixedU128::from_rational(125, 100),
-			icr: FixedU128::from_rational(130, 100),
-			scr: FixedU128::from_rational(130, 100),
-			..Default::default()
-		});
+		// MCR 125% makes the CR 120% vault eligible for final recovery. Zero keeper terms keep
+		// the parked collateral round; the entry reward has its own test below.
+		create_branch(&accounting_spec());
 		// 6,000 WND = 12,000 pUSD value against 10,000 pUSD debt: CR 120%.
 		let parked_owner = acct(1);
 		park_in_final_recovery(&parked_owner, 6_000 * WND, 10_000 * PUSD);
@@ -82,6 +78,62 @@ fn final_recovery_redemption_above_par() {
 	});
 }
 
+/// Entering final recovery pays the keeper what liquidating the vault would have
+/// paid, out of the vault: the 6.25 WND that `liquidations.rs` pays for an
+/// identical vault, from the 2 pUSD flat plus 0.1% of the 5,250 WND seizure.
+/// Settlement then prices the collateral the reward left.
+#[test]
+fn final_recovery_entry_pays_the_liquidation_keeper_reward() {
+	AssetHubWestend::execute_with(|| {
+		feed_price(dot_price(4, 1));
+		create_branch(&liquidation_spec());
+		// 6,000 WND = 12,000 pUSD value against 10,000 pUSD debt at 2: CR 120%.
+		let parked_owner = acct(1);
+		open_vault(&parked_owner, 6_000 * WND, 10_000 * PUSD, FixedU128::zero());
+		feed_price(dot_price(2, 1));
+		let keeper = acct(0xFE);
+		fund_dot(&keeper, 0);
+
+		assert_ok!(Vaults::enter_final_recovery(
+			RuntimeOrigin::signed(keeper.clone()),
+			get_native_id(),
+			get_pusd_id(),
+			parked_owner.clone(),
+		));
+
+		let reward = 6_250_000_000_000;
+		assert_eq!(native_balance(&keeper) - get_native_ed(), reward);
+		assert_eq!(vault(&parked_owner).collateral, 6_000 * WND - reward);
+		assert_eq!(collateral_on_hold(&get_native_id(), &parked_owner), 6_000 * WND - reward);
+		assert_eq!(branch_state().total_collateral, 6_000 * WND - reward);
+		System::assert_has_event(RuntimeEvent::Vaults(
+			pallet_vaults::Event::VaultEnteredFinalRecovery {
+				collateral_id: get_native_id(),
+				stable_id: get_pusd_id(),
+				owner: parked_owner.clone(),
+				keeper: keeper.clone(),
+				keeper_reward: reward,
+			},
+		));
+
+		// CR 119.875% still caps the bonus at the 10% penalty, so 2,000 pUSD still buys
+		// 1,100 WND.
+		let redeemer = acct(3);
+		fund_dot(&redeemer, 0);
+		mint_pusd(&redeemer, 2_000 * PUSD);
+		assert_ok!(Redemptions::redeem(
+			RuntimeOrigin::signed(redeemer.clone()),
+			get_native_id(),
+			get_pusd_id(),
+			RedemptionTerms { max_stable_to_spend: 2_000 * PUSD, min_collateral_out: 1_100 * WND },
+			redeemer.clone(),
+			16,
+		));
+		assert_eq!(native_balance(&redeemer) - get_native_ed(), 1_100 * WND);
+		assert_eq!(vault(&parked_owner).collateral, 4_900 * WND - reward);
+	});
+}
+
 /// A 2,000 pUSD shortfall with 1,000 pUSD of insurance cover leaves 9,000 pUSD
 /// to cancel externally, at recovery rate 8,000 / 9,000. The full settlement
 /// pays out all collateral, burns the cover, and closes the vault.
@@ -89,12 +141,7 @@ fn final_recovery_redemption_above_par() {
 fn final_recovery_redemption_below_par_with_insurance_cover() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
-		create_branch(&BranchSpec {
-			mcr: FixedU128::from_rational(125, 100),
-			icr: FixedU128::from_rational(130, 100),
-			scr: FixedU128::from_rational(130, 100),
-			..Default::default()
-		});
+		create_branch(&accounting_spec());
 		// 4,000 WND = 8,000 pUSD value against 10,000 pUSD debt: CR 80%.
 		let parked_owner = acct(1);
 		park_in_final_recovery(&parked_owner, 4_000 * WND, 10_000 * PUSD);
@@ -178,12 +225,7 @@ fn final_recovery_redemption_below_par_with_insurance_cover() {
 fn final_recovery_redemption_below_par_with_full_insurance_cover() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
-		create_branch(&BranchSpec {
-			mcr: FixedU128::from_rational(125, 100),
-			icr: FixedU128::from_rational(130, 100),
-			scr: FixedU128::from_rational(130, 100),
-			..Default::default()
-		});
+		create_branch(&accounting_spec());
 		// 4,000 WND = 8,000 pUSD value against 10,000 pUSD debt: CR 80%.
 		let parked_owner = acct(1);
 		park_in_final_recovery(&parked_owner, 4_000 * WND, 10_000 * PUSD);

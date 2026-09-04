@@ -251,6 +251,7 @@ pub(crate) fn branch_config(
 		maximum_borrow_rate: FixedU128::from_rational(400, 100),
 		upfront_fee_period: spec.upfront_fee_period_ms,
 		rate_adjustment_cooldown: 0,
+		final_recovery_reward_cooldown: 60 * 60 * 1_000,
 		liquidation: pallet_vaults::LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			keeper_flat_compensation_value: spec.keeper_flat_compensation_value,

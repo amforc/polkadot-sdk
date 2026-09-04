@@ -194,6 +194,8 @@ fn park_continuation_behind_final_recovery_head() -> (AccountId, AccountId) {
 		icr: FixedU128::from_rational(130, 100),
 		scr: FixedU128::from_rational(130, 100),
 		minimum_debt: 2_000 * PUSD,
+		keeper_flat_compensation_value: 0,
+		keeper_percent_compensation: Permill::zero(),
 		..Default::default()
 	});
 

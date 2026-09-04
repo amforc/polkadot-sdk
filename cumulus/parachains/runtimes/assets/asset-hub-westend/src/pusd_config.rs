@@ -476,6 +476,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 			maximum_borrow_rate: FixedU128::from_rational(1u128, 1u128),
 			upfront_fee_period: 7 * 24 * 60 * 60 * 1_000,
 			rate_adjustment_cooldown: 24 * 60 * 60 * 1_000,
+			final_recovery_reward_cooldown: 60 * 60 * 1_000,
 			liquidation: pallet_vaults::LiquidationConfig {
 				offset_penalty: Permill::from_percent(5),
 				keeper_flat_compensation_value: 100,
