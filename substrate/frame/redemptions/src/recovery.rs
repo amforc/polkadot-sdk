@@ -97,21 +97,26 @@ impl<T: Config> Pallet<T> {
 		};
 		// The bonus keeps settlement attractive past MCR, so redeemers push the head up to ICR
 		// and it exits with the buffer a borrower opens with rather than one tick above the
-		// liquidation line. Above ICR only the exit remains.
-		ensure!(
-			ratio <= snapshot.initial_collateralization_ratio,
-			Error::<T>::FinalRecoveryExitRequired
-		);
+		// liquidation line. Above ICR only the exit remains, unless a sub-minimum debt could be
+		// kept from exiting by an occupied Dormant slot; that escape hatch pays face value.
+		let past_settlement = ratio > snapshot.initial_collateralization_ratio;
+		if past_settlement {
+			ensure!(snapshot.debt < snapshot.minimum_debt, Error::<T>::FinalRecoveryExitRequired);
+		}
 
 		if ratio < FixedU128::one() {
 			return Self::price_below_par(stable_id, snapshot, price, budget)
 				.ok_or(Error::<T>::NoRedeemableVault);
 		}
-		let bonus = recovery_pricing::recovery_bonus(
-			ratio,
-			config.final_recovery_bonus_buffer,
-			snapshot.redistribution_penalty,
-		);
+		let bonus = if past_settlement {
+			FixedU128::zero()
+		} else {
+			recovery_pricing::recovery_bonus(
+				ratio,
+				config.final_recovery_bonus_buffer,
+				snapshot.redistribution_penalty,
+			)
+		};
 		let debt = snapshot.size_within(budget);
 		let collateral = recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)
 			.ok_or(Error::<T>::NoRedeemableVault)?

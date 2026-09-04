@@ -37,6 +37,9 @@ pub struct RedemptionStepSnapshot<Balance> {
 	/// Branch ICR, the end of recovery settlement. A `FinalRecovery` vault above
 	/// it is refused settlement and must exit. Only consulted by that pricing.
 	pub initial_collateralization_ratio: FixedU128,
+	/// Branch minimum debt. Below it an occupied Dormant slot can block the
+	/// exit, so the vault stays settleable. Only consulted by that pricing.
+	pub minimum_debt: Balance,
 }
 
 impl<Balance: Copy> RedemptionStepSnapshot<Balance> {
