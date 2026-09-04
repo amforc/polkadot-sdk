@@ -178,8 +178,8 @@ fn final_recovery_entry_pays_what_liquidation_pays() {
 }
 
 // Exit is permissionless and unpaid. Without a cooldown, a caller can repeatedly move a vault
-// across the MCR and collect rewards. Every entry resets the market cooldown, including an unpaid
-// entry.
+// across the MCR and collect rewards. Only a paid entry resets the market cooldown: an unpaid one
+// must not push the next honest keeper's reward further out.
 #[test]
 fn final_recovery_reward_cooldown_blocks_flipping() {
 	build_and_execute(|| {
@@ -205,7 +205,8 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 				.expect("eligible entry succeeds")
 		};
 
-		// Inside the cooldown the flip moves the vault, stays fee-free, and pays nothing.
+		// Inside the cooldown the flip moves the vault, stays fee-free, pays nothing, and leaves
+		// the timestamp where the paid entry put it.
 		advance_time(cooldown / 2);
 		let post_info = flip(KEEPER);
 		assert_eq!(post_info.pays_fee, Pays::No);
@@ -215,30 +216,20 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD);
 		assert_eq!(
 			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
-			Some(first_entry + cooldown / 2)
+			Some(first_entry)
 		);
 
-		// One cooldown from the first entry is not sufficient. The first unpaid entry reset the
-		// timestamp. This second unpaid entry resets it again.
+		// One cooldown from the paid entry is sufficient, unpaid flips in between notwithstanding.
+		// The re-entry is priced on what the vault still holds: the flat 100 plus 0.1% of 899,
+		// which rounds to nothing. This paid entry moves the timestamp.
 		advance_time(cooldown / 2);
-		flip(KEEPER);
-		System::assert_has_event(entered_event(1, KEEPER, 0));
-		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
-		assert_eq!(
-			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
-			Some(first_entry + cooldown)
-		);
-
-		// Once the cooldown elapses a re-entry pays again, priced on what the vault still holds:
-		// the flat 100 plus 0.1% of 899, which rounds to nothing.
-		advance_time(cooldown);
 		flip(KEEPER);
 		System::assert_has_event(entered_event(1, KEEPER, 100));
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD + 100);
 		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD - 100);
 		assert_eq!(
 			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
-			Some(first_entry + 2 * cooldown)
+			Some(first_entry + cooldown)
 		);
 
 		// A market may switch the protection off, after which every entry pays.

@@ -449,7 +449,7 @@ pub struct BranchConfig<Balance> {
 	pub upfront_fee_period: Millis,
 	/// Minimum time between rate changes that do not charge an upfront fee.
 	pub rate_adjustment_cooldown: Millis,
-	/// Minimum time between a final-recovery entry and the next paid entry in this market.
+	/// Minimum time between a paid final-recovery entry and the next paid entry in this market.
 	pub final_recovery_reward_cooldown: Millis,
 	/// Penalties, keeper compensation, and direct-JIT limits used during liquidation.
 	pub liquidation: LiquidationConfig<Balance>,
