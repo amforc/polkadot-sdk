@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_status},
+	tests::{rate_pct, vault_status, ONE_YEAR_MS},
 };
 
 // `debt_in_front` sums the projected entire debt of vaults at rates strictly
@@ -67,12 +67,12 @@ fn debt_in_front_projects_pending_interest_poke_independent() {
 		// One year of unpoked accrual. Projected per-vault entire debt:
 		//   vault 1: 500 + 1 (fee) + floor(500 × 0.5%) = 503
 		//   vault 2: 700 + 1 (fee) + floor(700 × 0.6%) = 705
-		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		advance_time(ONE_YEAR_MS);
 		assert_eq!(debt_in_front(), 503 + 705);
 
 		// Poking vault 1 moves its pending interest into recorded debt; the
 		// total must not change.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		assert_ok!(poke(9, DOT, PUSD, 1));
 		let v1 = vault(DOT, PUSD, 1);
 		assert_eq!(v1.debt.interest, 3, "fee 1 + year interest 2 settled by the poke");
 		assert_eq!(debt_in_front(), 503 + 705, "projection unchanged by the poke");
@@ -123,7 +123,7 @@ fn debt_in_front_counts_final_recovery_queue_first() {
 		// At price 7 its CR is 490/501 < 1.10, and as the last eligible vault it
 		// enters final recovery instead of liquidation.
 		set_price(DOT, FixedU128::from_rational(7, 1));
-		assert_ok!(Vaults::enter_final_recovery(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		assert_ok!(enter_final_recovery(9, DOT, PUSD, 1));
 		set_price(DOT, FixedU128::from_rational(10, 1));
 
 		// Two active vaults join the rate index afterwards.

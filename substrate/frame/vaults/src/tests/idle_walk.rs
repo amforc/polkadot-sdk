@@ -5,7 +5,7 @@
 use crate::{
 	mock::*,
 	pallet::{BranchIdleCursor, Branches, IdleCursor},
-	tests::rate_pct,
+	tests::{rate_pct, ONE_DAY_MS},
 	weights::WeightInfo,
 	Config,
 };
@@ -42,7 +42,7 @@ fn on_idle_walk_budgets_touches_and_wraps_the_cursor() {
 		for owner in 1..=5u64 {
 			assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		}
-		advance_time(365 * 24 * 3_600 * 1_000);
+		advance_time(365 * ONE_DAY_MS);
 
 		// Base + one branch + four of the five vaults; the branch walk's half
 		// share ((44 − 1) / 2 = 21) comfortably covers the single branch.
@@ -104,7 +104,7 @@ fn branch_walk_cannot_starve_the_vault_walk() {
 			GLOBAL_CEILING
 		));
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		advance_time(365 * 24 * 3_600 * 1_000);
+		advance_time(365 * ONE_DAY_MS);
 
 		// Base + eight branch weights: the branch walk's half share (8 / 2 =
 		// 4 branch weights) affords exactly four refreshes, and the reserved

@@ -25,13 +25,7 @@ fn default_rate() -> FixedU128 {
 fn repay_all(owner: AccountId, collateral: AssetId, stable: StableId) {
 	// Headroom for the upfront fee that the debt includes beyond the minted principal.
 	mint_stable(stable, owner, 100);
-	assert_ok!(Vaults::repay_for(
-		RuntimeOrigin::signed(owner),
-		collateral,
-		stable,
-		owner,
-		Some(10_000)
-	));
+	assert_ok!(repay(owner, collateral, stable, owner, Some(10_000)));
 }
 
 #[test]
@@ -124,7 +118,7 @@ fn close_refunds_the_original_ticket_to_the_owner_after_a_price_change() {
 		let owner_before = collateral_balance(ETH, OWNER);
 		let recipient_before = collateral_balance(ETH, 2);
 
-		assert_ok!(Vaults::close_vault(RuntimeOrigin::signed(OWNER), ETH, PUSD, Some(2)));
+		assert_ok!(close_vault(OWNER, ETH, PUSD, Some(2)));
 
 		assert_eq!(collateral_balance(ETH, 2), recipient_before + 1_000);
 		assert_eq!(collateral_balance(ETH, OWNER), owner_before + 63);
@@ -162,7 +156,7 @@ fn markets_on_one_collateral_aggregate_the_hold() {
 		assert_eq!(vault_deposit_held(DOT, OWNER), 2 * VAULT_DEPOSIT);
 
 		repay_all(OWNER, DOT, EUSD);
-		assert_ok!(Vaults::close_vault(RuntimeOrigin::signed(OWNER), DOT, EUSD, None));
+		assert_ok!(close_vault(OWNER, DOT, EUSD, None));
 
 		assert_eq!(vault_deposit_held(DOT, OWNER), VAULT_DEPOSIT);
 	});

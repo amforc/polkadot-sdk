@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_status},
+	tests::{rate_pct, vault_status, ONE_DAY_MS},
 };
 
 /// Open one vault, then drop the oracle price so the branch enters Safety
@@ -60,18 +60,7 @@ fn safety_mode_allows_new_vault_that_improves_tcr() {
 fn safety_mode_blocks_borrow_alone() {
 	build_and_execute(|| {
 		enter_safety_mode_single_vault();
-		assert_noop!(
-			crate::Pallet::<Test>::borrow(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				200,
-				None,
-				None,
-				Position::endpoints_only()
-			),
-			crate::Error::<Test>::SafetyModeTcrWorsening
-		);
+		assert_noop!(borrow(1, DOT, PUSD, 200, None), crate::Error::<Test>::SafetyModeTcrWorsening);
 	});
 }
 
@@ -85,24 +74,10 @@ fn safety_mode_blocks_borrow_alone() {
 fn safety_mode_allows_borrow_after_large_deposit() {
 	build_and_execute(|| {
 		enter_safety_mode_single_vault();
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			200
-		));
+		assert_ok!(deposit_collateral(1, DOT, PUSD, 1, 200));
 		// post-deposit TCR ≈ 1200*6.3/5005 ≈ 151%. Now borrow a moderate amount
 		// while staying in Normal mode and well above Safety.
-		assert_ok!(crate::Pallet::<Test>::borrow(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			200,
-			None,
-			None,
-			Position::endpoints_only()
-		));
+		assert_ok!(borrow(1, DOT, PUSD, 200, None));
 	});
 }
 
@@ -114,13 +89,7 @@ fn safety_mode_blocks_withdraw_alone() {
 	build_and_execute(|| {
 		enter_safety_mode_single_vault();
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				1,
-				None
-			),
+			withdraw_collateral(1, DOT, PUSD, 1, None),
 			crate::Error::<Test>::SafetyModeTcrWorsening
 		);
 	});
@@ -139,22 +108,10 @@ fn safety_mode_allows_repay_then_withdraw() {
 		enter_safety_mode_single_vault();
 		// Repay 3000 pUSD: total debt drops from 5005 to ~2005, TCR rises to
 		// 1000*6.3/2005 ≈ 314%. Branch exits Safety mode.
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(3_000)
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(3_000)));
 		// Now withdraw 100 DOT — TCR drops to 900*6.3/2005 ≈ 282%, still in
 		// Normal mode and well above Safety threshold.
-		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			100,
-			None
-		));
+		assert_ok!(withdraw_collateral(1, DOT, PUSD, 100, None));
 	});
 }
 
@@ -175,13 +132,7 @@ fn normal_mode_blocks_premature_rate_change_pulling_into_safety() {
 		// Safety, tripping the Normal-branch rule in `enforce_mode_rules`.
 		set_price(DOT, FixedU128::from_rational(655u128, 100u128));
 		assert_noop!(
-			crate::Pallet::<Test>::change_rate(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				rate_pct(50, 100),
-				Position::endpoints_only()
-			),
+			change_rate(1, DOT, PUSD, rate_pct(50, 100)),
 			crate::Error::<Test>::WouldEnterSafetyMode
 		);
 	});
@@ -198,13 +149,7 @@ fn safety_mode_blocks_premature_rate_change() {
 		// Premature change (within cooldown) charges a non-zero upfront fee
 		// → reverts.
 		assert_noop!(
-			crate::Pallet::<Test>::change_rate(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				rate_pct(7, 100),
-				Position::endpoints_only()
-			),
+			change_rate(1, DOT, PUSD, rate_pct(7, 100)),
 			crate::Error::<Test>::SafetyModeTcrWorsening
 		);
 	});
@@ -215,15 +160,9 @@ fn safety_mode_allows_post_cooldown_rate_change() {
 	build_and_execute(|| {
 		enter_safety_mode_single_vault();
 		// Wait out the cooldown so the rate change carries no upfront fee.
-		// Default rate_adjustment_cooldown = 1 day = 86_400_000 ms.
-		advance_time(86_400_000);
-		assert_ok!(crate::Pallet::<Test>::change_rate(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			rate_pct(7, 100),
-			Position::endpoints_only()
-		));
+		// Default rate_adjustment_cooldown = 1 day.
+		advance_time(ONE_DAY_MS);
+		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(7, 100)));
 	});
 }
 
@@ -248,13 +187,7 @@ fn safety_mode_blocks_close_with_collateral() {
 		));
 		// Repay to zero at $10 (Normal mode) — allowed, leaves a Dormant husk
 		// still holding its 1000 DOT.
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			2,
-			Some(total)
-		));
+		assert_ok!(repay(2, DOT, PUSD, 2, Some(total)));
 		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "husk survives the repay");
 		// Now drop the price: releasing the husk's collateral on close would push
 		// post-close TCR below the safety threshold, so the close must revert.
@@ -262,10 +195,7 @@ fn safety_mode_blocks_close_with_collateral() {
 		// The branch is still in Normal mode here (TCR ≈ 252%); it is *releasing* the
 		// husk's collateral on close that would drop TCR into Safety — hence the block.
 		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Normal),);
-		assert_noop!(
-			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None),
-			crate::Error::<Test>::WouldEnterSafetyMode
-		);
+		assert_noop!(close_vault(2, DOT, PUSD, None), crate::Error::<Test>::WouldEnterSafetyMode);
 	});
 }
 
@@ -287,39 +217,21 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 			frame::traits::tokens::Preservation::Expendable,
 		));
 		// Repay to zero — leaves a Dormant husk still holding its 1000 DOT.
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			2,
-			Some(total)
-		));
+		assert_ok!(repay(2, DOT, PUSD, 2, Some(total)));
 		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "husk survives the repay");
 		// At $6.30 releasing the husk's 1000 DOT would push TCR into Safety, so
 		// the emptying withdraw is blocked exactly like the explicit close.
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Normal),);
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(
-				RuntimeOrigin::signed(2),
-				DOT,
-				PUSD,
-				1_000,
-				None
-			),
+			withdraw_collateral(2, DOT, PUSD, 1_000, None),
 			crate::Error::<Test>::WouldEnterSafetyMode
 		);
 		// Back at $10 the release keeps the branch in Normal mode: the withdraw
 		// empties the vault and auto-closes it, paying out the collateral.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		let collateral_before = collateral_balance(DOT, 2);
-		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			1_000,
-			None
-		));
+		assert_ok!(withdraw_collateral(2, DOT, PUSD, 1_000, None));
 		assert!(!vault_exists(DOT, PUSD, 2), "zero/zero vault auto-closed");
 		assert_eq!(held(DOT, 2), 0, "hold fully released");
 		assert_eq!(collateral_balance(DOT, 2), collateral_before + 1_000 + VAULT_DEPOSIT);
@@ -331,10 +243,7 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 			collateral: 1_000,
 		}));
 		// The row is gone, so an explicit close has nothing to act on.
-		assert_noop!(
-			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None),
-			crate::Error::<Test>::VaultNotFound
-		);
+		assert_noop!(close_vault(2, DOT, PUSD, None), crate::Error::<Test>::VaultNotFound);
 	});
 }
 
@@ -350,38 +259,16 @@ fn borrow_below_icr_is_blocked_in_both_modes() {
 		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
 		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Safety));
 
-		let borrow_one = || {
-			crate::Pallet::<Test>::borrow(
-				RuntimeOrigin::signed(2),
-				DOT,
-				PUSD,
-				1,
-				None,
-				None,
-				Position::endpoints_only(),
-			)
-		};
+		let borrow_one = || borrow(2, DOT, PUSD, 1, None);
 		assert_noop!(borrow_one(), crate::Error::<Test>::UnsafeCollateralizationRatio);
 
 		// Improve only the branch ratio to isolate the per-vault gate.
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			99_000
-		));
+		assert_ok!(deposit_collateral(1, DOT, PUSD, 1, 99_000));
 		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Normal));
 		assert_noop!(borrow_one(), crate::Error::<Test>::UnsafeCollateralizationRatio);
 
 		// The same borrow succeeds after this vault clears ICR.
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			2,
-			100
-		));
+		assert_ok!(deposit_collateral(2, DOT, PUSD, 2, 100));
 		assert_ok!(borrow_one());
 	});
 }
@@ -405,13 +292,7 @@ fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 		// Withdrawing any collateral fails because post-CR < ICR (and so does
 		// pre-CR; the per-call gate uses the post-state).
 		assert_noop!(
-			crate::Pallet::<Test>::withdraw_collateral(
-				RuntimeOrigin::signed(2),
-				DOT,
-				PUSD,
-				1,
-				None
-			),
+			withdraw_collateral(2, DOT, PUSD, 1, None),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
 
@@ -419,22 +300,10 @@ fn safety_mode_blocks_withdraw_when_cr_below_icr() {
 		// mode entirely (target TCR > 130%). state.total_debt ≈ 5206; we need
 		// total_coll * 2.10 / 5206 ≥ 1.30 → total_coll ≥ 3223 DOT, so a
 		// deposit of 3000 DOT puts us comfortably in Normal mode.
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			2,
-			3_000
-		));
+		assert_ok!(deposit_collateral(2, DOT, PUSD, 2, 3_000));
 		// Withdraw 1 DOT now — vault 2 CR is huge, branch is in Normal mode
 		// well above Safety, so the per-call gate passes from both directions.
-		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			1,
-			None
-		));
+		assert_ok!(withdraw_collateral(2, DOT, PUSD, 1, None));
 	});
 }
 

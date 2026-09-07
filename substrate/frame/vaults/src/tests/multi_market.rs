@@ -5,11 +5,13 @@
 //! one owner running several markets, markets sharing a collateral, and
 //! in-market isolation of redemption, liquidation, redistribution, and yield.
 
-use crate::{mock::*, pallet::StablecoinDebt, tests::rate_pct};
+use crate::{
+	mock::*,
+	pallet::StablecoinDebt,
+	tests::{rate_pct, ONE_YEAR_MS},
+};
 use frame::traits::fungibles::Mutate;
 use pusd_primitives::VaultInterface;
-
-const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
 
 // One owner runs dotUSD/DOT and ethUSD/ETH independently: each market mints
 // only its own coin and locks only its own collateral.
@@ -123,13 +125,7 @@ fn stablecoin_debt_sums_the_markets_issuing_that_coin() {
 		// The aggregate tracks debt leaving as well as arriving: repaying 1_000
 		// on one PUSD market drops the shared total by exactly that, and leaves
 		// the other coin's total alone.
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			ETH,
-			PUSD,
-			1,
-			Some(1_000)
-		));
+		assert_ok!(repay(1, ETH, PUSD, 1, Some(1_000)));
 		assert_eq!(StablecoinDebt::<Test>::get(PUSD).outstanding, 4_007);
 		assert_eq!(StablecoinDebt::<Test>::get(EUSD).outstanding, 4_004);
 	});
@@ -211,16 +207,10 @@ fn closing_one_market_leaves_shared_collateral_held() {
 		<VaultStableAssets as Mutate<AccountId>>::mint_into(PUSD, &1, 10_000)
 			.expect("mint pUSD to repay");
 		let debt = vault(DOT, PUSD, 1).debt.total();
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(debt)
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(debt)));
 		// Repay-to-zero leaves a husk still holding the PUSD market's collateral;
 		// close it to release only that market's share.
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_ok!(close_vault(1, DOT, PUSD, None));
 
 		// Only the PUSD market's 1_000 DOT was released; the EUSD market's 600
 		// DOT remains held against its still-open vault.
@@ -244,7 +234,7 @@ fn yield_accrues_in_the_markets_own_coin() {
 		let eusd_fee_before = stable_balance(EUSD, FEE_DEST);
 
 		advance_time(ONE_YEAR_MS);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), ETH, EUSD, 1));
+		assert_ok!(poke(9, ETH, EUSD, 1));
 
 		let interest_after = vault(ETH, EUSD, 1).debt.interest;
 		// A full year at 50% on 5_000 principal accrues exactly 2_500 EUSD of vault
