@@ -5,7 +5,7 @@
 //! plus a 1 upfront fee. At the parked price of 0.52 its CR is 104%, so the recovery bonus is 3%
 //! and cancelling debt `D` pays `floor(floor(D * 1.03) / 0.52)` collateral.
 
-use crate::{mock::*, types::Leg, Error};
+use crate::{mock::*, Error};
 use frame::prelude::ArithmeticError;
 
 /// Open the standing vault (owner 5) and pin its exact debt.
@@ -32,12 +32,14 @@ fn park_at_104_percent() {
 #[test]
 fn active_pool_recovery_offset_settles_the_head() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
 
-		assert_ok!(offset_recovery(DOT, PUSD, 300));
+		// 350 would leave 50 < the 100 floor: clamped to 300, and the settlement burns exactly
+		// the clamped amount.
+		assert_ok!(offset_recovery(DOT, PUSD, 350));
 
 		// collateral_out = floor(floor(300 * 1.03) / 0.52) = floor(309/0.52)
 		//                = 594.
@@ -64,14 +66,12 @@ fn active_pool_recovery_offset_settles_the_head() {
 		assert_eq!(state.total_active_deposits, 100);
 		assert_eq!(state.coords.p, FixedU128::from_rational(1, 4));
 		assert_eq!(state.total_collateral_gains_unclaimed, 594);
-		let sums = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
+		let sums = active_sums(0, 0);
 		assert_eq!(sums.s_collateral, FixedU128::from_inner(1_485_000_000_000_000_000));
 
 		// The depositor realizes exactly the settled collateral:
 		// gain = floor(400 * 1.485) = 594, compounded = floor(400 * 0.25).
-		let before = collateral_balance(DOT, 1);
-		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 594);
+		assert_claim_collateral(1, 594);
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
 		assert_eq!(row.active_deposit, 100);
 	});
@@ -80,7 +80,7 @@ fn active_pool_recovery_offset_settles_the_head() {
 #[test]
 fn recovery_offset_can_fully_deplete_the_pool() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
@@ -93,48 +93,20 @@ fn recovery_offset_can_fully_deplete_the_pool() {
 		//                = 792.
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.coords.epoch, 1);
-		assert_eq!(state.coords.p, FixedU128::one());
+		assert_eq!(state.coords, Accumulators { p: FixedU128::one(), epoch: 1, scale: 0 });
 		assert_eq!(vault_debt(DOT, PUSD, 5), 100);
 
 		// The old-epoch depositor realizes to zero active with the full
 		// gain: floor(400 * floor(792e18/400) / 1e18) = 792.
-		let before = collateral_balance(DOT, 1);
-		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 792);
+		assert_claim_collateral(1, 792);
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
-	});
-}
-
-#[test]
-fn recovery_offset_clamps_at_the_pool_floor() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		open_standing_vault();
-		prepare_active_pool();
-		park_at_104_percent();
-
-		// 350 would leave 50 < the 100 floor: clamped to 300, and the
-		// settlement burns exactly the clamped amount.
-		assert_ok!(offset_recovery(DOT, PUSD, 350));
-		System::assert_has_event(
-			crate::Event::RecoveryOffsetApplied {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				debt_burned: 300,
-				collateral_gain: 594,
-				source: crate::types::RecoveryOffsetSource::ActivePool,
-			}
-			.into(),
-		);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 100);
 	});
 }
 
 #[test]
 fn recovery_offset_error_paths() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		prepare_active_pool();
 
 		// No FinalRecovery vault queued.
@@ -156,7 +128,7 @@ fn recovery_offset_error_paths() {
 #[test]
 fn active_recovery_rolls_back_when_pool_accounting_fails_after_settlement() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
@@ -181,7 +153,7 @@ fn active_recovery_rolls_back_when_pool_accounting_fails_after_settlement() {
 #[test]
 fn incoming_recovery_rolls_back_when_deposit_accounting_fails_after_settlement() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		mint_stable(PUSD, 2, 300);
 		assert_ok!(deposit(2, DOT, PUSD, 100));
@@ -209,7 +181,7 @@ fn incoming_recovery_rolls_back_when_deposit_accounting_fails_after_settlement()
 #[test]
 fn recovery_offset_with_empty_pool_is_rejected() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		park_at_104_percent();
 
@@ -221,7 +193,7 @@ fn recovery_offset_with_empty_pool_is_rejected() {
 #[test]
 fn par_band_head_settles_at_face_value() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 
@@ -269,7 +241,7 @@ fn par_band_head_settles_at_face_value() {
 #[test]
 fn below_par_head_rejects_offsets_and_deposits() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		// CR = 400/500 = 80%: below par. The (empty) Insurance Fund plays
@@ -291,13 +263,13 @@ fn below_par_head_rejects_offsets_and_deposits() {
 #[test]
 fn incoming_deposit_recovers_first_and_queues_the_rest() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();
 
 		let state_before = pool_state(DOT, PUSD);
-		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32));
+		let sums_before = active_sums(0, 0);
 
 		// Full settlement burns the depositor payment and collects the terminal charge.
 		mint_stable(PUSD, 2, 800);
@@ -339,13 +311,8 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		assert_eq!(state.total_active_deposits, 400);
 		assert_eq!(state.total_pending_deposits, 299);
 		assert_eq!(state.total_collateral_gains_unclaimed, 992);
-		assert_eq!(state.coords.p, state_before.coords.p);
-		assert_eq!(state.coords.epoch, state_before.coords.epoch);
-		assert_eq!(state.coords.scale, state_before.coords.scale);
-		assert_eq!(
-			crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32)),
-			sums_before
-		);
+		assert_eq!(state.coords, state_before.coords);
+		assert_eq!(active_sums(0, 0), sums_before);
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert_eq!(stable_balance(PUSD, pool), 699);
 		assert_eq!(collateral_balance(DOT, pool), 992);
@@ -357,16 +324,14 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		assert_eq!(row.pending_deposit.expect("merged").amount, 399);
 
 		// The direct credit is claimable through the normal path.
-		let before = collateral_balance(DOT, 2);
-		assert_ok!(claim_collateral(2, DOT, PUSD, 2));
-		assert_eq!(collateral_balance(DOT, 2) - before, 992);
+		assert_claim_collateral(2, 992);
 	});
 }
 
 #[test]
 fn incoming_deposit_fully_used_leaves_no_pending() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, PUSD, recovery_branch_config());
 		open_standing_vault();
 		prepare_active_pool();
 		park_at_104_percent();

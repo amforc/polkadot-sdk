@@ -28,17 +28,12 @@ fn frozen_branch_blocks_every_value_moving_operation() {
 		assert_noop!(claim_yield(1, DOT, PUSD, 1), Error::<Test>::BranchFrozen);
 		assert_noop!(compound(1, DOT, PUSD, 10), Error::<Test>::BranchFrozen);
 		// The infallible offset surfaces step aside on a frozen branch:
-		// zeroed results, credits returned whole.
-		let (debt_offset, leftover) = simulate_offset(DOT, PUSD, 100, 50);
-		assert_eq!(debt_offset, 0);
-		assert_eq!(leftover, 50);
-		let (debt_offset, leftover) = simulate_pending_offset(DOT, PUSD, 100, 50);
-		assert_eq!(debt_offset, 0);
-		assert_eq!(leftover, 50);
-		// Yield routing cannot fail: the frozen pool just takes nothing.
-		let leftover = distribute_yield(DOT, PUSD, 40);
-		assert_eq!(leftover.peek(), 40);
-		drop(leftover);
+		// zeroed results, credits returned whole, nothing written.
+		assert_storage_noop!(assert_eq!(simulate_offset(DOT, PUSD, 100, 50), (0, 50)));
+		assert_storage_noop!(assert_eq!(simulate_pending_offset(DOT, PUSD, 100, 50), (0, 50)));
+		// Yield routing cannot fail: the frozen pool just takes nothing, and not even the
+		// matured cohort advances.
+		assert_yield_declined(DOT, PUSD, 40);
 		// Settlement moves no value and stays available for housekeeping, but the
 		// matured pending amount stays put: activation changes offsettable
 		// risk, which the freeze halts.
@@ -114,25 +109,13 @@ fn safety_mode_keeps_deposits_claims_and_offsets_working() {
 		// delta_S = 80 * (1/400) = 0.2, P = 352/400 = 0.88;
 		// gain = (400/1) * 0.2 = 80, compounded = (400/1) * 0.88 = 352.
 		assert_eq!(simulate_offset(DOT, PUSD, 48, 80).0, 48);
-		let before = collateral_balance(DOT, 1);
-		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 80);
+		assert_claim_collateral(1, 80);
 
 		drop(distribute_yield(DOT, PUSD, 70));
 		// A = 352 after the offset: delta_G = 70 * (0.88/352) = 0.175;
 		// the claim realizes against the post-claim snapshot (P0 = 0.88):
 		// yield = floor(352 * 0.175 / 0.88) = 70.
-		assert_ok!(claim_yield(1, DOT, PUSD, 1));
-		System::assert_has_event(
-			crate::Event::YieldClaimed {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				recipient: 1,
-				amount: 70,
-			}
-			.into(),
-		);
+		assert_claim_yield(1, 70);
 	});
 }
 

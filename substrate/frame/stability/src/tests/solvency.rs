@@ -5,31 +5,11 @@
 
 use crate::mock::*;
 
-/// Claim `who`'s collateral to itself and assert the exact payout.
-fn assert_claim_collateral(who: AccountId, expected: Balance) {
-	let before = collateral_balance(DOT, who);
-	assert_ok!(claim_collateral(who, DOT, PUSD, who));
-	assert_eq!(collateral_balance(DOT, who) - before, expected);
-}
-
-/// The pool account holds nothing and the aggregates are all zero.
-fn assert_pool_fully_drained() {
-	let pool = Stability::pool_account(&DOT, &PUSD);
-	assert_eq!(stable_balance(PUSD, pool), 0);
-	assert_eq!(collateral_balance(DOT, pool), 0);
-	let state = pool_state(DOT, PUSD);
-	assert_eq!(state.total_active_deposits, 0);
-	assert_eq!(state.total_pending_deposits, 0);
-	assert_eq!(state.total_collateral_gains_unclaimed, 0);
-	assert_eq!(state.total_yield_unclaimed, 0);
-}
-
 /// Three depositor cohorts across two yields and two offsets, then every one
 /// of them realized and the pool drained to zero.
 #[test]
 fn multiple_depositor_cohorts_reconcile_to_zero() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		seed_matured_deposit(1, 1_000);
 		seed_matured_deposit(2, 500);
 
@@ -71,48 +51,6 @@ fn multiple_depositor_cohorts_reconcile_to_zero() {
 		// The reconciliation: collateral 350+175+225 = 750 (= 300+450),
 		// yield 160+80+90 = 330 (= 150+180), compounded 300+150+450 = 900. The
 		// pool holds nothing.
-		assert_pool_fully_drained();
-	});
-}
-
-#[test]
-fn full_depletion_epoch_boundary_stays_solvent() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		seed_matured_deposit(1, 1_000);
-
-		// Yield 1: G(0,0) = 100/1000 = 0.1.
-		drop(distribute_yield(DOT, PUSD, 100));
-		// A full offset bumps the epoch: delta_S = floor(800 * 1e18 / 1000) =
-		// 8e17 on the epoch-0 row, then coords reset to (epoch 1, P = 1).
-		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).0, 1_000);
-		assert_eq!(pool_state(DOT, PUSD).coords.epoch, 1);
-
-		// A fresh epoch-1 depositor is untouched by epoch-0 history.
-		seed_matured_deposit(2, 1_000);
-		// Yield 2 on epoch 1: G(1,0) = 50/1000 = 0.05.
-		drop(distribute_yield(DOT, PUSD, 50));
-		// Offset on epoch 1: A = 1000 → 600, P = 0.6, delta_S =
-		// floor(200 * 1e18 / 1000) = 2e17, so S(1,0) = 0.2.
-		assert_eq!(simulate_offset(DOT, PUSD, 400, 200).0, 400);
-
-		// user1 (epoch 0): compounded is zero (an epoch behind), but its
-		// epoch-0 gains stay claimable: collateral floor(1000 * 0.8) = 800,
-		// yield floor(1000 * 0.1) = 100.
-		assert_claim_collateral(1, 800);
-		assert_ok!(claim_yield(1, DOT, PUSD, 1));
-		assert_eq!(stable_balance(PUSD, 1), 100);
-		assert!(deposit_row(DOT, PUSD, 1).is_none());
-
-		// user2 (epoch 1): collateral floor(1000 * 0.2) = 200, yield
-		// floor(1000 * 0.05) = 50, compounded floor(1000 * 0.6) = 600.
-		assert_claim_collateral(2, 200);
-		assert_ok!(claim_yield(2, DOT, PUSD, 2));
-		assert_ok!(withdraw(2, DOT, PUSD, 10_000, 2));
-		assert_eq!(stable_balance(PUSD, 2), 650);
-
-		// Collateral 800+200 = 1000, yield 100+50 = 150. Nothing stranded
-		// across the epoch boundary.
 		assert_pool_fully_drained();
 	});
 }

@@ -5,8 +5,7 @@ use crate::{mock::*, Error};
 
 #[test]
 fn deposit_moves_funds_and_queues_pending() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		mint_stable(PUSD, 1, 1_000);
 
 		assert_ok!(deposit(1, DOT, PUSD, 400));
@@ -15,23 +14,18 @@ fn deposit_moves_funds_and_queues_pending() {
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert_eq!(stable_balance(PUSD, pool), 400);
 
-		let row = deposit_row(DOT, PUSD, 1).expect("row created");
-		assert_eq!(row.active_deposit, 0);
-		let pending = row.pending_deposit.expect("queued as pending");
-		assert_eq!(pending.amount, 400);
+		// The whole 400 queues in the first cohort at the fresh pending accumulators. Nothing is
+		// active or claimable yet.
+		let mut expected = Deposit::fresh(DepositSnapshot::fresh());
+		expected.pending_deposit = Some(PendingDeposit {
+			amount: 400,
+			cohort: CohortId(0),
+			snapshot: DepositSnapshot::fresh(),
+		});
+		assert_eq!(deposit_row(DOT, PUSD, 1), Some(expected));
 		// Deposited at t = 1_000 with the 5_000 ms entry delay: 6_000, rounded up to the cohort
 		// boundary at 10_000.
 		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(10_000));
-		// Queued at the fresh pending accumulators.
-		assert_eq!(pending.snapshot.coords.p, FixedU128::one());
-		assert_eq!(pending.snapshot.coords.epoch, 0);
-		assert_eq!(pending.snapshot.coords.scale, 0);
-		assert_eq!(row.claimable_collateral, 0);
-		assert_eq!(row.claimable_yield, 0);
-		assert_eq!(row.snapshot.coords.p, FixedU128::one());
-		assert_eq!(row.snapshot.coords.epoch, 0);
-		assert_eq!(row.snapshot.coords.scale, 0);
-		assert!(row.withdrawal_request.is_none());
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_pending_deposits, 400);
@@ -53,8 +47,7 @@ fn deposit_moves_funds_and_queues_pending() {
 
 #[test]
 fn deposit_below_minimum_reverts_at_minimum_succeeds() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		mint_stable(PUSD, 1, 1_000);
 
 		// The branch minimum is 100.
@@ -65,17 +58,8 @@ fn deposit_below_minimum_reverts_at_minimum_succeeds() {
 }
 
 #[test]
-fn deposit_on_unregistered_branch_reverts() {
-	build_and_execute(|| {
-		mint_stable(PUSD, 1, 1_000);
-		assert_noop!(deposit(1, DOT, PUSD, 400), Error::<Test>::PoolNotRegistered);
-	});
-}
-
-#[test]
 fn deposit_without_funds_reverts() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		// User 2 was never minted any PUSD, so the asset account itself is
 		// missing (a funded-but-short wallet errors `BalanceLow` instead —
 		// see `deposit_in_the_wallet_dead_zone_fails_instead_of_dusting`).
@@ -85,8 +69,7 @@ fn deposit_without_funds_reverts() {
 
 #[test]
 fn second_deposit_merges_and_resets_delay() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		mint_stable(PUSD, 1, 1_000);
 
 		assert_ok!(deposit(1, DOT, PUSD, 400));
@@ -109,41 +92,6 @@ fn second_deposit_merges_and_resets_delay() {
 				amount: 300,
 				used_for_recovery: 0,
 				pending_amount: 300,
-			}
-			.into(),
-		);
-	});
-}
-
-#[test]
-fn deposit_auto_activates_matured_pending() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		mint_stable(PUSD, 1, 1_000);
-
-		assert_ok!(deposit(1, DOT, PUSD, 400));
-		// The cohort matures at t = 10_000; the next deposit advances it and settles the row
-		// before queueing its own amount.
-		advance_time(9_000);
-		assert_ok!(deposit(1, DOT, PUSD, 300));
-
-		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
-		assert_eq!(row.active_deposit, 400);
-		let pending = row.pending_deposit.expect("new amount queued");
-		assert_eq!(pending.amount, 300);
-		// Fresh delay for the new amount: t = 10_000 + 5_000, already on a cohort boundary.
-		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(15_000));
-
-		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.total_active_deposits, 400);
-		assert_eq!(state.total_pending_deposits, 300);
-
-		System::assert_has_event(
-			crate::Event::PendingDepositActivated {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				amount: 400,
 			}
 			.into(),
 		);

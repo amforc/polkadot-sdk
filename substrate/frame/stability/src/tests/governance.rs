@@ -1,10 +1,10 @@
 //! What market registration seeds, what teardown removes, and what governance may change
 //! afterwards.
 
-use crate::{
-	mock::*,
-	types::{Leg, PoolSums},
-	Error,
+use crate::{mock::*, Error};
+use frame::traits::{
+	fungibles::{Inspect as _, Refund as _},
+	tokens::Provenance,
 };
 
 fn providers(who: AccountId) -> u32 {
@@ -25,16 +25,11 @@ fn branch_registration_seeds_pool_rows() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(state.total_pending_deposits, 0);
-		assert_eq!(state.coords.p, FixedU128::one());
-		assert_eq!(state.coords.epoch, 0);
-		assert_eq!(state.coords.scale, 0);
+		assert_eq!(state.coords, Accumulators { p: FixedU128::one(), epoch: 0, scale: 0 });
 		assert_eq!(state.total_collateral_gains_unclaimed, 0);
 		assert_eq!(state.total_yield_unclaimed, 0);
 		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 0u32, 0u32)));
-		assert_eq!(
-			crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, 0u32, 0u32)),
-			PoolSums::default()
-		);
+		assert_eq!(active_sums(0, 0), PoolSums::default());
 
 		let config = crate::Pools::<Test>::get(DOT, PUSD)
 			.expect("pool seeded on registration")
@@ -48,6 +43,112 @@ fn branch_registration_seeds_pool_rows() {
 		// (`Consideration`), pricing the storage.
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert!(providers(pool) >= 1);
+	});
+}
+
+// Native collateral has no asset account to touch: `can_deposit(1)` fails
+// against a production ED and `Balances::touch` is a no-op. Registration must
+// still succeed because the provider reference lets the account receive its
+// own minimum.
+#[test]
+fn native_collateral_registration_does_not_need_a_touch() {
+	build_with_default_market(|| {
+		let pool = Stability::pool_account(&DOT, &PUSD);
+		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_some());
+		assert!(providers(pool) >= 1);
+		assert_ok!(PoolCollateralAssets::can_deposit(
+			DOT,
+			&pool,
+			PoolCollateralAssets::minimum_balance(DOT),
+			Provenance::Extant,
+		)
+		.into_result());
+	});
+}
+
+// The pool's asset-account deposit is charged to the same account Vaults charges for the
+// market's collateral custody: the depositor when a signed creation paid one, and the full
+// admin otherwise. Governance can therefore register an issued-collateral market too.
+#[test]
+fn issued_collateral_account_touch_follows_the_custody_funder() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		// The funder also seeds the market's redistribution custody, withdrawn under
+		// `Preserve`, so each candidate needs two minimum balances on hand.
+		mint_collateral(AssetId::WithId(77), 1, 2_000);
+		mint_collateral(AssetId::WithId(77), ADMIN, 2_000);
+		let collateral = AssetId::WithId(77);
+		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+		let pool = Stability::pool_account(&collateral, &PUSD);
+
+		// Root supplies no depositor, so the market's full admin pays.
+		let admin_held_before = native_on_hold(ADMIN);
+		assert_ok!(Vaults::create_branch(
+			RuntimeOrigin::root(),
+			collateral.clone(),
+			PUSD,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			branch_config_for(collateral.clone(), PUSD),
+			registration_config(PUSD),
+		));
+		assert_ok!(Assets::can_deposit(77, &pool, 1, Provenance::Extant).into_result());
+		let (payer, account_deposit) =
+			Assets::deposit_held(77, pool).expect("registration touched the pool account");
+		assert_eq!(payer, ADMIN);
+		assert!(account_deposit > 0);
+
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
+		assert!(Assets::deposit_held(77, pool).is_none());
+		assert_eq!(native_on_hold(ADMIN), admin_held_before);
+
+		// A signed creation pays its own deposit, so the depositor is charged instead.
+		let held_before = native_on_hold(1);
+		assert_ok!(Vaults::create_branch(
+			RuntimeOrigin::signed(1),
+			collateral.clone(),
+			PUSD,
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
+			branch_config_for(collateral.clone(), PUSD),
+			registration_config(PUSD),
+		));
+		let (payer, account_deposit) =
+			Assets::deposit_held(77, pool).expect("registration touched the pool account");
+		assert_eq!(payer, 1);
+		assert!(account_deposit > 0);
+
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
+		assert!(Assets::deposit_held(77, pool).is_none());
+		assert_eq!(native_on_hold(1), held_before);
+	});
+}
+
+#[test]
+fn branch_registration_rejects_prefunded_pool_account() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		// Whoever creates the market funds its redistribution seed: the depositor when there is
+		// one, the full admin otherwise. The withdrawal preserves the payer, so both need two
+		// minimum balances on hand.
+		mint_collateral(AssetId::WithId(77), 1, 2_000);
+		mint_collateral(AssetId::WithId(77), ADMIN, 2_000);
+		let collateral = AssetId::WithId(77);
+		let pool = Stability::pool_account(&collateral, &PUSD);
+		mint_collateral(collateral.clone(), pool, 1_000);
+		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::signed(1),
+				collateral.clone(),
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				branch_config_for(collateral.clone(), PUSD),
+				registration_config(PUSD),
+			),
+			Error::<Test>::PoolAccountNotEmpty
+		);
+		assert!(crate::Pools::<Test>::get(collateral, PUSD).is_none());
+		assert_eq!(collateral_balance(AssetId::WithId(77), pool), 1_000);
 	});
 }
 
@@ -70,22 +171,19 @@ fn branch_registration_rejects_invalid_pool_config() {
 			Error::<Test>::InvalidStabilityPoolConfig
 		);
 		// The whole registration rolled back, vaults side included.
-		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
-		assert!(Vaults::branch_tcr(DOT, PUSD).is_err());
+		assert_err!(Vaults::branch_tcr(DOT, PUSD), pallet_vaults::Error::<Test>::BranchNotFound);
 	});
 }
 
 #[test]
 fn branch_removal_blocked_while_depositor_rows_exist() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		crate::Deposits::<Test>::insert((DOT, PUSD, 5u128), empty_deposit_row());
 
 		assert_noop!(
 			Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
 			Error::<Test>::PoolNotEmpty
 		);
-		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_some());
 
 		crate::Deposits::<Test>::remove((DOT, PUSD, 5u128));
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
@@ -94,8 +192,7 @@ fn branch_removal_blocked_while_depositor_rows_exist() {
 
 #[test]
 fn branch_removal_tears_down_pool_rows() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		let providers_before = providers(pool);
 
@@ -114,8 +211,7 @@ fn branch_removal_tears_down_pool_rows() {
 
 #[test]
 fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		let pool = Stability::pool_account(&DOT, &PUSD);
 
 		// Two 150-deposits, then amounts indivisible by the two-way split so
@@ -179,9 +275,8 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 }
 
 #[test]
-fn set_stability_pool_config_origin_matrix() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+fn set_stability_pool_config_checks_the_origin_then_stores_and_emits() {
+	build_with_default_market(|| {
 		let mut config = default_pool_config();
 		config.minimum_deposit = 250;
 
@@ -204,46 +299,32 @@ fn set_stability_pool_config_origin_matrix() {
 			config.clone()
 		));
 
-		// Root is the governance override.
+		// Root is the governance override. The whole config is stored as given.
 		config.minimum_deposit = 300;
-		assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
+		config.entry_delay = 10_000;
+		assert_ok!(Stability::set_stability_pool_config(
+			RuntimeOrigin::root(),
+			DOT,
+			PUSD,
+			config.clone()
+		));
 		let stored = crate::Pools::<Test>::get(DOT, PUSD).expect("stored").config;
-		assert_eq!(stored.minimum_deposit, 300);
-	});
-}
-
-#[test]
-fn set_stability_pool_config_requires_registered_branch() {
-	build_and_execute(|| {
-		assert_noop!(
-			Stability::set_stability_pool_config(
-				RuntimeOrigin::root(),
-				DOT,
-				PUSD,
-				default_pool_config()
-			),
-			Error::<Test>::PoolNotRegistered
+		assert_eq!(stored, config);
+		System::assert_last_event(
+			crate::Event::StabilityPoolConfigUpdated { collateral_id: DOT, stable_id: PUSD }.into(),
 		);
 	});
 }
 
 #[test]
-fn set_stability_pool_config_rejects_invalid_config() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+fn set_stability_pool_config_validates_and_freezes_precision_parameters() {
+	build_with_default_market(|| {
 		let mut config = default_pool_config();
 		config.minimum_active_pool_balance = 0;
 		assert_noop!(
 			Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config),
 			Error::<Test>::InvalidStabilityPoolConfig
 		);
-	});
-}
-
-#[test]
-fn set_stability_pool_config_freezes_precision_parameters() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
 
 		// Still a valid config on its own (0.5e-9 * 1e9 = 0.5 <= 1), so it
 		// reaches the immutability check rather than failing validation.
@@ -260,29 +341,6 @@ fn set_stability_pool_config_freezes_precision_parameters() {
 		assert_noop!(
 			Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config),
 			Error::<Test>::AccumulatorParamsImmutable
-		);
-	});
-}
-
-#[test]
-fn set_stability_pool_config_updates_and_emits() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		let mut config = default_pool_config();
-		config.minimum_deposit = 250;
-		config.entry_delay = 10_000;
-
-		assert_ok!(Stability::set_stability_pool_config(
-			RuntimeOrigin::root(),
-			DOT,
-			PUSD,
-			config.clone()
-		));
-
-		let stored = crate::Pools::<Test>::get(DOT, PUSD).expect("stored").config;
-		assert_eq!(stored, config);
-		System::assert_last_event(
-			crate::Event::StabilityPoolConfigUpdated { collateral_id: DOT, stable_id: PUSD }.into(),
 		);
 	});
 }
