@@ -37,13 +37,12 @@ fn liquidation_fully_covered_by_the_active_stability_pool() {
 
 		feed_price(dot_price(2, 1)); // CR 120% < MCR 125%: liquidatable
 
-		let keeper = acct(4);
-		fund_dot(&keeper, 0);
+		let keeper = keeper();
 		let owner_free_before = native_balance(&liquidated_owner);
 		assert_ok!(Vaults::liquidate(
 			RuntimeOrigin::signed(keeper.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			liquidated_owner.clone(),
 			JitTerms { max_stable: 0, min_collateral_out: 0 },
 		));
@@ -59,10 +58,7 @@ fn liquidation_fully_covered_by_the_active_stability_pool() {
 		assert_eq!(native_balance(&pool_account()), 5_243_750_000_000_000);
 		assert_eq!(pool_state().total_active_deposits, 10_000 * PUSD);
 		// The liquidated vault is removed.
-		assert_eq!(
-			Vaults::vault_status(get_native_id(), get_pusd_id(), liquidated_owner.clone()),
-			None
-		);
+		assert_eq!(vault_status(&liquidated_owner), None);
 	});
 }
 
@@ -97,14 +93,13 @@ fn liquidation_splits_across_active_jit_pending_and_redistribution() {
 
 		feed_price(dot_price(2, 1));
 
-		let keeper = acct(4);
-		fund_dot(&keeper, 0);
+		let keeper = keeper();
 		// JIT allowance = 200 pUSD, plus 1 pUSD so the burn does not empty the account.
 		mint_pusd(&keeper, 201 * PUSD);
 		assert_ok!(Vaults::liquidate(
 			RuntimeOrigin::signed(keeper.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			liquidated_owner.clone(),
 			JitTerms { max_stable: 200 * PUSD, min_collateral_out: 0 },
 		));
@@ -122,12 +117,7 @@ fn liquidation_splits_across_active_jit_pending_and_redistribution() {
 		assert_eq!(pool_state().total_active_deposits, 0);
 		assert_eq!(pool_state().total_pending_deposits, 0);
 		// Redistribution: 200 pUSD debt and 110 WND reach the recipient after a poke.
-		assert_ok!(Vaults::poke(
-			RuntimeOrigin::signed(keeper.clone()),
-			get_native_id(),
-			get_pusd_id(),
-			recipient_owner.clone(),
-		));
+		poke(&recipient_owner);
 		let recipient_vault = vault(&recipient_owner);
 		assert_eq!(recipient_vault.debt.total(), 1_200 * PUSD);
 		assert_eq!(recipient_vault.collateral, 10_110 * WND);

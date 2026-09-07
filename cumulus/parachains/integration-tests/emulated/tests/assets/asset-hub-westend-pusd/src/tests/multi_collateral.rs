@@ -23,13 +23,12 @@ use asset_hub_westend_runtime::{
 };
 use emulated_integration_tests_common::{snowbridge::SEPOLIA_ID, USDT_ID};
 use frame_support::{
-	assert_err,
+	assert_noop,
 	traits::{
 		fungibles::Refund,
 		tokens::{Fortitude, Preservation, Provenance},
 	},
 };
-use pallet_vaults::JitTerms;
 use sp_runtime::traits::MaybeEquivalence;
 use xcm::v5::{Junction::GlobalConsensus, Location, NetworkId};
 
@@ -51,19 +50,6 @@ fn usdt_id() -> VaultsCollateralId {
 
 fn eth_price(pusd_per_eth: u128) -> FixedU128 {
 	FixedU128::from_rational(pusd_per_eth * PUSD, ETH)
-}
-
-/// Liquidates without JIT, with a throwaway keeper.
-fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId) {
-	let keeper = acct(0xEE);
-	fund_collateral(&collateral_id, &keeper, 0);
-	assert_ok!(Vaults::liquidate(
-		RuntimeOrigin::signed(keeper),
-		collateral_id,
-		get_pusd_id(),
-		owner.clone(),
-		JitTerms { max_stable: 0, min_collateral_out: 0 },
-	));
 }
 
 /// One stablecoin, three markets: native WND, trust-backed USDT, bridged ETH.
@@ -143,16 +129,16 @@ fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::root(),
 			eth_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			branch_admins(),
 			branch_config(&eth_id(), &BranchSpec::default()),
 			registration_config(),
 		));
-		assert!(pallet_vaults::Branches::<Runtime>::get(eth_id(), get_pusd_id()).is_some());
+		assert!(pallet_vaults::Branches::<Runtime>::get(eth_id(), PUSD_ID).is_some());
 
 		// The pool can now take a gain below the collateral's minimum balance. The
 		// full admin paid the deposit.
-		let pool = pallet_stability::Pallet::<Runtime>::pool_account(&eth_id(), &get_pusd_id());
+		let pool = pallet_stability::Pallet::<Runtime>::pool_account(&eth_id(), &PUSD_ID);
 		let (depositor, deposit) =
 			<StabilityCollateral as Refund<AccountId>>::deposit_held(eth_id(), pool.clone())
 				.expect("registration touched the pool account");
@@ -179,7 +165,6 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 		feed_price(dot_price(2, 1));
 		feed_price_for(eth_id(), eth_price(4_000));
 		create_market_signed(eth_id(), &liquidation_spec());
-		lift_global_ceiling(1_000_000_000 * PUSD);
 
 		// 6 ETH against 10,000 pUSD debt: CR 240% at 4,000, 120% at 2,000.
 		let liquidated_owner = acct(1);
@@ -203,16 +188,9 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 
 		feed_price_for(eth_id(), eth_price(2_000)); // CR 120% < MCR 125%
 
-		let keeper = acct(4);
-		fund_collateral(&eth_id(), &keeper, 0);
+		let keeper = acct(0xEE);
 		let owner_free_before = collateral_free(&eth_id(), &liquidated_owner);
-		assert_ok!(Vaults::liquidate(
-			RuntimeOrigin::signed(keeper.clone()),
-			eth_id(),
-			get_pusd_id(),
-			liquidated_owner.clone(),
-			JitTerms { max_stable: 0, min_collateral_out: 0 },
-		));
+		liquidate_on(eth_id(), &liquidated_owner);
 
 		// seized = min(6, 10,000 × 1.05 / 2,000) = 5.25 ETH. The 0.75 ETH
 		// surplus returns to the owner, with the vault's storage deposit in ETH.
@@ -230,7 +208,7 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 		assert_eq!(pusd_balance(&pool), 10_000 * PUSD);
 		assert_eq!(collateral_free(&eth_id(), &pool), 5_243_750_000_000_000_000);
 		// The liquidated vault is removed.
-		assert_eq!(Vaults::vault_status(eth_id(), get_pusd_id(), liquidated_owner.clone()), None);
+		assert_eq!(vault_status_on(&eth_id(), &liquidated_owner), None);
 
 		// The sole depositor's gain is the whole pool collateral.
 		claim_collateral_out(&eth_id(), &depositor, 5_243_750_000_000_000_000);
@@ -248,7 +226,6 @@ fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 		feed_price(dot_price(2, 1));
 		feed_price_for(usdt_id(), FixedU128::from_rational(PUSD, USDT)); // at par
 		create_market_signed(usdt_id(), &accounting_spec());
-		lift_global_ceiling(1_000_000_000 * PUSD);
 
 		// 14,000 USDT against 10,000 pUSD debt: CR 140% at par, 117.6% at 0.84.
 		let liquidated_owner = acct(1);
@@ -305,7 +282,6 @@ fn sufficient_collateral_settles_the_vault_deposit_in_itself() {
 		create_market_signed(usdt_id(), &BranchSpec::default());
 		feed_price_for(eth_id(), eth_price(2_000));
 		create_market_signed(eth_id(), &BranchSpec::default());
-		lift_global_ceiling(1_000_000_000 * PUSD);
 
 		let usdt_owner = acct(1);
 		let eth_owner = acct(2);
@@ -339,7 +315,7 @@ fn sufficient_collateral_settles_the_vault_deposit_in_itself() {
 		assert_ok!(Vaults::repay_for(
 			RuntimeOrigin::signed(usdt_owner.clone()),
 			usdt_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			usdt_owner.clone(),
 			Some(100_000 * PUSD),
 		));
@@ -347,7 +323,7 @@ fn sufficient_collateral_settles_the_vault_deposit_in_itself() {
 		assert_ok!(Vaults::close_vault(
 			RuntimeOrigin::signed(usdt_owner.clone()),
 			usdt_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			None,
 		));
 		assert_eq!(vault_deposit_on_hold(&usdt_id(), &usdt_owner), 0);
@@ -365,7 +341,6 @@ fn insufficient_collateral_settles_the_vault_deposit_in_wnd() {
 		create_pusd();
 		feed_price_for(reservable_id(), dot_price(2, 1));
 		create_market_signed(reservable_id(), &BranchSpec::default());
-		lift_global_ceiling(1_000_000_000 * PUSD);
 
 		let owner = acct(1);
 		let (deposit_asset, deposit) = expected_vault_deposit(&reservable_id(), &owner);
@@ -389,15 +364,14 @@ fn unpriceable_sufficient_collateral_cannot_open_a_vault() {
 		create_pusd();
 		feed_price_for(usdt_id(), FixedU128::from_rational(PUSD, USDT)); // at par
 		create_market_signed(usdt_id(), &BranchSpec::default());
-		lift_global_ceiling(1_000_000_000 * PUSD);
 
 		let owner = acct(1);
 		fund_collateral(&usdt_id(), &owner, 20_000 * USDT);
-		assert_err!(
+		assert_noop!(
 			Vaults::open_vault(
 				RuntimeOrigin::signed(owner.clone()),
 				usdt_id(),
-				get_pusd_id(),
+				PUSD_ID,
 				20_000 * USDT,
 				10_000 * PUSD,
 				FixedU128::zero(),
@@ -405,6 +379,5 @@ fn unpriceable_sufficient_collateral_cannot_open_a_vault() {
 			),
 			sp_runtime::DispatchError::Unavailable
 		);
-		assert_eq!(Vaults::vault_status(usdt_id(), get_pusd_id(), owner), None);
 	});
 }
