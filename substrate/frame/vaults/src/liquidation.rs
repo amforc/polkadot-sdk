@@ -24,7 +24,6 @@ use frame::{
 	arithmetic::{
 		AtLeast32BitUnsigned, CheckedAdd, FixedPointOperand, FixedU128, Permill, Saturating, Zero,
 	},
-	deps::frame_support::{require_transactional, transactional},
 	prelude::*,
 	traits::{
 		fungibles::{
@@ -89,11 +88,7 @@ struct LiquidationQuote<Balance> {
 }
 
 impl<T: Config> Pallet<T> {
-	/// Executes liquidation and commits all custody changes as one transaction.
-	///
-	/// The transaction reverts all changes — the pool offset included — if a
-	/// later settlement fails.
-	#[transactional]
+	/// Executes liquidation and commits all custody changes.
 	pub(crate) fn do_liquidate(
 		keeper: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
@@ -140,7 +135,6 @@ impl<T: Config> Pallet<T> {
 	///
 	/// The redistribution account holds collateral until recipients materialize it. The owner
 	/// receives surplus as free balance.
-	#[require_transactional]
 	pub(crate) fn settle_liquidation_custody(
 		op: VaultOp<T>,
 		redistribution: DebtCollateral<BalanceOf<T>>,
