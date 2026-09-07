@@ -11,7 +11,6 @@ use crate::{
 	types::Leg,
 };
 use frame::{
-	deps::frame_support::require_transactional,
 	prelude::*,
 	traits::{tokens::Preservation, Time},
 };
@@ -137,7 +136,6 @@ impl<T: Config>
 	StabilityPoolOffset<CollateralIdOf<T>, StableIdOf<T>, BalanceOf<T>, CollateralCreditOf<T>>
 	for Pallet<T>
 {
-	#[require_transactional]
 	fn offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,

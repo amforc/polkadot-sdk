@@ -209,8 +209,8 @@ fn offset_api_trait_surface_matches_the_engine() {
 		// the active reservation.
 		assert_eq!(Stability::reducible_pending(&DOT, &PUSD, 100, 500), 0);
 
-		// `offset` requires the caller's transaction (`require_transactional`);
-		// the hypothetical supplies it here, standing in for dispatch.
+		// The hypothetical supplies the caller's transaction for `offset`, standing in for
+		// dispatch.
 		hypothetically!({
 			assert_ok!(Stability::offset(
 				&DOT,
