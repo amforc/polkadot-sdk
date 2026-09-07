@@ -14,34 +14,13 @@
 // limitations under the License.
 
 use crate::imports::*;
-use asset_hub_westend_runtime::Vaults;
-use pallet_vaults::{types::InterestWeight, JitTerms};
-
-fn liquidate(owner: &AccountId) {
-	let keeper = acct(0xEE);
-	fund_dot(&keeper, 0);
-	assert_ok!(Vaults::liquidate(
-		RuntimeOrigin::signed(keeper),
-		get_native_id(),
-		get_pusd_id(),
-		owner.clone(),
-		JitTerms { max_stable: 0, min_collateral_out: 0 },
-	));
-}
+use frame_support::hypothetically;
+use pallet_vaults::types::{BranchState, InterestWeight, Vault};
 
 /// A whole-unit rate-weighted principal, `principal × annual_rate` in stablecoin
 /// units.
 fn weight(whole: Balance) -> InterestWeight<Balance> {
 	InterestWeight { whole, remainder: 0 }
-}
-
-fn poke(owner: &AccountId) {
-	assert_ok!(Vaults::poke(
-		RuntimeOrigin::signed(acct(0xFE)),
-		get_native_id(),
-		get_pusd_id(),
-		owner.clone(),
-	));
 }
 
 /// The first redistribution, 1,000 pUSD / 550 WND, splits 60/40 over the 6,000
@@ -116,11 +95,16 @@ fn redistribution_with_a_vault_joining_between_events() {
 	});
 }
 
+/// The end state of a two-recipient reconciliation: vault A, vault B, and the market.
+type Reconciled = (Vault<Balance>, Vault<Balance>, BranchState<AccountId, Balance>);
+
 /// Adds 1,000 × 6.4% = 64 pUSD of pending weight at the recipient-average rate.
 ///
 /// A touch moves A's 600 × 4% = 24 or B's 400 × 10% = 40 to its principal weight.
-/// The total remains 64 pUSD and does not depend on `touch_order`.
-fn run_weight_per_stake_reconciliation(touch_order: [usize; 2]) {
+/// The total remains 64 pUSD and does not depend on which recipient touches
+/// first, so the reversed order runs hypothetically and must reach the same state.
+#[test]
+fn weight_per_stake_reconciliation_is_touch_order_independent() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
 		create_branch(&accounting_spec());
@@ -142,46 +126,31 @@ fn run_weight_per_stake_reconciliation(touch_order: [usize; 2]) {
 		assert_eq!(debt.pending_redistribution_weight, weight(64 * PUSD));
 		assert_eq!(debt.weighted_principal, weight(384 * PUSD));
 
-		// One year passes before the touches.
-		let recipients = [owner_a.clone(), owner_b.clone()];
 		// A's share of the pending weight is 600 × 4% = 24, B's 400 × 10% = 40.
-		let shares = [24 * PUSD, 40 * PUSD];
-		advance_time(31_557_600_000);
-		poke(&recipients[touch_order[0]]);
-		// The first touch moves its share from pending weight to vault principal.
-		// The aggregate does not change.
-		let debt = branch_state().debt;
-		assert_eq!(debt.pending_redistribution_weight, weight(64 * PUSD - shares[touch_order[0]]));
-		assert_eq!(debt.weighted_principal, weight(384 * PUSD));
-		poke(&recipients[touch_order[1]]);
-		// The second touch drains the pending weight.
-		let debt = branch_state().debt;
-		assert_eq!(debt.pending_redistribution_weight, weight(0));
-		assert_eq!(debt.weighted_principal, weight(384 * PUSD));
+		let reversed = hypothetically!(reconcile_by_touching(
+			[(&owner_b, 40 * PUSD), (&owner_a, 24 * PUSD)],
+			&owner_a,
+			&owner_b,
+		));
+		let forward = reconcile_by_touching(
+			[(&owner_a, 24 * PUSD), (&owner_b, 40 * PUSD)],
+			&owner_a,
+			&owner_b,
+		);
+		assert_eq!(forward, reversed);
+		let (vault_a, vault_b, state) = forward;
 
-		// A: 3,000 + 600 principal; interest (3,000 + 600) × 4% = 144.
-		let vault_a = vault(&owner_a);
+		// A: 3,000 + 600 principal; two years of (3,000 + 600) × 4% = 144.
 		assert_eq!(vault_a.debt.principal, 3_600 * PUSD);
-		assert_eq!(vault_a.debt.interest, 144 * PUSD);
-		assert_eq!(vault_a.collateral, 6_330 * WND);
-		// B: 2,000 + 400 principal; interest (2,000 + 400) × 10% = 240.
-		let vault_b = vault(&owner_b);
-		assert_eq!(vault_b.debt.principal, 2_400 * PUSD);
-		assert_eq!(vault_b.debt.interest, 240 * PUSD);
-		assert_eq!(vault_b.collateral, 4_220 * WND);
-
-		// A second year accrues on the reconciled principals: A adds 144, B adds 240.
-		advance_time(31_557_600_000);
-		poke(&recipients[touch_order[0]]);
-		poke(&recipients[touch_order[1]]);
-		let vault_a = vault(&owner_a);
-		let vault_b = vault(&owner_b);
 		assert_eq!(vault_a.debt.interest, 2 * 144 * PUSD);
+		assert_eq!(vault_a.collateral, 6_330 * WND);
+		// B: 2,000 + 400 principal; two years of (2,000 + 400) × 10% = 240.
+		assert_eq!(vault_b.debt.principal, 2_400 * PUSD);
 		assert_eq!(vault_b.debt.interest, 2 * 240 * PUSD);
+		assert_eq!(vault_b.collateral, 4_220 * WND);
 
 		// Both shares are materialized, so the market totals equal the two rows.
 		// Nothing is pending in redistribution or interest attribution.
-		let state = branch_state();
 		assert_eq!(state.debt.pending_redistribution_principal, 0);
 		assert_eq!(state.pending_redistribution_collateral, 0);
 		assert_eq!(state.debt.pending_interest_attribution, 0);
@@ -195,13 +164,36 @@ fn run_weight_per_stake_reconciliation(touch_order: [usize; 2]) {
 	});
 }
 
-#[test]
-fn weight_per_stake_reconciliation() {
-	run_weight_per_stake_reconciliation([0, 1]);
-}
+/// Touches the two recipients in `touch_order` after a year, checks each touch
+/// moves only that recipient's `share` of pending weight, then accrues a second
+/// year and returns the end state.
+fn reconcile_by_touching(
+	touch_order: [(&AccountId, Balance); 2],
+	owner_a: &AccountId,
+	owner_b: &AccountId,
+) -> Reconciled {
+	let [(first, first_share), (second, _)] = touch_order;
 
-/// The result must not depend on which recipient touches first.
-#[test]
-fn reconciliation_is_touch_order_independent() {
-	run_weight_per_stake_reconciliation([1, 0]);
+	// One year passes before the touches.
+	advance_time(31_557_600_000);
+	poke(first);
+	// The first touch moves its share from pending weight to vault principal.
+	// The aggregate does not change.
+	let debt = branch_state().debt;
+	assert_eq!(debt.pending_redistribution_weight, weight(64 * PUSD - first_share));
+	assert_eq!(debt.weighted_principal, weight(384 * PUSD));
+	poke(second);
+	// The second touch drains the pending weight.
+	let debt = branch_state().debt;
+	assert_eq!(debt.pending_redistribution_weight, weight(0));
+	assert_eq!(debt.weighted_principal, weight(384 * PUSD));
+	// One year of interest on the reconciled principals: A 144, B 240.
+	assert_eq!(vault(owner_a).debt.interest, 144 * PUSD);
+	assert_eq!(vault(owner_b).debt.interest, 240 * PUSD);
+
+	// A second year accrues on the reconciled principals.
+	advance_time(31_557_600_000);
+	poke(first);
+	poke(second);
+	(vault(owner_a), vault(owner_b), branch_state())
 }

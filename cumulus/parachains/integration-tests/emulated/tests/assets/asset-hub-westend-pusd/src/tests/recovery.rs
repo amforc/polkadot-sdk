@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use crate::imports::*;
-use asset_hub_westend_runtime::{Redemptions, RuntimeEvent, System, Vaults};
+use asset_hub_westend_runtime::{RuntimeEvent, System, Vaults};
 use pallet_redemptions::{RecoveryRegime, RedemptionTerms};
 use pusd_primitives::VaultStatus;
 
@@ -23,16 +23,7 @@ use pusd_primitives::VaultStatus;
 fn park_in_final_recovery(owner: &AccountId, collateral: Balance, debt: Balance) {
 	open_vault(owner, collateral, debt, FixedU128::zero());
 	feed_price(dot_price(2, 1));
-	assert_ok!(Vaults::enter_final_recovery(
-		RuntimeOrigin::signed(acct(0xFE)),
-		get_native_id(),
-		get_pusd_id(),
-		owner.clone(),
-	));
-	assert_eq!(
-		Vaults::vault_status(get_native_id(), get_pusd_id(), owner.clone()),
-		Some(VaultStatus::FinalRecovery),
-	);
+	enter_final_recovery(owner);
 }
 
 /// At CR 120% the raw bonus is 120% − 100% − 1% = 19%. It caps at the 10%
@@ -49,32 +40,20 @@ fn final_recovery_redemption_above_par() {
 		let parked_owner = acct(1);
 		park_in_final_recovery(&parked_owner, 6_000 * WND, 10_000 * PUSD);
 
-		let redeemer = acct(3);
-		fund_dot(&redeemer, 0);
-		mint_pusd(&redeemer, 2_000 * PUSD);
-
 		// collateral_out = 2,000 * 1.10 / 2 = 1,100 WND. Recovery redemptions
 		// charge no fee.
-		assert_ok!(Redemptions::redeem(
-			RuntimeOrigin::signed(redeemer.clone()),
-			get_native_id(),
-			get_pusd_id(),
+		let collateral_out = redeem(
+			&acct(3),
 			RedemptionTerms { max_stable_to_spend: 2_000 * PUSD, min_collateral_out: 1_100 * WND },
-			redeemer.clone(),
-			16,
-		));
-		assert_eq!(pusd_balance(&redeemer), 0);
-		assert_eq!(native_balance(&redeemer), 1_100 * WND + get_native_ed());
+		);
+		assert_eq!(collateral_out, 1_100 * WND);
 
 		// Vault after: 8,000 pUSD debt, 4,900 WND = 9,800 pUSD value,
 		// CR 122.5%, still in the FIFO.
 		let parked_vault = vault(&parked_owner);
 		assert_eq!(parked_vault.debt.total(), 8_000 * PUSD);
 		assert_eq!(parked_vault.collateral, 4_900 * WND);
-		assert_eq!(
-			Vaults::vault_status(get_native_id(), get_pusd_id(), parked_owner.clone()),
-			Some(VaultStatus::FinalRecovery),
-		);
+		assert_eq!(vault_status(&parked_owner), Some(VaultStatus::FinalRecovery));
 	});
 }
 
@@ -91,13 +70,12 @@ fn final_recovery_entry_pays_the_liquidation_keeper_reward() {
 		let parked_owner = acct(1);
 		open_vault(&parked_owner, 6_000 * WND, 10_000 * PUSD, FixedU128::zero());
 		feed_price(dot_price(2, 1));
-		let keeper = acct(0xFE);
-		fund_dot(&keeper, 0);
+		let keeper = keeper();
 
 		assert_ok!(Vaults::enter_final_recovery(
 			RuntimeOrigin::signed(keeper.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			parked_owner.clone(),
 		));
 
@@ -109,7 +87,7 @@ fn final_recovery_entry_pays_the_liquidation_keeper_reward() {
 		System::assert_has_event(RuntimeEvent::Vaults(
 			pallet_vaults::Event::VaultEnteredFinalRecovery {
 				collateral_id: get_native_id(),
-				stable_id: get_pusd_id(),
+				stable_id: PUSD_ID,
 				owner: parked_owner.clone(),
 				keeper: keeper.clone(),
 				keeper_reward: reward,
@@ -118,18 +96,11 @@ fn final_recovery_entry_pays_the_liquidation_keeper_reward() {
 
 		// CR 119.875% still caps the bonus at the 10% penalty, so 2,000 pUSD still buys
 		// 1,100 WND.
-		let redeemer = acct(3);
-		fund_dot(&redeemer, 0);
-		mint_pusd(&redeemer, 2_000 * PUSD);
-		assert_ok!(Redemptions::redeem(
-			RuntimeOrigin::signed(redeemer.clone()),
-			get_native_id(),
-			get_pusd_id(),
+		let collateral_out = redeem(
+			&acct(3),
 			RedemptionTerms { max_stable_to_spend: 2_000 * PUSD, min_collateral_out: 1_100 * WND },
-			redeemer.clone(),
-			16,
-		));
-		assert_eq!(native_balance(&redeemer) - get_native_ed(), 1_100 * WND);
+		);
+		assert_eq!(collateral_out, 1_100 * WND);
 		assert_eq!(vault(&parked_owner).collateral, 4_900 * WND - reward);
 	});
 }
@@ -151,54 +122,27 @@ fn final_recovery_redemption_below_par_with_insurance_cover() {
 		mint_pusd(&insurance, 1_000 * PUSD);
 
 		// Partial settlement: 3,000 pUSD × 8/9 = 2,666.67 pUSD of collateral
-		// value = 1,333.33 WND.
-		let redeemer = acct(3);
-		fund_dot(&redeemer, 0);
-		mint_pusd(&redeemer, 3_000 * PUSD);
-		assert_ok!(Redemptions::redeem(
-			RuntimeOrigin::signed(redeemer.clone()),
-			get_native_id(),
-			get_pusd_id(),
+		// value = 1,333.33 WND. 3,000 of the 9,000 pUSD market debt buys a third
+		// of the 4,000 WND, floored to the planck.
+		let partial_out = redeem(
+			&acct(3),
 			RedemptionTerms { max_stable_to_spend: 3_000 * PUSD, min_collateral_out: 1_333 * WND },
-			redeemer.clone(),
-			16,
-		));
-		assert_eq!(pusd_balance(&redeemer), 0);
-		// 3,000 of the 9,000 pUSD market debt buys a third of the 4,000 WND,
-		// floored to the planck.
-		let partial_out = native_balance(&redeemer) - get_native_ed();
+		);
 		assert_eq!(partial_out, 1_333_333_333_333_333);
 
 		// Full settlement: the remaining 6,000 pUSD takes all collateral and burns the cover.
 		let deposit_held_before = vault_deposit_on_hold(&get_native_id(), &parked_owner);
 		let owner_free_before = native_balance(&parked_owner);
-		let settler = acct(4);
-		fund_dot(&settler, 0);
-		mint_pusd(&settler, 6_000 * PUSD);
-		assert_ok!(Redemptions::redeem(
-			RuntimeOrigin::signed(settler.clone()),
-			get_native_id(),
-			get_pusd_id(),
+		let settled_out = redeem(
+			&acct(4),
 			RedemptionTerms { max_stable_to_spend: 6_000 * PUSD, min_collateral_out: 2_600 * WND },
-			settler.clone(),
-			16,
-		));
-		assert_eq!(pusd_balance(&settler), 0);
+		);
 		// Total collateral paid out = 4,000 WND.
-		assert_eq!(native_balance(&settler) - get_native_ed(), 4_000 * WND - partial_out);
+		assert_eq!(settled_out, 4_000 * WND - partial_out);
 		// Insurance Fund burn = 1,000 pUSD.
 		assert_eq!(pusd_balance(&insurance), 0);
 		// Full settlement removes the vault, releases its holds, and refunds its storage deposit.
-		assert!(pallet_vaults::Vaults::<Runtime>::get((
-			get_native_id(),
-			get_pusd_id(),
-			parked_owner.clone(),
-		))
-		.is_none());
-		assert_eq!(
-			Vaults::vault_status(get_native_id(), get_pusd_id(), parked_owner.clone()),
-			None
-		);
+		assert_eq!(vault_status(&parked_owner), None);
 		assert_eq!(collateral_on_hold(&get_native_id(), &parked_owner), 0);
 		assert_eq!(vault_deposit_on_hold(&get_native_id(), &parked_owner), 0);
 		assert_eq!(
@@ -209,7 +153,7 @@ fn final_recovery_redemption_below_par_with_insurance_cover() {
 		assert_eq!(branch_state().vault_count, 0);
 		System::assert_has_event(RuntimeEvent::Vaults(pallet_vaults::Event::VaultClosed {
 			collateral_id: get_native_id(),
-			stable_id: get_pusd_id(),
+			stable_id: PUSD_ID,
 			owner: parked_owner.clone(),
 			recipient: parked_owner.clone(),
 			collateral: 0,
@@ -235,49 +179,31 @@ fn final_recovery_redemption_below_par_with_full_insurance_cover() {
 		mint_pusd(&insurance, 3_000 * PUSD);
 
 		// Partial settlement at par: 3,000 pUSD buys 1,500 WND and draws no cover.
-		let redeemer = acct(3);
-		fund_dot(&redeemer, 0);
-		mint_pusd(&redeemer, 3_000 * PUSD);
-		assert_ok!(Redemptions::redeem(
-			RuntimeOrigin::signed(redeemer.clone()),
-			get_native_id(),
-			get_pusd_id(),
+		let partial_out = redeem(
+			&acct(3),
 			RedemptionTerms { max_stable_to_spend: 3_000 * PUSD, min_collateral_out: 1_500 * WND },
-			redeemer.clone(),
-			16,
-		));
-		assert_eq!(pusd_balance(&redeemer), 0);
-		assert_eq!(native_balance(&redeemer) - get_native_ed(), 1_500 * WND);
+		);
+		assert_eq!(partial_out, 1_500 * WND);
 		assert_eq!(pusd_balance(&insurance), 3_000 * PUSD, "a partial fill draws no cover");
 		let parked_vault = vault(&parked_owner);
 		assert_eq!(parked_vault.debt.total(), 7_000 * PUSD);
 		assert_eq!(parked_vault.collateral, 2_500 * WND);
-		assert_eq!(
-			Vaults::vault_status(get_native_id(), get_pusd_id(), parked_owner.clone()),
-			Some(VaultStatus::FinalRecovery),
-		);
+		assert_eq!(vault_status(&parked_owner), Some(VaultStatus::FinalRecovery));
 
 		// Full settlement: 5,000 pUSD from the market plus 2,000 pUSD of cover
 		// cancels the remaining 7,000 pUSD of debt and takes the last 2,500 WND.
 		let settler = acct(4);
-		fund_dot(&settler, 0);
-		mint_pusd(&settler, 5_000 * PUSD);
-		assert_ok!(Redemptions::redeem(
-			RuntimeOrigin::signed(settler.clone()),
-			get_native_id(),
-			get_pusd_id(),
+		let settled_out = redeem(
+			&settler,
 			RedemptionTerms { max_stable_to_spend: 5_000 * PUSD, min_collateral_out: 2_500 * WND },
-			settler.clone(),
-			16,
-		));
-		assert_eq!(pusd_balance(&settler), 0);
-		assert_eq!(native_balance(&settler) - get_native_ed(), 2_500 * WND);
+		);
+		assert_eq!(settled_out, 2_500 * WND);
 		// The fund burns only the shortfall and keeps the surplus.
 		assert_eq!(pusd_balance(&insurance), 1_000 * PUSD);
 		System::assert_has_event(RuntimeEvent::Redemptions(
 			pallet_redemptions::Event::RecoveryRedemptionExecuted {
 				collateral_id: get_native_id(),
-				stable_id: get_pusd_id(),
+				stable_id: PUSD_ID,
 				redeemer: settler.clone(),
 				recipient: settler.clone(),
 				vault_owner: parked_owner.clone(),
@@ -287,12 +213,7 @@ fn final_recovery_redemption_below_par_with_full_insurance_cover() {
 				regime: RecoveryRegime::InsuranceAdjusted,
 			},
 		));
-		assert!(pallet_vaults::Vaults::<Runtime>::get((
-			get_native_id(),
-			get_pusd_id(),
-			parked_owner.clone(),
-		))
-		.is_none());
+		assert_eq!(vault_status(&parked_owner), None);
 		assert_eq!(collateral_on_hold(&get_native_id(), &parked_owner), 0);
 		assert_eq!(branch_state().vault_count, 0);
 	});

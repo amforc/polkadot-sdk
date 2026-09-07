@@ -14,36 +14,9 @@
 // limitations under the License.
 
 use crate::imports::*;
-use asset_hub_westend_runtime::{governance::TreasuryAccount, Redemptions, Vaults};
+use asset_hub_westend_runtime::{governance::TreasuryAccount, Vaults};
 use pallet_redemptions::{RedemptionStates, RedemptionTerms};
 use pusd_primitives::VaultStatus;
-
-/// Funds `redeemer` with `terms.max_stable_to_spend` plus the stablecoin minimum
-/// balance, redeems, and returns the collateral received.
-///
-/// Every redemption in this file is budgeted to the unit, so the helper asserts
-/// that only the minimum balance remains.
-fn redeem(redeemer: &AccountId, terms: RedemptionTerms<Balance>) -> Balance {
-	fund_dot(redeemer, 0);
-	mint_pusd(redeemer, terms.max_stable_to_spend + PUSD_MIN_BALANCE);
-	let native_before = native_balance(redeemer);
-
-	assert_ok!(Redemptions::redeem(
-		RuntimeOrigin::signed(redeemer.clone()),
-		get_native_id(),
-		get_pusd_id(),
-		terms,
-		redeemer.clone(),
-		16,
-	));
-
-	assert_eq!(pusd_balance(redeemer), PUSD_MIN_BALANCE);
-	native_balance(redeemer) - native_before
-}
-
-fn vault_status(owner: &AccountId) -> Option<VaultStatus> {
-	Vaults::vault_status(get_native_id(), get_pusd_id(), owner.clone())
-}
 
 /// 1,000 pUSD against 100,000 pUSD of market debt raises the 1.5% dynamic fee by
 /// 1,000 / 100,000 / 2 = 0.5%. The redemption pays the 1.75% mean of the 1.5%
@@ -76,7 +49,7 @@ fn ordinary_redemption_updates_the_dynamic_fee_and_charges_the_mean() {
 		);
 
 		// new dynamic_fee = 1.5% + 0.5% = 2.0%.
-		let state = RedemptionStates::<Runtime>::get(get_pusd_id());
+		let state = RedemptionStates::<Runtime>::get(PUSD_ID);
 		assert_eq!(state.dynamic_fee, FixedU128::from_rational(2, 100));
 
 		// collateral_out = 1,000 / 2 = 500 WND.
@@ -203,12 +176,7 @@ fn park_continuation_behind_final_recovery_head() -> (AccountId, AccountId) {
 	let continuation_owner = acct(1);
 	open_vault(&continuation_owner, 1_200 * WND, 2_000 * PUSD, FixedU128::zero());
 	feed_price(dot_price(2, 1));
-	assert_ok!(Vaults::enter_final_recovery(
-		RuntimeOrigin::signed(acct(0xFE)),
-		get_native_id(),
-		get_pusd_id(),
-		continuation_owner.clone(),
-	));
+	enter_final_recovery(&continuation_owner);
 
 	// 1,150 WND = 2,300 pUSD value against 2,000 pUSD debt at 2: CR 115%.
 	// It opens at the healthy price. It is admitted because the first vault no
@@ -217,12 +185,7 @@ fn park_continuation_behind_final_recovery_head() -> (AccountId, AccountId) {
 	let head_owner = acct(2);
 	open_vault(&head_owner, 1_150 * WND, 2_000 * PUSD, FixedU128::zero());
 	feed_price(dot_price(2, 1));
-	assert_ok!(Vaults::enter_final_recovery(
-		RuntimeOrigin::signed(acct(0xFE)),
-		get_native_id(),
-		get_pusd_id(),
-		head_owner.clone(),
-	));
+	enter_final_recovery(&head_owner);
 
 	// The FIFO head is the first vault. At CR 120% the bonus caps at 10%, so
 	// 1,800 pUSD takes 1,800 * 1.10 / 2 = 990 WND. 200 pUSD against 210 WND
@@ -241,7 +204,7 @@ fn park_continuation_behind_final_recovery_head() -> (AccountId, AccountId) {
 	assert_ok!(Vaults::exit_final_recovery(
 		RuntimeOrigin::signed(acct(0xFE)),
 		get_native_id(),
-		get_pusd_id(),
+		PUSD_ID,
 		continuation_owner.clone(),
 		pallet_linked_list::Position::endpoints_only(),
 	));

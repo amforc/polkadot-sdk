@@ -19,7 +19,7 @@ use asset_hub_westend_runtime::{
 	TrustBackedAssetsInstance, Vaults,
 };
 use frame_support::{
-	assert_err, assert_noop,
+	assert_noop, assert_storage_noop, hypothetically_ok,
 	traits::{
 		fungible::InspectHold as FungibleInspectHold,
 		fungibles::{roles::Inspect as RolesInspect, Refund},
@@ -36,14 +36,13 @@ fn registration_creates_the_fee_account_stablecoin_account() {
 	AssetHubWestend::execute_with(|| {
 		let fee_account = governance::TreasuryAccount::get();
 		assert!(PUSD_MIN_BALANCE > 1, "a one-unit minimum would skip the touch entirely");
-		assert!(<Assets as Refund<AccountId>>::deposit_held(get_pusd_id(), fee_account.clone())
-			.is_none());
+		assert!(<Assets as Refund<AccountId>>::deposit_held(PUSD_ID, fee_account.clone()).is_none());
 
 		feed_price(dot_price(2, 1));
 		create_branch(&BranchSpec::default());
 
 		let (depositor, deposit) =
-			<Assets as Refund<AccountId>>::deposit_held(get_pusd_id(), fee_account.clone())
+			<Assets as Refund<AccountId>>::deposit_held(PUSD_ID, fee_account.clone())
 				.expect("registration touched the fee account");
 		assert_eq!(depositor, fee_account, "the stablecoin-wide account owns its deposit");
 		assert!(deposit > 0);
@@ -71,7 +70,7 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::signed(creator.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			pallet_vaults::types::BranchAdmins {
 				full_admin: MultiAddress::Id(full_admin.clone()),
 				emergency_admin: MultiAddress::Id(emergency_admin.clone()),
@@ -80,7 +79,7 @@ fn signed_user_registers_a_native_collateral_market() {
 			registration_config(),
 		));
 
-		let branch = pallet_vaults::Branches::<Runtime>::get(get_native_id(), get_pusd_id())
+		let branch = pallet_vaults::Branches::<Runtime>::get(get_native_id(), PUSD_ID)
 			.expect("the signed creation registered the market");
 		// The deposit is held from the creator, so a removal refunds the creator.
 		assert_eq!(branch.deposit.map(|(who, _)| who), Some(creator.clone()));
@@ -91,7 +90,7 @@ fn signed_user_registers_a_native_collateral_market() {
 			),
 			VaultsBranchCreationDeposit::get(),
 		);
-		let custody = Vaults::redistribution_account(&get_native_id(), &get_pusd_id());
+		let custody = Vaults::redistribution_account(&get_native_id(), &PUSD_ID);
 		assert_eq!(native_balance(&custody), get_native_ed());
 		assert_eq!(
 			creator_free_before - native_balance(&creator),
@@ -101,7 +100,7 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_ok!(Vaults::set_param(
 			RuntimeOrigin::signed(full_admin.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			pallet_vaults::BranchConfigUpdate::MinimumDebt(100 * PUSD),
 		));
 		// The full admin controls every market parameter. Lowering the branch
@@ -110,14 +109,14 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_ok!(Vaults::set_param(
 			RuntimeOrigin::signed(emergency_admin.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			pallet_vaults::BranchConfigUpdate::DebtCeiling(50_000_000 * PUSD),
 		));
 		assert_noop!(
 			Vaults::set_param(
 				RuntimeOrigin::signed(emergency_admin.clone()),
 				get_native_id(),
-				get_pusd_id(),
+				PUSD_ID,
 				pallet_vaults::BranchConfigUpdate::DebtCeiling(200_000_000 * PUSD),
 			),
 			pallet_vaults::Error::<Runtime>::DefensiveActionNotDefensive,
@@ -125,7 +124,7 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_ok!(Vaults::set_param(
 			RuntimeOrigin::signed(full_admin.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			pallet_vaults::BranchConfigUpdate::DebtCeiling(200_000_000 * PUSD),
 		));
 
@@ -134,27 +133,27 @@ fn signed_user_registers_a_native_collateral_market() {
 		let custodian = full_admin.clone();
 		assert_ok!(Assets::set_team(
 			RuntimeOrigin::signed(creator.clone()),
-			get_pusd_id().into(),
+			PUSD_ID.into(),
 			MultiAddress::Id(custodian.clone()),
 			MultiAddress::Id(custodian.clone()),
 			MultiAddress::Id(custodian.clone()),
 		));
 		assert_ok!(Assets::transfer_ownership(
 			RuntimeOrigin::signed(creator.clone()),
-			get_pusd_id().into(),
+			PUSD_ID.into(),
 			MultiAddress::Id(custodian.clone()),
 		));
-		assert_eq!(<Assets as RolesInspect<AccountId>>::owner(get_pusd_id()), Some(custodian));
+		assert_eq!(<Assets as RolesInspect<AccountId>>::owner(PUSD_ID), Some(custodian));
 		// The former owner cannot freeze the asset or register another market.
 		assert_noop!(
-			Assets::freeze_asset(RuntimeOrigin::signed(creator.clone()), get_pusd_id().into()),
+			Assets::freeze_asset(RuntimeOrigin::signed(creator.clone()), PUSD_ID.into()),
 			pallet_assets::Error::<Runtime, TrustBackedAssetsInstance>::NoPermission,
 		);
 		assert_noop!(
 			Vaults::create_branch(
 				RuntimeOrigin::signed(creator.clone()),
 				get_native_id(),
-				get_pusd_id(),
+				PUSD_ID,
 				branch_admins(),
 				branch_config(&get_native_id(), &BranchSpec::default()),
 				registration_config(),
@@ -167,15 +166,15 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_noop!(
 			Vaults::set_global_debt_ceiling(
 				RuntimeOrigin::signed(creator.clone()),
-				get_pusd_id(),
-				1_000_000_000 * PUSD,
+				PUSD_ID,
+				SCENARIO_GLOBAL_CEILING,
 			),
 			sp_runtime::DispatchError::BadOrigin,
 		);
 		assert_ok!(Vaults::set_global_debt_ceiling(
 			RuntimeOrigin::signed(full_admin.clone()),
-			get_pusd_id(),
-			1_000_000_000 * PUSD,
+			PUSD_ID,
+			SCENARIO_GLOBAL_CEILING,
 		));
 		let owner = acct(9);
 		// 10,000 WND at 2 pUSD against 10,000 pUSD debt: CR 200%.
@@ -193,7 +192,7 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_eq!(vault(&other_owner).annual_rate, FixedU128::from_rational(5, 100));
 
 		// The market aggregates both.
-		let state = pallet_vaults::Branches::<Runtime>::get(get_native_id(), get_pusd_id())
+		let state = pallet_vaults::Branches::<Runtime>::get(get_native_id(), PUSD_ID)
 			.expect("market still registered")
 			.state;
 		assert_eq!(state.vault_count, 2);
@@ -224,34 +223,38 @@ fn branch_safety_ratio_gates_withdrawals_not_repayments() {
 		let tight_owner = acct(2); // 27,750 WND = 55,500 pUSD value, CR 111%
 		open_vault(&tight_owner, 27_750 * WND, 50_000 * PUSD, FixedU128::zero());
 
-		// A 5,000 WND = 10,000 pUSD withdrawal leaves the vault at 119%, but the
-		// branch at 115,000 / 100,000 = 115% < 120%.
-		assert_err!(
+		let withdraw = |amount: Balance| {
 			Vaults::withdraw_collateral(
 				RuntimeOrigin::signed(roomy_owner.clone()),
 				get_native_id(),
-				get_pusd_id(),
-				5_000 * WND,
+				PUSD_ID,
+				amount,
 				None,
-			),
-			pallet_vaults::Error::<Runtime>::WouldEnterSafetyMode,
-		);
+			)
+		};
+		// A 2,500 WND = 5,000 pUSD withdrawal lands the branch exactly on the
+		// 120,000 / 100,000 = 120% threshold, which is still allowed.
+		hypothetically_ok!(withdraw(2_500 * WND));
+		// A 5,000 WND = 10,000 pUSD withdrawal leaves the vault at 119%, but the
+		// branch at 115,000 / 100,000 = 115% < 120%.
+		assert_noop!(withdraw(5_000 * WND), pallet_vaults::Error::<Runtime>::WouldEnterSafetyMode,);
 
 		// Repaying 10,000 pUSD improves TCR to 125,000 / 90,000 = 138.89%.
 		assert_ok!(Vaults::repay_for(
 			RuntimeOrigin::signed(roomy_owner.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			roomy_owner.clone(),
 			Some(10_000 * PUSD),
 		));
 		// 125,000 / 90,000 = 1.38888…, floored at 18 decimals. `from_rational` would round up.
-		assert_eq!(
-			Vaults::branch_tcr(get_native_id(), get_pusd_id()),
+		// The TCR is a quote and must not write.
+		assert_storage_noop!(assert_eq!(
+			Vaults::branch_tcr(get_native_id(), PUSD_ID),
 			Ok(pusd_primitives::CollateralRatio::Ratio(FixedU128::from_inner(
 				1_388_888_888_888_888_888
 			))),
-		);
+		));
 	});
 }
 
@@ -285,7 +288,7 @@ fn upfront_fee_is_charged_on_open_and_on_each_draw() {
 		assert_ok!(Vaults::borrow(
 			RuntimeOrigin::signed(borrower.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			2_000 * PUSD,
 			None,
 			None,
