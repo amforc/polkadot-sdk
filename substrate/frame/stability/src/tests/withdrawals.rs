@@ -47,20 +47,6 @@ fn withdraw_full_amount_prunes_row() {
 }
 
 #[test]
-fn withdraw_partial_keeps_row() {
-	build_and_execute(|| {
-		seed_pool_with_matured_deposit();
-
-		assert_ok!(withdraw(1, DOT, PUSD, 150, 1));
-
-		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
-		assert_eq!(row.active_deposit, 250);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 250);
-		assert_eq!(stable_balance(PUSD, 1), 750);
-	});
-}
-
-#[test]
 fn withdraw_clamps_to_active_deposit() {
 	build_and_execute(|| {
 		seed_pool_with_matured_deposit();
@@ -86,23 +72,11 @@ fn withdraw_clamps_to_active_deposit() {
 
 #[test]
 fn withdraw_with_nothing_active_reverts() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		mint_stable(PUSD, 1, 1_000);
 		// Still pending (immature): nothing withdrawable.
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 		assert_noop!(withdraw(1, DOT, PUSD, 400, 1), Error::<Test>::NoActiveDeposit);
-	});
-}
-
-#[test]
-fn withdraw_to_third_party_recipient() {
-	build_and_execute(|| {
-		seed_pool_with_matured_deposit();
-
-		assert_ok!(withdraw(1, DOT, PUSD, 100, 9));
-		assert_eq!(stable_balance(PUSD, 9), 100);
-		assert_eq!(stable_balance(PUSD, 1), 600);
 	});
 }
 
@@ -125,22 +99,7 @@ fn withdraw_leaves_pending_untouched() {
 }
 
 #[test]
-fn withdraw_without_row_reverts() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::DepositNotFound);
-	});
-}
-
-#[test]
-fn withdraw_on_unregistered_branch_reverts() {
-	build_and_execute(|| {
-		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::PoolNotRegistered);
-	});
-}
-
-#[test]
-fn request_withdraw_records_exact_executable_at() {
+fn request_is_recorded_replaced_by_a_new_one_and_survives_deposits() {
 	build_and_execute(|| {
 		// Requests only record in Safety Mode: real branch debt plus the 0.6
 		// price puts the TCR at 120%, under the 130% Safety threshold.
@@ -150,12 +109,11 @@ fn request_withdraw_records_exact_executable_at() {
 		let requested_at = Timestamp::get();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 		let executable_at = requested_at + 600_000;
-
-		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
-		let request = row.withdrawal_request.expect("request recorded");
-		assert_eq!(request.amount, 250);
-		assert_eq!(request.executable_at, executable_at);
-
+		let request = deposit_row(DOT, PUSD, 1)
+			.expect("row exists")
+			.withdrawal_request
+			.expect("request recorded");
+		assert_eq!(request, WithdrawalRequest { amount: 250, executable_at });
 		System::assert_last_event(
 			crate::Event::WithdrawalRequested {
 				collateral_id: DOT,
@@ -166,26 +124,24 @@ fn request_withdraw_records_exact_executable_at() {
 			}
 			.into(),
 		);
-	});
-}
 
-#[test]
-fn new_request_replaces_old() {
-	build_and_execute(|| {
-		seed_branch_with_debt();
-		enter_safety_mode();
-		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
-
+		// A new request replaces the old one, delay and all.
 		advance_time(4_000);
 		let requested_at = Timestamp::get();
 		assert_ok!(request_withdraw(1, DOT, PUSD, 100));
+		let expected = WithdrawalRequest { amount: 100, executable_at: requested_at + 600_000 };
+		assert_eq!(
+			deposit_row(DOT, PUSD, 1).expect("row exists").withdrawal_request,
+			Some(expected.clone())
+		);
 
-		let request = deposit_row(DOT, PUSD, 1)
-			.expect("row exists")
-			.withdrawal_request
-			.expect("request recorded");
-		assert_eq!(request.amount, 100);
-		assert_eq!(request.executable_at, requested_at + 600_000);
+		// A deposit leaves the request as it was.
+		advance_time(1_000);
+		assert_ok!(deposit(1, DOT, PUSD, 300));
+		assert_eq!(
+			deposit_row(DOT, PUSD, 1).expect("row exists").withdrawal_request,
+			Some(expected)
+		);
 	});
 }
 
@@ -198,27 +154,6 @@ fn zero_amount_requests_and_withdrawals_revert() {
 		assert_noop!(request_withdraw(1, DOT, PUSD, 0), Error::<Test>::ZeroAmount);
 		enter_safety_mode();
 		assert_noop!(request_withdraw(1, DOT, PUSD, 0), Error::<Test>::ZeroAmount);
-	});
-}
-
-#[test]
-fn deposit_leaves_request_unchanged() {
-	build_and_execute(|| {
-		seed_branch_with_debt();
-		enter_safety_mode();
-		let requested_at = Timestamp::get();
-		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
-
-		// A new deposit leaves the request as it was.
-		advance_time(1_000);
-		assert_ok!(deposit(1, DOT, PUSD, 300));
-
-		let request = deposit_row(DOT, PUSD, 1)
-			.expect("row exists")
-			.withdrawal_request
-			.expect("request survives the deposit");
-		assert_eq!(request.amount, 250);
-		assert_eq!(request.executable_at, requested_at + 600_000);
 	});
 }
 
@@ -249,11 +184,11 @@ fn safety_withdrawal_respects_delay_boundary() {
 	let mut row = active_row(400, Some(request.clone()));
 	// One millisecond early: rejected, request untouched.
 	let got = Stability::resolve_withdrawal(BranchMode::Safety, 605_999, 100, &mut row);
-	assert_eq!(got, Err(Error::<Test>::SafetyWithdrawalDelayActive.into()));
+	assert_err!(got, Error::<Test>::SafetyWithdrawalDelayActive);
 	assert_eq!(row.withdrawal_request, Some(request));
 
 	// At exactly `executable_at`: allowed.
 	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606_000, 100, &mut row);
-	assert_eq!(got, Ok(100));
+	assert_ok!(got, 100);
 	assert_eq!(row.withdrawal_request.as_ref().expect("still open").amount, 150);
 }

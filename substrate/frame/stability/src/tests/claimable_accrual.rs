@@ -11,8 +11,7 @@ use crate::{mock::*, Error};
 
 #[test]
 fn top_up_realizes_offset_gain_into_claimable_not_wallet() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		seed_matured_deposit_from_balance(1, 2_000, 1_000);
 
 		// Offset halves the pool: P = 500/1000 = 0.5, delta_S = C_sp * P/A =
@@ -36,17 +35,14 @@ fn top_up_realizes_offset_gain_into_claimable_not_wallet() {
 		assert_eq!(collateral_balance(DOT, 1), coll_before);
 		assert_eq!(stable_balance(PUSD, 1), 800);
 
-		// The claim is what pays the realized gain out (against the same
-		// pre-top-up balance, unchanged above).
-		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - coll_before, 400);
+		// The claim is what pays the realized gain out.
+		assert_claim_collateral(1, 400);
 	});
 }
 
 #[test]
 fn sequential_offsets_accumulate_claimable_across_touches() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		// Two depositors, so distributed gains actually split: only user 1
 		// is touched below; user 2's share stays latent until the end.
 		seed_matured_deposit_from_balance(1, 2_000, 1_000);
@@ -73,9 +69,7 @@ fn sequential_offsets_accumulate_claimable_across_touches() {
 		assert_eq!(row.active_deposit, 150);
 
 		// One claim pays the whole accumulated gain.
-		let before = collateral_balance(DOT, 1);
-		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 600);
+		assert_claim_collateral(1, 600);
 		assert_eq!(deposit_row(DOT, PUSD, 1).expect("row").claimable_collateral, 0);
 
 		// User 2, untouched the whole time, realizes its complement:
@@ -89,8 +83,7 @@ fn sequential_offsets_accumulate_claimable_across_touches() {
 
 #[test]
 fn withdraw_realizes_yield_into_claimable_never_compounds() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		seed_matured_deposit(1, 600);
 
 		// delta_G = Y * (P/A) = 60 * (1/600) = 0.1.
@@ -119,8 +112,7 @@ fn claim_after_full_withdrawal_pays_earned_gains() {
 	// claim pays them and prunes the row. Distinct from
 	// `final_claim_prunes_an_otherwise_empty_row`, which seeds the claimable
 	// directly, here it is earned through an offset.
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		seed_matured_deposit(1, 1_000);
 
 		// Offset: P = 500/1000 = 0.5, delta_S = 400 * (1/1000) = 0.4;
@@ -137,9 +129,7 @@ fn claim_after_full_withdrawal_pays_earned_gains() {
 		assert_noop!(withdraw(1, DOT, PUSD, 1, 1), Error::<Test>::NoActiveDeposit);
 
 		// The claim pays the earned gain and prunes the now-empty row.
-		let before = collateral_balance(DOT, 1);
-		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 400);
+		assert_claim_collateral(1, 400);
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 		assert_eq!(pool_state(DOT, PUSD).total_collateral_gains_unclaimed, 0);
 	});
@@ -147,8 +137,7 @@ fn claim_after_full_withdrawal_pays_earned_gains() {
 
 #[test]
 fn permissionless_settlement_realizes_gain_into_owner_claimable() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		seed_matured_deposit(1, 1_000);
 
 		// P = 0.5, delta_S = 400 * (1/1000) = 0.4.
@@ -164,8 +153,6 @@ fn permissionless_settlement_realizes_gain_into_owner_claimable() {
 
 		// The owner still owns the payout: the caller has no row to claim from.
 		assert_noop!(claim_collateral(7, DOT, PUSD, 7), Error::<Test>::DepositNotFound);
-		let before = collateral_balance(DOT, 1);
-		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 400);
+		assert_claim_collateral(1, 400);
 	});
 }

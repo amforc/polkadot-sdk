@@ -66,6 +66,7 @@ pub struct PoolSums {
 /// The difference between this snapshot and the current accumulators gives the unsettled loss and
 /// gains of the deposit.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct DepositSnapshot {
 	/// The accumulator coordinates at the time of the last realization.
 	pub coords: Accumulators,
@@ -251,6 +252,7 @@ pub enum PUpdate {
 /// `active_deposit` is the amount at the last settlement. Each row operation must first apply the
 /// current loss and gain accumulators.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct Deposit<Balance> {
 	/// Stablecoin that absorbs offsets and earns yield.
 	pub active_deposit: Balance,
@@ -299,6 +301,7 @@ impl<Balance: Zero> Deposit<Balance> {
 /// Pending capital earns no yield and is not part of `total_active_deposits`. It remains exposed as
 /// the final pool backstop, in proportion to each pending deposit.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct PendingDeposit<Balance> {
 	/// Amount at the last settlement. It can lag the current pending `P`.
 	pub amount: Balance,
