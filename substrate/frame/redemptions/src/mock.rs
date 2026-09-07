@@ -10,7 +10,9 @@ use crate::types::{RedemptionConfig, RedemptionQuote};
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, One, Permill, Saturating, Zero},
 	prelude::{DispatchError, DispatchResult},
-	testing_prelude::{assert_noop, assert_ok, BadOrigin},
+	testing_prelude::{
+		assert_noop, assert_ok, assert_storage_noop, hypothetically, BadOrigin, StateVersion,
+	},
 };
 use frame::{
 	deps::sp_runtime::traits::ConvertInto,
@@ -563,20 +565,53 @@ struct RedeemSnapshot {
 }
 
 /// Contains the values from an ordinary or recovery settlement event.
-struct Settlement {
-	collateral_id: AssetId,
-	stable_id: StableId,
-	redeemer: AccountId,
-	recipient: AccountId,
-	stable_burned: Balance,
-	insurance_cover: Balance,
-	fee: Balance,
-	collateral_out: Balance,
+///
+/// [`redeem`] verifies every balance movement against these figures, so a test that pins them
+/// through [`last_settlement`] pins the movements too.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Settlement {
+	pub collateral_id: AssetId,
+	pub stable_id: StableId,
+	pub redeemer: AccountId,
+	pub recipient: AccountId,
+	pub stable_burned: Balance,
+	pub insurance_cover: Balance,
+	pub fee: Balance,
+	pub collateral_out: Balance,
 	/// Number of steps in an ordinary settlement.
 	///
 	/// A recovery settlement uses `None` because it settles one FIFO head and does not change the
 	/// dynamic fee.
-	ordinary_steps: Option<u32>,
+	pub ordinary_steps: Option<u32>,
+}
+
+impl Settlement {
+	/// The `(stable_burned, fee, collateral_out)` figures, for compact pinning.
+	pub fn figures(&self) -> (Balance, Balance, Balance) {
+		(self.stable_burned, self.fee, self.collateral_out)
+	}
+}
+
+/// The most recent settlement event.
+pub fn last_settlement() -> Settlement {
+	System::events()
+		.into_iter()
+		.rev()
+		.find_map(|record| Settlement::from_event(record.event))
+		.expect("a redemption settled")
+}
+
+/// Quotes a redemption and proves the quote is read-only.
+pub fn preview_redeem(
+	collateral: AssetId,
+	stable: StableId,
+	max_stable_to_spend: Balance,
+	max_steps: u32,
+) -> Result<RedemptionQuote<Balance>, DispatchError> {
+	let root = frame::deps::sp_io::storage::root(StateVersion::V1);
+	let quote = Redemptions::preview_redeem(collateral, stable, max_stable_to_spend, max_steps);
+	assert_eq!(root, frame::deps::sp_io::storage::root(StateVersion::V1), "the preview wrote");
+	quote
 }
 
 impl Settlement {
@@ -647,10 +682,9 @@ impl RedeemSnapshot {
 			Preservation::Preserve,
 			Fortitude::Polite,
 		);
-		let quote =
-			Redemptions::preview_redeem(collateral.clone(), stable, max_stable_to_spend, max_steps)
-				.ok()
-				.filter(|quote| spendable >= quote.stable_in());
+		let quote = preview_redeem(collateral.clone(), stable, max_stable_to_spend, max_steps)
+			.ok()
+			.filter(|quote| spendable >= quote.stable_in());
 		Self {
 			who,
 			collateral: collateral.clone(),
