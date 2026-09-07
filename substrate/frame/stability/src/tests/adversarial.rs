@@ -2,13 +2,10 @@
 //! that disagrees with itself, and value that fails to move after the arithmetic is already
 //! done.
 
-use crate::{mock::*, types::Leg};
-use frame::{
-	testing_prelude::hypothetically,
-	traits::{
-		fungibles::Balanced as FungiblesBalanced,
-		tokens::{Fortitude, Precision, Preservation},
-	},
+use crate::mock::*;
+use frame::traits::{
+	fungibles::Balanced as FungiblesBalanced,
+	tokens::{Fortitude, Precision, Preservation},
 };
 use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, StabilityPoolOffset};
 
@@ -65,38 +62,31 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 
 #[test]
 fn yield_distribution_routes_by_the_credits_own_asset() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		mint_stable(PUSD, 1, 400);
 		assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
 
 		// The credit's asset names the market: a USDX credit targets the
 		// unregistered (DOT, USDX) pair and comes back whole, while the
 		// funded PUSD pool never sees it.
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		let state_before = pool_state(DOT, PUSD);
-		let credit = <Assets as FungiblesBalanced<AccountId>>::issue(USDX, 20_000);
-		let returned = Stability::distribute_yield(&DOT, credit);
-
+		let credit = issue_stable(USDX, 20_000);
+		let returned = storage_noop(|| Stability::distribute_yield(&DOT, credit));
 		assert_eq!(returned.asset(), USDX);
 		assert_eq!(returned.peek(), 20_000);
-		assert_eq!(stable_balance(USDX, pool), 0);
-		assert_eq!(pool_state(DOT, PUSD), state_before);
 		drop(returned);
 	});
 }
 
 #[test]
 fn offset_apis_reject_a_credit_for_another_collateral() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+	build_with_default_market(|| {
 		mint_stable(PUSD, 1, 400);
 		assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
 		mint_stable(PUSD, 2, 200);
 		assert_ok!(deposit(2, DOT, PUSD, 200));
 
 		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 200), 200);
-		assert_noop!(
+		assert_err!(
 			hypothetically!(Stability::offset(
 				&DOT,
 				&PUSD,
@@ -110,7 +100,7 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 		);
 
 		assert_eq!(Stability::reducible_pending(&DOT, &PUSD, 200, 0), 200);
-		assert_noop!(
+		assert_err!(
 			hypothetically!(Stability::offset(
 				&DOT,
 				&PUSD,
@@ -138,8 +128,7 @@ fn stable_shortfall_steps_aside_without_consuming_collateral() {
 		// is consumed.
 		burn_stable(PUSD, pool, 400);
 
-		assert_eq!(simulate_offset(TOKEN_X, PUSD, 200, 100), (0, 100));
-		assert_eq!(collateral_balance(TOKEN_X, pool), 0);
+		assert_storage_noop!(assert_eq!(simulate_offset(TOKEN_X, PUSD, 200, 100), (0, 100)));
 
 		// Repair the deliberate corruption before the post-test invariant check.
 		mint_stable(PUSD, pool, 400);
@@ -177,9 +166,7 @@ fn safety_withdraw_after_offset_cannot_overdraw_stale_request() {
 		assert_eq!(row.claimable_collateral, 500);
 		assert_eq!(row.withdrawal_request.expect("request remainder stays bounded").amount, 300);
 
-		let before = collateral_balance(DOT, 1);
-		assert_ok!(claim_collateral(1, DOT, PUSD, 1));
-		assert_eq!(collateral_balance(DOT, 1) - before, 500);
+		assert_claim_collateral(1, 500);
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 	});
 }

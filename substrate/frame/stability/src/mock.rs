@@ -9,11 +9,16 @@
 //! [`USDX`] has six decimals, which the scale tests need.
 
 use crate as pallet_stability;
-use crate::types::{Leg, PoolPrecision, StabilityPoolConfig};
+pub use crate::types::{
+	Accumulators, CohortId, Deposit, DepositSnapshot, Leg, PendingDeposit, PoolSums,
+};
+use crate::types::{PoolPrecision, StabilityPoolConfig};
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, One, Permill, Saturating, Zero},
-	prelude::DispatchError,
-	testing_prelude::{assert_noop, assert_ok, BadOrigin},
+	prelude::{DispatchError, DispatchResult},
+	testing_prelude::{
+		assert_err, assert_noop, assert_ok, assert_storage_noop, hypothetically, BadOrigin,
+	},
 };
 use frame::{
 	deps::sp_runtime::traits::ConvertInto,
@@ -458,6 +463,14 @@ pub fn build_and_execute(test: impl FnOnce()) {
 	});
 }
 
+/// [`build_and_execute`] with the default market already registered.
+pub fn build_with_default_market(test: impl FnOnce()) {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		test();
+	});
+}
+
 /// The pool parameters every registered market starts with: a 5 second entry delay and a
 /// 10 minute Safety-Mode withdrawal delay.
 pub fn default_pool_config() -> StabilityPoolConfig<Balance> {
@@ -527,6 +540,12 @@ pub fn registration_config(
 	(redemption_config, default_pool_config())
 }
 
+/// Market configuration for recovery settlement tests, with no entry compensation.
+/// These tests price the collateral available to settle the head.
+pub fn recovery_branch_config() -> pallet_vaults::BranchConfig<Balance> {
+	default_branch_config()
+}
+
 /// Registers a market at a price of 1.25 and a debt ceiling high enough never to bind.
 ///
 /// Registration also seeds the pool rows, through the lifecycle hook.
@@ -537,17 +556,18 @@ pub fn register_branch(
 ) {
 	// A market cannot be registered without a live price.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
-	// A market Root registers has no depositor, so its full admin pays the custody seed. The
-	// withdrawal keeps the payer alive, so the admin needs two minimum balances.
+	// Account 1 owns every test stablecoin. The refundable deposit it pays for the market funds
+	// the collateral account the pool needs, and as the depositor it also pays the redistribution
+	// custody seed. That seed is withdrawn under `Preserve`, so it needs two minimum balances.
 	mint_collateral(
 		collateral.clone(),
-		ADMIN,
+		1,
 		2 * <VaultCollateralAssets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(
 			collateral.clone(),
 		),
 	);
 	Vaults::create_branch(
-		RuntimeOrigin::root(),
+		RuntimeOrigin::signed(1),
 		collateral.clone(),
 		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
@@ -557,9 +577,8 @@ pub fn register_branch(
 	.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
-	// The pool account gets no existential deposit. The provider reference from the
-	// registration hook keeps it alive, and native funds parked here would read as collateral
-	// the DOT market cannot account for.
+	// The pool account gets no collateral pre-fund. Registration creates a zero-balance asset
+	// account when one is needed, so every gain stays tracked as pool collateral.
 }
 
 /// Opens a vault, so that a test can create real market debt and move the TCR.
@@ -584,6 +603,12 @@ pub fn open_vault(
 	)
 }
 
+/// The native balance an account holds on hold, where every refundable market deposit ends up.
+pub fn native_on_hold(who: AccountId) -> Balance {
+	use frame::traits::fungible::InspectHold;
+	<Balances as InspectHold<AccountId>>::total_balance_on_hold(&who)
+}
+
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
 	use frame::traits::fungibles::Mutate as FungiblesMutate;
 	<Assets as FungiblesMutate<AccountId>>::mint_into(stable, &who, amount).expect("mint stable");
@@ -601,6 +626,42 @@ pub fn mint_collateral(collateral: AssetId, who: AccountId, amount: Balance) {
 				.expect("mint asset collateral");
 		},
 	}
+}
+
+/// Claims the collateral of `who` in the default market, paid to itself, and checks the payout.
+pub fn assert_claim_collateral(who: AccountId, expected: Balance) {
+	let before = collateral_balance(DOT, who);
+	assert_ok!(claim_collateral(who, DOT, PUSD, who));
+	assert_eq!(collateral_balance(DOT, who) - before, expected);
+}
+
+/// Claims the yield of `who` in the default market, paid to itself, and checks the payout.
+pub fn assert_claim_yield(who: AccountId, expected: Balance) {
+	let before = stable_balance(PUSD, who);
+	assert_ok!(claim_yield(who, DOT, PUSD, who));
+	assert_eq!(stable_balance(PUSD, who) - before, expected);
+}
+
+/// The default pool account holds nothing and the aggregates are all zero.
+pub fn assert_pool_fully_drained() {
+	let pool = Stability::pool_account(&DOT, &PUSD);
+	assert_eq!(stable_balance(PUSD, pool), 0);
+	assert_eq!(collateral_balance(DOT, pool), 0);
+	let state = pool_state(DOT, PUSD);
+	assert_eq!(state.total_active_deposits, 0);
+	assert_eq!(state.total_pending_deposits, 0);
+	assert_eq!(state.total_collateral_gains_unclaimed, 0);
+	assert_eq!(state.total_yield_unclaimed, 0);
+}
+
+/// The active-leg sums row of the default market at the given coordinates.
+pub fn active_sums(epoch: u32, scale: u32) -> PoolSums {
+	crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, epoch, scale))
+}
+
+/// The pending-leg sums row of the default market at the given coordinates.
+pub fn pending_sums(epoch: u32, scale: u32) -> PoolSums {
+	crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Pending, epoch, scale))
 }
 
 /// The stablecoin balance of an account.
@@ -817,13 +878,51 @@ pub fn distribute_yield(
 	stable: StableId,
 	amount: Balance,
 ) -> crate::pallet::StableCreditOf<Test> {
-	let credit = <Assets as FungiblesBalanced<AccountId>>::issue(stable, amount);
-	// This calls the engine directly rather than through `OnBranchYield`, so the whole
-	// credit reaches the pool and no `yield_share` cut is taken.
+	let credit = issue_stable(stable, amount);
+	offer_yield(collateral, stable, credit)
+}
+
+/// Issues stablecoin the way the vault engine mints interest.
+pub fn issue_stable(stable: StableId, amount: Balance) -> crate::pallet::StableCreditOf<Test> {
+	<Assets as FungiblesBalanced<AccountId>>::issue(stable, amount)
+}
+
+/// Offers an existing credit to the pool, returning what the pool could not take.
+///
+/// This calls the engine directly rather than through `OnBranchYield`, so the whole credit
+/// reaches the pool and no `yield_share` cut is taken.
+pub fn offer_yield(
+	collateral: AssetId,
+	stable: StableId,
+	credit: crate::pallet::StableCreditOf<Test>,
+) -> crate::pallet::StableCreditOf<Test> {
 	let Some(pool) = crate::Pools::<Test>::get(&collateral, &stable) else {
 		return credit;
 	};
 	Stability::do_distribute_yield(&collateral, &stable, pool, credit)
+}
+
+/// Runs `operation` and checks that it wrote nothing, returning its value.
+///
+/// The value-returning form of `assert_storage_noop!`, for operations that hand a credit back.
+pub fn storage_noop<R>(operation: impl FnOnce() -> R) -> R {
+	use frame::deps::{sp_io::storage::root, sp_runtime::StateVersion};
+	let root_before = root(StateVersion::V1);
+	let result = operation();
+	assert_eq!(root(StateVersion::V1), root_before, "storage has been mutated");
+	result
+}
+
+/// Offers `amount` of yield and checks that the pool declines it: the credit comes back whole
+/// and nothing is written.
+///
+/// Issuing and dropping the credit is not itself storage-neutral, since `pallet-assets` records
+/// events for both, so only the offer sits inside the check.
+pub fn assert_yield_declined(collateral: AssetId, stable: StableId, amount: Balance) {
+	let credit = issue_stable(stable, amount);
+	let returned = storage_noop(|| offer_yield(collateral, stable, credit));
+	assert_eq!(returned.peek(), amount);
+	drop(returned);
 }
 
 /// Issues collateral, standing in for what a liquidation seizes. Dropping it, or any part split
@@ -922,16 +1021,23 @@ pub fn realized_pending(collateral: AssetId, stable: StableId, who: AccountId) -
 		return 0;
 	};
 	let state = pool_state(collateral.clone(), stable);
-	let window = Stability::sums_window(&collateral, &stable, Leg::Pending, &pending.snapshot);
-	let config = crate::Pools::<Test>::get(collateral, stable).expect("pool registered").config;
-	crate::math::realize(
-		pending.amount,
-		&pending.snapshot,
-		&state.pending_coords,
-		&window,
-		&config.precision,
-	)
-	.compounded
+	let config = crate::Pools::<Test>::get(collateral.clone(), stable)
+		.expect("pool registered")
+		.config;
+	let realize = || {
+		let window = Stability::sums_window(&collateral, &stable, Leg::Pending, &pending.snapshot);
+		crate::math::realize(
+			pending.amount,
+			&pending.snapshot,
+			&state.pending_coords,
+			&window,
+			&config.precision,
+		)
+		.compounded
+	};
+	// Settling against the live accumulators is a pure read.
+	assert_storage_noop!(realize());
+	realize()
 }
 
 /// The live state of a pool. Panics if the market is not registered.
