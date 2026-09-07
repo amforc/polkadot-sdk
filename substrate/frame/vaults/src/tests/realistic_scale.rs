@@ -6,7 +6,12 @@
 //! `10^-3` stable-per-collateral minor unit = $10_000; against 5_000 USDX
 //! (5×10^9 minor units) of debt that is a 200% CR.
 
-use crate::{mock::*, tests::{rate_pct, ONE_YEAR_MS}, types::BranchConfigUpdate, Error};
+use crate::{
+	mock::*,
+	tests::{rate_pct, ONE_YEAR_MS},
+	types::BranchConfigUpdate,
+	Error,
+};
 use frame::{
 	arithmetic::Permill,
 	prelude::TokenError,
@@ -318,10 +323,10 @@ fn final_recovery_entry_plans_out_a_sub_ed_keeper_reward() {
 		crash_price_with_flat_keeper_value(500);
 
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
-		assert_ok!(Vaults::enter_final_recovery(RuntimeOrigin::signed(998), XBT, USDX, 1));
+		assert_ok!(enter_final_recovery(998, XBT, USDX, 1));
 		assert!(Vaults::vault_status(XBT, USDX, 1).expect("status").is_final_recovery());
 		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper stayed unpaid");
-		assert_eq!(vault(1).collateral, 1_000 * XBT_UNIT, "the vault kept its collateral");
+		assert_eq!(xbt_vault(1).collateral, 1_000 * XBT_UNIT, "the vault kept its collateral");
 		System::assert_has_event(RuntimeEvent::Vaults(Event::VaultEnteredFinalRecovery {
 			collateral_id: XBT,
 			stable_id: USDX,
@@ -421,7 +426,7 @@ fn redistribution_custody_holds_issued_collateral() {
 		assert_eq!(collateral_balance(XBT, custody), XBT_ED);
 
 		// Materializing drains the hold and leaves the seed behind.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 3));
+		assert_ok!(poke(9, XBT, USDX, 3));
 		assert_eq!(held(XBT, custody), 0);
 		assert_eq!(collateral_balance(XBT, custody), XBT_ED);
 	});
