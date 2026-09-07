@@ -1,7 +1,7 @@
 use crate::{
 	mock::*,
 	pallet::Vaults,
-	tests::{rate_pct, vault_status},
+	tests::{rate_pct, vault_events, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 };
 use pallet_linked_list::SortedListInterface;
 
@@ -23,23 +23,9 @@ fn adjust_vault_via_deposit_then_borrow() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// +200 collateral.
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			200
-		));
+		assert_ok!(deposit_collateral(1, DOT, PUSD, 1, 200));
 		// +300 debt (no rate change). `None` recipient defaults to the owner.
-		assert_ok!(crate::Pallet::<Test>::borrow(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			300,
-			None,
-			None,
-			Position::endpoints_only()
-		));
+		assert_ok!(borrow(1, DOT, PUSD, 300, None));
 		assert_eq!(held(DOT, 1), 1_200);
 		let v = vault(DOT, PUSD, 1);
 		assert_eq!(v.debt.principal, 800);
@@ -91,13 +77,7 @@ fn withdraw_collateral_with_recipient_transfers_to_recipient() {
 		assert_ok!(open(1, DOT, PUSD, 3_000, 500, rate_pct(5, 100)));
 		let recipient_pre = collateral_balance(DOT, 4);
 
-		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			250,
-			Some(4)
-		));
+		assert_ok!(withdraw_collateral(1, DOT, PUSD, 250, Some(4)));
 
 		assert_eq!(held(DOT, 1), 2_750);
 		assert_eq!(collateral_balance(DOT, 4), recipient_pre + 250);
@@ -113,13 +93,7 @@ fn repay_for_by_third_party_burns_payer_balance_and_updates_owner_vault() {
 		let payer_pre = stable_balance(PUSD, 2);
 		let v_pre = vault(DOT, PUSD, 1);
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			1,
-			Some(100)
-		));
+		assert_ok!(repay(2, DOT, PUSD, 1, Some(100)));
 
 		assert_eq!(stable_balance(PUSD, 2), payer_pre - 100);
 		let v_post = vault(DOT, PUSD, 1);
@@ -140,12 +114,7 @@ fn close_vault_with_recipient_releases_collateral_to_recipient() {
 
 		let residual = held(DOT, 1);
 		let recipient_pre = collateral_balance(DOT, 4);
-		assert_ok!(crate::Pallet::<Test>::close_vault(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			Some(4)
-		));
+		assert_ok!(close_vault(1, DOT, PUSD, Some(4)));
 
 		assert!(!vault_exists(DOT, PUSD, 1));
 		assert_eq!(held(DOT, 1), 0);
@@ -172,13 +141,7 @@ fn repay_for_to_zero_leaves_dormant_husk() {
 			v.debt.interest,
 			frame::traits::tokens::Preservation::Expendable,
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(total)
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(total)));
 
 		// Row survives as a zero-debt husk with its collateral still held.
 		let husk = vault(DOT, PUSD, 1);
@@ -193,15 +156,13 @@ fn repay_for_to_zero_leaves_dormant_husk() {
 			"husk left the rate index"
 		);
 		assert!(
-			!System::events()
-				.iter()
-				.any(|e| matches!(e.event, RuntimeEvent::Vaults(crate::Event::VaultClosed { .. }))),
+			!vault_events().iter().any(|e| matches!(e, crate::Event::VaultClosed { .. })),
 			"repay-to-zero does not auto-close"
 		);
 
 		// The owner reclaims the collateral with an explicit close.
 		let collateral_before = collateral_balance(DOT, 1);
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_ok!(close_vault(1, DOT, PUSD, None));
 		assert!(!vault_exists(DOT, PUSD, 1), "close removes the row");
 		assert_eq!(held(DOT, 1), 0, "collateral released on close");
 		assert_eq!(
@@ -225,10 +186,7 @@ fn repay_for_to_zero_leaves_dormant_husk() {
 fn poke_missing_vault_errors() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_noop!(
-			crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 99),
-			crate::Error::<Test>::VaultNotFound
-		);
+		assert_noop!(poke(1, DOT, PUSD, 99), crate::Error::<Test>::VaultNotFound);
 	});
 }
 
@@ -253,13 +211,7 @@ fn repay_overpay_burns_only_debt_and_leaves_husk() {
 		let balance_before = stable_balance(PUSD, 1);
 		assert!(balance_before > total, "overpay setup needs a surplus");
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(balance_before)
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(balance_before)));
 
 		assert_eq!(stable_balance(PUSD, 1), balance_before - total, "only the debt burned");
 		let husk = vault(DOT, PUSD, 1);
@@ -273,9 +225,7 @@ fn repay_overpay_burns_only_debt_and_leaves_husk() {
 			amount: total,
 		}));
 		assert!(
-			!System::events()
-				.iter()
-				.any(|e| matches!(e.event, RuntimeEvent::Vaults(crate::Event::VaultClosed { .. }))),
+			!vault_events().iter().any(|e| matches!(e, crate::Event::VaultClosed { .. })),
 			"overpay-to-zero does not auto-close"
 		);
 	});
@@ -300,13 +250,7 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 		assert_eq!(residual, 199, "residual is MinimumDebt - 1");
 
 		let balance_before = stable_balance(PUSD, 1);
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(balance_before)
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(balance_before)));
 
 		assert_eq!(
 			stable_balance(PUSD, 1),
@@ -345,13 +289,7 @@ fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
 			total.saturating_sub(stable_balance(PUSD, 1)),
 			frame::traits::tokens::Preservation::Expendable,
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(total)
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(total)));
 
 		let husk = vault(DOT, PUSD, 1);
 		assert_eq!(husk.debt.total(), 0);
@@ -373,35 +311,23 @@ fn liability_free_market_closes_husks_without_ratio_math() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 400, rate_pct(7, 100)));
 		// Distinct timestamps create independent aggregate and vault residue.
-		advance_time(30 * 24 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		advance_time(24 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
+		advance_time(30 * ONE_DAY_MS);
+		assert_ok!(poke(9, DOT, PUSD, 1));
+		advance_time(ONE_DAY_MS);
+		assert_ok!(poke(9, DOT, PUSD, 2));
 		// Top up both owners so overpay-repays can cover accrued interest.
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 100));
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&2, 100));
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			2,
-			Some(10_000)
-		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(10_000)
-		));
+		assert_ok!(repay(2, DOT, PUSD, 2, Some(10_000)));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(10_000)));
 		assert!(vault_status(DOT, PUSD, 2).is_dormant(), "vault 2 is a husk");
 		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "vault 1 is a husk");
 
 		// A maximal price proves that both closes bypass ratio math, not only the last close.
 		set_price(DOT, FixedU128::from_inner(u128::MAX));
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_ok!(close_vault(2, DOT, PUSD, None));
+		assert_ok!(close_vault(1, DOT, PUSD, None));
 		assert!(!vault_exists(DOT, PUSD, 1), "last husk closed");
 
 		let state = branch_state(DOT, PUSD).expect("branch state");
@@ -425,26 +351,20 @@ fn stale_payoff_quote_reverts_while_an_uncapped_repay_settles() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 100));
 
-		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		advance_time(ONE_YEAR_MS);
 		let quote = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
 			.expect("payoff quote");
 		assert_eq!(quote.terminal_interest_charge, 0);
 		advance_time(1);
 
 		assert_noop!(
-			crate::Pallet::<Test>::repay_for(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				1,
-				Some(quote.debt)
-			),
+			repay(1, DOT, PUSD, 1, Some(quote.debt)),
 			crate::Error::<Test>::TerminalChargeUnpaid
 		);
 
 		// `None` is uncapped: it settles whatever the payoff is at execution, so the extra unit of
 		// interest accrued since the quote is paid rather than rejected.
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
+		assert_ok!(repay(1, DOT, PUSD, 1, None));
 		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.debt.total(), 0);
 		assert_eq!(vault.interest_remainder, 0, "the terminal charge settled the fraction");
@@ -469,13 +389,7 @@ fn uncovered_terminal_charge_bypasses_the_yield_split() {
 			.expect("payoff quote");
 		assert_eq!(quote.terminal_interest_charge, 1);
 		let fee_before = stable_balance(PUSD, FEE_DEST);
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(quote.debt + 1),
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(quote.debt + 1)));
 
 		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 0);
 		assert_eq!(stable_balance(PUSD, FEE_DEST), fee_before + 1);
@@ -497,33 +411,21 @@ fn liability_free_close_fails_closed_on_unattributed_liability() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(1_000),
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(1_000)));
 		// Isolate each residue so that each guard has independent coverage.
 
 		// Minted interest prevents branch removal.
 		mutate_branch_state(DOT, PUSD, |state| state.debt.minted_interest = 1);
-		assert_noop!(
-			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None),
-			DispatchError::Corruption
-		);
+		assert_noop!(close_vault(1, DOT, PUSD, None), DispatchError::Corruption);
 		mutate_branch_state(DOT, PUSD, |state| state.debt.minted_interest = 0);
 
 		// Unattributed issuance prevents branch removal independently.
 		mutate_branch_state(DOT, PUSD, |state| state.debt.pending_interest_attribution = 1);
-		assert_noop!(
-			crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None),
-			DispatchError::Corruption
-		);
+		assert_noop!(close_vault(1, DOT, PUSD, None), DispatchError::Corruption);
 		assert!(Vaults::<Test>::contains_key((DOT, PUSD, 1)));
 		mutate_branch_state(DOT, PUSD, |state| state.debt.pending_interest_attribution = 0);
 
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_ok!(close_vault(1, DOT, PUSD, None));
 	});
 }
 
@@ -571,7 +473,7 @@ fn terminal_charges_empty_the_shared_remainder_in_either_order() {
 			assert_ok!(open(2, DOT, PUSD, 1_400, 700, rate_pct(37, 100)));
 			assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 1_000));
 			assert_ok!(<Pusd as Mutate<u64>>::mint_into(&2, 1_000));
-			advance_time(10 * 24 * 3_600 * 1_000);
+			advance_time(10 * ONE_DAY_MS);
 
 			// Each vault must owe a terminal charge for this order-independence test.
 			for owner in [1, 2] {
@@ -580,19 +482,8 @@ fn terminal_charges_empty_the_shared_remainder_in_either_order() {
 				assert_eq!(quote.terminal_interest_charge, 1);
 			}
 			for owner in [first, second] {
-				assert_ok!(crate::Pallet::<Test>::repay_for(
-					RuntimeOrigin::signed(owner),
-					DOT,
-					PUSD,
-					owner,
-					None,
-				));
-				assert_ok!(crate::Pallet::<Test>::close_vault(
-					RuntimeOrigin::signed(owner),
-					DOT,
-					PUSD,
-					None,
-				));
+				assert_ok!(repay(owner, DOT, PUSD, owner, None));
+				assert_ok!(close_vault(owner, DOT, PUSD, None));
 			}
 
 			let state = branch_state(DOT, PUSD).expect("branch persists after closes");

@@ -18,8 +18,8 @@ pub use crate::{
 };
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, Permill, Saturating},
-	prelude::{DispatchError, DispatchResult},
-	testing_prelude::{assert_err, assert_noop, assert_ok},
+	prelude::{DispatchError, DispatchResult, DispatchResultWithPostInfo},
+	testing_prelude::{assert_err, assert_noop, assert_ok, assert_storage_noop, hypothetically},
 };
 use frame::{
 	deps::sp_runtime::traits::{Convert as ConvertTrait, ConvertInto},
@@ -699,6 +699,146 @@ pub fn liquidate_with(
 			owner_surplus: collateral_credit,
 		})
 	})
+}
+
+/// Calls the `poke` dispatchable as `who` against `owner`'s vault.
+pub fn poke(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+) -> DispatchResult {
+	Vaults::poke(RuntimeOrigin::signed(who), collateral, stable, owner)
+}
+
+/// Calls the `repay_for` dispatchable; `None` repays the whole debt.
+pub fn repay(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+	amount: Option<Balance>,
+) -> DispatchResult {
+	Vaults::repay_for(RuntimeOrigin::signed(who), collateral, stable, owner, amount)
+}
+
+/// Calls the `borrow` dispatchable to the caller with endpoint hints.
+pub fn borrow(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	amount: Balance,
+	new_rate: Option<FixedU128>,
+) -> DispatchResult {
+	Vaults::borrow(
+		RuntimeOrigin::signed(who),
+		collateral,
+		stable,
+		amount,
+		new_rate,
+		None,
+		Position::endpoints_only(),
+	)
+}
+
+/// Calls the `change_rate` dispatchable with endpoint hints.
+pub fn change_rate(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	new_rate: FixedU128,
+) -> DispatchResult {
+	Vaults::change_rate(
+		RuntimeOrigin::signed(who),
+		collateral,
+		stable,
+		new_rate,
+		Position::endpoints_only(),
+	)
+}
+
+/// Calls the `close_vault` dispatchable; `None` returns collateral to the owner.
+pub fn close_vault(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	recipient: Option<AccountId>,
+) -> DispatchResult {
+	Vaults::close_vault(RuntimeOrigin::signed(who), collateral, stable, recipient)
+}
+
+/// Calls the `deposit_collateral_for` dispatchable.
+pub fn deposit_collateral(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+	amount: Balance,
+) -> DispatchResult {
+	Vaults::deposit_collateral_for(RuntimeOrigin::signed(who), collateral, stable, owner, amount)
+}
+
+/// Calls the `withdraw_collateral` dispatchable; `None` pays the owner.
+pub fn withdraw_collateral(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	amount: Balance,
+	recipient: Option<AccountId>,
+) -> DispatchResult {
+	Vaults::withdraw_collateral(RuntimeOrigin::signed(who), collateral, stable, amount, recipient)
+}
+
+/// Calls the `set_governance_frozen` dispatchable as a signed branch admin.
+pub fn set_governance_frozen(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	frozen: bool,
+) -> DispatchResult {
+	Vaults::set_governance_frozen(RuntimeOrigin::signed(who), collateral, stable, frozen)
+}
+
+/// Calls the `enter_final_recovery` dispatchable as `keeper`.
+pub fn enter_final_recovery(
+	keeper: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+) -> DispatchResult {
+	Vaults::enter_final_recovery(RuntimeOrigin::signed(keeper), collateral, stable, owner)
+}
+
+/// Calls the `exit_final_recovery` dispatchable with endpoint hints.
+pub fn exit_final_recovery(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+) -> DispatchResult {
+	Vaults::exit_final_recovery(
+		RuntimeOrigin::signed(who),
+		collateral,
+		stable,
+		owner,
+		Position::endpoints_only(),
+	)
+}
+
+/// Calls the `activate_dormant` dispatchable with endpoint hints.
+pub fn activate_dormant(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+) -> DispatchResultWithPostInfo {
+	Vaults::activate_dormant(
+		RuntimeOrigin::signed(who),
+		collateral,
+		stable,
+		owner,
+		Position::endpoints_only(),
+	)
 }
 
 /// Removes a vault and records its whole debt as redistribution.

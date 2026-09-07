@@ -5,7 +5,7 @@
 
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_status},
+	tests::{rate_pct, vault_status, ONE_DAY_MS},
 	types::BranchConfigUpdate,
 };
 use pallet_linked_list::SortedListInterface;
@@ -273,12 +273,7 @@ fn open_vault_on_multi_asset_branch() {
 fn frozen_branch_blocks_user_ops() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			true
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		assert_noop!(
 			open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)),
 			crate::Error::<Test>::BranchFrozen
@@ -287,12 +282,7 @@ fn frozen_branch_blocks_user_ops() {
 }
 
 fn freeze_by_governance() {
-	assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-		RuntimeOrigin::signed(ADMIN),
-		DOT,
-		PUSD,
-		true
-	));
+	assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 	assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Frozen));
 }
 
@@ -305,13 +295,7 @@ fn frozen_branch_accepts_collateral_deposit() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		freeze_by_governance();
 
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			1,
-			100
-		));
+		assert_ok!(deposit_collateral(2, DOT, PUSD, 1, 100));
 
 		assert_eq!(held(DOT, 1), 1_100);
 		assert_eq!(vault(DOT, PUSD, 1).collateral, 1_100);
@@ -333,13 +317,7 @@ fn frozen_branch_accepts_partial_repayment() {
 		let debt_before = vault(DOT, PUSD, 1).debt.total();
 		freeze_by_governance();
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(100)
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(100)));
 
 		assert_eq!(vault(DOT, PUSD, 1).debt.total(), debt_before - 100);
 		assert!(vault_status(DOT, PUSD, 1).is_active());
@@ -358,7 +336,7 @@ fn frozen_branch_accepts_full_repayment_that_leaves_a_husk() {
 		mint_stable(PUSD, 1, 10);
 		freeze_by_governance();
 
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
+		assert_ok!(repay(1, DOT, PUSD, 1, None));
 
 		let husk = vault(DOT, PUSD, 1);
 		assert_eq!(husk.debt.total(), 0);
@@ -388,19 +366,11 @@ fn frozen_branch_rejects_repayment_that_would_close_the_vault() {
 		assert_eq!(vault(DOT, PUSD, 1).collateral, 0);
 		freeze_by_governance();
 
-		assert_noop!(
-			crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None),
-			crate::Error::<Test>::BranchFrozen
-		);
+		assert_noop!(repay(1, DOT, PUSD, 1, None), crate::Error::<Test>::BranchFrozen);
 
 		// Once the freeze lifts, the same payoff closes the empty row.
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			false
-		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, false));
+		assert_ok!(repay(1, DOT, PUSD, 1, None));
 		assert!(!vault_exists(DOT, PUSD, 1));
 	});
 }
@@ -457,12 +427,7 @@ fn refresh_branch_clears_oracle_frozen() {
 fn refresh_branch_does_not_clear_governance_frozen() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			true
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
@@ -473,28 +438,13 @@ fn governance_clear_clears_governance_frozen() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Defensive (acct 999) cannot clear governance Frozen — needs Full.
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			true
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		assert_noop!(
-			crate::Pallet::<Test>::set_governance_frozen(
-				RuntimeOrigin::signed(EMERGENCY_ADMIN),
-				DOT,
-				PUSD,
-				false
-			),
+			set_governance_frozen(EMERGENCY_ADMIN, DOT, PUSD, false),
 			crate::Error::<Test>::NotBranchAdmin
 		);
 		// Full clears governance Frozen.
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			false
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, false));
 		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
@@ -508,12 +458,7 @@ fn governance_clear_is_noop_for_oracle_frozen() {
 		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Governance clear refuses oracle-Frozen state — branch stays frozen.
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			false
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, false));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
@@ -523,17 +468,12 @@ fn frozen_poke_pins_interest_time_without_minting() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			true
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		let before = branch_state(DOT, PUSD).expect("branch state");
 
-		let elapsed: Moment = 24 * 3_600 * 1_000;
+		let elapsed: Moment = ONE_DAY_MS;
 		advance_time(elapsed);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		assert_ok!(poke(9, DOT, PUSD, 1));
 
 		let after = branch_state(DOT, PUSD).expect("branch state");
 		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
