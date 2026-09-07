@@ -1,6 +1,9 @@
 //! Stablecoin-wide and per-market debt ceilings.
 
-use crate::{mock::*, tests::rate_pct};
+use crate::{
+	mock::*,
+	tests::{rate_pct, ONE_DAY_MS, ONE_YEAR_MS},
+};
 use frame::traits::fungibles::Mutate;
 
 // A stablecoin whose global ceiling is `0` cannot be borrowed, even though a market can exist.
@@ -163,7 +166,7 @@ fn projected_ceiling_counts_accrued_aggregate_interest() {
 		// A year at 100% accrues 2_000 of pending aggregate interest. The
 		// second open projects 2_300 principal + 39 + 2_000 + 6 fee = 4_345
 		// PUSD, though its 2_345 stored-debt view would have fit.
-		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		advance_time(ONE_YEAR_MS);
 		assert_noop!(
 			open(2, DOT, PUSD, 1_000, 300, rate_pct(100, 100)),
 			Error::<Test>::GlobalDebtCeilingExceeded
@@ -209,7 +212,7 @@ fn stablecoin_debt_aggregate_tracks_every_write() {
 		));
 		assert_aggregate_matches(PUSD);
 
-		advance_time(30 * 24 * 3_600 * 1_000);
+		advance_time(30 * ONE_DAY_MS);
 		assert_ok!(Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
 		assert_aggregate_matches(PUSD);
 
@@ -227,7 +230,7 @@ fn stablecoin_debt_aggregate_tracks_every_write() {
 		assert_aggregate_matches(PUSD);
 
 		// Freezing flushes pending aggregate interest into the stored state.
-		advance_time(24 * 3_600 * 1_000);
+		advance_time(ONE_DAY_MS);
 		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,

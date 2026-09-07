@@ -10,10 +10,8 @@
 use crate::{
 	mock::*,
 	pallet::Vaults,
-	tests::{rate_pct, vault_status},
+	tests::{rate_pct, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 };
-
-const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
 
 /// `floor(x * rate)` for the recipient-rate assertions.
 fn weighted(x: Balance, rate: FixedU128) -> Balance {
@@ -61,8 +59,8 @@ fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
 			assert_eq!(vault(DOT, PUSD, 2).debt.principal, before_2);
 
 			advance_time(ONE_YEAR_MS);
-			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, first,));
-			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, second,));
+			assert_ok!(poke(99, DOT, PUSD, first));
+			assert_ok!(poke(99, DOT, PUSD, second));
 			let final_state = branch_state(DOT, PUSD).unwrap();
 			let allocated_1 = vault(DOT, PUSD, 1).debt.principal - before_1;
 			let allocated_2 = vault(DOT, PUSD, 2).debt.principal - before_2;
@@ -98,7 +96,7 @@ fn nonzero_time_weight_residue_is_touch_order_independent() {
 			set_price(DOT, FixedU128::from_rational(1u128, 1u128));
 			assert_eq!(redistribute_for_test(DOT, PUSD, 3, 0).unwrap(), 204);
 
-			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, first));
+			assert_ok!(poke(9, DOT, PUSD, first));
 			let after_first = branch_state(DOT, PUSD).unwrap();
 			let tau = after_first.interest_time(Timestamp::get());
 			// The pending residue must have zero accrued interest at the record time.
@@ -113,7 +111,7 @@ fn nonzero_time_weight_residue_is_touch_order_independent() {
 					.unwrap()
 			);
 
-			assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, second));
+			assert_ok!(poke(9, DOT, PUSD, second));
 			assert_accounting_identity_holds();
 			(branch_state(DOT, PUSD).unwrap(), vault(DOT, PUSD, 1), vault(DOT, PUSD, 2))
 		})
@@ -141,7 +139,7 @@ fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 
 		let coll_1 = held(DOT, 1);
 		assert_ok!(redistribute_for_test(DOT, PUSD, 1, coll_1));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
+		assert_ok!(poke(99, DOT, PUSD, 2));
 
 		// Collateral conservation: the liquidatee's hold is released; the
 		// recipient immediately receives the redistributed collateral.
@@ -188,7 +186,7 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		assert_eq!(state_pre.debt.weighted_principal.whole, 200);
 
 		advance_time(ONE_YEAR_MS);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
+		assert_ok!(poke(99, DOT, PUSD, 2));
 
 		let post_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
 		assert_eq!(post_minted - state_pre.debt.minted_interest, 200);
@@ -212,8 +210,8 @@ fn mixed_rate_recipients_materialize_at_their_own_rates() {
 			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
 		}));
 
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
+		assert_ok!(poke(99, DOT, PUSD, 1));
+		assert_ok!(poke(99, DOT, PUSD, 2));
 
 		let state = branch_state(DOT, PUSD).unwrap();
 		let vault_a = vault(DOT, PUSD, 1);
@@ -249,13 +247,7 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 		// price so the rate change passes the ratio checks.
 		advance_time(ONE_YEAR_MS);
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		assert_ok!(crate::Pallet::<Test>::change_rate(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			rate_pct(30, 100),
-			Position::endpoints_only()
-		));
+		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(30, 100)));
 
 		let vault_a = vault(DOT, PUSD, 1);
 		assert_eq!(vault_a.annual_rate, rate_pct(30, 100));
@@ -277,7 +269,7 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 
 		// Interest after the change uses the new rate for all principal.
 		advance_time(ONE_YEAR_MS);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		assert_ok!(poke(9, DOT, PUSD, 1));
 		let vault_a_post = vault(DOT, PUSD, 1);
 		assert_eq!(vault_a_post.debt.interest, vault_a.debt.interest + 225);
 		assert_accounting_identity_holds();
@@ -305,16 +297,17 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 		}));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
-		assert_ok!(crate::Pallet::<Test>::borrow(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			200,
-			None,
-			None,
-			Position::endpoints_only()
-		));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
+		let interest_before = vault(DOT, PUSD, 1).debt.interest;
+		let predicted_fee =
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 200, None)
+				.expect("touch projection and fee calculation succeed");
+		assert_ok!(borrow(1, DOT, PUSD, 200, None));
+		assert_eq!(
+			vault(DOT, PUSD, 1).debt.interest,
+			interest_before + predicted_fee,
+			"the prediction and execution paths share the pending-touch kernel",
+		);
+		assert_ok!(poke(99, DOT, PUSD, 2));
 
 		let state = branch_state(DOT, PUSD).unwrap();
 		let vault_a = vault(DOT, PUSD, 1);
@@ -343,26 +336,15 @@ fn final_recovery_exit_requires_explicit_hint() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
-			RuntimeOrigin::signed(99),
-			DOT,
-			PUSD,
-			1
-		));
+		assert_ok!(enter_final_recovery(99, DOT, PUSD, 1));
 		assert!(matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::FinalRecovery));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
+		assert_ok!(poke(99, DOT, PUSD, 1));
 		assert!(
 			matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::FinalRecovery),
 			"poke must not auto-exit FinalRecovery; exit requires an explicit hint",
 		);
-		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
-			RuntimeOrigin::signed(99),
-			DOT,
-			PUSD,
-			1,
-			Position::endpoints_only()
-		));
+		assert_ok!(exit_final_recovery(99, DOT, PUSD, 1));
 		assert!(matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::Active));
 	});
 }
@@ -453,8 +435,8 @@ fn sub_resolution_liquidation_remains_explicitly_pending() {
 		let p1_before = vault(DOT, PUSD, 1).debt.principal;
 		let p2_before = vault(DOT, PUSD, 2).debt.principal;
 		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
+		assert_ok!(poke(9, DOT, PUSD, 1));
+		assert_ok!(poke(9, DOT, PUSD, 2));
 
 		assert!(debt_3 < 3_000_000, "the event must sit below the index resolution");
 		let p1_after = vault(DOT, PUSD, 1).debt.principal;
@@ -473,9 +455,9 @@ fn sub_resolution_liquidation_remains_explicitly_pending() {
 
 		// Stake consolidation must give the remaining bearer the exact residue.
 		mint_stable(PUSD, 2, 10_000);
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, PUSD, 2, None));
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		assert_ok!(repay(2, DOT, PUSD, 2, None));
+		assert_ok!(close_vault(2, DOT, PUSD, None));
+		assert_ok!(poke(9, DOT, PUSD, 1));
 		let drained = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(drained.debt.pending_redistribution_principal, 0);
 		assert_eq!(drained.pending_redistribution_collateral, 0);
@@ -513,8 +495,8 @@ fn pending_residue_outlives_its_recipients_and_lands_on_a_later_vault() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
+		assert_ok!(poke(9, DOT, PUSD, 1));
+		assert_ok!(poke(9, DOT, PUSD, 2));
 		let seeded = branch_state(DOT, PUSD).unwrap();
 		let residue = seeded.debt.pending_redistribution_principal;
 		let residue_collateral = seeded.pending_redistribution_collateral;
@@ -525,19 +507,19 @@ fn pending_residue_outlives_its_recipients_and_lands_on_a_later_vault() {
 		// The new recipient must exist before the last old one closes: a close touches the vault,
 		// and a sole stake bearer would absorb the residue itself instead of leaving it pending.
 		mint_stable(PUSD, 2, 10_000_000);
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(2), DOT, PUSD, 2, None));
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(2), DOT, PUSD, None));
+		assert_ok!(repay(2, DOT, PUSD, 2, None));
+		assert_ok!(close_vault(2, DOT, PUSD, None));
 		assert_ok!(open(4, DOT, PUSD, 40_000, 500, rate_pct(5, 100)));
 		mint_stable(PUSD, 1, 10_000_000);
-		assert_ok!(crate::Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, None));
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), DOT, PUSD, None));
+		assert_ok!(repay(1, DOT, PUSD, 1, None));
+		assert_ok!(close_vault(1, DOT, PUSD, None));
 
 		let stranded = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(stranded.debt.pending_redistribution_principal, residue);
 		assert_eq!(stranded.pending_redistribution_collateral, residue_collateral);
 
 		let fresh_before = vault(DOT, PUSD, 4);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 4));
+		assert_ok!(poke(9, DOT, PUSD, 4));
 		let fresh_after = vault(DOT, PUSD, 4);
 		assert_eq!(fresh_after.debt.principal - fresh_before.debt.principal, residue);
 		assert_eq!(fresh_after.collateral - fresh_before.collateral, residue_collateral);
@@ -563,7 +545,7 @@ fn sole_survivor_receives_the_exact_remainder() {
 		let principal_before = vault(DOT, PUSD, 1).debt.principal;
 		assert_ok!(redistribute_for_test(DOT, PUSD, 2, coll_2));
 		assert_eq!(vault(DOT, PUSD, 1).debt.principal, principal_before);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		assert_ok!(poke(9, DOT, PUSD, 1));
 		let principal_after = vault(DOT, PUSD, 1).debt.principal;
 		assert_eq!(principal_after - principal_before, debt_2);
 		assert_eq!(held(DOT, 1), 11_000);
@@ -588,7 +570,7 @@ fn dust_ratio_stake_floors_to_one_unit_and_stays_liquidatable() {
 		// The liquidation snapshot is total stake 1_000 over collateral 2_001_000, so the new
 		// vault's stake floor(1_000 × 1_000 / 2_001_000) = 0 is lifted to the one-unit minimum.
 		assert_eq!(vault(DOT, PUSD, 3).redistribution_stake, 1);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 3));
+		assert_ok!(poke(9, DOT, PUSD, 3));
 
 		set_price(DOT, FixedU128::from_rational(50u128, 100u128));
 		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
@@ -616,7 +598,7 @@ fn vault_cr_projects_lazy_redistribution_before_materialization() {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
 		let view_pre = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).expect("cr");
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
+		assert_ok!(poke(99, DOT, PUSD, 1));
 		let view_post = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).expect("cr");
 		// Projection must match execution before materialization.
 		assert_eq!(view_pre, view_post);
@@ -639,7 +621,7 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 		// Advance time so that simple interest at 50% APR pushes the residual
 		// principal back over MinimumDebt=200.
 		advance_time(ONE_YEAR_MS * 10);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 2));
+		assert_ok!(poke(99, DOT, PUSD, 2));
 
 		// Dormant status is sticky: passive accrual never re-indexes a vault.
 		// Even though the debt has crossed MinimumDebt again, the vault stays
@@ -680,7 +662,7 @@ fn full_lifecycle_holds_branch_identities() {
 		assert_identities();
 
 		// A month of accrual so touches materialise real interest.
-		advance_time(30 * 24 * 3_600 * 1_000);
+		advance_time(30 * ONE_DAY_MS);
 
 		// Liquidate vault 1 with a genuine three-way split: one third offset,
 		// the rest redistributed, plus keeper compensation.
@@ -703,17 +685,11 @@ fn full_lifecycle_holds_branch_identities() {
 		assert_eq!(collateral_balance(DOT, 9), offset_9_pre + 100);
 
 		// The recipient must accrue interest from the redistribution time.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
+		assert_ok!(poke(9, DOT, PUSD, 2));
 		assert_identities();
 
 		// Partial repay exercises the full-contribution weighted-sum swap.
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			2,
-			Some(300)
-		));
+		assert_ok!(repay(2, DOT, PUSD, 2, Some(300)));
 		assert_identities();
 
 		// Redemption against the cheapest vault at a healthy price.
@@ -727,7 +703,7 @@ fn full_lifecycle_holds_branch_identities() {
 		assert_identities();
 
 		// Touch the remaining whale, then close it by overpaying.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 3));
+		assert_ok!(poke(9, DOT, PUSD, 3));
 		assert_identities();
 		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 			&1,
@@ -735,16 +711,10 @@ fn full_lifecycle_holds_branch_identities() {
 			stable_balance(PUSD, 1),
 			frame::traits::tokens::Preservation::Expendable,
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(3),
-			DOT,
-			PUSD,
-			3,
-			Some(stable_balance(PUSD, 3))
-		));
+		assert_ok!(repay(3, DOT, PUSD, 3, Some(stable_balance(PUSD, 3))));
 		// Repay-to-zero leaves a husk; close it to release the collateral and end
 		// the lifecycle with the row gone.
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(3), DOT, PUSD, None));
+		assert_ok!(close_vault(3, DOT, PUSD, None));
 		assert!(!vault_exists(DOT, PUSD, 3), "vault 3 closed");
 		assert_identities();
 	});
@@ -776,7 +746,7 @@ fn redistributed_principal_accrues_interest_from_liquidation_moment() {
 		let projected =
 			<crate::Pallet<Test> as pusd_primitives::VaultInterface>::stablecoin_debt(&PUSD);
 		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.minted_interest, minted_pre);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
+		assert_ok!(poke(9, DOT, PUSD, 2));
 		let v_post = vault(DOT, PUSD, 2);
 		assert_eq!(v_post.debt.principal, v_at_record.debt.principal + 501);
 		assert_eq!(v_post.debt.interest - v_at_record.debt.interest, 1_301);
@@ -818,7 +788,7 @@ fn recipient_owned_redistribution_interest_stays_in_branch_projection() {
 		);
 		assert_eq!(accrued_after_idle_year, 1_104);
 
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(99), DOT, PUSD, 1));
+		assert_ok!(poke(99, DOT, PUSD, 1));
 
 		let state = branch_state(DOT, PUSD).unwrap();
 		let vault = vault(DOT, PUSD, 1);
@@ -843,12 +813,7 @@ fn branch_debt_projection_is_refresh_cadence_independent() {
 			for step in 0..10u64 {
 				advance_time(ONE_YEAR_MS / 10);
 				if step < refreshes {
-					assert_ok!(crate::Pallet::<Test>::poke(
-						RuntimeOrigin::signed(99),
-						DOT,
-						PUSD,
-						9
-					));
+					assert_ok!(poke(99, DOT, PUSD, 9));
 				}
 			}
 			crate::Pallet::<Test>::accrued_branch_debt(

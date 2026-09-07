@@ -6,10 +6,11 @@
 //! maximally-stale hint, so the pallet's repair walk lands it correctly.
 //! `hint_helpers.rs` covers the walk's budget bounds and rollback-on-unrepairable.
 
-use crate::{mock::*, tests::rate_pct};
+use crate::{
+	mock::*,
+	tests::{rate_pct, ONE_DAY_MS},
+};
 use pallet_linked_list::SortedListInterface;
-
-const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 
 // Open vaults in arbitrary order; walking the rate index tail-first (lowest
 // rate → highest) yields ascending order.
@@ -71,13 +72,7 @@ fn repay_to_zero_drops_vault_from_rate_index() {
 			v.debt.interest,
 			frame::traits::tokens::Preservation::Expendable,
 		));
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(3),
-			DOT,
-			PUSD,
-			3,
-			Some(total)
-		));
+		assert_ok!(repay(3, DOT, PUSD, 3, Some(total)));
 		// The husk is out of the rate index even though its row survives.
 		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
 			&rate_list(DOT, PUSD),
@@ -87,7 +82,7 @@ fn repay_to_zero_drops_vault_from_rate_index() {
 		let order = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
 		assert_eq!(order, alloc::vec![1, 2, 4, 5]);
 		// The explicit close removes the row entirely.
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(3), DOT, PUSD, None));
+		assert_ok!(close_vault(3, DOT, PUSD, None));
 		assert!(!vault_exists(DOT, PUSD, 3));
 	});
 }
@@ -105,21 +100,9 @@ fn change_rate_re_inserts_in_correct_position() {
 		advance_time(2 * ONE_DAY_MS);
 
 		// Move acct 3 from 30% to 5% — should land at the tail.
-		assert_ok!(crate::Pallet::<Test>::change_rate(
-			RuntimeOrigin::signed(3),
-			DOT,
-			PUSD,
-			rate_pct(5, 100),
-			Position::endpoints_only()
-		));
+		assert_ok!(change_rate(3, DOT, PUSD, rate_pct(5, 100)));
 		// Move acct 1 from 10% to 60% — should land at the head.
-		assert_ok!(crate::Pallet::<Test>::change_rate(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			rate_pct(60, 100),
-			Position::endpoints_only()
-		));
+		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(60, 100)));
 
 		// Final ascending order: 3 (5%), 2 (20%), 4 (40%), 5 (50%), 1 (60%).
 		let order = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 10);
@@ -147,13 +130,7 @@ fn find_re_insert_position_locates_target_and_none_for_unlisted() {
 		// preview said — its live neighbours match the predicted position (and the
 		// slot is unchanged: 25% still sits between vault 2 and vault 4).
 		advance_time(2 * ONE_DAY_MS); // clear the rate cooldown
-		assert_ok!(crate::Pallet::<Test>::change_rate(
-			RuntimeOrigin::signed(3),
-			DOT,
-			PUSD,
-			rate_pct(25, 100),
-			Position::endpoints_only()
-		));
+		assert_ok!(change_rate(3, DOT, PUSD, rate_pct(25, 100)));
 		let moved =
 			crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 3).expect("listed");
 		assert_eq!(moved.prev, Some(4));

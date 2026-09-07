@@ -44,12 +44,7 @@ fn execute_liquidation_rejects_final_recovery_vault() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
-			RuntimeOrigin::signed(99),
-			DOT,
-			PUSD,
-			1
-		));
+		assert_ok!(enter_final_recovery(99, DOT, PUSD, 1));
 		assert_noop!(liquidate(DOT, PUSD, 1), crate::Error::<Test>::VaultInFinalRecovery);
 	});
 }
@@ -60,12 +55,7 @@ fn execute_liquidation_rejects_frozen_branch() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			true
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		assert_noop!(liquidate(DOT, PUSD, 1), crate::Error::<Test>::BranchFrozen);
 	});
 }
@@ -156,7 +146,7 @@ fn execute_liquidation_pays_keeper_and_derives_redistributed_debt() {
 		// on touch is exactly the derived redistributed debt (0.301 × 1_000 — no
 		// flooring loss).
 		let v_pre = vault(DOT, PUSD, 2);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 2));
+		assert_ok!(poke(9, DOT, PUSD, 2));
 		let v_post = vault(DOT, PUSD, 2);
 		assert_eq!(v_post.debt.principal - v_pre.debt.principal, post_touch_debt - 200);
 	});

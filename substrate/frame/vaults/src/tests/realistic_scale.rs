@@ -6,7 +6,12 @@
 //! `10^-3` stable-per-collateral minor unit = $10_000; against 5_000 USDX
 //! (5×10^9 minor units) of debt that is a 200% CR.
 
-use crate::{mock::*, tests::rate_pct, types::BranchConfigUpdate, Error};
+use crate::{
+	mock::*,
+	tests::{rate_pct, ONE_YEAR_MS},
+	types::BranchConfigUpdate,
+	Error,
+};
 use frame::{
 	arithmetic::Permill,
 	prelude::TokenError,
@@ -17,9 +22,9 @@ use frame::{
 		AccountTouch,
 	},
 };
-use pusd_primitives::{collateralization_ratio, CollateralRatio, MILLIS_PER_YEAR};
+use pusd_primitives::{collateralization_ratio, CollateralRatio};
 
-fn vault(owner: AccountId) -> crate::types::Vault<Balance> {
+fn xbt_vault(owner: AccountId) -> crate::types::Vault<Balance> {
 	crate::mock::vault(XBT, USDX, owner)
 }
 
@@ -95,7 +100,7 @@ fn lifecycle_exact_at_realistic_scale() {
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 		assert_eq!(stable_balance(USDX, 1), 5_000 * USD, "borrowed amount minted at scale");
 
-		let fee = vault(1).debt.interest;
+		let fee = xbt_vault(1).debt.interest;
 		assert!(fee > 0, "upfront fee recorded as interest");
 		let cr = crate::Pallet::<Test>::vault_cr(XBT, USDX, 1).expect("cr");
 		let expected = collateralization_ratio(
@@ -111,21 +116,15 @@ fn lifecycle_exact_at_realistic_scale() {
 		assert_eq!(expected.trunc(), FixedU128::from_u32(1), "human CR just under 200%");
 
 		// One year at 5% on 5×10^9 minor units: exactly 250 USDX of interest.
-		advance_time(MILLIS_PER_YEAR);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 1));
-		assert_eq!(vault(1).debt.interest, fee + 250 * USD);
+		advance_time(ONE_YEAR_MS);
+		assert_ok!(poke(9, XBT, USDX, 1));
+		assert_eq!(xbt_vault(1).debt.interest, fee + 250 * USD);
 
 		// Fund the interest, repay to a husk, close, and get the collateral back.
 		assert_ok!(<Assets as FungiblesMutate<AccountId>>::mint_into(USDX, &1, fee + 250 * USD));
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			XBT,
-			USDX,
-			1,
-			Some(10_000 * USD)
-		));
+		assert_ok!(repay(1, XBT, USDX, 1, Some(10_000 * USD)));
 		assert!(crate::Pallet::<Test>::vault_status(XBT, USDX, 1).expect("status").is_dormant());
-		assert_ok!(crate::Pallet::<Test>::close_vault(RuntimeOrigin::signed(1), XBT, USDX, None));
+		assert_ok!(close_vault(1, XBT, USDX, None));
 		assert_eq!(held(XBT, 1), 0);
 		assert_eq!(collateral_balance(XBT, 1), 100_000_000 * XBT_UNIT, "genesis balance restored");
 	});
@@ -218,7 +217,7 @@ fn borrow_below_stable_ed_depends_on_recipient() {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 
-		let borrow = |recipient: AccountId| {
+		let borrow_to = |recipient: AccountId| {
 			crate::Pallet::<Test>::borrow(
 				RuntimeOrigin::signed(1),
 				XBT,
@@ -230,11 +229,11 @@ fn borrow_below_stable_ed_depends_on_recipient() {
 			)
 		};
 		assert_eq!(stable_balance(USDX, 999), 0, "recipient is fresh");
-		assert_noop!(borrow(999), TokenError::BelowMinimum);
+		assert_noop!(borrow_to(999), TokenError::BelowMinimum);
 
 		// The owner's account exists (funded by the open), so the same amount
 		// lands as a sub-ED top-up.
-		assert_ok!(borrow(1));
+		assert_ok!(borrow_to(1));
 		assert_eq!(stable_balance(USDX, 1), 5_000 * USD + 5_000);
 	});
 }
@@ -256,7 +255,7 @@ fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
 		let minted_pre = branch_state(XBT, USDX).expect("state").debt.minted_interest;
 		let issuance_pre = total_stable(USDX);
 		advance_time(60_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 1));
+		assert_ok!(poke(9, XBT, USDX, 1));
 		let minted_delta =
 			branch_state(XBT, USDX).expect("state").debt.minted_interest - minted_pre;
 		assert_eq!(minted_delta, 475);
@@ -274,10 +273,7 @@ fn frozen_stable_fails_fee_resolution_loudly() {
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 		advance_time(60_000);
 		assert_ok!(Assets::freeze_asset(RuntimeOrigin::signed(1), USDX));
-		assert_noop!(
-			crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), XBT, USDX, 1),
-			Error::<Test>::FeeResolutionFailed
-		);
+		assert_noop!(poke(9, XBT, USDX, 1), Error::<Test>::FeeResolutionFailed);
 	});
 }
 
@@ -340,19 +336,13 @@ fn repay_dusts_sub_ed_payer_remainder() {
 		assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 
 		// Top the owner up to debt + a sub-ED remainder of 5_000 minor units.
-		let debt = vault(3).debt.total();
+		let debt = xbt_vault(3).debt.total();
 		let top_up = debt - 5_000 * USD + 5_000;
 		assert_ok!(<Assets as FungiblesMutate<AccountId>>::mint_into(USDX, &3, top_up));
 		assert_eq!(stable_balance(USDX, 3), debt + 5_000);
 
 		let issuance_pre = total_stable(USDX);
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(3),
-			XBT,
-			USDX,
-			3,
-			Some(10_000 * USD)
-		));
+		assert_ok!(repay(3, XBT, USDX, 3, Some(10_000 * USD)));
 		assert_eq!(stable_balance(USDX, 3), 0, "payer reaped, sub-ED remainder gone");
 		assert_eq!(total_stable(USDX), issuance_pre - debt - 5_000, "remainder burned from supply");
 	});

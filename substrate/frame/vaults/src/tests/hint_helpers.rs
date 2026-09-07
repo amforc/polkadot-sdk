@@ -94,31 +94,18 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 		fund_account(21);
 		assert_ok!(open(21, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
-			RuntimeOrigin::signed(99),
-			DOT,
-			PUSD,
-			21
-		));
+		assert_ok!(enter_final_recovery(99, DOT, PUSD, 21));
 
 		// Restore the price and seed a long index so the tail re-insertion at 1%
 		// needs more than the repair budget.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 		seed_long_rate_index();
 
-		let vault_pre = vault(DOT, PUSD, 21);
 		assert_noop!(
-			crate::Pallet::<Test>::exit_final_recovery(
-				RuntimeOrigin::signed(99),
-				DOT,
-				PUSD,
-				21,
-				Position::endpoints_only()
-			),
+			exit_final_recovery(99, DOT, PUSD, 21),
 			crate::Error::<Test>::InvalidPositionHints
 		);
 		assert!(vault_status(DOT, PUSD, 21).is_final_recovery());
-		assert_eq!(vault(DOT, PUSD, 21), vault_pre);
 		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), alloc::vec![21]);
 	});
 }
@@ -129,8 +116,6 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 		register_market(DOT, PUSD);
 		seed_long_rate_index();
 		fund_account(21);
-		let collateral_pre = collateral_balance(DOT, 21);
-		let pusd_pre = stable_balance(PUSD, 21);
 
 		assert_noop!(
 			crate::Pallet::<Test>::open_vault(
@@ -147,8 +132,6 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 
 		assert!(!vault_exists(DOT, PUSD, 21));
 		assert_eq!(held(DOT, 21), 0);
-		assert_eq!(collateral_balance(DOT, 21), collateral_pre);
-		assert_eq!(stable_balance(PUSD, 21), pusd_pre);
 	});
 }
 
@@ -157,24 +140,10 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		seed_long_rate_index();
-		let vault_pre = vault(DOT, PUSD, 20);
-		let branch_pre = branch_state(DOT, PUSD).expect("branch state");
-		let order_pre = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 25);
 
 		assert_noop!(
-			crate::Pallet::<Test>::change_rate(
-				RuntimeOrigin::signed(20),
-				DOT,
-				PUSD,
-				rate_pct(1, 100),
-				Position::endpoints_only()
-			),
+			change_rate(20, DOT, PUSD, rate_pct(1, 100)),
 			crate::Error::<Test>::InvalidPositionHints
 		);
-
-		assert_eq!(vault(DOT, PUSD, 20), vault_pre);
-		assert_eq!(branch_state(DOT, PUSD).unwrap(), branch_pre);
-		let order_post = LinkedList::iter_from_tail(rate_list(DOT, PUSD), 25);
-		assert_eq!(order_post, order_pre);
 	});
 }

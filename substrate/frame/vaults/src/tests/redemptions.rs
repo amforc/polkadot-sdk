@@ -1,11 +1,9 @@
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_status},
+	tests::{rate_pct, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 };
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{RedemptionSettlement, VaultInterface};
-
-const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 
 // Behavior note: Dormant vaults can still be the target of `withdraw` and
 // `repay` operations. The carve-outs are `change_rate` and collateral-only
@@ -23,7 +21,7 @@ fn fully_redeemed_vault_becomes_dormant_and_leaves_rate_index() {
 		// Let a full year accrue so the redemption must poke the target's pending
 		// interest before cancelling — redeeming at the genesis instant would only
 		// exercise this against pre-touch stored debt.
-		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		advance_time(ONE_YEAR_MS);
 		let now = pallet_timestamp::Pallet::<Test>::get();
 		// Redeem more than the fully-accrued debt (500 principal + 1 open fee + 5 year
 		// interest = 506) so acct 1's debt is cancelled in full.
@@ -95,12 +93,7 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		// A frozen branch must reject settlement, like every other price-dependent
 		// path; the gate fires before any vault is touched or priced.
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			true
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		assert_noop!(redeem_step(DOT, PUSD, 1, 3, 1, 0), crate::Error::<Test>::BranchFrozen);
 	});
 }
@@ -115,20 +108,17 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(60, 100)));
-		advance_time(pusd_primitives::MILLIS_PER_YEAR + 1);
+		advance_time(ONE_YEAR_MS + 1);
 
-		let branch_before = branch_state(DOT, PUSD).expect("branch stored");
 		let vault_before = vault(DOT, PUSD, 1);
 		let held_before = held(DOT, 1);
-		let events_before = System::events();
 
-		let projected =
-			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
 		// Projection is a pure read.
-		assert_eq!(branch_state(DOT, PUSD), Some(branch_before));
-		assert_eq!(try_vault(DOT, PUSD, 1), Some(vault_before.clone()));
-		assert_eq!(held(DOT, 1), held_before);
-		assert_eq!(System::events(), events_before);
+		let projected;
+		assert_storage_noop!(
+			projected = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
+				.expect("snapshot")
+		);
 		// The projection includes the year of pending interest the row lacks.
 		assert_eq!(projected.debt, vault_before.debt.total() + 250);
 		assert_eq!(projected.terminal_interest_charge, 1);
@@ -177,8 +167,6 @@ fn redeem_step_rejects_invalid_settlements_without_state_change() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		let vault_pre = vault(DOT, PUSD, 1);
-		let held_pre = held(DOT, 1);
 		let snapshot =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
 
@@ -203,28 +191,18 @@ fn redeem_step_rejects_invalid_settlements_without_state_change() {
 			crate::Error::<Test>::InvalidRedemptionSettlement
 		);
 		// A payment in another market's coin cannot settle this market's debt.
-		{
-			use frame::deps::frame_support::storage::{with_transaction, TransactionOutcome};
-			assert_noop!(
-				with_transaction(|| {
-					let result = <crate::Pallet<Test> as VaultInterface>::redeem_step(
-						&DOT,
-						&PUSD,
-						&1,
-						&3,
-						settlement(USDX, 100, 0),
-					);
-					match result {
-						Ok(()) => TransactionOutcome::Commit(Ok(())),
-						Err(error) => TransactionOutcome::Rollback(Err(error)),
-					}
-				}),
-				crate::Error::<Test>::InvalidRedemptionSettlement
-			);
-		}
-
-		assert_eq!(vault(DOT, PUSD, 1), vault_pre);
-		assert_eq!(held(DOT, 1), held_pre);
+		// The step is run hypothetically so the issued credit is rolled back
+		// with the rejection rather than leaking into the storage comparison.
+		assert_noop!(
+			hypothetically!(<crate::Pallet<Test> as VaultInterface>::redeem_step(
+				&DOT,
+				&PUSD,
+				&1,
+				&3,
+				settlement(USDX, 100, 0),
+			)),
+			crate::Error::<Test>::InvalidRedemptionSettlement
+		);
 	});
 }
 
@@ -318,16 +296,10 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 
 		advance_time(365 * ONE_DAY_MS);
 		// Touch alone never re-activates a Dormant, even past MinimumDebt.
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
+		assert_ok!(poke(9, DOT, PUSD, 1));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "touch never re-activates a Dormant");
 
-		assert_ok!(crate::Pallet::<Test>::activate_dormant(
-			RuntimeOrigin::signed(9),
-			DOT,
-			PUSD,
-			1,
-			Position::endpoints_only()
-		));
+		assert_ok!(activate_dormant(9, DOT, PUSD, 1));
 		assert!(vault_status(DOT, PUSD, 1).is_active());
 		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(
 			&rate_list(DOT, PUSD),
@@ -345,16 +317,7 @@ fn activate_dormant_rejects_below_minimum_debt() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		assert_ok!(redeem(DOT, PUSD, 3, 350)); // vault 1 → Dormant, debt ~150 < 200
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_noop!(
-			crate::Pallet::<Test>::activate_dormant(
-				RuntimeOrigin::signed(9),
-				DOT,
-				PUSD,
-				1,
-				Position::endpoints_only()
-			),
-			crate::Error::<Test>::DebtBelowMinimum
-		);
+		assert_noop!(activate_dormant(9, DOT, PUSD, 1), crate::Error::<Test>::DebtBelowMinimum);
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 	});
 }
@@ -364,16 +327,7 @@ fn activate_dormant_rejects_active_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_noop!(
-			crate::Pallet::<Test>::activate_dormant(
-				RuntimeOrigin::signed(9),
-				DOT,
-				PUSD,
-				1,
-				Position::endpoints_only()
-			),
-			crate::Error::<Test>::InvalidVaultStatus
-		);
+		assert_noop!(activate_dormant(9, DOT, PUSD, 1), crate::Error::<Test>::InvalidVaultStatus);
 	});
 }
 
@@ -398,7 +352,7 @@ fn dormant_vault_with_residual_accrues_interest() {
 		assert_eq!(v_pre.debt.interest, 0);
 
 		advance_time(365 * ONE_DAY_MS); // ~1 year (365 days)
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
+		assert_ok!(poke(2, DOT, PUSD, 1));
 		let v_post = vault(DOT, PUSD, 1);
 		// The Dormant residual keeps accruing: floor(155 * 0.5 * 365days / year) = 77.
 		assert_eq!(v_post.debt.interest, 77);
@@ -433,7 +387,7 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 			vault_dormant_pre.debt.principal,
 			"the allocation stays lazy until this vault is touched",
 		);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
+		assert_ok!(poke(99, DOT, PUSD, 1));
 		let vault_dormant_post = vault(DOT, PUSD, 1);
 		// Dormant debt must not remove a vault from redistribution.
 		let gained = vault_dormant_post.debt.principal - vault_dormant_pre.debt.principal;
@@ -461,7 +415,7 @@ fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 
 		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
 		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
+		assert_ok!(poke(2, DOT, PUSD, 1));
 
 		// The liquidated vault leaves the recipient set before allocation.
 		let husk_after = vault(DOT, PUSD, 1);
@@ -489,18 +443,7 @@ fn dormant_borrow_below_min_debt_reverts() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		assert_ok!(redeem(DOT, PUSD, 3, 480)); // pushes acct 1 to Dormant with tiny debt
 										 // Borrow 1 — total debt would be far below MinimumDebt 200.
-		assert_noop!(
-			crate::Pallet::<Test>::borrow(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				1,
-				None,
-				None,
-				Position::endpoints_only()
-			),
-			crate::Error::<Test>::DebtBelowMinimum
-		);
+		assert_noop!(borrow(1, DOT, PUSD, 1, None), crate::Error::<Test>::DebtBelowMinimum);
 	});
 }
 
@@ -524,26 +467,12 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 		// A deposit alone cannot revive a Dormant vault → rejected (so it must not
 		// lead a batch).
 		assert_noop!(
-			crate::Pallet::<Test>::deposit_collateral_for(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				1,
-				100
-			),
+			deposit_collateral(1, DOT, PUSD, 1, 100),
 			crate::Error::<Test>::InvalidVaultStatus
 		);
 
 		// Borrow across MinimumDebt revives it to Active...
-		assert_ok!(crate::Pallet::<Test>::borrow(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			500,
-			None,
-			None,
-			Position::endpoints_only()
-		));
+		assert_ok!(borrow(1, DOT, PUSD, 500, None));
 		assert!(vault_status(DOT, PUSD, 1).is_active());
 		// ...re-inserted into the rate index and the dormant slot cleared.
 		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(
@@ -554,13 +483,7 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 
 		// ...after which the deposit leg of the batch is accepted.
 		let held_before = held(DOT, 1);
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			100
-		));
+		assert_ok!(deposit_collateral(1, DOT, PUSD, 1, 100));
 		assert_eq!(held(DOT, 1), held_before + 100);
 	});
 }
@@ -576,13 +499,7 @@ fn dormant_vault_cannot_change_rate() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		assert_ok!(redeem(DOT, PUSD, 3, 350));
 		assert_noop!(
-			crate::Pallet::<Test>::change_rate(
-				RuntimeOrigin::signed(1),
-				DOT,
-				PUSD,
-				rate_pct(7, 100),
-				Position::endpoints_only()
-			),
+			change_rate(1, DOT, PUSD, rate_pct(7, 100)),
 			crate::Error::<Test>::InvalidVaultStatus
 		);
 	});

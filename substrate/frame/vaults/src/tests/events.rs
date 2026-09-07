@@ -1,8 +1,7 @@
-use crate::{mock::*, tests::rate_pct};
-
-fn assert_event(event: crate::Event<Test>) {
-	System::assert_has_event(RuntimeEvent::Vaults(event));
-}
+use crate::{
+	mock::*,
+	tests::{assert_event, rate_pct, vault_events, ONE_DAY_MS},
+};
 
 // Open emits VaultOpened carrying both inputs, plus UpfrontFeeCharged for the
 // protocol-favored fee.
@@ -42,13 +41,7 @@ fn deposit_collateral_emits_collateral_deposited() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::deposit_collateral_for(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			1,
-			100
-		));
+		assert_ok!(deposit_collateral(2, DOT, PUSD, 1, 100));
 		// `from` is the caller (acct 2), `owner` is the vault owner (acct 1).
 		assert_event(crate::Event::CollateralDeposited {
 			collateral_id: DOT,
@@ -66,15 +59,7 @@ fn borrow_emits_borrowed() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(5, 100)));
 		// `None` recipient defaults to the owner; the emitted event confirms it.
-		assert_ok!(crate::Pallet::<Test>::borrow(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			500,
-			None,
-			None,
-			Position::endpoints_only()
-		));
+		assert_ok!(borrow(1, DOT, PUSD, 500, None));
 		assert_event(crate::Event::Borrowed {
 			collateral_id: DOT,
 			stable_id: PUSD,
@@ -91,13 +76,7 @@ fn withdraw_collateral_emits_collateral_withdrawn() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 3_000, 500, rate_pct(5, 100)));
 		// `None` recipient defaults to the owner; the emitted event confirms it.
-		assert_ok!(crate::Pallet::<Test>::withdraw_collateral(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			100,
-			None
-		));
+		assert_ok!(withdraw_collateral(1, DOT, PUSD, 100, None));
 		assert_event(crate::Event::CollateralWithdrawn {
 			collateral_id: DOT,
 			stable_id: PUSD,
@@ -113,13 +92,7 @@ fn repay_emits_repaid() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
-		assert_ok!(crate::Pallet::<Test>::repay_for(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			1,
-			Some(200)
-		));
+		assert_ok!(repay(1, DOT, PUSD, 1, Some(200)));
 		assert_event(crate::Event::Repaid {
 			collateral_id: DOT,
 			stable_id: PUSD,
@@ -137,14 +110,8 @@ fn change_rate_emits_borrow_rate_changed() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		// After the cooldown, no fee — only BorrowRateChanged.
-		advance_time(24 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::change_rate(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			rate_pct(7, 100),
-			Position::endpoints_only()
-		));
+		advance_time(ONE_DAY_MS);
+		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(7, 100)));
 		assert_event(crate::Event::BorrowRateChanged {
 			collateral_id: DOT,
 			stable_id: PUSD,
@@ -161,19 +128,13 @@ fn premature_change_rate_emits_upfront_fee_charged() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		// Within the cooldown window — fee charged.
-		advance_time(12 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(1), DOT, PUSD, 1));
+		advance_time(ONE_DAY_MS / 2);
+		assert_ok!(poke(1, DOT, PUSD, 1));
 		let predicted =
 			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(7, 100))
 				.expect("registered market and vault");
 		assert!(predicted > 0);
-		assert_ok!(crate::Pallet::<Test>::change_rate(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			rate_pct(7, 100),
-			Position::endpoints_only()
-		));
+		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(7, 100)));
 		assert_event(crate::Event::UpfrontFeeCharged {
 			collateral_id: DOT,
 			stable_id: PUSD,
@@ -196,8 +157,8 @@ fn poke_emits_interest_accrued() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(50, 100)));
-		advance_time(7 * 24 * 3_600 * 1_000);
-		assert_ok!(crate::Pallet::<Test>::poke(RuntimeOrigin::signed(2), DOT, PUSD, 1));
+		advance_time(7 * ONE_DAY_MS);
+		assert_ok!(poke(2, DOT, PUSD, 1));
 		// Exact magnitude: 7 days at 50% on 2_000 principal accrues
 		// floor(2_000 * 0.5 * 7days / year) = 19 (interest is on principal, not the fee).
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::InterestAccrued {
@@ -220,15 +181,11 @@ fn redemption_emits_vault_redeemed() {
 		assert_eq!(target, 1);
 		// VaultRedeemed event: don't pin the exact magnitudes (collateral
 		// rounding depends on price), just confirm the event landed.
-		let saw = System::events().into_iter().any(|e| {
+		let saw = vault_events().iter().any(|e| {
 			matches!(
-				e.event,
-				RuntimeEvent::Vaults(crate::Event::VaultRedeemed {
-					collateral_id, owner, recipient, debt_cancelled, ..
-				}) if collateral_id == DOT
-					&& owner == 1
-					&& recipient == 3
-					&& debt_cancelled == 200
+				e,
+				crate::Event::VaultRedeemed { collateral_id, owner, recipient, debt_cancelled, .. }
+					if *collateral_id == DOT && *owner == 1 && *recipient == 3 && *debt_cancelled == 200
 			)
 		});
 		assert!(saw, "expected a VaultRedeemed event");
@@ -249,20 +206,14 @@ fn register_branch_emits_branch_registered() {
 fn set_governance_frozen_emits_mode_changed() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(crate::Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			true
-		));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		// Branch starts in Normal mode (no debt yet, TCR is treated as
 		// infinity); after the governance freeze it transitions to Frozen.
-		let saw = System::events().into_iter().any(|e| {
+		let saw = vault_events().iter().any(|e| {
 			matches!(
-				e.event,
-				RuntimeEvent::Vaults(crate::Event::ModeChanged { collateral_id, new_mode, .. })
-					if collateral_id == DOT
-						&& matches!(new_mode, crate::BranchMode::Frozen { .. })
+				e,
+				crate::Event::ModeChanged { collateral_id, new_mode, .. }
+					if *collateral_id == DOT && matches!(new_mode, crate::BranchMode::Frozen { .. })
 			)
 		});
 		assert!(saw, "expected a ModeChanged → Frozen event");
@@ -321,12 +272,7 @@ fn enter_final_recovery_emits_status_change() {
 		// Single vault that we'll push into FinalRecovery via a price drop.
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(2u128, 100u128));
-		assert_ok!(crate::Pallet::<Test>::enter_final_recovery(
-			RuntimeOrigin::signed(2),
-			DOT,
-			PUSD,
-			1
-		));
+		assert_ok!(enter_final_recovery(2, DOT, PUSD, 1));
 		assert_event(crate::Event::VaultStatusChanged {
 			collateral_id: DOT,
 			stable_id: PUSD,
