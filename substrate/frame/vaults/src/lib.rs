@@ -121,6 +121,7 @@ pub mod pallet {
 	pub type RegistrationConfigOf<T> = <<T as Config>::OnBranchLifecycle as OnBranchLifecycle<
 		CollateralIdOf<T>,
 		StableIdOf<T>,
+		<T as frame_system::Config>::AccountId,
 	>>::RegistrationConfig;
 
 	/// Stable-asset credit produced by the pallet.
@@ -191,7 +192,11 @@ pub mod pallet {
 		type YieldHook: OnBranchYield<CollateralIdOf<Self>, StableCreditOf<Self>>;
 
 		/// Notifies other pallets when a market is created or removed.
-		type OnBranchLifecycle: OnBranchLifecycle<CollateralIdOf<Self>, StableIdOf<Self>>;
+		type OnBranchLifecycle: OnBranchLifecycle<
+			CollateralIdOf<Self>,
+			StableIdOf<Self>,
+			Self::AccountId,
+		>;
 
 		/// Provides UNIX time in milliseconds.
 		type TimeProvider: Time<Moment = Millis>;
