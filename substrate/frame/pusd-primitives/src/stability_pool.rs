@@ -3,7 +3,6 @@
 use frame::deps::{
 	frame_support::{
 		pallet_prelude::{DispatchError, DispatchResult},
-		require_transactional,
 		traits::TryDrop,
 	},
 	sp_runtime::traits::Zero,
@@ -94,7 +93,6 @@ impl<CollateralId, StableId, Balance: Zero> StabilityPoolInspect<CollateralId, S
 impl<CollateralId, StableId, Balance: Zero, CollateralCredit: TryDrop>
 	StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit> for ()
 {
-	#[require_transactional]
 	fn offset(
 		_: &CollateralId,
 		_: &StableId,

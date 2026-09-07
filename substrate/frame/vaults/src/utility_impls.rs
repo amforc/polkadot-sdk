@@ -18,9 +18,7 @@ use crate::{
 };
 use frame::{
 	arithmetic::ArithmeticError,
-	deps::frame_support::{
-		require_transactional, storage::with_storage_layer, weights::WeightMeter,
-	},
+	deps::frame_support::{storage::with_storage_layer, weights::WeightMeter},
 	prelude::*,
 	traits::{
 		fungibles::{Balanced as FungiblesBalanced, Inspect as FungiblesInspect, InspectHold as _},
@@ -149,7 +147,6 @@ impl<T: Config> Pallet<T> {
 
 	/// Replace the stored branch and update derived aggregates from its
 	/// authoritative stored preimage.
-	#[require_transactional]
 	pub(crate) fn commit_branch(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
