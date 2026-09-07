@@ -11,6 +11,8 @@ use crate::{
 	BranchConfig, BranchMode, DebtCollateral, Error, Event, LiquidationConfig, LiquidationOutcome,
 };
 
+const KEEPER: AccountId = 3;
+
 fn liquidation_branch_config() -> BranchConfig<Balance> {
 	let mut config = crate::mock::default_branch_config();
 	config.liquidation.redistribution_penalty = Permill::from_percent(10);
@@ -29,8 +31,16 @@ fn setup_underwater_vault() {
 	set_price(DOT, FixedU128::from_rational(9, 10));
 }
 
-const KEEPER: AccountId = 3;
-const GENESIS_BALANCE: Balance = 1_000_000_000_000;
+fn set_liquidation_param(who: AccountId, update: BranchConfigUpdate<Balance>) -> DispatchResult {
+	Vaults::set_param(RuntimeOrigin::signed(who), DOT, PUSD, update)
+}
+
+fn liquidation_config() -> LiquidationConfig<Balance> {
+	crate::Branches::<Test>::get(DOT, PUSD)
+		.expect("registered branch")
+		.config
+		.liquidation
+}
 
 /// Keeps exact event assertions compact by using liquidation-path order:
 /// `[active_pool, keeper_jit, pending_pool, redistribution]`.
@@ -50,67 +60,88 @@ fn outcome(
 	}
 }
 
-/// Fixes the common market and actors so each test can focus on its outcome.
-fn assert_liquidated_event(outcome: LiquidationOutcome<Balance>) {
+/// The balances a liquidation of vault 1 moves, taken before the call.
+struct Ledger {
+	owner: Balance,
+	keeper: Balance,
+	keeper_stable: Balance,
+	pool: Balance,
+	redistribution: Balance,
+}
+
+fn ledger() -> Ledger {
+	Ledger {
+		owner: collateral_balance(DOT, 1),
+		keeper: collateral_balance(DOT, KEEPER),
+		keeper_stable: stable_balance(PUSD, KEEPER),
+		pool: collateral_balance(DOT, SP_ACCOUNT),
+		redistribution: held(DOT, Vaults::redistribution_account(&DOT, &PUSD)),
+	}
+}
+
+/// Asserts the `VaultLiquidated` event for vault 1 and that the ledger agrees with it: each path's
+/// collateral landed where the outcome says, the JIT debt left the keeper, and the owner got the
+/// surplus back with the vault deposit.
+fn assert_settled(before: &Ledger, outcome: LiquidationOutcome<Balance>) {
 	assert_event(Event::VaultLiquidated {
 		collateral_id: DOT,
 		stable_id: PUSD,
 		owner: 1,
 		keeper: KEEPER,
-		outcome,
+		outcome: outcome.clone(),
 	});
+	assert!(!vault_exists(DOT, PUSD, 1));
+	let after = ledger();
+	assert_eq!(after.owner - before.owner, outcome.owner_surplus + VAULT_DEPOSIT);
+	assert_eq!(after.keeper - before.keeper, outcome.keeper_reward + outcome.keeper_jit.collateral);
+	assert_eq!(before.keeper_stable - after.keeper_stable, outcome.keeper_jit.debt);
+	assert_eq!(
+		after.pool - before.pool,
+		outcome.active_pool.collateral + outcome.pending_pool.collateral
+	);
+	assert_eq!(after.redistribution - before.redistribution, outcome.redistribution.collateral);
 }
 
-// Branch creation must reject a penalty order that makes redistribution cheaper than an offset.
-#[test]
-fn create_with_inverted_penalties_rejected() {
-	build_and_execute(|| {
-		let mut config = liquidation_branch_config();
-		config.liquidation.redistribution_penalty = Permill::from_percent(4);
-		set_price(DOT, FixedU128::from_rational(5, 4));
-		assert_noop!(
-			Vaults::create_branch(
-				RuntimeOrigin::root(),
-				DOT,
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				config,
-				(),
-			),
-			crate::Error::<Test>::InvalidBranchConfig(
-				BranchConfigDefect::OffsetPenaltyAboveRedistribution
-			)
-		);
-		assert!(crate::Branches::<Test>::get(DOT, PUSD).is_none());
-	});
+/// The outcome every JIT-less liquidation of the standard fixture produces: all 500 of debt is
+/// redistributed, so the whole lot is priced at the harsher 10% penalty and ceil(550/0.9) = 612
+/// exceeds the 600 held. The owner keeps nothing rather than the 16 a 5%-priced seizure would
+/// have left, and the 588 after the keeper's 12 follows the debt.
+fn full_redistribution() -> LiquidationOutcome<Balance> {
+	outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0)
 }
 
 // Without Stability capital, redistribution must settle all debt and apply its higher borrower
-// penalty.
+// penalty. The optional JIT leg fails open: whatever makes it unusable, liquidation still runs and
+// the keeper's stablecoin is untouched.
 #[test]
-fn full_redistribution_without_surplus() {
+fn jit_skipped_falls_back_to_full_redistribution() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 
-		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
-
-		// The vault is gone and its debt was fully redistributed.
-		assert!(!vault_exists(DOT, PUSD, 1));
-		// Keeper reward 12 lands as free native balance.
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 12);
-		// All 500 debt is redistributed, so the whole lot is priced at the
-		// harsher 10% penalty: ceil(550/0.9) = 612 exceeds the 600 held, so the
-		// owner keeps nothing rather than the 16 a 5%-priced seizure would have
-		// left.
-		assert_eq!(collateral_balance(DOT, 1), GENESIS_BALANCE - 600);
-		// Redistribution collateral remains in custody until the recipient is touched.
-		let redistribution = Vaults::redistribution_account(&DOT, &PUSD);
-		assert_eq!(held(DOT, redistribution), 588);
-		// No stability capital was touched.
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT), GENESIS_BALANCE);
+		let cases = [
+			(0, 0, 0, "no allowance"),
+			// A 50-unit allowance sits below the 100-unit `minimum_jit_contribution`.
+			(500, 50, 0, "allowance below the market minimum"),
+			// The allowance clears the minimum, but the keeper's funding clamps it below.
+			(50, 1_000, 0, "funding clamps the contribution below the minimum"),
+			// An allowance does not reserve stablecoin, so an unfunded keeper resolves to no JIT
+			// rather than a failed withdrawal.
+			(0, 200, 0, "unfunded keeper"),
+			// The floor protects an executed trade only; without one it is inert even when no
+			// collateral could satisfy it.
+			(0, 200, 1_000, "unsatisfiable floor without a trade"),
+		];
+		for (funding, max_jit, min_out, reason) in cases {
+			hypothetically!({
+				if funding > 0 {
+					mint_stable(PUSD, KEEPER, funding);
+				}
+				let before = ledger();
+				assert_eq!(liquidate(KEEPER, DOT, PUSD, 1, max_jit, min_out), Ok(()), "{reason}");
+				assert_settled(&before, full_redistribution());
+			});
+		}
 		assert_eq!(SpOffsetCalls::get(), 0, "a pure redistribution must not call the pool");
-
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0));
 	});
 }
 
@@ -122,16 +153,14 @@ fn full_redistribution_with_surplus() {
 		assert_ok!(open(1, DOT, PUSD, 600, 500, FixedU128::from_rational(1, 1_000)));
 		assert_ok!(open(2, DOT, PUSD, 2_000, 500, FixedU128::from_rational(2, 1_000)));
 		set_price(DOT, FixedU128::from_rational(9, 10));
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		// At 5% the full 500 of redistributed debt weighs 525, seizing
 		// ceil(525/0.9) = 584 of the 600 held — the owner keeps 16 even though
 		// every unit of debt lands on other vaults.
-		assert_eq!(collateral_balance(DOT, 1), GENESIS_BALANCE - 600 + 16);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 572);
-
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 572], 12, 16));
+		assert_settled(&before, outcome([0, 0, 0, 500], [0, 0, 0, 572], 12, 16));
 	});
 }
 
@@ -144,15 +173,14 @@ fn redistribution_with_collateral_below_debt() {
 		setup_underwater_vault();
 		// 600 * 0.7 = 420 of value against 500 of debt: CR 0.84.
 		set_price(DOT, FixedU128::from_rational(7, 10));
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		// The 10%-penalty ask ceil(550/0.7) = 786 dwarfs the 600 held, so the
 		// owner keeps nothing and the keeper takes the flat ceil(10/0.7) = 15
 		// (floor(0.1% * 600) adds nothing).
-		assert_eq!(collateral_balance(DOT, 1), GENESIS_BALANCE - 600);
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 15);
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 585], 15, 0));
+		assert_settled(&before, outcome([0, 0, 0, 500], [0, 0, 0, 585], 15, 0));
 
 		// The recipient must own the complete redistributed shortfall after its touch.
 		assert_ok!(poke(KEEPER, DOT, PUSD, 2));
@@ -169,6 +197,7 @@ fn debt_includes_accrued_interest() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		advance_time(10 * ONE_YEAR_MS);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
@@ -176,10 +205,7 @@ fn debt_includes_accrued_interest() {
 		// redistributes. Its 10%-penalty weight is 505 + ceil(50.5) = 556, and
 		// ceil(556/0.9) = 618 exceeds the 600 held: no owner surplus, and the
 		// 588 left after the keeper all follows the redistributed debt.
-		assert!(!vault_exists(DOT, PUSD, 1));
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 588);
-
-		assert_liquidated_event(outcome([0, 0, 0, 505], [0, 0, 0, 588], 12, 0));
+		assert_settled(&before, outcome([0, 0, 0, 505], [0, 0, 0, 588], 12, 0));
 	});
 }
 
@@ -190,11 +216,12 @@ fn terminal_interest_enters_the_waterfall_before_redistribution() {
 		setup_underwater_vault();
 		advance_time(1);
 		let fee_before = stable_balance(PUSD, FEE_DEST);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		// Liquidation must include the terminal interest unit.
-		assert_liquidated_event(outcome([0, 0, 0, 501], [0, 0, 0, 588], 12, 0));
+		assert_settled(&before, outcome([0, 0, 0, 501], [0, 0, 0, 588], 12, 0));
 		// Only terminal interest increases fee-account revenue.
 		assert_eq!(stable_balance(PUSD, FEE_DEST), fee_before + 1);
 	});
@@ -208,17 +235,13 @@ fn active_pool_precedes_jit() {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(1_000);
 		mint_stable(PUSD, KEEPER, 1_000);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 200, 0));
 
 		// Full offset: the whole resolution collateral 572 goes to the pool,
 		// nothing reaches redistribution, and the JIT allowance stays unused.
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT), GENESIS_BALANCE + 572);
-		let redistribution = Vaults::redistribution_account(&DOT, &PUSD);
-		assert_eq!(held(DOT, redistribution), 0);
-		assert_eq!(stable_balance(PUSD, KEEPER), 1_000);
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 12);
-		assert_eq!(collateral_balance(DOT, 1), GENESIS_BALANCE - 600 + 16);
+		assert_settled(&before, outcome([500, 0, 0, 0], [572, 0, 0, 0], 12, 16));
 		// 500 of the 1_000 mocked capacity was consumed.
 		assert_eq!(ActiveSpCapacity::get(), 500);
 		assert_eq!(
@@ -227,8 +250,6 @@ fn active_pool_precedes_jit() {
 			"a full active offset must not inspect pending capacity"
 		);
 		assert_eq!(SpOffsetCalls::get(), 1, "the non-zero active leg settles once");
-
-		assert_liquidated_event(outcome([500, 0, 0, 0], [572, 0, 0, 0], 12, 16));
 	});
 }
 
@@ -241,18 +262,14 @@ fn full_offset_without_surplus() {
 		// value asks for ceil(525/0.8) = 657, more than the 600 held.
 		set_price(DOT, FixedU128::from_rational(4, 5));
 		ActiveSpCapacity::set(1_000);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		// Seized = 600, surplus 0. The keeper takes ceil(10/0.8) = 13 flat
 		// (floor(0.1% * 600) adds nothing) and the pool the remaining 587.
-		assert_eq!(collateral_balance(DOT, 1), GENESIS_BALANCE - 600);
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 13);
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT), GENESIS_BALANCE + 587);
+		assert_settled(&before, outcome([500, 0, 0, 0], [587, 0, 0, 0], 13, 0));
 		assert_eq!(ActiveSpCapacity::get(), 500);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 0);
-
-		assert_liquidated_event(outcome([500, 0, 0, 0], [587, 0, 0, 0], 13, 0));
 	});
 }
 
@@ -264,6 +281,7 @@ fn jit_burns_after_active_pool() {
 		ActiveSpCapacity::set(300);
 		mint_stable(PUSD, KEEPER, 500);
 		let issuance_before = total_stable(PUSD);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 1_000, 0));
 
@@ -274,15 +292,8 @@ fn jit_burns_after_active_pool() {
 		// floor(572 * 210/525) = 228. The 1 the flooring leaves has no
 		// redistributed debt to follow, so the last non-zero offset (JIT)
 		// receives it.
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT), GENESIS_BALANCE + 343);
-		assert_eq!(stable_balance(PUSD, KEEPER), 500 - 200);
-		assert_eq!(total_stable(PUSD), issuance_before - 200);
-		// Keeper reward 12 plus JIT collateral 229.
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 12 + 229);
-		let redistribution = Vaults::redistribution_account(&DOT, &PUSD);
-		assert_eq!(held(DOT, redistribution), 0);
-
-		assert_liquidated_event(outcome([300, 200, 0, 0], [343, 229, 0, 0], 12, 16));
+		assert_settled(&before, outcome([300, 200, 0, 0], [343, 229, 0, 0], 12, 16));
+		assert_eq!(total_stable(PUSD), issuance_before - 200, "the JIT stablecoin burned");
 	});
 }
 
@@ -293,6 +304,7 @@ fn jit_clamped_by_keeper_balance() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(PUSD, KEEPER, 150);
+		let before = ledger();
 
 		// The 1_000 allowance is capped by the keeper's 150 of funding, and
 		// the unfunded 350 redistributes.
@@ -302,11 +314,7 @@ fn jit_clamped_by_keeper_balance() {
 		// 385; of the 588 left after the keeper, JIT takes
 		// floor(588 * 158/543) = 171 and redistribution
 		// floor(588 * 385/543) = 416 plus the 1 the flooring leaves.
-		assert_eq!(stable_balance(PUSD, KEEPER), 0);
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 12 + 171);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 417);
-
-		assert_liquidated_event(outcome([0, 150, 0, 350], [0, 171, 0, 417], 12, 0));
+		assert_settled(&before, outcome([0, 150, 0, 350], [0, 171, 0, 417], 12, 0));
 	});
 }
 
@@ -316,6 +324,7 @@ fn pending_precedes_redistribution() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		PendingSpCapacity::set(150);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
@@ -324,12 +333,8 @@ fn pending_precedes_redistribution() {
 		// left after the keeper, pending takes floor(588 * 158/543) = 171 and
 		// redistribution floor(588 * 385/543) = 416, plus the 1 the flooring
 		// leaves — redistribution has debt, so the remainder follows it.
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT), GENESIS_BALANCE + 171);
-		let redistribution = Vaults::redistribution_account(&DOT, &PUSD);
-		assert_eq!(held(DOT, redistribution), 417);
+		assert_settled(&before, outcome([0, 0, 150, 350], [0, 0, 171, 417], 12, 0));
 		assert_eq!(PendingSpCapacity::get(), 0);
-
-		assert_liquidated_event(outcome([0, 0, 150, 350], [0, 0, 171, 417], 12, 0));
 	});
 }
 
@@ -341,51 +346,14 @@ fn remainder_follows_last_offset() {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(300);
 		PendingSpCapacity::set(200);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		// Active takes floor(572 * 315/525) = 343, pending
 		// floor(572 * 210/525) = 228 plus the 1 the flooring leaves.
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT), GENESIS_BALANCE + 343 + 229);
+		assert_settled(&before, outcome([300, 0, 200, 0], [343, 0, 229, 0], 12, 16));
 		assert_eq!((ActiveSpCapacity::get(), PendingSpCapacity::get()), (0, 0));
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 0);
-
-		assert_liquidated_event(outcome([300, 0, 200, 0], [343, 0, 229, 0], 12, 16));
-	});
-}
-
-// A deliberately small JIT allowance must not block liquidation. It opts out of JIT and leaves
-// the keeper's stablecoin untouched while the debt continues through the waterfall.
-#[test]
-fn jit_below_minimum_skipped() {
-	build_and_execute(|| {
-		setup_underwater_vault();
-		mint_stable(PUSD, KEEPER, 500);
-
-		// A 50-unit allowance sits below the 100-unit `minimum_jit_contribution`.
-		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 50, 0));
-
-		assert_eq!(stable_balance(PUSD, KEEPER), 500, "no below-minimum JIT burn");
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 588);
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0));
-	});
-}
-
-// Underfunding a large allowance below the market minimum follows the same fail-open rule: the
-// optional JIT leg is skipped and liquidation continues.
-#[test]
-fn jit_underfunded_below_minimum_skipped() {
-	build_and_execute(|| {
-		setup_underwater_vault();
-		mint_stable(PUSD, KEEPER, 50);
-
-		// The 1_000 allowance clears the minimum, but the keeper's 50 of
-		// funding would clamp the contribution below it.
-		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 1_000, 0));
-
-		assert_eq!(stable_balance(PUSD, KEEPER), 50, "no underfunded JIT burn");
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 588);
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0));
 	});
 }
 
@@ -395,6 +363,7 @@ fn jit_executes_at_minimum_funding() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(PUSD, KEEPER, 100);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 1_000, 0));
 
@@ -403,11 +372,7 @@ fn jit_executes_at_minimum_funding() {
 		// seizes the whole 600. Of the 588 left after the keeper, JIT takes
 		// floor(588 * 105/545) = 113 and redistribution floor(588 * 440/545) = 474
 		// plus the 1 the flooring leaves.
-		assert_eq!(stable_balance(PUSD, KEEPER), 0);
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 12 + 113);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 475);
-
-		assert_liquidated_event(outcome([0, 100, 0, 400], [0, 113, 0, 475], 12, 0));
+		assert_settled(&before, outcome([0, 100, 0, 400], [0, 113, 0, 475], 12, 0));
 	});
 }
 
@@ -419,6 +384,7 @@ fn jit_executes_below_minimum_ask() {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(450);
 		mint_stable(PUSD, KEEPER, 500);
+		let before = ledger();
 
 		// The active pool leaves only 50 debt, below the market's 100-unit
 		// minimum JIT contribution — the JIT burns it anyway.
@@ -429,13 +395,8 @@ fn jit_executes_below_minimum_ask() {
 		// weights 473 : 53 (450 + ceil(22.5) and 50 + ceil(2.5)) give active
 		// floor(572 * 473/526) = 514 and JIT floor(572 * 53/526) = 57 plus the
 		// 1 the flooring leaves.
+		assert_settled(&before, outcome([450, 50, 0, 0], [514, 58, 0, 0], 12, 16));
 		assert_eq!(ActiveSpCapacity::get(), 0);
-		assert_eq!(stable_balance(PUSD, KEEPER), 500 - 50, "the dust residual burned");
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 12 + 58);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 0);
-		assert!(!vault_exists(DOT, PUSD, 1));
-
-		assert_liquidated_event(outcome([450, 50, 0, 0], [514, 58, 0, 0], 12, 16));
 	});
 }
 
@@ -446,6 +407,7 @@ fn jit_executes_at_minimum_ask() {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(400);
 		mint_stable(PUSD, KEEPER, 500);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 1_000, 0));
 
@@ -454,45 +416,31 @@ fn jit_executes_at_minimum_ask() {
 		// standard 584. Of the 572 after the keeper, active takes
 		// floor(572 * 420/525) = 457 and JIT floor(572 * 105/525) = 114 plus the
 		// 1 the flooring leaves.
+		assert_settled(&before, outcome([400, 100, 0, 0], [457, 115, 0, 0], 12, 16));
 		assert_eq!(ActiveSpCapacity::get(), 0);
-		assert_eq!(stable_balance(PUSD, KEEPER), 400);
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT), GENESIS_BALANCE + 457);
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 12 + 115);
-
-		assert_liquidated_event(outcome([400, 100, 0, 0], [457, 115, 0, 0], 12, 16));
 	});
 }
 
-// The slippage floor must protect the keeper's trade without blocking the liquidation: an
-// unmet floor skips the JIT contribution and the waterfall proceeds.
+// The slippage floor must protect the keeper's trade without blocking the liquidation. The
+// protection must not exceed the keeper's request: the exact share is accepted, and one above it
+// drops the trade while the waterfall proceeds without it.
 #[test]
-fn slippage_above_share_skips_jit() {
+fn slippage_floor_binds_at_the_jit_share() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(PUSD, KEEPER, 200);
 
-		// One above the 228 the trade would pay: the trade is dropped, no
-		// stablecoin burns, and the standard full redistribution follows.
+		hypothetically!({
+			let before = ledger();
+			assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 200, 228));
+			// The 540 of value seizes exactly ceil(540/0.9) = 600: no surplus, and
+			// redistribution takes floor(588 * 330/540) = 359 plus the 1 remainder.
+			assert_settled(&before, outcome([0, 200, 0, 300], [0, 228, 0, 360], 12, 0));
+		});
+
+		let before = ledger();
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 200, 229));
-
-		assert_eq!(stable_balance(PUSD, KEEPER), 200, "no JIT burn under the floor");
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 588);
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0));
-	});
-}
-
-// The exact slippage boundary must succeed. The protection must not exceed the keeper's request.
-#[test]
-fn slippage_at_share_accepted() {
-	build_and_execute(|| {
-		setup_underwater_vault();
-		mint_stable(PUSD, KEEPER, 200);
-
-		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 200, 228));
-
-		// The 540 of value seizes exactly ceil(540/0.9) = 600: no surplus, and
-		// redistribution takes floor(588 * 330/540) = 359 plus the 1 remainder.
-		assert_liquidated_event(outcome([0, 200, 0, 300], [0, 228, 0, 360], 12, 0));
+		assert_settled(&before, full_redistribution());
 	});
 }
 
@@ -504,6 +452,7 @@ fn slippage_skip_preserves_pool_settlement() {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(300);
 		mint_stable(PUSD, KEEPER, 500);
+		let before = ledger();
 
 		// The same split as `jit_burns_after_active_pool` would pay the JIT
 		// 229 of collateral, so a 230 floor drops the trade and its 200 debt
@@ -515,45 +464,8 @@ fn slippage_skip_preserves_pool_settlement() {
 		// left after the keeper, active takes floor(583 * 315/535) = 343 and
 		// redistribution floor(583 * 220/535) = 239 plus the 1 the flooring
 		// leaves.
+		assert_settled(&before, outcome([300, 0, 0, 200], [343, 0, 0, 240], 12, 5));
 		assert_eq!(ActiveSpCapacity::get(), 0, "the active leg settled");
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT), GENESIS_BALANCE + 343);
-		assert_eq!(stable_balance(PUSD, KEEPER), 500, "no JIT burn under the floor");
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 12);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 240);
-		assert!(!vault_exists(DOT, PUSD, 1));
-
-		assert_liquidated_event(outcome([300, 0, 0, 200], [343, 0, 0, 240], 12, 5));
-	});
-}
-
-// An allowance does not reserve stablecoin. Thus, an unfunded keeper must not block fallback
-// redistribution.
-#[test]
-fn jit_skipped_for_unfunded_keeper() {
-	build_and_execute(|| {
-		setup_underwater_vault();
-
-		// The keeper holds no stablecoin, so the 200 allowance quietly resolves
-		// to no JIT rather than a failed withdrawal, and the standard full
-		// redistribution follows.
-		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 200, 0));
-
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 588);
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0));
-	});
-}
-
-// Slippage protects an executed JIT trade only. It must not block liquidation when no trade occurs.
-#[test]
-fn slippage_floor_inert_without_trade() {
-	build_and_execute(|| {
-		setup_underwater_vault();
-
-		// A 1_000 floor is unsatisfiable against the 600 of collateral held,
-		// but the unfunded keeper executes no JIT trade and the floor applies
-		// only to one — the liquidation settles regardless.
-		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 200, 1_000));
-		assert!(!vault_exists(DOT, PUSD, 1));
 	});
 }
 
@@ -585,6 +497,7 @@ fn safety_mode_allows_liquidation() {
 		assert_ok!(open(1, DOT, PUSD, 600, 500, FixedU128::from_rational(1, 1_000)));
 		assert_ok!(open(2, DOT, PUSD, 800, 500, FixedU128::from_rational(2, 1_000)));
 		set_price(DOT, FixedU128::from_rational(9, 10));
+		let before = ledger();
 
 		// The tighter vault 2 pulls branch TCR to (540 + 720) / 1_000 = 1.26,
 		// below the 1.30 safety threshold, while staying healthy itself at
@@ -592,7 +505,7 @@ fn safety_mode_allows_liquidation() {
 		assert_eq!(branch_mode(DOT, PUSD), Some(BranchMode::Safety));
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 588], 12, 0));
+		assert_settled(&before, full_redistribution());
 	});
 }
 
@@ -606,14 +519,14 @@ fn branch_below_par_still_liquidates() {
 		assert_ok!(open(2, DOT, PUSD, 600, 500, FixedU128::from_rational(2, 1_000)));
 		// Both vaults sit at CR 600 * 0.8 / 500 = 0.96, so branch TCR is 0.96.
 		set_price(DOT, FixedU128::from_rational(4, 5));
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		// The 10%-penalty ask ceil(550/0.8) = 688 exceeds the vault's collateral:
 		// the whole 600 is seized, the keeper takes ceil(10/0.8) = 13, and the
 		// remaining 587 follows the 500 of redistributed debt.
-		assert!(!vault_exists(DOT, PUSD, 1));
-		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 587], 13, 0));
+		assert_settled(&before, outcome([0, 0, 0, 500], [0, 0, 0, 587], 13, 0));
 
 		// The sole recipient must receive the complete redistributed debt and collateral.
 		assert_ok!(poke(KEEPER, DOT, PUSD, 2));
@@ -631,54 +544,42 @@ fn branch_below_par_still_liquidates() {
 	});
 }
 
-// Liquidation must reject an unknown market before it can change protocol state.
+// Liquidation must reject an unknown market, a missing vault, and an unavailable oracle before it
+// can change protocol state.
 #[test]
-fn unknown_market_rejected() {
+fn preconditions_rejected_without_side_effects() {
 	build_and_execute(|| {
-		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0), crate::Error::<Test>::BranchNotFound);
-	});
-}
-
-// Market existence must not hide that the target vault does not exist.
-#[test]
-fn missing_vault_rejected() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, liquidation_branch_config());
+		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0), Error::<Test>::BranchNotFound);
 
 		// The market exists but account 1 never opened a vault on it.
-		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0), crate::Error::<Test>::VaultNotFound);
-	});
-}
+		register_branch(DOT, PUSD, liquidation_branch_config());
+		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0), Error::<Test>::VaultNotFound);
 
-// Liquidation must stop when the protocol cannot value collateral safely.
-#[test]
-fn oracle_outage_halts_liquidation() {
-	build_and_execute(|| {
-		setup_underwater_vault();
+		assert_ok!(open(1, DOT, PUSD, 600, 500, FixedU128::from_rational(1, 1_000)));
+		assert_ok!(open(2, DOT, PUSD, 2_000, 500, FixedU128::from_rational(2, 1_000)));
+		set_price(DOT, FixedU128::from_rational(9, 10));
 		MockOracleAvailable::set(false);
-
 		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0), Error::<Test>::OraclePriceNotAvailable);
 	});
 }
 
-// A branch administrator must be able to update liquidation policy for that branch.
+// Liquidation policy is branch governance state: only that branch's administrator may change it,
+// and authority on one market must not create policy for an unregistered one.
 #[test]
-fn admin_updates_config() {
+fn config_update_requires_the_branch_admin() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, liquidation_branch_config());
+		let update = BranchConfigUpdate::OffsetPenalty(Permill::from_percent(10));
 
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			BranchConfigUpdate::OffsetPenalty(Permill::from_percent(10))
-		));
+		assert_noop!(set_liquidation_param(1, update.clone()), Error::<Test>::NotBranchAdmin);
+		assert_noop!(
+			Vaults::set_param(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD, update.clone()),
+			Error::<Test>::BranchNotFound
+		);
 
+		assert_ok!(set_liquidation_param(ADMIN, update));
 		assert_eq!(
-			crate::Branches::<Test>::get(DOT, PUSD)
-				.expect("registered market")
-				.config
-				.liquidation,
+			liquidation_config(),
 			LiquidationConfig {
 				offset_penalty: Permill::from_percent(10),
 				..liquidation_branch_config().liquidation
@@ -687,65 +588,50 @@ fn admin_updates_config() {
 	});
 }
 
-// Liquidation policy is branch governance state, so an ordinary account must not change it.
+// The offset penalty must not exceed the redistribution penalty, on creation and on either
+// update: a higher value would invert the borrower-loss order. Equality is valid because it
+// does not.
 #[test]
-fn non_admin_config_update_rejected() {
+fn penalty_order_enforced_on_create_and_update() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, liquidation_branch_config());
-
+		let mut config = liquidation_branch_config();
+		config.liquidation.redistribution_penalty = Permill::from_percent(4);
+		set_price(DOT, FixedU128::from_rational(5, 4));
 		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(1),
+			Vaults::create_branch(
+				RuntimeOrigin::root(),
 				DOT,
 				PUSD,
-				BranchConfigUpdate::OffsetPenalty(Permill::from_percent(10))
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				config,
+				(),
 			),
-			crate::Error::<Test>::NotBranchAdmin
-		);
-	});
-}
-
-// Authority on one market must not create liquidation policy for an unregistered market.
-#[test]
-fn unknown_market_config_update_rejected() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, liquidation_branch_config());
-
-		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				TOKEN_X,
-				PUSD,
-				BranchConfigUpdate::OffsetPenalty(Permill::from_percent(10))
-			),
-			crate::Error::<Test>::BranchNotFound
-		);
-	});
-}
-
-// The offset penalty must not exceed the redistribution penalty. A higher value would invert the
-// borrower-loss order.
-#[test]
-fn offset_penalty_above_redistribution_rejected() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, liquidation_branch_config());
-		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				BranchConfigUpdate::OffsetPenalty(Permill::from_percent(11))
-			),
-			crate::Error::<Test>::InvalidBranchConfig(
+			Error::<Test>::InvalidBranchConfig(
 				BranchConfigDefect::OffsetPenaltyAboveRedistribution
 			)
 		);
 
-		// Equality is valid because it does not invert the borrower-loss order.
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
+		register_branch(DOT, PUSD, liquidation_branch_config());
+		assert_noop!(
+			set_liquidation_param(
+				ADMIN,
+				BranchConfigUpdate::OffsetPenalty(Permill::from_percent(11))
+			),
+			Error::<Test>::InvalidBranchConfig(
+				BranchConfigDefect::OffsetPenaltyAboveRedistribution
+			)
+		);
+		assert_noop!(
+			set_liquidation_param(
+				ADMIN,
+				BranchConfigUpdate::RedistributionPenalty(Permill::from_percent(4))
+			),
+			Error::<Test>::InvalidBranchConfig(
+				BranchConfigDefect::OffsetPenaltyAboveRedistribution
+			)
+		);
+		assert_ok!(set_liquidation_param(
+			ADMIN,
 			BranchConfigUpdate::OffsetPenalty(Permill::from_percent(10))
 		));
 	});
@@ -761,50 +647,33 @@ fn keeper_compensation_above_the_penalty_rejected() {
 		// The mock's smallest vault owes 200 at a 5% offset penalty, so a liquidation seizes
 		// 210 and leaves exactly 10 spare.
 		register_branch(DOT, PUSD, liquidation_branch_config());
+		let exceeds_penalty = || {
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::KeeperCompensationExceedsPenalty)
+		};
 
 		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				BranchConfigUpdate::KeeperFlatCompensationValue(11)
-			),
-			crate::Error::<Test>::InvalidBranchConfig(
-				BranchConfigDefect::KeeperCompensationExceedsPenalty
-			)
+			set_liquidation_param(ADMIN, BranchConfigUpdate::KeeperFlatCompensationValue(11)),
+			exceeds_penalty()
 		);
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
+		assert_ok!(set_liquidation_param(
+			ADMIN,
 			BranchConfigUpdate::KeeperFlatCompensationValue(10)
 		));
 
 		// A liquidation pays the capped sum, so a cap inside the penalty is what the keeper
 		// collects and the fee above it is unreachable.
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
+		assert_ok!(set_liquidation_param(
+			ADMIN,
 			BranchConfigUpdate::KeeperCompensationCapValue(10)
 		));
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
+		assert_ok!(set_liquidation_param(
+			ADMIN,
 			BranchConfigUpdate::KeeperFlatCompensationValue(11)
 		));
 		// The cap is the amount that gets paid, so it must fit the penalty itself.
 		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				BranchConfigUpdate::KeeperCompensationCapValue(11)
-			),
-			crate::Error::<Test>::InvalidBranchConfig(
-				BranchConfigDefect::KeeperCompensationExceedsPenalty
-			)
+			set_liquidation_param(ADMIN, BranchConfigUpdate::KeeperCompensationCapValue(11)),
+			exceeds_penalty()
 		);
 	});
 }
@@ -816,89 +685,29 @@ fn keeper_compensation_above_the_penalty_rejected() {
 fn keeper_percentage_above_the_penalty_rate_rejected() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, liquidation_branch_config());
+		let percent = |numerator: u32| {
+			BranchConfigUpdate::KeeperPercentCompensation(Permill::from_rational(
+				numerator,
+				1_000_000u32,
+			))
+		};
+		let exceeds_penalty =
+			|| Error::<Test>::InvalidBranchConfig(BranchConfigDefect::KeeperPercentExceedsPenalty);
 		// Price the rate on its own, with no flat fee competing for the same penalty.
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
+		assert_ok!(set_liquidation_param(
+			ADMIN,
 			BranchConfigUpdate::KeeperFlatCompensationValue(0)
 		));
 
 		// A seizure is 1 + 5% per unit of debt and 5% of it is spare, so the rate that exactly
 		// exhausts the penalty is 5/105 = 4.7619%.
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			BranchConfigUpdate::KeeperPercentCompensation(Permill::from_rational(
-				47_619u32,
-				1_000_000u32
-			))
-		));
-		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				BranchConfigUpdate::KeeperPercentCompensation(Permill::from_rational(
-					47_620u32,
-					1_000_000u32
-				))
-			),
-			crate::Error::<Test>::InvalidBranchConfig(
-				BranchConfigDefect::KeeperPercentExceedsPenalty
-			)
-		);
+		assert_ok!(set_liquidation_param(ADMIN, percent(47_619)));
+		assert_noop!(set_liquidation_param(ADMIN, percent(47_620)), exceeds_penalty());
 
 		// 5% of a seizure is past the 5% penalty inside it: on a 2_000 debt the keeper would
 		// take 105 against a 100 penalty. On the 200 the market floors at, the same rate takes
 		// floor(10.5) = 10 out of a 10 penalty and looks payable.
-		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				BranchConfigUpdate::KeeperPercentCompensation(Permill::from_percent(5))
-			),
-			crate::Error::<Test>::InvalidBranchConfig(
-				BranchConfigDefect::KeeperPercentExceedsPenalty
-			)
-		);
-	});
-}
-
-// Governance must not lower the redistribution penalty below the current offset penalty.
-#[test]
-fn redistribution_penalty_below_offset_rejected() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, liquidation_branch_config());
-
-		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				BranchConfigUpdate::RedistributionPenalty(Permill::from_percent(4)),
-			),
-			crate::Error::<Test>::InvalidBranchConfig(
-				BranchConfigDefect::OffsetPenaltyAboveRedistribution
-			)
-		);
-		assert_eq!(
-			crate::Branches::<Test>::get(DOT, PUSD)
-				.expect("registered branch")
-				.config
-				.liquidation
-				.redistribution_penalty,
-			Permill::from_percent(10)
-		);
-
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			BranchConfigUpdate::RedistributionPenalty(Permill::from_percent(5)),
-		));
+		assert_noop!(set_liquidation_param(ADMIN, percent(50_000)), exceeds_penalty());
 	});
 }
 
@@ -909,13 +718,21 @@ fn redistribution_outpays_offsets() {
 	build_and_execute(|| {
 		setup_underwater_vault();
 		ActiveSpCapacity::set(200);
+		let before = ledger();
+
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
-		let sp = collateral_balance(DOT, SP_ACCOUNT) - GENESIS_BALANCE;
-		let redistribution = held(DOT, Vaults::redistribution_account(&DOT, &PUSD));
-		assert_eq!((sp, redistribution), (228, 360));
-
-		assert!(redistribution * 200 > sp * 300);
+		// 200 offset at 5% weighs 210 and 300 redistributed at 10% weighs 330, so
+		// the 540 of value seizes exactly ceil(540/0.9) = 600 and leaves no
+		// surplus. Of the 588 left after the keeper, active takes
+		// floor(588 * 210/540) = 228 and redistribution floor(588 * 330/540) = 359
+		// plus the 1 the flooring leaves: 1.14 against 1.20 of collateral per unit
+		// of debt.
+		assert_settled(&before, outcome([200, 0, 0, 300], [228, 0, 0, 360], 12, 0));
+		let after = ledger();
+		let pool = after.pool - before.pool;
+		let redistribution = after.redistribution - before.redistribution;
+		assert!(redistribution * 200 > pool * 300);
 	});
 }
 
@@ -923,8 +740,8 @@ fn redistribution_outpays_offsets() {
 const UNIT: Balance = 1_000_000;
 
 /// Raises the MCR above 120% so token-scale fixtures become liquidatable after the price change.
-fn token_scale_branch_config() -> crate::BranchConfig<Balance> {
-	crate::BranchConfig {
+fn token_scale_branch_config(liquidation: LiquidationConfig<Balance>) -> BranchConfig<Balance> {
+	BranchConfig {
 		minimum_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
 		initial_collateralization_ratio: FixedU128::from_rational(140u128, 100u128),
 		safety_collateralization_ratio: FixedU128::from_rational(150u128, 100u128),
@@ -933,8 +750,30 @@ fn token_scale_branch_config() -> crate::BranchConfig<Balance> {
 		minimum_debt: 100 * UNIT,
 		// This isolates liquidation because the drawn principal equals debt.
 		upfront_fee_period: 0,
+		liquidation,
 		..liquidation_branch_config()
 	}
+}
+
+/// Opens vault 1 above the 140% ICR at 1 DOT = 4 stablecoin, adds a large recipient vault, then
+/// drops the price to 1 DOT = 2 stablecoin.
+fn setup_token_scale_vault(
+	liquidation: LiquidationConfig<Balance>,
+	collateral: Balance,
+	debt: Balance,
+) {
+	register_branch(DOT, PUSD, token_scale_branch_config(liquidation));
+	set_price(DOT, FixedU128::from_rational(4, 1));
+	assert_ok!(open(1, DOT, PUSD, collateral, debt, FixedU128::from_rational(1, 1_000)));
+	assert_ok!(open(
+		2,
+		DOT,
+		PUSD,
+		100_000 * UNIT,
+		1_000 * UNIT,
+		FixedU128::from_rational(2, 1_000)
+	));
+	set_price(DOT, FixedU128::from_rational(2, 1));
 }
 
 // The complete waterfall must preserve relative path allocation and collateral when keeper
@@ -942,8 +781,7 @@ fn token_scale_branch_config() -> crate::BranchConfig<Balance> {
 #[test]
 fn four_way_split() {
 	build_and_execute(|| {
-		let mut config = token_scale_branch_config();
-		config.liquidation = LiquidationConfig {
+		let liquidation = LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			keeper_flat_compensation_value: 0,
 			keeper_percent_compensation: Permill::zero(),
@@ -951,35 +789,12 @@ fn four_way_split() {
 			minimum_jit_contribution: 100,
 			redistribution_penalty: Permill::from_percent(10),
 		};
-		register_branch(DOT, PUSD, config);
-
-		// Open above the 140% ICR, then drop to 1 DOT = 2 stablecoin.
-		set_price(DOT, FixedU128::from_rational(4, 1));
 		// 1_000 of stablecoin debt against 600 DOT.
-		assert_ok!(open(
-			1,
-			DOT,
-			PUSD,
-			600 * UNIT,
-			1_000 * UNIT,
-			FixedU128::from_rational(1, 1_000)
-		));
-		// A second vault to receive the redistributed share.
-		assert_ok!(open(
-			2,
-			DOT,
-			PUSD,
-			100_000 * UNIT,
-			1_000 * UNIT,
-			FixedU128::from_rational(2, 1_000)
-		));
-		set_price(DOT, FixedU128::from_rational(2, 1));
-
+		setup_token_scale_vault(liquidation, 600 * UNIT, 1_000 * UNIT);
 		ActiveSpCapacity::set(500 * UNIT);
 		PendingSpCapacity::set(100 * UNIT);
 		mint_stable(PUSD, KEEPER, 200 * UNIT);
-		let sp_before = collateral_balance(DOT, SP_ACCOUNT);
-		let owner_before = collateral_balance(DOT, 1);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 200 * UNIT, 0));
 
@@ -989,18 +804,15 @@ fn four_way_split() {
 		// 1_060/2 = 530 DOT and leaves the owner 70. With no keeper cut the
 		// whole 530 is allocated: 262.5 / 105 / 52.5 / 110, which sums back to
 		// 530 exactly — no rounding remainder to assign.
-		assert_eq!(collateral_balance(DOT, 1) - owner_before, 70 * UNIT + VAULT_DEPOSIT);
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT) - sp_before, 262_500_000 + 52_500_000);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 110 * UNIT);
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 105 * UNIT);
-		assert_eq!(stable_balance(PUSD, KEEPER), 0);
-
-		assert_liquidated_event(outcome(
-			[500 * UNIT, 200 * UNIT, 100 * UNIT, 200 * UNIT],
-			[262_500_000, 105 * UNIT, 52_500_000, 110 * UNIT],
-			0,
-			70 * UNIT,
-		));
+		assert_settled(
+			&before,
+			outcome(
+				[500 * UNIT, 200 * UNIT, 100 * UNIT, 200 * UNIT],
+				[262_500_000, 105 * UNIT, 52_500_000, 110 * UNIT],
+				0,
+				70 * UNIT,
+			),
+		);
 	});
 }
 
@@ -1009,8 +821,7 @@ fn four_way_split() {
 #[test]
 fn full_offset_with_keeper_compensation() {
 	build_and_execute(|| {
-		let mut config = token_scale_branch_config();
-		config.liquidation = LiquidationConfig {
+		let liquidation = LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			keeper_flat_compensation_value: 2 * UNIT,
 			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
@@ -1018,32 +829,11 @@ fn full_offset_with_keeper_compensation() {
 			minimum_jit_contribution: 100,
 			redistribution_penalty: Permill::from_percent(10),
 		};
-		register_branch(DOT, PUSD, config);
-
-		set_price(DOT, FixedU128::from_rational(4, 1));
 		// 10_000 of stablecoin debt against 6_000 DOT.
-		assert_ok!(open(
-			1,
-			DOT,
-			PUSD,
-			6_000 * UNIT,
-			10_000 * UNIT,
-			FixedU128::from_rational(1, 1_000)
-		));
-		assert_ok!(open(
-			2,
-			DOT,
-			PUSD,
-			100_000 * UNIT,
-			1_000 * UNIT,
-			FixedU128::from_rational(2, 1_000)
-		));
-		set_price(DOT, FixedU128::from_rational(2, 1));
-
+		setup_token_scale_vault(liquidation, 6_000 * UNIT, 10_000 * UNIT);
 		// 20_000 of active deposits, twice what the debt needs.
 		ActiveSpCapacity::set(20_000 * UNIT);
-		let sp_before = collateral_balance(DOT, SP_ACCOUNT);
-		let owner_before = collateral_balance(DOT, 1);
+		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
@@ -1051,16 +841,9 @@ fn full_offset_with_keeper_compensation() {
 		// vault holds 6_000, leaving the owner 750. The keeper takes
 		// 2/2 = 1 DOT flat plus 0.1% of 5_250 = 5.25 DOT, and the pool takes
 		// the remaining 5_243.75 DOT for the whole 10_000 of debt.
-		assert_eq!(collateral_balance(DOT, 1) - owner_before, 750 * UNIT + VAULT_DEPOSIT);
-		assert_eq!(collateral_balance(DOT, KEEPER), GENESIS_BALANCE + 6_250_000);
-		assert_eq!(collateral_balance(DOT, SP_ACCOUNT) - sp_before, 5_243_750_000);
-		assert_eq!(held(DOT, Vaults::redistribution_account(&DOT, &PUSD)), 0);
-
-		assert_liquidated_event(outcome(
-			[10_000 * UNIT, 0, 0, 0],
-			[5_243_750_000, 0, 0, 0],
-			6_250_000,
-			750 * UNIT,
-		));
+		assert_settled(
+			&before,
+			outcome([10_000 * UNIT, 0, 0, 0], [5_243_750_000, 0, 0, 0], 6_250_000, 750 * UNIT),
+		);
 	});
 }
