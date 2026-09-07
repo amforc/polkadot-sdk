@@ -854,7 +854,7 @@ pub fn enter_final_recovery(
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
-) -> DispatchResult {
+) -> DispatchResultWithPostInfo {
 	Vaults::enter_final_recovery(RuntimeOrigin::signed(keeper), collateral, stable, owner)
 }
 

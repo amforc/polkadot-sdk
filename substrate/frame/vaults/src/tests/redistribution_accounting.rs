@@ -10,7 +10,7 @@
 use crate::{
 	mock::*,
 	pallet::Vaults,
-	tests::{rate_pct, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{liquidation_outcome, rate_pct, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 };
 
 /// `floor(x * rate)` for the recipient-rate assertions.
@@ -352,15 +352,7 @@ fn liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
 		let owner_before = collateral_balance(DOT, 1);
 		assert_ok!(liquidate(999, DOT, PUSD, 1, 0, 0));
 
-		let outcome = System::events()
-			.into_iter()
-			.find_map(|record| match record.event {
-				RuntimeEvent::Vaults(crate::Event::VaultLiquidated { outcome, .. }) => {
-					Some(outcome)
-				},
-				_ => None,
-			})
-			.expect("liquidation event");
+		let outcome = liquidation_outcome();
 		assert_eq!(
 			collateral_balance(DOT, SP_ACCOUNT) - pool_before,
 			outcome.active_pool.collateral
@@ -657,15 +649,7 @@ fn full_lifecycle_holds_branch_identities() {
 		mint_stable(PUSD, 8, 200);
 		assert_ok!(liquidate(8, DOT, PUSD, 1, 200, 0));
 		assert_identities();
-		let outcome = System::events()
-			.into_iter()
-			.find_map(|record| match record.event {
-				RuntimeEvent::Vaults(crate::Event::VaultLiquidated { outcome, .. }) => {
-					Some(outcome)
-				},
-				_ => None,
-			})
-			.expect("liquidation event");
+		let outcome = liquidation_outcome();
 		assert_ne!(outcome.active_pool.debt, 0);
 		assert_ne!(outcome.keeper_jit.debt, 0);
 		assert_ne!(outcome.redistribution.debt, 0);

@@ -5,10 +5,11 @@
 //! The token-scale tests verify the same formulas with economically realistic amounts.
 
 use crate::{
-	mock::*, types::BranchConfigUpdate, BranchConfig, BranchMode, DebtCollateral, Error, Event,
-	LiquidationConfig, LiquidationOutcome,
+	mock::*,
+	tests::{assert_event, ONE_YEAR_MS},
+	types::BranchConfigUpdate,
+	BranchConfig, BranchMode, DebtCollateral, Error, Event, LiquidationConfig, LiquidationOutcome,
 };
-use pusd_primitives::MILLIS_PER_YEAR;
 
 fn liquidation_branch_config() -> BranchConfig<Balance> {
 	let mut config = crate::mock::default_branch_config();
@@ -51,16 +52,13 @@ fn outcome(
 
 /// Fixes the common market and actors so each test can focus on its outcome.
 fn assert_liquidated_event(outcome: LiquidationOutcome<Balance>) {
-	System::assert_has_event(
-		Event::<Test>::VaultLiquidated {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			keeper: KEEPER,
-			outcome,
-		}
-		.into(),
-	);
+	assert_event(Event::VaultLiquidated {
+		collateral_id: DOT,
+		stable_id: PUSD,
+		owner: 1,
+		keeper: KEEPER,
+		outcome,
+	});
 }
 
 // Branch creation must reject a penalty order that makes redistribution cheaper than an offset.
@@ -157,7 +155,7 @@ fn redistribution_with_collateral_below_debt() {
 		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 585], 15, 0));
 
 		// The recipient must own the complete redistributed shortfall after its touch.
-		assert_ok!(Vaults::poke(RuntimeOrigin::signed(KEEPER), DOT, PUSD, 2));
+		assert_ok!(poke(KEEPER, DOT, PUSD, 2));
 		let vault = vault(DOT, PUSD, 2);
 		assert_eq!(vault.debt.total(), 501 + 500);
 		assert_eq!(vault.collateral, 2_585);
@@ -170,7 +168,7 @@ fn redistribution_with_collateral_below_debt() {
 fn debt_includes_accrued_interest() {
 	build_and_execute(|| {
 		setup_underwater_vault();
-		advance_time(10 * MILLIS_PER_YEAR);
+		advance_time(10 * ONE_YEAR_MS);
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
@@ -618,7 +616,7 @@ fn branch_below_par_still_liquidates() {
 		assert_liquidated_event(outcome([0, 0, 0, 500], [0, 0, 0, 587], 13, 0));
 
 		// The sole recipient must receive the complete redistributed debt and collateral.
-		assert_ok!(Vaults::poke(RuntimeOrigin::signed(KEEPER), DOT, PUSD, 2));
+		assert_ok!(poke(KEEPER, DOT, PUSD, 2));
 		let vault = vault(DOT, PUSD, 2);
 		assert_eq!(vault.debt.total(), 501 + 500);
 		assert_eq!(vault.collateral, 600 + 587);
