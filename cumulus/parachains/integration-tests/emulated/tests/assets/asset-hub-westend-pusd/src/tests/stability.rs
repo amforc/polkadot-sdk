@@ -14,31 +14,16 @@
 // limitations under the License.
 
 use crate::imports::*;
-use asset_hub_westend_runtime::{Stability, Vaults};
-use frame_support::assert_err;
+use asset_hub_westend_runtime::Stability;
+use frame_support::assert_noop;
 use pallet_stability::types::Leg;
-use pallet_vaults::JitTerms;
-use pusd_primitives::VaultStatus;
-
-/// Liquidates without JIT, with a throwaway keeper.
-fn liquidate(owner: &AccountId) {
-	let keeper = acct(0xEE);
-	fund_dot(&keeper, 0);
-	assert_ok!(Vaults::liquidate(
-		RuntimeOrigin::signed(keeper),
-		get_native_id(),
-		get_pusd_id(),
-		owner.clone(),
-		JitTerms { max_stable: 0, min_collateral_out: 0 },
-	));
-}
 
 fn settle_row(who: &AccountId) {
 	assert_ok!(Stability::settle_deposit(
 		RuntimeOrigin::signed(who.clone()),
 		who.clone(),
 		get_native_id(),
-		get_pusd_id(),
+		PUSD_ID,
 	));
 }
 
@@ -52,34 +37,7 @@ fn sums_at(epoch: u32, scale: u32) -> pallet_stability::types::PoolSums {
 }
 
 fn sums_at_leg(leg: Leg, epoch: u32, scale: u32) -> pallet_stability::types::PoolSums {
-	pallet_stability::PoolSumsStore::<Runtime>::get((
-		get_native_id(),
-		get_pusd_id(),
-		leg,
-		epoch,
-		scale,
-	))
-}
-
-fn park_in_final_recovery(owner: &AccountId, collateral: Balance, debt: Balance) {
-	assert_ok!(Vaults::enter_final_recovery(
-		RuntimeOrigin::signed(acct(0xFE)),
-		get_native_id(),
-		get_pusd_id(),
-		owner.clone(),
-	));
-	assert_eq!(
-		Vaults::vault_status(get_native_id(), get_pusd_id(), owner.clone()),
-		Some(VaultStatus::FinalRecovery),
-	);
-	let parked = vault(owner);
-	assert_eq!(parked.collateral, collateral);
-	assert_eq!(parked.debt.total(), debt);
-}
-
-fn deposit_row(who: &AccountId) -> pallet_stability::types::Deposit<Balance> {
-	pallet_stability::Deposits::<Runtime>::get((get_native_id(), get_pusd_id(), who.clone()))
-		.expect("deposit row exists")
+	pallet_stability::PoolSumsStore::<Runtime>::get((get_native_id(), PUSD_ID, leg, epoch, scale))
 }
 
 /// A CR 120% vault holds the FinalRecovery head. An incoming 1,000 pUSD deposit
@@ -95,7 +53,7 @@ fn incoming_deposit_recovery_offset_accepted() {
 		let parked_owner = acct(1);
 		open_vault(&parked_owner, 3_000 * WND, 5_000 * PUSD, FixedU128::zero());
 		feed_price(dot_price(2, 1));
-		park_in_final_recovery(&parked_owner, 3_000 * WND, 5_000 * PUSD);
+		enter_final_recovery(&parked_owner);
 
 		let depositor = acct(2);
 		sp_deposit_pending(&depositor, 1_000 * PUSD);
@@ -132,28 +90,20 @@ fn incoming_deposit_rejected_below_par() {
 		let parked_owner = acct(1);
 		open_vault(&parked_owner, 2_000 * WND, 5_000 * PUSD, FixedU128::zero());
 		feed_price(dot_price(2, 1));
-		park_in_final_recovery(&parked_owner, 2_000 * WND, 5_000 * PUSD);
+		enter_final_recovery(&parked_owner);
 
+		// Nothing burns and no row is created.
 		let depositor = acct(2);
 		mint_pusd(&depositor, 1_000 * PUSD);
-		assert_err!(
+		assert_noop!(
 			Stability::deposit(
 				RuntimeOrigin::signed(depositor.clone()),
 				get_native_id(),
-				get_pusd_id(),
+				PUSD_ID,
 				1_000 * PUSD,
 			),
 			pallet_stability::Error::<Runtime>::RecoveryOffsetBelowPar,
 		);
-
-		// No pUSD burned, no pending deposit created.
-		assert_eq!(pusd_balance(&depositor), 1_000 * PUSD);
-		assert!(pallet_stability::Deposits::<Runtime>::get((
-			get_native_id(),
-			get_pusd_id(),
-			depositor.clone(),
-		))
-		.is_none());
 	});
 }
 
@@ -177,12 +127,12 @@ fn active_pool_recovery_offset_and_realization() {
 		sp_deposit_matured(&small_depositor, 1_000 * PUSD);
 
 		feed_price(dot_price(2, 1));
-		park_in_final_recovery(&parked_owner, 3_000 * WND, 5_000 * PUSD);
+		enter_final_recovery(&parked_owner);
 
 		assert_ok!(Stability::offset_recovery(
 			RuntimeOrigin::signed(acct(0xFE)),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			2_000 * PUSD,
 		));
 
@@ -320,24 +270,13 @@ fn offset_yield_and_depositor_realization() {
 
 		// One year of interest mints 400 pUSD of yield: G += 400 × 0.8 / 8,000 = 0.04.
 		advance_time(31_557_600_000);
-		assert_ok!(Vaults::poke(
-			RuntimeOrigin::signed(acct(0xFE)),
-			get_native_id(),
-			get_pusd_id(),
-			yield_owner.clone(),
-		));
+		poke(&yield_owner);
 		assert_eq!(active_sums().g_yield, FixedU128::from_rational(4, 100));
 
 		// The claims settle the 1,000 pUSD depositor's row: 800 pUSD stay active,
 		// 120 WND and 40 pUSD of yield pay out.
 		claim_collateral_out(&get_native_id(), &small_depositor, 120 * WND);
-		assert_ok!(Stability::claim_yield(
-			RuntimeOrigin::signed(small_depositor.clone()),
-			get_native_id(),
-			get_pusd_id(),
-			None,
-		));
-		assert_eq!(pusd_balance(&small_depositor), 40 * PUSD);
+		claim_yield_out(&small_depositor, 40 * PUSD);
 		assert_eq!(deposit_row(&small_depositor).active_deposit, 800 * PUSD);
 	});
 }
@@ -376,12 +315,7 @@ fn multiple_depositor_cohorts() {
 
 		// Year one: 150 pUSD yield, G = 150 / 1,500 = 0.1.
 		advance_time(31_557_600_000);
-		assert_ok!(Vaults::poke(
-			RuntimeOrigin::signed(acct(0xFE)),
-			get_native_id(),
-			get_pusd_id(),
-			yield_owner.clone(),
-		));
+		poke(&yield_owner);
 		assert_eq!(active_sums().g_yield, FixedU128::from_rational(1, 10));
 
 		// First offset: 600 pUSD / 300 WND. S = 0.2, P = 0.6, total 900.
@@ -397,12 +331,7 @@ fn multiple_depositor_cohorts() {
 
 		// 1.2 more years: 180 pUSD yield, G += 180 × 0.6 / 1,800 = 0.06.
 		advance_time(37_869_120_000);
-		assert_ok!(Vaults::poke(
-			RuntimeOrigin::signed(acct(0xFE)),
-			get_native_id(),
-			get_pusd_id(),
-			yield_owner.clone(),
-		));
+		poke(&yield_owner);
 		assert_eq!(active_sums().g_yield, FixedU128::from_rational(16, 100));
 
 		// Second offset: 900 pUSD / 450 WND. S += 450 × 0.6 / 1,800 = 0.15,
@@ -432,14 +361,7 @@ fn multiple_depositor_cohorts() {
 			(&depositor_3, 450 * PUSD, 225 * WND, 90 * PUSD),
 		] {
 			claim_collateral_out(&get_native_id(), who, collateral);
-			let pusd_before = pusd_balance(who);
-			assert_ok!(Stability::claim_yield(
-				RuntimeOrigin::signed(who.clone()),
-				get_native_id(),
-				get_pusd_id(),
-				None,
-			));
-			assert_eq!(pusd_balance(who) - pusd_before, yield_gain);
+			claim_yield_out(who, yield_gain);
 			assert_eq!(deposit_row(who).active_deposit, compounded);
 		}
 		let state = pool_state();
@@ -515,18 +437,13 @@ fn full_depletion_and_scale_crossing_then_realization() {
 		assert_ok!(Stability::withdraw(
 			RuntimeOrigin::signed(scale_depositor.clone()),
 			get_native_id(),
-			get_pusd_id(),
+			PUSD_ID,
 			floor,
 			None,
 		));
 		assert_eq!(pusd_balance(&scale_depositor), floor);
 		// Claim and withdrawal prune the empty row.
-		assert!(pallet_stability::Deposits::<Runtime>::get((
-			get_native_id(),
-			get_pusd_id(),
-			scale_depositor.clone(),
-		))
-		.is_none());
+		assert!(!deposit_row_exists(&get_native_id(), &scale_depositor));
 		assert_eq!(pool_state().total_active_deposits, 0);
 		// The epoch depositor receives ceil(1,050 pUSD / 3.6) = 291.666666666667 WND.
 		claim_collateral_out(&get_native_id(), &epoch_depositor, 291_666_666_666_667);
@@ -565,12 +482,7 @@ fn full_depletion_and_scale_crossing_then_realization() {
 		// empty and prune, draining all offset collateral.
 		claim_collateral_out(&get_native_id(), &watched_depositor, 360 * WND);
 		claim_collateral_out(&get_native_id(), &other_depositor, 540 * WND);
-		assert!(pallet_stability::Deposits::<Runtime>::get((
-			get_native_id(),
-			get_pusd_id(),
-			watched_depositor.clone(),
-		))
-		.is_none());
+		assert!(!deposit_row_exists(&get_native_id(), &watched_depositor));
 		assert_eq!(pool_state().total_collateral_gains_unclaimed, 0);
 		assert_eq!(native_balance(&pool_account()), 0);
 	});
