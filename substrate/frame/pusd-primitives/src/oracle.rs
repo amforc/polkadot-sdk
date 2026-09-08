@@ -1,8 +1,9 @@
 //! TODO: Oracle trait surface and price conversions.
 
+use crate::math::mul_div;
 use core::marker::PhantomData;
 use frame::{
-	arithmetic::{helpers_128bit::multiply_by_rational_with_rounding, Rounding, Zero},
+	arithmetic::{Rounding, Zero},
 	deps::{
 		frame_support::pallet_prelude::DispatchError,
 		sp_runtime::{ArithmeticError, FixedPointOperand, FixedU128},
@@ -68,14 +69,13 @@ where
 			(Ok(_), Err(reference_error)) => return Err(reference_error),
 		};
 		// Rounding up means a deposit is never undercharged by a sub-unit.
-		let amount = multiply_by_rational_with_rounding(
+		mul_div(
 			balance.unique_saturated_into(),
 			reference_price.into_inner(),
 			asset_price.into_inner(),
 			Rounding::Up,
 		)
-		.ok_or(ArithmeticError::Overflow)?;
-		Balance::try_from(amount).map_err(|_| ArithmeticError::Overflow.into())
+		.ok_or_else(|| ArithmeticError::Overflow.into())
 	}
 }
 
