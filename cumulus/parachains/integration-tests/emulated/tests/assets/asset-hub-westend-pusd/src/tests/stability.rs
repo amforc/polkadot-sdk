@@ -15,7 +15,7 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::Stability;
-use frame_support::assert_noop;
+use frame_support::{assert_noop, hypothetically_ok};
 use pallet_stability::types::Leg;
 
 fn settle_row(who: &AccountId) {
@@ -38,6 +38,56 @@ fn sums_at(epoch: u32, scale: u32) -> pallet_stability::types::PoolSums {
 
 fn sums_at_leg(leg: Leg, epoch: u32, scale: u32) -> pallet_stability::types::PoolSums {
 	pallet_stability::PoolSumsStore::<Runtime>::get((get_native_id(), PUSD_ID, leg, epoch, scale))
+}
+
+/// In Normal mode an active deposit withdraws at once. Once the branch
+/// TCR falls under the 130% safety ratio, a withdrawal needs a prior request
+/// and the 10-minute delay.
+#[test]
+fn safety_mode_gates_withdrawals_behind_a_request_and_the_delay() {
+	AssetHubWestend::execute_with(|| {
+		feed_price(dot_price(4, 1));
+		create_branch(&liquidation_spec());
+		// 6,400 WND against 10,000 pUSD: CR 256% at 4 and 128% at 2, between the
+		// 125% MCR and the 130% SCR.
+		open_vault(&acct(1), 6_400 * WND, 10_000 * PUSD, FixedU128::zero());
+
+		let depositor = acct(2);
+		sp_deposit_matured(&depositor, 1_000 * PUSD);
+		settle_row(&depositor);
+		assert_eq!(deposit_row(&depositor).active_deposit, 1_000 * PUSD);
+
+		let withdraw = |amount: Balance| {
+			Stability::withdraw(
+				RuntimeOrigin::signed(depositor.clone()),
+				get_native_id(),
+				PUSD_ID,
+				amount,
+				None,
+			)
+		};
+		hypothetically_ok!(withdraw(500 * PUSD));
+
+		feed_price(dot_price(2, 1)); // TCR 128% < SCR 130%: Safety mode
+		assert_noop!(
+			withdraw(500 * PUSD),
+			pallet_stability::Error::<Runtime>::WithdrawalRequestMissing
+		);
+		assert_ok!(Stability::request_withdraw(
+			RuntimeOrigin::signed(depositor.clone()),
+			get_native_id(),
+			PUSD_ID,
+			500 * PUSD,
+		));
+		assert_noop!(
+			withdraw(500 * PUSD),
+			pallet_stability::Error::<Runtime>::SafetyWithdrawalDelayActive
+		);
+		advance_time(10 * 60 * 1_000);
+		assert_ok!(withdraw(500 * PUSD));
+		assert_eq!(pusd_balance(&depositor), 500 * PUSD);
+		assert_eq!(deposit_row(&depositor).active_deposit, 500 * PUSD);
+	});
 }
 
 /// A CR 120% vault holds the FinalRecovery head. An incoming 1,000 pUSD deposit
