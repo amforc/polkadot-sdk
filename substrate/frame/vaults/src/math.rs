@@ -6,14 +6,22 @@
 //! Overflow triggers a debug failure and saturates in release.
 
 use frame::{
-	arithmetic::{
-		helpers_128bit::multiply_by_rational_with_rounding, FixedPointNumber, FixedPointOperand,
-		FixedU128, One, Rounding, Zero,
-	},
+	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Rounding, Zero},
 	deps::sp_core::U256,
 	traits::Defensive,
 };
-use pusd_primitives::MILLIS_PER_YEAR;
+use pusd_primitives::{math::mul_div, MILLIS_PER_YEAR};
+
+/// Splits a wide numerator at `denominator` into whole `Balance` units and a
+/// sub-unit residue. `None` when the whole part overflows `Balance`.
+pub(crate) fn split_wide<Balance: FixedPointOperand>(
+	numerator: U256,
+	denominator: u128,
+) -> Option<(Balance, u128)> {
+	let (whole, remainder) = numerator.div_mod(U256::from(denominator));
+	let whole = Balance::try_from(u128::try_from(whole).ok()?).ok()?;
+	Some((whole, remainder.low_u128()))
+}
 
 /// Returns simple interest rounded up.
 ///
@@ -31,9 +39,7 @@ pub fn simple_interest_ceil<Balance: FixedPointOperand>(
 	let p: u128 = principal.unique_saturated_into();
 	let rate_times_delta = rate.into_inner().saturating_mul(u128::from(delta_millis));
 	let denom = FixedU128::DIV.saturating_mul(u128::from(MILLIS_PER_YEAR));
-	multiply_by_rational_with_rounding(p, rate_times_delta, denom, Rounding::Up)
-		.and_then(|raw| Balance::try_from(raw).ok())
-		.defensive_unwrap_or_else(Balance::max_value)
+	mul_div(p, rate_times_delta, denom, Rounding::Up).defensive_unwrap_or_else(Balance::max_value)
 }
 
 /// Returns the market's average rate, rounded up.
@@ -49,8 +55,7 @@ pub fn average_branch_rate<Balance: FixedPointOperand>(
 	}
 	let w: u128 = weighted_sum.unique_saturated_into();
 	let t: u128 = total_ib_debt.unique_saturated_into();
-	let inner = multiply_by_rational_with_rounding(w, FixedU128::DIV, t, Rounding::Up)
-		.defensive_unwrap_or(u128::MAX);
+	let inner = mul_div(w, FixedU128::DIV, t, Rounding::Up).defensive_unwrap_or(u128::MAX);
 	FixedU128::from_inner(inner)
 }
 
@@ -72,17 +77,27 @@ pub fn redistribution_per_stake_with_carry<Balance: FixedPointOperand>(
 	let numerator = U256::from(amount)
 		.checked_mul(U256::from(FixedU128::DIV))?
 		.checked_add(U256::from(carry % total))?;
-	let (quotient, remainder) = numerator.div_mod(U256::from(total));
-	if quotient > U256::from(u128::MAX) {
-		return None;
-	}
-	Some((FixedU128::from_inner(quotient.low_u128()), remainder.low_u128()))
+	let (quotient, remainder) = split_wide::<u128>(numerator, total)?;
+	Some((FixedU128::from_inner(quotient), remainder))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use frame::arithmetic::Saturating;
+
+	#[test]
+	fn wide_splits_preserve_remainders_and_check_the_output_width() {
+		let numerator = U256::from(u64::MAX) * U256::from(3) + U256::from(2);
+		assert_eq!(split_wide::<u64>(numerator, 3), Some((u64::MAX, 2)));
+		assert_eq!(split_wide::<u64>(numerator + U256::one(), 3), None);
+		assert_eq!(split_wide::<u128>(U256::from(u128::MAX) + U256::one(), 1), None);
+		// Redistribution returns a FixedU128 increment, not a Balance-sized quotient.
+		assert_eq!(
+			redistribution_per_stake_with_carry(u64::MAX, 1, 0),
+			Some((FixedU128::from_inner(u128::from(u64::MAX) * FixedU128::DIV), 0)),
+		);
+	}
 
 	#[test]
 	fn simple_interest_ceil_zero_inputs() {

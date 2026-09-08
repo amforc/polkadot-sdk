@@ -1,6 +1,9 @@
 //! Types stored or exposed by the Vaults pallet.
 
-use crate::{math, Millis};
+use crate::{
+	math::{self, split_wide},
+	Millis,
+};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
 	arithmetic::{
@@ -590,19 +593,6 @@ pub struct InterestWeight<Balance> {
 /// `whole * denominator + remainder`: the wide numerator one split limb represents.
 fn join_wide(whole: u128, remainder: u128, denominator: u128) -> U256 {
 	U256::from(whole) * U256::from(denominator) + U256::from(remainder)
-}
-
-/// Splits a wide numerator at `denominator` into whole `Balance` units and a
-/// sub-unit residue. `None` when the whole part overflows `Balance`.
-fn split_wide<Balance: FixedPointOperand>(
-	numerator: U256,
-	denominator: u128,
-) -> Option<(Balance, u128)> {
-	let (whole, remainder) = numerator.div_mod(U256::from(denominator));
-	if whole > U256::from(u128::MAX) {
-		return None;
-	}
-	Some((Balance::try_from(whole.low_u128()).ok()?, remainder.low_u128()))
 }
 
 /// Adds two `(whole, remainder)` limbs at `denominator`, carrying into the whole part.
