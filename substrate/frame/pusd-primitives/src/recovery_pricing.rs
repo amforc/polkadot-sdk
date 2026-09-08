@@ -4,60 +4,14 @@
 //! [`insurance_adjusted`] returns `None` when the vault is outside its pricing regime. A caller
 //! must treat `None` as an error.
 
+pub use crate::math::{collateral_for_value_ceil, collateral_for_value_floor};
 use frame::deps::{
 	frame_support::traits::Defensive,
 	sp_runtime::{
-		helpers_128bit::multiply_by_rational_with_rounding,
 		traits::{CheckedAdd, One, Saturating, Zero},
-		FixedPointNumber, FixedPointOperand, FixedU128, Permill, Rounding,
+		FixedPointNumber, FixedPointOperand, FixedU128, Permill,
 	},
 };
-
-/// Calculates collateral for a stablecoin `value` at `price`.
-///
-/// `price` is the stablecoin value of one collateral unit. The function divides `value` by `price`
-/// and rounds the result in the specified direction.
-///
-/// Public functions select the rounding direction that is correct for each economic action.
-///
-/// Returns `None` if `price` is zero or if the result does not fit in `Balance`.
-fn collateral_for_value<Balance: FixedPointOperand>(
-	value: Balance,
-	price: FixedU128,
-	rounding: Rounding,
-) -> Option<Balance> {
-	multiply_by_rational_with_rounding(
-		value.unique_saturated_into(),
-		FixedU128::DIV,
-		price.into_inner(),
-		rounding,
-	)
-	.and_then(|raw| Balance::try_from(raw).ok())
-}
-
-/// Calculates collateral for `value` at `price` and rounds the result down.
-///
-/// The result is `floor(value / price)`.
-///
-/// Returns `None` if `price` is zero or if the result does not fit in `Balance`.
-pub fn collateral_for_value_floor<Balance: FixedPointOperand>(
-	value: Balance,
-	price: FixedU128,
-) -> Option<Balance> {
-	collateral_for_value(value, price, Rounding::Down)
-}
-
-/// Calculates collateral for `value` at `price` and rounds the result up.
-///
-/// The result is `ceil(value / price)`.
-///
-/// Returns `None` if `price` is zero or if the result does not fit in `Balance`.
-pub fn collateral_for_value_ceil<Balance: FixedPointOperand>(
-	value: Balance,
-	price: FixedU128,
-) -> Option<Balance> {
-	collateral_for_value(value, price, Rounding::Up)
-}
 
 /// Calculates the bonus for a recovery vault with `CR >= 100%`.
 ///
@@ -162,48 +116,6 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn collateral_for_value_floors() {
-		// 100 stablecoin at price 10 → 10 collateral.
-		let price = FixedU128::from_rational(10, 1);
-		assert_eq!(collateral_for_value_floor::<u128>(100, price), Some(10));
-		// 105 stablecoin at price 10 → floor(10.5) = 10.
-		assert_eq!(collateral_for_value_floor::<u128>(105, price), Some(10));
-		// Sub-1.0 price scales up.
-		assert_eq!(
-			collateral_for_value_floor::<u128>(100, FixedU128::from_rational(1, 2)),
-			Some(200)
-		);
-		assert_eq!(collateral_for_value_floor::<u128>(0, FixedU128::one()), Some(0));
-	}
-
-	#[test]
-	fn collateral_for_value_ceils() {
-		// 100 stablecoin at price 10 → exactly 10 collateral.
-		let price = FixedU128::from_rational(10, 1);
-		assert_eq!(collateral_for_value_ceil::<u128>(100, price), Some(10));
-		// 105 stablecoin at price 10 → ceil(10.5) = 11 (the floor variant gives 10).
-		assert_eq!(collateral_for_value_ceil::<u128>(105, price), Some(11));
-		// Sub-1.0 price scales up: 100 / 0.9 = 111.1… → 112.
-		assert_eq!(
-			collateral_for_value_ceil::<u128>(100, FixedU128::from_rational(9, 10)),
-			Some(112)
-		);
-		assert_eq!(collateral_for_value_ceil::<u128>(0, FixedU128::one()), Some(0));
-	}
-
-	#[test]
-	fn collateral_for_value_fails_loudly() {
-		// A zero price cannot size anything, in either rounding direction.
-		assert_eq!(collateral_for_value_floor::<u128>(100, FixedU128::zero()), None);
-		assert_eq!(collateral_for_value_ceil::<u128>(100, FixedU128::zero()), None);
-		// A sub-1.0 price doubles the value past u128::MAX.
-		let half = FixedU128::from_rational(1, 2);
-		assert_eq!(collateral_for_value_floor::<u128>(u128::MAX, half), None);
-		// The result fits u128 but not the caller's narrower Balance.
-		assert_eq!(collateral_for_value_floor::<u64>(u64::MAX, half), None);
-	}
-
-	#[test]
 	fn recovery_bonus_capped_by_penalty_and_buffer() {
 		let penalty = Permill::from_percent(5);
 		let buffer = FixedU128::from_rational(1, 100); // 1%
@@ -237,6 +149,16 @@ mod tests {
 		assert_eq!(recovery_bonus_collateral_out::<u128>(200, bonus, price), Some(21));
 		// A zero price cannot size a payout.
 		assert_eq!(recovery_bonus_collateral_out::<u128>(100, bonus, FixedU128::zero()), None);
+		// Keep the intermediate floor: floor(floor(1 * 1.5) / 1.5) = 0, while a fused
+		// calculation would pay one collateral unit.
+		assert_eq!(
+			recovery_bonus_collateral_out::<u128>(
+				1,
+				FixedU128::from_rational(1, 2),
+				FixedU128::from_rational(3, 2),
+			),
+			Some(0),
+		);
 	}
 
 	#[test]
