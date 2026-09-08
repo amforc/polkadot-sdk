@@ -138,7 +138,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							&stable_id,
 							Leg::Pending,
 							&pending.snapshot,
-						);
+						)
+						.map_err(|_| "pending snapshot has no sums row")?;
 						let realized = crate::math::realize(
 							pending.amount,
 							&pending.snapshot,
@@ -160,7 +161,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							&stable_id,
 							&pending.snapshot,
 							&checkpoint.pending_end,
-						);
+						)
+						.map_err(|_| "checkpoint window has no sums row")?;
 						let phase_one = crate::math::realize(
 							pending.amount,
 							&pending.snapshot,
@@ -183,7 +185,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							&stable_id,
 							Leg::Active,
 							&checkpoint.active_start,
-						);
+						)
+						.map_err(|_| "checkpoint active start has no sums row")?;
 						let phase_two = crate::math::realize(
 							phase_one.compounded,
 							&checkpoint.active_start,
@@ -202,7 +205,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				&stable_id,
 				Leg::Active,
 				&deposit.snapshot,
-			);
+			)
+			.map_err(|_| "deposit snapshot has no sums row")?;
 			let realized = crate::math::realize(
 				deposit.active_deposit,
 				&deposit.snapshot,
@@ -270,16 +274,6 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			if deposit.snapshot.coords.scale > state.coords.scale {
 				return Err("deposit snapshot scale ahead of the pool".into());
 			}
-		}
-		// Realization reads the sums row the snapshot points at, so that row must still exist.
-		if !PoolSumsStore::<T>::contains_key((
-			&collateral_id,
-			&stable_id,
-			Leg::Active,
-			deposit.snapshot.coords.epoch,
-			deposit.snapshot.coords.scale,
-		)) {
-			return Err("deposit snapshot references a pruned sums row".into());
 		}
 
 		let Some(pending) = &deposit.pending_deposit else {

@@ -58,13 +58,20 @@ impl<'a, T: Config> DepositOp<'a, T> {
 		owner: &'a T::AccountId,
 		pool: StabilityPoolOf<T>,
 		stored: Option<DepositOf<T>>,
-	) -> Self {
-		let deposit = stored.unwrap_or_else(|| {
-			let current =
-				Pallet::<T>::sums_at(collateral_id, stable_id, Leg::Active, &pool.state.coords);
-			Deposit::fresh(pool.state.snapshot(Leg::Active, &current))
-		});
-		Self { collateral_id, stable_id, owner, pool, deposit }
+	) -> Result<Self, DispatchError> {
+		let deposit = match stored {
+			Some(deposit) => deposit,
+			None => {
+				let current = Pallet::<T>::sums_at(
+					collateral_id,
+					stable_id,
+					Leg::Active,
+					&pool.state.coords,
+				)?;
+				Deposit::fresh(pool.state.snapshot(Leg::Active, &current))
+			},
+		};
+		Ok(Self { collateral_id, stable_id, owner, pool, deposit })
 	}
 
 	/// Settles the row at `now`. Due cohorts activate first so the settlement uses the current
@@ -185,7 +192,7 @@ impl<'a, T: Config> DepositOp<'a, T> {
 		let deadline = math::cohort_deadline(now, pool.config.entry_delay);
 		let snapshot = {
 			let current =
-				Pallet::<T>::sums_at(self.collateral_id, self.stable_id, Leg::Pending, &live);
+				Pallet::<T>::sums_at(self.collateral_id, self.stable_id, Leg::Pending, &live)?;
 			pool.state.snapshot(Leg::Pending, &current)
 		};
 		let cohort = Pallet::<T>::join_cohort(&mut pool.state, deadline, live)?;
@@ -323,11 +330,12 @@ impl<T: Config> Pallet<T> {
 		// them all: the pending leg ends here, and the active leg starts here.
 		let state = &pool.state;
 		let pending_end = {
-			let sums = Self::sums_at(collateral_id, stable_id, Leg::Pending, &state.pending_coords);
+			let sums =
+				Self::sums_at(collateral_id, stable_id, Leg::Pending, &state.pending_coords)?;
 			state.snapshot(Leg::Pending, &sums)
 		};
 		let active_start = {
-			let sums = Self::sums_at(collateral_id, stable_id, Leg::Active, &state.coords);
+			let sums = Self::sums_at(collateral_id, stable_id, Leg::Active, &state.coords)?;
 			state.snapshot(Leg::Active, &sums)
 		};
 		for roll in rolls {
@@ -368,7 +376,7 @@ impl<T: Config> Pallet<T> {
 
 		let now = T::TimeProvider::now();
 		let stored = Deposits::<T>::get((&collateral_id, &stable_id, &who));
-		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, stored);
+		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, stored)?;
 		op.refresh(now)?;
 
 		// One withdrawal funds both halves: the recovery settlement takes its slice from the
@@ -562,7 +570,7 @@ impl<T: Config> Pallet<T> {
 		}
 		let stored = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
-		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, Some(stored));
+		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, Some(stored))?;
 
 		let now = T::TimeProvider::now();
 		op.refresh(now)?;
@@ -592,7 +600,7 @@ impl<T: Config> Pallet<T> {
 		let pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let stored = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
-		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, Some(stored));
+		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, Some(stored))?;
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 
 		let now = T::TimeProvider::now();
@@ -641,7 +649,7 @@ impl<T: Config> Pallet<T> {
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let stored = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
-		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, Some(stored));
+		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, Some(stored))?;
 
 		op.refresh(T::TimeProvider::now())?;
 
@@ -873,7 +881,7 @@ impl<T: Config> Pallet<T> {
 		debug_assert!(!debt.is_zero());
 		debug_assert!(debt <= total);
 
-		let mut sums = Self::sums_at(collateral_id, stable_id, leg, coords);
+		let mut sums = Self::sums_at(collateral_id, stable_id, leg, coords)?;
 		let delta_s =
 			math::delta_sum(collateral, coords.p, total).ok_or(ArithmeticError::Overflow)?;
 		sums.s_collateral =
@@ -1022,7 +1030,10 @@ impl<T: Config> Pallet<T> {
 		let Some(delta_g) = pool.state.delta_sum(amount) else {
 			return Err(credit);
 		};
-		let mut sums = Self::sums_at(collateral_id, stable_id, Leg::Active, &pool.state.coords);
+		let Ok(mut sums) = Self::sums_at(collateral_id, stable_id, Leg::Active, &pool.state.coords)
+		else {
+			return Err(credit);
+		};
 		let Some(new_g) = sums.g_yield.checked_add(&delta_g) else {
 			return Err(credit);
 		};
@@ -1070,7 +1081,7 @@ impl<T: Config> Pallet<T> {
 		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let stored = Deposits::<T>::get((&collateral_id, &stable_id, &who))
 			.ok_or(Error::<T>::DepositNotFound)?;
-		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, Some(stored));
+		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &who, pool, Some(stored))?;
 
 		op.refresh(T::TimeProvider::now())?;
 
@@ -1119,7 +1130,7 @@ impl<T: Config> Pallet<T> {
 		let pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let stored = Deposits::<T>::get((&collateral_id, &stable_id, &owner))
 			.ok_or(Error::<T>::DepositNotFound)?;
-		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &owner, pool, Some(stored));
+		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &owner, pool, Some(stored))?;
 
 		op.refresh(T::TimeProvider::now())?;
 		op.commit();
@@ -1188,7 +1199,7 @@ impl<T: Config> Pallet<T> {
 			pool,
 			deposit.active_deposit,
 			&deposit.snapshot,
-		);
+		)?;
 		deposit.active_deposit = realized.compounded;
 		deposit.claimable_collateral = deposit
 			.claimable_collateral
@@ -1252,7 +1263,7 @@ impl<T: Config> Pallet<T> {
 			stable_id,
 			&pending.snapshot,
 			&checkpoint.pending_end,
-		);
+		)?;
 		let phase_one = math::realize(
 			pending.amount,
 			&pending.snapshot,
@@ -1270,7 +1281,7 @@ impl<T: Config> Pallet<T> {
 			pool,
 			phase_one.compounded,
 			&checkpoint.active_start,
-		);
+		)?;
 		debug_assert!(deposit.snapshot.coords.p == live.coords.p);
 		deposit.active_deposit = deposit
 			.active_deposit
@@ -1310,7 +1321,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		snapshot: &DepositSnapshot,
 		end: &DepositSnapshot,
-	) -> SumsWindow {
+	) -> Result<SumsWindow, DispatchError> {
 		if snapshot.coords.epoch != end.coords.epoch {
 			// The pending leg was depleted after the join, and every row of the join epoch froze
 			// at that depletion, before the advancement: plain storage reads cover the window.
@@ -1325,7 +1336,7 @@ impl<T: Config> Pallet<T> {
 				Leg::Pending,
 				snapshot.coords.epoch,
 				snapshot.coords.scale,
-			)
+			)?
 		};
 		let mut ahead = [PoolSums::default(); math::SCALE_SPAN as usize];
 		let mut scale = snapshot.coords.scale;
@@ -1337,10 +1348,16 @@ impl<T: Config> Pallet<T> {
 			*slot = if scale == end.coords.scale {
 				end.sums
 			} else {
-				Self::sums_row(collateral_id, stable_id, Leg::Pending, snapshot.coords.epoch, scale)
+				Self::sums_row(
+					collateral_id,
+					stable_id,
+					Leg::Pending,
+					snapshot.coords.epoch,
+					scale,
+				)?
 			};
 		}
-		SumsWindow { snap, ahead }
+		Ok(SumsWindow { snap, ahead })
 	}
 
 	/// Settles one position and its open cohort at the current pending coordinates.
@@ -1371,7 +1388,7 @@ impl<T: Config> Pallet<T> {
 			pool,
 			pending.amount,
 			&pending.snapshot,
-		);
+		)?;
 		debug_assert!(realized.yield_gain.is_zero());
 		deposit.claimable_collateral = deposit
 			.claimable_collateral
@@ -1420,9 +1437,9 @@ impl<T: Config> Pallet<T> {
 		pool: &StabilityPoolOf<T>,
 		amount: BalanceOf<T>,
 		snapshot: &DepositSnapshot,
-	) -> (Realized<BalanceOf<T>>, DepositSnapshot) {
+	) -> Result<(Realized<BalanceOf<T>>, DepositSnapshot), DispatchError> {
 		let coords = pool.state.coords(leg);
-		let current = Self::sums_at(collateral_id, stable_id, leg, coords);
+		let current = Self::sums_at(collateral_id, stable_id, leg, coords)?;
 		// A snapshot already at the live coordinates realizes against the live row alone, because
 		// no row above the live scale can exist. The read for the snapshot reset then covers the
 		// whole window.
@@ -1430,11 +1447,11 @@ impl<T: Config> Pallet<T> {
 			if snapshot.coords.epoch == coords.epoch && snapshot.coords.scale == coords.scale {
 				SumsWindow { snap: current, ahead: Default::default() }
 			} else {
-				Self::sums_window(collateral_id, stable_id, leg, snapshot)
+				Self::sums_window(collateral_id, stable_id, leg, snapshot)?
 			};
 		let realized = math::realize(amount, snapshot, coords, &window, &pool.config.precision);
 		debug_assert!(realized.compounded <= amount);
-		(realized, pool.state.snapshot(leg, &current))
+		Ok((realized, pool.state.snapshot(leg, &current)))
 	}
 
 	/// Validates and stores replacement pool parameters.
@@ -1454,25 +1471,28 @@ impl<T: Config> Pallet<T> {
 
 	/// Returns the sums row of `leg` at `coords`.
 	///
-	/// An absent row returns zero. This conservative result prevents an overpayment.
+	/// Every live or snapshot coordinate has a row: offsets create rows as they advance and no
+	/// path removes one. An absent row is corruption, and the read fails rather than substitute
+	/// zero. Only the look-ahead scans in the window readers may hit absent rows.
 	pub(crate) fn sums_at(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		leg: Leg,
 		coords: &Accumulators,
-	) -> PoolSums {
+	) -> Result<PoolSums, DispatchError> {
 		Self::sums_row(collateral_id, stable_id, leg, coords.epoch, coords.scale)
 	}
 
-	/// Returns a sums row by raw `(epoch, scale)` coordinates.
+	/// Returns a sums row by raw `(epoch, scale)` coordinates. See [`Pallet::sums_at`].
 	fn sums_row(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		leg: Leg,
 		epoch: u32,
 		scale: u32,
-	) -> PoolSums {
-		PoolSumsStore::<T>::get((collateral_id, stable_id, leg, epoch, scale))
+	) -> Result<PoolSums, DispatchError> {
+		PoolSumsStore::<T>::try_get((collateral_id, stable_id, leg, epoch, scale))
+			.map_err(|()| Error::<T>::AccumulatorRowMissing.into())
 	}
 
 	/// Returns the bounded sums window required to settle a snapshot.
@@ -1483,8 +1503,8 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		leg: Leg,
 		snapshot: &DepositSnapshot,
-	) -> SumsWindow {
-		let snap = Self::sums_at(collateral_id, stable_id, leg, &snapshot.coords);
+	) -> Result<SumsWindow, DispatchError> {
+		let snap = Self::sums_at(collateral_id, stable_id, leg, &snapshot.coords)?;
 		let mut ahead = [PoolSums::default(); math::SCALE_SPAN as usize];
 		let mut scale = snapshot.coords.scale;
 		for slot in &mut ahead {
@@ -1500,6 +1520,6 @@ impl<T: Config> Pallet<T> {
 			};
 			*slot = sums;
 		}
-		SumsWindow { snap, ahead }
+		Ok(SumsWindow { snap, ahead })
 	}
 }
