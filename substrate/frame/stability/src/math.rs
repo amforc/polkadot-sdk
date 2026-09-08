@@ -8,13 +8,10 @@
 
 use crate::types::{Accumulators, DepositSnapshot, PUpdate, PoolPrecision, Realized, SumsWindow};
 use frame::{
-	arithmetic::{
-		helpers_128bit::multiply_by_rational_with_rounding, FixedPointOperand, FixedU128, One,
-		Rounding, Saturating, Zero,
-	},
+	arithmetic::{FixedPointOperand, FixedU128, One, Rounding, Saturating, Zero},
 	traits::Defensive,
 };
-use pusd_primitives::Millis;
+use pusd_primitives::{math::mul_div, Millis};
 
 /// Maximum number of `P` rescale operations in one offset.
 ///
@@ -68,7 +65,10 @@ fn compound<Balance: FixedPointOperand>(
 		Some(_) | None => None,
 	};
 	let compounded = match denominator {
-		Some(denominator) => mul_ratio(amount, to.p.into_inner(), denominator, rounding),
+		Some(denominator) => {
+			mul_div(amount.unique_saturated_into(), to.p.into_inner(), denominator, rounding)
+				.defensive_unwrap_or_else(Balance::zero)
+		},
 		None => Balance::zero(),
 	};
 	debug_assert!(compounded <= amount);
@@ -178,7 +178,8 @@ fn gain<Balance: FixedPointOperand>(
 	if delta.is_zero() {
 		return Balance::zero();
 	}
-	mul_ratio(d, delta.into_inner(), p0.into_inner(), Rounding::Down)
+	mul_div(d.unique_saturated_into(), delta.into_inner(), p0.into_inner(), Rounding::Down)
+		.defensive_unwrap_or_else(Balance::zero)
 }
 
 /// Caps a partial offset at the `min_active_pool` floor.
@@ -275,24 +276,6 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 		factor = factor.checked_mul(sf_int)?;
 	}
 	None
-}
-
-/// Returns `value * numerator / denominator` at `Balance` precision with the specified rounding.
-/// Invalid arithmetic returns the conservative fallback used by payout calculations.
-fn mul_ratio<Balance: FixedPointOperand>(
-	value: Balance,
-	numerator: u128,
-	denominator: u128,
-	rounding: Rounding,
-) -> Balance {
-	multiply_by_rational_with_rounding(
-		value.unique_saturated_into(),
-		numerator,
-		denominator,
-		rounding,
-	)
-	.and_then(|raw| Balance::try_from(raw).ok())
-	.defensive_unwrap_or_else(Balance::zero)
 }
 
 #[cfg(test)]
