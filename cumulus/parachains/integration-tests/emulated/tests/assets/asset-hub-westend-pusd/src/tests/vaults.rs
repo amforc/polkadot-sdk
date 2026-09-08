@@ -15,8 +15,8 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
-	governance, pusd_config::VaultsBranchCreationDeposit, Assets, Balances, RuntimeHoldReason,
-	TrustBackedAssetsInstance, Vaults,
+	governance, pusd_config::VaultsBranchCreationDeposit, Assets, Balances, Redemptions,
+	RuntimeHoldReason, Stability, TrustBackedAssetsInstance, Vaults,
 };
 use frame_support::{
 	assert_noop, assert_storage_noop, hypothetically_ok,
@@ -25,6 +25,21 @@ use frame_support::{
 		fungibles::{roles::Inspect as RolesInspect, Refund},
 	},
 };
+use pallet_vaults::{types::BranchAdmins, BranchConfigUpdate};
+use sp_runtime::{DispatchError, TokenError};
+
+/// Opens a 10,000 WND / 10,000 pUSD vault for `owner` without any helper funding.
+fn open_native_vault(owner: &AccountId) -> sp_runtime::DispatchResult {
+	Vaults::open_vault(
+		RuntimeOrigin::signed(owner.clone()),
+		get_native_id(),
+		PUSD_ID,
+		10_000 * WND,
+		10_000 * PUSD,
+		FixedU128::zero(),
+		pallet_linked_list::Position::endpoints_only(),
+	)
+}
 
 /// A stablecoin minimum balance above one unit requires the fee account's
 /// stablecoin account before the first market registers.
@@ -198,6 +213,176 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_eq!(state.vault_count, 2);
 		assert_eq!(state.total_collateral, 13_000 * WND);
 		assert_eq!(state.debt.principal, 12_500 * PUSD);
+	});
+}
+
+/// The emergency admin can pull the freeze but not clear it, a stranger can
+/// change nothing, and Root can do everything. A market with a live vault
+/// cannot be removed. Stablecoin-wide settings belong to the asset owner, not
+/// to branch admins.
+#[test]
+fn branch_admin_levels_gate_freeze_config_and_removal() {
+	AssetHubWestend::execute_with(|| {
+		feed_price(dot_price(2, 1));
+		create_branch(&BranchSpec::default());
+		let full_admin = acct(7);
+		let emergency_admin = acct(8);
+		assert_ok!(Vaults::set_branch_admins(
+			RuntimeOrigin::signed(admin()),
+			get_native_id(),
+			PUSD_ID,
+			BranchAdmins {
+				full_admin: MultiAddress::Id(full_admin.clone()),
+				emergency_admin: MultiAddress::Id(emergency_admin.clone()),
+			},
+		));
+		open_vault(&acct(1), 10_000 * WND, 10_000 * PUSD, FixedU128::zero());
+
+		let stranger = acct(9);
+		assert_noop!(
+			Vaults::set_param(
+				RuntimeOrigin::signed(stranger.clone()),
+				get_native_id(),
+				PUSD_ID,
+				BranchConfigUpdate::MinimumDebt(100 * PUSD),
+			),
+			pallet_vaults::Error::<Runtime>::NotBranchAdmin,
+		);
+		assert_noop!(
+			Vaults::set_branch_admins(
+				RuntimeOrigin::signed(stranger.clone()),
+				get_native_id(),
+				PUSD_ID,
+				branch_admins(),
+			),
+			pallet_vaults::Error::<Runtime>::NotBranchAdmin,
+		);
+		assert_noop!(
+			Vaults::remove_branch(
+				RuntimeOrigin::signed(full_admin.clone()),
+				get_native_id(),
+				PUSD_ID
+			),
+			pallet_vaults::Error::<Runtime>::BranchNotEmpty,
+		);
+
+		let set_frozen = |who: &AccountId, frozen: bool| {
+			Vaults::set_governance_frozen(
+				RuntimeOrigin::signed(who.clone()),
+				get_native_id(),
+				PUSD_ID,
+				frozen,
+			)
+		};
+		assert_noop!(set_frozen(&stranger, true), pallet_vaults::Error::<Runtime>::NotBranchAdmin);
+		assert_ok!(set_frozen(&emergency_admin, true));
+		// The freeze bites: the same open is refused frozen and accepted thawed.
+		let late_owner = acct(2);
+		fund_dot(&late_owner, 10_000 * WND);
+		fund_vault_deposit(&get_native_id(), &late_owner);
+		assert_noop!(open_native_vault(&late_owner), pallet_vaults::Error::<Runtime>::BranchFrozen);
+		assert_noop!(
+			set_frozen(&emergency_admin, false),
+			pallet_vaults::Error::<Runtime>::NotBranchAdmin
+		);
+		hypothetically_ok!(Vaults::set_governance_frozen(
+			RuntimeOrigin::root(),
+			get_native_id(),
+			PUSD_ID,
+			false,
+		));
+		assert_ok!(set_frozen(&full_admin, false));
+		assert_ok!(open_native_vault(&late_owner));
+
+		// The redemption policy takes the stablecoin owner or Root.
+		let redemption_config = pallet_redemptions::RedemptionConfigs::<Runtime>::get(PUSD_ID)
+			.expect("registration stored the redemption policy");
+		assert_noop!(
+			Redemptions::set_redemption_config(
+				RuntimeOrigin::signed(full_admin.clone()),
+				PUSD_ID,
+				redemption_config.clone(),
+			),
+			DispatchError::BadOrigin,
+		);
+		hypothetically_ok!(Redemptions::set_redemption_config(
+			RuntimeOrigin::signed(admin()),
+			PUSD_ID,
+			redemption_config,
+		));
+		// The pool configuration takes the branch full admin or Root.
+		let pool_config = pallet_stability::Pools::<Runtime>::get(get_native_id(), PUSD_ID)
+			.expect("stability pool registered")
+			.config;
+		let set_pool_config = |origin: RuntimeOrigin| {
+			Stability::set_stability_pool_config(
+				origin,
+				get_native_id(),
+				PUSD_ID,
+				pool_config.clone(),
+			)
+		};
+		assert_noop!(
+			set_pool_config(RuntimeOrigin::signed(emergency_admin.clone())),
+			DispatchError::BadOrigin
+		);
+		hypothetically_ok!(set_pool_config(RuntimeOrigin::root()));
+		assert_ok!(set_pool_config(RuntimeOrigin::signed(full_admin.clone())));
+	});
+}
+
+/// A frozen stablecoin asset stops every mint and burn: borrowing, repaying,
+/// and pool deposits all fail, and thawing restores them.
+#[test]
+fn frozen_stablecoin_blocks_borrow_repay_and_pool_deposits() {
+	AssetHubWestend::execute_with(|| {
+		feed_price(dot_price(2, 1));
+		create_branch(&BranchSpec::default());
+		let owner = acct(1);
+		open_vault(&owner, 10_000 * WND, 5_000 * PUSD, FixedU128::zero());
+		let depositor = acct(2);
+		mint_pusd(&depositor, 1_000 * PUSD);
+
+		assert_ok!(Assets::freeze_asset(RuntimeOrigin::signed(admin()), PUSD_ID.into()));
+		let borrow = || {
+			Vaults::borrow(
+				RuntimeOrigin::signed(owner.clone()),
+				get_native_id(),
+				PUSD_ID,
+				1_000 * PUSD,
+				None,
+				None,
+				pallet_linked_list::Position::endpoints_only(),
+			)
+		};
+		let repay = || {
+			Vaults::repay_for(
+				RuntimeOrigin::signed(owner.clone()),
+				get_native_id(),
+				PUSD_ID,
+				owner.clone(),
+				Some(1_000 * PUSD),
+			)
+		};
+		let deposit = || {
+			Stability::deposit(
+				RuntimeOrigin::signed(depositor.clone()),
+				get_native_id(),
+				PUSD_ID,
+				1_000 * PUSD,
+			)
+		};
+		let not_live = || pallet_assets::Error::<Runtime, TrustBackedAssetsInstance>::AssetNotLive;
+		assert_noop!(borrow(), not_live());
+		// A frozen asset reports no reducible balance, so the repayment is short
+		// of funds before the burn ever reaches the status check.
+		assert_noop!(repay(), TokenError::FundsUnavailable);
+		assert_noop!(deposit(), not_live());
+
+		assert_ok!(Assets::thaw_asset(RuntimeOrigin::signed(admin()), PUSD_ID.into()));
+		hypothetically_ok!(borrow());
+		hypothetically_ok!(repay());
+		assert_ok!(deposit());
 	});
 }
 

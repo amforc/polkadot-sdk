@@ -23,13 +23,14 @@ use asset_hub_westend_runtime::{
 };
 use emulated_integration_tests_common::{snowbridge::SEPOLIA_ID, USDT_ID};
 use frame_support::{
-	assert_noop,
+	assert_noop, hypothetically, hypothetically_ok,
 	traits::{
 		fungibles::Refund,
 		tokens::{Fortitude, Preservation, Provenance},
 	},
 };
-use sp_runtime::traits::MaybeEquivalence;
+use pallet_vaults::BranchConfigUpdate;
+use sp_runtime::{traits::MaybeEquivalence, TokenError};
 use xcm::v5::{Junction::GlobalConsensus, Location, NetworkId};
 
 const ETH: Balance = 1_000_000_000_000_000_000;
@@ -106,6 +107,38 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 				0,
 			);
 		}
+
+		// A branch ceiling binds one market only. Lowered to the native market's
+		// 10,000 pUSD of debt, it refuses the next native vault while the USDT
+		// market keeps lending.
+		assert_ok!(Vaults::set_param(
+			RuntimeOrigin::signed(admin()),
+			get_native_id(),
+			PUSD_ID,
+			BranchConfigUpdate::DebtCeiling(10_000 * PUSD),
+		));
+		let late_owner = acct(4);
+		fund_dot(&late_owner, 1_000 * WND);
+		fund_vault_deposit(&get_native_id(), &late_owner);
+		assert_noop!(
+			Vaults::open_vault(
+				RuntimeOrigin::signed(late_owner.clone()),
+				get_native_id(),
+				PUSD_ID,
+				1_000 * WND,
+				1_000 * PUSD,
+				FixedU128::zero(),
+				pallet_linked_list::Position::endpoints_only(),
+			),
+			pallet_vaults::Error::<Runtime>::DebtCeilingExceeded
+		);
+		hypothetically!(open_vault_on(
+			usdt_id(),
+			&late_owner,
+			2_000 * USDT,
+			1_000 * PUSD,
+			FixedU128::zero()
+		));
 	});
 }
 
@@ -350,7 +383,22 @@ fn insufficient_collateral_settles_the_vault_deposit_in_wnd() {
 		let (_, native_deposit) = expected_vault_deposit(&get_native_id(), &owner);
 		assert!(deposit > native_deposit);
 
-		open_vault_on(reservable_id(), &owner, 10_000 * WND, 10_000 * PUSD, FixedU128::zero());
+		// The collateral alone cannot pay a WND-settled deposit.
+		fund_collateral(&reservable_id(), &owner, 10_000 * WND);
+		let open = || {
+			Vaults::open_vault(
+				RuntimeOrigin::signed(owner.clone()),
+				reservable_id(),
+				PUSD_ID,
+				10_000 * WND,
+				10_000 * PUSD,
+				FixedU128::zero(),
+				pallet_linked_list::Position::endpoints_only(),
+			)
+		};
+		assert_noop!(open(), TokenError::FundsUnavailable);
+		fund_vault_deposit(&reservable_id(), &owner);
+		assert_ok!(open());
 		assert_eq!(vault_deposit_on_hold(&get_native_id(), &owner), deposit);
 		assert_eq!(vault_deposit_on_hold(&reservable_id(), &owner), 0);
 	});
@@ -379,5 +427,17 @@ fn unpriceable_sufficient_collateral_cannot_open_a_vault() {
 			),
 			sp_runtime::DispatchError::Unavailable
 		);
+		// The same open succeeds once the deposit can be priced.
+		feed_price(dot_price(2, 1));
+		fund_vault_deposit(&usdt_id(), &owner);
+		hypothetically_ok!(Vaults::open_vault(
+			RuntimeOrigin::signed(owner.clone()),
+			usdt_id(),
+			PUSD_ID,
+			20_000 * USDT,
+			10_000 * PUSD,
+			FixedU128::zero(),
+			pallet_linked_list::Position::endpoints_only(),
+		));
 	});
 }
