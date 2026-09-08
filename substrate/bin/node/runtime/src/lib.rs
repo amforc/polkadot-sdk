@@ -3271,14 +3271,10 @@ parameter_types! {
 		};
 }
 
-use frame_support::traits::{
-	fungibles::{
-		AssetFootprintPrice, AtLeastMinimumBalance,
-		HoldConsideration as FungiblesHoldConsideration, SufficientAssets,
-	},
-	tokens::FallbackOnUnavailable,
+use frame_support::traits::fungibles::{
+	AssetFootprintPrice, AtLeastMinimumBalance, HoldConsideration as FungiblesHoldConsideration,
+	SufficientAssets,
 };
-use pallet_asset_conversion::PoolQuoteConversion;
 use pallet_vaults::pusd_primitives::OraclePriceConversion;
 
 pub type VaultsCollateralId = NativeOrWithId<u32>;
@@ -3358,18 +3354,14 @@ impl traits::Convert<VaultsStableId, AccountId> for VaultsFeeAccount {
 }
 
 /// Settles a vault deposit in the collateral when it is native or sufficient, else in the native
-/// token; re-prices through the oracle, and through the native/asset pool only when the oracle
-/// has no feed.
+/// token; re-prices through the oracle.
 pub type VaultsDepositPolicy = AssetFootprintPrice<
 	SufficientAssets<VaultsCollateral, AccountId>,
 	VaultsNativeCollateralId,
 	LinearStoragePrice<VaultsVaultDepositBase, VaultsVaultDepositPerByte, Balance>,
 	AtLeastMinimumBalance<
 		VaultsCollateral,
-		FallbackOnUnavailable<
-			OraclePriceConversion<VaultsOracleAdapter, VaultsNativeCollateralId>,
-			PoolQuoteConversion<AssetConversion, VaultsNativeCollateralId>,
-		>,
+		OraclePriceConversion<VaultsOracleAdapter, VaultsNativeCollateralId>,
 		AccountId,
 	>,
 >;
