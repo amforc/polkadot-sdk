@@ -7,9 +7,8 @@
 pub use crate::math::{collateral_for_value_ceil, collateral_for_value_floor};
 use crate::mul_div_floor;
 use frame::deps::sp_runtime::{
-	helpers_128bit::multiply_by_rational_with_rounding,
 	traits::{CheckedAdd, One, Saturating},
-	FixedPointNumber, FixedPointOperand, FixedU128, Permill, Rounding,
+	FixedPointNumber, FixedPointOperand, FixedU128, Permill,
 };
 
 /// Calculates the stablecoin value of `collateral` at `price` and rounds the result up.
@@ -19,18 +18,7 @@ use frame::deps::sp_runtime::{
 /// actually short and the redeemer never pays less than the collateral is worth.
 ///
 /// Returns `None` if the result does not fit in `Balance`.
-pub fn collateral_value_ceil<Balance: FixedPointOperand>(
-	collateral: Balance,
-	price: FixedU128,
-) -> Option<Balance> {
-	multiply_by_rational_with_rounding(
-		collateral.unique_saturated_into(),
-		price.into_inner(),
-		FixedU128::DIV,
-		Rounding::Up,
-	)
-	.and_then(|raw| Balance::try_from(raw).ok())
-}
+pub use crate::math::mul_rate_ceil as collateral_value_ceil;
 
 /// Calculates the bonus for a recovery vault with `CR >= 100%`.
 ///

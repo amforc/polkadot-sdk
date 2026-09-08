@@ -22,8 +22,8 @@ use frame::{
 	},
 };
 use pusd_primitives::{
-	recovery_pricing, reducible_debit, CollateralRatio, ProvidePrice, RedemptionSettlement,
-	VaultInterface,
+	math::collateral_for_value_floor, reducible_debit, CollateralRatio, ProvidePrice,
+	RedemptionSettlement, VaultInterface,
 };
 
 /// Inputs shared by ordinary and recovery redemptions.
@@ -335,7 +335,7 @@ impl<T: Config> Pallet<T> {
 			return Step::Stop;
 		}
 		// A failed face-value conversion cannot price this or any later target.
-		let Some(collateral) = recovery_pricing::collateral_for_value_floor(debt, price) else {
+		let Some(collateral) = collateral_for_value_floor(debt, price) else {
 			return Step::Stop;
 		};
 		Step::Redeem { debt, collateral: collateral.min(snapshot.collateral) }
