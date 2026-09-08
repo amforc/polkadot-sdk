@@ -35,7 +35,7 @@ use frame::{
 	},
 };
 use pusd_primitives::{
-	mul_div_floor, recovery_pricing::collateral_for_value_ceil, reducible_debit, OffsetLegs,
+	math::collateral_for_value_ceil, mul_div_floor, reducible_debit, OffsetLegs,
 	StabilityPoolInspect, StabilityPoolOffset,
 };
 
