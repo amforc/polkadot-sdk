@@ -2,11 +2,11 @@ use crate::types::{Millis, RedemptionConfig, RedemptionState};
 use frame::deps::{
 	frame_support::traits::Defensive,
 	sp_runtime::{
-		helpers_128bit::multiply_by_rational_with_rounding,
 		traits::{CheckedAdd, CheckedDiv, One, Saturating, Zero},
-		ArithmeticError, FixedPointNumber, FixedPointOperand, FixedU128, Permill, Rounding,
+		ArithmeticError, FixedPointNumber, FixedPointOperand, FixedU128, Permill,
 	},
 };
+use pusd_primitives::math::mul_rate_ceil;
 
 /// One half in the fixed-point domain of the dynamic fee.
 const HALF: FixedU128 = FixedU128::from_rational(1, 2);
@@ -190,8 +190,7 @@ pub fn redemption_fee<Balance: FixedPointOperand>(
 	if debt_cancelled.is_zero() || fee_rate.is_zero() {
 		return Balance::zero();
 	}
-	let a: u128 = debt_cancelled.unique_saturated_into();
-	mul_ratio_or(a, fee_rate.into_inner(), FixedU128::DIV, Rounding::Up, Balance::max_value)
+	mul_rate_ceil(debt_cancelled, fee_rate).defensive_unwrap_or_else(Balance::max_value)
 }
 
 /// Calculates the maximum debt that `budget` can buy, including the fee.
@@ -240,22 +239,6 @@ pub fn scale_floor<Balance: FixedPointOperand>(
 		return Balance::zero();
 	}
 	pusd_primitives::mul_div_floor(value, num, denom).defensive_unwrap_or_else(Balance::max_value)
-}
-
-/// Calculates `a * num / denom` at `Balance` precision with the specified rounding.
-///
-/// The function uses the defensive fallback if the product cannot have a `Balance`
-/// representation.
-fn mul_ratio_or<Balance: FixedPointOperand>(
-	a: u128,
-	num: u128,
-	denom: u128,
-	rounding: Rounding,
-	fallback: fn() -> Balance,
-) -> Balance {
-	multiply_by_rational_with_rounding(a, num, denom, rounding)
-		.and_then(|raw| Balance::try_from(raw).ok())
-		.defensive_unwrap_or_else(fallback)
 }
 
 #[cfg(test)]
@@ -658,7 +641,9 @@ mod tests {
 	/// precision and one unit for upward fee rounding.
 	mod properties {
 		use super::*;
-		use frame::arithmetic::SignedRounding;
+		use frame::arithmetic::{
+			helpers_128bit::multiply_by_rational_with_rounding, Rounding, SignedRounding,
+		};
 		use proptest::prelude::*;
 
 		/// Maximum difference, in inner `FixedU128` units, between two evaluations of the same
