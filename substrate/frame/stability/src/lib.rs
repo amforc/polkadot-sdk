@@ -472,6 +472,8 @@ pub mod pallet {
 		AccumulatorParamsImmutable,
 		/// The pool still has deposit rows. Remove all user positions before market removal.
 		PoolNotEmpty,
+		/// A sums row required by the pool's accumulator coordinates is absent.
+		AccumulatorRowMissing,
 	}
 
 	#[pallet::hooks]

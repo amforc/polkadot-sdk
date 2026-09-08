@@ -1025,7 +1025,8 @@ pub fn realized_pending(collateral: AssetId, stable: StableId, who: AccountId) -
 		.expect("pool registered")
 		.config;
 	let realize = || {
-		let window = Stability::sums_window(&collateral, &stable, Leg::Pending, &pending.snapshot);
+		let window = Stability::sums_window(&collateral, &stable, Leg::Pending, &pending.snapshot)
+			.expect("pending snapshot row exists");
 		crate::math::realize(
 			pending.amount,
 			&pending.snapshot,
