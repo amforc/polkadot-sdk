@@ -14,7 +14,8 @@
 // limitations under the License.
 
 use crate::imports::*;
-use asset_hub_westend_runtime::{governance::TreasuryAccount, Vaults};
+use asset_hub_westend_runtime::{governance::TreasuryAccount, Redemptions, Vaults};
+use frame_support::assert_noop;
 use pallet_redemptions::{RedemptionStates, RedemptionTerms};
 use pusd_primitives::VaultStatus;
 
@@ -32,21 +33,36 @@ fn ordinary_redemption_updates_the_dynamic_fee_and_charges_the_mean() {
 		open_vault(&target_owner, 4_000 * WND, 5_000 * PUSD, FixedU128::zero());
 		// The filler brings market debt to 100,000 pUSD. Its higher rate keeps the
 		// target at the redeemable head.
-		let filler_owner = acct(2);
-		open_vault(&filler_owner, 100_000 * WND, 95_000 * PUSD, FixedU128::from_rational(1, 100));
+		open_vault(&acct(2), 100_000 * WND, 95_000 * PUSD, FixedU128::from_rational(1, 100));
 
 		set_dynamic_fee(FixedU128::from_rational(15, 1_000)); // decayed dynamic_fee = 1.5%
 
 		let treasury_pusd_before = pusd_balance(&TreasuryAccount::get());
 		// fee = 1,000 * 2.25% = 22.5 pUSD.
 		let fee = 45 * PUSD / 2;
-		let collateral_out = redeem(
-			&acct(3),
-			RedemptionTerms {
-				max_stable_to_spend: 1_000 * PUSD + fee,
-				min_collateral_out: 500 * WND,
-			},
+		let redeemer = acct(3);
+		fund_dot(&redeemer, 0);
+		mint_pusd(&redeemer, 1_000 * PUSD + fee + PUSD_MIN_BALANCE);
+		let native_before = native_balance(&redeemer);
+		let redeem_with = |min_collateral_out: Balance| {
+			Redemptions::redeem(
+				RuntimeOrigin::signed(redeemer.clone()),
+				get_native_id(),
+				PUSD_ID,
+				RedemptionTerms { max_stable_to_spend: 1_000 * PUSD + fee, min_collateral_out },
+				redeemer.clone(),
+				16,
+			)
+		};
+		// A floor one planck above the payout rolls back the entire settlement.
+		assert_noop!(
+			redeem_with(500 * WND + 1),
+			pallet_redemptions::Error::<Runtime>::SlippageExceeded
 		);
+		// The exact floor passes and preserves only the stablecoin minimum balance.
+		assert_ok!(redeem_with(500 * WND));
+		assert_eq!(pusd_balance(&redeemer), PUSD_MIN_BALANCE);
+		let collateral_out = native_balance(&redeemer) - native_before;
 
 		// new dynamic_fee = 1.5% + 0.5% = 2.0%.
 		let state = RedemptionStates::<Runtime>::get(PUSD_ID);

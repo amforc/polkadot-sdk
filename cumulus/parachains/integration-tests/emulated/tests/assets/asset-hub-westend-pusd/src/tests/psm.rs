@@ -123,6 +123,21 @@ fn psm_debt_consumes_and_releases_vault_headroom() {
 			borrow(150 * PUSD),
 			pallet_vaults::Error::<Runtime>::GlobalDebtCeilingExceeded
 		);
+		hypothetically_ok!(borrow(PUSD));
+
+		// A stored ceiling below the live PSM debt leaves vaults no headroom at
+		// all. Existing debt stays where it is, and repayment is never gated.
+		lift_global_ceiling(200 * PUSD);
+		assert_noop!(borrow(PUSD), pallet_vaults::Error::<Runtime>::GlobalDebtCeilingExceeded);
+		assert_eq!(vault(&owner).debt.principal, 600 * PUSD);
+		hypothetically_ok!(Vaults::repay_for(
+			RuntimeOrigin::signed(owner.clone()),
+			get_native_id(),
+			PUSD_ID,
+			owner.clone(),
+			Some(100 * PUSD),
+		));
+		lift_global_ceiling(1_000 * PUSD);
 
 		// Redeeming the PSM debt returns its headroom to vault borrowers at
 		// once: the identical borrow now fits.

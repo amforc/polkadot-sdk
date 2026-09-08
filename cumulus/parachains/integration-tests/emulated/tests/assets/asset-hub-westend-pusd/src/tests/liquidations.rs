@@ -15,6 +15,7 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::Vaults;
+use frame_support::hypothetically;
 use pallet_vaults::JitTerms;
 
 /// Seizure caps at debt × 1.05 in value. The keeper takes 2 pUSD flat plus 0.1%
@@ -96,13 +97,26 @@ fn liquidation_splits_across_active_jit_pending_and_redistribution() {
 		let keeper = keeper();
 		// JIT allowance = 200 pUSD, plus 1 pUSD so the burn does not empty the account.
 		mint_pusd(&keeper, 201 * PUSD);
-		assert_ok!(Vaults::liquidate(
-			RuntimeOrigin::signed(keeper.clone()),
-			get_native_id(),
-			PUSD_ID,
-			liquidated_owner.clone(),
-			JitTerms { max_stable: 200 * PUSD, min_collateral_out: 0 },
-		));
+		let liquidate_with = |jit: JitTerms<Balance>| {
+			Vaults::liquidate(
+				RuntimeOrigin::signed(keeper.clone()),
+				get_native_id(),
+				PUSD_ID,
+				liquidated_owner.clone(),
+				jit,
+			)
+		};
+		// A JIT floor above the 105 WND the slice pays skips the JIT leg instead
+		// of failing the liquidation: the keeper burns nothing, the vault still goes.
+		hypothetically!({
+			assert_ok!(liquidate_with(JitTerms {
+				max_stable: 200 * PUSD,
+				min_collateral_out: 105 * WND + 1,
+			}));
+			assert_eq!(pusd_balance(&keeper), 201 * PUSD);
+			assert_eq!(vault_status(&liquidated_owner), None);
+		});
+		assert_ok!(liquidate_with(JitTerms { max_stable: 200 * PUSD, min_collateral_out: 0 }));
 
 		// total weight = 800 × 1.05 + 200 × 1.10 = 1,060 pUSD, so 530 WND is
 		// seized. The 70 WND surplus returns to the owner, with the vault's storage deposit.
