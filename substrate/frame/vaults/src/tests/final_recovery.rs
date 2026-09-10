@@ -210,6 +210,114 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 }
 
 #[test]
+fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
+	build_and_execute(|| {
+		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
+		register_market_with(DOT, PUSD, FixedU128::from_u32(10), config);
+		assert_ok!(open(1, DOT, PUSD, 1_040, 500, rate_pct(5, 100)));
+		assert_ok!(redeem(DOT, PUSD, 3, 400));
+		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 100);
+		assert_eq!(vault(DOT, PUSD, 1).collateral, 1_000);
+		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, Some(1));
+
+		// Even the last Dormant vault must be strictly below MCR, not merely at it.
+		set_price(DOT, FixedU128::from_rational(11, 100));
+		assert_noop!(
+			enter_final_recovery(KEEPER, DOT, PUSD, 1),
+			crate::Error::<Test>::CollateralizationRatioTooHealthy
+		);
+		set_price(DOT, FixedU128::from_rational(1, 100));
+		assert_noop!(
+			liquidate(KEEPER, DOT, PUSD, 1, 0, 0),
+			crate::Error::<Test>::LastVaultCannotBeLiquidated
+		);
+		assert_ok!(enter_final_recovery(KEEPER, DOT, PUSD, 1));
+
+		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
+		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 100);
+		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, 0);
+		assert_eq!(branch_state(DOT, PUSD).expect("state").stakes.total, 0);
+		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, None);
+		assert_eq!(LinkedList::neighbors(rate_list(DOT, PUSD), 1), None);
+		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), vec![1]);
+		assert_event(crate::Event::VaultStatusChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			old_status: crate::VaultStatus::Dormant,
+			new_status: crate::VaultStatus::FinalRecovery,
+		});
+	});
+}
+
+#[test]
+fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
+	build_and_execute(|| {
+		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
+		register_market_with(DOT, PUSD, FixedU128::from_u32(10), config);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(repay(2, DOT, PUSD, 2, None));
+		assert_ok!(redeem(DOT, PUSD, 3, 400));
+		set_price(DOT, low_recovery_price());
+
+		// A debt-free husk still counts as another stake bearer.
+		assert_noop!(
+			enter_final_recovery(KEEPER, DOT, PUSD, 1),
+			crate::Error::<Test>::NotLastEligibleVault
+		);
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
+		assert!(!vault_exists(DOT, PUSD, 1));
+		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, None);
+		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+	});
+}
+
+// The reward is not held back to keep the row closable: it may take every unit of collateral.
+// The debt-bearing empty row it leaves still repays in full on a frozen branch, and that payoff
+// closes it on the spot since removing an empty row releases no collateral.
+#[test]
+fn exhausting_recovery_reward_leaves_a_row_that_repays_and_closes_while_frozen() {
+	build_and_execute(|| {
+		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
+		register_market_with(DOT, PUSD, FixedU128::from_u32(10), config.clone());
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		let price = FixedU128::from_rational(1, 100);
+		set_price(DOT, price);
+		assert_eq!(
+			crate::liquidation::final_recovery_keeper_reward(
+				1_000,
+				500,
+				price,
+				&config.liquidation
+			),
+			Some(1_000)
+		);
+
+		assert_ok!(enter_final_recovery(KEEPER, DOT, PUSD, 1));
+		assert_entered_event(1, KEEPER, 1_000);
+		assert_eq!(collateral_balance(DOT, KEEPER), 1_000);
+		assert_eq!(vault(DOT, PUSD, 1).collateral, 0);
+		assert_eq!(held(DOT, 1), 0);
+		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 500);
+		let state = branch_state(DOT, PUSD).expect("state");
+		assert_eq!(state.total_collateral, 0);
+		assert_eq!(state.last_final_recovery_entry, Some(Timestamp::get()));
+		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), vec![1]);
+
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
+		assert_ok!(repay(1, DOT, PUSD, 1, None));
+		assert!(!vault_exists(DOT, PUSD, 1));
+		assert_eq!(vault_deposit_held(DOT, 1), 0);
+		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		let state = branch_state(DOT, PUSD).expect("state");
+		assert_eq!(state.vault_count, 0);
+		assert_eq!(state.total_collateral, 0);
+		assert!(state.frozen.is_some());
+	});
+}
+
+#[test]
 fn enter_final_recovery_rejects_non_last_eligible_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
