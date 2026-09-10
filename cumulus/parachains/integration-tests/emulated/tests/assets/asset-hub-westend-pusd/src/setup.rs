@@ -461,6 +461,47 @@ pub(crate) fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId)
 	));
 }
 
+/// Repaid vaults retain stake. With an empty pool, liquidation assigns each 100 pUSD of debt
+/// and 100 WND lazily, without putting either recipient in the redemption slot.
+pub(crate) fn redistributed_husks() -> [AccountId; 2] {
+	feed_price(dot_price(10, 1));
+	create_branch(&BranchSpec {
+		minimum_debt: 200 * PUSD,
+		keeper_flat_compensation_value: 0,
+		keeper_percent_compensation: Permill::zero(),
+		..Default::default()
+	});
+	let owners = [acct(1), acct(2)];
+	for owner in &owners {
+		// The existing redistribution ledger requires non-zero rate-weighted recipient stake.
+		open_vault(owner, 1_000 * WND, 500 * PUSD, FixedU128::from_rational(1, 100));
+		assert_ok!(Vaults::repay_for(
+			RuntimeOrigin::signed(owner.clone()),
+			get_native_id(),
+			PUSD_ID,
+			owner.clone(),
+			None,
+		));
+	}
+	let victim = acct(3);
+	open_vault(&victim, 200 * WND, 200 * PUSD, FixedU128::zero());
+	feed_price(dot_price(1, 1));
+	liquidate(&victim);
+	assert_eq!(branch_state().dormant_redemption_target, None);
+	assert_eq!(branch_state().debt.pending_redistribution_principal, 200 * PUSD);
+	owners
+}
+
+/// Nominates `owner`'s dust vault for the Dormant slot through a throwaway signer.
+pub(crate) fn nominate_dormant(owner: &AccountId) -> DispatchResult {
+	Vaults::nominate_dormant(
+		RuntimeOrigin::signed(acct(0xF0)),
+		get_native_id(),
+		PUSD_ID,
+		owner.clone(),
+	)
+}
+
 /// Funds a fresh `redeemer` with `terms.max_stable_to_spend` plus the stablecoin
 /// minimum balance, redeems on the native market, and returns the collateral
 /// received.
