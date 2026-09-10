@@ -273,11 +273,10 @@ fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 	});
 }
 
-// The reward is not held back to keep the row closable: it may take every unit of collateral.
-// The debt-bearing empty row it leaves still repays in full on a frozen branch, and that payoff
-// closes it on the spot since removing an empty row releases no collateral.
+// A reward that would take every collateral unit is skipped. The vault still enters recovery,
+// keeps its collateral, pays no fee, and leaves the reward cooldown untouched.
 #[test]
-fn exhausting_recovery_reward_leaves_a_row_that_repays_and_closes_while_frozen() {
+fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
 	build_and_execute(|| {
 		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
 		register_market_with(DOT, PUSD, FixedU128::from_u32(10), config.clone());
@@ -294,26 +293,20 @@ fn exhausting_recovery_reward_leaves_a_row_that_repays_and_closes_while_frozen()
 			Some(1_000)
 		);
 
-		assert_ok!(enter_final_recovery(KEEPER, DOT, PUSD, 1));
-		assert_entered_event(1, KEEPER, 1_000);
-		assert_eq!(collateral_balance(DOT, KEEPER), 1_000);
-		assert_eq!(vault(DOT, PUSD, 1).collateral, 0);
-		assert_eq!(held(DOT, 1), 0);
+		let post_info = enter_final_recovery(KEEPER, DOT, PUSD, 1).expect("recovery still enters");
+		assert_eq!(post_info.pays_fee, Pays::No);
+		assert_entered_event(1, KEEPER, 0);
+		assert_eq!(collateral_balance(DOT, KEEPER), 0);
+		assert_eq!(vault(DOT, PUSD, 1).collateral, 1_000);
+		assert_eq!(held(DOT, 1), 1_000);
 		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 500);
+		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, 0);
+		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
 		let state = branch_state(DOT, PUSD).expect("state");
-		assert_eq!(state.total_collateral, 0);
-		assert_eq!(state.last_final_recovery_entry, Some(Timestamp::get()));
+		assert_eq!(state.total_collateral, 1_000);
+		assert_eq!(state.stakes.total, 0);
+		assert_eq!(state.last_final_recovery_entry, None);
 		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), vec![1]);
-
-		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
-		assert_ok!(repay(1, DOT, PUSD, 1, None));
-		assert!(!vault_exists(DOT, PUSD, 1));
-		assert_eq!(vault_deposit_held(DOT, 1), 0);
-		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
-		let state = branch_state(DOT, PUSD).expect("state");
-		assert_eq!(state.vault_count, 0);
-		assert_eq!(state.total_collateral, 0);
-		assert!(state.frozen.is_some());
 	});
 }
 

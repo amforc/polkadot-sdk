@@ -9,8 +9,7 @@
 //! compensation and the JIT share — are dropped the same way when the keeper's account cannot
 //! receive them.
 //!
-//! Final-recovery entry prices its keeper through the same seizure, so resolving an unsafe vault
-//! pays the same whichever path the market leaves open.
+//! Final recovery uses the same reward calculation, but does not always pay it.
 
 use crate::{
 	context::VaultOp,
@@ -578,12 +577,10 @@ fn plan<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	Some(LiquidationPlan { debt, collateral, seized, keeper_reward, owner_surplus })
 }
 
-/// The keeper compensation for moving the last eligible vault into final recovery: what the
-/// liquidation this vault would have had, were it not the last one, pays its keeper.
+/// Quotes the recovery reward as if a Stability Pool covered all debt.
 ///
-/// The whole debt is priced as one pool offset. The real split is unknowable at entry, and
-/// `offset_penalty` is the bound the keeper terms are validated against, so the reward stays
-/// inside what liquidation itself honors.
+/// The debt split is not known at entry. The pool's `offset_penalty` also caps keeper fees.
+/// The caller checks whether to pay the reward.
 pub(crate) fn final_recovery_keeper_reward<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	collateral: Balance,
 	debt: Balance,
