@@ -14,8 +14,9 @@
 // limitations under the License.
 
 use crate::imports::*;
-use asset_hub_westend_runtime::{RuntimeEvent, System, Vaults};
-use pallet_redemptions::{RecoveryRegime, RedemptionTerms};
+use asset_hub_westend_runtime::{Redemptions, RuntimeEvent, System, Vaults};
+use frame_support::assert_noop;
+use pallet_redemptions::{RecoveryOffsetQuote, RecoveryRegime, RedemptionTerms};
 use pusd_primitives::VaultStatus;
 
 /// Opens a vault at a healthy price, halves the price, and puts the vault in the
@@ -216,5 +217,58 @@ fn final_recovery_redemption_below_par_with_full_insurance_cover() {
 		assert_eq!(vault_status(&parked_owner), None);
 		assert_eq!(collateral_on_hold(&get_native_id(), &parked_owner), 0);
 		assert_eq!(branch_state().vault_count, 0);
+	});
+}
+
+#[test]
+fn nominated_last_dormant_can_recover_and_settle_after_becoming_underwater() {
+	AssetHubWestend::execute_with(|| {
+		let [owner, other] = redistributed_husks();
+		assert_ok!(nominate_dormant(&owner));
+		// Repay and exit the other stake bearer while the TCR still permits collateral release.
+		mint_pusd(&other, 100 * PUSD);
+		assert_ok!(Vaults::repay_for(
+			RuntimeOrigin::signed(other.clone()),
+			get_native_id(),
+			PUSD_ID,
+			other.clone(),
+			None,
+		));
+		assert_ok!(Vaults::close_vault(
+			RuntimeOrigin::signed(other),
+			get_native_id(),
+			PUSD_ID,
+			None
+		));
+
+		feed_price(dot_price(1, 20));
+		assert_noop!(
+			Redemptions::preview_redeem(get_native_id(), PUSD_ID, 1_000 * PUSD, 16),
+			pallet_redemptions::Error::<Runtime>::NoRedeemableVault
+		);
+		assert_ok!(
+			Redemptions::preview_recovery_offset(&get_native_id(), &PUSD_ID, 100 * PUSD),
+			RecoveryOffsetQuote::NoTarget
+		);
+		enter_final_recovery(&owner);
+		assert_eq!(branch_state().dormant_redemption_target, None);
+		assert_eq!(branch_state().stakes.total, 0);
+
+		// Recovery offers settlement, not a guarantee of willing demand: with an empty Insurance
+		// Fund this redeemer deliberately pays 100 pUSD for collateral worth only 55 pUSD.
+		assert_eq!(pusd_balance(&insurance_account()), 0);
+		assert_eq!(
+			redeem(
+				&acct(4),
+				RedemptionTerms {
+					max_stable_to_spend: 100 * PUSD,
+					min_collateral_out: 1_100 * WND,
+				},
+			),
+			1_100 * WND
+		);
+		assert_eq!(vault_status(&owner), None);
+		assert_eq!(branch_state().vault_count, 0);
+		assert_eq!(branch_state().debt.outstanding(), 0);
 	});
 }

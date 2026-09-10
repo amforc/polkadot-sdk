@@ -17,7 +17,7 @@ use crate::imports::*;
 use asset_hub_westend_runtime::{governance::TreasuryAccount, Redemptions, Vaults};
 use frame_support::assert_noop;
 use pallet_redemptions::{RedemptionStates, RedemptionTerms};
-use pusd_primitives::VaultStatus;
+use pusd_primitives::{VaultInterface, VaultStatus};
 
 /// 1,000 pUSD against 100,000 pUSD of market debt raises the 1.5% dynamic fee by
 /// 1,000 / 100,000 / 2 = 0.5%. The redemption pays the 1.75% mean of the 1.5%
@@ -279,5 +279,49 @@ fn final_recovery_head_precedes_the_continuation() {
 		assert_eq!(continuation_vault.debt.total(), 100 * PUSD);
 		assert_eq!(continuation_vault.collateral, 160 * WND);
 		assert_eq!(branch_state().dormant_redemption_target, Some(continuation_owner));
+	});
+}
+
+#[test]
+fn redistribution_dust_is_nominated_and_redeemed_one_recipient_at_a_time() {
+	AssetHubWestend::execute_with(|| {
+		let owners = redistributed_husks();
+		assert_eq!(Vaults::next_redemption_target(&get_native_id(), &PUSD_ID, None), None);
+		assert_noop!(
+			Redemptions::preview_redeem(get_native_id(), PUSD_ID, 1_000 * PUSD, 16),
+			pallet_redemptions::Error::<Runtime>::NoRedeemableVault
+		);
+		assert_ok!(nominate_dormant(&owners[0]));
+		assert_noop!(
+			nominate_dormant(&owners[1]),
+			pallet_vaults::Error::<Runtime>::DormantTargetOccupied
+		);
+		assert_eq!(vault(&owners[1]).debt.total(), 0, "failed nomination rolls back its touch");
+
+		for (i, owner) in owners.iter().enumerate() {
+			assert_ok!(nominate_dormant(owner));
+			assert_eq!(vault_status(owner), Some(VaultStatus::Dormant));
+			assert_eq!(vault(owner).debt.total(), 100 * PUSD);
+			assert_eq!(vault(owner).collateral, 1_100 * WND);
+			let quote = Redemptions::preview_redeem(get_native_id(), PUSD_ID, 1_000 * PUSD, 16)
+				.expect("nominated dust is quoted");
+			assert_eq!(quote.debt_cancelled, 100 * PUSD);
+			assert_eq!(quote.collateral_out, 100 * WND);
+			assert_eq!(quote.steps, 1);
+			assert_eq!(
+				redeem(
+					&acct(10 + i as u8),
+					RedemptionTerms {
+						max_stable_to_spend: quote.stable_in(),
+						min_collateral_out: quote.collateral_out,
+					},
+				),
+				100 * WND
+			);
+			assert_eq!(vault(owner).debt.total(), 0);
+			assert_eq!(branch_state().dormant_redemption_target, None);
+		}
+		assert_eq!(branch_state().debt.outstanding(), 0);
+		assert_eq!(Vaults::next_redemption_target(&get_native_id(), &PUSD_ID, None), None);
 	});
 }
