@@ -890,6 +890,16 @@ pub fn activate_dormant(
 	)
 }
 
+/// Calls the permissionless `nominate_dormant` dispatchable.
+pub fn nominate_dormant(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+) -> DispatchResult {
+	Vaults::nominate_dormant(RuntimeOrigin::signed(who), collateral, stable, owner)
+}
+
 /// Removes a vault and records its whole debt as redistribution.
 ///
 /// This bypasses liquidation pricing only for tests concerned with the

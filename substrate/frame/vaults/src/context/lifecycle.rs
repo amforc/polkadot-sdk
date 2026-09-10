@@ -43,6 +43,20 @@ impl<T: Config> VaultOp<T> {
 		self.vault.redemption_snapshot(self.status, &self.ctx.config)
 	}
 
+	/// Exposes a dormant vault's redemption dust without displacing another slot holder.
+	///
+	/// The loaded vault already includes pending redistribution and interest. At or above the
+	/// debt minimum it must be activated instead; below par it needs liquidation or recovery.
+	pub(crate) fn nominate_dormant(&mut self) -> DispatchResult {
+		ensure!(self.status.is_dormant(), Error::<T>::InvalidVaultStatus);
+		let debt = self.vault.debt.total();
+		ensure!(!debt.is_zero(), Error::<T>::DebtNotDust);
+		ensure!(debt < self.ctx.config.minimum_debt, Error::<T>::DebtNotDust);
+		let cr = self.ctx.collateralization_ratio(&self.vault.position())?;
+		ensure!(cr >= FixedU128::one(), Error::<T>::UnsafeCollateralizationRatio);
+		self.sync_dormant_target()
+	}
+
 	/// Moves a dormant vault back to the rate list.
 	pub(crate) fn activate(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
 		ensure!(self.status.is_dormant(), Error::<T>::InvalidVaultStatus);

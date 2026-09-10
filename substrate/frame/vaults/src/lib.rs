@@ -614,6 +614,15 @@ pub mod pallet {
 			/// market's reward cooldown, or when the keeper's account cannot receive it.
 			keeper_reward: BalanceOf<T>,
 		},
+		/// A dormant vault's dust was nominated for redemption.
+		DormantTargetNominated {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Owner of the nominated vault.
+			owner: T::AccountId,
+		},
 	}
 
 	#[pallet::error]
@@ -720,6 +729,8 @@ pub mod pallet {
 		ZeroAmount,
 		/// The vault is below the ratio required to leave final recovery.
 		CollateralizationRatioTooLow,
+		/// Nomination requires non-zero debt below the market minimum.
+		DebtNotDust,
 	}
 
 	#[pallet::hooks]
@@ -1455,6 +1466,28 @@ pub mod pallet {
 		) -> DispatchResult {
 			let keeper = ensure_signed(origin)?;
 			Self::do_liquidate(keeper, collateral_id, stable_id, owner, jit)
+		}
+
+		/// Nominates a dormant vault's dust as the market's redemption target.
+		///
+		/// ## Dispatch Origin
+		///
+		/// May be called by any signed account.
+		///
+		/// After pending redistribution and interest, the vault must have non-zero debt below
+		/// the market minimum and a collateral ratio of at least 100%. The market must be
+		/// unfrozen with a live price. The single Dormant slot must be empty or already held by
+		/// this vault; final recovery retains priority.
+		#[pallet::call_index(20)]
+		#[pallet::weight(T::WeightInfo::nominate_dormant())]
+		pub fn nominate_dormant(
+			origin: OriginFor<T>,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			owner: T::AccountId,
+		) -> DispatchResult {
+			let _ = ensure_signed(origin)?;
+			Self::do_nominate_dormant(owner, collateral_id, stable_id)
 		}
 	}
 

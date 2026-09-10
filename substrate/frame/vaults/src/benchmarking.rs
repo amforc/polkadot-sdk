@@ -714,6 +714,74 @@ mod benchmarks {
 	}
 
 	#[benchmark]
+	fn nominate_dormant() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		let owner: T::AccountId = account("husk", 0, 0);
+		// Two repaid vaults split a liquidation into sub-minimum debt. Leave the allocation
+		// pending so nomination measures the collateral transfer as well as interest minting.
+		for who in [owner.clone(), account("husk", 1, 0)] {
+			fund_collateral::<T>(&asset, &who, balance::<T>(ACCOUNT_FUNDING))?;
+			Pallet::<T>::open_vault(
+				RawOrigin::Signed(who.clone()).into(),
+				asset.clone(),
+				stable::<T>(),
+				balance::<T>(SEED_COLL),
+				balance::<T>(SEED_DEBT),
+				rate(5, 100),
+				Position::endpoints_only(),
+			)?;
+			T::StableAssets::mint_into(stable::<T>(), &who, balance::<T>(SEED_DEBT))?;
+			Pallet::<T>::repay_for(
+				RawOrigin::Signed(who.clone()).into(),
+				asset.clone(),
+				stable::<T>(),
+				who,
+				None,
+			)?;
+		}
+		let victim = funded_account::<T>("victim", &asset)?;
+		Pallet::<T>::open_vault(
+			RawOrigin::Signed(victim.clone()).into(),
+			asset.clone(),
+			stable::<T>(),
+			balance::<T>(RECOVERY_VAULT_COLL),
+			balance::<T>(SEED_DEBT),
+			rate(5, 100),
+			Position::endpoints_only(),
+		)?;
+		T::BenchmarkHelper::set_oracle_price(
+			asset.clone(),
+			FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
+		);
+		let caller: T::AccountId = whitelisted_caller();
+		Pallet::<T>::liquidate(
+			RawOrigin::Signed(caller.clone()).into(),
+			asset.clone(),
+			stable::<T>(),
+			victim,
+			JitTerms {
+				max_stable: BalanceOf::<T>::zero(),
+				min_collateral_out: BalanceOf::<T>::zero(),
+			},
+		)?;
+		T::BenchmarkHelper::advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		let before = Pallet::<T>::vault_of(&asset, &stable::<T>(), &owner)?;
+		assert!(before.debt.total().is_zero());
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone());
+
+		let branch = Pallet::<T>::branch_of(&asset, &stable::<T>())?;
+		let after = Pallet::<T>::vault_of(&asset, &stable::<T>(), &owner)?;
+		assert_eq!(branch.state.dormant_redemption_target, Some(owner));
+		assert!(!after.debt.principal.is_zero());
+		assert!(!after.debt.interest.is_zero());
+		assert!(after.debt.total() < branch.config.minimum_debt);
+		assert!(after.collateral > before.collateral);
+		Ok(())
+	}
+
+	#[benchmark]
 	fn create_branch() -> Result<(), BenchmarkError> {
 		let asset = T::BenchmarkHelper::collateral_asset_id();
 		let config = default_branch_config::<T>();

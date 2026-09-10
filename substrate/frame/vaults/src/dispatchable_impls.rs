@@ -302,6 +302,22 @@ impl<T: Config> Pallet<T> {
 		op.commit(Commit::Exempt)
 	}
 
+	/// Nominates a collateralized dormant vault's dust for redemption. Anyone may call this.
+	pub(crate) fn do_nominate_dormant(
+		owner: T::AccountId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+	) -> DispatchResult {
+		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		op.nominate_dormant()?;
+		Self::deposit_event(Event::DormantTargetNominated {
+			collateral_id: op.collateral_id().clone(),
+			stable_id: op.stable_id().clone(),
+			owner,
+		});
+		op.commit(Commit::Exempt)
+	}
+
 	/// Checks role exclusivity for a new market and counts it against its stablecoin.
 	///
 	/// A stable asset cannot also be collateral, or its issuer could create unbacked collateral.
