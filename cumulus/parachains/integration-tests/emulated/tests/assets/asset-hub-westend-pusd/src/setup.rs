@@ -29,16 +29,19 @@ use frame_support::{assert_noop, assert_storage_noop};
 use pallet_redemptions::RedemptionTerms;
 use pallet_vaults::JitTerms;
 use pusd_primitives::VaultStatus;
+use sp_runtime::DispatchResult;
 
 pub(crate) const WND: Balance = 1_000_000_000_000;
-/// The stablecoin has 6 decimals, the same as the runtime's PSM asset.
-pub(crate) const PUSD: Balance = 1_000_000;
+/// The stablecoin's metadata decimals.
+pub(crate) const PUSD_DECIMALS: u8 = 6;
+/// One whole stablecoin, at [`PUSD_DECIMALS`].
+pub(crate) const PUSD: Balance = 10u128.pow(PUSD_DECIMALS as u32);
 /// 0.01 pUSD. The stablecoin registers with this minimum balance.
 pub(crate) const PUSD_MIN_BALANCE: Balance = PUSD / 100;
 
-/// Trust-backed asset id for pUSD. The runtime names no stablecoin, so the tests
-/// choose one. It must not collide with the assets the emulated genesis creates.
-pub(crate) const PUSD_ID: u32 = 50_000_342;
+/// Trust-backed asset id for the stablecoin: 7873, the id the dotUSD launch
+/// referendum creates on Polkadot Asset Hub.
+pub(crate) const PUSD_ID: u32 = 7873;
 
 /// Stablecoin-wide supply cap that exceeds all scenario debt.
 pub(crate) const SCENARIO_GLOBAL_CEILING: Balance = 1_000_000_000 * PUSD;
@@ -160,6 +163,14 @@ pub(crate) fn create_pusd() {
 		MultiAddress::Id(admin()),
 		true,
 		PUSD_MIN_BALANCE,
+	));
+	assert_ok!(Assets::force_set_metadata(
+		RuntimeOrigin::root(),
+		PUSD_ID.into(),
+		b"dotUSD".to_vec(),
+		b"dotUSD".to_vec(),
+		PUSD_DECIMALS,
+		false,
 	));
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(
 		&governance::TreasuryAccount::get(),
