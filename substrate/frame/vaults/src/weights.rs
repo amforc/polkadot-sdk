@@ -17,6 +17,7 @@ pub trait WeightInfo {
 	fn enter_final_recovery() -> Weight;
 	fn exit_final_recovery() -> Weight;
 	fn activate_dormant() -> Weight;
+	fn nominate_dormant() -> Weight;
 	fn create_branch() -> Weight;
 	fn remove_branch() -> Weight;
 	fn set_param() -> Weight;
@@ -72,6 +73,9 @@ impl WeightInfo for () {
 		Weight::zero()
 	}
 	fn activate_dormant() -> Weight {
+		Weight::zero()
+	}
+	fn nominate_dormant() -> Weight {
 		Weight::zero()
 	}
 	fn create_branch() -> Weight {
