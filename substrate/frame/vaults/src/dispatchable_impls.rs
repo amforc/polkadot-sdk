@@ -212,11 +212,9 @@ impl<T: Config> Pallet<T> {
 			amount: repay,
 		});
 
-		// Close a fully repaid vault when it has no collateral left. The close itself refuses a
-		// frozen branch.
+		// Removing an empty row.
 		if new_total.is_zero() && op.vault().collateral.is_zero() {
-			op.load_price()?;
-			return op.finish_close(&owner, Commit::Checked);
+			return op.finish_close(&owner, Commit::Exempt);
 		}
 
 		op.reconcile_after_debt_reduction()?;
@@ -247,7 +245,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		recipient: Option<T::AccountId>,
 	) -> DispatchResult {
-		let op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		let op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		let recipient = recipient.unwrap_or(owner);
 
 		op.finish_close(&recipient, Commit::Checked)

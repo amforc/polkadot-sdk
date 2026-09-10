@@ -209,11 +209,16 @@ impl<T: Config> VaultOp<T> {
 		recipient: &T::AccountId,
 		commit: Commit,
 	) -> DispatchResult {
-		// A close is a lifecycle exit that the freeze holds back, whatever its reason. Only the
-		// frozen-tolerant repayment path can reach here on a frozen branch.
-		self.ctx.ensure_not_frozen()?;
-		ensure!(self.vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 		let collateral = self.vault.collateral;
+		// Only collateral-releasing exits need an unfrozen branch and a price. Empty-row
+		// cleanup cannot worsen collateralization.
+		if !collateral.is_zero() {
+			self.ctx.ensure_not_frozen()?;
+			if matches!(commit, Commit::Checked) {
+				self.ctx.load_price()?;
+			}
+		}
+		ensure!(self.vault.debt.total().is_zero(), Error::<T>::DebtOutstanding);
 		self.detach(collateral)?;
 		let branch_empties = self.ctx.state.is_empty_of_liability();
 		if branch_empties {
@@ -247,7 +252,9 @@ impl<T: Config> VaultOp<T> {
 		});
 		// An empty branch has no collateralization ratio to protect.
 		match commit {
-			Commit::Checked if !branch_empties => self.ctx.ensure_mode_rules()?,
+			Commit::Checked if !collateral.is_zero() && !branch_empties => {
+				self.ctx.ensure_mode_rules()?
+			},
 			Commit::Checked | Commit::Exempt => {},
 		}
 		self.persist(true)

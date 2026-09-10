@@ -1083,8 +1083,9 @@ pub mod pallet {
 		///
 		/// Any account may repay for a vault owner. `None` settles the full payoff at execution.
 		/// A `Some` amount must be non-zero and cannot leave only the terminal charge unpaid.
-		/// Repayment is allowed during final recovery, where a full payoff leaves a debt-free
-		/// dormant vault, and while the market is frozen, where it may not close the vault.
+		/// Repayment is allowed during final recovery, while frozen, and without a live price.
+		/// A full payoff closes a vault with no collateral, including while frozen or without a
+		/// live price. A vault with remaining collateral becomes debt-free and dormant.
 		#[pallet::call_index(4)]
 		#[pallet::weight(T::WeightInfo::repay_for())]
 		pub fn repay_for(
