@@ -349,30 +349,55 @@ fn frozen_branch_accepts_full_repayment_that_leaves_a_husk() {
 			),
 			"the husk left the rate index"
 		);
-		assert!(vault_exists(DOT, PUSD, 1), "a frozen branch never closes a row");
+		assert!(vault_exists(DOT, PUSD, 1), "a frozen branch retains collateral");
+		assert_noop!(close_vault(1, DOT, PUSD, None), crate::Error::<Test>::BranchFrozen);
 	});
 }
 
-// Closing a vault is a lifecycle exit the freeze must hold back, whatever the freeze reason. The
-// only repayment that closes is one on a vault that already lost all its collateral.
+// Empty-row cleanup remains available under either freeze reason and before an oracle
+// failure has been persisted as a freeze.
 #[test]
-fn frozen_branch_rejects_repayment_that_would_close_the_vault() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		// Drain the collateral through a settlement that keeps the debt above the minimum, leaving
-		// a debt-bearing row with nothing held.
-		assert_ok!(redeem_step(DOT, PUSD, 1, 7, 200, 1_000));
-		assert_eq!(vault(DOT, PUSD, 1).collateral, 0);
-		freeze_by_governance();
-
-		assert_noop!(repay(1, DOT, PUSD, 1, None), crate::Error::<Test>::BranchFrozen);
-
-		// Once the freeze lifts, the same payoff closes the empty row.
-		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, false));
-		assert_ok!(repay(1, DOT, PUSD, 1, None));
-		assert!(!vault_exists(DOT, PUSD, 1));
-	});
+fn repayment_closes_empty_vault_without_price_or_unfreezing() {
+	for another_vault in [false, true] {
+		for governance_frozen in [false, true] {
+			for oracle_frozen in [false, true] {
+				build_and_execute(|| {
+					register_market(DOT, PUSD);
+					assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+					// Exercise both the last-vault and nonempty-branch cleanup paths.
+					if another_vault {
+						assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+					}
+					assert_ok!(redeem_step(DOT, PUSD, 1, 7, 200, 1_000));
+					assert_eq!(vault(DOT, PUSD, 1).collateral, 0);
+					if governance_frozen {
+						freeze_by_governance();
+					}
+					MockOracleAvailable::set(false);
+					if oracle_frozen {
+						assert_ok!(crate::Pallet::<Test>::refresh_branch(
+							RuntimeOrigin::signed(99),
+							DOT,
+							PUSD
+						));
+					}
+					let before = branch_state(DOT, PUSD).expect("state");
+					assert_ok!(repay(1, DOT, PUSD, 1, None));
+					assert!(!vault_exists(DOT, PUSD, 1));
+					assert_eq!(vault_deposit_held(DOT, 1), 0);
+					assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
+						&rate_list(DOT, PUSD),
+						&1
+					));
+					let after = branch_state(DOT, PUSD).expect("state");
+					assert_eq!(after.vault_count, before.vault_count - 1);
+					assert_eq!(after.total_collateral, before.total_collateral);
+					assert_eq!(after.frozen, before.frozen);
+					assert_eq!(after.dormant_redemption_target, None);
+				});
+			}
+		}
+	}
 }
 
 #[test]
