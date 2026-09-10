@@ -81,11 +81,18 @@ impl<T: Config> VaultOp<T> {
 		keeper: &T::AccountId,
 	) -> Result<BalanceOf<T>, DispatchError> {
 		let price = self.ctx.price()?;
-		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
+		ensure!(
+			self.status.is_active() || self.status.is_dormant(),
+			Error::<T>::InvalidVaultStatus
+		);
 		self.ctx.ensure_below_mcr(&self.vault.position())?;
 		ensure!(self.is_only_stake_bearer(), Error::<T>::NotLastEligibleVault);
 		let reward_due = self.ctx.state.final_recovery_reward_due(&self.ctx.config, self.ctx.now);
-		self.index_remove()?;
+		if self.status.is_active() {
+			self.index_remove()?;
+		} else {
+			self.ctx.state.release_dormant_target(&self.owner);
+		}
 		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
 		self.set_status(VaultStatus::FinalRecovery)?;
 		debug_assert!(self.vault.redistribution_stake.is_zero());
