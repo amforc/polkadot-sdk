@@ -4,6 +4,7 @@ mod basic_ops;
 mod borrower_operations;
 mod critical_threshold;
 mod debt_in_front;
+mod dormant_nomination;
 mod events;
 mod final_recovery;
 mod governance;
