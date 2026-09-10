@@ -18,7 +18,7 @@
 //!
 //! Vaults are ordered by rate for redemptions. Lower-rate vaults are redeemed first. A final
 //! recovery queue is served before the rate list when a market has only one eligible vault left.
-//! Moving that vault into recovery pays the keeper what liquidating it would have paid.
+//! Moving a vault into recovery may pay a keeper reward; see [`Call::enter_final_recovery`].
 //!
 //! A market may enter safety mode when its total collateral ratio is low. It may also be frozen by
 //! an administrator or when its oracle price is unavailable.
@@ -610,8 +610,7 @@ pub mod pallet {
 			owner: T::AccountId,
 			/// Account that moved the vault into final recovery.
 			keeper: T::AccountId,
-			/// Collateral paid to the keeper out of the vault. Zero for a re-entry inside the
-			/// market's reward cooldown, or when the keeper's account cannot receive it.
+			/// Collateral paid from the vault to the keeper.
 			keeper_reward: BalanceOf<T>,
 		},
 		/// A dormant vault's dust was nominated for redemption.
@@ -714,8 +713,6 @@ pub mod pallet {
 		/// A redemption supplied invalid debt or collateral amounts.
 		InvalidRedemptionSettlement,
 		/// The last eligible vault cannot be liquidated.
-		///
-		/// Move it into final recovery instead; that call pays the same keeper compensation.
 		LastVaultCannotBeLiquidated,
 		/// The liquidation would overflow redistribution accounting.
 		RedistributionWouldOverflow,
@@ -1190,7 +1187,7 @@ pub mod pallet {
 		/// May be called by any signed account.
 		///
 		/// The vault must be the market's last eligible vault and must be below the minimum
-		/// collateral ratio.
+		/// collateral ratio. Pays the liquidation reward unless the cooldown is active.
 		#[pallet::call_index(8)]
 		#[pallet::weight(T::WeightInfo::enter_final_recovery())]
 		pub fn enter_final_recovery(
@@ -1433,7 +1430,7 @@ pub mod pallet {
 		///
 		/// The vault must be below the market's minimum collateralization ratio and must not be
 		/// the market's last eligible vault. That vault enters final recovery through
-		/// [`Call::enter_final_recovery`] for the same compensation.
+		/// [`Call::enter_final_recovery`] instead.
 		///
 		/// Active Stability Pool capital is used first, followed by the
 		/// keeper's optional direct contribution, pending pool capital, and

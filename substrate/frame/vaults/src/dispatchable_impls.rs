@@ -251,9 +251,7 @@ impl<T: Config> Pallet<T> {
 		op.finish_close(&recipient, Commit::Checked)
 	}
 
-	/// Moves the last unsafe eligible vault into final recovery and pays the keeper what a
-	/// liquidation of it would have paid. A vault already in final recovery is left untouched,
-	/// at the caller's expense.
+	/// Moves the last unsafe eligible vault into final recovery.
 	pub(crate) fn do_enter_final_recovery(
 		keeper: T::AccountId,
 		owner: T::AccountId,

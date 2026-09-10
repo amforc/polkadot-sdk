@@ -85,11 +85,9 @@ impl<T: Config> VaultOp<T> {
 			.map_err(|e| Pallet::<T>::map_error(e).into())
 	}
 
-	/// Moves an unsafe last eligible vault into final recovery and pays `keeper` what a
-	/// liquidation of it would have paid, out of the vault's collateral.
+	/// Moves the last unsafe eligible vault into final recovery and returns the reward paid.
 	///
-	/// Returns the reward paid. A re-entry inside the market's reward cooldown moves the vault
-	/// but pays nothing. Only a paid entry restarts the cooldown.
+	/// Only a paid reward resets the cooldown.
 	pub(crate) fn enter_final_recovery(
 		&mut self,
 		keeper: &T::AccountId,
@@ -120,9 +118,7 @@ impl<T: Config> VaultOp<T> {
 		Ok(reward)
 	}
 
-	/// Pays the liquidation reward for this vault to `keeper` from its collateral, or nothing
-	/// when the keeper's account cannot take it: an unpaid keeper is preferable to an unsafe
-	/// vault left in the market.
+	/// Pays the keeper unless the reward would take all collateral or the keeper cannot receive it.
 	fn pay_final_recovery_reward(
 		&mut self,
 		keeper: &T::AccountId,
@@ -142,8 +138,8 @@ impl<T: Config> VaultOp<T> {
 		)
 		.ok_or(Error::<T>::ArithmeticOverflow)?;
 		debug_assert!(reward <= self.vault.collateral);
-		if reward.is_zero() {
-			return Ok(reward);
+		if reward.is_zero() || reward >= self.vault.collateral {
+			return Ok(BalanceOf::<T>::zero());
 		}
 		if !Pallet::<T>::keeper_can_be_paid(self.collateral_id(), keeper, reward) {
 			return Ok(BalanceOf::<T>::zero());
