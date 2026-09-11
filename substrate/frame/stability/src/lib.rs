@@ -37,9 +37,15 @@
 //! Claimable yield does not absorb debt or earn more yield. Only the depositor can use
 //! [`Pallet::compound_yield`] to expose it to pool risk again.
 //!
+//! Market interest accrues lazily and is shared out when it is issued. Before a deposit,
+//! withdrawal request, withdrawal, yield claim, or compounding changes the active capital, the
+//! pallet asks
+//! [`Config::BranchInterface`] to issue the interest accrued so far, so it reaches the capital
+//! that earned it.
+//!
 //! ### Operating modes
 //!
-//! [`Config::BranchModes`] reports the operating mode of a market:
+//! [`Config::BranchInterface`] reports the operating mode of a market:
 //!
 //! - `Normal` permits immediate withdrawals.
 //! - `Safety` requires [`Pallet::request_withdraw`] and a `safety_withdrawal_delay`. The delay
@@ -138,7 +144,7 @@ pub mod pallet {
 		},
 		prelude::*,
 	};
-	use pusd_primitives::{BranchModeProvider, Millis, OnBranchLifecycle, RecoveryOffsetInterface};
+	use pusd_primitives::{BranchInterface, Millis, OnBranchLifecycle, RecoveryOffsetInterface};
 
 	/// Balance type shared by the stablecoin and collateral asset systems.
 	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
@@ -207,8 +213,9 @@ pub mod pallet {
 		/// Clock for the entry delay and the Safety-mode withdrawal delay.
 		type TimeProvider: Time<Moment = Millis>;
 
-		/// Authority for the operating mode of each market.
-		type BranchModes: BranchModeProvider<CollateralIdOf<Self>, StableIdOf<Self>>;
+		/// The vault engine: authority for the operating mode of each market, and issuer of its
+		/// pending interest.
+		type BranchInterface: BranchInterface<CollateralIdOf<Self>, StableIdOf<Self>>;
 
 		/// Price policy and settlement interface for vaults in `FinalRecovery`.
 		type RecoveryOffsets: RecoveryOffsetInterface<
@@ -509,6 +516,7 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
+			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_deposit(who, collateral_id, stable_id, amount)
 		}
 
@@ -533,6 +541,7 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
+			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_request_withdraw(who, collateral_id, stable_id, amount)
 		}
 
@@ -562,6 +571,7 @@ pub mod pallet {
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
+			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_withdraw(who, collateral_id, stable_id, amount, recipient)
 		}
 
@@ -609,6 +619,7 @@ pub mod pallet {
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
+			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Yield)
 		}
 
@@ -657,6 +668,7 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
+			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_compound_yield(who, collateral_id, stable_id, amount)
 		}
 
