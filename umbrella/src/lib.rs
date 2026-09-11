@@ -818,6 +818,10 @@ pub use pallet_uniques;
 #[cfg(feature = "pallet-utility")]
 pub use pallet_utility;
 
+/// FRAME vaults pallet.
+#[cfg(feature = "pallet-vaults")]
+pub use pallet_vaults;
+
 /// FRAME verify signature pallet.
 #[cfg(feature = "pallet-verify-signature")]
 pub use pallet_verify_signature;
@@ -1072,6 +1076,10 @@ pub use polkadot_statement_distribution;
 /// Stores messages other authorities issue about candidates in Polkadot.
 #[cfg(feature = "polkadot-statement-table")]
 pub use polkadot_statement_table;
+
+/// Shared primitive types and traits for the pUSD protocol pallets.
+#[cfg(feature = "pusd-primitives")]
+pub use pusd_primitives;
 
 /// Collection of allocator implementations.
 #[cfg(feature = "sc-allocator")]
