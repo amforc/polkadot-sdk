@@ -3525,7 +3525,7 @@ impl pallet_stability::Config for Runtime {
 	type StableAssets = Assets;
 	type CollateralAssets = StabilityCollateral;
 	type TimeProvider = Timestamp;
-	type BranchModes = Vaults;
+	type BranchInterface = Vaults;
 	type RecoveryOffsets = Redemptions;
 	type StableDustHandler = ResolveAssetTo<TreasuryAccount, Assets>;
 	type CollateralDustHandler = ResolveAssetTo<TreasuryAccount, StabilityCollateral>;
