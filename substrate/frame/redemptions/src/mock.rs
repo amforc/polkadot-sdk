@@ -120,7 +120,6 @@ impl pallet_assets_holder::Config for Test {
 
 parameter_types! {
 	pub const MaxHintRepairSteps: u32 = 16;
-	pub const IdleMaxRefreshWeight: Option<Weight> = Some(Weight::MAX);
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
 }
 
@@ -253,7 +252,6 @@ impl pallet_vaults::Config for Test {
 	type GlobalDebtCeiling = pallet_vaults::StoredCeiling<Test>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
-	type IdleMaxRefreshWeight = IdleMaxRefreshWeight;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = VaultsBenchHelper;
