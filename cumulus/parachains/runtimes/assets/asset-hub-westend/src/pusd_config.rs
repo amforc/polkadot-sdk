@@ -124,7 +124,6 @@ impl pallet_linked_list::Config for Runtime {
 
 parameter_types! {
 	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
-	pub const VaultsIdleMaxRefreshWeight: Option<Weight> = None;
 	/// The native token as the collateral namespace names it.
 	pub VaultsNativeCollateralId: VaultsCollateralId = WestendLocation::get();
 	pub const VaultsMarketCreationHoldReason: RuntimeHoldReason =
@@ -296,7 +295,6 @@ impl pallet_vaults::Config for Runtime {
 	type ForceOrigin = EnsureRoot<AccountId>;
 	type GlobalDebtCeiling = VaultsGlobalDebtCeiling;
 	type PalletId = VaultsPalletId;
-	type IdleMaxRefreshWeight = VaultsIdleMaxRefreshWeight;
 	type VaultLists = LinkedList;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
@@ -353,7 +351,7 @@ impl pallet_stability::Config for Runtime {
 	type StableAssets = Assets;
 	type CollateralAssets = StabilityCollateral;
 	type TimeProvider = RelayTimestamp;
-	type BranchModes = Vaults;
+	type BranchInterface = Vaults;
 	type RecoveryOffsets = Redemptions;
 	type StableDustHandler = ResolveAssetTo<governance::TreasuryAccount, Assets>;
 	type CollateralDustHandler = ResolveAssetTo<governance::TreasuryAccount, StabilityCollateral>;
