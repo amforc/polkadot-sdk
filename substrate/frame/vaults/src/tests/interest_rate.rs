@@ -632,3 +632,68 @@ fn poke_cadence_cannot_change_accrued_state() {
 	};
 	assert_eq!(run(&[ONE_DAY_MS; 10]), run(&[10 * ONE_DAY_MS]));
 }
+
+// Two vaults at 50% on 1_000_000 each accrue exactly 1_000_000 of aggregate
+// interest over one year. The refresh issues it to the yield route without
+// writing either vault row, a repeat refresh changes nothing, and the later
+// vault touches attribute from the issued pool instead of minting again.
+#[test]
+fn refresh_branch_issues_pending_aggregate_interest() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
+		assert_ok!(open(2, DOT, PUSD, 1_000_000, 1_000_000, rate_pct(50, 100)));
+		let state_pre = branch_state(DOT, PUSD).unwrap();
+		let vault_1_pre = vault(DOT, PUSD, 1);
+		let vault_2_pre = vault(DOT, PUSD, 2);
+		let fee_pre = stable_balance(PUSD, FEE_DEST);
+		let total_pre = total_stable(PUSD);
+		advance_time(ONE_YEAR_MS);
+		let projected = crate::Pallet::<Test>::accrued_stablecoin_debt(&PUSD);
+
+		assert_ok!(refresh_branch(99, DOT, PUSD));
+
+		let expected: Balance = 1_000_000;
+		let state = branch_state(DOT, PUSD).unwrap();
+		assert_eq!(state.debt.minted_interest - state_pre.debt.minted_interest, expected);
+		assert_eq!(state.debt.pending_interest_attribution, expected);
+		assert_eq!(state.debt.aggregate_interest_remainder, 0);
+		assert_eq!(state.debt.last_interest_time, state.interest_time(Timestamp::get()));
+		assert!(!state.is_frozen());
+		assert_eq!(vault(DOT, PUSD, 1), vault_1_pre, "the refresh writes no vault row");
+		assert_eq!(vault(DOT, PUSD, 2), vault_2_pre, "the refresh writes no vault row");
+
+		// Only the residual after the Stability Pool share increases issuance in this mock.
+		let residual = expected - SpFeeShare::get() * expected;
+		assert_eq!(stable_balance(PUSD, FEE_DEST) - fee_pre, residual);
+		assert_eq!(total_stable(PUSD) - total_pre, residual);
+
+		// The stablecoin-wide projection before the refresh equals the realized aggregate after.
+		let stablecoin_debt = crate::pallet::StablecoinDebt::<Test>::get(PUSD);
+		assert_eq!(stablecoin_debt.outstanding, state.debt.outstanding());
+		assert_eq!(stablecoin_debt.outstanding, projected);
+		assert!(stablecoin_debt.pending_interest.is_zero());
+		assert!(
+			!vault_events()
+				.iter()
+				.any(|event| matches!(event, crate::Event::ModeChanged { .. })),
+			"an unfrozen market's refresh changes no mode"
+		);
+
+		assert_storage_noop!(assert_ok!(refresh_branch(99, DOT, PUSD)));
+
+		let total = total_stable(PUSD);
+		assert_ok!(poke(9, DOT, PUSD, 1));
+		assert_ok!(poke(9, DOT, PUSD, 2));
+		let state = branch_state(DOT, PUSD).unwrap();
+		assert_eq!(state.debt.pending_interest_attribution, 0);
+		assert_eq!(
+			state.debt.minted_interest - state_pre.debt.minted_interest,
+			expected,
+			"pokes attribute, they do not mint"
+		);
+		assert_eq!(vault(DOT, PUSD, 1).debt.interest - vault_1_pre.debt.interest, 500_000);
+		assert_eq!(vault(DOT, PUSD, 2).debt.interest - vault_2_pre.debt.interest, 500_000);
+		assert_eq!(total_stable(PUSD), total, "issuance unchanged by the pokes");
+	});
+}

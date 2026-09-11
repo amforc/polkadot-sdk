@@ -406,7 +406,7 @@ fn refresh_branch_persists_frozen_on_oracle_failure() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		MockOracleAvailable::set(false);
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert_ok!(refresh_branch(99, DOT, PUSD));
 		let state = branch_state(DOT, PUSD).expect("state");
 		let frozen = state.frozen.expect("frozen persisted");
 		assert!(matches!(frozen.reason, crate::FrozenReason::OracleFailure));
@@ -435,26 +435,31 @@ fn refresh_branch_clears_oracle_frozen() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		MockOracleAvailable::set(false);
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert_ok!(refresh_branch(99, DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Oracle still down → second refresh is a no-op (already frozen for
 		// the same reason).
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert_ok!(refresh_branch(99, DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Restore oracle and refresh → unfreezes.
 		MockOracleAvailable::set(true);
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert_ok!(refresh_branch(99, DOT, PUSD));
 		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
 }
 
 #[test]
-fn refresh_branch_does_not_clear_governance_frozen() {
+fn refresh_branch_does_not_clear_governance_frozen_or_mint() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
-		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
+		let before = branch_state(DOT, PUSD).unwrap();
+		advance_time(ONE_DAY_MS);
+		assert_ok!(refresh_branch(99, DOT, PUSD));
+		let after = branch_state(DOT, PUSD).unwrap();
+		assert!(after.is_frozen());
+		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
 	});
 }
 
@@ -480,7 +485,7 @@ fn governance_clear_is_noop_for_oracle_frozen() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		MockOracleAvailable::set(false);
-		assert_ok!(crate::Pallet::<Test>::refresh_branch(RuntimeOrigin::signed(99), DOT, PUSD));
+		assert_ok!(refresh_branch(99, DOT, PUSD));
 		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		// Governance clear refuses oracle-Frozen state — branch stays frozen.
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, false));
