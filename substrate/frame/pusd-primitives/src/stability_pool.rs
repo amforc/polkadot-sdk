@@ -63,9 +63,11 @@ pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit>
 	/// The function returns an error if one equality does not hold. On success, the pool burns the
 	/// specified stablecoin debt. The caller reduces vault debt by the same amounts.
 	///
-	/// TODO: The function consumes the collateral credits even when it returns an error, so it must run
-	/// inside a storage transaction that restores them on rollback. Implementations must reject a
-	/// call outside a transactional layer; annotate them with `#[require_transactional]`.
+	/// Branch registration prepares pool custody for all nonzero collateral credits.
+	///
+	/// The caller must create the collateral credits and execute this operation within the same
+	/// storage transaction, and roll it back if settlement fails. The function consumes the credits
+	/// even when it returns an error.
 	fn offset(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
