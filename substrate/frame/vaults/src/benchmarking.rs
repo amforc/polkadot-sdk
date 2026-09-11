@@ -6,8 +6,8 @@
 
 use crate::{
 	pallet::{
-		AccountIdLookupOf, BalanceOf, BranchIdleCursor, Branches, CollateralIdOf, Config,
-		GlobalDebtCeilings, IdleCursor, Pallet, RegistrationConfigOf, StableIdOf, Vaults,
+		AccountIdLookupOf, BalanceOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings, Pallet,
+		RegistrationConfigOf, StableIdOf, Vaults,
 	},
 	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
 	BenchmarkHelper as _,
@@ -21,7 +21,7 @@ use frame::{
 			Balanced as FungiblesBalanced, Inspect as FungiblesInspect, Mutate as FungiblesMutate,
 		},
 		tokens::Precision,
-		Consideration as _, EnsureOriginWithArg, SaturatedConversion, Time, Zero,
+		Consideration as _, EnsureOriginWithArg, SaturatedConversion, Zero,
 	},
 };
 use frame_system::RawOrigin;
@@ -823,83 +823,6 @@ mod benchmarks {
 		let branch =
 			Branches::<T>::get(&asset, &stable::<T>()).expect("branch present after register");
 		assert!(branch.state.frozen.is_some());
-		Ok(())
-	}
-
-	#[benchmark]
-	fn on_idle_base() -> Result<(), BenchmarkError> {
-		let (asset, owner) = seed_idle_market::<T>()?;
-		BranchIdleCursor::<T>::put((asset.clone(), stable::<T>()));
-		IdleCursor::<T>::put((asset, stable::<T>(), owner));
-
-		// The idle walk's flat cost: both cursors' read/write plus one
-		// terminal `next_key` probe per walk — `idle_walk_pass`'s charging
-		// contract.
-		let branch_probe;
-		let vault_probe;
-		#[block]
-		{
-			let branch_cursor = BranchIdleCursor::<T>::get();
-			let vault_cursor = IdleCursor::<T>::get();
-			branch_probe = Branches::<T>::iter_keys().next();
-			vault_probe = Vaults::<T>::iter_keys().next();
-			BranchIdleCursor::<T>::set(branch_cursor);
-			IdleCursor::<T>::set(vault_cursor);
-		}
-
-		assert!(branch_probe.is_some(), "the probe read the registered branch's key");
-		assert!(vault_probe.is_some(), "the probe read the opened vault's key");
-		assert!(BranchIdleCursor::<T>::get().is_some());
-		Ok(())
-	}
-
-	#[benchmark]
-	fn on_idle_one_branch() -> Result<(), BenchmarkError> {
-		let (asset, _owner) = seed_idle_market::<T>()?;
-		// A year of accrual, then a dead oracle: the refresh takes its
-		// heaviest path — freeze, flush the aggregate interest, mint and
-		// route the yield.
-		T::BenchmarkHelper::advance_time(ONE_HOUR_MS.saturating_mul(24 * 365));
-		T::BenchmarkHelper::clear_oracle_price(asset.clone());
-
-		// One `idle_branch_walk` step: the key pull plus the shared step fn.
-		#[block]
-		{
-			let (collateral_id, stable_id) =
-				Branches::<T>::iter_keys().next().expect("branch registered above");
-			Pallet::<T>::idle_branch_step(&collateral_id, &stable_id);
-		}
-
-		let branch = Branches::<T>::get(&asset, &stable::<T>()).expect("branch registered above");
-		assert!(branch.state.frozen.is_some(), "oracle failure froze the branch");
-		assert!(
-			!branch.state.debt.minted_interest.is_zero(),
-			"the freeze flushed accrued aggregate interest"
-		);
-		Ok(())
-	}
-
-	#[benchmark]
-	fn on_idle_one_vault() -> Result<(), BenchmarkError> {
-		let (asset, owner) = seed_idle_market::<T>()?;
-		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
-
-		// One `idle_vault_walk` step: the key pull plus the shared step fn.
-		#[block]
-		{
-			let (collateral_id, stable_id, walked_owner) =
-				Vaults::<T>::iter_keys().next().expect("vault opened above");
-			Pallet::<T>::idle_vault_step(&collateral_id, &stable_id, &walked_owner);
-		}
-
-		let vault =
-			Pallet::<T>::vault_of(&asset, &stable::<T>(), &owner).expect("vault opened above");
-		let branch = Branches::<T>::get(&asset, &stable::<T>()).expect("branch registered above");
-		assert_eq!(
-			vault.last_interest_time,
-			branch.state.interest_time(T::TimeProvider::now()),
-			"the refresh caught the vault up to the branch interest clock"
-		);
 		Ok(())
 	}
 

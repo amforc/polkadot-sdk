@@ -8,7 +8,6 @@ mod events;
 mod final_recovery;
 mod governance;
 mod hint_helpers;
-mod idle_walk;
 mod interest_rate;
 mod last_vault;
 mod lifecycle;

@@ -1,12 +1,11 @@
 //! Internal (non-dispatchable) `Pallet` helpers: storage accessors,
-//! interest/fee accounting, branch modes, and the `on_idle` refresh walk.
+//! interest/fee accounting, and branch modes.
 
 use crate::{
-	context::VaultOp,
 	math,
 	pallet::{
-		BalanceOf, BranchIdleCursor, BranchOf, Branches, CollateralIdOf, Config, Error, IdleCursor,
-		Millis, Pallet, StableCreditOf, StableIdOf, StablecoinDebt, VaultRecordOf, Vaults,
+		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, Error, Millis, Pallet,
+		StableCreditOf, StableIdOf, StablecoinDebt, VaultRecordOf, Vaults,
 	},
 	recovery,
 	types::{
@@ -14,11 +13,9 @@ use crate::{
 		InterestWeight, PendingInterest, RedistributionAttribution, StablecoinDebtState, Vault,
 		VaultListId, VaultStatus,
 	},
-	weights::WeightInfo,
 };
 use frame::{
 	arithmetic::ArithmeticError,
-	deps::frame_support::{storage::with_storage_layer, weights::WeightMeter},
 	prelude::*,
 	traits::{
 		fungibles::{Balanced as FungiblesBalanced, Inspect as FungiblesInspect, InspectHold as _},
@@ -46,18 +43,6 @@ pub(crate) struct TouchedVaultDraft<AccountId, Balance> {
 	pub(crate) vault: Vault<Balance>,
 	pub(crate) status: VaultStatus,
 	pub(crate) now: Millis,
-}
-
-/// How one idle-walk pass ended, deciding the cursor write.
-enum WalkExit<K> {
-	/// Not even one step fit the meter — leave the stored cursor untouched.
-	Untouched,
-	/// The map drained — clear any stored cursor so the next pass wraps to
-	/// the front.
-	Drained,
-	/// The meter ran dry mid-map — park the cursor after the last charged
-	/// step.
-	Parked(K),
 }
 
 /// The part of one branch that contributes to derived debt aggregates.
@@ -561,6 +546,23 @@ impl<T: Config> Pallet<T> {
 		Self::resolve_fee_credit(stable_id, credit)
 	}
 
+	/// Persists the market's pending aggregate interest and issues it as yield.
+	///
+	/// A frozen market has no elapsed interest time, so it issues nothing.
+	pub(crate) fn accrue_branch_interest(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> DispatchResult {
+		let minted = Self::try_mutate_branch_state(collateral_id, stable_id, |_, state, now| {
+			Self::accrue_aggregate_interest(state, now)
+		})?;
+		// Mint only after storing the updated market.
+		if !minted.is_zero() {
+			Self::mint_and_route_yield(collateral_id, stable_id, minted)?;
+		}
+		Ok(())
+	}
+
 	/// Issues uncovered terminal rounding revenue to the fee account.
 	pub(crate) fn mint_rounding_fee(
 		stable_id: &StableIdOf<T>,
@@ -977,157 +979,5 @@ impl<T: Config> Pallet<T> {
 		let status = Self::vault_status_of(collateral_id, stable_id, owner);
 		Self::apply_vault_touch(&mut state, &mut vault, status, now)?;
 		Ok(TouchedVaultDraft { config, state, vault, status, now })
-	}
-
-	/// Refresh markets and vaults with the block's leftover weight, clamped to
-	/// [`Config::IdleMaxRefreshWeight`]: charge the cursor bookkeeping, resume
-	/// the [`BranchIdleCursor`] walk reconciling oracle-frozen state, then
-	/// resume the flat [`IdleCursor`] walk over the [`Vaults`] map until the
-	/// meter drains. Every attempted step — failed transactional attempts
-	/// included — is charged in the returned weight; [`Self::idle_walk_pass`]
-	/// states the exact per-step and terminal-probe accounting.
-	pub(crate) fn on_idle_walk(remaining: Weight) -> Weight {
-		let Some(limit) = T::IdleMaxRefreshWeight::get() else { return Weight::zero() };
-		let mut meter = WeightMeter::with_limit(remaining.min(limit));
-
-		// The walk's flat cost — the cursor reads/writes, modeled by
-		// `on_idle_base`. If even that does not fit, nothing is read or
-		// written — report zero.
-		if meter.try_consume(T::WeightInfo::on_idle_base()).is_err() {
-			return Weight::zero();
-		}
-
-		// The registry is unbounded, so the branch walk gets at most half the
-		// remaining budget — permissionless branch registration can never
-		// starve vault maintenance — and the vault walk inherits whatever the
-		// branch walk leaves unused.
-		let mut branch_budget = WeightMeter::with_limit(meter.remaining().saturating_div(2));
-		Self::idle_branch_walk(&mut branch_budget);
-		meter.consume(branch_budget.consumed());
-
-		Self::idle_vault_walk(&mut meter);
-		meter.consumed()
-	}
-
-	/// Resume the branch-refresh walk at [`BranchIdleCursor`], reconciling
-	/// oracle-frozen state until `meter` drains.
-	fn idle_branch_walk(meter: &mut WeightMeter) {
-		let cursor = BranchIdleCursor::<T>::get();
-		let iter = match &cursor {
-			Some((collateral_id, stable_id)) => Branches::<T>::iter_keys_from(
-				Branches::<T>::hashed_key_for(collateral_id, stable_id),
-			),
-			None => Branches::<T>::iter_keys(),
-		};
-		let pass = Self::idle_walk_pass(
-			meter,
-			T::WeightInfo::on_idle_one_branch(),
-			iter,
-			|(collateral_id, stable_id)| Self::idle_branch_step(collateral_id, stable_id),
-		);
-		match pass {
-			WalkExit::Untouched => {},
-			// Skip the write when no cursor was stored: the steady state of a
-			// registry that drains within budget every block.
-			WalkExit::Drained => {
-				if cursor.is_some() {
-					BranchIdleCursor::<T>::set(None);
-				}
-			},
-			WalkExit::Parked(key) => BranchIdleCursor::<T>::set(Some(key)),
-		}
-	}
-
-	/// One transactional branch-refresh attempt: the per-key unit of
-	/// [`Self::idle_branch_walk`], and exactly what `on_idle_one_branch`
-	/// measures. Failures roll back and are swallowed — the walk charges
-	/// attempts, not outcomes.
-	pub(crate) fn idle_branch_step(collateral_id: &CollateralIdOf<T>, stable_id: &StableIdOf<T>) {
-		let _ = with_storage_layer(|| Self::do_refresh_branch(collateral_id, stable_id));
-	}
-
-	/// Resume the flat vault-refresh walk at [`IdleCursor`] until the meter
-	/// drains. Map order visits every row eventually — dormant husks and
-	/// mid-FIFO `FinalRecovery` vaults included, which a per-branch rate-index
-	/// cursor never reached.
-	fn idle_vault_walk(meter: &mut WeightMeter) {
-		let cursor = IdleCursor::<T>::get();
-		let iter = match &cursor {
-			Some(key) => Vaults::<T>::iter_keys_from(Vaults::<T>::hashed_key_for(key.clone())),
-			None => Vaults::<T>::iter_keys(),
-		};
-		let pass = Self::idle_walk_pass(
-			meter,
-			T::WeightInfo::on_idle_one_vault(),
-			iter,
-			|(collateral_id, stable_id, owner)| {
-				Self::idle_vault_step(collateral_id, stable_id, owner);
-			},
-		);
-		match pass {
-			WalkExit::Untouched => {},
-			// Skip the write when no cursor was stored: the steady state of a
-			// map that drains within budget every block.
-			WalkExit::Drained => {
-				if cursor.is_some() {
-					IdleCursor::<T>::set(None);
-				}
-			},
-			WalkExit::Parked(key) => IdleCursor::<T>::set(Some(key)),
-		}
-	}
-
-	/// One transactional vault-refresh attempt: the per-key unit of
-	/// [`Self::idle_vault_walk`], and exactly what `on_idle_one_vault`
-	/// measures.
-	pub(crate) fn idle_vault_step(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		owner: &T::AccountId,
-	) {
-		let _ = with_storage_layer(|| {
-			VaultOp::<T>::refresh(collateral_id.clone(), stable_id.clone(), owner)
-		});
-	}
-
-	/// Drive `step` over `iter`, charging `per_step` from `meter` for every
-	/// attempted step — failures included, since a failed attempt costs the
-	/// same execution. The terminal probe (one uncharged `iter.next()` after
-	/// the meter runs dry) only distinguishes [`WalkExit::Drained`] from
-	/// [`WalkExit::Parked`]; the probed key is re-read as the next pass's
-	/// first charged step.
-	fn idle_walk_pass<K>(
-		meter: &mut WeightMeter,
-		per_step: Weight,
-		mut iter: impl Iterator<Item = K>,
-		mut step: impl FnMut(&K),
-	) -> WalkExit<K> {
-		defensive_assert!(
-			per_step != Weight::zero(),
-			"zero per-step weight disables the idle walk"
-		);
-		if per_step == Weight::zero() {
-			return WalkExit::Untouched;
-		}
-		if !meter.can_consume(per_step) {
-			return WalkExit::Untouched;
-		}
-		// Bounded: every iteration consumes the non-zero `per_step` from the
-		// finite meter, or breaks when the map drains.
-		loop {
-			let Some(key) = iter.next() else { break WalkExit::Drained };
-			step(&key);
-			meter.consume(per_step);
-			if !meter.can_consume(per_step) {
-				// Drained rather than Parked when the meter ran dry exactly
-				// at the map's end, so the next pass starts at the front
-				// instead of burning a block discovering the drain.
-				break if iter.next().is_some() {
-					WalkExit::Parked(key)
-				} else {
-					WalkExit::Drained
-				};
-			}
-		}
 	}
 }
