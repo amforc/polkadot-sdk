@@ -594,7 +594,8 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Updates the oracle freeze to match the current price result.
+	/// Updates the oracle freeze to match the current price result, and issues an unfrozen
+	/// market's pending aggregate interest.
 	pub(crate) fn do_refresh_branch(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -602,13 +603,14 @@ impl<T: Config> Pallet<T> {
 		let state = Self::branch_of(collateral_id, stable_id)?.state;
 		let oracle_ok = T::Oracle::provide_price(collateral_id).is_ok();
 		match (state.frozen, oracle_ok) {
-			(Some(state), true) if matches!(state.reason, FrozenReason::OracleFailure) => {
+			(Some(frozen), true) if matches!(frozen.reason, FrozenReason::OracleFailure) => {
 				Self::transition_frozen(collateral_id, stable_id, None)
 			},
 			(None, false) => {
 				Self::transition_frozen(collateral_id, stable_id, Some(FrozenReason::OracleFailure))
 			},
-			_ => Ok(()),
+			(None, true) => Self::accrue_branch_interest(collateral_id, stable_id),
+			(Some(_), _) => Ok(()),
 		}
 	}
 }

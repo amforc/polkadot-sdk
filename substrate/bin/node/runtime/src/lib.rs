@@ -3246,8 +3246,6 @@ impl pallet_psm::Config for Runtime {
 
 parameter_types! {
 	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
-	/// TODO: Use a proper value
-	pub const VaultsIdleMaxRefreshWeight: Option<Weight> = None;
 	/// Oracle key reserved for the native-token price feed.
 	pub const VaultsNativePriceFeedId: u32 = u32::MAX;
 	pub const VaultsOraclePriceMaxAge: Moment =
@@ -3392,7 +3390,6 @@ impl pallet_vaults::Config for Runtime {
 	type ForceOrigin = EnsureRoot<AccountId>;
 	type GlobalDebtCeiling = pallet_vaults::StoredCeiling<Runtime>;
 	type PalletId = VaultsPalletId;
-	type IdleMaxRefreshWeight = VaultsIdleMaxRefreshWeight;
 	type VaultLists = LinkedList;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]

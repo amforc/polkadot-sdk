@@ -384,7 +384,6 @@ pub type VaultDepositConsideration = FungiblesHoldConsideration<
 >;
 
 parameter_types! {
-	pub const IdleMaxRefreshWeight: Option<Weight> = Some(Weight::MAX);
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
 	pub TestBranchConfigBounds: BranchConfigBounds = BranchConfigBounds {
 		min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
@@ -411,7 +410,6 @@ impl pallet_vaults::Config for Test {
 	type GlobalDebtCeiling = pallet_vaults::StoredCeiling<Test>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
-	type IdleMaxRefreshWeight = IdleMaxRefreshWeight;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = MockBenchmarkHelper;
@@ -710,6 +708,11 @@ pub fn poke(
 	owner: AccountId,
 ) -> DispatchResult {
 	Vaults::poke(RuntimeOrigin::signed(who), collateral, stable, owner)
+}
+
+/// Calls the `refresh_branch` dispatchable as `who`.
+pub fn refresh_branch(who: AccountId, collateral: AssetId, stable: StableId) -> DispatchResult {
+	Vaults::refresh_branch(RuntimeOrigin::signed(who), collateral, stable)
 }
 
 /// Calls the `repay_for` dispatchable; `None` repays the whole debt.

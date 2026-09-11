@@ -16,7 +16,7 @@ use frame::deps::{
 };
 use scale_info::TypeInfo;
 
-pub mod branch_mode;
+pub mod branch_interface;
 pub mod debit;
 pub mod math;
 pub mod oracle;
@@ -27,7 +27,7 @@ pub mod stability_pool;
 pub mod vault_interface;
 pub mod yield_routing;
 
-pub use branch_mode::{BranchMode, BranchModeProvider};
+pub use branch_interface::{BranchInterface, BranchMode};
 pub use debit::{debit_preservation, reducible_debit};
 pub use math::{collateralization_ratio, mul_div_floor, mul_div_rate_floor};
 pub use oracle::{OraclePriceConversion, ProvidePrice, ZERO_ORACLE_PRICE};

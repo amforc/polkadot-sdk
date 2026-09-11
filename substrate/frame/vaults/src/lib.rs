@@ -241,13 +241,7 @@ pub mod pallet {
 		#[pallet::constant]
 		type PalletId: Get<PalletId>;
 
-		/// Maximum weight used to refresh markets and vaults during `on_idle`.
-		///
-		/// `None` disables idle refreshes.
-		#[pallet::constant]
-		type IdleMaxRefreshWeight: Get<Option<Weight>>;
-
-		/// Weights for calls and idle work.
+		/// Weights for calls.
 		type WeightInfo: weights::WeightInfo;
 
 		/// See [`crate::BenchmarkHelper`].
@@ -328,20 +322,6 @@ pub mod pallet {
 		crate::types::StablecoinDebtState<BalanceOf<T>>,
 		ValueQuery,
 	>;
-
-	/// Last vault visited by the idle refresh.
-	///
-	/// The next idle refresh resumes after this key. `None` starts at the first vault.
-	#[pallet::storage]
-	pub type IdleCursor<T: Config> =
-		StorageValue<_, (CollateralIdOf<T>, StableIdOf<T>, T::AccountId), OptionQuery>;
-
-	/// Last market visited by the idle refresh.
-	///
-	/// The next idle refresh resumes after this key. `None` starts at the first market.
-	#[pallet::storage]
-	pub type BranchIdleCursor<T: Config> =
-		StorageValue<_, (CollateralIdOf<T>, StableIdOf<T>), OptionQuery>;
 
 	/// Accepts a signed origin matching a branch's stored full administrator.
 	///
@@ -704,10 +684,6 @@ pub mod pallet {
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
-		fn on_idle(_block: BlockNumberFor<T>, remaining: Weight) -> Weight {
-			Self::on_idle_walk(remaining)
-		}
-
 		#[cfg(feature = "try-runtime")]
 		fn try_state(_: BlockNumberFor<T>) -> Result<(), frame::try_runtime::TryRuntimeError> {
 			crate::try_state::do_try_state::<T>()
@@ -1285,14 +1261,15 @@ pub mod pallet {
 			Self::do_set_governance_frozen(&collateral_id, &stable_id, frozen)
 		}
 
-		/// Updates a market's oracle freeze.
+		/// Brings a market up to date.
 		///
 		/// ## Dispatch Origin
 		///
 		/// May be called by any signed account.
 		///
 		/// The market is frozen when its price is unavailable and unfrozen when the price returns.
-		/// Administrative freezes are unchanged.
+		/// Administrative freezes are unchanged. An unfrozen market applies its pending aggregate
+		/// interest and issues it as yield; a frozen market accrues nothing.
 		#[pallet::call_index(13)]
 		#[pallet::weight(T::WeightInfo::refresh_branch())]
 		pub fn refresh_branch(

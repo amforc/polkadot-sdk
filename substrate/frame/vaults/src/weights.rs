@@ -21,9 +21,6 @@ pub trait WeightInfo {
 	fn set_global_debt_ceiling() -> Weight;
 	fn set_governance_frozen() -> Weight;
 	fn refresh_branch() -> Weight;
-	fn on_idle_base() -> Weight;
-	fn on_idle_one_branch() -> Weight;
-	fn on_idle_one_vault() -> Weight;
 }
 
 impl WeightInfo for () {
@@ -80,14 +77,5 @@ impl WeightInfo for () {
 	}
 	fn refresh_branch() -> Weight {
 		Weight::zero()
-	}
-	fn on_idle_base() -> Weight {
-		Weight::from_parts(1, 1)
-	}
-	fn on_idle_one_branch() -> Weight {
-		Weight::from_parts(3, 3)
-	}
-	fn on_idle_one_vault() -> Weight {
-		Weight::from_parts(10, 10)
 	}
 }

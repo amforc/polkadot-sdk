@@ -21,15 +21,22 @@ use frame::{
 };
 use linked_list_interface::SortedListInterface;
 use pusd_primitives::{
-	BranchMode, BranchModeProvider, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
+	BranchInterface, BranchMode, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
 
-impl<T: Config> BranchModeProvider<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
+impl<T: Config> BranchInterface<CollateralIdOf<T>, StableIdOf<T>> for Pallet<T> {
 	fn branch_mode(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 	) -> Result<BranchMode, DispatchError> {
 		Self::current_mode(collateral_id, stable_id)
+	}
+
+	fn accrue_interest(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> DispatchResult {
+		Self::accrue_branch_interest(collateral_id, stable_id)
 	}
 }
 
