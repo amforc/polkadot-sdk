@@ -224,3 +224,37 @@ fn pending_deposits_earn_no_yield() {
 		assert_claim_yield(1, 60);
 	});
 }
+
+// Every call that changes the capital sharing the yield issues the market's
+// pending interest first, over the capital active before the call: one year on
+// the 499 vault is 24 units, 18 of which the pool spreads over the 400 already
+// active, whatever the call then does.
+#[test]
+fn capital_changing_calls_issue_pending_branch_interest_first() {
+	let calls: [fn() -> DispatchResult; 5] = [
+		|| deposit(2, DOT, PUSD, 400),
+		|| withdraw(1, DOT, PUSD, 400, 1),
+		|| request_withdraw(1, DOT, PUSD, 400),
+		|| claim_yield(1, DOT, PUSD, 1),
+		|| compound(1, DOT, PUSD, 100),
+	];
+	for call in calls {
+		build_with_default_market(|| {
+			seed_matured_deposit_from_balance(1, 10_000, 400);
+			seed_claimables(1, 0, 100);
+			mint_stable(PUSD, 2, 10_000);
+			mint_collateral(DOT, 5, 2_000);
+			assert_ok!(open_vault(5, DOT, PUSD, 1_000, 499));
+			advance_time(pusd_primitives::MILLIS_PER_YEAR);
+
+			assert_ok!(call());
+
+			System::assert_has_event(
+				crate::Event::YieldDistributed { collateral_id: DOT, stable_id: PUSD, amount: 18 }
+					.into(),
+			);
+			// delta_G = floor(18 * 1e18 / 400): spread over the 400 active before the call.
+			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_inner(45_000_000_000_000_000));
+		});
+	}
+}

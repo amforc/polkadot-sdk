@@ -29,7 +29,7 @@ use frame::{
 	},
 };
 use pusd_primitives::{
-	debit_preservation, reducible_debit, BranchMode, BranchModeProvider, Millis,
+	debit_preservation, reducible_debit, BranchInterface, BranchMode, Millis,
 	RecoveryOffsetInterface, RecoveryOffsetResult,
 };
 
@@ -981,7 +981,7 @@ impl<T: Config> Pallet<T> {
 			return credit;
 		}
 		// A frozen market, or one whose mode cannot be read, takes no yield.
-		match T::BranchModes::branch_mode(collateral_id, stable_id) {
+		match T::BranchInterface::branch_mode(collateral_id, stable_id) {
 			Ok(BranchMode::Normal) | Ok(BranchMode::Safety) => {},
 			Ok(BranchMode::Frozen) | Err(_) => return credit,
 		}
@@ -1175,7 +1175,7 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 	) -> Result<BranchMode, DispatchError> {
-		let mode = T::BranchModes::branch_mode(collateral_id, stable_id)?;
+		let mode = T::BranchInterface::branch_mode(collateral_id, stable_id)?;
 		ensure!(mode != BranchMode::Frozen, Error::<T>::BranchFrozen);
 		Ok(mode)
 	}
