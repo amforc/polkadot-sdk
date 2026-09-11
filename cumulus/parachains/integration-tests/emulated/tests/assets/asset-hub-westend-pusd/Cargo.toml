@@ -1,0 +1,38 @@
+[package]
+name = "asset-hub-westend-pusd-integration-tests"
+version = "1.0.0"
+authors.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "Stablecoin-framework scenario tests over the Asset Hub Westend runtime with xcm-emulator"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codec = { workspace = true }
+
+# Substrate
+frame-support = { workspace = true, default-features = true }
+frame-system = { workspace = true, default-features = true }
+pallet-assets = { workspace = true, default-features = true }
+pallet-aura = { workspace = true, default-features = true }
+pallet-balances = { workspace = true, default-features = true }
+pallet-linked-list = { workspace = true, default-features = true }
+pallet-psm = { workspace = true, default-features = true }
+pallet-redemptions = { workspace = true, default-features = true }
+pallet-stability = { workspace = true, default-features = true }
+pallet-timestamp = { workspace = true, default-features = true }
+pallet-vaults = { workspace = true, default-features = true }
+pusd-primitives = { workspace = true, default-features = true }
+sp-consensus-slots = { workspace = true, default-features = true }
+sp-runtime = { workspace = true, default-features = true }
+
+# Polkadot
+xcm = { workspace = true }
+
+# Cumulus
+emulated-integration-tests-common = { workspace = true }
+parachains-common = { workspace = true, default-features = true }
+westend-system-emulated-network = { workspace = true }
