@@ -2,9 +2,10 @@
 
 use super::{Commit, VaultOp};
 use crate::{
+	liquidation::{final_recovery_keeper_reward, LiquidationSnapshot},
 	pallet::{BalanceOf, Config, Error, Event, HoldReason, Pallet},
 	recovery,
-	types::{DebtCollateral, LiquidationSnapshot, Vault, VaultStatus},
+	types::{DebtCollateral, Vault, VaultStatus},
 };
 use frame::{
 	prelude::*,
@@ -22,6 +23,7 @@ impl<T: Config> VaultOp<T> {
 		&mut self,
 	) -> Result<LiquidationSnapshot<BalanceOf<T>>, DispatchError> {
 		self.finalize_terminal_interest()?;
+		let price = self.ctx.price()?;
 		ensure!(!self.status.is_final_recovery(), Error::<T>::VaultInFinalRecovery);
 		let cr = self.ctx.collateralization_ratio(&self.vault.position())?;
 		ensure!(
@@ -31,13 +33,28 @@ impl<T: Config> VaultOp<T> {
 		ensure!(!self.is_only_stake_bearer(), Error::<T>::LastVaultCannotBeLiquidated);
 		Ok(LiquidationSnapshot {
 			debt: self.vault.debt.total(),
-			redistribution_penalty: self.ctx.config.redistribution_penalty,
+			price,
+			config: self.ctx.config.liquidation,
 		})
 	}
 
 	/// Returns the current values needed for one redemption step.
 	pub(crate) fn redemption_snapshot(&self) -> RedemptionStepSnapshot<BalanceOf<T>> {
 		self.vault.redemption_snapshot(self.status, &self.ctx.config)
+	}
+
+	/// Exposes a dormant vault's redemption dust without displacing another slot holder.
+	///
+	/// The loaded vault already includes pending redistribution and interest. At or above the
+	/// debt minimum it must be activated instead; below par it needs liquidation or recovery.
+	pub(crate) fn nominate_dormant(&mut self) -> DispatchResult {
+		ensure!(self.status.is_dormant(), Error::<T>::InvalidVaultStatus);
+		let debt = self.vault.debt.total();
+		ensure!(!debt.is_zero(), Error::<T>::DebtNotDust);
+		ensure!(debt < self.ctx.config.minimum_debt, Error::<T>::DebtNotDust);
+		let cr = self.ctx.collateralization_ratio(&self.vault.position())?;
+		ensure!(cr >= FixedU128::one(), Error::<T>::UnsafeCollateralizationRatio);
+		self.sync_dormant_target()
 	}
 
 	/// Moves a dormant vault back to the rate list.
@@ -68,14 +85,77 @@ impl<T: Config> VaultOp<T> {
 			.map_err(|e| Pallet::<T>::map_error(e).into())
 	}
 
-	/// Moves an unsafe last eligible vault into final recovery.
-	pub(crate) fn enter_final_recovery(&mut self) -> DispatchResult {
-		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
+	/// Moves the last unsafe eligible vault into final recovery and returns the reward paid.
+	///
+	/// Only a paid reward resets the cooldown.
+	pub(crate) fn enter_final_recovery(
+		&mut self,
+		keeper: &T::AccountId,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let price = self.ctx.price()?;
+		ensure!(
+			self.status.is_active() || self.status.is_dormant(),
+			Error::<T>::InvalidVaultStatus
+		);
 		self.ctx.ensure_below_mcr(&self.vault.position())?;
 		ensure!(self.is_only_stake_bearer(), Error::<T>::NotLastEligibleVault);
-		self.index_remove()?;
+		let reward_due = self.ctx.state.final_recovery_reward_due(&self.ctx.config, self.ctx.now);
+		if self.status.is_active() {
+			self.index_remove()?;
+		} else {
+			self.ctx.state.release_dormant_target(&self.owner);
+		}
 		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
-		self.set_status(VaultStatus::FinalRecovery)
+		self.set_status(VaultStatus::FinalRecovery)?;
+		debug_assert!(self.vault.redistribution_stake.is_zero());
+		if !reward_due {
+			return Ok(BalanceOf::<T>::zero());
+		}
+		let reward = self.pay_final_recovery_reward(keeper, price)?;
+		if !reward.is_zero() {
+			self.ctx.state.last_final_recovery_entry = Some(self.ctx.now);
+		}
+		Ok(reward)
+	}
+
+	/// Pays the keeper unless the reward would take all collateral or the keeper cannot receive it.
+	fn pay_final_recovery_reward(
+		&mut self,
+		keeper: &T::AccountId,
+		price: FixedU128,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let full_payoff = self
+			.vault
+			.debt
+			.total()
+			.checked_add(&self.vault.terminal_interest_charge())
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		let reward = final_recovery_keeper_reward(
+			self.vault.collateral,
+			full_payoff,
+			price,
+			&self.ctx.config.liquidation,
+		)
+		.ok_or(Error::<T>::ArithmeticOverflow)?;
+		debug_assert!(reward <= self.vault.collateral);
+		if reward.is_zero() || reward >= self.vault.collateral {
+			return Ok(BalanceOf::<T>::zero());
+		}
+		if !Pallet::<T>::keeper_can_be_paid(self.collateral_id(), keeper, reward) {
+			return Ok(BalanceOf::<T>::zero());
+		}
+		T::CollateralAssets::transfer_on_hold(
+			self.collateral_id().clone(),
+			&HoldReason::VaultCollateral.into(),
+			&self.owner,
+			keeper,
+			reward,
+			Precision::Exact,
+			Restriction::Free,
+			Fortitude::Polite,
+		)?;
+		self.remove_collateral(reward)?;
+		Ok(reward)
 	}
 
 	/// Removes a safe vault from final recovery.
@@ -179,15 +259,12 @@ impl<T: Config> VaultOp<T> {
 		mut self,
 		redistribution: DebtCollateral<BalanceOf<T>>,
 	) -> DispatchResult {
-		ensure!(
-			redistribution.debt <= self.vault.debt.total(),
-			Error::<T>::InvalidLiquidationSettlement
-		);
+		ensure!(redistribution.debt <= self.vault.debt.total(), Error::<T>::InvalidLiquidationPlan);
 		let collateral_out = self
 			.vault
 			.collateral
 			.checked_sub(&redistribution.collateral)
-			.ok_or(Error::<T>::InvalidLiquidationSettlement)?;
+			.ok_or(Error::<T>::InvalidLiquidationPlan)?;
 		self.detach(collateral_out)?;
 		if !redistribution.debt.is_zero() || !redistribution.collateral.is_zero() {
 			self.ctx

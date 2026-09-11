@@ -254,6 +254,7 @@ impl pallet_vaults::Config for Test {
 	// Registration seeds the per-market rows of both siblings. Redemptions comes first, so
 	// the config that prices recovery offsets always exists once the pool rows do.
 	type OnBranchLifecycle = (Redemptions, Stability);
+	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type BranchConsideration = VaultsConsideration;
@@ -501,7 +502,17 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(100u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
-		redistribution_penalty: Permill::from_percent(5),
+		final_recovery_reward_cooldown: 3_600 * 1_000,
+		liquidation: pallet_vaults::LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			// The keeper is paid out of the offset penalty, which on the smallest
+			// vault here is 5% of a 200 debt.
+			keeper_flat_compensation_value: 10,
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: 10_000,
+			minimum_jit_contribution: 100,
+			redistribution_penalty: Permill::from_percent(5),
+		},
 	}
 }
 
@@ -541,7 +552,10 @@ pub fn registration_config(
 /// Market configuration for recovery settlement tests, with no entry compensation.
 /// These tests price the collateral available to settle the head.
 pub fn recovery_branch_config() -> pallet_vaults::BranchConfig<Balance> {
-	default_branch_config()
+	let mut config = default_branch_config();
+	config.liquidation.keeper_flat_compensation_value = 0;
+	config.liquidation.keeper_percent_compensation = Permill::zero();
+	config
 }
 
 /// Registers a market at a price of 1.25 and a debt ceiling high enough never to bind.
@@ -1052,6 +1066,8 @@ pub fn enter_final_recovery(
 	owner: AccountId,
 ) -> DispatchResult {
 	Vaults::enter_final_recovery(RuntimeOrigin::signed(99), collateral, stable, owner)
+		.map(|_post_info| ())
+		.map_err(|error| error.error)
 }
 
 /// The stored debt of a vault, principal and settled interest together. Zero if it is absent.
