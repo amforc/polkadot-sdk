@@ -20,6 +20,13 @@ frame = { workspace = true, features = ["runtime"] }
 pusd-primitives = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
 
+pallet-assets = { optional = true, workspace = true }
+pallet-assets-holder = { optional = true, workspace = true }
+pallet-balances = { optional = true, workspace = true }
+pallet-linked-list = { optional = true, workspace = true }
+pallet-timestamp = { optional = true, workspace = true }
+pallet-vaults = { optional = true, workspace = true }
+
 [dev-dependencies]
 pallet-assets = { workspace = true, features = ["std"] }
 pallet-assets-holder = { workspace = true, features = ["std"] }
@@ -34,32 +41,42 @@ default = ["std"]
 std = [
 	"codec/std",
 	"frame/std",
-	"pallet-assets-holder/std",
-	"pallet-assets/std",
-	"pallet-balances/std",
-	"pallet-linked-list/std",
-	"pallet-timestamp/std",
-	"pallet-vaults/std",
+	"pallet-assets-holder?/std",
+	"pallet-assets?/std",
+	"pallet-balances?/std",
+	"pallet-linked-list?/std",
+	"pallet-timestamp?/std",
+	"pallet-vaults?/std",
 	"pusd-primitives/std",
 	"scale-info/std",
 ]
 runtime-benchmarks = [
 	"frame/runtime-benchmarks",
-	"pallet-assets-holder/runtime-benchmarks",
-	"pallet-assets/runtime-benchmarks",
-	"pallet-balances/runtime-benchmarks",
-	"pallet-linked-list/runtime-benchmarks",
-	"pallet-timestamp/runtime-benchmarks",
-	"pallet-vaults/runtime-benchmarks",
+	"pallet-assets-holder?/runtime-benchmarks",
+	"pallet-assets?/runtime-benchmarks",
+	"pallet-balances?/runtime-benchmarks",
+	"pallet-linked-list?/runtime-benchmarks",
+	"pallet-timestamp?/runtime-benchmarks",
+	"pallet-vaults?/runtime-benchmarks",
 	"pusd-primitives/runtime-benchmarks",
 ]
 try-runtime = [
 	"frame/try-runtime",
-	"pallet-assets-holder/try-runtime",
-	"pallet-assets/try-runtime",
-	"pallet-balances/try-runtime",
-	"pallet-linked-list/try-runtime",
-	"pallet-timestamp/try-runtime",
-	"pallet-vaults/try-runtime",
+	"pallet-assets-holder?/try-runtime",
+	"pallet-assets?/try-runtime",
+	"pallet-balances?/try-runtime",
+	"pallet-linked-list?/try-runtime",
+	"pallet-timestamp?/try-runtime",
+	"pallet-vaults?/try-runtime",
 	"pusd-primitives/try-runtime",
+]
+# Exposes the `mock` runtime to other crates, such as the simulator that drives the real pallets.
+test-utils = [
+	"pallet-assets",
+	"pallet-assets-holder",
+	"pallet-balances",
+	"pallet-linked-list",
+	"pallet-timestamp",
+	"pallet-vaults",
+	"std",
 ]

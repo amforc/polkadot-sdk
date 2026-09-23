@@ -1,11 +1,10 @@
-//! User redemption execution and read-only quoting.
+//! User redemption execution.
 
 use crate::{
 	fees,
 	pallet::{
 		BalanceOf, CollateralIdOf, Config, Error, Event, Millis, Pallet, RedemptionConfigOf,
-		RedemptionConfigs, RedemptionQuoteOf, RedemptionStates, SnapshotOf, StableCreditOf,
-		StableIdOf,
+		RedemptionConfigs, RedemptionStates, SnapshotOf, StableCreditOf, StableIdOf,
 	},
 	types::{RedemptionState, RedemptionTerms},
 };
@@ -34,7 +33,7 @@ struct RedemptionInputs<Balance> {
 
 /// Fee inputs read only for an ordinary redemption.
 struct FeeInputs {
-	state: RedemptionState,
+	stored: RedemptionState,
 	now: Millis,
 	curve: fees::DynamicFeeCurve,
 }
@@ -105,7 +104,7 @@ impl<T: Config> Pallet<T> {
 			T::Vaults::stablecoin_debt(stable_id),
 			config,
 		)?;
-		Ok(FeeInputs { state, now, curve })
+		Ok(FeeInputs { stored: state, now, curve })
 	}
 
 	pub(crate) fn do_redeem(
@@ -205,8 +204,6 @@ impl<T: Config> Pallet<T> {
 			collateral_id: context.collateral_id.clone(),
 			stable_id: context.stable_id.clone(),
 			redeemer: context.redeemer.clone(),
-			recipient: context.recipient.clone(),
-			vault_owner: owner,
 			stable_burned: plan.debt(),
 			insurance_cover,
 			collateral_out: plan.collateral(),
@@ -471,14 +468,15 @@ impl<T: Config> Pallet<T> {
 		fee: BalanceOf<T>,
 	) {
 		let new_fee = fee_inputs.curve.raised_dynamic_fee(result.debt.unique_saturated_into());
-		RedemptionStates::<T>::insert(
-			context.stable_id,
-			RedemptionState { dynamic_fee: new_fee, last_fee_operation: fee_inputs.now },
-		);
-		if new_fee != fee_inputs.state.dynamic_fee {
+		let new_state =
+			RedemptionState { dynamic_fee: new_fee, last_fee_operation: fee_inputs.now };
+		RedemptionStates::<T>::insert(context.stable_id, new_state);
+		// Restarting the decay moves future fees even when the value holds, as at the ceiling, so
+		// any change to the stored state is reported.
+		if new_state != fee_inputs.stored {
 			Self::deposit_event(Event::RedemptionDynamicFeeUpdated {
 				stable_id: context.stable_id.clone(),
-				old_dynamic_fee: fee_inputs.state.dynamic_fee,
+				old_dynamic_fee: fee_inputs.curve.decayed_dynamic_fee(),
 				new_dynamic_fee: new_fee,
 			});
 		}
@@ -486,110 +484,10 @@ impl<T: Config> Pallet<T> {
 			collateral_id: context.collateral_id.clone(),
 			stable_id: context.stable_id.clone(),
 			redeemer: context.redeemer.clone(),
-			recipient: context.recipient.clone(),
 			stable_burned: result.debt,
 			collateral_out: result.collateral,
 			fee,
 			steps: result.steps,
 		});
-	}
-
-	/// Builds an indicative read-only quote from projected post-touch snapshots.
-	pub(crate) fn quote_redeem(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		max_stable_to_spend: BalanceOf<T>,
-		max_steps: u32,
-	) -> Result<RedemptionQuoteOf<T>, DispatchError> {
-		let inputs = Self::redemption_inputs(collateral_id, stable_id, max_stable_to_spend)?;
-		let mut targets = T::Vaults::redemption_quote_targets(collateral_id, stable_id);
-		let first_owner = targets.next().ok_or(Error::<T>::NoRedeemableVault)?;
-		let first = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &first_owner)?;
-
-		if first.status.is_final_recovery() {
-			let plan = Self::price_recovery(
-				stable_id,
-				&first,
-				inputs.price,
-				max_stable_to_spend,
-				&inputs.config,
-			)?;
-			ensure!(
-				!plan.debt().is_zero() || !plan.insurance_cover().is_zero(),
-				Error::<T>::NoRedeemableVault
-			);
-			return Ok(RedemptionQuoteOf::<T> {
-				debt_cancelled: plan.debt(),
-				collateral_out: plan.collateral(),
-				fee: Zero::zero(),
-				steps: 1,
-				truncated: false,
-			});
-		}
-
-		let fee_inputs = Self::fee_inputs(stable_id, &inputs.config)?;
-		let debt_budget = Self::ordinary_debt_budget(&fee_inputs, max_stable_to_spend);
-		ensure!(
-			debt_budget >= inputs.config.minimum_redemption_amount,
-			Error::<T>::BelowMinimumRedemptionAmount
-		);
-		Self::quote_ordinary(
-			collateral_id,
-			stable_id,
-			&inputs,
-			&fee_inputs,
-			debt_budget,
-			Self::effective_step_cap(max_steps),
-			first,
-			targets,
-		)
-	}
-
-	fn quote_ordinary(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		inputs: &RedemptionInputs<BalanceOf<T>>,
-		fee_inputs: &FeeInputs,
-		debt_budget: BalanceOf<T>,
-		step_cap: u32,
-		first: SnapshotOf<T>,
-		mut targets: impl Iterator<Item = T::AccountId>,
-	) -> Result<RedemptionQuoteOf<T>, DispatchError> {
-		let mut quote = RedemptionQuoteOf::<T>::default();
-		let mut next = Some(first);
-
-		loop {
-			let remaining = debt_budget.saturating_sub(quote.debt_cancelled);
-			if remaining.is_zero() {
-				break;
-			}
-			if quote.steps >= step_cap {
-				quote.truncated = true;
-				break;
-			}
-			let snapshot = match next.take() {
-				Some(first) => first,
-				None => {
-					let Some(owner) = targets.next() else {
-						break;
-					};
-					T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?
-				},
-			};
-			quote.steps = quote.steps.saturating_add(1);
-
-			match Self::price_ordinary_step(&snapshot, inputs.price, remaining) {
-				Step::Stop => break,
-				Step::Skip => {},
-				Step::Redeem { debt, collateral } => {
-					quote.debt_cancelled = quote.debt_cancelled.saturating_add(debt);
-					quote.collateral_out = quote.collateral_out.saturating_add(collateral);
-				},
-			}
-		}
-
-		ensure!(!quote.debt_cancelled.is_zero(), Error::<T>::NoRedeemableVault);
-		quote.fee = fee_inputs.curve.fee(quote.debt_cancelled);
-		Ok(quote)
 	}
 }
