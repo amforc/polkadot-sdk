@@ -42,7 +42,7 @@ fn nomination_settles_multiple_redistribution_recipients_serially() {
 		assert_eq!(vault(DOT, PUSD, 1).collateral, 1_095);
 		assert_eq!(held(DOT, 1), 1_095);
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(LinkedList::neighbors(rate_list(DOT, PUSD), 1), None);
+		assert_eq!(LinkedList::node(rate_list(DOT, PUSD), 1), None);
 		assert_eq!(Vaults::redemption_queue(DOT, PUSD, 10), vec![1]);
 		assert_event(Event::DormantTargetNominated {
 			collateral_id: DOT,

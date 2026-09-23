@@ -8,10 +8,13 @@ mod lifecycle;
 use crate::{
 	pallet::{
 		BalanceOf, BranchOf, CollateralIdOf, Config, Error, Event, HoldReason, Millis, Pallet,
-		StableCreditOf, StableIdOf, VaultListIdOf, Vaults,
+		StableIdOf, VaultListIdOf, Vaults,
 	},
-	types::{DebtBreakdown, DebtCollateral, Vault, VaultListId, VaultRecord, VaultStatus},
-	utility_impls::{BranchContribution, Issuance},
+	types::{
+		DebtBreakdown, DebtCollateral, LiquidationTouch, Vault, VaultListId, VaultRecord,
+		VaultStatus,
+	},
+	utility_impls::{BranchContribution, PendingTouch},
 };
 use frame::{
 	prelude::*,
@@ -364,13 +367,17 @@ impl<T: Config> Context<T> {
 		});
 	}
 
-	/// Applies pending interest and redistribution to a vault in memory.
-	fn touch(mut self, owner: &T::AccountId) -> Result<VaultOp<T>, DispatchError> {
+	/// Redistribution collateral stays in custody to avoid a transfer to the owner before
+	/// liquidation seizes it. The caller controls transfers and events.
+	fn touch(
+		mut self,
+		owner: &T::AccountId,
+	) -> Result<(VaultOp<T>, PendingTouch<BalanceOf<T>>), DispatchError> {
 		debug_assert!(self.pending_fee.is_zero(), "fee charged before touch");
 		let VaultRecord { mut vault, deposit } =
 			Pallet::<T>::record_of(&self.collateral_id, &self.stable_id, owner)?;
 		let status = Pallet::<T>::vault_status_of(&self.collateral_id, &self.stable_id, owner);
-		let (pending, interest_to_mint) =
+		let (touch, interest_to_mint) =
 			Pallet::<T>::apply_vault_touch(&mut self.branch.state, &mut vault, status, self.now)?;
 		self.pending_interest_mint
 			.ensure_add_assign(interest_to_mint)
@@ -379,35 +386,60 @@ impl<T: Config> Context<T> {
 		// is the protocol's, so the baseline takes it and the operation answers only for its own
 		// change.
 		self.tcr_baseline.debt = Pallet::<T>::accrued_branch_debt(&self.branch.state, self.now);
-		if !pending.redistribution.collateral.is_zero() {
-			T::CollateralAssets::transfer_on_hold(
-				self.collateral_id.clone(),
-				&HoldReason::VaultCollateral.into(),
-				&Pallet::<T>::redistribution_account(&self.collateral_id, &self.stable_id),
-				owner,
-				pending.redistribution.collateral,
-				Precision::Exact,
-				Restriction::OnHold,
-				Fortitude::Polite,
-			)?;
-		}
-
-		if !pending.interest.is_zero() {
-			Pallet::<T>::deposit_event(Event::InterestAccrued {
-				collateral_id: self.collateral_id.clone(),
-				stable_id: self.stable_id.clone(),
-				owner: owner.clone(),
-				amount: pending.interest,
-			});
-		}
-		Ok(VaultOp {
+		let op = VaultOp {
 			ctx: self,
 			owner: owner.clone(),
 			vault,
 			deposit,
 			status,
 			hint_repair_steps: 0,
-		})
+		};
+		Ok((op, touch))
+	}
+
+	fn touch_and_release(self, owner: &T::AccountId) -> Result<VaultOp<T>, DispatchError> {
+		let (op, touch) = self.touch(owner)?;
+		if !touch.redistribution.collateral.is_zero() {
+			T::CollateralAssets::transfer_on_hold(
+				op.ctx.collateral_id.clone(),
+				&HoldReason::VaultCollateral.into(),
+				&Pallet::<T>::redistribution_account(&op.ctx.collateral_id, &op.ctx.stable_id),
+				owner,
+				touch.redistribution.collateral,
+				Precision::Exact,
+				Restriction::OnHold,
+				Fortitude::Polite,
+			)?;
+		}
+		Self::emit_touch_events(&op.ctx.collateral_id, &op.ctx.stable_id, owner, touch);
+		Ok(op)
+	}
+
+	fn emit_touch_events(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		owner: &T::AccountId,
+		PendingTouch { interest, redistribution, .. }: PendingTouch<BalanceOf<T>>,
+	) {
+		if !interest.is_zero() {
+			Pallet::<T>::deposit_event(Event::InterestAccrued {
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
+				owner: owner.clone(),
+				amount: interest,
+			});
+		}
+		// No other event carries a vault's share: it follows from the stake, which events omit.
+		if !redistribution.is_zero() {
+			let DebtCollateral { debt, collateral } = redistribution;
+			Pallet::<T>::deposit_event(Event::RedistributionApplied {
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
+				owner: owner.clone(),
+				debt,
+				collateral,
+			});
+		}
 	}
 
 	/// Attaches a new vault without touching an existing row.
@@ -442,7 +474,7 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Self, DispatchError> {
-		Context::<T>::load(collateral_id, stable_id)?.touch(owner)
+		Context::<T>::load(collateral_id, stable_id)?.touch_and_release(owner)
 	}
 
 	/// Loads an existing vault from an unfrozen branch and applies its pending changes.
@@ -451,7 +483,7 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Self, DispatchError> {
-		Context::<T>::load_unfrozen(collateral_id, stable_id)?.touch(owner)
+		Context::<T>::load_unfrozen(collateral_id, stable_id)?.touch_and_release(owner)
 	}
 
 	/// Loads an existing vault from an unfrozen branch, caching its price before touching it.
@@ -460,7 +492,20 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Self, DispatchError> {
-		Context::<T>::load_priced(collateral_id, stable_id)?.touch(owner)
+		Context::<T>::load_priced(collateral_id, stable_id)?.touch_and_release(owner)
+	}
+
+	/// The vault balance includes redistribution collateral still held by the redistribution
+	/// account. The returned changes belong in the liquidation event to avoid separate events.
+	pub(crate) fn load_for_liquidation(
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+		owner: &T::AccountId,
+	) -> Result<(Self, LiquidationTouch<BalanceOf<T>>), DispatchError> {
+		let (op, touch) = Context::<T>::load_priced(collateral_id, stable_id)?.touch(owner)?;
+		let touch =
+			LiquidationTouch { interest: touch.interest, redistribution: touch.redistribution };
+		Ok((op, touch))
 	}
 
 	/// Prepares a new vault in an unfrozen branch.
@@ -534,6 +579,16 @@ impl<T: Config> VaultOp<T> {
 		Ok(false)
 	}
 
+	/// Returns the loaded vault status.
+	pub(crate) const fn status(&self) -> VaultStatus {
+		self.status
+	}
+
+	/// Returns the hint-repair steps used by this operation.
+	pub(crate) const fn hint_repair_steps(&self) -> u32 {
+		self.hint_repair_steps
+	}
+
 	/// Places the vault in the rate index at its current rate.
 	pub(super) fn index_insert(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
 		let steps = T::VaultLists::insert(
@@ -545,16 +600,6 @@ impl<T: Config> VaultOp<T> {
 		.map_err(Pallet::<T>::map_error)?;
 		self.hint_repair_steps.saturating_accrue(steps);
 		Ok(())
-	}
-
-	/// Returns the loaded vault status.
-	pub(crate) const fn status(&self) -> VaultStatus {
-		self.status
-	}
-
-	/// Returns the hint-repair steps used by this operation.
-	pub(crate) const fn hint_repair_steps(&self) -> u32 {
-		self.hint_repair_steps
 	}
 
 	/// Removes the vault from the rate index, where it must be present.
@@ -732,20 +777,22 @@ impl<T: Config> VaultOp<T> {
 		Ok(payment)
 	}
 
+	/// The branch as this operation hands it to the Stability Pool.
+	pub(crate) fn branch_snapshot(&self) -> BranchSnapshot {
+		self.ctx.branch_snapshot()
+	}
+
 	/// Commits the operation, running the mode gate when `commit` asks for it.
 	pub(crate) fn commit(self, commit: Commit) -> DispatchResult {
 		match commit {
 			Commit::Checked => self.ctx.ensure_mode_rules()?,
 			Commit::Exempt => {},
 		}
-		self.persist(false, None)
+		self.persist(false)
 	}
 
 	/// Writes the vault and the branch, then issues what the operation owes.
-	///
-	/// `burned` is stablecoin the operation took out of circulation. Issuance draws from it before
-	/// minting, and the rest burns here, so the operation changes the supply once.
-	fn persist(self, remove: bool, burned: Option<StableCreditOf<T>>) -> DispatchResult {
+	fn persist(self, remove: bool) -> DispatchResult {
 		let VaultOp { ctx, owner, vault, deposit, .. } = self;
 		let collateral_id = ctx.collateral_id.clone();
 		let stable_id = ctx.stable_id.clone();
@@ -780,27 +827,12 @@ impl<T: Config> VaultOp<T> {
 		)?;
 
 		// Mint after writing state.
-		let mut issuance = Issuance::netted(stable_id.clone(), burned);
 		if let Some(branch) = branch {
-			Pallet::<T>::issue_interest(
-				&collateral_id,
-				&stable_id,
-				branch,
-				pending_interest_mint,
-				&mut issuance,
-			)?;
+			Pallet::<T>::issue_interest(&collateral_id, &stable_id, branch, pending_interest_mint)?;
 			if !pending_fee.is_zero() {
-				Pallet::<T>::mint_and_route_yield(
-					&collateral_id,
-					&stable_id,
-					branch,
-					pending_fee,
-					&mut issuance,
-				)?;
+				Pallet::<T>::mint_and_route_yield(&collateral_id, &stable_id, branch, pending_fee)?;
 			}
 		}
-		// Burns what issuance did not use.
-		drop(issuance);
 		Ok(())
 	}
 }
