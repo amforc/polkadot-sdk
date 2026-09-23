@@ -8,7 +8,7 @@
 
 use crate::{
 	mock::*,
-	tests::{rate_pct, ONE_YEAR_MS},
+	tests::{rate_pct, vault_events, ONE_YEAR_MS},
 	types::BranchConfigUpdate,
 	Error,
 };
@@ -327,13 +327,9 @@ fn final_recovery_entry_plans_out_a_sub_ed_keeper_reward() {
 		assert!(Vaults::vault_status(XBT, USDX, 1).expect("status").is_final_recovery());
 		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper stayed unpaid");
 		assert_eq!(xbt_vault(1).collateral, 1_000 * XBT_UNIT, "the vault kept its collateral");
-		System::assert_has_event(RuntimeEvent::Vaults(Event::VaultEnteredFinalRecovery {
-			collateral_id: XBT,
-			stable_id: USDX,
-			owner: 1,
-			keeper: 998,
-			keeper_reward: 0,
-		}));
+		assert!(!vault_events()
+			.iter()
+			.any(|event| matches!(event, Event::FinalRecoveryRewardPaid { .. })));
 	});
 }
 

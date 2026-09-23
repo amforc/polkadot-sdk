@@ -244,13 +244,15 @@ impl<T: Config> Pallet<T> {
 		}
 		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
 		let keeper_reward = op.enter_final_recovery(&keeper)?;
-		Self::deposit_event(Event::VaultEnteredFinalRecovery {
-			collateral_id: op.collateral_id().clone(),
-			stable_id: op.stable_id().clone(),
-			owner,
-			keeper,
-			keeper_reward,
-		});
+		if !keeper_reward.is_zero() {
+			Self::deposit_event(Event::FinalRecoveryRewardPaid {
+				collateral_id: op.collateral_id().clone(),
+				stable_id: op.stable_id().clone(),
+				owner,
+				keeper,
+				amount: keeper_reward,
+			});
+		}
 		op.commit(Commit::Exempt)?;
 		Ok(Pays::No.into())
 	}

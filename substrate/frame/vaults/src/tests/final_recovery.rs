@@ -2,7 +2,7 @@
 
 use crate::{
 	mock::*,
-	tests::{assert_event, rate_pct, vault_status, ONE_YEAR_MS},
+	tests::{assert_event, rate_pct, vault_events, vault_status, ONE_YEAR_MS},
 };
 use frame::prelude::Pays;
 use pallet_linked_list::SortedListInterface;
@@ -29,14 +29,17 @@ fn enter_recovery(who: AccountId, rate: FixedU128) {
 	assert_ok!(enter_final_recovery(KEEPER, DOT, PUSD, who));
 }
 
-fn assert_entered_event(owner: AccountId, keeper: AccountId, keeper_reward: Balance) {
-	assert_event(crate::Event::VaultEnteredFinalRecovery {
-		collateral_id: DOT,
-		stable_id: PUSD,
-		owner,
-		keeper,
-		keeper_reward,
-	});
+/// Returns `(owner, keeper, amount)` for every `FinalRecoveryRewardPaid` event of the block.
+fn reward_events() -> Vec<(AccountId, AccountId, Balance)> {
+	vault_events()
+		.into_iter()
+		.filter_map(|event| match event {
+			crate::Event::FinalRecoveryRewardPaid { owner, keeper, amount, .. } => {
+				Some((owner, keeper, amount))
+			},
+			_ => None,
+		})
+		.collect()
 }
 
 #[test]
@@ -104,7 +107,7 @@ fn final_recovery_entry_pays_the_keeper_from_the_vault() {
 		assert_eq!(state.total_collateral, remaining);
 		assert_eq!(state.stakes.total, 0);
 		assert_eq!(state.stakes.collateral_basis, 0);
-		assert_entered_event(1, KEEPER, ENTRY_REWARD);
+		assert_eq!(reward_events(), vec![(1, KEEPER, ENTRY_REWARD)]);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultStatusChanged {
 			collateral_id: DOT,
 			stable_id: PUSD,
@@ -145,7 +148,7 @@ fn final_recovery_entry_pays_what_liquidation_pays() {
 		assert_eq!(collateral_balance(DOT, 3) - liquidator_before, liquidation_reward);
 		assert_eq!(collateral_balance(DOT, 4) - entrant_before, liquidation_reward);
 		assert_eq!(post_info.pays_fee, Pays::No);
-		assert_entered_event(2, 4, ENTRY_REWARD);
+		assert_eq!(reward_events().last(), Some(&(2, 4, ENTRY_REWARD)));
 	});
 }
 
@@ -176,7 +179,7 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 		let post_info = flip(KEEPER);
 		assert_eq!(post_info.pays_fee, Pays::No);
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
-		assert_entered_event(1, KEEPER, 0);
+		assert_eq!(reward_events(), vec![(1, KEEPER, ENTRY_REWARD)]);
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
 		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD);
 		assert_eq!(
@@ -189,7 +192,7 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 		// which rounds to nothing. This paid entry moves the timestamp.
 		advance_time(cooldown / 2);
 		flip(KEEPER);
-		assert_entered_event(1, KEEPER, 100);
+		assert_eq!(reward_events(), vec![(1, KEEPER, ENTRY_REWARD), (1, KEEPER, 100)]);
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD + 100);
 		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD - 100);
 		assert_eq!(
@@ -238,8 +241,8 @@ fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
 		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, 0);
 		assert_eq!(branch_state(DOT, PUSD).expect("state").stakes.total, 0);
 		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, None);
-		assert_eq!(LinkedList::neighbors(rate_list(DOT, PUSD), 1), None);
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), vec![1]);
+		assert_eq!(LinkedList::node(rate_list(DOT, PUSD), 1), None);
+		assert_eq!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10), vec![1]);
 		assert_event(crate::Event::VaultStatusChanged {
 			collateral_id: DOT,
 			stable_id: PUSD,
@@ -269,7 +272,7 @@ fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 		assert!(!vault_exists(DOT, PUSD, 1));
 		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, None);
-		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
 	});
 }
 
@@ -295,7 +298,7 @@ fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
 
 		let post_info = enter_final_recovery(KEEPER, DOT, PUSD, 1).expect("recovery still enters");
 		assert_eq!(post_info.pays_fee, Pays::No);
-		assert_entered_event(1, KEEPER, 0);
+		assert_eq!(reward_events(), vec![]);
 		assert_eq!(collateral_balance(DOT, KEEPER), 0);
 		assert_eq!(vault(DOT, PUSD, 1).collateral, 1_000);
 		assert_eq!(held(DOT, 1), 1_000);
@@ -306,7 +309,7 @@ fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
 		assert_eq!(state.total_collateral, 1_000);
 		assert_eq!(state.stakes.total, 0);
 		assert_eq!(state.last_final_recovery_entry, None);
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), vec![1]);
+		assert_eq!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10), vec![1]);
 	});
 }
 

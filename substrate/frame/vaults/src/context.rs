@@ -347,6 +347,17 @@ impl<T: Config> Context<T> {
 				amount: pending.interest.interest,
 			});
 		}
+		// No other event carries a vault's share: it follows from the stake, which events omit.
+		let DebtCollateral { debt, collateral } = pending.redistribution;
+		if !debt.is_zero() || !collateral.is_zero() {
+			Pallet::<T>::deposit_event(Event::RedistributionApplied {
+				collateral_id: self.collateral_id.clone(),
+				stable_id: self.stable_id.clone(),
+				owner: owner.clone(),
+				debt,
+				collateral,
+			});
+		}
 		// A touch only realizes accrued interest, so it does not change the TCR.
 		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, deposit, status })
 	}

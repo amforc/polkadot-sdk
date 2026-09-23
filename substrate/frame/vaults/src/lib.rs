@@ -603,8 +603,11 @@ pub mod pallet {
 			/// Debt and collateral allocated through the liquidation waterfall.
 			outcome: LiquidationOutcome<BalanceOf<T>>,
 		},
-		/// The last eligible vault entered final recovery.
-		VaultEnteredFinalRecovery {
+		/// A keeper was paid for moving the last eligible vault into final recovery.
+		///
+		/// [`Event::VaultStatusChanged`] reports the entry itself. An entry that pays no reward
+		/// emits only that event.
+		FinalRecoveryRewardPaid {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
 			/// Stable asset ID.
@@ -614,7 +617,7 @@ pub mod pallet {
 			/// Account that moved the vault into final recovery.
 			keeper: T::AccountId,
 			/// Collateral paid from the vault to the keeper.
-			keeper_reward: BalanceOf<T>,
+			amount: BalanceOf<T>,
 		},
 		/// A dormant vault's dust was nominated for redemption.
 		DormantTargetNominated {
@@ -624,6 +627,22 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			/// Owner of the nominated vault.
 			owner: T::AccountId,
+		},
+		/// A vault update realized the vault's share of earlier liquidations.
+		///
+		/// [`Event::VaultLiquidated`] reports the amounts a liquidation redistributes across the
+		/// market. This is the part one vault absorbs, which its stake decides.
+		RedistributionApplied {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Vault owner.
+			owner: T::AccountId,
+			/// Principal added to the vault's debt.
+			debt: BalanceOf<T>,
+			/// Collateral moved from the redistribution account into the vault.
+			collateral: BalanceOf<T>,
 		},
 		/// Aggregate interest accrued since the market's last update was issued as yield.
 		///
