@@ -83,11 +83,10 @@ pub(crate) fn new_test_ext() -> TestState {
 }
 
 /// Run `test` against a fresh externality and unconditionally re-check the
-/// pallet's invariants afterwards under `try-runtime`.
+/// pallet's invariants afterwards.
 pub(crate) fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
-		#[cfg(feature = "try-runtime")]
 		LinkedList::do_try_state().expect("invariants hold post-test");
 	});
 }
@@ -125,9 +124,10 @@ pub(crate) fn insert(list_id: ListId, item: ItemId, priority: Priority) -> u32 {
 
 /// Items in `list_id` head-to-tail.
 pub(crate) fn dump(list_id: ListId) -> alloc::vec::Vec<(ItemId, Priority)> {
-	let count = LinkedList::count(list_id);
+	use pallet_linked_list::SortedListInterface;
+	let count = LinkedList::count(&list_id);
 	let mut out = alloc::vec::Vec::with_capacity(count as usize);
-	let mut cursor = LinkedList::head(list_id);
+	let mut cursor = LinkedList::head(&list_id);
 	while let Some(item) = cursor {
 		assert!(out.len() <= count as usize, "dump: walk exceeded count (cycle?)");
 		let node = pallet_linked_list::ListNodes::<Test>::get(list_id, item)

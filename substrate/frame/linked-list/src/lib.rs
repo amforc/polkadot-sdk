@@ -57,6 +57,7 @@ pub use types::ListMeta;
 mod dispatchables;
 mod list;
 mod sorted_list_interface;
+#[cfg(any(feature = "try-runtime", test))]
 mod try_state;
 mod types;
 mod view_helpers;
@@ -206,37 +207,6 @@ pub mod pallet {
 
 	#[pallet::view_functions]
 	impl<T: Config> Pallet<T> {
-		/// Highest-priority item in `list_id`, or `None` if empty.
-		pub fn head(list_id: T::ListId) -> Option<T::ItemId> {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::head(&list_id)
-		}
-
-		/// Lowest-priority item in `list_id`, or `None` if empty.
-		pub fn tail(list_id: T::ListId) -> Option<T::ItemId> {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::tail(&list_id)
-		}
-
-		/// Number of items in `list_id`.
-		pub fn count(list_id: T::ListId) -> u32 {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::count(&list_id)
-		}
-
-		/// Whether `(list_id, item)` is currently in the list.
-		pub fn contains(list_id: T::ListId, item: T::ItemId) -> bool {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::contains(&list_id, &item)
-		}
-
-		/// Current `(prev, next)` neighbors of `(list_id, item)`, if present.
-		pub fn neighbors(list_id: T::ListId, item: T::ItemId) -> Option<Position<T::ItemId>> {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::neighbors(&list_id, &item)
-		}
-
-		/// Stored priority cached on `(list_id, item)`'s node, or `None` if the
-		/// item is not in the list.
-		pub fn priority(list_id: T::ListId, item: T::ItemId) -> Option<T::Priority> {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::priority(&list_id, &item)
-		}
-
 		/// Stored priority and `(prev, next)` neighbors of `(list_id, item)` in
 		/// a single read, or `None` if the item is not in the list.
 		pub fn node(
@@ -270,38 +240,6 @@ pub mod pallet {
 				&list_id,
 				&item,
 				new_priority,
-			)
-		}
-
-		/// Steps the on-chain repair walk would take from `hint` to insert a NEW
-		/// item at `priority`. Matches [`SortedListInterface::insert`] only; see
-		/// [`SortedListInterface::repair_steps_needed`] for the full contract and
-		/// [`Pallet::re_insert_steps_needed`] for `reprioritize`.
-		pub fn repair_steps_needed(
-			list_id: T::ListId,
-			priority: T::Priority,
-			hint: Position<T::ItemId>,
-		) -> u32 {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::repair_steps_needed(
-				&list_id, priority, hint,
-			)
-		}
-
-		/// Steps a [`Pallet::reprioritize`] moving `(list_id, item)` to
-		/// `new_priority` would take to repair `hint`, simulating the dispatch
-		/// exactly. See [`SortedListInterface::re_insert_steps_needed`] for the
-		/// full contract.
-		pub fn re_insert_steps_needed(
-			list_id: T::ListId,
-			item: T::ItemId,
-			new_priority: T::Priority,
-			hint: Position<T::ItemId>,
-		) -> u32 {
-			<Self as SortedListInterface<T::ListId, T::ItemId>>::re_insert_steps_needed(
-				&list_id,
-				&item,
-				new_priority,
-				hint,
 			)
 		}
 	}

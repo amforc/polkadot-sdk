@@ -102,8 +102,8 @@ fn assert_relocated<T: Config>(
 			.next,
 		Some(seeded[s_idx + 4].clone())
 	);
-	assert_eq!(Pallet::<T>::head(list_id.clone()), Some(seeded[0].clone()));
-	assert_eq!(Pallet::<T>::tail(list_id.clone()), Some(seeded[s_idx + 4].clone()));
+	assert_eq!(Pallet::<T>::head(&list_id), Some(seeded[0].clone()));
+	assert_eq!(Pallet::<T>::tail(&list_id), Some(seeded[s_idx + 4].clone()));
 }
 
 #[benchmarks(
@@ -144,7 +144,7 @@ mod benchmarks {
 		assert_eq!(node.prev, Some(seeded[0].clone()));
 		assert_eq!(node.next, Some(seeded[1].clone()));
 		// Interior insert: the head is intentionally untouched.
-		assert_eq!(Pallet::<T>::head(list_id), Some(seeded[0].clone()));
+		assert_eq!(Pallet::<T>::head(&list_id), Some(seeded[0].clone()));
 		Ok(())
 	}
 
@@ -266,8 +266,8 @@ mod benchmarks {
 		);
 
 		assert_eq!(ListNodes::<T>::get(&list_id, &target).map(|n| n.priority), Some(new_priority));
-		assert_eq!(Pallet::<T>::head(list_id.clone()), Some(seeded[0].clone()));
-		assert_eq!(Pallet::<T>::tail(list_id), Some(seeded[2].clone()));
+		assert_eq!(Pallet::<T>::head(&list_id), Some(seeded[0].clone()));
+		assert_eq!(Pallet::<T>::tail(&list_id), Some(seeded[2].clone()));
 		Ok(())
 	}
 

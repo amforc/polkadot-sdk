@@ -25,11 +25,11 @@ fn lists_are_independent_size_head_tail() {
 		insert(2, 100, 70);
 		insert(2, 200, 30);
 
-		assert_eq!(LinkedList::count(1), 1);
-		assert_eq!(LinkedList::count(2), 2);
-		assert_eq!(LinkedList::head(1), Some(100));
-		assert_eq!(LinkedList::head(2), Some(100));
-		assert_eq!(LinkedList::tail(2), Some(200));
+		assert_eq!(LinkedList::count(&1), 1);
+		assert_eq!(LinkedList::count(&2), 2);
+		assert_eq!(LinkedList::head(&1), Some(100));
+		assert_eq!(LinkedList::head(&2), Some(100));
+		assert_eq!(LinkedList::tail(&2), Some(200));
 	});
 }
 

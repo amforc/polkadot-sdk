@@ -104,42 +104,6 @@ fn find_position_terminates_on_cyclic_corruption() {
 }
 
 #[test]
-fn neighbors_returns_none_for_unknown_item() {
-	build_and_execute(|| {
-		insert(1, 1, 90);
-		assert_eq!(LinkedList::neighbors(1, 999), None);
-	});
-}
-
-#[test]
-fn neighbors_returns_links_for_known_item() {
-	build_and_execute(|| {
-		insert(1, 1, 90);
-		insert(1, 2, 50);
-		insert(1, 3, 10);
-		assert_eq!(LinkedList::neighbors(1, 2), Some(Position::between(1, 3)));
-	});
-}
-
-#[test]
-fn priority_returns_none_for_unknown_item() {
-	build_and_execute(|| {
-		insert(1, 1, 90);
-		assert_eq!(LinkedList::priority(1, 999), None);
-	});
-}
-
-#[test]
-fn priority_returns_stored_priority_for_known_item() {
-	build_and_execute(|| {
-		insert(1, 1, 90);
-		insert(1, 2, 50);
-		assert_eq!(LinkedList::priority(1, 1), Some(90));
-		assert_eq!(LinkedList::priority(1, 2), Some(50));
-	});
-}
-
-#[test]
 fn node_returns_priority_and_position_for_known_item() {
 	build_and_execute(|| {
 		insert(1, 1, 90);

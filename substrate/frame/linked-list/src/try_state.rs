@@ -31,26 +31,18 @@
 //! 5. `ListNodes` has no orphan rows (total row count equals the chain length).
 
 use crate::pallet::*;
-
-#[cfg(feature = "try-runtime")]
 use alloc::{collections::BTreeSet, vec::Vec};
-
-#[cfg(feature = "try-runtime")]
 use codec::Encode;
-
-#[cfg(feature = "try-runtime")]
-use frame::try_runtime::TryRuntimeError;
+use frame::deps::sp_runtime::TryRuntimeError;
 
 /// Cap on the walk vectors' initial capacity. `meta.len` is the value we are
 /// checking, so a corrupt near-`u32::MAX` len must not size a huge allocation.
 /// A longer list just grows its vector.
-#[cfg(feature = "try-runtime")]
 const MAX_WALK_PREALLOC: usize = 1 << 12;
 
 impl<T: Config> Pallet<T> {
 	/// Run the per-list invariant checks across every list with stored state.
 	/// Returns the first violation found.
-	#[cfg(feature = "try-runtime")]
 	pub fn do_try_state() -> Result<(), TryRuntimeError> {
 		// Dedup on the SCALE encoding to avoid an `Ord` bound on `ListId`
 		// while staying O(n log n) over the total row count. `try_state_list`
@@ -66,7 +58,6 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	#[cfg(feature = "try-runtime")]
 	fn try_state_list(list_id: &T::ListId) -> Result<(), TryRuntimeError> {
 		let meta = ListMetas::<T>::get(list_id);
 		let nodes_present = ListNodes::<T>::iter_key_prefix(list_id).next().is_some();
