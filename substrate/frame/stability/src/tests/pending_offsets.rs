@@ -229,8 +229,6 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 			crate::Event::PoolOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 1_501,
-				collateral_gain: 7_865_547_022_727,
 				epoch: 1,
 				scale: 0,
 			}
@@ -270,8 +268,6 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 			crate::Event::PendingDepositOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 350,
-				collateral_gain: 1_834_071_590_909,
 				epoch: 1,
 				scale: 0,
 			}
@@ -325,8 +321,6 @@ fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 			crate::Event::PendingDepositOffsetApplied {
 				collateral_id: DOT,
 				stable_id: USDX,
-				debt_burned: 40_000,
-				collateral_gain: 40_000,
 				epoch: 0,
 				scale: 0,
 			}
@@ -373,8 +367,6 @@ fn pending_deposit_offset_is_shared_pro_rata() {
 			crate::Event::PendingDepositOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 1_000,
-				collateral_gain: 500,
 				epoch: 0,
 				scale: 0,
 			}

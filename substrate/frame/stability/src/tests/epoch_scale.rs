@@ -124,8 +124,6 @@ fn scale_crossing_preserves_older_deposits() {
 			crate::Event::PoolOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: unit - 100,
-				collateral_gain: 5_000_000_000_000,
 				epoch: 0,
 				scale: 1,
 			}

@@ -21,6 +21,7 @@ use crate::{
 	},
 };
 use frame::{
+	deps::frame_support::storage::{with_transaction, TransactionOutcome},
 	prelude::*,
 	traits::{
 		fungibles::{Balanced as _, Inspect as _},
@@ -116,9 +117,6 @@ impl<'a, T: Config> DepositOp<'a, T> {
 			},
 			RecoveryOffsetResult::Applied { collateral_out } => collateral_out,
 		};
-		// The settlement can only spend value the credit carried, so the difference is what it
-		// spent.
-		let used_for_recovery = amount.saturating_sub(change.peek());
 
 		self.deposit.claimable_collateral = self
 			.deposit
@@ -134,8 +132,6 @@ impl<'a, T: Config> DepositOp<'a, T> {
 		Pallet::<T>::deposit_event(Event::RecoveryOffsetApplied {
 			collateral_id: self.collateral_id.clone(),
 			stable_id: self.stable_id.clone(),
-			debt_burned: used_for_recovery,
-			collateral_gain: collateral_out,
 			source: RecoveryOffsetSource::IncomingDeposit,
 		});
 		Ok(change)
@@ -395,10 +391,8 @@ impl<T: Config> Pallet<T> {
 		)?;
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
 		let change = op.settle_incoming_recovery(&pool_account, payment)?;
-		// The settlement can only spend value the credit carried, so the difference is what it
-		// spent.
+		// The settlement can only spend value the credit carried, so the rest is still to queue.
 		let pending_amount = change.peek();
-		let used_for_recovery = amount.saturating_sub(pending_amount);
 
 		if let Err(change) = change.drop_zero() {
 			T::StableAssets::can_deposit(
@@ -421,7 +415,6 @@ impl<T: Config> Pallet<T> {
 			stable_id,
 			depositor: who,
 			amount,
-			used_for_recovery,
 			pending_amount,
 		});
 		Ok(())
@@ -541,8 +534,6 @@ impl<T: Config> Pallet<T> {
 		Self::deposit_event(Event::RecoveryOffsetApplied {
 			collateral_id,
 			stable_id,
-			debt_burned: debt_cancelled,
-			collateral_gain: collateral_out,
 			source: RecoveryOffsetSource::ActivePool,
 		});
 		Ok(())
@@ -805,24 +796,19 @@ impl<T: Config> Pallet<T> {
 			reservation.debt,
 			collateral.peek(),
 		)?;
-		let collateral_amount =
-			Self::settle_reservation_exact(stable_id, pool_account, reservation, collateral)?;
+		Self::settle_reservation_exact(stable_id, pool_account, reservation, collateral)?;
 		Self::commit_offset(collateral_id, stable_id, leg, &mut pool.state, plan);
 		let coords = pool.state.coords(leg);
 		Self::deposit_event(match leg {
 			Leg::Active => Event::PoolOffsetApplied {
 				collateral_id: collateral_id.clone(),
 				stable_id: stable_id.clone(),
-				debt_burned: reservation.debt,
-				collateral_gain: collateral_amount,
 				epoch: coords.epoch,
 				scale: coords.scale,
 			},
 			Leg::Pending => Event::PendingDepositOffsetApplied {
 				collateral_id: collateral_id.clone(),
 				stable_id: stable_id.clone(),
-				debt_burned: reservation.debt,
-				collateral_gain: collateral_amount,
 				epoch: coords.epoch,
 				scale: coords.scale,
 			},
@@ -832,15 +818,13 @@ impl<T: Config> Pallet<T> {
 
 	/// Burns the reserved stablecoin and resolves all collateral into pool custody.
 	///
-	/// Exact movement keeps debt cancellation equal to the quoted amount. The function returns the
-	/// collateral amount received.
+	/// Exact movement keeps debt cancellation equal to the quoted amount.
 	fn settle_reservation_exact(
 		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
 		reservation: OffsetReservation<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
-	) -> Result<BalanceOf<T>, DispatchError> {
-		let collateral_amount = collateral.peek();
+	) -> DispatchResult {
 		let stable_credit = T::StableAssets::withdraw(
 			stable_id.clone(),
 			pool_account,
@@ -860,7 +844,7 @@ impl<T: Config> Pallet<T> {
 		}
 		// Dropping the withdrawn credit is what cancels the debt.
 		drop(stable_credit);
-		Ok(collateral_amount)
+		Ok(())
 	}
 
 	/// Returns the validated state after an offset without a storage write.
@@ -1127,14 +1111,56 @@ impl<T: Config> Pallet<T> {
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 	) -> DispatchResult {
-		let pool = Self::load_pool(&collateral_id, &stable_id)?;
-		let stored = Deposits::<T>::get((&collateral_id, &stable_id, &owner))
+		Self::settled_deposit_op(&owner, &collateral_id, &stable_id)?.commit();
+		Ok(())
+	}
+
+	/// Settles the stored row of `owner` at the current time and leaves the commit to the caller.
+	///
+	/// Cohort activation and checkpoint release write storage before the commit. A caller that
+	/// must change nothing has to roll those writes back.
+	fn settled_deposit_op<'a>(
+		owner: &'a T::AccountId,
+		collateral_id: &'a CollateralIdOf<T>,
+		stable_id: &'a StableIdOf<T>,
+	) -> Result<DepositOp<'a, T>, DispatchError> {
+		let pool = Self::load_pool(collateral_id, stable_id)?;
+		let stored = Deposits::<T>::get((collateral_id, stable_id, owner))
 			.ok_or(Error::<T>::DepositNotFound)?;
-		let mut op = DepositOp::<T>::new(&collateral_id, &stable_id, &owner, pool, Some(stored))?;
+		let mut op = DepositOp::<T>::new(collateral_id, stable_id, owner, pool, Some(stored))?;
 
 		op.refresh(T::TimeProvider::now())?;
-		op.commit();
-		Ok(())
+		Ok(op)
+	}
+
+	/// Returns the row that [`Pallet::do_settle_deposit`] would store, without storing it.
+	///
+	/// The real settlement runs in a transaction that always rolls back, so the result cannot
+	/// differ from execution. The rollback also discards the deposited events.
+	pub(crate) fn settled_deposit(
+		owner: &T::AccountId,
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> Result<DepositOf<T>, DispatchError> {
+		with_transaction(|| {
+			TransactionOutcome::Rollback(
+				Self::settled_deposit_op(owner, collateral_id, stable_id).map(|op| op.deposit),
+			)
+		})
+	}
+
+	/// Returns the pool state with each due cohort activated, without storing it.
+	///
+	/// A frozen or unavailable mode prevents activation, as in [`Pallet::advance_cohorts`].
+	pub(crate) fn activated_pool_state(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> Result<PoolStateOf<T>, DispatchError> {
+		let mut pool = Self::load_pool(collateral_id, stable_id)?;
+		if Self::ensure_not_frozen(collateral_id, stable_id).is_ok() {
+			Self::roll_due_cohorts(&mut pool, T::TimeProvider::now())?;
+		}
+		Ok(pool.state)
 	}
 
 	/// Returns the stablecoin amount authorized by the current operating mode.

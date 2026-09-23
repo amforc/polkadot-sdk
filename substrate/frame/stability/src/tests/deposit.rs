@@ -37,7 +37,6 @@ fn deposit_moves_funds_and_queues_pending() {
 				stable_id: PUSD,
 				depositor: 1,
 				amount: 400,
-				used_for_recovery: 0,
 				pending_amount: 400,
 			}
 			.into(),
@@ -90,7 +89,6 @@ fn second_deposit_merges_and_resets_delay() {
 				stable_id: PUSD,
 				depositor: 1,
 				amount: 300,
-				used_for_recovery: 0,
 				pending_amount: 300,
 			}
 			.into(),

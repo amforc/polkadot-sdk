@@ -456,7 +456,6 @@ pub fn new_test_ext() -> TestState {
 pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
-		#[cfg(feature = "try-runtime")]
 		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 	});
 }
@@ -1059,6 +1058,22 @@ pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Bala
 	pallet_vaults::Vaults::<Test>::get((collateral, stable, who))
 		.map(|record| record.vault.debt.principal + record.vault.debt.interest)
 		.unwrap_or_default()
+}
+
+/// Asserts that Vaults reported `debt` cancelled against `collateral` for the vault of `owner`.
+///
+/// The recovery events of this pallet carry no amounts, because the vault engine reports them.
+pub fn assert_vault_redeemed(owner: AccountId, debt: Balance, collateral: Balance) {
+	let reported = System::events().into_iter().any(|record| match record.event {
+		RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed {
+			owner: redeemed,
+			debt_cancelled,
+			collateral_to_recipient,
+			..
+		}) => redeemed == owner && debt_cancelled == debt && collateral_to_recipient == collateral,
+		_ => false,
+	});
+	assert!(reported, "no `VaultRedeemed` for vault {owner}: debt {debt}, collateral {collateral}");
 }
 
 /// Runs an active-pool recovery offset, signed by an arbitrary account.

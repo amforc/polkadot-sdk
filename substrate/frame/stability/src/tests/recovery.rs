@@ -43,12 +43,11 @@ fn active_pool_recovery_offset_settles_the_head() {
 
 		// collateral_out = floor(floor(300 * 1.03) / 0.52) = floor(309/0.52)
 		//                = 594.
+		assert_vault_redeemed(5, 300, 594);
 		System::assert_has_event(
 			crate::Event::RecoveryOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 300,
-				collateral_gain: 594,
 				source: crate::types::RecoveryOffsetSource::ActivePool,
 			}
 			.into(),
@@ -206,12 +205,11 @@ fn par_band_head_settles_at_face_value() {
 
 		// collateral_out = floor(200 / 0.5025) = 398 — no bonus, no haircut.
 		assert_ok!(offset_recovery(DOT, PUSD, 200));
+		assert_vault_redeemed(5, 200, 398);
 		System::assert_has_event(
 			crate::Event::RecoveryOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 200,
-				collateral_gain: 398,
 				source: crate::types::RecoveryOffsetSource::ActivePool,
 			}
 			.into(),
@@ -221,12 +219,11 @@ fn par_band_head_settles_at_face_value() {
 		// Full settlement includes the terminal charge. Partial settlement does not.
 		mint_stable(PUSD, 2, 301);
 		assert_ok!(deposit(2, DOT, PUSD, 301));
+		assert_vault_redeemed(5, 301, 599);
 		System::assert_has_event(
 			crate::Event::RecoveryOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 301,
-				collateral_gain: 599,
 				source: crate::types::RecoveryOffsetSource::IncomingDeposit,
 			}
 			.into(),
@@ -275,12 +272,11 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		mint_stable(PUSD, 2, 800);
 		assert_ok!(deposit(2, DOT, PUSD, 800));
 
+		assert_vault_redeemed(5, 501, 992);
 		System::assert_has_event(
 			crate::Event::RecoveryOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 501,
-				collateral_gain: 992,
 				source: crate::types::RecoveryOffsetSource::IncomingDeposit,
 			}
 			.into(),
@@ -291,7 +287,6 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 				stable_id: PUSD,
 				depositor: 2,
 				amount: 800,
-				used_for_recovery: 501,
 				pending_amount: 299,
 			}
 			.into(),
@@ -348,7 +343,6 @@ fn incoming_deposit_fully_used_leaves_no_pending() {
 				stable_id: PUSD,
 				depositor: 2,
 				amount: 200,
-				used_for_recovery: 200,
 				pending_amount: 0,
 			}
 			.into(),
