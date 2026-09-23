@@ -22,14 +22,18 @@ use asset_hub_westend_runtime::{
 		StabilityCollateral, StableInsuranceAccount, VaultsCollateral, VaultsDepositPolicy,
 		VaultsNativeCollateralId,
 	},
-	Assets, AuraExt, Balances, MockOracle, Redemptions, Runtime, RuntimeHoldReason, Stability,
-	Timestamp, Vaults,
+	Assets, AuraExt, Balances, MockOracle, OriginCaller, Redemptions, Runtime, RuntimeCall,
+	RuntimeEvent, RuntimeHoldReason, Stability, Timestamp, Vaults,
 };
-use frame_support::{assert_noop, assert_storage_noop};
+use emulated_integration_tests_common::macros::DryRunApiV2;
+use frame_support::{
+	assert_noop, assert_storage_noop,
+	storage::{with_transaction, TransactionOutcome},
+};
 use pallet_redemptions::RedemptionTerms;
 use pallet_vaults::JitTerms;
 use pusd_primitives::VaultStatus;
-use sp_runtime::DispatchResult;
+use sp_runtime::{DispatchError, DispatchResult};
 
 pub(crate) const WND: Balance = 1_000_000_000_000;
 /// The stablecoin's metadata decimals.
@@ -524,6 +528,71 @@ pub(crate) fn redeem(redeemer: &AccountId, terms: RedemptionTerms<Balance>) -> B
 
 	assert_eq!(pusd_balance(redeemer), PUSD_MIN_BALANCE);
 	native_balance(redeemer) - native_before
+}
+
+/// Amounts that a dry run of `Redemptions::redeem` reports through its settlement event.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DryRedemption {
+	pub stable_burned: Balance,
+	pub fee: Balance,
+	pub collateral_out: Balance,
+	pub steps: u32,
+}
+
+impl DryRedemption {
+	/// Total pUSD that the redeemer would pay.
+	pub(crate) fn stable_in(&self) -> Balance {
+		self.stable_burned + self.fee
+	}
+
+	fn from_events(events: Vec<RuntimeEvent>) -> Option<Self> {
+		events.into_iter().find_map(|event| match event {
+			RuntimeEvent::Redemptions(pallet_redemptions::Event::OrdinaryRedemptionExecuted {
+				stable_burned,
+				collateral_out,
+				fee,
+				steps,
+				..
+			}) => Some(Self { stable_burned, fee, collateral_out, steps }),
+			RuntimeEvent::Redemptions(pallet_redemptions::Event::RecoveryRedemptionExecuted {
+				stable_burned,
+				collateral_out,
+				..
+			}) => Some(Self { stable_burned, fee: 0, collateral_out, steps: 1 }),
+			_ => None,
+		})
+	}
+}
+
+/// Dry-runs a redemption by an account that can pay all of `max_stable_to_spend`, so only the
+/// market bounds the result.
+///
+/// The pallet has no quote of its own. A client dry-runs the call through the runtime's
+/// `DryRunApi` and reads the amounts from the settlement event, and so does this helper. The
+/// funding is rolled back with the dry run, so the call changes nothing.
+pub(crate) fn dry_run_funded_redeem(
+	max_stable_to_spend: Balance,
+) -> Result<DryRedemption, DispatchError> {
+	let redeemer = acct(0xEF);
+	with_transaction(|| {
+		fund_dot(&redeemer, 0);
+		mint_pusd(&redeemer, max_stable_to_spend + PUSD_MIN_BALANCE);
+		let call = RuntimeCall::Redemptions(pallet_redemptions::Call::redeem {
+			collateral_id: get_native_id(),
+			stable_id: PUSD_ID,
+			terms: RedemptionTerms { max_stable_to_spend, min_collateral_out: 0 },
+			recipient: redeemer.clone(),
+			max_steps: 16,
+		});
+		let origin = OriginCaller::system(frame_system::RawOrigin::Signed(redeemer.clone()));
+		let effects = Runtime::dry_run_call(origin, call, xcm::prelude::XCM_VERSION)
+			.expect("the runtime can dry-run a local call");
+		let dry = effects.execution_result.map_err(|failed| failed.error).map(|_post_info| {
+			DryRedemption::from_events(effects.emitted_events)
+				.expect("a successful redemption deposits its settlement event")
+		});
+		TransactionOutcome::Rollback(dry)
+	})
 }
 
 pub(crate) fn pusd_balance(who: &AccountId) -> Balance {
