@@ -1,7 +1,7 @@
 //! `try_state` invariant verification.
 //!
-//! Gated on `feature = "try-runtime"`. Run after every test by the mock's
-//! `next_block` and end-to-end by the runtime's pre-upgrade hook.
+//! Gated on `feature = "try-runtime"` or `test`. Run after every test by the mock's
+//! `build_and_execute` and end-to-end by the runtime's pre-upgrade hook.
 
 use crate::{
 	pallet::{
@@ -13,11 +13,11 @@ use crate::{
 use alloc::collections::{BTreeMap, BTreeSet};
 use frame::{
 	arithmetic::{CheckedAdd, FixedPointNumber, FixedU128, Zero},
+	deps::sp_runtime::TryRuntimeError,
 	traits::{
 		fungibles::{Inspect as FungiblesInspect, InspectHold},
 		Convert, Time,
 	},
-	try_runtime::TryRuntimeError,
 };
 use linked_list_interface::SortedListInterface;
 

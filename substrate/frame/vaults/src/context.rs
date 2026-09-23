@@ -241,6 +241,16 @@ impl<T: Config> Context<T> {
 			.checked_add(&initial_collateral)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		self.state.total_collateral = total_collateral;
+		// The vault is announced before its fee, so a reader of the events never sees a charge
+		// against a vault it does not know yet.
+		Pallet::<T>::deposit_event(Event::VaultOpened {
+			collateral_id: self.collateral_id.clone(),
+			stable_id: self.stable_id.clone(),
+			owner: owner.clone(),
+			collateral: initial_collateral,
+			debt: initial_debt,
+			annual_rate,
+		});
 		self.charge_upfront_fee(owner, upfront_fee);
 		// Charged only after every in-memory check, so a rejected open reports the validation
 		// error rather than the deposit's.
@@ -696,9 +706,7 @@ impl<T: Config> VaultOp<T> {
 		Pallet::<T>::commit_branch(&collateral_id, &stable_id, now, state)?;
 
 		// Mint after writing state. Keep both amounts separate to preserve fee rounding.
-		if !pending_interest_mint.is_zero() {
-			Pallet::<T>::mint_and_route_yield(&collateral_id, &stable_id, pending_interest_mint)?;
-		}
+		Pallet::<T>::issue_interest(&collateral_id, &stable_id, pending_interest_mint)?;
 		if !pending_fee.is_zero() {
 			Pallet::<T>::mint_and_route_yield(&collateral_id, &stable_id, pending_fee)?;
 		}

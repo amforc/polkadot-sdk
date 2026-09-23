@@ -515,11 +515,10 @@ pub fn new_test_ext() -> TestState {
 	ext
 }
 
-/// Runs a test and checks invariants when `try-runtime` is enabled.
+/// Runs a test, then checks the pallet's `try_state` invariants against the state it left behind.
 pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
-		#[cfg(feature = "try-runtime")]
 		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 	});
 }

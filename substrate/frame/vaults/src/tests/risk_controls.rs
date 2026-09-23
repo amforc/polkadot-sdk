@@ -127,7 +127,6 @@ fn assert_aggregate_matches(stable: StableId) {
 		recomputed_stablecoin_debt(stable),
 		"StablecoinDebt aggregate diverged from the branch recomputation"
 	);
-	#[cfg(feature = "try-runtime")]
 	crate::try_state::do_try_state::<Test>().expect("all aggregate identities hold");
 }
 

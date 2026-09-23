@@ -3,7 +3,7 @@ use crate::{
 	tests::{assert_event, rate_pct, vault_events, ONE_DAY_MS},
 };
 
-// Open emits VaultOpened carrying both inputs, plus UpfrontFeeCharged for the
+// Open emits VaultOpened carrying its inputs, plus UpfrontFeeCharged for the
 // protocol-favored fee.
 #[test]
 fn open_vault_emits_canonical_events() {
@@ -16,6 +16,7 @@ fn open_vault_emits_canonical_events() {
 			owner: 1,
 			collateral: 1_000,
 			debt: 2_000,
+			annual_rate: rate_pct(10, 100),
 		});
 		// Upfront fee is non-trivial for these inputs.
 		let predicted_fee =
@@ -130,9 +131,14 @@ fn premature_change_rate_emits_upfront_fee_charged() {
 		// Within the cooldown window — fee charged.
 		advance_time(ONE_DAY_MS / 2);
 		assert_ok!(poke(1, DOT, PUSD, 1));
-		let predicted =
-			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(7, 100))
-				.expect("registered market and vault");
+		let predicted = crate::Pallet::<Test>::predict_borrow_upfront_fee(
+			DOT,
+			PUSD,
+			1,
+			0,
+			Some(rate_pct(7, 100)),
+		)
+		.expect("registered market and vault");
 		assert!(predicted > 0);
 		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(7, 100)));
 		assert_event(crate::Event::UpfrontFeeCharged {

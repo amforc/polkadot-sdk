@@ -19,7 +19,7 @@ fn seed_long_rate_index() {
 // A rate-position hint never names a vault that has left the rate index (a
 // redemption-Dormant vault).
 #[test]
-fn find_rate_position_skips_dormant_vaults() {
+fn find_position_skips_dormant_vaults() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Five vaults at 1%, 2%, 3%, 4%, 5%.
@@ -41,7 +41,7 @@ fn find_rate_position_skips_dormant_vaults() {
 
 		// Now query a hint at a rate near acct 1's old rate. The result
 		// must not name acct 1 — it's no longer in the index.
-		let pos = crate::Pallet::<Test>::find_rate_position(DOT, PUSD, rate_pct(15, 1000)); // 1.5%
+		let pos = LinkedList::find_position(rate_list(DOT, PUSD), rate_pct(15, 1000)); // 1.5%
 		assert_ne!(pos.prev, Some(1));
 		assert_ne!(pos.next, Some(1));
 	});
@@ -58,10 +58,13 @@ fn repair_steps_needed_zero_for_valid_positive_for_stale() {
 		}
 		let budget = <LinkedList as SortedListInterface<VaultList, u64>>::repair_budget();
 		let rate = rate_pct(25, 100);
-		let good = crate::Pallet::<Test>::find_rate_position(DOT, PUSD, rate);
-		assert_eq!(crate::Pallet::<Test>::repair_steps_needed(DOT, PUSD, rate, good), 0);
-		let stale =
-			crate::Pallet::<Test>::repair_steps_needed(DOT, PUSD, rate, Position::endpoints_only());
+		let good = LinkedList::find_position(rate_list(DOT, PUSD), rate);
+		assert_eq!(LinkedList::repair_steps_needed(&rate_list(DOT, PUSD), rate, good), 0);
+		let stale = LinkedList::repair_steps_needed(
+			&rate_list(DOT, PUSD),
+			rate,
+			Position::endpoints_only(),
+		);
 		assert!(stale > 0 && stale <= budget, "stale hint must be repairable within budget");
 	});
 }
@@ -74,9 +77,8 @@ fn repair_steps_needed_exceeds_budget_for_extreme_hint_in_long_index() {
 		register_market(DOT, PUSD);
 		seed_long_rate_index();
 		let budget = <LinkedList as SortedListInterface<VaultList, u64>>::repair_budget();
-		let steps = crate::Pallet::<Test>::repair_steps_needed(
-			DOT,
-			PUSD,
+		let steps = LinkedList::repair_steps_needed(
+			&rate_list(DOT, PUSD),
 			rate_pct(1, 100),
 			Position::endpoints_only(),
 		);
@@ -106,7 +108,10 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 			crate::Error::<Test>::InvalidPositionHints
 		);
 		assert!(vault_status(DOT, PUSD, 21).is_final_recovery());
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), alloc::vec![21]);
+		assert_eq!(
+			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
+			alloc::vec![21]
+		);
 	});
 }
 

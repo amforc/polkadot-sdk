@@ -4,7 +4,7 @@
 use crate::{
 	math,
 	pallet::{
-		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, Error, Millis, Pallet,
+		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, Error, Event, Millis, Pallet,
 		StableCreditOf, StableIdOf, StablecoinDebt, VaultRecordOf, Vaults,
 	},
 	recovery,
@@ -381,6 +381,18 @@ impl<T: Config> Pallet<T> {
 		VaultStatus::Dormant
 	}
 
+	/// Returns the vault's status, or `None` when the vault does not exist.
+	///
+	/// Not a view: [`Pallet::vault_after_touch`] reports the same status.
+	pub fn vault_status(
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+		owner: T::AccountId,
+	) -> Option<VaultStatus> {
+		Vaults::<T>::contains_key((&collateral_id, &stable_id, &owner))
+			.then(|| Self::vault_status_of(&collateral_id, &stable_id, &owner))
+	}
+
 	/// Derive the lifecycle status of an existing vault row from queue/index
 	/// membership. Status is not stored on the row, and the keys must be
 	/// re-supplied because the row does not carry them.
@@ -546,6 +558,24 @@ impl<T: Config> Pallet<T> {
 		Self::resolve_fee_credit(stable_id, credit)
 	}
 
+	/// Issues aggregate interest as market yield and reports it.
+	pub(crate) fn issue_interest(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		amount: BalanceOf<T>,
+	) -> DispatchResult {
+		if amount.is_zero() {
+			return Ok(());
+		}
+		Self::mint_and_route_yield(collateral_id, stable_id, amount)?;
+		Self::deposit_event(Event::InterestIssued {
+			collateral_id: collateral_id.clone(),
+			stable_id: stable_id.clone(),
+			amount,
+		});
+		Ok(())
+	}
+
 	/// Persists the market's pending aggregate interest and issues it as yield.
 	///
 	/// A frozen market has no elapsed interest time, so it issues nothing.
@@ -557,10 +587,7 @@ impl<T: Config> Pallet<T> {
 			Self::accrue_aggregate_interest(state, now)
 		})?;
 		// Mint only after storing the updated market.
-		if !minted.is_zero() {
-			Self::mint_and_route_yield(collateral_id, stable_id, minted)?;
-		}
-		Ok(())
+		Self::issue_interest(collateral_id, stable_id, minted)
 	}
 
 	/// Issues uncovered terminal rounding revenue to the fee account.
@@ -807,19 +834,19 @@ impl<T: Config> Pallet<T> {
 
 	/// Projects a vault's fully accrued debt from branch state accrued to `now`.
 	///
-	/// Returns `None` when the vault is missing. Each projection is independent of iteration order.
+	/// Each projection is independent of iteration order.
 	pub(crate) fn projected_vault_debt(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
 		accrued_state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
-	) -> Option<BalanceOf<T>> {
+	) -> Result<BalanceOf<T>, DispatchError> {
 		let mut state = accrued_state.clone();
-		let mut vault = Self::vault_of(collateral_id, stable_id, owner).ok()?;
+		let mut vault = Self::vault_of(collateral_id, stable_id, owner)?;
 		let status = Self::vault_status_of(collateral_id, stable_id, owner);
-		Self::apply_vault_touch(&mut state, &mut vault, status, now).ok()?;
-		Some(vault.debt.total())
+		Self::apply_vault_touch(&mut state, &mut vault, status, now)?;
+		Ok(vault.debt.total())
 	}
 
 	/// A zero-debt, zero-stake vault row: the pre-borrow shape an open feeds

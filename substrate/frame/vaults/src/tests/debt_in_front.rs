@@ -32,23 +32,26 @@ fn debt_in_front_sums_lower_rate_vaults_only() {
 			|rate, steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate, steps);
 
 		// Entire debt at rates strictly < 0.7%: vaults 1..=4.
-		assert_eq!(debt_in_front(rate_pct(7, 1000), u32::MAX), 500 + 700 + 600 + 800 + 4 * FEE);
+		assert_eq!(
+			debt_in_front(rate_pct(7, 1000), u32::MAX),
+			Ok((500 + 700 + 600 + 800 + 4 * FEE, false))
+		);
 
 		// Entire debt at rates strictly < 0.6%: vaults 1..=2.
-		assert_eq!(debt_in_front(rate_pct(6, 1000), u32::MAX), 500 + 700 + 2 * FEE);
+		assert_eq!(debt_in_front(rate_pct(6, 1000), u32::MAX), Ok((500 + 700 + 2 * FEE, false)));
 
 		// Entire debt at rates strictly < 1% covers everything.
 		let all = 500 + 700 + 600 + 800 + 900 + 1_000 + 400 + 500 + 8 * FEE;
-		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), all);
+		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), Ok((all, false)));
 
 		// The step cap stops the walk early.
 		assert_eq!(
 			debt_in_front(rate_pct(1, 100), 2),
-			500 + 700 + 2 * FEE,
+			Ok((500 + 700 + 2 * FEE, true)),
 			"cap of 2 visits only the two tail vaults"
 		);
 		// A cap at least the list length matches the uncapped result.
-		assert_eq!(debt_in_front(rate_pct(1, 100), 8), all);
+		assert_eq!(debt_in_front(rate_pct(1, 100), 8), Ok((all, false)));
 	});
 }
 
@@ -68,14 +71,14 @@ fn debt_in_front_projects_pending_interest_poke_independent() {
 		//   vault 1: 500 + 1 (fee) + floor(500 × 0.5%) = 503
 		//   vault 2: 700 + 1 (fee) + floor(700 × 0.6%) = 705
 		advance_time(ONE_YEAR_MS);
-		assert_eq!(debt_in_front(), 503 + 705);
+		assert_eq!(debt_in_front(), Ok((503 + 705, false)));
 
 		// Poking vault 1 moves its pending interest into recorded debt; the
 		// total must not change.
 		assert_ok!(poke(9, DOT, PUSD, 1));
 		let v1 = vault(DOT, PUSD, 1);
 		assert_eq!(v1.debt.interest, 3, "fee 1 + year interest 2 settled by the poke");
-		assert_eq!(debt_in_front(), 503 + 705, "projection unchanged by the poke");
+		assert_eq!(debt_in_front(), Ok((503 + 705, false)), "projection unchanged by the poke");
 	});
 }
 
@@ -90,7 +93,7 @@ fn debt_in_front_includes_dormant_redemption_target() {
 		assert_ok!(open(2, DOT, PUSD, 5_000, 700, rate_pct(6, 1000))); // 0.6%
 		let debt_in_front =
 			|steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), steps);
-		assert_eq!(debt_in_front(u32::MAX), 501 + 701); // principal + fee 1 each, no elapsed time
+		assert_eq!(debt_in_front(u32::MAX), Ok((501 + 701, false))); // principal + fee 1 each, no elapsed time
 
 		// Redeem vault 1 (entire debt 501) down to 199, one below `MinimumDebt`.
 		assert_ok!(redeem(DOT, PUSD, 3, 302));
@@ -102,13 +105,13 @@ fn debt_in_front_includes_dormant_redemption_target() {
 		);
 		assert_eq!(
 			debt_in_front(u32::MAX),
-			199 + 701,
+			Ok((199 + 701, false)),
 			"the dormant target's residual (199) is consumed first and counted"
 		);
 		// The dormant target consumes one step of the walk budget, mirroring the
 		// per-touch step accounting a real redemption pays.
-		assert_eq!(debt_in_front(1), 199, "one step reaches only the dormant target");
-		assert_eq!(debt_in_front(0), 0, "a zero budget counts nothing");
+		assert_eq!(debt_in_front(1), Ok((199, true)), "one step reaches only the dormant target");
+		assert_eq!(debt_in_front(0), Ok((0, true)), "a zero budget counts nothing");
 	});
 }
 
@@ -134,31 +137,38 @@ fn debt_in_front_counts_final_recovery_queue_first() {
 			|rate, steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate, steps);
 
 		// The recovery vault counts at every rate; vault 3 at exactly 0.7% does not.
-		assert_eq!(debt_in_front(rate_pct(7, 1000), u32::MAX), 501 + 701);
-		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), 501 + 701 + 901);
+		assert_eq!(debt_in_front(rate_pct(7, 1000), u32::MAX), Ok((501 + 701, false)));
+		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), Ok((501 + 701 + 901, false)));
 		// The recovery vault consumes the first walk step.
-		assert_eq!(debt_in_front(rate_pct(1, 100), 1), 501);
-		assert_eq!(debt_in_front(rate_pct(1, 100), 0), 0);
+		assert_eq!(debt_in_front(rate_pct(1, 100), 1), Ok((501, true)));
+		assert_eq!(debt_in_front(rate_pct(1, 100), 0), Ok((0, true)));
 
 		// Redeeming vault 2 below `MinimumDebt` parks it as the dormant target:
 		// the walk orders recovery (501), then the dormant residual (199), then
 		// the rate index (901).
 		assert_ok!(redeem_from(DOT, PUSD, 2, 4, 502));
 		assert!(vault_status(DOT, PUSD, 2).is_dormant());
-		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), 501 + 199 + 901);
-		assert_eq!(debt_in_front(rate_pct(1, 100), 2), 501 + 199);
+		assert_eq!(debt_in_front(rate_pct(1, 100), u32::MAX), Ok((501 + 199 + 901, false)));
+		assert_eq!(debt_in_front(rate_pct(1, 100), 2), Ok((501 + 199, true)));
 	});
 }
 
-// A zero step budget and an empty rate index both return zero.
+// A zero step budget and an empty rate index both return zero, and only the
+// budget truncates.
 #[test]
 fn debt_in_front_zero_for_no_steps_or_empty_index() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Empty rate index → nothing in front.
-		assert_eq!(crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX), 0);
+		assert_eq!(
+			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX),
+			Ok((0, false))
+		);
 		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000)));
 		// A zero step budget visits no vaults.
-		assert_eq!(crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), 0), 0);
+		assert_eq!(
+			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), 0),
+			Ok((0, true))
+		);
 	});
 }
