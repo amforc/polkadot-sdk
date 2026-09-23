@@ -96,6 +96,12 @@ Consumer pallets use [`SortedListInterface`]:
   `node` (priority + neighbors in one read), `find_position`,
   `find_re_insert_position`, `repair_steps_needed`.
 
+Off-chain clients get view functions only for the reads that cost more than a
+storage lookup: `node`, `iter_from_tail`, `find_position`,
+`find_re_insert_position`. `head`, `tail`, and the item count are the
+`ListMetas` row itself. A client unsure whether a hint is stale fetches a fresh
+one instead of measuring the repair it would need.
+
 Mutating operations fail with [`ListError`], a standalone enum consumer
 pallets can match on or nest directly in their own `#[pallet::error]` (it
 derives `PalletError`); this pallet's own `Error<T>` nests it the same way

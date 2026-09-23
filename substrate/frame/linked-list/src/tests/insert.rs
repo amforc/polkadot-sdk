@@ -25,9 +25,9 @@ fn insert_into_empty_list_sets_head_tail_size() {
 	build_and_execute(|| {
 		let steps = LinkedList::insert(1, 100, 50, Position::endpoints_only()).unwrap();
 		assert_eq!(steps, 0);
-		assert_eq!(LinkedList::head(1), Some(100));
-		assert_eq!(LinkedList::tail(1), Some(100));
-		assert_eq!(LinkedList::count(1), 1);
+		assert_eq!(LinkedList::head(&1), Some(100));
+		assert_eq!(LinkedList::tail(&1), Some(100));
+		assert_eq!(LinkedList::count(&1), 1);
 		assert_eq!(dump(1), vec![(100, 50)]);
 		System::assert_last_event(
 			Event::ItemInserted { list_id: 1, item: 100, priority: 50 }.into(),
@@ -80,7 +80,7 @@ fn insert_at_head() {
 	build_and_execute(|| {
 		insert(1, 100, 50);
 		assert_ok!(LinkedList::insert(1, 200, 90, Position::at_head(100)));
-		assert_eq!(LinkedList::head(1), Some(200));
+		assert_eq!(LinkedList::head(&1), Some(200));
 		assert_eq!(dump(1), vec![(200, 90), (100, 50)]);
 	});
 }
@@ -90,7 +90,7 @@ fn insert_at_tail() {
 	build_and_execute(|| {
 		insert(1, 100, 90);
 		assert_ok!(LinkedList::insert(1, 200, 10, Position::at_tail(100)));
-		assert_eq!(LinkedList::tail(1), Some(200));
+		assert_eq!(LinkedList::tail(&1), Some(200));
 		assert_eq!(dump(1), vec![(100, 90), (200, 10)]);
 	});
 }
@@ -144,8 +144,8 @@ fn insert_does_not_saturate_size_counter() {
 			Err(ListError::ListTooLong)
 		));
 		assert!(!ListNodes::<Test>::contains_key(1, 100));
-		assert!(LinkedList::head(1).is_none());
-		assert!(LinkedList::tail(1).is_none());
+		assert!(LinkedList::head(&1).is_none());
+		assert!(LinkedList::tail(&1).is_none());
 	});
 }
 

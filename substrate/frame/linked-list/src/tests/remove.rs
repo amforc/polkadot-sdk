@@ -23,9 +23,9 @@ fn remove_only_item_clears_head_tail_size() {
 	build_and_execute(|| {
 		insert(1, 100, 50);
 		assert_ok!(LinkedList::remove(&1, &100));
-		assert!(LinkedList::head(1).is_none());
-		assert!(LinkedList::tail(1).is_none());
-		assert_eq!(LinkedList::count(1), 0);
+		assert!(LinkedList::head(&1).is_none());
+		assert!(LinkedList::tail(&1).is_none());
+		assert_eq!(LinkedList::count(&1), 0);
 		assert!(!ListMetas::<Test>::contains_key(1));
 		System::assert_has_event(Event::ItemRemoved { list_id: 1, item: 100, priority: 50 }.into());
 		System::assert_last_event(Event::ListRemoved { list_id: 1 }.into());
@@ -49,7 +49,7 @@ fn remove_head_promotes_next() {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		assert_ok!(LinkedList::remove(&1, &100));
-		assert_eq!(LinkedList::head(1), Some(200));
+		assert_eq!(LinkedList::head(&1), Some(200));
 		assert_eq!(dump(1), vec![(200, 50)]);
 	});
 }
@@ -60,7 +60,7 @@ fn remove_tail_promotes_prev() {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		assert_ok!(LinkedList::remove(&1, &200));
-		assert_eq!(LinkedList::tail(1), Some(100));
+		assert_eq!(LinkedList::tail(&1), Some(100));
 		assert_eq!(dump(1), vec![(100, 90)]);
 	});
 }
@@ -110,8 +110,8 @@ fn pop_tail_removes_lowest_priority_tail() {
 		hypothetically!({
 			assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((200, 50)));
 			assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((100, 90)));
-			assert!(LinkedList::head(1).is_none());
-			assert!(LinkedList::tail(1).is_none());
+			assert!(LinkedList::head(&1).is_none());
+			assert!(LinkedList::tail(&1).is_none());
 			assert!(!ListMetas::<Test>::contains_key(1));
 		});
 	});

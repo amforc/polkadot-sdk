@@ -19,8 +19,6 @@
 //! continuously by `build_and_execute`'s post-test check; these tests
 //! additionally prove that deliberate corruption is detected.
 
-#![cfg(feature = "try-runtime")]
-
 use crate::{mock::*, ListMeta, ListMetas, ListNodes, Node, Position, SortedListInterface};
 
 #[test]
