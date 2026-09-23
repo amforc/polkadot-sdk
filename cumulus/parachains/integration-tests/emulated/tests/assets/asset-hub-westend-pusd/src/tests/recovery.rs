@@ -86,12 +86,12 @@ fn final_recovery_entry_pays_the_liquidation_keeper_reward() {
 		assert_eq!(collateral_on_hold(&get_native_id(), &parked_owner), 6_000 * WND - reward);
 		assert_eq!(branch_state().total_collateral, 6_000 * WND - reward);
 		System::assert_has_event(RuntimeEvent::Vaults(
-			pallet_vaults::Event::VaultEnteredFinalRecovery {
+			pallet_vaults::Event::FinalRecoveryRewardPaid {
 				collateral_id: get_native_id(),
 				stable_id: PUSD_ID,
 				owner: parked_owner.clone(),
 				keeper: keeper.clone(),
-				keeper_reward: reward,
+				amount: reward,
 			},
 		));
 
@@ -201,13 +201,21 @@ fn final_recovery_redemption_below_par_with_full_insurance_cover() {
 		assert_eq!(settled_out, 2_500 * WND);
 		// The fund burns only the shortfall and keeps the surplus.
 		assert_eq!(pusd_balance(&insurance), 1_000 * PUSD);
+		// Vaults reports the settled vault; Redemptions adds who paid and what the fund covered.
+		System::assert_has_event(RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed {
+			collateral_id: get_native_id(),
+			stable_id: PUSD_ID,
+			owner: parked_owner.clone(),
+			recipient: settler.clone(),
+			debt_cancelled: 7_000 * PUSD,
+			collateral_to_recipient: 2_500 * WND,
+			vault_annual_rate: FixedU128::zero(),
+		}));
 		System::assert_has_event(RuntimeEvent::Redemptions(
 			pallet_redemptions::Event::RecoveryRedemptionExecuted {
 				collateral_id: get_native_id(),
 				stable_id: PUSD_ID,
 				redeemer: settler.clone(),
-				recipient: settler.clone(),
-				vault_owner: parked_owner.clone(),
 				stable_burned: 5_000 * PUSD,
 				insurance_cover: 2_000 * PUSD,
 				collateral_out: 2_500 * WND,
@@ -243,7 +251,7 @@ fn nominated_last_dormant_can_recover_and_settle_after_becoming_underwater() {
 
 		feed_price(dot_price(1, 20));
 		assert_noop!(
-			Redemptions::preview_redeem(get_native_id(), PUSD_ID, 1_000 * PUSD, 16),
+			dry_run_funded_redeem(1_000 * PUSD),
 			pallet_redemptions::Error::<Runtime>::NoRedeemableVault
 		);
 		assert_ok!(
