@@ -108,11 +108,12 @@ pub mod weights;
 mod dispatchable_impls;
 mod interfaces;
 mod math;
-#[cfg(feature = "try-runtime")]
+// The mock checks these invariants after each run, so `test-utils` needs them as well.
+#[cfg(any(feature = "try-runtime", feature = "test-utils", test))]
 mod try_state;
 
-#[cfg(test)]
-mod mock;
+#[cfg(any(feature = "test-utils", test))]
+pub mod mock;
 #[cfg(test)]
 mod tests;
 
@@ -311,15 +312,14 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// Stablecoin entered the pool. `used_for_recovery` settled `FinalRecovery` debt.
-		/// `pending_amount` entered the pending deposit or the active pool when the delay was
-		/// zero.
+		/// Stablecoin entered the pool. `pending_amount` entered the pending deposit or the active
+		/// pool when the delay was zero. The rest of `amount` settled `FinalRecovery` debt, which
+		/// [`Event::RecoveryOffsetApplied`] marks.
 		DepositReceived {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
-			used_for_recovery: BalanceOf<T>,
 			pending_amount: BalanceOf<T>,
 		},
 		/// A maturity cohort passed its deadline, and the capital that remained joined the active
@@ -386,32 +386,34 @@ pub mod pallet {
 		},
 		/// Active stablecoin canceled liquidation debt. `epoch` and `scale` are the coordinates
 		/// the active pool holds after the offset.
+		///
+		/// The liquidation engine reports the debt burned and the collateral gained, as the active
+		/// pool leg of its own outcome.
 		PoolOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			debt_burned: BalanceOf<T>,
-			collateral_gain: BalanceOf<T>,
 			epoch: u32,
 			scale: u32,
 		},
 		/// Pending deposits canceled liquidation debt as the final pool backstop, in proportion
 		/// to their size. `epoch` and `scale` are the coordinates the pending leg holds after the
 		/// offset.
+		///
+		/// The liquidation engine reports the debt burned and the collateral gained, as the
+		/// pending pool leg of its own outcome.
 		PendingDepositOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			debt_burned: BalanceOf<T>,
-			collateral_gain: BalanceOf<T>,
 			epoch: u32,
 			scale: u32,
 		},
 		/// Stablecoin settled the head of the `FinalRecovery` queue. `source` identifies the
 		/// capital that paid and therefore the owner of the collateral gain.
+		///
+		/// The vault engine reports the settled vault, the debt burned, and the collateral gained.
 		RecoveryOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			debt_burned: BalanceOf<T>,
-			collateral_gain: BalanceOf<T>,
 			source: RecoveryOffsetSource,
 		},
 		/// An authorized origin replaced the pool parameters of a market.
@@ -488,6 +490,37 @@ pub mod pallet {
 		#[cfg(feature = "try-runtime")]
 		fn try_state(_: BlockNumberFor<T>) -> Result<(), frame::try_runtime::TryRuntimeError> {
 			crate::try_state::do_try_state::<T>()
+		}
+	}
+
+	#[pallet::view_functions]
+	impl<T: Config> Pallet<T> {
+		/// Returns the deposit row its next settlement would store.
+		///
+		/// Pending offsets, collateral gains, yield, and any cohort activation that is due are
+		/// applied, and nothing is persisted. The stored row holds the amounts as of the last
+		/// settlement, so the difference is the pending part.
+		///
+		/// A row that settles to no value is returned with zero amounts, although the settlement
+		/// would remove it. A missing pool or row is reported explicitly.
+		pub fn deposit_after_settlement(
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			owner: T::AccountId,
+		) -> Result<DepositOf<T>, DispatchError> {
+			Self::settled_deposit(&owner, &collateral_id, &stable_id)
+		}
+
+		/// Returns the pool state with each due cohort activated.
+		///
+		/// Activation needs no action from a depositor, so the stored totals can still count
+		/// capital as pending after its deadline. This view reports the classification an offset
+		/// or a settlement would use now. A frozen market activates nothing.
+		pub fn pool_after_activation(
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+		) -> Result<PoolStateOf<T>, DispatchError> {
+			Self::activated_pool_state(&collateral_id, &stable_id)
 		}
 	}
 

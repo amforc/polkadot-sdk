@@ -34,8 +34,6 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 			crate::Event::PoolOffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				debt_burned: 500,
-				collateral_gain: 400,
 				epoch: 0,
 				scale: 0,
 			}
@@ -170,8 +168,6 @@ fn combined_offset_settles_active_then_pending() {
 				crate::Event::PoolOffsetApplied {
 					collateral_id: DOT,
 					stable_id: USDX,
-					debt_burned: 60_000,
-					collateral_gain: 240,
 					epoch: 1,
 					scale: 0,
 				}
@@ -181,8 +177,6 @@ fn combined_offset_settles_active_then_pending() {
 				crate::Event::PendingDepositOffsetApplied {
 					collateral_id: DOT,
 					stable_id: USDX,
-					debt_burned: 40_000,
-					collateral_gain: 160,
 					epoch: 1,
 					scale: 0,
 				}

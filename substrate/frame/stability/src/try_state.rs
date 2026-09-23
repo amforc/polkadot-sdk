@@ -14,8 +14,7 @@ use crate::{
 use alloc::collections::BTreeMap;
 use frame::{
 	arithmetic::{FixedU128, One, Saturating, Zero},
-	deps::frame_support::traits::fungibles::Inspect as _,
-	try_runtime::TryRuntimeError,
+	deps::{frame_support::traits::fungibles::Inspect as _, sp_runtime::TryRuntimeError},
 };
 
 /// Member counts and claims derived from the deposit rows of one market.

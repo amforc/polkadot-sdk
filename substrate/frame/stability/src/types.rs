@@ -15,7 +15,7 @@ use crate::math;
 /// A deposit stores these coordinates in its snapshot. Their change measures the deposit loss
 /// without an update to every deposit row.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub struct Accumulators {
 	/// The fraction of a deposit that survives every offset applied so far.
 	pub p: FixedU128,
@@ -53,7 +53,7 @@ impl Leg {
 
 /// Gains per deposit unit at one `(epoch, scale)` coordinate.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, Default)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub struct PoolSums {
 	/// `S`: collateral paid per unit of deposit.
 	pub s_collateral: FixedU128,
@@ -66,7 +66,7 @@ pub struct PoolSums {
 /// The difference between this snapshot and the current accumulators gives the unsettled loss and
 /// gains of the deposit.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub struct DepositSnapshot {
 	/// The accumulator coordinates at the time of the last realization.
 	pub coords: Accumulators,
@@ -108,7 +108,7 @@ pub struct CohortId(pub u64);
 ///
 /// The pool keeps at most two in [`PoolState::open_cohorts`].
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub struct OpenCohort<Balance> {
 	/// Stable identifier referenced by member rows.
 	pub id: CohortId,
@@ -227,7 +227,7 @@ impl PoolPrecision {
 }
 
 /// Settlement result for a deposit at the current accumulators.
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub struct Realized<Balance> {
 	/// Deposit principal that remains after all applicable offsets.
 	pub compounded: Balance,
@@ -238,7 +238,7 @@ pub struct Realized<Balance> {
 }
 
 /// Effect of an offset on `P`.
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub enum PUpdate {
 	/// The leg remains with a smaller `P`. `scales_crossed` counts the rescale operations that
 	/// keep `P` at or above `p_min`.
@@ -252,7 +252,7 @@ pub enum PUpdate {
 /// `active_deposit` is the amount at the last settlement. Each row operation must first apply the
 /// current loss and gain accumulators.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub struct Deposit<Balance> {
 	/// Stablecoin that absorbs offsets and earns yield.
 	pub active_deposit: Balance,
@@ -301,7 +301,7 @@ impl<Balance: Zero> Deposit<Balance> {
 /// Pending capital earns no yield and is not part of `total_active_deposits`. It remains exposed as
 /// the final pool backstop, in proportion to each pending deposit.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub struct PendingDeposit<Balance> {
 	/// Amount at the last settlement. It can lag the current pending `P`.
 	pub amount: Balance,
@@ -317,7 +317,7 @@ pub struct PendingDeposit<Balance> {
 ///
 /// Only Safety mode stores this request. Normal mode permits a withdrawal without one.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
-#[cfg_attr(test, derive(Clone, PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(Clone, PartialEq, Debug))]
 pub struct WithdrawalRequest<Balance> {
 	/// Active stablecoin amount that the request still authorizes.
 	pub amount: Balance,
@@ -333,7 +333,7 @@ pub struct WithdrawalRequest<Balance> {
 /// The totals include downward-rounding remainders. Thus, user positions cannot exceed the pool
 /// totals, and the totals remain equal to pool custody.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
 pub struct PoolState<Balance> {
 	/// Stablecoin tracked for the active pool.
 	pub total_active_deposits: Balance,
