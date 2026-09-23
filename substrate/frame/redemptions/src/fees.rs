@@ -122,6 +122,11 @@ impl DynamicFeeCurve {
 		self.decayed.checked_add(&self.rise(redeemed)?)
 	}
 
+	/// Returns the dynamic fee at the start of the redemption, after decay and policy bounds.
+	pub fn decayed_dynamic_fee(&self) -> FixedU128 {
+		self.decayed
+	}
+
 	/// Calculates the stored dynamic fee after redemption of `redeemed`.
 	pub fn raised_dynamic_fee(&self, redeemed: u128) -> FixedU128 {
 		self.dynamic_fee_after(redeemed)

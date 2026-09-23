@@ -4,15 +4,17 @@
 //! - Collateral `AssetId::Native` ([`DOT`]) routes to `Balances`; `AssetId::WithId(asset)` routes
 //!   to `AssetsHolder`. Stablecoins are plain `pallet-assets` ids: [`PUSD`] is the unit-scale
 //!   default coin, [`USDX`] the 6-decimals coin the scale tests use.
+//!
+//! The `test-utils` feature exposes this runtime to other crates. The pallet has no quote of its
+//! own: dispatch the call inside [`hypothetically`] to dry-run it, and read the amounts from its
+//! events.
 
 use crate as pallet_redemptions;
-use crate::types::{RedemptionConfig, RedemptionQuote};
+use crate::types::RedemptionConfig;
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, One, Permill, Saturating, Zero},
 	prelude::{DispatchError, DispatchResult},
-	testing_prelude::{
-		assert_noop, assert_ok, assert_storage_noop, hypothetically, BadOrigin, StateVersion,
-	},
+	testing_prelude::{assert_noop, assert_ok, assert_storage_noop, hypothetically, BadOrigin},
 };
 use frame::{
 	deps::sp_runtime::traits::ConvertInto,
@@ -23,7 +25,7 @@ use frame::{
 			roles::Inspect as FungiblesRolesInspect, Inspect as FungiblesInspect, InspectHold,
 			Mutate as FungiblesMutate,
 		},
-		tokens::{fungible, imbalance::ResolveAssetTo, Fortitude, Preservation},
+		tokens::{fungible, imbalance::ResolveAssetTo},
 		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
@@ -527,8 +529,7 @@ pub fn redeem(
 	recipient: AccountId,
 	max_steps: u32,
 ) -> DispatchResultWithPostInfo {
-	let snapshot =
-		RedeemSnapshot::take(who, &collateral, stable, recipient, max_stable_to_spend, max_steps);
+	let snapshot = RedeemSnapshot::take(who, &collateral, stable, recipient);
 	let result = Redemptions::redeem(
 		RuntimeOrigin::signed(who),
 		collateral,
@@ -539,6 +540,8 @@ pub fn redeem(
 	);
 	if result.is_ok() {
 		snapshot.assert_settled();
+	} else {
+		LastSettlement::set(None);
 	}
 	result
 }
@@ -549,8 +552,6 @@ struct RedeemSnapshot {
 	collateral: AssetId,
 	stable: StableId,
 	recipient: AccountId,
-	/// Execution must reproduce this quote when the account can fund it.
-	quote: Option<RedemptionQuote<Balance>>,
 	/// Number of events before dispatch. Settlement events must follow them.
 	events: usize,
 	supply: Balance,
@@ -562,11 +563,15 @@ struct RedeemSnapshot {
 	fee_state: pallet_redemptions::RedemptionState,
 }
 
-/// Contains the values from an ordinary or recovery settlement event.
+/// Contains the figures of one ordinary or recovery settlement.
+///
+/// The redemption event totals what the `VaultRedeemed` events of the same call report, and
+/// [`Settlement::from_call`] holds the two against each other. Only the vault side names the
+/// recipient.
 ///
 /// [`redeem`] verifies every balance movement against these figures, so a test that pins them
 /// through [`last_settlement`] pins the movements too.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settlement {
 	pub collateral_id: AssetId,
 	pub stable_id: StableId,
@@ -588,74 +593,138 @@ impl Settlement {
 	pub fn figures(&self) -> (Balance, Balance, Balance) {
 		(self.stable_burned, self.fee, self.collateral_out)
 	}
+
+	/// Total stable assets that the redeemer paid.
+	pub fn stable_in(&self) -> Balance {
+		self.stable_burned + self.fee
+	}
 }
 
-/// The most recent settlement event.
+parameter_types! {
+	/// Settlement of the most recent [`redeem`], or `None` if that call failed.
+	///
+	/// A recovery offset emits `VaultRedeemed` without a settlement event, so the events of the
+	/// whole block cannot be attributed. [`redeem`] records the settlement of its own call.
+	///
+	/// A failed call clears the record, so a failed dry run cannot report an earlier success.
+	pub static LastSettlement: Option<Settlement> = None;
+}
+
+/// The settlement of the most recent [`redeem`], which must have succeeded.
 pub fn last_settlement() -> Settlement {
-	System::events()
-		.into_iter()
-		.rev()
-		.find_map(|record| Settlement::from_event(record.event))
-		.expect("a redemption settled")
+	LastSettlement::get().expect("a redemption settled")
 }
 
-/// Quotes a redemption and proves the quote is read-only.
-pub fn preview_redeem(
-	collateral: AssetId,
-	stable: StableId,
-	max_stable_to_spend: Balance,
-	max_steps: u32,
-) -> Result<RedemptionQuote<Balance>, DispatchError> {
-	let root = frame::deps::sp_io::storage::root(StateVersion::V1);
-	let quote = Redemptions::preview_redeem(collateral, stable, max_stable_to_spend, max_steps);
-	assert_eq!(root, frame::deps::sp_io::storage::root(StateVersion::V1), "the preview wrote");
-	quote
+/// Vault-side figures of one settlement, summed over its `VaultRedeemed` events.
+#[derive(Default)]
+struct VaultSide {
+	recipient: Option<AccountId>,
+	debt_cancelled: Balance,
+	collateral_out: Balance,
 }
 
 impl Settlement {
-	fn from_event(event: RuntimeEvent) -> Option<Self> {
-		match event {
-			RuntimeEvent::Redemptions(pallet_redemptions::Event::OrdinaryRedemptionExecuted {
-				collateral_id,
-				stable_id,
-				redeemer,
-				recipient,
-				stable_burned,
-				collateral_out,
-				fee,
-				steps,
-			}) => Some(Self {
-				collateral_id,
-				stable_id,
-				redeemer,
-				recipient,
-				stable_burned,
-				insurance_cover: 0,
-				fee,
-				collateral_out,
-				ordinary_steps: Some(steps),
-			}),
-			RuntimeEvent::Redemptions(pallet_redemptions::Event::RecoveryRedemptionExecuted {
-				collateral_id,
-				stable_id,
-				redeemer,
-				recipient,
-				stable_burned,
-				insurance_cover,
-				collateral_out,
-				..
-			}) => Some(Self {
-				collateral_id,
-				stable_id,
-				redeemer,
-				recipient,
-				stable_burned,
-				insurance_cover,
-				fee: 0,
-				collateral_out,
-				ordinary_steps: None,
-			}),
-			_ => None,
+	/// Builds the settlements of one call from its events, in order.
+	///
+	/// Each `VaultRedeemed` belongs to the settlement event that follows it.
+	pub fn from_call(events: impl Iterator<Item = RuntimeEvent>) -> Vec<Self> {
+		let mut vault_side = VaultSide::default();
+		let mut settlements = Vec::new();
+		for event in events {
+			match event {
+				RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed {
+					recipient,
+					debt_cancelled,
+					collateral_to_recipient,
+					..
+				}) => {
+					assert_eq!(*vault_side.recipient.get_or_insert(recipient), recipient);
+					vault_side.debt_cancelled += debt_cancelled;
+					vault_side.collateral_out += collateral_to_recipient;
+				},
+				RuntimeEvent::Redemptions(
+					pallet_redemptions::Event::OrdinaryRedemptionExecuted {
+						collateral_id,
+						stable_id,
+						redeemer,
+						stable_burned,
+						collateral_out,
+						fee,
+						steps,
+					},
+				) => settlements.push(core::mem::take(&mut vault_side).settle(
+					(collateral_id, stable_id, redeemer),
+					EventSide {
+						stable_burned,
+						insurance_cover: 0,
+						fee,
+						collateral_out,
+						ordinary_steps: Some(steps),
+					},
+				)),
+				RuntimeEvent::Redemptions(
+					pallet_redemptions::Event::RecoveryRedemptionExecuted {
+						collateral_id,
+						stable_id,
+						redeemer,
+						stable_burned,
+						insurance_cover,
+						collateral_out,
+						..
+					},
+				) => settlements.push(core::mem::take(&mut vault_side).settle(
+					(collateral_id, stable_id, redeemer),
+					EventSide {
+						stable_burned,
+						insurance_cover,
+						fee: 0,
+						collateral_out,
+						ordinary_steps: None,
+					},
+				)),
+				_ => {},
+			}
+		}
+		settlements
+	}
+}
+
+/// Figures that one settlement event reports.
+struct EventSide {
+	stable_burned: Balance,
+	insurance_cover: Balance,
+	fee: Balance,
+	collateral_out: Balance,
+	ordinary_steps: Option<u32>,
+}
+
+impl VaultSide {
+	/// Redemptions totals its own walk and Vaults reports each step, so the two sides are
+	/// independent accounts of one settlement and must agree.
+	fn settle(
+		self,
+		(collateral_id, stable_id, redeemer): (AssetId, StableId, AccountId),
+		event: EventSide,
+	) -> Settlement {
+		assert_eq!(
+			self.debt_cancelled,
+			event.stable_burned + event.insurance_cover,
+			"the redeemer and the insurance cover cancel the vaults' debt between them"
+		);
+		assert_eq!(
+			self.collateral_out, event.collateral_out,
+			"the event totals the collateral that the vaults paid"
+		);
+		Settlement {
+			collateral_id,
+			stable_id,
+			redeemer,
+			recipient: self.recipient.expect("a settlement redeems at least one vault"),
+			stable_burned: event.stable_burned,
+			insurance_cover: event.insurance_cover,
+			fee: event.fee,
+			collateral_out: event.collateral_out,
+			ordinary_steps: event.ordinary_steps,
 		}
 	}
 }
@@ -666,29 +735,12 @@ fn free_collateral(collateral: &AssetId, who: AccountId) -> Balance {
 }
 
 impl RedeemSnapshot {
-	fn take(
-		who: AccountId,
-		collateral: &AssetId,
-		stable: StableId,
-		recipient: AccountId,
-		max_stable_to_spend: Balance,
-		max_steps: u32,
-	) -> Self {
-		let spendable = <Assets as FungiblesInspect<AccountId>>::reducible_balance(
-			stable,
-			&who,
-			Preservation::Preserve,
-			Fortitude::Polite,
-		);
-		let quote = preview_redeem(collateral.clone(), stable, max_stable_to_spend, max_steps)
-			.ok()
-			.filter(|quote| spendable >= quote.stable_in());
+	fn take(who: AccountId, collateral: &AssetId, stable: StableId, recipient: AccountId) -> Self {
 		Self {
 			who,
 			collateral: collateral.clone(),
 			stable,
 			recipient,
-			quote,
 			events: System::events().len(),
 			supply: Assets::total_supply(stable),
 			redeemer_stable: Assets::balance(stable, who),
@@ -701,13 +753,12 @@ impl RedeemSnapshot {
 	}
 
 	fn assert_settled(&self) {
-		let settlements: Vec<Settlement> = System::events()
-			.into_iter()
-			.skip(self.events)
-			.filter_map(|record| Settlement::from_event(record.event))
-			.collect();
+		let settlements = Settlement::from_call(
+			System::events().into_iter().skip(self.events).map(|record| record.event),
+		);
 		assert_eq!(settlements.len(), 1, "one redemption settles per call");
 		let settled = &settlements[0];
+		LastSettlement::set(Some(settled.clone()));
 		assert_eq!(settled.collateral_id, self.collateral);
 		assert_eq!(settled.stable_id, self.stable);
 		assert_eq!(settled.redeemer, self.who);
@@ -721,7 +772,6 @@ impl RedeemSnapshot {
 				"a recovery settlement leaves the ordinary accelerator alone"
 			),
 		}
-		self.assert_quote_honoured(settled);
 	}
 
 	fn assert_moves(&self, settled: &Settlement) {
@@ -761,7 +811,9 @@ impl RedeemSnapshot {
 		assert!(state.dynamic_fee >= config.dynamic_fee_floor, "dynamic fee below the floor");
 		assert!(state.dynamic_fee <= config.dynamic_fee_ceiling, "dynamic fee above the ceiling");
 		assert_eq!(state.last_fee_operation, Timestamp::get(), "fee state not stamped now");
-		// An event reports each fee-state change and no event reports an unchanged state.
+		// The redemption starts from the stored fee decayed to now. An event reports each change
+		// to the stored state, including a restarted decay, and no event reports an unchanged one.
+		let decayed = self.fee_state.dynamic_fee_at(Timestamp::get(), &config);
 		let reported =
 			System::events()
 				.into_iter()
@@ -778,21 +830,11 @@ impl RedeemSnapshot {
 				});
 		match reported {
 			Some((old, new)) => {
-				assert_eq!(old, self.fee_state.dynamic_fee, "reported old dynamic fee");
+				assert_eq!(old, decayed, "reported old dynamic fee");
 				assert_eq!(new, state.dynamic_fee, "reported new dynamic fee");
-				assert_ne!(old, new, "a fee move reported where there was none");
+				assert_ne!(state, self.fee_state, "a fee change reported where there was none");
 			},
-			None => assert_eq!(state.dynamic_fee, self.fee_state.dynamic_fee, "an unreported move"),
-		}
-	}
-
-	fn assert_quote_honoured(&self, settled: &Settlement) {
-		let Some(quote) = &self.quote else { return };
-		assert_eq!(settled.stable_burned, quote.debt_cancelled, "execution vs quoted debt");
-		assert_eq!(settled.fee, quote.fee, "execution vs quoted fee");
-		assert_eq!(settled.collateral_out, quote.collateral_out, "execution vs quoted collateral");
-		if let Some(steps) = settled.ordinary_steps {
-			assert_eq!(steps, quote.steps, "execution vs quoted steps");
+			None => assert_eq!(state, self.fee_state, "an unreported fee-state change"),
 		}
 	}
 }

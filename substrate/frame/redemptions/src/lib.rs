@@ -30,11 +30,12 @@ pub mod weights;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
 
-#[cfg(any(feature = "try-runtime", test))]
+// The mock checks these invariants after each run, so `test-utils` needs them as well.
+#[cfg(any(feature = "try-runtime", feature = "test-utils", test))]
 mod try_state;
 
-#[cfg(test)]
-mod mock;
+#[cfg(any(feature = "test-utils", test))]
+pub mod mock;
 
 #[cfg(test)]
 mod tests;
@@ -42,8 +43,7 @@ mod tests;
 pub use pallet::*;
 pub use pusd_primitives;
 pub use types::{
-	RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, RedemptionQuote, RedemptionState,
-	RedemptionTerms,
+	RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, RedemptionState, RedemptionTerms,
 };
 pub use weights::WeightInfo;
 
@@ -59,7 +59,7 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 #[frame::pallet]
 pub mod pallet {
 	use super::*;
-	use crate::types::{RedemptionConfig, RedemptionQuote, RedemptionState, RedemptionTerms};
+	use crate::types::{RedemptionConfig, RedemptionState, RedemptionTerms};
 	use frame::{
 		deps::sp_runtime::{traits::Convert, FixedU128},
 		prelude::*,
@@ -92,9 +92,6 @@ pub mod pallet {
 
 	/// Market redemption configuration used by the runtime.
 	pub type RedemptionConfigOf<T> = RedemptionConfig<BalanceOf<T>>;
-
-	/// Result returned by [`Pallet::preview_redeem`].
-	pub type RedemptionQuoteOf<T> = RedemptionQuote<BalanceOf<T>>;
 
 	/// Vault snapshot used to price a redemption step.
 	pub type SnapshotOf<T> = RedemptionStepSnapshot<BalanceOf<T>>;
@@ -179,7 +176,11 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// One or more ordinary (or dormant-target) vaults were redeemed.
+		/// An ordinary redemption settled against one or more ordinary (or dormant-target) vaults.
+		///
+		/// Vaults reports each settled vault and the recipient. `stable_burned` and
+		/// `collateral_out` total those reports, so a reader need not attribute them to this
+		/// settlement. The redeemer paid `stable_burned` plus `fee`.
 		OrdinaryRedemptionExecuted {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
@@ -187,18 +188,19 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			/// Account that paid the stable assets.
 			redeemer: T::AccountId,
-			/// Account that received collateral.
-			recipient: T::AccountId,
 			/// Stable assets burned against vault debt.
 			stable_burned: BalanceOf<T>,
 			/// Collateral paid to the recipient.
 			collateral_out: BalanceOf<T>,
 			/// Stable-asset fee charged to the redeemer.
 			fee: BalanceOf<T>,
-			/// Number of vaults visited.
+			/// Number of vaults visited, including those that settled nothing.
 			steps: u32,
 		},
 		/// A `FinalRecovery` vault was (partially) settled.
+		///
+		/// Vaults reports the settled vault and the recipient. The debt it reports cancelled is
+		/// `stable_burned` plus `insurance_cover`.
 		RecoveryRedemptionExecuted {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
@@ -206,10 +208,6 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			/// Account that paid the stable assets.
 			redeemer: T::AccountId,
-			/// Account that received collateral.
-			recipient: T::AccountId,
-			/// Owner of the settled vault.
-			vault_owner: T::AccountId,
 			/// Stable assets the redeemer burned against vault debt.
 			stable_burned: BalanceOf<T>,
 			/// Insurance Fund cover burned against the same vault's debt, in
@@ -220,11 +218,11 @@ pub mod pallet {
 			/// Pricing regime applied to the settlement.
 			regime: RecoveryRegime,
 		},
-		/// The stablecoin's dynamic fee moved after an ordinary redemption.
+		/// An ordinary redemption rewrote the stablecoin's dynamic fee state.
 		RedemptionDynamicFeeUpdated {
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
-			/// Dynamic fee before the redemption.
+			/// Dynamic fee the redemption started from, decayed to its block.
 			old_dynamic_fee: FixedU128,
 			/// Dynamic fee after the redemption.
 			new_dynamic_fee: FixedU128,
@@ -278,24 +276,19 @@ pub mod pallet {
 
 	#[pallet::view_functions]
 	impl<T: Config> Pallet<T> {
-		/// Quotes the market-side result of spending up to `max_stable_to_spend`.
+		/// Returns the fee rate at which an ordinary redemption of the stablecoin starts now.
 		///
-		/// `max_stable_to_spend` and `max_steps` mean the same as in [`Pallet::redeem`]. The
-		/// quote projects pending vault updates without applying them and ignores the
-		/// redeemer's balance, so an account that cannot cover [`RedemptionQuote::stable_in`]
-		/// while keeping its minimum balance fills less. Use `min_collateral_out` on execution
-		/// to guard against state changes after the quote.
+		/// The rate is `min(base_fee + dynamic fee, fee_ceiling)`, with the dynamic fee decayed
+		/// to now and nothing persisted. A redemption raises the rate while it cancels debt, so
+		/// every size pays at least this rate. A dry run of [`Pallet::redeem`] gives the result
+		/// of a given size, and its event carries the amounts.
 		///
-		/// Validation, oracle, and vault-projection failures are returned to the caller. An
-		/// empty or blocked queue returns [`Error::NoRedeemableVault`]; a `FinalRecovery` head
-		/// above ICR returns [`Error::FinalRecoveryExitRequired`].
-		pub fn preview_redeem(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			max_stable_to_spend: BalanceOf<T>,
-			max_steps: u32,
-		) -> Result<RedemptionQuoteOf<T>, DispatchError> {
-			Self::quote_redeem(&collateral_id, &stable_id, max_stable_to_spend, max_steps)
+		/// Returns `None` when no market issues the stablecoin.
+		pub fn current_fee_rate(stable_id: StableIdOf<T>) -> Option<FixedU128> {
+			let config = RedemptionConfigs::<T>::get(&stable_id)?;
+			let dynamic_fee = RedemptionStates::<T>::get(&stable_id)
+				.dynamic_fee_at(T::TimeProvider::now(), &config);
+			Some(fees::fee_rate(dynamic_fee, config.base_fee, config.fee_ceiling))
 		}
 	}
 

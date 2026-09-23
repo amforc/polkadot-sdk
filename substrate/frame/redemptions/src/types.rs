@@ -1,8 +1,5 @@
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame::deps::sp_runtime::{
-	traits::{Saturating, Zero},
-	FixedU128, Permill,
-};
+use frame::deps::sp_runtime::{traits::Zero, FixedU128, Permill};
 use scale_info::TypeInfo;
 
 pub use pusd_primitives::Millis;
@@ -85,9 +82,15 @@ pub struct RedemptionTerms<Balance> {
 	pub min_collateral_out: Balance,
 }
 
+/// Dynamic fee of a stablecoin as of its last ordinary redemption.
+///
+/// The fee decays over time without a write, so the stored value is not the current fee.
+/// [`crate::Pallet::current_fee_rate`] returns the current rate, decayed and with the base fee.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RedemptionState {
+	/// Dynamic fee right after the last ordinary redemption, before any decay since.
 	pub dynamic_fee: FixedU128,
+	/// Time of the last ordinary redemption, from which the decay runs.
 	pub last_fee_operation: Millis,
 }
 
@@ -95,38 +98,4 @@ pub struct RedemptionState {
 pub enum RecoveryRegime {
 	RecoveryBonus,
 	InsuranceAdjusted,
-}
-
-#[derive(Encode, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
-pub struct RedemptionQuote<Balance> {
-	/// Debt cancelled using the redeemer's stable assets. This excludes both
-	/// the redemption fee and any Insurance Fund residual settlement.
-	pub debt_cancelled: Balance,
-	/// Collateral paid to the recipient.
-	pub collateral_out: Balance,
-	/// Stable assets routed as the redemption fee.
-	pub fee: Balance,
-	/// Targets inspected, including skipped targets and barriers.
-	pub steps: u32,
-	/// The step cap stopped the quote while budget remained.
-	pub truncated: bool,
-}
-
-impl<Balance: Zero> Default for RedemptionQuote<Balance> {
-	fn default() -> Self {
-		Self {
-			debt_cancelled: Balance::zero(),
-			collateral_out: Balance::zero(),
-			fee: Balance::zero(),
-			steps: 0,
-			truncated: false,
-		}
-	}
-}
-
-impl<Balance: Saturating + Copy> RedemptionQuote<Balance> {
-	/// Total stable assets the redeemer must supply.
-	pub fn stable_in(&self) -> Balance {
-		self.debt_cancelled.saturating_add(self.fee)
-	}
 }
