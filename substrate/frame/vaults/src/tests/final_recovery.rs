@@ -28,7 +28,7 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 		enter_recovery(3, rate_pct(3, 100));
 
 		assert_eq!(
-			crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10),
+			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
 			alloc::vec![1, 2, 3]
 		);
 		assert_eq!(
@@ -87,7 +87,7 @@ fn debt_free_husk_keeps_the_branch_out_of_final_recovery() {
 		assert_eq!(state.pending_redistribution_collateral, 0);
 		// Redistribution does not reactivate a Dormant vault.
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
 	});
 }
 
@@ -118,7 +118,10 @@ fn final_recovery_middle_exit_splices_queue() {
 		assert_ok!(exit_final_recovery(42, DOT, PUSD, 2));
 
 		assert!(vault_status(DOT, PUSD, 2).is_active());
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), alloc::vec![1, 3]);
+		assert_eq!(
+			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
+			alloc::vec![1, 3]
+		);
 	});
 }
 
@@ -133,7 +136,10 @@ fn exit_final_recovery_rejects_when_cr_still_below_mcr() {
 			crate::Error::<Test>::CollateralizationRatioTooLow
 		);
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), alloc::vec![1]);
+		assert_eq!(
+			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
+			alloc::vec![1]
+		);
 	});
 }
 
@@ -193,7 +199,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 			new_status: crate::types::VaultStatus::Dormant,
 		}));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
 		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.debt.total(), 0);
 		assert_eq!(vault.collateral, 950);
@@ -238,7 +244,7 @@ fn final_recovery_accepts_partial_repayment_and_stays_queued() {
 		assert_eq!(vault.debt.total(), debt_before - 200);
 		assert_eq!(vault.redistribution_stake, 0, "still excluded from redistribution");
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), vec![1]);
+		assert_eq!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10), vec![1]);
 	});
 }
 
@@ -277,7 +283,7 @@ fn final_recovery_repayment_then_exit_rejoins_rate_index() {
 
 		assert!(vault_status(DOT, PUSD, 1).is_active());
 		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, held(DOT, 1));
-		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
 	});
 }
 
@@ -301,7 +307,7 @@ fn final_recovery_full_repayment_leaves_dormant_husk() {
 			new_status: crate::types::VaultStatus::Dormant,
 		}));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
 		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.debt.total(), 0);
 		assert_eq!(vault.collateral, 1_000);
@@ -353,7 +359,10 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 		));
 		// Vault is no longer in FR FIFO and not in the rate index — it's Dormant.
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), alloc::vec![2]);
+		assert_eq!(
+			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
+			alloc::vec![2]
+		);
 		let state = branch_state(DOT, PUSD).expect("state");
 		assert_eq!(state.dormant_redemption_target, Some(1));
 	});
@@ -425,7 +434,7 @@ fn final_recovery_rescue_deposit_then_exit() {
 		assert!(vault_status(DOT, PUSD, 1).is_active());
 		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.redistribution_stake, held(DOT, 1));
-		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
 	});
 }
 
@@ -466,7 +475,10 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 		assert_ok!(exit_final_recovery(42, DOT, PUSD, 1));
 		set_price(DOT, low_recovery_price());
 		assert_ok!(enter_final_recovery(99, DOT, PUSD, 1));
-		assert_eq!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10), alloc::vec![2, 1]);
+		assert_eq!(
+			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
+			alloc::vec![2, 1]
+		);
 
 		// The stored priorities stay strictly distinct (newest greatest), so
 		// the linked list's permissionless re-anchoring can never legally
@@ -501,7 +513,7 @@ fn full_settlement_of_a_final_recovery_vault_closes_it() {
 		assert!(!vault_exists(DOT, PUSD, 1));
 		assert_eq!(held(DOT, 1), 0);
 		assert_eq!(vault_deposit_held(DOT, 1), 0);
-		assert!(crate::Pallet::<Test>::final_recovery_queue(DOT, PUSD, 10).is_empty());
+		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
 		let state = branch_state(DOT, PUSD).expect("state");
 		assert_eq!(state.vault_count, 0);
 		assert_eq!(state.dormant_redemption_target, None);

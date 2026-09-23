@@ -12,6 +12,10 @@ use crate::{
 };
 use pallet_linked_list::SortedListInterface;
 
+fn rate_neighbors(owner: AccountId) -> Option<Position<AccountId>> {
+	LinkedList::node(rate_list(DOT, PUSD), owner).map(|(_, position)| position)
+}
+
 // Open vaults in arbitrary order; walking the rate index tail-first (lowest
 // rate → highest) yields ascending order.
 #[test]
@@ -28,9 +32,9 @@ fn open_orders_dll_by_annual_interest_rate() {
 	});
 }
 
-// `find_rate_position` returns valid neighbors for any new score.
+// The rate list's `find_position` returns valid neighbors for any new score.
 #[test]
-fn find_rate_position_returns_valid_neighbors() {
+fn find_position_returns_valid_neighbors() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Vaults at 5%, 10%, 20%, 30%, 50%.
@@ -40,17 +44,17 @@ fn find_rate_position_returns_valid_neighbors() {
 		// Insert position for 15% should be between 10% (acct 2) and 20%
 		// (acct 3). The DLL stores low-at-tail; "prev" walking head-first is
 		// higher-score, "next" is lower-score — so prev=acct 3, next=acct 2.
-		let pos = crate::Pallet::<Test>::find_rate_position(DOT, PUSD, rate_pct(15, 100));
+		let pos = LinkedList::find_position(rate_list(DOT, PUSD), rate_pct(15, 100));
 		assert_eq!(pos.prev, Some(3));
 		assert_eq!(pos.next, Some(2));
 
 		// Position for 0.001% — lower than the lowest, so next = None
 		// (we'd be inserted at the very tail).
-		let pos = crate::Pallet::<Test>::find_rate_position(DOT, PUSD, rate_pct(1, 100_000));
+		let pos = LinkedList::find_position(rate_list(DOT, PUSD), rate_pct(1, 100_000));
 		assert_eq!(pos.next, None);
 
 		// Position for 100% — higher than the highest, prev = None.
-		let pos = crate::Pallet::<Test>::find_rate_position(DOT, PUSD, rate_pct(100, 100));
+		let pos = LinkedList::find_position(rate_list(DOT, PUSD), rate_pct(100, 100));
 		assert_eq!(pos.prev, None);
 	});
 }
@@ -122,7 +126,7 @@ fn find_re_insert_position_locates_target_and_none_for_unlisted() {
 		// Move vault 3 (currently 20%) to 25%: its own node is skipped, so among
 		// the remaining {5, 10, 30, 50} the new rate sits between 10% (vault 2,
 		// tail side) and 30% (vault 4, head side).
-		let pos = crate::Pallet::<Test>::find_re_insert_position(DOT, PUSD, 3, rate_pct(25, 100))
+		let pos = LinkedList::find_re_insert_position(rate_list(DOT, PUSD), 3, rate_pct(25, 100))
 			.expect("vault 3 is listed");
 		assert_eq!(pos.prev, Some(4));
 		assert_eq!(pos.next, Some(2));
@@ -131,43 +135,42 @@ fn find_re_insert_position_locates_target_and_none_for_unlisted() {
 		// slot is unchanged: 25% still sits between vault 2 and vault 4).
 		advance_time(2 * ONE_DAY_MS); // clear the rate cooldown
 		assert_ok!(change_rate(3, DOT, PUSD, rate_pct(25, 100)));
-		let moved =
-			crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 3).expect("listed");
+		let moved = rate_neighbors(3).expect("listed");
 		assert_eq!(moved.prev, Some(4));
 		assert_eq!(moved.next, Some(2));
 		// A never-opened owner is not in the rate index.
 		assert_eq!(
-			crate::Pallet::<Test>::find_re_insert_position(DOT, PUSD, 99, rate_pct(25, 100)),
+			LinkedList::find_re_insert_position(rate_list(DOT, PUSD), 99, rate_pct(25, 100)),
 			None
 		);
 	});
 }
 
-// `vault_rate_index_neighbors` reports a listed vault's live neighbors (`None`
+// The rate list's `node` reports a listed vault's live neighbors (`None`
 // at the head/tail ends) and `None` for a vault outside the index.
 #[test]
-fn vault_rate_index_neighbors_reports_ends_and_none_when_unlisted() {
+fn rate_neighbors_reports_ends_and_none_when_unlisted() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		for (who, pct) in [(1u64, 5), (2, 10), (3, 20), (4, 30), (5, 50)] {
 			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
 		}
 		// Tail = lowest rate (vault 1, 5%): no lower (tail-side) neighbor.
-		let tail = crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 1).expect("listed");
+		let tail = rate_neighbors(1).expect("listed");
 		assert_eq!(tail.next, None);
 		assert_eq!(tail.prev, Some(2));
 		// Head = highest rate (vault 5, 50%): no higher (head-side) neighbor.
-		let head = crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 5).expect("listed");
+		let head = rate_neighbors(5).expect("listed");
 		assert_eq!(head.prev, None);
 		assert_eq!(head.next, Some(4));
 		// Middle vault has both neighbors.
-		let mid = crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 3).expect("listed");
+		let mid = rate_neighbors(3).expect("listed");
 		assert_eq!(mid.prev, Some(4));
 		assert_eq!(mid.next, Some(2));
 		// A never-opened owner is not in the index.
-		assert_eq!(crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 99), None);
+		assert_eq!(rate_neighbors(99), None);
 		// Redeeming the tail vault to zero drops it from the index → no neighbors.
 		assert_ok!(redeem(DOT, PUSD, 6, 600));
-		assert_eq!(crate::Pallet::<Test>::vault_rate_index_neighbors(DOT, PUSD, 1), None);
+		assert_eq!(rate_neighbors(1), None);
 	});
 }

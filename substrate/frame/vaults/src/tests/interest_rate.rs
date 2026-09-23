@@ -141,11 +141,12 @@ fn change_rate_post_cooldown_full_state() {
 
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 		assert_eq!(
-			crate::Pallet::<Test>::predict_rate_change_upfront_fee(
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(
 				DOT,
 				PUSD,
 				1,
-				rate_pct(75, 100),
+				0,
+				Some(rate_pct(75, 100))
 			)
 			.expect("registered market and vault"),
 			0,
@@ -178,9 +179,14 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 		assert_ok!(poke(1, DOT, PUSD, 1));
 		let v_pre = vault(DOT, PUSD, 1);
 
-		let predicted =
-			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(75, 100))
-				.expect("registered market and vault");
+		let predicted = crate::Pallet::<Test>::predict_borrow_upfront_fee(
+			DOT,
+			PUSD,
+			1,
+			0,
+			Some(rate_pct(75, 100)),
+		)
+		.expect("registered market and vault");
 		assert!(predicted > 0, "premature change at debt=2000 must charge a fee");
 
 		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(75, 100)));

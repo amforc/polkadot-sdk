@@ -56,13 +56,6 @@ impl<T: Config> Pallet<T> {
 			initial_collateral,
 		)?;
 		T::StableAssets::mint_into(op.stable_id().clone(), &owner, initial_debt)?;
-		Self::deposit_event(Event::VaultOpened {
-			collateral_id: op.collateral_id().clone(),
-			stable_id: op.stable_id().clone(),
-			owner,
-			collateral: initial_collateral,
-			debt: initial_debt,
-		});
 		op.commit(Commit::Checked)
 	}
 
@@ -582,9 +575,7 @@ impl<T: Config> Pallet<T> {
 				Ok((minted, old_mode, new_mode))
 			})?;
 		// Mint interest only after storing the updated market.
-		if !minted.is_zero() {
-			Self::mint_and_route_yield(collateral_id, stable_id, minted)?;
-		}
+		Self::issue_interest(collateral_id, stable_id, minted)?;
 		Self::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),

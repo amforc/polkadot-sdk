@@ -651,7 +651,6 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 #[test]
 fn full_lifecycle_holds_branch_identities() {
 	fn assert_identities() {
-		#[cfg(feature = "try-runtime")]
 		crate::try_state::do_try_state::<Test>().expect("branch identities hold");
 	}
 	build_and_execute(|| {

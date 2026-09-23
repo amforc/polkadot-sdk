@@ -6,7 +6,7 @@ use crate::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
 		StableCreditOf, StableIdOf,
 	},
-	types::{DebtCollateral, LiquidationSettlement, LiquidationSnapshot, VaultListId, VaultStatus},
+	types::{DebtCollateral, LiquidationSettlement, LiquidationSnapshot, VaultStatus},
 };
 use frame::{
 	deps::frame_support::transactional,
@@ -19,7 +19,6 @@ use frame::{
 		tokens::Restriction,
 	},
 };
-use linked_list_interface::SortedListInterface;
 use pusd_primitives::{
 	BranchInterface, BranchMode, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
@@ -145,19 +144,6 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			Self::ordinary_redemption_target(collateral_id, stable_id, after)
 				.map(|owner| (owner, VaultStatus::Active))
 		})
-	}
-
-	fn redemption_quote_targets(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-	) -> impl Iterator<Item = T::AccountId> {
-		let priority =
-			Self::priority_redemption_target(collateral_id, stable_id).map(|(owner, _)| owner);
-		let rate = T::VaultLists::iter_from_tail(VaultListId::Rate(
-			collateral_id.clone(),
-			stable_id.clone(),
-		));
-		priority.into_iter().chain(rate)
 	}
 
 	fn project_redemption_snapshot(

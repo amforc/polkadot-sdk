@@ -8,7 +8,6 @@ use crate::{
 	pallet::{CollateralIdOf, Config, Error, StableIdOf},
 	types::VaultListId,
 };
-use alloc::vec::Vec;
 use frame::prelude::*;
 use linked_list_interface::{fifo_append, SortedListInterface};
 
@@ -49,15 +48,4 @@ pub fn next_target<T: Config>(
 	stable_id: &StableIdOf<T>,
 ) -> Option<T::AccountId> {
 	T::VaultLists::tail(&list_id::<T>(collateral_id, stable_id))
-}
-
-/// First `n` FIFO owners, oldest first.
-pub fn queue<T: Config>(
-	collateral_id: &CollateralIdOf<T>,
-	stable_id: &StableIdOf<T>,
-	n: u32,
-) -> Vec<T::AccountId> {
-	T::VaultLists::iter_from_tail(list_id::<T>(collateral_id, stable_id))
-		.take(n as usize)
-		.collect()
 }

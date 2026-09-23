@@ -153,8 +153,14 @@ fn change_rate_to_same_rate_is_no_op() {
 		advance_time(ONE_DAY_MS); // one day of pending interest
 		let now = pallet_timestamp::Pallet::<Test>::get();
 		assert_eq!(
-			crate::Pallet::<Test>::predict_rate_change_upfront_fee(DOT, PUSD, 1, rate_pct(5, 100),)
-				.expect("registered market and vault"),
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(
+				DOT,
+				PUSD,
+				1,
+				0,
+				Some(rate_pct(5, 100))
+			)
+			.expect("registered market and vault"),
 			0,
 			"the quote must reflect that an unchanged rate is a no-op"
 		);

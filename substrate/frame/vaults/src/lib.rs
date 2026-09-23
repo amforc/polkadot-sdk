@@ -38,7 +38,7 @@ pub mod weights;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
 
-#[cfg(feature = "try-runtime")]
+#[cfg(any(feature = "try-runtime", test))]
 mod try_state;
 
 #[cfg(test)]
@@ -380,6 +380,9 @@ pub mod pallet {
 			collateral: BalanceOf<T>,
 			/// Stable assets minted to the owner.
 			debt: BalanceOf<T>,
+			/// Annual interest rate chosen by the owner, which places the vault in the redemption
+			/// order.
+			annual_rate: FixedU128,
 		},
 		/// A vault changed status.
 		VaultStatusChanged {
@@ -574,6 +577,20 @@ pub mod pallet {
 			/// Vault rate used for the redemption fee.
 			vault_annual_rate: FixedU128,
 		},
+		/// Aggregate interest accrued since the market's last update was issued as yield.
+		///
+		/// Every write to a market issues the interest accrued since the previous one, so this
+		/// reports each increase of the stablecoin supply from interest.
+		/// [`Event::InterestAccrued`] later adds one vault's share of issued interest to its
+		/// debt row, and mints nothing.
+		InterestIssued {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Stablecoin issued to the yield hook.
+			amount: BalanceOf<T>,
+		},
 	}
 
 	#[pallet::error]
@@ -642,7 +659,8 @@ pub mod pallet {
 		OracleStale,
 		/// The rate-list hint is too far from the correct position.
 		///
-		/// Fetch a new hint and try again.
+		/// Fetch a new hint from the [`Config::VaultLists`] views for [`VaultListId::Rate`] and
+		/// try again.
 		InvalidPositionHints,
 		/// The rate list does not match the vault records. This is storage corruption.
 		RateIndexInvariantBroken,
@@ -706,16 +724,6 @@ pub mod pallet {
 			Ok(collateralization_ratio(&draft.vault.position(), price)?)
 		}
 
-		/// Returns the current vault status.
-		pub fn vault_status(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			owner: T::AccountId,
-		) -> Option<VaultStatus> {
-			Vaults::<T>::contains_key((&collateral_id, &stable_id, &owner))
-				.then(|| Self::vault_status_of(&collateral_id, &stable_id, &owner))
-		}
-
 		/// Returns the market's total collateral ratio after pending interest.
 		///
 		/// Missing markets, oracle failure, and arithmetic failure are reported
@@ -730,11 +738,38 @@ pub mod pallet {
 			Self::compute_tcr(&state, price, now)
 		}
 
+		/// Returns the vault row its next touch would store, with its status.
+		///
+		/// Pending interest and redistribution are applied and nothing is persisted. The stored
+		/// row still holds the amounts as of the last touch, so the difference is the pending
+		/// part.
+		pub fn vault_after_touch(
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			owner: T::AccountId,
+		) -> Result<(Vault<BalanceOf<T>>, VaultStatus), DispatchError> {
+			let draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
+			Ok((draft.vault, draft.status))
+		}
+
+		/// Returns the market state with aggregate interest accrued to now.
+		///
+		/// Nothing is persisted and no interest is issued. The carried interest fraction stays
+		/// in the remainder here, while [`Self::branch_tcr`] rounds it up to one debt unit.
+		pub fn branch_after_accrual(
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+		) -> Result<BranchState<T::AccountId, BalanceOf<T>>, DispatchError> {
+			let (_, state, _) = Self::accrued_branch_view(&collateral_id, &stable_id)?;
+			Ok(state)
+		}
+
 		/// Returns up to `n` owners in redemption order.
 		///
 		/// Tiered with a cutoff: a `FinalRecovery` head (else a dormant target)
-		/// gates the whole rate index, so only the gating target is returned;
-		/// otherwise active vaults from the lowest rate upward.
+		/// gates the whole rate index, so only the gating target is returned and
+		/// any `n > 0` yields one owner; otherwise active vaults from the lowest
+		/// rate upward.
 		pub fn redemption_queue(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -751,128 +786,35 @@ pub mod pallet {
 			}
 		}
 
-		/// Returns up to `n` final recovery owners, oldest first.
-		pub fn final_recovery_queue(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			n: u32,
-		) -> Vec<T::AccountId> {
-			recovery::queue::<T>(&collateral_id, &stable_id, n)
-		}
-
-		/// Returns an insertion hint for an annual rate.
-		pub fn find_rate_position(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			rate: FixedU128,
-		) -> Position<T::AccountId> {
-			T::VaultLists::find_position(&VaultListId::Rate(collateral_id, stable_id), rate)
-		}
-
-		/// Returns a hint for moving a vault to a new annual rate.
-		///
-		/// Returns `None` if the vault is not in the rate list.
-		pub fn find_re_insert_position(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			owner: T::AccountId,
-			new_rate: FixedU128,
-		) -> Option<Position<T::AccountId>> {
-			T::VaultLists::find_re_insert_position(
-				&VaultListId::Rate(collateral_id, stable_id),
-				&owner,
-				new_rate,
-			)
-		}
-
-		/// Returns the number of steps needed to repair a rate-list hint.
-		pub fn repair_steps_needed(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			rate: FixedU128,
-			hint: Position<T::AccountId>,
-		) -> u32 {
-			T::VaultLists::repair_steps_needed(
-				&VaultListId::Rate(collateral_id, stable_id),
-				rate,
-				hint,
-			)
-		}
-
-		/// Returns the vault's current neighbors in the rate list.
-		///
-		/// Returns `None` if the vault is not in the list.
-		pub fn vault_rate_index_neighbors(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			owner: T::AccountId,
-		) -> Option<Position<T::AccountId>> {
-			T::VaultLists::neighbors(&VaultListId::Rate(collateral_id, stable_id), &owner)
-		}
-
-		/// Returns the debt redeemed before the given annual rate.
+		/// Returns the debt redeemed before the given annual rate, and whether the walk stopped
+		/// early.
 		///
 		/// Final recovery vaults are counted first (oldest first), then the dormant target, then
-		/// rate-list vaults below `rate`. The search visits at most `max_steps` vaults and may
-		/// return a partial sum.
+		/// rate-list vaults below `rate`. The walk visits at most `max_steps` vaults. When more
+		/// remain, the sum is partial and the flag is `true`.
 		pub fn debt_in_front(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			rate: FixedU128,
 			max_steps: u32,
-		) -> BalanceOf<T> {
-			let mut total = BalanceOf::<T>::zero();
-			let Some(branch) = Branches::<T>::get(&collateral_id, &stable_id) else {
-				return total;
-			};
-			let now = T::TimeProvider::now();
+		) -> Result<(BalanceOf<T>, bool), DispatchError> {
 			// All vault projections must use the same accrued branch state.
-			let accrued = {
-				let mut state = branch.state;
-				if Self::accrue_aggregate_interest(&mut state, now).is_err() {
-					return total;
-				}
-				state
-			};
-			let mut steps_left = max_steps;
-			let recovery_list = recovery::list_id::<T>(&collateral_id, &stable_id);
-			for owner in T::VaultLists::iter_from_tail(recovery_list).take(steps_left as usize) {
-				steps_left -= 1;
-				if let Some(debt) =
-					Self::projected_vault_debt(&collateral_id, &stable_id, &owner, &accrued, now)
-				{
-					total = total.saturating_add(debt);
-				}
-			}
-			if let Some(target) = &accrued.dormant_redemption_target {
-				if steps_left == 0 {
-					return total;
-				}
-				steps_left -= 1;
-				if let Some(debt) =
-					Self::projected_vault_debt(&collateral_id, &stable_id, target, &accrued, now)
-				{
-					total = total.saturating_add(debt);
-				}
-			}
+			let (_, accrued, now) = Self::accrued_branch_view(&collateral_id, &stable_id)?;
 			let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
-			let mut cursor = T::VaultLists::tail(&rate_list);
-			for _ in 0..steps_left {
-				let Some(o) = cursor else { break };
-				let Some((priority, neighbors)) = T::VaultLists::node(&rate_list, &o) else {
-					break;
-				};
-				if priority >= rate {
-					break;
-				}
-				if let Some(debt) =
-					Self::projected_vault_debt(&collateral_id, &stable_id, &o, &accrued, now)
-				{
-					total = total.saturating_add(debt);
-				}
-				cursor = neighbors.prev;
+			let below_rate = T::VaultLists::iter_from_tail(rate_list.clone()).take_while(|owner| {
+				T::VaultLists::priority(&rate_list, owner).is_some_and(|priority| priority < rate)
+			});
+			let mut in_front =
+				T::VaultLists::iter_from_tail(recovery::list_id::<T>(&collateral_id, &stable_id))
+					.chain(accrued.dormant_redemption_target.clone())
+					.chain(below_rate);
+			let mut total = BalanceOf::<T>::zero();
+			for owner in in_front.by_ref().take(max_steps as usize) {
+				let debt =
+					Self::projected_vault_debt(&collateral_id, &stable_id, &owner, &accrued, now)?;
+				total = total.checked_add(&debt).ok_or(Error::<T>::ArithmeticOverflow)?;
 			}
-			total
+			Ok((total, in_front.next().is_some()))
 		}
 
 		/// Estimates the upfront fee for opening a vault.
@@ -898,9 +840,12 @@ pub mod pallet {
 			)
 		}
 
-		/// Estimates the upfront fee for borrowing from a vault.
+		/// Estimates the upfront fee for borrowing from a vault, changing its annual rate, or
+		/// both.
 		///
-		/// Applies the same pending touch as execution before pricing the fee.
+		/// Applies the same pending touch as execution before pricing the fee. A zero
+		/// `debt_increase` with a new rate prices [`Pallet::change_rate`], which charges nothing
+		/// once the rate-change cooldown has passed.
 		pub fn predict_borrow_upfront_fee(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -908,9 +853,6 @@ pub mod pallet {
 			debt_increase: BalanceOf<T>,
 			maybe_new_rate: Option<FixedU128>,
 		) -> Result<BalanceOf<T>, DispatchError> {
-			if debt_increase.is_zero() {
-				return Ok(BalanceOf::<T>::zero());
-			}
 			let mut draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
 			ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
 			let new_rate = maybe_new_rate.unwrap_or(draft.vault.annual_rate);
@@ -920,29 +862,6 @@ pub mod pallet {
 				&draft.config,
 				&mut draft.vault,
 				debt_increase,
-				new_rate,
-				draft.now,
-			)
-		}
-
-		/// Estimates the upfront fee for changing a vault's annual rate.
-		///
-		/// Applies the same pending touch as execution. Returns zero when the
-		/// rate-change cooldown has passed.
-		pub fn predict_rate_change_upfront_fee(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			owner: T::AccountId,
-			new_rate: FixedU128,
-		) -> Result<BalanceOf<T>, DispatchError> {
-			let mut draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
-			ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
-			Self::validate_rate(&draft.config, new_rate)?;
-			Self::apply_borrow_unchecked(
-				&mut draft.state,
-				&draft.config,
-				&mut draft.vault,
-				Zero::zero(),
 				new_rate,
 				draft.now,
 			)
