@@ -292,18 +292,12 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn accrued_stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {
 		let debt = StablecoinDebt::<T>::get(stable_id);
 		let elapsed = T::TimeProvider::now().saturating_sub(debt.last_update);
-		let Some(elapsed_interest) =
-			PendingInterest::from_interest_weight(debt.active_weighted_principal, elapsed)
-		else {
-			return BalanceOf::<T>::max_value();
-		};
-		let Some(pending) = debt.pending_interest.checked_add(&elapsed_interest) else {
-			return BalanceOf::<T>::max_value();
-		};
-		let Some(accrued) = pending.ceil() else {
-			return BalanceOf::<T>::max_value();
-		};
-		debt.outstanding.saturating_add(accrued)
+		PendingInterest::from_interest_weight(debt.active_weighted_principal, elapsed)
+			.and_then(|elapsed_interest| debt.pending_interest.checked_add(&elapsed_interest))
+			.and_then(|pending| pending.ceil())
+			.map_or_else(BalanceOf::<T>::max_value, |accrued| {
+				debt.outstanding.saturating_add(accrued)
+			})
 	}
 
 	/// Move an aggregate from `before` to `after`. Underflow means the aggregate
@@ -843,10 +837,22 @@ impl<T: Config> Pallet<T> {
 		now: Millis,
 	) -> Result<BalanceOf<T>, DispatchError> {
 		let mut state = accrued_state.clone();
+		let (vault, _) = Self::touched_row(collateral_id, stable_id, owner, &mut state, now)?;
+		Ok(vault.debt.total())
+	}
+
+	/// Reads one vault row with its status and touches it against `state`, accrued to `now`.
+	fn touched_row(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		owner: &T::AccountId,
+		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
+		now: Millis,
+	) -> Result<(Vault<BalanceOf<T>>, VaultStatus), DispatchError> {
 		let mut vault = Self::vault_of(collateral_id, stable_id, owner)?;
 		let status = Self::vault_status_of(collateral_id, stable_id, owner);
-		Self::apply_vault_touch(&mut state, &mut vault, status, now)?;
-		Ok(vault.debt.total())
+		Self::apply_vault_touch(state, &mut vault, status, now)?;
+		Ok((vault, status))
 	}
 
 	/// A zero-debt, zero-stake vault row: the pre-borrow shape an open feeds
@@ -1002,9 +1008,7 @@ impl<T: Config> Pallet<T> {
 		owner: &T::AccountId,
 	) -> Result<TouchedVaultDraft<T::AccountId, BalanceOf<T>>, DispatchError> {
 		let (config, mut state, now) = Self::accrued_branch_view(collateral_id, stable_id)?;
-		let mut vault = Self::vault_of(collateral_id, stable_id, owner)?;
-		let status = Self::vault_status_of(collateral_id, stable_id, owner);
-		Self::apply_vault_touch(&mut state, &mut vault, status, now)?;
+		let (vault, status) = Self::touched_row(collateral_id, stable_id, owner, &mut state, now)?;
 		Ok(TouchedVaultDraft { config, state, vault, status, now })
 	}
 }

@@ -2,17 +2,11 @@
 
 use super::{Commit, VaultOp};
 use crate::{
-	pallet::{BalanceOf, Config, Error, Event, HoldReason, Pallet},
+	pallet::{BalanceOf, Config, Error, Event, Pallet},
 	recovery,
 	types::{DebtCollateral, LiquidationSnapshot, Vault, VaultStatus},
 };
-use frame::{
-	prelude::*,
-	traits::{
-		fungibles::MutateHold as FungiblesMutateHold,
-		tokens::{Fortitude, Precision, Restriction},
-	},
-};
+use frame::prelude::*;
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
 use pusd_primitives::RedemptionStepSnapshot;
 
@@ -231,16 +225,7 @@ impl<T: Config> VaultOp<T> {
 			self.ctx.state.debt.aggregate_interest_remainder = 0;
 		}
 		if !collateral.is_zero() {
-			T::CollateralAssets::transfer_on_hold(
-				self.collateral_id().clone(),
-				&HoldReason::VaultCollateral.into(),
-				&self.owner,
-				recipient,
-				collateral,
-				Precision::Exact,
-				Restriction::Free,
-				Fortitude::Polite,
-			)?;
+			self.release_collateral(recipient, collateral)?;
 		}
 
 		Pallet::<T>::deposit_event(Event::VaultClosed {

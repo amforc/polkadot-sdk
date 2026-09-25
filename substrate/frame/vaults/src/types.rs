@@ -591,40 +591,15 @@ pub struct InterestWeight<Balance> {
 }
 
 /// `whole * denominator + remainder`: the wide numerator one split limb represents.
+///
+/// With `denominator < 2^127`, one joined value is below `2^255`, so the sum of two cannot
+/// overflow `U256` either.
 fn join_wide(whole: u128, remainder: u128, denominator: u128) -> U256 {
 	U256::from(whole) * U256::from(denominator) + U256::from(remainder)
 }
 
-/// Adds two `(whole, remainder)` limbs at `denominator`, carrying into the whole part.
-fn limb_add<Balance: CheckedAdd + One>(
-	lhs: (&Balance, u128),
-	rhs: (&Balance, u128),
-	denominator: u128,
-) -> Option<(Balance, u128)> {
-	let mut whole = lhs.0.checked_add(rhs.0)?;
-	let mut remainder = lhs.1.checked_add(rhs.1)?;
-	if remainder >= denominator {
-		remainder -= denominator;
-		whole = whole.checked_add(&Balance::one())?;
-	}
-	Some((whole, remainder))
-}
-
-/// Subtracts two `(whole, remainder)` limbs at `denominator`, borrowing from the whole part.
-fn limb_sub<Balance: CheckedSub + One>(
-	lhs: (&Balance, u128),
-	rhs: (&Balance, u128),
-	denominator: u128,
-) -> Option<(Balance, u128)> {
-	let mut whole = lhs.0.checked_sub(rhs.0)?;
-	let remainder = if lhs.1 >= rhs.1 {
-		lhs.1 - rhs.1
-	} else {
-		whole = whole.checked_sub(&Balance::one())?;
-		lhs.1 + denominator - rhs.1
-	};
-	Some((whole, remainder))
-}
+const _: () = assert!(FixedU128::DIV < 1 << 127);
+const _: () = assert!(PendingInterest::<u128>::DENOMINATOR < 1 << 127);
 
 impl<Balance: Zero> InterestWeight<Balance> {
 	pub fn zero() -> Self {
@@ -647,27 +622,17 @@ impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> InterestWeight<
 	}
 
 	pub(crate) fn from_principal_rate(principal: Balance, rate: FixedU128) -> Option<Self> {
-		let product = U256::from(principal.unique_saturated_into()) * U256::from(rate.into_inner());
-		let (whole, remainder) = split_wide(product, FixedU128::DIV)?;
-		Some(Self { whole, remainder })
+		Self::from_raw(
+			U256::from(principal.unique_saturated_into()) * U256::from(rate.into_inner()),
+		)
 	}
 
 	pub(crate) fn checked_add(&self, other: &Self) -> Option<Self> {
-		let (whole, remainder) = limb_add(
-			(&self.whole, self.remainder),
-			(&other.whole, other.remainder),
-			FixedU128::DIV,
-		)?;
-		Some(Self { whole, remainder })
+		Self::from_raw(self.raw().checked_add(other.raw())?)
 	}
 
 	pub(crate) fn checked_sub(&self, other: &Self) -> Option<Self> {
-		let (whole, remainder) = limb_sub(
-			(&self.whole, self.remainder),
-			(&other.whole, other.remainder),
-			FixedU128::DIV,
-		)?;
-		Some(Self { whole, remainder })
+		Self::from_raw(self.raw().checked_sub(other.raw())?)
 	}
 
 	/// Rate-weighted principal posted for one redistribution, rounded once upward.
@@ -725,6 +690,15 @@ impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> PendingInterest
 	/// one whole unit of rate-weighted principal.
 	pub const DENOMINATOR: u128 = FixedU128::DIV * MILLIS_PER_YEAR as u128;
 
+	pub(crate) fn raw(&self) -> U256 {
+		join_wide(self.interest.unique_saturated_into(), self.remainder, Self::DENOMINATOR)
+	}
+
+	pub(crate) fn from_raw(raw: U256) -> Option<Self> {
+		let (interest, remainder) = split_wide(raw, Self::DENOMINATOR)?;
+		Some(Self { interest, remainder })
+	}
+
 	/// The exact `weight * elapsed` numerator, in split form.
 	///
 	/// Returns `None` when the divided product overflows `Balance`.
@@ -732,11 +706,7 @@ impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> PendingInterest
 		weight: InterestWeight<Balance>,
 		elapsed: Millis,
 	) -> Option<Self> {
-		let numerator =
-			join_wide(weight.whole.unique_saturated_into(), weight.remainder, FixedU128::DIV) *
-				U256::from(elapsed);
-		let (interest, remainder) = split_wide(numerator, Self::DENOMINATOR)?;
-		Some(Self { interest, remainder })
+		Self::from_raw(weight.raw() * U256::from(elapsed))
 	}
 
 	pub(crate) fn from_principal_rate_millis(
@@ -747,8 +717,7 @@ impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> PendingInterest
 		let numerator = (U256::from(principal.unique_saturated_into()) *
 			U256::from(rate.into_inner()))
 		.checked_mul(U256::from(elapsed))?;
-		let (interest, remainder) = split_wide(numerator, Self::DENOMINATOR)?;
-		Some(Self { interest, remainder })
+		Self::from_raw(numerator)
 	}
 
 	/// Interest accrued by a pending weight since its liquidation-time anchor.
@@ -763,27 +732,15 @@ impl<Balance: FixedPointOperand + CheckedAdd + CheckedSub + One> PendingInterest
 			.ok_or(ArithmeticError::Overflow)?
 			.checked_sub(weight_time.to_wide())
 			.ok_or(ArithmeticError::Underflow)?;
-		let (interest, remainder) =
-			split_wide(numerator, Self::DENOMINATOR).ok_or(ArithmeticError::Overflow)?;
-		Ok(Self { interest, remainder })
+		Self::from_raw(numerator).ok_or(ArithmeticError::Overflow)
 	}
 
 	pub fn checked_add(&self, other: &Self) -> Option<Self> {
-		let (interest, remainder) = limb_add(
-			(&self.interest, self.remainder),
-			(&other.interest, other.remainder),
-			Self::DENOMINATOR,
-		)?;
-		Some(Self { interest, remainder })
+		Self::from_raw(self.raw().checked_add(other.raw())?)
 	}
 
 	pub fn checked_sub(&self, other: &Self) -> Option<Self> {
-		let (interest, remainder) = limb_sub(
-			(&self.interest, self.remainder),
-			(&other.interest, other.remainder),
-			Self::DENOMINATOR,
-		)?;
-		Some(Self { interest, remainder })
+		Self::from_raw(self.raw().checked_sub(other.raw())?)
 	}
 
 	/// Whole interest units, rounded up. `None` when the round-up overflows.
@@ -955,23 +912,20 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 				.checked_add(&new)
 				.ok_or(ArithmeticError::Overflow)
 		};
-
-		let shifted_weight = |current: InterestWeight<Balance>| {
-			current
-				.shifted(&before.weighted_principal, &after.weighted_principal)
-				.ok_or(ArithmeticError::Underflow)
-		};
-		let shifted_stake_weight = |current: InterestWeight<Balance>| {
-			current
-				.shifted(&before.weighted_stake, &after.weighted_stake)
-				.ok_or(ArithmeticError::Underflow)
+		let shifted_weight = |current: InterestWeight<Balance>, old, new| {
+			current.shifted(old, new).ok_or(ArithmeticError::Underflow)
 		};
 
 		let principal = shifted(self.debt.principal, before.principal, after.principal)?;
 		let minted_interest = shifted(self.debt.minted_interest, before.interest, after.interest)?;
-		let weighted_principal = shifted_weight(self.debt.weighted_principal)?;
+		let weighted_principal = shifted_weight(
+			self.debt.weighted_principal,
+			&before.weighted_principal,
+			&after.weighted_principal,
+		)?;
 		let stake = shifted(self.stakes.total, before.stake, after.stake)?;
-		let weighted_stake = shifted_stake_weight(self.stakes.weighted)?;
+		let weighted_stake =
+			shifted_weight(self.stakes.weighted, &before.weighted_stake, &after.weighted_stake)?;
 		let collateral_basis = shifted(
 			self.stakes.collateral_basis,
 			before.eligible_collateral,
@@ -1015,35 +969,46 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 		redistribution: DebtCollateral<Balance>,
 		attribution: RedistributionAttribution<Balance>,
 	) -> Result<(), ArithmeticError> {
-		self.debt.pending_redistribution_principal = self
-			.debt
-			.pending_redistribution_principal
-			.checked_sub(&redistribution.debt)
-			.ok_or(ArithmeticError::Underflow)?;
-		self.pending_redistribution_collateral = self
-			.pending_redistribution_collateral
-			.checked_sub(&redistribution.collateral)
-			.ok_or(ArithmeticError::Underflow)?;
-		self.stakes.collateral_basis = self
-			.stakes
-			.collateral_basis
-			.checked_sub(&redistribution.collateral)
-			.ok_or(ArithmeticError::Underflow)?;
-		self.debt.pending_redistribution_weight = self
-			.debt
-			.pending_redistribution_weight
-			.checked_sub(&attribution.weight)
-			.ok_or(ArithmeticError::Underflow)?;
-		self.pending_redistribution_weight_time = self
-			.pending_redistribution_weight_time
-			.checked_sub(attribution.weight_time)
-			.ok_or(ArithmeticError::Underflow)?;
-		self.debt.weighted_principal = self
-			.debt
-			.weighted_principal
-			.checked_sub(&attribution.weight)
-			.ok_or(ArithmeticError::Underflow)?;
-		Ok(())
+		self.move_pending(redistribution, attribution, false)
+			.ok_or(ArithmeticError::Underflow)
+	}
+
+	/// Posts to (`post`) or takes from the pending redistribution pools.
+	///
+	/// Recording and consuming a redistribution move the same six fields in opposite directions.
+	fn move_pending(
+		&mut self,
+		amounts: DebtCollateral<Balance>,
+		attribution: RedistributionAttribution<Balance>,
+		post: bool,
+	) -> Option<()> {
+		let balance = |current: Balance, amount: Balance| {
+			if post {
+				current.checked_add(&amount)
+			} else {
+				current.checked_sub(&amount)
+			}
+		};
+		let weight = |current: InterestWeight<Balance>| {
+			if post {
+				current.checked_add(&attribution.weight)
+			} else {
+				current.checked_sub(&attribution.weight)
+			}
+		};
+		self.debt.pending_redistribution_principal =
+			balance(self.debt.pending_redistribution_principal, amounts.debt)?;
+		self.pending_redistribution_collateral =
+			balance(self.pending_redistribution_collateral, amounts.collateral)?;
+		self.stakes.collateral_basis = balance(self.stakes.collateral_basis, amounts.collateral)?;
+		self.debt.pending_redistribution_weight = weight(self.debt.pending_redistribution_weight)?;
+		self.pending_redistribution_weight_time = if post {
+			self.pending_redistribution_weight_time.checked_add(attribution.weight_time)
+		} else {
+			self.pending_redistribution_weight_time.checked_sub(attribution.weight_time)
+		}?;
+		self.debt.weighted_principal = weight(self.debt.weighted_principal)?;
+		Some(())
 	}
 
 	/// Records one liquidation residual in the per-stake accumulators.
@@ -1103,17 +1068,9 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 		};
 		self.redistribution_carry =
 			RedistributionCarry { principal: principal_carry, collateral: collateral_carry };
-		self.debt.pending_redistribution_principal =
-			self.debt.pending_redistribution_principal.checked_add(&redistributed.debt)?;
-		self.pending_redistribution_collateral =
-			self.pending_redistribution_collateral.checked_add(&redistributed.collateral)?;
-		self.stakes.collateral_basis =
-			self.stakes.collateral_basis.checked_add(&redistributed.collateral)?;
-		self.debt.pending_redistribution_weight =
-			self.debt.pending_redistribution_weight.checked_add(&posted_weight)?;
-		self.pending_redistribution_weight_time =
-			self.pending_redistribution_weight_time.checked_add(posted_weight_time)?;
-		self.debt.weighted_principal = self.debt.weighted_principal.checked_add(&posted_weight)?;
+		let attribution =
+			RedistributionAttribution { weight: posted_weight, weight_time: posted_weight_time };
+		self.move_pending(redistributed, attribution, true)?;
 		self.stakes.snapshot_total = self.stakes.total;
 		self.stakes.snapshot_collateral = self.stakes.collateral_basis;
 		Some(())

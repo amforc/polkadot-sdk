@@ -71,8 +71,8 @@ impl<Balance: Copy + Ord + Zero + One + Saturating> RedemptionStepSnapshot<Balan
 
 /// Provides authoritative vault state and atomic settlement for external redemption flows.
 ///
-/// [`Self::redeem_step`] validates the settlement against a new projection. A mismatch aborts the
-/// complete step.
+/// [`Self::redeem_step`] validates the settlement against a new projection. A mismatch fails the
+/// step, which is rolled back with the caller's transaction.
 pub trait VaultInterface {
 	type CollateralId;
 	type StableId;
@@ -105,9 +105,9 @@ pub trait VaultInterface {
 	/// A partial payment must leave base debt when a terminal charge applies. The caller charges
 	/// the redemption fee.
 	///
-	/// An error consumes `settlement.debt_payment` inside the rolled-back
-	/// step, so callers MUST propagate the error and abort the dispatch —
-	/// swallowing it would strand the payment's issuance accounting.
+	/// An error consumes `settlement.debt_payment`, and the step's writes are rolled back with
+	/// the caller's transaction, so callers MUST propagate the error and abort the dispatch —
+	/// swallowing it would strand the payment's issuance accounting and any partial vault writes.
 	fn redeem_step(
 		collateral_id: &Self::CollateralId,
 		stable_id: &Self::StableId,

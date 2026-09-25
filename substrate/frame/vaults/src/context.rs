@@ -97,6 +97,15 @@ impl<T: Config> Context<T> {
 		Ok(ctx)
 	}
 
+	fn load_priced(
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+	) -> Result<Self, DispatchError> {
+		let mut ctx = Self::load_unfrozen(collateral_id, stable_id)?;
+		ctx.load_price()?;
+		Ok(ctx)
+	}
+
 	fn ensure_not_frozen(&self) -> DispatchResult {
 		ensure!(!self.state.is_frozen(), Error::<T>::BranchFrozen);
 		Ok(())
@@ -394,9 +403,7 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Self, DispatchError> {
-		let mut ctx = Context::<T>::load_unfrozen(collateral_id, stable_id)?;
-		ctx.load_price()?;
-		ctx.touch(owner)
+		Context::<T>::load_priced(collateral_id, stable_id)?.touch(owner)
 	}
 
 	/// Prepares a new vault in an unfrozen branch.
@@ -409,8 +416,7 @@ impl<T: Config> VaultOp<T> {
 		annual_rate: FixedU128,
 		hint: ListPosition<T::AccountId>,
 	) -> Result<Self, DispatchError> {
-		let mut ctx = Context::<T>::load_unfrozen(collateral_id, stable_id)?;
-		ctx.load_price()?;
+		let ctx = Context::<T>::load_priced(collateral_id, stable_id)?;
 		ctx.create_vault(owner, initial_collateral, initial_debt, annual_rate, hint)
 	}
 
@@ -529,6 +535,27 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
+	/// Transfers held vault collateral from the owner to `to`, released from the hold.
+	///
+	/// Moves funds only; the caller adjusts vault and market accounting.
+	pub(crate) fn release_collateral(
+		&self,
+		to: &T::AccountId,
+		amount: BalanceOf<T>,
+	) -> DispatchResult {
+		T::CollateralAssets::transfer_on_hold(
+			self.collateral_id().clone(),
+			&HoldReason::VaultCollateral.into(),
+			&self.owner,
+			to,
+			amount,
+			Precision::Exact,
+			Restriction::Free,
+			Fortitude::Polite,
+		)?;
+		Ok(())
+	}
+
 	/// Adds debt and optionally changes the vault rate.
 	pub(crate) fn borrow(
 		&mut self,
@@ -636,7 +663,7 @@ impl<T: Config> VaultOp<T> {
 	pub(crate) fn repay(
 		&mut self,
 		amount: BalanceOf<T>,
-	) -> Result<crate::types::DebtBreakdown<BalanceOf<T>>, DispatchError> {
+	) -> Result<DebtBreakdown<BalanceOf<T>>, DispatchError> {
 		let payment = self.cancel_debt(amount)?;
 		let total_after = self.vault.debt.total();
 		ensure!(
@@ -644,6 +671,15 @@ impl<T: Config> VaultOp<T> {
 			Error::<T>::DebtWouldBecomeDust
 		);
 		Ok(payment)
+	}
+
+	/// Returns the recorded debt plus the terminal interest charge a full settlement pays.
+	pub(crate) fn full_payoff(&self) -> Result<BalanceOf<T>, DispatchError> {
+		self.vault
+			.debt
+			.total()
+			.checked_add(&self.vault.terminal_interest_charge())
+			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 	}
 
 	/// Cancels an exact debt payment without a minimum-debt check.
@@ -657,10 +693,7 @@ impl<T: Config> VaultOp<T> {
 		amount: BalanceOf<T>,
 	) -> Result<DebtBreakdown<BalanceOf<T>>, DispatchError> {
 		let base_debt = self.vault.debt.total();
-		let full_payoff = base_debt
-			.checked_add(&self.vault.terminal_interest_charge())
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		if amount == full_payoff {
+		if amount == self.full_payoff()? {
 			self.finalize_terminal_interest()?;
 		} else {
 			// Preserve a liability owner for the terminal interest.

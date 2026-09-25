@@ -27,12 +27,12 @@ use frame::{
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
 		fungibles::{
-			roles::Inspect as FungiblesRolesInspect, AssetFootprintPrice, AtLeastMinimumBalance,
-			Balanced as FungiblesBalanced, Credit, HoldConsideration as FungiblesHoldConsideration,
-			Inspect as FungiblesInspect, InspectHold, SufficientAssets,
+			AssetFootprintPrice, AtLeastMinimumBalance, Balanced as FungiblesBalanced, Credit,
+			HoldConsideration as FungiblesHoldConsideration, Inspect as FungiblesInspect, InspectHold,
+			SufficientAssets,
 		},
 		tokens::{fungible, ConversionToAssetBalance, FallbackOnUnavailable},
-		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
+		AsEnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
 pub use pallet_linked_list::Position;
@@ -298,28 +298,7 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for Record
 /// Allows root or the stable asset owner to create a market.
 ///
 /// Root pays no deposit. The asset owner does.
-pub struct EnsureAssetOwner;
-impl EnsureOriginWithArg<RuntimeOrigin, StableId> for EnsureAssetOwner {
-	type Success = Option<AccountId>;
-	fn try_origin(o: RuntimeOrigin, stable: &StableId) -> Result<Self::Success, RuntimeOrigin> {
-		match Into::<Result<frame_system::RawOrigin<AccountId>, RuntimeOrigin>>::into(o.clone()) {
-			Ok(frame_system::RawOrigin::Root) => Ok(None),
-			Ok(frame_system::RawOrigin::Signed(who)) => {
-				if <Assets as FungiblesRolesInspect<AccountId>>::owner(*stable) == Some(who) {
-					Ok(Some(who))
-				} else {
-					Err(o)
-				}
-			},
-			_ => Err(o),
-		}
-	}
-
-	#[cfg(feature = "runtime-benchmarks")]
-	fn try_successful_origin(_: &StableId) -> Result<RuntimeOrigin, ()> {
-		Ok(RuntimeOrigin::root())
-	}
-}
+pub type EnsureAssetOwner = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 parameter_types! {
 	pub const MarketDepositReason: RuntimeHoldReason =
