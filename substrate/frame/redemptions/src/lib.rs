@@ -59,7 +59,6 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
 #[frame::pallet]
 pub mod pallet {
 	use super::*;
-	use crate::types::{RedemptionConfig, RedemptionState, RedemptionTerms};
 	use frame::{
 		deps::sp_runtime::{traits::Convert, FixedU128},
 		prelude::*,

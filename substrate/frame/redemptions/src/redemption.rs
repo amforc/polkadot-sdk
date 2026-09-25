@@ -25,12 +25,6 @@ use pusd_primitives::{
 	RedemptionSettlement, VaultInterface,
 };
 
-/// Inputs shared by ordinary and recovery redemptions.
-struct RedemptionInputs<Balance> {
-	config: crate::types::RedemptionConfig<Balance>,
-	price: FixedU128,
-}
-
 /// Fee inputs read only for an ordinary redemption.
 struct FeeInputs {
 	stored: RedemptionState,
@@ -75,22 +69,14 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	fn redemption_inputs(
+	/// The oracle price of the collateral; a zero price is as unusable as a missing one.
+	pub(crate) fn collateral_price(
 		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		max_stable_to_spend: BalanceOf<T>,
-	) -> Result<RedemptionInputs<BalanceOf<T>>, Error<T>> {
-		let config =
-			RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::StablecoinNotRegistered)?;
-		// A budget below the minimum cannot buy it however small the fee.
-		ensure!(
-			max_stable_to_spend >= config.minimum_redemption_amount,
-			Error::<T>::BelowMinimumRedemptionAmount
-		);
+	) -> Result<FixedU128, Error<T>> {
 		let price =
 			T::Oracle::provide_price(collateral_id).map_err(|_| Error::<T>::OracleUnavailable)?;
 		ensure!(!price.is_zero(), Error::<T>::OracleUnavailable);
-		Ok(RedemptionInputs { config, price })
+		Ok(price)
 	}
 
 	fn fee_inputs(
@@ -115,17 +101,23 @@ impl<T: Config> Pallet<T> {
 		recipient: &T::AccountId,
 		max_steps: u32,
 	) -> Result<u32, DispatchError> {
-		let inputs = Self::redemption_inputs(collateral_id, stable_id, terms.max_stable_to_spend)?;
+		let config =
+			RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::StablecoinNotRegistered)?;
+		// A budget below the minimum cannot buy it however small the fee.
+		ensure!(
+			terms.max_stable_to_spend >= config.minimum_redemption_amount,
+			Error::<T>::BelowMinimumRedemptionAmount
+		);
+		let price = Self::collateral_price(collateral_id)?;
 		let first_target = T::Vaults::next_redemption_target(collateral_id, stable_id, None)
 			.ok_or(Error::<T>::NoRedeemableVault)?;
-		let context =
-			WalkContext { redeemer, collateral_id, stable_id, recipient, price: inputs.price };
+		let context = WalkContext { redeemer, collateral_id, stable_id, recipient, price };
 
 		if first_target.1.is_final_recovery() {
-			return Self::redeem_recovery(&context, &inputs.config, first_target.0, terms);
+			return Self::redeem_recovery(&context, &config, first_target.0, terms);
 		}
 
-		Self::redeem_ordinary(&context, &inputs.config, first_target, terms, max_steps)
+		Self::redeem_ordinary(&context, &config, first_target, terms, max_steps)
 	}
 
 	/// Settle the `FinalRecovery` FIFO head in one step. The redeemer funds the
@@ -392,15 +384,25 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 		preservation: Preservation,
 	) -> Result<StableCreditOf<T>, DispatchError> {
-		let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
+		let credit = Self::withdraw_stable(stable_id, redeemer, amount, preservation)?;
+		Self::exact_credit(credit, amount)
+	}
+
+	/// Withdraws `amount` of the stablecoin from `who` as a credit, exactly and politely.
+	pub(crate) fn withdraw_stable(
+		stable_id: &StableIdOf<T>,
+		who: &T::AccountId,
+		amount: BalanceOf<T>,
+		preservation: Preservation,
+	) -> Result<StableCreditOf<T>, DispatchError> {
+		<T::StableAssets as FungiblesBalanced<_>>::withdraw(
 			stable_id.clone(),
-			redeemer,
+			who,
 			amount,
 			Precision::Exact,
 			preservation,
 			Fortitude::Polite,
-		)?;
-		Self::exact_credit(credit, amount)
+		)
 	}
 
 	/// Accepts `credit` only if it carries exactly `amount`: vaults and the fee handler take

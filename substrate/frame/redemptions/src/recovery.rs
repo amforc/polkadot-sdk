@@ -13,13 +13,9 @@ use frame::{
 		FixedU128,
 	},
 	prelude::*,
-	traits::{
-		fungibles::Balanced as FungiblesBalanced,
-		tokens::{Fortitude, Precision},
-	},
 };
 use pusd_primitives::{
-	debit_preservation, recovery_pricing, reducible_debit, CollateralRatio, ProvidePrice,
+	debit_preservation, recovery_pricing, reducible_debit, CollateralRatio,
 	RecoveryOffsetInterface, RecoveryOffsetResult, RedemptionSettlement, VaultInterface,
 };
 
@@ -186,15 +182,8 @@ impl<T: Config> Pallet<T> {
 		// The cover was capped at the fund's reducible balance when priced, in
 		// this same dispatch; a failure means the payer drained the fund
 		// mid-redemption (it is the fund itself) and must abort.
-		let credit = <T::StableAssets as FungiblesBalanced<_>>::withdraw(
-			stable_id.clone(),
-			&account,
-			cover,
-			Precision::Exact,
-			preservation,
-			Fortitude::Polite,
-		)
-		.map_err(|_| Error::<T>::InsuranceFundWithdrawFailed)?;
+		let credit = Self::withdraw_stable(stable_id, &account, cover, preservation)
+			.map_err(|_| Error::<T>::InsuranceFundWithdrawFailed)?;
 		Self::exact_credit(credit, cover)
 	}
 
@@ -206,18 +195,6 @@ impl<T: Config> Pallet<T> {
 		status.is_final_recovery().then_some(owner)
 	}
 
-	fn offset_inputs(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-	) -> Result<(RedemptionConfigOf<T>, FixedU128), DispatchError> {
-		let config =
-			RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::StablecoinNotRegistered)?;
-		let price =
-			T::Oracle::provide_price(collateral_id).map_err(|_| Error::<T>::OracleUnavailable)?;
-		ensure!(!price.is_zero(), Error::<T>::OracleUnavailable);
-		Ok((config, price))
-	}
-
 	/// Locate and price the recovery head for an offset, as a pure read.
 	fn offset_decision(
 		collateral_id: &CollateralIdOf<T>,
@@ -227,7 +204,9 @@ impl<T: Config> Pallet<T> {
 		let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
 			return Ok(OffsetDecision::NoTarget);
 		};
-		let (config, price) = Self::offset_inputs(collateral_id, stable_id)?;
+		let config =
+			RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::StablecoinNotRegistered)?;
+		let price = Self::collateral_price(collateral_id)?;
 		let snapshot = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?;
 		let plan = Self::price_recovery(stable_id, &snapshot, price, max_debt_to_cancel, &config);
 		Ok(match plan {
@@ -266,7 +245,7 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 
 	fn execute_recovery_offset(
 		collateral_id: &CollateralIdOf<T>,
-		payment: StableCreditOf<T>,
+		mut payment: StableCreditOf<T>,
 		collateral_recipient: &T::AccountId,
 	) -> Result<(RecoveryOffsetResult<BalanceOf<T>>, StableCreditOf<T>), DispatchError> {
 		// The payment's own asset names the market: a coin mismatch is
@@ -277,7 +256,6 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 			OffsetDecision::NoTarget => Ok((RecoveryOffsetResult::NoTarget, payment)),
 			OffsetDecision::BelowPar => Ok((RecoveryOffsetResult::BelowPar, payment)),
 			OffsetDecision::Available { owner, debt, collateral } => {
-				let mut payment = payment;
 				let debt_payment = payment.extract(debt);
 				debug_assert_eq!(debt_payment.peek(), debt);
 				T::Vaults::redeem_step(
