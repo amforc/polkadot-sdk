@@ -647,15 +647,7 @@ mod benchmarks {
 		// pending so nomination measures the collateral transfer as well as interest minting.
 		for who in [owner.clone(), account("husk", 1, 0)] {
 			fund_collateral::<T>(&asset, &who, balance::<T>(ACCOUNT_FUNDING))?;
-			Pallet::<T>::open_vault(
-				RawOrigin::Signed(who.clone()).into(),
-				asset.clone(),
-				stable::<T>(),
-				balance::<T>(SEED_COLL),
-				balance::<T>(SEED_DEBT),
-				rate(5, 100),
-				Position::endpoints_only(),
-			)?;
+			open_default_vault::<T>(&who, &asset, balance::<T>(SEED_COLL))?;
 			T::StableAssets::mint_into(stable::<T>(), &who, balance::<T>(SEED_DEBT))?;
 			Pallet::<T>::repay_for(
 				RawOrigin::Signed(who.clone()).into(),
@@ -666,15 +658,7 @@ mod benchmarks {
 			)?;
 		}
 		let victim = funded_account::<T>("victim", &asset)?;
-		Pallet::<T>::open_vault(
-			RawOrigin::Signed(victim.clone()).into(),
-			asset.clone(),
-			stable::<T>(),
-			balance::<T>(RECOVERY_VAULT_COLL),
-			balance::<T>(SEED_DEBT),
-			rate(5, 100),
-			Position::endpoints_only(),
-		)?;
+		open_default_vault::<T>(&victim, &asset, balance::<T>(RECOVERY_VAULT_COLL))?;
 		T::BenchmarkHelper::set_oracle_price(
 			asset.clone(),
 			FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
@@ -847,15 +831,7 @@ mod benchmarks {
 			(owner.clone(), balance::<T>(RECOVERY_VAULT_COLL)),
 			(recipient, balance::<T>(SEED_COLL)),
 		] {
-			Pallet::<T>::open_vault(
-				RawOrigin::Signed(who).into(),
-				asset.clone(),
-				stable::<T>(),
-				collateral,
-				balance::<T>(SEED_DEBT),
-				rate(5, 100),
-				Position::endpoints_only(),
-			)?;
+			open_default_vault::<T>(&who, &asset, collateral)?;
 		}
 		T::BenchmarkHelper::set_oracle_price(
 			asset.clone(),

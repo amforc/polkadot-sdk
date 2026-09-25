@@ -118,15 +118,9 @@ impl<T: Config> VaultOp<T> {
 		keeper: &T::AccountId,
 		price: FixedU128,
 	) -> Result<BalanceOf<T>, DispatchError> {
-		let full_payoff = self
-			.vault
-			.debt
-			.total()
-			.checked_add(&self.vault.terminal_interest_charge())
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		let reward = final_recovery_keeper_reward(
 			self.vault.collateral,
-			full_payoff,
+			self.full_payoff()?,
 			price,
 			&self.ctx.config.liquidation,
 		)
@@ -138,16 +132,7 @@ impl<T: Config> VaultOp<T> {
 		if !Pallet::<T>::keeper_can_be_paid(self.collateral_id(), keeper, reward) {
 			return Ok(BalanceOf::<T>::zero());
 		}
-		T::CollateralAssets::transfer_on_hold(
-			self.collateral_id().clone(),
-			&HoldReason::VaultCollateral.into(),
-			&self.owner,
-			keeper,
-			reward,
-			Precision::Exact,
-			Restriction::Free,
-			Fortitude::Polite,
-		)?;
+		self.release_collateral(keeper, reward)?;
 		self.remove_collateral(reward)?;
 		Ok(reward)
 	}

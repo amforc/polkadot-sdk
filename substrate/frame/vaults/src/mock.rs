@@ -31,8 +31,8 @@ use frame::{
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
 		fungibles::{
-			roles::Inspect as FungiblesRolesInspect, AssetFootprintPrice, AtLeastMinimumBalance,
-			Balanced as FungiblesBalanced, BalancedHold as FungiblesBalancedHold, Credit,
+			AssetFootprintPrice, AtLeastMinimumBalance, Balanced as FungiblesBalanced,
+			BalancedHold as FungiblesBalancedHold, Credit,
 			HoldConsideration as FungiblesHoldConsideration, Inspect as FungiblesInspect,
 			InspectHold, SufficientAssets,
 		},

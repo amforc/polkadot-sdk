@@ -2,17 +2,10 @@
 
 use crate::{
 	context::{Commit, VaultOp},
-	pallet::{
-		BalanceOf, CollateralIdOf, Config, Error, Event, HoldReason, Pallet, StableCreditOf,
-		StableIdOf,
-	},
+	pallet::{BalanceOf, CollateralIdOf, Config, Error, Event, Pallet, StableCreditOf, StableIdOf},
 	types::VaultStatus,
 };
-use frame::{
-	deps::frame_support::transactional,
-	prelude::*,
-	traits::{fungibles::MutateHold as FungiblesMutateHold, tokens::Restriction},
-};
+use frame::prelude::*;
 use pusd_primitives::{
 	BranchInterface, BranchMode, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
