@@ -132,20 +132,15 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 						{
 							return Err("member snapshot ahead of its cohort's coordinates".into());
 						}
-						let window = Pallet::<T>::sums_window(
+						let (realized, _) = Pallet::<T>::realize_leg(
 							&collateral_id,
 							&stable_id,
 							Leg::Pending,
+							&pool,
+							pending.amount,
 							&pending.snapshot,
 						)
 						.map_err(|_| "pending snapshot has no sums row")?;
-						let realized = crate::math::realize(
-							pending.amount,
-							&pending.snapshot,
-							&state.pending_coords,
-							&window,
-							&config.precision,
-						);
 						if !realized.yield_gain.is_zero() {
 							return Err("pending deposit realized a yield gain".into());
 						}
@@ -155,20 +150,16 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 						*claims = claims.saturating_add(realized.compounded);
 					},
 					(None, Some(checkpoint)) => {
-						let window = Pallet::<T>::checkpoint_window(
+						let phase_one = Pallet::<T>::realize_between(
 							&collateral_id,
 							&stable_id,
-							&pending.snapshot,
-							&checkpoint.pending_end,
-						)
-						.map_err(|_| "checkpoint window has no sums row")?;
-						let phase_one = crate::math::realize(
+							Leg::Pending,
 							pending.amount,
 							&pending.snapshot,
-							&checkpoint.pending_end.coords,
-							&window,
+							&checkpoint.pending_end,
 							&config.precision,
-						);
+						)
+						.map_err(|_| "checkpoint window has no sums row")?;
 						if !phase_one.yield_gain.is_zero() {
 							return Err("checkpointed tranche realized a yield gain".into());
 						}
@@ -179,40 +170,30 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 						}
 						// The survivor is active capital since the checkpoint: it counts against
 						// the active total, not the pending one.
-						let window = Pallet::<T>::sums_window(
+						let (phase_two, _) = Pallet::<T>::realize_leg(
 							&collateral_id,
 							&stable_id,
 							Leg::Active,
+							&pool,
+							phase_one.compounded,
 							&checkpoint.active_start,
 						)
 						.map_err(|_| "checkpoint active start has no sums row")?;
-						let phase_two = crate::math::realize(
-							phase_one.compounded,
-							&checkpoint.active_start,
-							&state.coords,
-							&window,
-							&config.precision,
-						);
 						compounded_sum = compounded_sum.saturating_add(phase_two.compounded);
 					},
 				}
 				*tallies.members.entry(pending.cohort).or_default() += 1;
 			}
 
-			let window = Pallet::<T>::sums_window(
+			let (realized, _) = Pallet::<T>::realize_leg(
 				&collateral_id,
 				&stable_id,
 				Leg::Active,
+				&pool,
+				deposit.active_deposit,
 				&deposit.snapshot,
 			)
 			.map_err(|_| "deposit snapshot has no sums row")?;
-			let realized = crate::math::realize(
-				deposit.active_deposit,
-				&deposit.snapshot,
-				&state.coords,
-				&window,
-				&config.precision,
-			);
 			compounded_sum = compounded_sum.saturating_add(realized.compounded);
 		}
 		if pending_sum > state.total_pending_deposits {
@@ -299,8 +280,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 
 	// No checkpoint may outlive the rows that reference it: every stored checkpoint belongs to a
 	// registered market, and the per-market loop above already matched member counts.
-	for ((collateral_id, stable_id, _id), _checkpoint) in CohortCheckpoints::<T>::iter() {
-		if Pools::<T>::get(&collateral_id, &stable_id).is_none() {
+	for (collateral_id, stable_id, _id) in CohortCheckpoints::<T>::iter_keys() {
+		if !Pools::<T>::contains_key(&collateral_id, &stable_id) {
 			return Err("cohort checkpoint without a pool row".into());
 		}
 	}

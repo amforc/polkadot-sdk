@@ -80,19 +80,45 @@ impl<T: Config> Pallet<T> {
 		Some(pool)
 	}
 
-	/// Confirms that one nonzero offset leg still has its quoted capacity.
+	/// Returns the debt that `leg` can cancel now, with all due cohorts activated in memory.
+	///
+	/// A missing or frozen market has zero capacity.
+	fn reducible(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		leg: Leg,
+		max_debt: BalanceOf<T>,
+		reserved: BalanceOf<T>,
+	) -> BalanceOf<T> {
+		let Some(pool) = Self::offset_pool_advanced(collateral_id, stable_id) else {
+			return BalanceOf::<T>::zero();
+		};
+		let pool_account = Self::pool_account(collateral_id, stable_id);
+		Self::size_offset(&pool, stable_id, &pool_account, leg, max_debt, reserved)
+			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+	}
+
+	/// Confirms that `leg` still has the quoted capacity for `requested` debt. A zero request
+	/// reserves nothing.
 	///
 	/// A mismatch means that the quote is stale. The complete offset must then fail without value
 	/// movement.
-	fn size_leg_exact(
-		sized: Option<(BalanceOf<T>, Preservation)>,
+	fn reserve_leg(
+		pool: &StabilityPoolOf<T>,
+		stable_id: &StableIdOf<T>,
+		pool_account: &T::AccountId,
+		leg: Leg,
 		requested: BalanceOf<T>,
-	) -> Result<OffsetReservation<BalanceOf<T>>, DispatchError> {
-		let Some((debt, preservation)) = sized else {
-			return Err(crate::Error::<T>::OffsetSettlementFailed.into());
-		};
+		reserved: BalanceOf<T>,
+	) -> Result<Option<OffsetReservation<BalanceOf<T>>>, DispatchError> {
+		if requested.is_zero() {
+			return Ok(None);
+		}
+		let (debt, preservation) =
+			Self::size_offset(pool, stable_id, pool_account, leg, requested, reserved)
+				.ok_or(crate::Error::<T>::OffsetSettlementFailed)?;
 		ensure!(debt == requested, crate::Error::<T>::OffsetSettlementFailed);
-		Ok(OffsetReservation { debt, preservation })
+		Ok(Some(OffsetReservation { debt, preservation }))
 	}
 }
 
@@ -102,19 +128,7 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 		stable_id: &StableIdOf<T>,
 		max_debt: BalanceOf<T>,
 	) -> BalanceOf<T> {
-		let Some(pool) = Self::offset_pool_advanced(collateral_id, stable_id) else {
-			return BalanceOf::<T>::zero();
-		};
-		let pool_account = Self::pool_account(collateral_id, stable_id);
-		Self::size_offset(
-			&pool,
-			stable_id,
-			&pool_account,
-			Leg::Active,
-			max_debt,
-			BalanceOf::<T>::zero(),
-		)
-		.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+		Self::reducible(collateral_id, stable_id, Leg::Active, max_debt, BalanceOf::<T>::zero())
 	}
 
 	fn reducible_pending(
@@ -123,12 +137,7 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 		max_debt: BalanceOf<T>,
 		active_debt: BalanceOf<T>,
 	) -> BalanceOf<T> {
-		let Some(pool) = Self::offset_pool_advanced(collateral_id, stable_id) else {
-			return BalanceOf::<T>::zero();
-		};
-		let pool_account = Self::pool_account(collateral_id, stable_id);
-		Self::size_offset(&pool, stable_id, &pool_account, Leg::Pending, max_debt, active_debt)
-			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+		Self::reducible(collateral_id, stable_id, Leg::Pending, max_debt, active_debt)
 	}
 }
 
@@ -163,32 +172,22 @@ impl<T: Config>
 		// Both legs re-size against the untouched pool, in the order the caller inspected them:
 		// active first, pending reserved behind it. A caller whose readings went stale therefore
 		// fails here, with nothing moved.
-		let active = if debt.active.is_zero() {
-			None
-		} else {
-			let sized = Self::size_offset(
-				&pool,
-				stable_id,
-				&pool_account,
-				Leg::Active,
-				debt.active,
-				BalanceOf::<T>::zero(),
-			);
-			Some(Self::size_leg_exact(sized, debt.active)?)
-		};
-		let pending = if debt.pending.is_zero() {
-			None
-		} else {
-			let sized = Self::size_offset(
-				&pool,
-				stable_id,
-				&pool_account,
-				Leg::Pending,
-				debt.pending,
-				debt.active,
-			);
-			Some(Self::size_leg_exact(sized, debt.pending)?)
-		};
+		let active = Self::reserve_leg(
+			&pool,
+			stable_id,
+			&pool_account,
+			Leg::Active,
+			debt.active,
+			BalanceOf::<T>::zero(),
+		)?;
+		let pending = Self::reserve_leg(
+			&pool,
+			stable_id,
+			&pool_account,
+			Leg::Pending,
+			debt.pending,
+			debt.active,
+		)?;
 
 		// Active settles first. The pending `Preservation` was sized against the combined limit,
 		// so it only holds once the active part has left the pool account.

@@ -133,6 +133,7 @@ pub mod pallet {
 	use frame::{
 		deps::{
 			frame_support::{
+				storage::StorageNMap as _,
 				traits::{
 					fungibles,
 					fungibles::{Balanced as _, Inspect as _, Refund as _},
@@ -881,8 +882,7 @@ pub mod pallet {
 			if frame_system::Pallet::<T>::providers(&pool_account) == 0 {
 				frame_system::Pallet::<T>::inc_providers(&pool_account);
 			}
-			Self::ensure_collateral_account(collateral_id, &pool_account, funder)?;
-			Ok(())
+			Self::ensure_collateral_account(collateral_id, &pool_account, funder)
 		}
 
 		fn on_deregistered(
@@ -894,9 +894,7 @@ pub mod pallet {
 			// live on them. Vaults rolls the whole `remove_branch` back on this error, so a market
 			// admin cannot strand depositor funds.
 			ensure!(
-				Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
-					.next()
-					.is_none(),
+				!Deposits::<T>::contains_prefix((collateral_id.clone(), stable_id.clone())),
 				Error::<T>::PoolNotEmpty
 			);
 
