@@ -6,7 +6,7 @@ use frame::{deps::sp_runtime::TryRuntimeError, traits::Time};
 pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	// Every write path validates before inserting. A stored invalid config means a path skipped the
 	// shared validation.
-	for (_stable_id, config) in RedemptionConfigs::<T>::iter() {
+	for config in RedemptionConfigs::<T>::iter_values() {
 		if !config.is_valid() {
 			return Err("stored redemption config fails `is_valid`".into());
 		}

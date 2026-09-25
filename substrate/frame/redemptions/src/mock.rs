@@ -21,12 +21,9 @@ use frame::{
 	testing_prelude::*,
 	traits::{
 		fungible::{HoldConsideration, NativeFromLeft, NativeOrWithId},
-		fungibles::{
-			roles::Inspect as FungiblesRolesInspect, Inspect as FungiblesInspect, InspectHold,
-			Mutate as FungiblesMutate,
-		},
+		fungibles::{Inspect as FungiblesInspect, InspectHold, Mutate as FungiblesMutate},
 		tokens::{fungible, imbalance::ResolveAssetTo},
-		AsEnsureOriginWithArg, EnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
+		AsEnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
 use pallet_linked_list::Position;
@@ -194,28 +191,7 @@ pub fn branch_admins(
 
 /// `CreateOrigin`: Root creates deposit-free (`None`); the stable asset's owner
 /// creates with a deposit (`Some(who)`); anyone else is rejected.
-pub struct EnsureAssetOwner;
-impl EnsureOriginWithArg<RuntimeOrigin, StableId> for EnsureAssetOwner {
-	type Success = Option<AccountId>;
-	fn try_origin(o: RuntimeOrigin, stable: &StableId) -> Result<Self::Success, RuntimeOrigin> {
-		match Into::<Result<frame_system::RawOrigin<AccountId>, RuntimeOrigin>>::into(o.clone()) {
-			Ok(frame_system::RawOrigin::Root) => Ok(None),
-			Ok(frame_system::RawOrigin::Signed(who)) => {
-				if <Assets as FungiblesRolesInspect<AccountId>>::owner(*stable) == Some(who) {
-					Ok(Some(who))
-				} else {
-					Err(o)
-				}
-			},
-			_ => Err(o),
-		}
-	}
-
-	#[cfg(feature = "runtime-benchmarks")]
-	fn try_successful_origin(_: &StableId) -> Result<RuntimeOrigin, ()> {
-		Ok(RuntimeOrigin::root())
-	}
-}
+pub type EnsureAssetOwner = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 /// Flat 1_000-unit refundable creation deposit, held in native balance.
 pub type VaultsConsideration = HoldConsideration<

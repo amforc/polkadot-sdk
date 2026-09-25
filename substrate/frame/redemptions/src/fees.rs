@@ -177,8 +177,7 @@ impl DynamicFeeCurve {
 
 /// Calculates the mean of two dynamic fees. It rounds down at the `1e-18` resolution.
 fn midpoint(a: FixedU128, b: FixedU128) -> FixedU128 {
-	let low = a.min(b);
-	low.saturating_add(a.max(b).saturating_sub(low).saturating_mul(HALF))
+	FixedU128::from_inner(a.into_inner().midpoint(b.into_inner()))
 }
 
 /// Calculates `min(dynamic_fee + base_fee, fee_ceiling)`.
