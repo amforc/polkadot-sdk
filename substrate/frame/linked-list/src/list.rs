@@ -17,27 +17,13 @@
 
 //! Storage primitives for the sorted doubly-linked list.
 //!
-//! [`Node`] is the per-item storage value. [`insert_at_inner`], [`remove_at`]
+//! [`Node`] is the per-item storage value. [`insert_at_inner`], [`remove_at`], [`unlink`]
 //! and [`walk_repair`] mutate or read the per-list [`ListNodes`] and
 //! [`ListMetas`] storage maps and are wrapped by the trait impl in
 //! [`super::sorted_list_interface`].
 
 use crate::{pallet::*, ListError, ListMeta, Position};
 use frame::{deps::frame_support::traits::DefensiveOption, prelude::*};
-
-/// Fetch a neighbor's stored node. A `Some(id)` that resolves to no row is
-/// internal corruption — a healthy node never links to an absent neighbor.
-fn fetch_neighbor<T: Config>(
-	list_id: &T::ListId,
-	id: Option<T::ItemId>,
-) -> Result<Option<(T::ItemId, Node<T::ItemId, T::Priority>)>, ListError> {
-	id.map(|i| {
-		ListNodes::<T>::get(list_id, &i)
-			.defensive_ok_or(ListError::CorruptList)
-			.map(|n| (i, n))
-	})
-	.transpose()
-}
 
 /// One node of a per-list sorted list.
 ///
@@ -133,11 +119,10 @@ pub fn neighbor_priorities_admit<ItemId, Priority: Ord>(
 /// fetched by [`neighbor_nodes`]; the meta row is read only when an endpoint
 /// side is present, so validating an interior node costs no extra reads.
 ///
-/// The single node-link integrity predicate: `re_insert` and [`remove_at`]
-/// require it before mutating, and [`insert_at_inner`]'s debug post-condition
-/// re-checks it after writing. The endpoint checks inside
-/// [`update_meta_for_insert`]/[`update_meta_for_remove`] stay as its
-/// write-site pair.
+/// The single node-link integrity predicate: every unlink goes through
+/// [`linked_neighbors`] before mutating, and [`insert_at_inner`]'s debug
+/// post-condition re-checks it after writing. [`update_meta_for_remove`]
+/// relies on its endpoint checks rather than repeating them on the same row.
 pub fn validate_node_links<T: Config>(
 	list_id: &T::ListId,
 	item: &T::ItemId,
@@ -268,14 +253,15 @@ fn try_walk_priority<ItemId: Clone, Priority: Ord>(
 }
 
 /// A validated insert position produced by [`walk_repair`]: the corrected
-/// position, the number of repair steps actually taken, and the neighbor rows
-/// fetched during the final validation pass so that [`insert_at_inner`] can
-/// splice without re-reading them.
+/// position, the number of repair steps actually taken, and the neighbor and
+/// [`ListMetas`] rows read during the final validation pass so that
+/// [`insert_at_inner`] can splice without re-reading them.
 pub struct ValidPosition<ItemId, Priority> {
 	pub position: Position<ItemId>,
 	pub steps: u32,
 	pub prev_node: Option<Node<ItemId, Priority>>,
 	pub next_node: Option<Node<ItemId, Priority>>,
+	pub meta: Option<ListMeta<ItemId>>,
 }
 
 /// Walk from `hint` toward the correct insert position for `priority`, taking
@@ -301,7 +287,7 @@ pub fn walk_repair<T: Config>(
 		let (prev_node, next_node) = neighbor_nodes::<T>(list_id, &current);
 		let (pn, nn) = (prev_node.as_ref(), next_node.as_ref());
 		if is_position_valid(priority, &current, pn, nn, meta.as_ref()) {
-			return Ok(ValidPosition { position: current, steps, prev_node, next_node });
+			return Ok(ValidPosition { position: current, steps, prev_node, next_node, meta });
 		}
 		if steps == budget {
 			break;
@@ -350,53 +336,55 @@ fn assert_position_admits<T: Config>(
 /// the head/tail, so the existing head/tail pointer must agree with the other
 /// side.
 ///
+/// `meta` is the stored row as read by the caller with no write since, so the
+/// row is written without being re-read.
+///
 /// Returns `true` if this insert created the list (the `ListMetas` row was absent).
 fn update_meta_for_insert<T: Config>(
 	list_id: &T::ListId,
 	item: &T::ItemId,
 	position: &Position<T::ItemId>,
+	meta: Option<ListMeta<T::ItemId>>,
 ) -> Result<bool, ListError> {
-	ListMetas::<T>::try_mutate_exists(list_id, |slot| -> Result<bool, ListError> {
-		let list_created = slot.is_none();
-		// No meta row means an empty list, so the only valid hint is
-		// `endpoints_only`. Any neighbor hint means nodes exist without a meta
-		// row: reject it as corruption instead of building a list over the orphans.
-		if list_created && *position != Position::endpoints_only() {
-			defensive!("insert_at: neighbor hint into absent list metadata");
-			return Err(ListError::CorruptList);
-		}
-		let mut meta = slot.take().unwrap_or_default();
-		if position.prev.is_none() && meta.head != position.next {
-			defensive!("insert_at: head pointer disagrees with head-side insert");
-			return Err(ListError::CorruptList);
-		}
-		if position.next.is_none() && meta.tail != position.prev {
-			defensive!("insert_at: tail pointer disagrees with tail-side insert");
-			return Err(ListError::CorruptList);
-		}
-		// Caller-reachable capacity limit, not corruption: a list can legitimately
-		// hold `u32::MAX` items, so overflow stays a graceful `ListTooLong` rather
-		// than the `defensive!` posture of the surrounding consistency checks.
-		meta.len = meta.len.checked_add(1).ok_or(ListError::ListTooLong)?;
-		if position.prev.is_none() {
-			meta.head = Some(item.clone());
-		}
-		if position.next.is_none() {
-			meta.tail = Some(item.clone());
-		}
-		*slot = Some(meta);
-		Ok(list_created)
-	})
+	let list_created = meta.is_none();
+	// No meta row means an empty list, so the only valid hint is
+	// `endpoints_only`. Any neighbor hint means nodes exist without a meta
+	// row: reject it as corruption instead of building a list over the orphans.
+	if list_created && *position != Position::endpoints_only() {
+		defensive!("insert_at: neighbor hint into absent list metadata");
+		return Err(ListError::CorruptList);
+	}
+	let mut meta = meta.unwrap_or_default();
+	if position.prev.is_none() && meta.head != position.next {
+		defensive!("insert_at: head pointer disagrees with head-side insert");
+		return Err(ListError::CorruptList);
+	}
+	if position.next.is_none() && meta.tail != position.prev {
+		defensive!("insert_at: tail pointer disagrees with tail-side insert");
+		return Err(ListError::CorruptList);
+	}
+	// Caller-reachable capacity limit, not corruption: a list can legitimately
+	// hold `u32::MAX` items, so overflow stays a graceful `ListTooLong` rather
+	// than the `defensive!` posture of the surrounding consistency checks.
+	meta.len = meta.len.checked_add(1).ok_or(ListError::ListTooLong)?;
+	if position.prev.is_none() {
+		meta.head = Some(item.clone());
+	}
+	if position.next.is_none() {
+		meta.tail = Some(item.clone());
+	}
+	ListMetas::<T>::insert(list_id, meta);
+	Ok(list_created)
 }
 
-/// Insert `item` at `position` in `list_id`, fetching the neighbor rows from
-/// storage. The caller is responsible for ensuring the position is valid;
-/// errors if `item` is already in the list.
+/// Insert `item` at `position` in `list_id`, fetching the neighbor and meta
+/// rows from storage. The caller is responsible for ensuring the position is
+/// valid; errors if `item` is already in the list.
 ///
 /// Thin wrapper over [`insert_at_inner`] for callers that did not just run
-/// [`walk_repair`] (which already holds the fetched neighbor rows). All
-/// production paths go through `walk_repair`, so only tests drive this
-/// entry point directly (to exercise the defensive guards in isolation).
+/// [`walk_repair`] (which already holds the fetched rows). All production
+/// paths go through `walk_repair`, so only tests drive this entry point
+/// directly (to exercise the defensive guards in isolation).
 ///
 /// Returns `true` if this insert created the list (it was previously empty).
 #[cfg(test)]
@@ -418,26 +406,28 @@ pub fn insert_at<T: Config>(
 		return Err(ListError::CorruptList);
 	}
 
-	let prev_node = fetch_neighbor::<T>(list_id, position.prev.clone())?.map(|(_, n)| n);
-	let next_node = fetch_neighbor::<T>(list_id, position.next.clone())?.map(|(_, n)| n);
-	insert_at_inner::<T>(list_id, item, priority, position, prev_node, next_node)
+	// A dangling side surfaces as `insert_at_inner`'s side/node disagreement.
+	let (prev_node, next_node) = neighbor_nodes::<T>(list_id, &position);
+	let meta = ListMetas::<T>::get(list_id);
+	let valid = ValidPosition { position, steps: 0, prev_node, next_node, meta };
+	insert_at_inner::<T>(list_id, item, priority, valid)
 }
 
-/// Splice `item` in at `position`, whose neighbor rows the caller has already
+/// Splice `item` in at `valid.position`, whose rows the caller has already
 /// fetched: `prev_node`/`next_node` must be the stored nodes for
-/// `position.prev`/`position.next`, `None` on endpoint sides. Called directly
-/// after [`walk_repair`] with the rows it validated, so the hot path never
-/// re-reads them.
+/// `position.prev`/`position.next` (`None` on endpoint sides) and `meta` the
+/// stored [`ListMetas`] row, all unchanged since. Called directly after
+/// [`walk_repair`] with the rows it validated, so the hot path never re-reads
+/// them.
 ///
 /// Returns `true` if this insert created the list (it was previously empty).
 pub fn insert_at_inner<T: Config>(
 	list_id: &T::ListId,
 	item: &T::ItemId,
 	priority: T::Priority,
-	position: Position<T::ItemId>,
-	prev_node: Option<Node<T::ItemId, T::Priority>>,
-	next_node: Option<Node<T::ItemId, T::Priority>>,
+	valid: ValidPosition<T::ItemId, T::Priority>,
 ) -> Result<bool, ListError> {
+	let ValidPosition { position, steps: _, prev_node, next_node, meta } = valid;
 	// Anti-cycle guard: a node must never be linked against itself. `walk_repair`
 	// never yields such a position, so reaching it is internal corruption.
 	if position.prev.as_ref() == Some(item) || position.next.as_ref() == Some(item) {
@@ -457,7 +447,7 @@ pub fn insert_at_inner<T: Config>(
 
 	assert_position_admits::<T>(&priority, &position, prev_node.as_ref(), next_node.as_ref())?;
 
-	let list_created = update_meta_for_insert::<T>(list_id, item, &position)?;
+	let list_created = update_meta_for_insert::<T>(list_id, item, &position, meta)?;
 
 	// Splice in on the head side: rewrite prev's `.next` to point at `item`.
 	if let (Some(p), Some(mut node)) = (position.prev.as_ref(), prev_node) {
@@ -507,14 +497,16 @@ fn debug_assert_insert_post_condition<T: Config>(list_id: &T::ListId, item: &T::
 	);
 }
 
-/// Apply the head/tail/len bookkeeping for removing `item`, whose stored
-/// links form the `vacated` gap, folding the endpoint cross-check into one
-/// `ListMetas` row update. On any error the row is left untouched.
+/// Apply the head/tail/len bookkeeping for removing the item whose stored
+/// links form the `vacated` gap, in one `ListMetas` row update. On any error
+/// the row is left untouched.
+///
+/// The endpoint cross-check is not repeated here: every caller has just run
+/// [`validate_node_links`], which checks the same row with no write since.
 ///
 /// Returns `true` if this remove emptied the list (the `ListMetas` row was dropped).
 fn update_meta_for_remove<T: Config>(
 	list_id: &T::ListId,
-	item: &T::ItemId,
 	vacated: &Position<T::ItemId>,
 ) -> Result<bool, ListError> {
 	ListMetas::<T>::try_mutate_exists(list_id, |slot| -> Result<bool, ListError> {
@@ -529,16 +521,6 @@ fn update_meta_for_remove<T: Config>(
 			if neighbors == 0 { meta.len == 1 } else { meta.len > neighbors };
 		if !len_matches_topology {
 			defensive!("remove_at: ListMetas.len incompatible with removed node topology");
-			return Err(ListError::CorruptList);
-		}
-		// Endpoint cross-check: a `None`-side neighbor link means `item` must
-		// be the stored head/tail; otherwise storage is internally inconsistent.
-		if vacated.prev.is_none() && meta.head.as_ref() != Some(item) {
-			defensive!("remove_at: head pointer disagrees with removed head node");
-			return Err(ListError::CorruptList);
-		}
-		if vacated.next.is_none() && meta.tail.as_ref() != Some(item) {
-			defensive!("remove_at: tail pointer disagrees with removed tail node");
 			return Err(ListError::CorruptList);
 		}
 		meta.len = meta.len.checked_sub(1).defensive_ok_or(ListError::CorruptList)?;
@@ -559,6 +541,55 @@ fn update_meta_for_remove<T: Config>(
 	})
 }
 
+/// Fetch the neighbor rows of `item`, whose stored links are `position`, and
+/// require them to pass [`validate_node_links`]. The returned `(prev, next)`
+/// rows are exactly what [`unlink`] needs to splice `item` out.
+pub fn linked_neighbors<T: Config>(
+	list_id: &T::ListId,
+	item: &T::ItemId,
+	position: &Position<T::ItemId>,
+) -> Result<(Option<Node<T::ItemId, T::Priority>>, Option<Node<T::ItemId, T::Priority>>), ListError>
+{
+	let (prev_node, next_node) = neighbor_nodes::<T>(list_id, position);
+	validate_node_links::<T>(list_id, item, position, prev_node.as_ref(), next_node.as_ref())?;
+	Ok((prev_node, next_node))
+}
+
+/// Splice `item` out of `list_id`. `vacated` is its stored position and
+/// `prev_node`/`next_node` its neighbor rows as returned by
+/// [`linked_neighbors`], with no write since.
+///
+/// Returns `true` if this unlink emptied the list (the `ListMetas` row was dropped).
+pub fn unlink<T: Config>(
+	list_id: &T::ListId,
+	item: &T::ItemId,
+	vacated: Position<T::ItemId>,
+	prev_node: Option<Node<T::ItemId, T::Priority>>,
+	next_node: Option<Node<T::ItemId, T::Priority>>,
+) -> Result<bool, ListError> {
+	debug_assert_eq!(vacated.prev.is_some(), prev_node.is_some(), "unvalidated prev side");
+	debug_assert_eq!(vacated.next.is_some(), next_node.is_some(), "unvalidated next side");
+
+	// Update the meta row first so that a `len` failure surfaces as
+	// `CorruptList` before any node-row mutation happens.
+	let list_removed = update_meta_for_remove::<T>(list_id, &vacated)?;
+
+	ListNodes::<T>::remove(list_id, item);
+
+	// Splice past `item` in the neighbors' node rows.
+	let Position { prev, next } = vacated;
+	if let (Some(p), Some(mut left)) = (prev.as_ref(), prev_node) {
+		left.next = next.clone();
+		ListNodes::<T>::insert(list_id, p, left);
+	}
+	if let (Some(n), Some(mut right)) = (next.as_ref(), next_node) {
+		right.prev = prev;
+		ListNodes::<T>::insert(list_id, n, right);
+	}
+
+	Ok(list_removed)
+}
+
 /// Remove `item` from `list_id`. Drops the [`ListMetas`] row when the list
 /// becomes empty. Errors if `item` is not in the list.
 ///
@@ -571,34 +602,7 @@ pub fn remove_at<T: Config>(
 	let node = ListNodes::<T>::get(list_id, item).ok_or(ListError::ItemNotFound)?;
 	let priority = node.priority;
 	let vacated = node.into_position();
-
-	// `fetch_neighbor` already rejects dangling sides defensively, pairing
-	// with the validator's own dangling arms.
-	let prev_node = fetch_neighbor::<T>(list_id, vacated.prev.clone())?;
-	let next_node = fetch_neighbor::<T>(list_id, vacated.next.clone())?;
-	validate_node_links::<T>(
-		list_id,
-		item,
-		&vacated,
-		prev_node.as_ref().map(|(_, node)| node),
-		next_node.as_ref().map(|(_, node)| node),
-	)?;
-
-	// Validate endpoints and update the meta row first so that any cross-check
-	// failure surfaces as `CorruptList` before any node-row mutation happens.
-	let list_removed = update_meta_for_remove::<T>(list_id, item, &vacated)?;
-
-	ListNodes::<T>::remove(list_id, item);
-
-	// Splice past `item` in the neighbors' node rows.
-	if let Some((p, mut left)) = prev_node {
-		left.next = vacated.next;
-		ListNodes::<T>::insert(list_id, p, left);
-	}
-	if let Some((n, mut right)) = next_node {
-		right.prev = vacated.prev;
-		ListNodes::<T>::insert(list_id, n, right);
-	}
-
+	let (prev_node, next_node) = linked_neighbors::<T>(list_id, item, &vacated)?;
+	let list_removed = unlink::<T>(list_id, item, vacated, prev_node, next_node)?;
 	Ok((priority, list_removed))
 }

@@ -67,19 +67,13 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 			return Err(ListError::ItemAlreadyExists);
 		}
 		let valid = list::walk_repair::<T>(&list_id, &priority, hint)?;
-		let list_created = list::insert_at_inner::<T>(
-			&list_id,
-			&item,
-			priority,
-			valid.position,
-			valid.prev_node,
-			valid.next_node,
-		)?;
+		let steps = valid.steps;
+		let list_created = list::insert_at_inner::<T>(&list_id, &item, priority, valid)?;
 		if list_created {
 			Self::deposit_event(Event::ListCreated { list_id: list_id.clone() });
 		}
 		Self::deposit_event(Event::ItemInserted { list_id, item, priority });
-		Ok(valid.steps)
+		Ok(steps)
 	}
 
 	fn remove(list_id: &T::ListId, item: &T::ItemId) -> Result<(), ListError> {
@@ -125,16 +119,11 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		// Every mutating path validates the node's stored links up front so
 		// corruption surfaces as `CorruptList` here, matching the posture of
 		// `insert`/`remove`. Interior nodes pay no extra reads: the neighbor
-		// rows double as the in-place admissibility inputs below.
+		// rows double as the in-place admissibility inputs and the unlink
+		// splice below.
 		let existing_position = existing.into_position();
-		let (prev_node, next_node) = list::neighbor_nodes::<T>(&list_id, &existing_position);
-		list::validate_node_links::<T>(
-			&list_id,
-			&item,
-			&existing_position,
-			prev_node.as_ref(),
-			next_node.as_ref(),
-		)?;
+		let (prev_node, next_node) =
+			list::linked_neighbors::<T>(&list_id, &item, &existing_position)?;
 
 		// Fast path: existing neighbors still admit the new priority, mutate in place.
 		if list::neighbor_priorities_admit(
@@ -143,11 +132,13 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 			prev_node.as_ref(),
 			next_node.as_ref(),
 		) {
-			ListNodes::<T>::mutate(&list_id, &item, |maybe| {
-				if let Some(n) = maybe {
-					n.priority = new_priority;
-				}
-			});
+			// The node was read above; rewrite it rather than re-read it through `mutate`.
+			let Position { prev, next } = existing_position;
+			ListNodes::<T>::insert(
+				&list_id,
+				&item,
+				list::Node { prev, next, priority: new_priority },
+			);
 			Self::deposit_event(Event::ItemReinserted {
 				list_id,
 				item,
@@ -158,23 +149,19 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		}
 
 		// Slow path: splice + re-insert. Wrapped in a nested storage layer so
-		// that an `InvalidPositionHints` after `remove_at` rolls back cleanly.
+		// that an `InvalidPositionHints` after `unlink` rolls back cleanly.
 		let outer = with_transaction_opaque_err::<u32, ListError, _>(|| {
 			let inner = (|| -> Result<u32, ListError> {
 				// The item never leaves the list, so the lifecycle flags from
-				// `remove_at`/`insert_at_inner` are intentionally dropped — emitting
+				// `unlink`/`insert_at_inner` are intentionally dropped — emitting
 				// `ListRemoved`/`ListCreated` here would churn a single-item relocate.
-				list::remove_at::<T>(&list_id, &item)?;
+				// The rows validated above are unchanged, so unlink with them
+				// rather than re-reading and re-validating through `remove_at`.
+				list::unlink::<T>(&list_id, &item, existing_position, prev_node, next_node)?;
 				let valid = list::walk_repair::<T>(&list_id, &new_priority, hint)?;
-				list::insert_at_inner::<T>(
-					&list_id,
-					&item,
-					new_priority,
-					valid.position,
-					valid.prev_node,
-					valid.next_node,
-				)?;
-				Ok(valid.steps)
+				let steps = valid.steps;
+				list::insert_at_inner::<T>(&list_id, &item, new_priority, valid)?;
+				Ok(steps)
 			})();
 			if inner.is_ok() {
 				TransactionOutcome::Commit(inner)

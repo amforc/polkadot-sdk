@@ -30,7 +30,7 @@
 //! 4. Priorities are non-increasing from head to tail.
 //! 5. `ListNodes` has no orphan rows (total row count equals the chain length).
 
-use crate::pallet::*;
+use crate::{pallet::*, ListMeta};
 use alloc::{collections::BTreeSet, vec::Vec};
 use codec::Encode;
 use frame::deps::sp_runtime::TryRuntimeError;
@@ -72,14 +72,12 @@ impl<T: Config> Pallet<T> {
 			return Err("ListMetas present without ListNodes".into());
 		}
 
-		let head_id =
-			meta.head.clone().ok_or::<TryRuntimeError>("ListMetas.head is None".into())?;
-		let tail_id =
-			meta.tail.clone().ok_or::<TryRuntimeError>("ListMetas.tail is None".into())?;
-		if meta.len == 0 {
+		let ListMeta { head, tail, len: stored_size } = meta;
+		let head_id = head.ok_or::<TryRuntimeError>("ListMetas.head is None".into())?;
+		let tail_id = tail.ok_or::<TryRuntimeError>("ListMetas.tail is None".into())?;
+		if stored_size == 0 {
 			return Err("ListMetas.len is zero on present row".into());
 		}
-		let stored_size = meta.len;
 		let head_node = ListNodes::<T>::get(list_id, &head_id)
 			.ok_or::<TryRuntimeError>("ListMetas.head points to missing node".into())?;
 		let tail_node = ListNodes::<T>::get(list_id, &tail_id)
