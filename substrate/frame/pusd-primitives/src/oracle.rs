@@ -57,17 +57,16 @@ where
 		// Read both feeds so that an unusable feed takes precedence when the other feed is absent.
 		// A zero quote is classified as unusable before precedence so that it never resolves to
 		// `Unavailable` and permits a fallback.
-		let asset_price = Self::usable_price(&asset);
-		let reference_price = Self::usable_price(&reference);
-		let (asset_price, reference_price) = match (asset_price, reference_price) {
-			(Ok(asset_price), Ok(reference_price)) => (asset_price, reference_price),
-			// This arm must precede the catch-all asset error: only `Unavailable` permits a
-			// fallback, so a missing asset feed beside an unusable reference feed must surface the
-			// reference error, or the fallback would be unlocked by a feed that cannot be trusted.
-			(Err(DispatchError::Unavailable), Err(reference_error)) => return Err(reference_error),
-			(Err(asset_error), _) => return Err(asset_error),
-			(Ok(_), Err(reference_error)) => return Err(reference_error),
-		};
+		let (asset_price, reference_price) =
+			match (Self::usable_price(&asset), Self::usable_price(&reference)) {
+				// Only `Unavailable` permits a fallback, so a missing asset feed beside an unusable
+				// reference feed must surface the reference error, or the fallback would be
+				// unlocked by a feed that cannot be trusted. Otherwise the asset error wins.
+				(Err(DispatchError::Unavailable), Err(reference_error)) => {
+					return Err(reference_error)
+				},
+				(asset_price, reference_price) => (asset_price?, reference_price?),
+			};
 		// Rounding up means a deposit is never undercharged by a sub-unit.
 		mul_div(
 			balance.unique_saturated_into(),

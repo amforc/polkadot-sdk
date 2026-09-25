@@ -21,7 +21,6 @@ use frame::{
 			Inspect as FungiblesInspect, Mutate as FungiblesMutate,
 			MutateHold as FungiblesMutateHold,
 		},
-		tokens::Restriction,
 		Consideration, Footprint, Time,
 	},
 };
@@ -108,16 +107,7 @@ impl<T: Config> Pallet<T> {
 			return op.finish_close(&recipient, Commit::Checked);
 		}
 
-		T::CollateralAssets::transfer_on_hold(
-			op.collateral_id().clone(),
-			&HoldReason::VaultCollateral.into(),
-			&owner,
-			&recipient,
-			amount,
-			Precision::Exact,
-			Restriction::Free,
-			Fortitude::Polite,
-		)?;
+		op.release_collateral(&recipient, amount)?;
 
 		Self::deposit_event(Event::CollateralWithdrawn {
 			collateral_id: op.collateral_id().clone(),
@@ -171,9 +161,7 @@ impl<T: Config> Pallet<T> {
 		// A repayment needs no price and only lowers risk, so a frozen branch still accepts it.
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		let debt_before_terminal = op.vault().debt.total();
-		let full_payoff = debt_before_terminal
-			.checked_add(&op.vault().terminal_interest_charge())
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		let full_payoff = op.full_payoff()?;
 		// The live repayment must not exceed the requested amount or payoff.
 		let repay = amount.map_or(full_payoff, |amount| amount.min(full_payoff));
 		if repay >= debt_before_terminal {

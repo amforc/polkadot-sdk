@@ -3314,34 +3314,7 @@ impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
 /// `CreateOrigin` for permissionless market creation. Root creates deposit-free
 /// (`None`); the stablecoin asset's owner creates with a refundable deposit
 /// (`Some(who)`); every other origin is rejected.
-pub struct VaultsCreateOrigin;
-impl EnsureOriginWithArg<RuntimeOrigin, VaultsStableId> for VaultsCreateOrigin {
-	type Success = Option<AccountId>;
-
-	fn try_origin(
-		o: RuntimeOrigin,
-		stable_id: &VaultsStableId,
-	) -> Result<Self::Success, RuntimeOrigin> {
-		use frame_support::traits::fungibles::roles::Inspect as RolesInspect;
-		use frame_system::RawOrigin;
-		match o.clone().into() {
-			Ok(RawOrigin::Root) => Ok(None),
-			Ok(RawOrigin::Signed(who)) => {
-				if <Assets as RolesInspect<AccountId>>::owner(*stable_id) == Some(who.clone()) {
-					Ok(Some(who))
-				} else {
-					Err(o)
-				}
-			},
-			_ => Err(o),
-		}
-	}
-
-	#[cfg(feature = "runtime-benchmarks")]
-	fn try_successful_origin(_stable_id: &VaultsStableId) -> Result<RuntimeOrigin, ()> {
-		Ok(RuntimeOrigin::root())
-	}
-}
+pub type VaultsCreateOrigin = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 /// Routes each stablecoin's vault fee remainder to the treasury.
 pub struct VaultsFeeAccount;

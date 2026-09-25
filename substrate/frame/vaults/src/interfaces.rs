@@ -16,7 +16,6 @@ use frame::{
 			Balanced as FungiblesBalanced, BalancedHold as FungiblesBalancedHold,
 			MutateHold as FungiblesMutateHold,
 		},
-		tokens::Restriction,
 	},
 };
 use pusd_primitives::{
@@ -158,7 +157,6 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			.redemption_snapshot(draft.status, draft.config.redistribution_penalty))
 	}
 
-	#[transactional]
 	fn redeem_step(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -186,16 +184,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 		debug_assert_eq!(payment.total(), debt_to_cancel);
 
 		if !collateral_to_recipient.is_zero() {
-			T::CollateralAssets::transfer_on_hold(
-				op.collateral_id().clone(),
-				&HoldReason::VaultCollateral.into(),
-				op.owner(),
-				recipient,
-				collateral_to_recipient,
-				Precision::Exact,
-				Restriction::Free,
-				Fortitude::Polite,
-			)?;
+			op.release_collateral(recipient, collateral_to_recipient)?;
 			op.remove_collateral(collateral_to_recipient)?;
 		}
 		op.reconcile_after_debt_reduction()?;
