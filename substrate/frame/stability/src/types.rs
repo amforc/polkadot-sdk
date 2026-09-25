@@ -3,7 +3,8 @@
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
 	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Saturating, Zero},
-	prelude::{BoundedVec, ConstU32},
+	prelude::{BoundedVec, ConstU32, DispatchError},
+	traits::DefensiveOption,
 };
 use pusd_primitives::Millis;
 use scale_info::TypeInfo;
@@ -366,8 +367,16 @@ impl<Balance> PoolState<Balance> {
 
 	/// Removes the open cohort with `id`.
 	pub fn remove_cohort(&mut self, id: CohortId) {
-		if let Some(index) = self.open_cohorts.iter().position(|cohort| cohort.id == id) {
-			self.open_cohorts.remove(index);
+		self.open_cohorts.retain(|cohort| cohort.id != id);
+	}
+
+	/// Removes one member from the open cohort with `id` and removes a cohort without members.
+	pub(crate) fn drop_member(&mut self, id: CohortId) {
+		if let Some(cohort) = self.cohort_mut(id) {
+			cohort.members = cohort.members.saturating_sub(1);
+			if cohort.members == 0 {
+				self.remove_cohort(id);
+			}
 		}
 	}
 
@@ -433,6 +442,20 @@ impl<Balance: FixedPointOperand> PoolState<Balance> {
 	/// Returns `None` when the active pool is empty or the product overflows.
 	pub fn delta_sum(&self, distributed: Balance) -> Option<FixedU128> {
 		math::delta_sum(distributed, self.coords.p, self.total_active_deposits)
+	}
+
+	/// Returns the open cohort with `id`, revalued at the `live` pending coordinates.
+	///
+	/// An open tranche always has its cohort, so an absent cohort is corruption.
+	pub(crate) fn revalued_cohort(
+		&mut self,
+		id: CohortId,
+		live: &Accumulators,
+		sf_int: u128,
+	) -> Result<&mut OpenCohort<Balance>, DispatchError> {
+		let cohort = self.cohort_mut(id).defensive_ok_or(DispatchError::Corruption)?;
+		cohort.revalue(live, sf_int);
+		Ok(cohort)
 	}
 }
 
