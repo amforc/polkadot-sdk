@@ -6,6 +6,7 @@ mod cohorts;
 mod deposit;
 mod epoch_scale;
 mod governance;
+mod liquidations;
 mod mode;
 mod offsets;
 mod pending_offsets;
