@@ -40,10 +40,11 @@ where
 ///
 /// Implementations fold a sub-minimum remainder into `Expendable` debits even
 /// under `Precision::Exact`, and hard-fail `Preserve` debits that would leave
-/// one. Picking the amount here instead resolves that dead zone up front:
-/// requests inside it round down to the preserving limit, and requests at or
-/// above the whole reducible balance become a full `Expendable` drain. The
-/// caller then invokes the fungibles traits directly with the returned pair.
+/// one. Picking the amount here settles that up front: a request that would
+/// leave less than the minimum balance rounds down to the amount that keeps
+/// it, and a request at or above the whole reducible balance becomes a full
+/// `Expendable` drain. The caller then invokes the fungibles traits directly
+/// with the returned pair.
 ///
 /// Callers deciding *whether* to debit rather than *how much* compare the
 /// returned amount against their request and refuse on a shortfall.
@@ -123,7 +124,7 @@ mod tests {
 	}
 
 	#[test]
-	fn dead_zone_rounds_down_to_the_preserving_limit() {
+	fn requests_leaving_less_than_the_minimum_balance_round_down_to_keep_it() {
 		// 91..=99 all leave a sub-minimum remainder; the amount caps at 90.
 		for limit in [91, 95, 99] {
 			assert_eq!(reducible_debit::<Funded, _>((), &0, limit), (90, Preservation::Preserve));
@@ -149,9 +150,9 @@ mod tests {
 
 	#[test]
 	fn preservation_expends_only_a_full_drain() {
-		// Below and inside the dead zone stay `Preserve`: the implementation
-		// then either succeeds exactly (90) or rejects outright (95), never
-		// folding dust.
+		// Amounts that keep the minimum balance, and amounts that would leave
+		// less than it, stay `Preserve`: the implementation then either
+		// succeeds exactly (90) or rejects outright (95), never folding dust.
 		for amount in [0, 90, 95, 99] {
 			assert_eq!(debit_preservation::<Funded, _>((), &0, amount), Preservation::Preserve);
 		}

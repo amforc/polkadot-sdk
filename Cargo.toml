@@ -435,6 +435,7 @@ members = [
 	"substrate/frame/pusd-primitives",
 	"substrate/frame/ranked-collective",
 	"substrate/frame/recovery",
+	"substrate/frame/redemptions",
 	"substrate/frame/referenda",
 	"substrate/frame/registrar/para",
 	"substrate/frame/registrar/primitives",
@@ -1072,6 +1073,7 @@ pallet-psm-remote-tests = { path = "substrate/frame/psm/remote-tests" }
 pusd-primitives = { path = "substrate/frame/pusd-primitives", default-features = false }
 pallet-ranked-collective = { path = "substrate/frame/ranked-collective", default-features = false }
 pallet-recovery = { path = "substrate/frame/recovery", default-features = false }
+pallet-redemptions = { path = "substrate/frame/redemptions", default-features = false }
 pallet-referenda = { path = "substrate/frame/referenda", default-features = false }
 pallet-revive = { path = "substrate/frame/revive", default-features = false }
 pallet-revive-fixtures = { path = "substrate/frame/revive/fixtures", default-features = false }
