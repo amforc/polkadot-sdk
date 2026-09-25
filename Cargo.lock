@@ -15114,6 +15114,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet-vaults"
+version = "0.1.0"
+dependencies = [
+ "linked-list-interface",
+ "pallet-assets",
+ "pallet-assets-holder",
+ "pallet-balances",
+ "pallet-linked-list",
+ "pallet-timestamp",
+ "parity-scale-codec",
+ "polkadot-sdk-frame",
+ "pusd-primitives",
+ "scale-info",
+]
+
+[[package]]
 name = "pallet-verify-signature"
 version = "1.0.0"
 dependencies = [
@@ -17558,6 +17574,7 @@ dependencies = [
  "pallet-tx-pause",
  "pallet-uniques",
  "pallet-utility",
+ "pallet-vaults",
  "pallet-verify-signature",
  "pallet-vesting",
  "pallet-vesting-precompiles",
@@ -17618,6 +17635,7 @@ dependencies = [
  "polkadot-service",
  "polkadot-statement-distribution",
  "polkadot-statement-table",
+ "pusd-primitives",
  "sc-allocator 23.0.0",
  "sc-authority-discovery",
  "sc-basic-authorship",
@@ -19093,6 +19111,16 @@ dependencies = [
  "proc-macro2 1.0.95",
  "quote 1.0.40",
  "syn 2.0.98",
+]
+
+[[package]]
+name = "pusd-primitives"
+version = "0.1.0"
+dependencies = [
+ "impl-trait-for-tuples",
+ "parity-scale-codec",
+ "polkadot-sdk-frame",
+ "scale-info",
 ]
 
 [[package]]
