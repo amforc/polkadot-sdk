@@ -3437,6 +3437,17 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 		let now = <pallet_timestamp::Pallet<Runtime>>::get();
 		<pallet_timestamp::Pallet<Runtime>>::set_timestamp(now + ms);
 	}
+
+	// The benchmark genesis does not create the pUSD asset, so opening vaults
+	// (which mints pUSD debt) would fail without it.
+	fn ensure_stable_asset(stable_id: VaultsStableId) {
+		use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
+		if !<Assets as FungiblesInspect<AccountId>>::asset_exists(stable_id) {
+			let asset_owner: AccountId = frame_benchmarking::account("pusd_owner", 0, 0);
+			<Assets as Create<AccountId>>::create(stable_id, asset_owner, true, 1)
+				.expect("create pUSD asset for benchmark");
+		}
+	}
 }
 
 #[cfg(feature = "runtime-benchmarks")]
@@ -3527,16 +3538,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		let collateral_id = VaultsCollateralId::Native;
 		let stable_id: VaultsStableId = BENCHMARK_STABLE_ASSET_ID;
 
-		// The benchmark genesis does not create the pUSD asset, so opening vaults
-		// (which mints pUSD debt) and funding the redeemer would fail without it.
-		{
-			use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
-			if !<Assets as FungiblesInspect<AccountId>>::asset_exists(stable_id) {
-				let asset_owner: AccountId = frame_benchmarking::account("pusd_owner", 0, 0);
-				<Assets as Create<AccountId>>::create(stable_id, asset_owner, true, 1)
-					.expect("create pUSD asset for benchmark");
-			}
-		}
+		VaultsBenchmarkHelper::ensure_stable_asset(stable_id);
 
 		// `create_branch` validates the oracle price, so set it first.
 		VaultsBenchmarkHelper::set_oracle_price(

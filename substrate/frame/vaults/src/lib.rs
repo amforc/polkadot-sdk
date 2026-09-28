@@ -52,7 +52,7 @@ pub use pusd_primitives;
 pub use types::{
 	AssetMinimums, BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate,
 	BranchDebt, BranchMode, BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState,
-	LiquidationSettlement, LiquidationSnapshot, RedistributionAccumulators, RedistributionCarry,
+	LiquidationSettlement, LiquidationSnapshot, RedistributionAccumulators,
 	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
 };
 pub use weights::WeightInfo;
@@ -70,6 +70,8 @@ pub trait BenchmarkHelper<CollateralId, StableId> {
 	fn clear_oracle_price(collateral_id: CollateralId);
 	/// Moves the benchmark clock forward.
 	fn advance_time(ms: u64);
+	/// Creates the stable asset when the benchmark genesis lacks it, so benchmarks can mint it.
+	fn ensure_stable_asset(stable_id: StableId);
 }
 
 #[frame::pallet]
@@ -473,17 +475,6 @@ pub mod pallet {
 			/// Interest added.
 			amount: BalanceOf<T>,
 		},
-		/// A vault paid one stablecoin unit for terminal fractional interest.
-		InterestRoundingFeeCharged {
-			/// Collateral asset ID.
-			collateral_id: CollateralIdOf<T>,
-			/// Stable asset ID.
-			stable_id: StableIdOf<T>,
-			/// Vault owner.
-			owner: T::AccountId,
-			/// Fee added to the terminal debt.
-			amount: BalanceOf<T>,
-		},
 		/// An upfront fee was charged to a vault.
 		UpfrontFeeCharged {
 			/// Collateral asset ID.
@@ -625,10 +616,6 @@ pub mod pallet {
 		///
 		/// Repay less or repay the full debt.
 		DebtWouldBecomeDust,
-		/// The repayment covers the recorded debt but not the terminal interest charge.
-		///
-		/// Repay less, or pass `None` to settle the full payoff.
-		TerminalChargeUnpaid,
 		/// The borrow would exceed the market debt limit.
 		DebtCeilingExceeded,
 		/// The borrow would exceed the global debt limit for this stablecoin.
@@ -977,7 +964,7 @@ pub mod pallet {
 		/// Must be signed by the account paying the stable assets.
 		///
 		/// Any account may repay for a vault owner. `None` settles the full payoff at execution.
-		/// A `Some` amount must be non-zero and cannot leave only the terminal charge unpaid.
+		/// A `Some` amount must be non-zero.
 		/// Repayment is allowed during final recovery, while frozen, and without a live price.
 		/// A full payoff closes a vault with no collateral, including while frozen or without a
 		/// live price. A vault with remaining collateral becomes debt-free and dormant.

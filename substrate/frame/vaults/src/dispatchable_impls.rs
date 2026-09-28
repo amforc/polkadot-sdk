@@ -10,6 +10,7 @@ use crate::{
 		AdminLevel, AssetMinimums, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode,
 		BranchState, FrozenReason, FrozenState,
 	},
+	utility_impls::Issuance,
 };
 use frame::{
 	prelude::{
@@ -25,7 +26,7 @@ use frame::{
 	},
 };
 use linked_list_interface::Position;
-use pusd_primitives::{OnBranchLifecycle, ProvidePrice};
+use pusd_primitives::{BranchSnapshot, OnBranchLifecycle, ProvidePrice};
 
 impl<T: Config> Pallet<T> {
 	/// Opens a vault with collateral, debt, and an interest rate.
@@ -147,7 +148,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Repays debt for a vault from another account.
 	///
-	/// `None` uses the live payoff and pays the terminal interest charge.
+	/// `None` uses the live payoff.
 	pub(crate) fn do_repay_for(
 		from: T::AccountId,
 		owner: T::AccountId,
@@ -160,17 +161,9 @@ impl<T: Config> Pallet<T> {
 		}
 		// A repayment needs no price and only lowers risk, so a frozen branch still accepts it.
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
-		let debt_before_terminal = op.vault().debt.total();
-		let full_payoff = op.full_payoff()?;
+		let full_payoff = op.vault().debt.total();
 		// The live repayment must not exceed the requested amount or payoff.
 		let repay = amount.map_or(full_payoff, |amount| amount.min(full_payoff));
-		if repay >= debt_before_terminal {
-			// Settling the debt without its terminal charge would strand the interest remainder.
-			ensure!(
-				amount.is_none_or(|amount| amount >= full_payoff),
-				Error::<T>::TerminalChargeUnpaid
-			);
-		}
 		T::StableAssets::burn_from(
 			op.stable_id().clone(),
 			&from,
@@ -537,7 +530,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		target: Option<FrozenReason>,
 	) -> DispatchResult {
-		let (minted, old_mode, new_mode) =
+		let (minted, old_mode, branch) =
 			Self::try_mutate_branch_state(collateral_id, stable_id, |config, state, now| {
 				let old_mode =
 					Self::mode_of(state, config, collateral_id, now).unwrap_or(BranchMode::Normal);
@@ -560,10 +553,13 @@ impl<T: Config> Pallet<T> {
 				state.frozen = target.map(|reason| FrozenState { reason, entered_at: now });
 				let new_mode =
 					Self::mode_of(state, config, collateral_id, now).unwrap_or(BranchMode::Normal);
-				Ok((minted, old_mode, new_mode))
+				Ok((minted, old_mode, BranchSnapshot { mode: new_mode, now }))
 			})?;
-		// Mint interest only after storing the updated market.
-		Self::issue_interest(collateral_id, stable_id, minted)?;
+		// Mint interest only after storing the updated market. The yield route sees the mode just
+		// stored: a freeze sends the whole mint to the fee account.
+		let mut issuance = Issuance::minted(stable_id.clone());
+		Self::issue_interest(collateral_id, stable_id, branch, minted, &mut issuance)?;
+		let new_mode = branch.mode;
 		Self::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),

@@ -1,4 +1,4 @@
-//! Origin checks the runtime wires into the pUSD protocol pallets.
+//! Origin checks for the pUSD pallets.
 
 use core::marker::PhantomData;
 use frame::{
@@ -6,16 +6,11 @@ use frame::{
 	traits::{fungibles::roles::Inspect as RolesInspect, EnsureOriginWithArg, OriginTrait},
 };
 
-/// Admits `Root` or a signed origin that owns the stablecoin asset passed as the argument.
+/// Admits `Root` or the owner of the stablecoin passed as the argument.
 ///
-/// `Root` succeeds with `None` (deposit-free
-/// creation) and the stablecoin's owner succeeds with `Some(owner)` (creation against a
-/// refundable deposit). Every other origin is rejected and handed back unchanged.
-///
-/// `Assets` reports the stablecoin owner through
-/// [`fungibles::roles::Inspect`](frame::traits::fungibles::roles::Inspect).
-///
-/// Under `runtime-benchmarks`, [`EnsureOriginWithArg::try_successful_origin`] returns `Root`.
+/// `Root` yields `None` (no deposit); the owner, as reported by `Assets` through
+/// [`fungibles::roles::Inspect`](frame::traits::fungibles::roles::Inspect), yields `Some(owner)`
+/// (refundable deposit). Other origins are returned unchanged. The benchmark origin is `Root`.
 ///
 /// ```ignore
 /// type CreateOrigin = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
