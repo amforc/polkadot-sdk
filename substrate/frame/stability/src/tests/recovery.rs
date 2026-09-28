@@ -11,9 +11,10 @@ use frame::prelude::ArithmeticError;
 /// Open the standing vault (owner 5) and pin its exact debt.
 fn open_standing_vault() {
 	mint_collateral(DOT, 5, 2_000);
-	assert_ok!(open_vault(5, DOT, PUSD, 1_000, 499));
-	// 499 borrowed + 1 upfront fee: every literal below derives from 500.
-	assert_eq!(vault_debt(DOT, PUSD, 5), 500);
+	assert_ok!(open_vault(5, DOT, PUSD, 1_000, 498));
+	// 498 borrowed + 1 upfront fee, plus the unit of interest the next touch rounds up while the
+	// pool matures: every literal below derives from 500.
+	assert_eq!(vault_debt(DOT, PUSD, 5), 499);
 }
 
 /// Deposit 400 for user 1 while the branch is still Normal and move to its deadline. This also
@@ -166,7 +167,7 @@ fn incoming_recovery_rolls_back_when_deposit_accounting_fails_after_settlement()
 
 		// The depositor burn and vault settlement rolled back with the failed
 		// claimable-collateral update.
-		assert_eq!(vault_debt(DOT, PUSD, 5), 500);
+		assert_eq!(vault_debt(DOT, PUSD, 5), 499);
 		assert_eq!(stable_balance(PUSD, 2), 200);
 		assert_eq!(collateral_balance(DOT, 2), collateral_before);
 		assert_eq!(deposit_row(DOT, PUSD, 2).unwrap().pending_deposit.unwrap().amount, 100);
@@ -216,10 +217,10 @@ fn par_band_head_settles_at_face_value() {
 		);
 		assert_eq!(vault_debt(DOT, PUSD, 5), 300);
 
-		// Full settlement includes the terminal charge. Partial settlement does not.
-		mint_stable(PUSD, 2, 301);
-		assert_ok!(deposit(2, DOT, PUSD, 301));
-		assert_vault_redeemed(5, 301, 599);
+		// Full settlement cancels the remaining 300: floor(300 / 0.5025) = 597.
+		mint_stable(PUSD, 2, 300);
+		assert_ok!(deposit(2, DOT, PUSD, 300));
+		assert_vault_redeemed(5, 300, 597);
 		System::assert_has_event(
 			crate::Event::RecoveryOffsetApplied {
 				collateral_id: DOT,
@@ -230,7 +231,7 @@ fn par_band_head_settles_at_face_value() {
 		);
 		assert_eq!(vault_debt(DOT, PUSD, 5), 0);
 		let row = deposit_row(DOT, PUSD, 2).expect("row created");
-		assert_eq!(row.claimable_collateral, 599);
+		assert_eq!(row.claimable_collateral, 597);
 		assert!(row.pending_deposit.is_none());
 	});
 }
@@ -268,11 +269,12 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		let state_before = pool_state(DOT, PUSD);
 		let sums_before = active_sums(0, 0);
 
-		// Full settlement burns the depositor payment and collects the terminal charge.
+		// Full settlement burns 500 of the depositor payment:
+		// collateral_out = floor(floor(500 * 1.03) / 0.52) = floor(515/0.52) = 990.
 		mint_stable(PUSD, 2, 800);
 		assert_ok!(deposit(2, DOT, PUSD, 800));
 
-		assert_vault_redeemed(5, 501, 992);
+		assert_vault_redeemed(5, 500, 990);
 		System::assert_has_event(
 			crate::Event::RecoveryOffsetApplied {
 				collateral_id: DOT,
@@ -287,7 +289,7 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 				stable_id: PUSD,
 				depositor: 2,
 				amount: 800,
-				pending_amount: 299,
+				pending_amount: 300,
 			}
 			.into(),
 		);
@@ -296,30 +298,30 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		assert_eq!(vault_debt(DOT, PUSD, 5), 0);
 
 		let row = deposit_row(DOT, PUSD, 2).expect("row created");
-		assert_eq!(row.claimable_collateral, 992);
-		assert_eq!(row.pending_deposit.expect("leftover queued").amount, 299);
+		assert_eq!(row.claimable_collateral, 990);
+		assert_eq!(row.pending_deposit.expect("leftover queued").amount, 300);
 		assert_eq!(stable_balance(PUSD, 2), 0);
 
 		// The part spent on the recovery never entered the pool balance and never touched
 		// the accumulators.
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 400);
-		assert_eq!(state.total_pending_deposits, 299);
-		assert_eq!(state.total_collateral_gains_unclaimed, 992);
+		assert_eq!(state.total_pending_deposits, 300);
+		assert_eq!(state.total_collateral_gains_unclaimed, 990);
 		assert_eq!(state.coords, state_before.coords);
 		assert_eq!(active_sums(0, 0), sums_before);
 		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 699);
-		assert_eq!(collateral_balance(DOT, pool), 992);
+		assert_eq!(stable_balance(PUSD, pool), 700);
+		assert_eq!(collateral_balance(DOT, pool), 990);
 
 		// With the head gone, a follow-up deposit queues normally.
 		mint_stable(PUSD, 2, 100);
 		assert_ok!(deposit(2, DOT, PUSD, 100));
 		let row = deposit_row(DOT, PUSD, 2).expect("row kept");
-		assert_eq!(row.pending_deposit.expect("merged").amount, 399);
+		assert_eq!(row.pending_deposit.expect("merged").amount, 400);
 
 		// The direct credit is claimable through the normal path.
-		assert_claim_collateral(2, 992);
+		assert_claim_collateral(2, 990);
 	});
 }
 

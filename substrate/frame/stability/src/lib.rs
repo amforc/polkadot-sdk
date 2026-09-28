@@ -107,6 +107,7 @@ pub mod weights;
 
 mod dispatchable_impls;
 mod interfaces;
+pub use interfaces::OffsetQuote;
 mod math;
 // The mock checks these invariants after each run, so `test-utils` needs them as well.
 #[cfg(any(feature = "try-runtime", feature = "test-utils", test))]
@@ -126,8 +127,8 @@ pub mod pallet {
 	use crate::{
 		dispatchable_impls::ClaimKind,
 		types::{
-			CohortCheckpoint, CohortId, Deposit, Leg, PoolState, PoolSums, RecoveryOffsetSource,
-			StabilityPool, StabilityPoolConfig,
+			CohortCheckpoint, CohortId, Deposit, Leg, LegCoords, PoolState, PoolSums,
+			RecoveryOffsetSource, StabilityPool, StabilityPoolConfig,
 		},
 	};
 	use frame::{
@@ -385,28 +386,18 @@ pub mod pallet {
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Active stablecoin canceled liquidation debt. `epoch` and `scale` are the coordinates
-		/// the active pool holds after the offset.
+		/// Pool capital canceled liquidation debt. Each leg that took part reports the
+		/// coordinates it holds after the offset: `active` for the active deposits, `pending` for
+		/// the pending deposits, which back the active pool and share their leg in proportion to
+		/// their size.
 		///
-		/// The liquidation engine reports the debt burned and the collateral gained, as the active
-		/// pool leg of its own outcome.
-		PoolOffsetApplied {
+		/// The liquidation engine reports the debt burned and the collateral gained per leg, as
+		/// the pool legs of its own outcome.
+		OffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			epoch: u32,
-			scale: u32,
-		},
-		/// Pending deposits canceled liquidation debt as the final pool backstop, in proportion
-		/// to their size. `epoch` and `scale` are the coordinates the pending leg holds after the
-		/// offset.
-		///
-		/// The liquidation engine reports the debt burned and the collateral gained, as the
-		/// pending pool leg of its own outcome.
-		PendingDepositOffsetApplied {
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			epoch: u32,
-			scale: u32,
+			active: Option<LegCoords>,
+			pending: Option<LegCoords>,
 		},
 		/// Stablecoin settled the head of the `FinalRecovery` queue. `source` identifies the
 		/// capital that paid and therefore the owner of the collateral gain.

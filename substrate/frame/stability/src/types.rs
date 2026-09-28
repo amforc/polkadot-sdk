@@ -26,6 +26,15 @@ pub struct Accumulators {
 	pub scale: u32,
 }
 
+/// Where one pool leg stands after an offset: its epoch and scale.
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LegCoords {
+	/// Epoch of the leg's coordinates.
+	pub epoch: u32,
+	/// Scale of the leg's coordinates.
+	pub scale: u32,
+}
+
 impl Accumulators {
 	/// Returns loss-free coordinates with `P = 1`, epoch zero, and scale zero.
 	///

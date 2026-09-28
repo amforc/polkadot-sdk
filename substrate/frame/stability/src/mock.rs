@@ -30,7 +30,9 @@ use frame::{
 		AsEnsureOriginWithArg, Convert, IdentityLookup, LinearStoragePrice,
 	},
 };
-use pusd_primitives::{OffsetLegs, ProvidePrice, StabilityPoolInspect, StabilityPoolOffset};
+use pusd_primitives::{
+	BranchSnapshot, OffsetLegs, ProvidePrice, StabilityPoolInspect, StabilityPoolOffset,
+};
 
 pub type AccountId = u128;
 pub type Balance = u128;
@@ -273,6 +275,9 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
+
+	// The genesis config already creates every stable asset.
+	fn ensure_stable_asset(_: StableId) {}
 }
 
 /// Root as the governance override, or the stored full admin of the market. A production runtime
@@ -800,7 +805,8 @@ pub fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Bal
 /// under examination.
 pub fn advance_matured_cohorts(collateral: AssetId, stable: StableId) {
 	let mut pool = crate::Pools::<Test>::get(&collateral, stable).expect("pool registered");
-	assert_ok!(Stability::advance_cohorts(&collateral, &stable, &mut pool, Timestamp::get()));
+	let branch = branch_snapshot(&collateral, &stable);
+	assert_ok!(Stability::advance_cohorts(&collateral, &stable, &mut pool, branch));
 	crate::Pools::<Test>::insert(&collateral, stable, pool);
 }
 
@@ -875,7 +881,18 @@ pub fn offer_yield(
 	let Some(pool) = crate::Pools::<Test>::get(&collateral, &stable) else {
 		return credit;
 	};
-	Stability::do_distribute_yield(&collateral, &stable, pool, credit)
+	let branch = branch_snapshot(&collateral, &stable);
+	Stability::do_distribute_yield(&collateral, &stable, branch, pool, credit)
+}
+
+/// The market as the vault engine would hand it to the pool right now.
+///
+/// Production callers pass the snapshot they already hold; tests that call the pool interfaces
+/// directly read it here, from the same vault engine and clock. A market the engine does not
+/// know counts as frozen, as the pool's own dispatchables treat it.
+pub fn branch_snapshot(collateral: &AssetId, stable: &StableId) -> BranchSnapshot {
+	let mode = Stability::branch_mode_or_frozen(collateral, stable);
+	BranchSnapshot { mode, now: Timestamp::get() }
 }
 
 /// Runs `operation` and checks that it wrote nothing, returning its value.
@@ -933,7 +950,8 @@ pub fn simulate_offset(
 ) -> (Balance, Balance) {
 	frame::deps::frame_support::storage::with_storage_layer(
 		|| -> Result<(Balance, Balance), DispatchError> {
-			let debt = Stability::reducible_active(&collateral, &stable, max_debt);
+			let branch = branch_snapshot(&collateral, &stable);
+			let debt = Stability::reducible_active(&collateral, &stable, branch, max_debt);
 			if debt.is_zero() {
 				return Ok((0, collateral_for_pool));
 			}
@@ -942,6 +960,7 @@ pub fn simulate_offset(
 			Stability::offset(
 				&collateral,
 				&stable,
+				branch,
 				OffsetLegs { active: debt, pending: 0 },
 				OffsetLegs { active: slice, pending: issue_collateral(collateral.clone(), 0) },
 			)?;
@@ -960,7 +979,9 @@ pub fn simulate_pending_offset(
 ) -> (Balance, Balance) {
 	frame::deps::frame_support::storage::with_storage_layer(
 		|| -> Result<(Balance, Balance), DispatchError> {
-			let debt = Stability::reducible_pending(&collateral, &stable, max_debt_to_offset, 0);
+			let branch = branch_snapshot(&collateral, &stable);
+			let debt =
+				Stability::reducible_pending(&collateral, &stable, branch, max_debt_to_offset, 0);
 			if debt.is_zero() {
 				return Ok((0, remaining_collateral));
 			}
@@ -970,6 +991,7 @@ pub fn simulate_pending_offset(
 			Stability::offset(
 				&collateral,
 				&stable,
+				branch,
 				OffsetLegs { active: 0, pending: debt },
 				OffsetLegs { active: issue_collateral(collateral.clone(), 0), pending: slice },
 			)?;

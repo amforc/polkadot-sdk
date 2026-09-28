@@ -79,7 +79,10 @@ fn full_depletion_at_a_compounded_p_closes_the_epoch() {
 		// 1_500.
 		seed_matured_deposit(2, 600);
 		seed_matured_deposit(3, 480);
-		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 1_500), 1_500);
+		assert_eq!(
+			Stability::reducible_active(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 1_500),
+			1_500
+		);
 		let epoch_before = pool_state(DOT, PUSD).coords.epoch;
 
 		// Deplete: S rises by 900 * 0.42 / 1_500 = 0.252 on the closing epoch, which is where
@@ -121,11 +124,11 @@ fn scale_crossing_preserves_older_deposits() {
 		assert_eq!(state.total_active_deposits, 100);
 		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 0u32, 1u32)));
 		System::assert_has_event(
-			crate::Event::PoolOffsetApplied {
+			crate::Event::OffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				epoch: 0,
-				scale: 1,
+				active: Some(crate::types::LegCoords { epoch: 0, scale: 1 }),
+				pending: None,
 			}
 			.into(),
 		);
