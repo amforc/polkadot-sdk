@@ -226,11 +226,11 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(7_865_547_022_727, 1_501));
 
 		System::assert_has_event(
-			crate::Event::PoolOffsetApplied {
+			crate::Event::OffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				epoch: 1,
-				scale: 0,
+				active: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
+				pending: None,
 			}
 			.into(),
 		);
@@ -265,11 +265,11 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		assert_eq!(state.pending_coords.epoch, 1);
 
 		System::assert_has_event(
-			crate::Event::PendingDepositOffsetApplied {
+			crate::Event::OffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				epoch: 1,
-				scale: 0,
+				active: None,
+				pending: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
 			}
 			.into(),
 		);
@@ -318,11 +318,11 @@ fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 		assert_eq!(debt_offset, 40_000);
 		assert_eq!(leftover, 5_000);
 		System::assert_has_event(
-			crate::Event::PendingDepositOffsetApplied {
+			crate::Event::OffsetApplied {
 				collateral_id: DOT,
 				stable_id: USDX,
-				epoch: 0,
-				scale: 0,
+				active: None,
+				pending: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
 			}
 			.into(),
 		);
@@ -364,11 +364,11 @@ fn pending_deposit_offset_is_shared_pro_rata() {
 		);
 		assert_eq!(stable_balance(PUSD, Stability::pool_account(&DOT, &PUSD)), 400);
 		System::assert_has_event(
-			crate::Event::PendingDepositOffsetApplied {
+			crate::Event::OffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				epoch: 0,
-				scale: 0,
+				active: None,
+				pending: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
 			}
 			.into(),
 		);

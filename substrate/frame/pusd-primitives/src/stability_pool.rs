@@ -1,115 +1,169 @@
-//! Interfaces for Stability Pool offsets in liquidation settlement.
+//! Stability Pool offset interfaces for liquidation settlement.
 
+use crate::BranchSnapshot;
 use frame::deps::{
-	frame_support::{
-		pallet_prelude::{DispatchError, DispatchResult},
-		traits::TryDrop,
-	},
+	frame_support::{pallet_prelude::DispatchError, traits::TryDrop},
 	sp_runtime::traits::Zero,
 };
 
-/// Contains the active and pending values for a Stability Pool offset.
-///
-/// `T` can hold debt amounts or collateral credits.
+/// Per-leg values of a Stability Pool offset: debt amounts or collateral credits.
 pub struct OffsetLegs<T> {
-	/// The value for the active-pool leg.
+	/// Active-pool leg.
 	pub active: T,
-	/// The value for the pending-deposit leg.
+	/// Pending-deposit leg.
 	pub pending: T,
 }
 
-/// Provides read-only offset limits for Stability Pool markets.
+/// Read-only offset limits of Stability Pool markets.
 ///
-/// Valid offset amounts do not form a contiguous range. Full depletion is always valid.
-/// A partial offset must not leave a remainder below the pool minimum.
-/// It also must not leave the stablecoin account holding less than its minimum balance.
-/// Thus, each limit depends on the requested debt.
+/// Valid amounts are not contiguous: full depletion is always valid, but a partial offset must
+/// leave at least the pool minimum and the stablecoin account's minimum balance. So each limit
+/// depends on the requested debt.
+///
+/// Read a market once with [`Self::quote`] and size every leg from it. A quote classifies pool
+/// capital as of `branch.now`; a frozen branch has none. It is not a reservation: it holds while
+/// the pool is unchanged, and [`StabilityPoolOffset::offset`] revalidates it.
 pub trait StabilityPoolInspect<CollateralId, StableId, Balance> {
-	/// Returns the active-pool debt that the pool can cancel, up to `max_debt`.
-	///
-	/// The result is a quote, not a reservation. It remains valid while the caller does not change
-	/// the pool.
+	/// Market state the leg limits read.
+	type Quote;
+
+	/// Reads the market under `branch`; `None` if it has no capacity.
+	fn quote(
+		collateral_id: &CollateralId,
+		stable_id: &StableId,
+		branch: BranchSnapshot,
+	) -> Option<Self::Quote>;
+
+	/// Returns the active-pool debt that `quote` can cancel, up to `max_debt`.
+	fn quote_active(quote: &Self::Quote, max_debt: Balance) -> Balance;
+
+	/// Returns the pending-deposit debt that `quote` can cancel, up to `max_debt`, given the
+	/// offset's `active_debt` (both legs burn from one custody account).
+	fn quote_pending(quote: &Self::Quote, max_debt: Balance, active_debt: Balance) -> Balance;
+
+	/// [`Self::quote_active`] on a fresh quote; zero without one.
 	fn reducible_active(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
+		branch: BranchSnapshot,
 		max_debt: Balance,
-	) -> Balance;
+	) -> Balance
+	where
+		Balance: Zero,
+	{
+		Self::quote(collateral_id, stable_id, branch)
+			.map_or_else(Balance::zero, |quote| Self::quote_active(&quote, max_debt))
+	}
 
-	/// Returns the pending-deposit debt that the pool can cancel, up to `max_debt`.
-	///
-	/// `active_debt` is the active-pool debt for the same offset. Both legs burn stablecoin from
-	/// one custody account.
+	/// [`Self::quote_pending`] on a fresh quote; zero without one.
 	fn reducible_pending(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
+		branch: BranchSnapshot,
 		max_debt: Balance,
 		active_debt: Balance,
-	) -> Balance;
+	) -> Balance
+	where
+		Balance: Zero,
+	{
+		Self::quote(collateral_id, stable_id, branch)
+			.map_or_else(Balance::zero, |quote| Self::quote_pending(&quote, max_debt, active_debt))
+	}
 }
 
-/// Applies a liquidation offset to one Stability Pool market.
-pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit>:
+/// Applies liquidation offsets to Stability Pool markets.
+pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit, StableCredit>:
 	StabilityPoolInspect<CollateralId, StableId, Balance>
 {
-	/// Cancels `debt` against pool deposits and pays the specified `collateral` to each pool leg.
+	/// Cancels exactly `debt` against pool deposits and pays `collateral` to each leg.
 	///
-	/// The operation uses exact amounts, similar to `Precision::Exact`. These equalities must hold
-	/// when the operation starts:
+	/// Fails unless, at the start:
 	///
-	/// - `debt.active == Self::reducible_active(collateral_id, stable_id, debt.active)`.
-	/// - `debt.pending == Self::reducible_pending(collateral_id, stable_id, debt.pending,
-	///   debt.active)`.
+	/// - `debt.active == Self::reducible_active(collateral_id, stable_id, branch, debt.active)`
+	/// - `debt.pending == Self::reducible_pending(collateral_id, stable_id, branch, debt.pending,
+	///   debt.active)`
 	///
-	/// The function returns an error if one equality does not hold. On success, the pool burns the
-	/// specified stablecoin debt. The caller reduces vault debt by the same amounts.
+	/// Returns the cancelled stablecoin as a credit (`None` if both debts are zero). Dropping it
+	/// burns it; a caller minting stablecoin in the same transaction may mint from it instead,
+	/// netting the supply changes. The caller reduces vault debt by the same amounts.
 	///
-	/// Branch registration prepares pool custody for all nonzero collateral credits.
+	/// Pass the `branch` the quotes were taken under so capital is classified the same way. Pool
+	/// collateral custody is prepared at branch registration.
 	///
-	/// The caller must create the collateral credits and execute this operation within the same
-	/// storage transaction, and roll it back if settlement fails. The function consumes the credits
-	/// even when it returns an error.
+	/// Create the credits and call this in one storage transaction, rolling back on failure: the
+	/// credits are consumed even on error.
 	fn offset(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
+		branch: BranchSnapshot,
 		debt: OffsetLegs<Balance>,
 		collateral: OffsetLegs<CollateralCredit>,
-	) -> DispatchResult;
+	) -> Result<Option<StableCredit>, DispatchError>;
+
+	/// Sets the market's entry delay to `entry_delay` and queues `amount` of freshly minted
+	/// stablecoin as benchmark `depositor`'s pending deposit.
+	///
+	/// Returns the activation deadline: the capital is pending before it and active from it. Lets
+	/// liquidation benchmarks seed both legs and a due cohort.
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_queue_deposit(
+		collateral_id: &CollateralId,
+		stable_id: &StableId,
+		depositor: u32,
+		entry_delay: crate::Millis,
+		amount: Balance,
+	) -> Result<crate::Millis, DispatchError>;
 }
 
-/// Provides empty Stability Pool limits for a runtime without a pool.
-///
-/// No debt is reducible. An offset succeeds only when both debts and both collateral credits are
-/// zero.
+/// No-op pool for runtimes without one: nothing is reducible, and an offset succeeds only when
+/// all debts and credits are zero.
 impl<CollateralId, StableId, Balance: Zero> StabilityPoolInspect<CollateralId, StableId, Balance>
 	for ()
 {
-	fn reducible_active(_: &CollateralId, _: &StableId, _: Balance) -> Balance {
+	type Quote = ();
+
+	fn quote(_: &CollateralId, _: &StableId, _: BranchSnapshot) -> Option<()> {
+		None
+	}
+
+	fn quote_active(_: &(), _: Balance) -> Balance {
 		Balance::zero()
 	}
 
-	fn reducible_pending(_: &CollateralId, _: &StableId, _: Balance, _: Balance) -> Balance {
+	fn quote_pending(_: &(), _: Balance, _: Balance) -> Balance {
 		Balance::zero()
 	}
 }
 
-impl<CollateralId, StableId, Balance: Zero, CollateralCredit: TryDrop>
-	StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit> for ()
+impl<CollateralId, StableId, Balance: Zero, CollateralCredit: TryDrop, StableCredit>
+	StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit, StableCredit> for ()
 {
 	fn offset(
 		_: &CollateralId,
 		_: &StableId,
+		_: BranchSnapshot,
 		debt: OffsetLegs<Balance>,
 		collateral: OffsetLegs<CollateralCredit>,
-	) -> DispatchResult {
+	) -> Result<Option<StableCredit>, DispatchError> {
 		let debt_is_zero = debt.active.is_zero() && debt.pending.is_zero();
-		// A successful `TryDrop` proves that a credit is zero. Thus, a nonzero credit cannot
-		// disappear in a successful no-op.
+		// `TryDrop` succeeds only on zero credits, so a nonzero credit cannot vanish here.
 		let active_is_zero = collateral.active.try_drop().is_ok();
 		let pending_is_zero = collateral.pending.try_drop().is_ok();
 		if debt_is_zero && active_is_zero && pending_is_zero {
-			Ok(())
+			Ok(None)
 		} else {
 			Err(DispatchError::Other("no Stability Pool to offset against"))
 		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_queue_deposit(
+		_: &CollateralId,
+		_: &StableId,
+		_: u32,
+		_: crate::Millis,
+		_: Balance,
+	) -> Result<crate::Millis, DispatchError> {
+		Err(DispatchError::Other("no stability pool to seed"))
 	}
 }

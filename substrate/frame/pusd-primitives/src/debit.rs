@@ -1,20 +1,15 @@
-//! Amount selection for fungible debits around the minimum-balance boundary.
+//! Debit sizing around the minimum-balance boundary.
 
 use frame::deps::frame_support::traits::{
 	fungibles,
 	tokens::{Fortitude, Preservation},
 };
 
-/// The [`Preservation`] under which debiting exactly `amount` cannot fold
-/// dust: `Expendable` only when the debit takes the whole reducible balance —
-/// leaving no remainder to fold — and `Preserve` otherwise, so the
-/// implementation itself rejects a debit that would strand a sub-minimum
-/// remainder.
+/// Returns the [`Preservation`] for debiting exactly `amount` without folding dust.
 ///
-/// The fungibles traits validate every debit except this one input, which is
-/// caller intent they cannot derive: may the operation consume the account?
-/// With the flag chosen here, fixed-amount call sites need no further checks
-/// of their own — the trait method either moves exactly `amount` or fails.
+/// `Expendable` only when `amount` takes the whole reducible balance, `Preserve` otherwise, so
+/// the implementation rejects a debit that would strand a sub-minimum remainder. Fixed-amount
+/// callers need no other checks: the debit moves exactly `amount` or fails.
 pub fn debit_preservation<Assets, AccountId>(
 	asset: Assets::AssetId,
 	who: &AccountId,
@@ -32,22 +27,16 @@ where
 	}
 }
 
-/// [`fungibles::Inspect::reducible_balance`] refined for a single debit: the
-/// greatest amount at or below `limit` that a `Precision::Exact` debit removes
-/// with no side effects on the rest of the account, paired with the
-/// [`Preservation`] to pass. For operations that size themselves to what an
-/// account can pay; fixed-amount operations only need [`debit_preservation`].
+/// Returns the largest amount up to `limit` that a `Precision::Exact` debit removes cleanly,
+/// with the [`Preservation`] to pass.
 ///
-/// Implementations fold a sub-minimum remainder into `Expendable` debits even
-/// under `Precision::Exact`, and hard-fail `Preserve` debits that would leave
-/// one. Picking the amount here settles that up front: a request that would
-/// leave less than the minimum balance rounds down to the amount that keeps
-/// it, and a request at or above the whole reducible balance becomes a full
-/// `Expendable` drain. The caller then invokes the fungibles traits directly
-/// with the returned pair.
+/// Implementations fold a sub-minimum remainder into `Expendable` debits and reject `Preserve`
+/// debits that would leave one. So a request that would leave less than the minimum balance
+/// rounds down to keep it, and one at or above the whole reducible balance becomes a full
+/// `Expendable` drain.
 ///
-/// Callers deciding *whether* to debit rather than *how much* compare the
-/// returned amount against their request and refuse on a shortfall.
+/// For operations sized to what the account can pay; fixed amounts need only
+/// [`debit_preservation`]. To refuse on a shortfall, compare the result with `limit`.
 pub fn reducible_debit<Assets, AccountId>(
 	asset: Assets::AssetId,
 	who: &AccountId,
@@ -58,11 +47,24 @@ where
 {
 	let preserved =
 		Assets::reducible_balance(asset.clone(), who, Preservation::Preserve, Fortitude::Polite);
+	refine_debit(limit, preserved, || {
+		Assets::reducible_balance(asset, who, Preservation::Expendable, Fortitude::Polite)
+	})
+}
+
+/// [`reducible_debit`] over balances already read.
+///
+/// `preserved` is the `Preserve` reducible balance. `expendable` returns the `Expendable` one
+/// and is called only when `limit > preserved`.
+pub fn refine_debit<Balance: Ord + Copy>(
+	limit: Balance,
+	preserved: Balance,
+	expendable: impl FnOnce() -> Balance,
+) -> (Balance, Preservation) {
 	if limit <= preserved {
 		return (limit, Preservation::Preserve);
 	}
-	let expendable =
-		Assets::reducible_balance(asset, who, Preservation::Expendable, Fortitude::Polite);
+	let expendable = expendable();
 	debug_assert!(preserved <= expendable);
 	if limit < expendable {
 		(preserved, Preservation::Preserve)

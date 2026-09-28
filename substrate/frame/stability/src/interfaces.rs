@@ -4,17 +4,18 @@
 //! pallet's storage model.
 
 use crate::{
+	dispatchable_impls::PoolCustody,
 	pallet::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Pallet, Pools, StabilityPoolOf,
 		StableCreditOf, StableIdOf,
 	},
-	types::Leg,
+	types::{Leg, LegCoords},
 };
-use frame::{
-	prelude::*,
-	traits::{tokens::Preservation, Time},
+use frame::{prelude::*, traits::tokens::Preservation};
+use pusd_primitives::{
+	BranchMode, BranchSnapshot, OffsetLegs, OnBranchYield, StabilityPoolInspect,
+	StabilityPoolOffset,
 };
-use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, StabilityPoolOffset};
 
 /// Allocates `floor(yield_share * credit)` to active depositors and returns the remainder.
 ///
@@ -23,6 +24,7 @@ use pusd_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect, Stability
 impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T> {
 	fn distribute_yield(
 		collateral_id: &CollateralIdOf<T>,
+		branch: BranchSnapshot,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
 		// The asset of the credit names the market; an unregistered pair has no pool row, and the
@@ -36,7 +38,7 @@ impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T
 			return credit;
 		}
 		let (taken, mut remainder) = credit.split(take);
-		let leftover = Self::do_distribute_yield(collateral_id, stable_id, pool, taken);
+		let leftover = Self::do_distribute_yield(collateral_id, stable_id, branch, pool, taken);
 		if let Err(leftover) = remainder.subsume(leftover) {
 			// Both halves came from one credit, so they cannot disagree. Burning the leftover
 			// keeps issuance on the conservative side.
@@ -62,9 +64,12 @@ impl<T: Config> Pallet<T> {
 	fn offset_pool(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		mode: BranchMode,
 	) -> Option<StabilityPoolOf<T>> {
-		Self::ensure_not_frozen(collateral_id, stable_id).ok()?;
-		Pools::<T>::get(collateral_id, stable_id)
+		match mode {
+			BranchMode::Normal | BranchMode::Safety => Pools::<T>::get(collateral_id, stable_id),
+			BranchMode::Frozen => None,
+		}
 	}
 
 	/// Returns the offset pool with all due cohort activations applied in memory.
@@ -74,28 +79,11 @@ impl<T: Config> Pallet<T> {
 	fn offset_pool_advanced(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		branch: BranchSnapshot,
 	) -> Option<StabilityPoolOf<T>> {
-		let mut pool = Self::offset_pool(collateral_id, stable_id)?;
-		Self::roll_due_cohorts(&mut pool, T::TimeProvider::now()).ok()?;
+		let mut pool = Self::offset_pool(collateral_id, stable_id, branch.mode)?;
+		Self::roll_due_cohorts(&mut pool, branch.now).ok()?;
 		Some(pool)
-	}
-
-	/// Returns the debt that `leg` can cancel now, with all due cohorts activated in memory.
-	///
-	/// A missing or frozen market has zero capacity.
-	fn reducible(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		leg: Leg,
-		max_debt: BalanceOf<T>,
-		reserved: BalanceOf<T>,
-	) -> BalanceOf<T> {
-		let Some(pool) = Self::offset_pool_advanced(collateral_id, stable_id) else {
-			return BalanceOf::<T>::zero();
-		};
-		let pool_account = Self::pool_account(collateral_id, stable_id);
-		Self::size_offset(&pool, stable_id, &pool_account, leg, max_debt, reserved)
-			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
 	}
 
 	/// Confirms that `leg` still has the quoted capacity for `requested` debt. A zero request
@@ -105,8 +93,7 @@ impl<T: Config> Pallet<T> {
 	/// movement.
 	fn reserve_leg(
 		pool: &StabilityPoolOf<T>,
-		stable_id: &StableIdOf<T>,
-		pool_account: &T::AccountId,
+		custody: &PoolCustody<T>,
 		leg: Leg,
 		requested: BalanceOf<T>,
 		reserved: BalanceOf<T>,
@@ -114,43 +101,65 @@ impl<T: Config> Pallet<T> {
 		if requested.is_zero() {
 			return Ok(None);
 		}
-		let (debt, preservation) =
-			Self::size_offset(pool, stable_id, pool_account, leg, requested, reserved)
-				.ok_or(crate::Error::<T>::OffsetSettlementFailed)?;
+		let (debt, preservation) = Self::size_offset(pool, custody, leg, requested, reserved)
+			.ok_or(crate::Error::<T>::OffsetSettlementFailed)?;
 		ensure!(debt == requested, crate::Error::<T>::OffsetSettlementFailed);
 		Ok(Some(OffsetReservation { debt, preservation }))
 	}
 }
 
+/// One market as its offset quotes read it: the pool with due cohorts activated in memory and its
+/// stablecoin custody.
+pub struct OffsetQuote<T: Config> {
+	pool: StabilityPoolOf<T>,
+	custody: PoolCustody<T>,
+}
+
 impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf<T>> for Pallet<T> {
-	fn reducible_active(
+	type Quote = OffsetQuote<T>;
+
+	fn quote(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-		max_debt: BalanceOf<T>,
-	) -> BalanceOf<T> {
-		Self::reducible(collateral_id, stable_id, Leg::Active, max_debt, BalanceOf::<T>::zero())
+		branch: BranchSnapshot,
+	) -> Option<OffsetQuote<T>> {
+		let pool = Self::offset_pool_advanced(collateral_id, stable_id, branch)?;
+		let pool_account = Self::pool_account(collateral_id, stable_id);
+		Some(OffsetQuote { pool, custody: PoolCustody::read(stable_id, pool_account) })
 	}
 
-	fn reducible_pending(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
+	fn quote_active(quote: &OffsetQuote<T>, max_debt: BalanceOf<T>) -> BalanceOf<T> {
+		let reserved = BalanceOf::<T>::zero();
+		Self::size_offset(&quote.pool, &quote.custody, Leg::Active, max_debt, reserved)
+			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+	}
+
+	fn quote_pending(
+		quote: &OffsetQuote<T>,
 		max_debt: BalanceOf<T>,
 		active_debt: BalanceOf<T>,
 	) -> BalanceOf<T> {
-		Self::reducible(collateral_id, stable_id, Leg::Pending, max_debt, active_debt)
+		Self::size_offset(&quote.pool, &quote.custody, Leg::Pending, max_debt, active_debt)
+			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
 	}
 }
 
 impl<T: Config>
-	StabilityPoolOffset<CollateralIdOf<T>, StableIdOf<T>, BalanceOf<T>, CollateralCreditOf<T>>
-	for Pallet<T>
+	StabilityPoolOffset<
+		CollateralIdOf<T>,
+		StableIdOf<T>,
+		BalanceOf<T>,
+		CollateralCreditOf<T>,
+		StableCreditOf<T>,
+	> for Pallet<T>
 {
 	fn offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		branch: BranchSnapshot,
 		debt: OffsetLegs<BalanceOf<T>>,
 		collateral: OffsetLegs<CollateralCreditOf<T>>,
-	) -> DispatchResult {
+	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
 		// A leg that cancels no debt must carry no collateral. Anything else would give the pool
 		// collateral for free and break the link between the two sides.
 		if debt.active.is_zero() {
@@ -159,61 +168,100 @@ impl<T: Config>
 		if debt.pending.is_zero() {
 			ensure!(collateral.pending.peek().is_zero(), crate::Error::<T>::OffsetSettlementFailed);
 			if debt.active.is_zero() {
-				return Ok(());
+				return Ok(None);
 			}
 		}
-		let mut pool = Self::offset_pool(collateral_id, stable_id)
+		let mut pool = Self::offset_pool(collateral_id, stable_id, branch.mode)
 			.ok_or(crate::Error::<T>::OffsetSettlementFailed)?;
 		// The same advancement the read-only sizing simulated, committed for real: inspection and
 		// settlement must agree on which capital is active.
-		Self::advance_cohorts(collateral_id, stable_id, &mut pool, T::TimeProvider::now())?;
-		let pool_account = Self::pool_account(collateral_id, stable_id);
+		Self::advance_cohorts(collateral_id, stable_id, &mut pool, branch)?;
+		// One custody read serves both legs: nothing moves the pool's stablecoin before the
+		// single withdrawal below.
+		let custody =
+			PoolCustody::<T>::read(stable_id, Self::pool_account(collateral_id, stable_id));
 
 		// Both legs re-size against the untouched pool, in the order the caller inspected them:
 		// active first, pending reserved behind it. A caller whose readings went stale therefore
 		// fails here, with nothing moved.
-		let active = Self::reserve_leg(
-			&pool,
+		let active =
+			Self::reserve_leg(&pool, &custody, Leg::Active, debt.active, BalanceOf::<T>::zero())?;
+		let pending = Self::reserve_leg(&pool, &custody, Leg::Pending, debt.pending, debt.active)?;
+
+		// Each leg records its own accounting, then the value moves once for both: one stablecoin
+		// withdrawal of the summed debt and one collateral deposit of the merged credits. The
+		// pending `Preservation` was sized behind the active debt, so it already covers the sum.
+		let active = Self::record_offset(
+			collateral_id,
 			stable_id,
-			&pool_account,
 			Leg::Active,
-			debt.active,
-			BalanceOf::<T>::zero(),
+			&mut pool,
+			active,
+			collateral.active,
 		)?;
-		let pending = Self::reserve_leg(
-			&pool,
+		let pending = Self::record_offset(
+			collateral_id,
 			stable_id,
-			&pool_account,
 			Leg::Pending,
-			debt.pending,
-			debt.active,
+			&mut pool,
+			pending,
+			collateral.pending,
+		)?;
+		let leg_coords = |taken: bool, leg| {
+			let coords = pool.state.coords(leg);
+			taken.then_some(LegCoords { epoch: coords.epoch, scale: coords.scale })
+		};
+		Self::deposit_event(crate::Event::OffsetApplied {
+			collateral_id: collateral_id.clone(),
+			stable_id: stable_id.clone(),
+			active: leg_coords(active.is_some(), Leg::Active),
+			pending: leg_coords(pending.is_some(), Leg::Pending),
+		});
+		let (reservation, collateral) = Self::merge_offset_movement(active, pending)?;
+		let burned =
+			Self::settle_reservation_exact(stable_id, custody.account(), reservation, collateral)?;
+		Pools::<T>::insert(collateral_id, stable_id, pool);
+		Ok(Some(burned))
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_queue_deposit(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		depositor: u32,
+		entry_delay: pusd_primitives::Millis,
+		amount: BalanceOf<T>,
+	) -> Result<pusd_primitives::Millis, DispatchError> {
+		use frame::traits::fungibles::Mutate as FungiblesMutate;
+		assert!(entry_delay > 0, "a zero entry delay queues nothing");
+		assert!(!amount.is_zero());
+
+		// The benchmark registration config has no entry delay; a pending leg needs one.
+		Pools::<T>::try_mutate(collateral_id, stable_id, |pool| {
+			let pool = pool.as_mut().ok_or(crate::Error::<T>::PoolNotRegistered)?;
+			pool.config.entry_delay = entry_delay;
+			Ok::<_, DispatchError>(())
+		})?;
+		let who: T::AccountId = frame::benchmarking::prelude::account("sp_depositor", depositor, 0);
+		if frame_system::Pallet::<T>::providers(&who) == 0 {
+			frame_system::Pallet::<T>::inc_providers(&who);
+		}
+		T::StableAssets::mint_into(stable_id.clone(), &who, amount)?;
+		Self::deposit(
+			frame_system::RawOrigin::Signed(who.clone()).into(),
+			collateral_id.clone(),
+			stable_id.clone(),
+			amount,
 		)?;
 
-		// Active settles first. The pending `Preservation` was sized against the combined limit,
-		// so it only holds once the active part has left the pool account.
-		if let Some(reservation) = active {
-			Self::settle_offset(
-				collateral_id,
-				stable_id,
-				&pool_account,
-				Leg::Active,
-				&mut pool,
-				reservation,
-				collateral.active,
-			)?;
-		}
-		if let Some(reservation) = pending {
-			Self::settle_offset(
-				collateral_id,
-				stable_id,
-				&pool_account,
-				Leg::Pending,
-				&mut pool,
-				reservation,
-				collateral.pending,
-			)?;
-		}
-		Pools::<T>::insert(collateral_id, stable_id, pool);
-		Ok(())
+		let cohort = crate::pallet::Deposits::<T>::get((collateral_id, stable_id, &who))
+			.and_then(|deposit| deposit.pending_deposit)
+			.map(|pending| pending.cohort)
+			.ok_or(DispatchError::Other("benchmark deposit did not queue"))?;
+		let deadline = Pools::<T>::get(collateral_id, stable_id)
+			.and_then(|pool| pool.state.cohort(cohort).map(|open| open.deadline))
+			.ok_or(DispatchError::Corruption)?;
+		assert!(deadline > <T::TimeProvider as frame::traits::Time>::now());
+		Ok(deadline)
 	}
 }

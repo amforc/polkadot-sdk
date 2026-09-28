@@ -70,7 +70,9 @@ fn yield_distribution_routes_by_the_credits_own_asset() {
 		// unregistered (DOT, USDX) pair and comes back whole, while the
 		// funded PUSD pool never sees it.
 		let credit = issue_stable(USDX, 20_000);
-		let returned = storage_noop(|| Stability::distribute_yield(&DOT, credit));
+		let returned = storage_noop(|| {
+			Stability::distribute_yield(&DOT, branch_snapshot(&DOT, &USDX), credit)
+		});
 		assert_eq!(returned.asset(), USDX);
 		assert_eq!(returned.peek(), 20_000);
 		drop(returned);
@@ -85,11 +87,15 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 		mint_stable(PUSD, 2, 200);
 		assert_ok!(deposit(2, DOT, PUSD, 200));
 
-		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 200), 200);
+		assert_eq!(
+			Stability::reducible_active(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 200),
+			200
+		);
 		assert_err!(
 			hypothetically!(Stability::offset(
 				&DOT,
 				&PUSD,
+				branch_snapshot(&DOT, &PUSD),
 				OffsetLegs { active: 200, pending: 0 },
 				OffsetLegs {
 					active: issue_collateral(TOKEN_X, 100),
@@ -99,11 +105,15 @@ fn offset_apis_reject_a_credit_for_another_collateral() {
 			crate::Error::<Test>::OffsetSettlementFailed,
 		);
 
-		assert_eq!(Stability::reducible_pending(&DOT, &PUSD, 200, 0), 200);
+		assert_eq!(
+			Stability::reducible_pending(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 200, 0),
+			200
+		);
 		assert_err!(
 			hypothetically!(Stability::offset(
 				&DOT,
 				&PUSD,
+				branch_snapshot(&DOT, &PUSD),
 				OffsetLegs { active: 0, pending: 200 },
 				OffsetLegs {
 					active: issue_collateral(DOT, 0),

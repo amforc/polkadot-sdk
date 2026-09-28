@@ -42,7 +42,7 @@ use frame::{
 };
 pub use pallet_linked_list::Position;
 use pusd_primitives::{
-	OffsetLegs, OraclePriceConversion, RedemptionSettlement, StabilityPoolInspect,
+	BranchSnapshot, OffsetLegs, OraclePriceConversion, RedemptionSettlement, StabilityPoolInspect,
 	StabilityPoolOffset, VaultInterface,
 };
 
@@ -249,8 +249,10 @@ impl pusd_primitives::OnBranchYield<AssetId, Credit<AccountId, VaultStableAssets
 {
 	fn distribute_yield(
 		_: &AssetId,
+		branch: BranchSnapshot,
 		credit: Credit<AccountId, VaultStableAssets>,
 	) -> Credit<AccountId, VaultStableAssets> {
+		assert_eq!(branch.now, Timestamp::get(), "the engine passes its own clock");
 		let sp_share = SpFeeShare::get() * credit.peek();
 		let (sp_credit, residual) = credit.split(sp_share);
 		drop(sp_credit);
@@ -375,6 +377,7 @@ pub type VaultDepositConsideration = FungiblesHoldConsideration<
 parameter_types! {
 	pub static ActiveSpCapacity: Balance = 0;
 	pub static PendingSpCapacity: Balance = 0;
+	pub static PendingSpCohorts: Vec<(u64, Balance)> = Vec::new();
 	pub static PendingSpInspectionCalls: u32 = 0;
 	pub static SpOffsetCalls: u32 = 0;
 	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
@@ -406,29 +409,58 @@ impl MockStabilityPool {
 		*capacity -= debt;
 		Ok(())
 	}
+
+	/// Moves every due benchmark cohort from the pending to the active capacity knob, as the
+	/// real pool activates cohorts at the deadline the engine's clock has reached.
+	fn activate_due_cohorts(branch: BranchSnapshot) {
+		assert_eq!(branch.now, Timestamp::get(), "the engine passes its own clock");
+		let (due, open): (Vec<_>, Vec<_>) = PendingSpCohorts::get()
+			.into_iter()
+			.partition(|(deadline, _)| *deadline <= branch.now);
+		for (_, amount) in due {
+			PendingSpCapacity::mutate(|capacity| *capacity -= amount);
+			ActiveSpCapacity::mutate(|capacity| *capacity += amount);
+		}
+		PendingSpCohorts::set(open);
+	}
 }
 
 impl StabilityPoolInspect<AssetId, StableId, Balance> for MockStabilityPool {
-	fn reducible_active(_: &AssetId, _: &StableId, max_debt: Balance) -> Balance {
+	type Quote = ();
+
+	fn quote(_: &AssetId, _: &StableId, branch: BranchSnapshot) -> Option<()> {
+		Self::activate_due_cohorts(branch);
+		Some(())
+	}
+
+	fn quote_active(_: &(), max_debt: Balance) -> Balance {
 		max_debt.min(ActiveSpCapacity::get())
 	}
 
-	fn reducible_pending(_: &AssetId, _: &StableId, max_debt: Balance, _: Balance) -> Balance {
+	fn quote_pending(_: &(), max_debt: Balance, _: Balance) -> Balance {
 		PendingSpInspectionCalls::mutate(|calls| *calls += 1);
 		max_debt.min(PendingSpCapacity::get())
 	}
 }
 
-impl StabilityPoolOffset<AssetId, StableId, Balance, CollateralCreditOf<Test>>
-	for MockStabilityPool
+impl
+	StabilityPoolOffset<
+		AssetId,
+		StableId,
+		Balance,
+		CollateralCreditOf<Test>,
+		pallet_vaults::StableCreditOf<Test>,
+	> for MockStabilityPool
 {
 	fn offset(
 		_: &AssetId,
-		_: &StableId,
+		stable_id: &StableId,
+		branch: BranchSnapshot,
 		debt: OffsetLegs<Balance>,
 		collateral: OffsetLegs<CollateralCreditOf<Test>>,
-	) -> DispatchResult {
+	) -> Result<Option<StableCreditOf<Test>>, DispatchError> {
 		SpOffsetCalls::mutate(|calls| *calls += 1);
+		Self::activate_due_cohorts(branch);
 		if debt.active.is_zero() {
 			ensure!(collateral.active.peek().is_zero(), Error::<Test>::InvalidLiquidationPlan);
 			drop(collateral.active);
@@ -445,7 +477,28 @@ impl StabilityPoolOffset<AssetId, StableId, Balance, CollateralCreditOf<Test>>
 			Self::settle_leg(debt.pending, collateral.pending, &mut capacity)?;
 			PendingSpCapacity::set(capacity);
 		}
-		Ok(())
+		// The knobs stand in for pool custody, so the stablecoin the pool gives up is issued here;
+		// the engine burns it again, leaving the supply as a real pool's burn would.
+		let given_up = debt.active + debt.pending;
+		if given_up.is_zero() {
+			return Ok(None);
+		}
+		Ok(Some(<VaultStableAssets as FungiblesBalanced<AccountId>>::issue(*stable_id, given_up)))
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_queue_deposit(
+		_: &AssetId,
+		_: &StableId,
+		_: u32,
+		entry_delay: u64,
+		amount: Balance,
+	) -> Result<u64, DispatchError> {
+		assert!(entry_delay > 0);
+		let deadline = Timestamp::get() + entry_delay;
+		PendingSpCapacity::mutate(|capacity| *capacity += amount);
+		PendingSpCohorts::mutate(|cohorts| cohorts.push((deadline, amount)));
+		Ok(deadline)
 	}
 }
 
@@ -498,6 +551,9 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for MockBenchmarkHelper {
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
+
+	// The genesis config already creates every stable asset.
+	fn ensure_stable_asset(_: StableId) {}
 }
 
 /// Builds fresh storage for a test.
@@ -566,6 +622,7 @@ pub fn new_test_ext() -> TestState {
 		MockOracleAvailable::set(true);
 		ActiveSpCapacity::set(0);
 		PendingSpCapacity::set(0);
+		PendingSpCohorts::set(Vec::new());
 		PendingSpInspectionCalls::set(0);
 		SpOffsetCalls::set(0);
 		LifecycleLog::set(Vec::new());
@@ -889,25 +946,36 @@ pub fn redistribute_for_test(
 	owner: AccountId,
 	redistribution_collateral: Balance,
 ) -> Result<Balance, DispatchError> {
-	let mut op = VaultOp::<Test>::load_priced(collateral.clone(), stable, &owner)?;
+	let op = VaultOp::<Test>::load_for_liquidation(collateral.clone(), stable, &owner)?;
 	let snapshot = op.prepare_liquidation()?;
-	let held = op.vault().collateral;
-	let (mut collateral_credit, shortfall) =
-		VaultCollateralAssets::slash(collateral, &HoldReason::VaultCollateral.into(), &owner, held);
+	let retained = op.retained_redistribution();
+	let held = op.vault().collateral.saturating_sub(retained);
+	let (collateral_credit, shortfall) = VaultCollateralAssets::slash(
+		collateral.clone(),
+		&HoldReason::VaultCollateral.into(),
+		&owner,
+		held,
+	);
 	ensure!(shortfall.is_zero(), Error::<Test>::InvalidLiquidationPlan);
 	ensure!(
-		redistribution_collateral <= collateral_credit.peek(),
+		redistribution_collateral <= collateral_credit.peek().saturating_add(retained),
 		Error::<Test>::InvalidLiquidationPlan
 	);
-	let redistribution_credit = collateral_credit.extract(redistribution_collateral);
+	let owner_credit = Vaults::reconcile_redistribution_custody(
+		&collateral,
+		&stable,
+		collateral_credit,
+		retained,
+		redistribution_collateral,
+	)?;
 	Vaults::settle_liquidation_custody(
 		op,
 		pusd_primitives::DebtCollateral {
 			debt: snapshot.debt,
 			collateral: redistribution_collateral,
 		},
-		redistribution_credit,
-		collateral_credit,
+		owner_credit,
+		None,
 	)?;
 	Ok(snapshot.debt)
 }

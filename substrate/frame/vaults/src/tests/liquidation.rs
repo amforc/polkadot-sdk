@@ -6,9 +6,10 @@
 
 use crate::{
 	mock::*,
-	tests::{assert_event, ONE_YEAR_MS},
+	tests::{assert_event, liquidation_outcome, vault_events, ONE_YEAR_MS},
 	types::BranchConfigUpdate,
 	BranchConfig, BranchMode, DebtCollateral, Error, Event, LiquidationConfig, LiquidationOutcome,
+	LiquidationTouch,
 };
 
 const KEEPER: AccountId = 3;
@@ -57,6 +58,10 @@ fn outcome(
 		redistribution: DebtCollateral { debt: debt[3], collateral: collateral[3] },
 		keeper_reward,
 		owner_surplus,
+		touch: LiquidationTouch {
+			interest: 0,
+			redistribution: DebtCollateral { debt: 0, collateral: 0 },
+		},
 	}
 }
 
@@ -202,28 +207,84 @@ fn debt_includes_accrued_interest() {
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
 		// Ten years at 0.1% accrue floor(500 * 0.001 * 10) = 5, so 505 of debt
-		// redistributes. Its 10%-penalty weight is 505 + ceil(50.5) = 556, and
+		// redistributes. Its 10%-penalized debt is 505 + ceil(50.5) = 556, and
 		// ceil(556/0.9) = 618 exceeds the 600 held: no owner surplus, and the
 		// 588 left after the keeper all follows the redistributed debt.
-		assert_settled(&before, outcome([0, 0, 0, 505], [0, 0, 0, 588], 12, 0));
+		let mut expected = outcome([0, 0, 0, 505], [0, 0, 0, 588], 12, 0);
+		// The accrued interest rides on the liquidation event instead of its own.
+		expected.touch.interest = 5;
+		assert_settled(&before, expected);
+		assert!(!vault_events().iter().any(|e| matches!(e, Event::InterestAccrued { .. })));
+	});
+}
+
+// The interest a liquidation issues comes out of the stablecoin it burns, so the supply moves
+// once: no fresh mint, one burn of what is left.
+#[test]
+fn interest_is_issued_out_of_the_burned_stablecoin() {
+	use frame::traits::fungibles::Inspect;
+	build_and_execute(|| {
+		// The mock hook burns the pool's share; route all yield to the fee account instead, so
+		// the only burn is the liquidation's.
+		SpFeeShare::set(Permill::zero());
+		setup_underwater_vault();
+		advance_time(10 * ONE_YEAR_MS);
+		mint_stable(PUSD, KEEPER, 500);
+		let supply_before = <Assets as Inspect<AccountId>>::total_issuance(PUSD);
+		let events_before = System::events().len();
+
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 500, 0));
+
+		let jit_debt = liquidation_outcome().keeper_jit.debt;
+		assert!(jit_debt > 0, "the keeper paid in");
+		let issued = vault_events()
+			.into_iter()
+			.find_map(|event| match event {
+				Event::InterestIssued { amount, .. } => Some(amount),
+				_ => None,
+			})
+			.expect("interest issued");
+		assert!(issued > 0);
+		assert!(issued < jit_debt, "the burn covers the issuance");
+		let supply_after = <Assets as Inspect<AccountId>>::total_issuance(PUSD);
+		assert_eq!(supply_before - supply_after, jit_debt - issued);
+
+		let asset_events: Vec<_> = System::events()
+			.into_iter()
+			.skip(events_before)
+			.filter_map(|record| match record.event {
+				RuntimeEvent::Assets(event) => Some(event),
+				_ => None,
+			})
+			.collect();
+		assert!(!asset_events
+			.iter()
+			.any(|event| matches!(event, pallet_assets::Event::IssuedCredit { .. })));
+		let burned: Vec<_> = asset_events
+			.iter()
+			.filter_map(|event| match event {
+				pallet_assets::Event::BurnedCredit { amount, .. } => Some(*amount),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(burned, vec![jit_debt - issued]);
 	});
 }
 
 #[test]
-fn terminal_interest_enters_the_waterfall_before_redistribution() {
+fn rounded_interest_enters_the_waterfall_before_redistribution() {
 	build_and_execute(|| {
-		SpFeeShare::set(Permill::from_percent(100));
 		setup_underwater_vault();
 		advance_time(1);
-		let fee_before = stable_balance(PUSD, FEE_DEST);
 		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 
-		// Liquidation must include the terminal interest unit.
-		assert_settled(&before, outcome([0, 0, 0, 501], [0, 0, 0, 588], 12, 0));
-		// Only terminal interest increases fee-account revenue.
-		assert_eq!(stable_balance(PUSD, FEE_DEST), fee_before + 1);
+		// The touch rounds the millisecond of interest up to one unit, which the liquidation
+		// settles.
+		let mut expected = outcome([0, 0, 0, 501], [0, 0, 0, 588], 12, 0);
+		expected.touch.interest = 1;
+		assert_settled(&before, expected);
 	});
 }
 
@@ -253,7 +314,7 @@ fn active_pool_precedes_jit() {
 	});
 }
 
-// An offset cannot create borrower surplus when penalty-weighted debt exceeds the held collateral.
+// An offset cannot create borrower surplus when penalized debt exceeds the held collateral.
 #[test]
 fn full_offset_without_surplus() {
 	build_and_execute(|| {
@@ -287,7 +348,7 @@ fn jit_burns_after_active_pool() {
 
 		// Every offset path is priced at the 5% liquidation penalty, so the
 		// 500 debt seizes ceil(525/0.9) = 584 and leaves the owner 16. After the
-		// 12 keeper reward, 572 is split by weight 315 : 210 (300 and 200 debt,
+		// 12 keeper reward, 572 is split by penalized debt 315 : 210 (300 and 200 debt,
 		// each at 1.05): active takes floor(572 * 315/525) = 343, JIT
 		// floor(572 * 210/525) = 228. The 1 the flooring leaves has no
 		// redistributed debt to follow, so the last non-zero offset (JIT)
@@ -392,7 +453,7 @@ fn jit_executes_below_minimum_ask() {
 
 		// Seizure prices the whole 500 of offset debt at 5%: ceil(525/0.9) =
 		// 584 leaves the owner 16. Of the 572 after the keeper, the path
-		// weights 473 : 53 (450 + ceil(22.5) and 50 + ceil(2.5)) give active
+		// penalized debts 473 : 53 (450 + ceil(22.5) and 50 + ceil(2.5)) give active
 		// floor(572 * 473/526) = 514 and JIT floor(572 * 53/526) = 57 plus the
 		// 1 the flooring leaves.
 		assert_settled(&before, outcome([450, 50, 0, 0], [514, 58, 0, 0], 12, 16));
@@ -844,6 +905,78 @@ fn full_offset_with_keeper_compensation() {
 		assert_settled(
 			&before,
 			outcome([10_000 * UNIT, 0, 0, 0], [5_243_750_000, 0, 0, 0], 6_250_000, 750 * UNIT),
+		);
+	});
+}
+
+// A liquidated vault's pending redistribution share never moves through its owner: the
+// redistribution account ends up holding exactly the new leg either way, whether the leg outgrows
+// the share and custody takes the difference, or a pool offset leaves no leg and custody releases
+// the share into the seized lot.
+#[test]
+fn pending_share_settles_in_custody_without_an_owner_round_trip() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, liquidation_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 600, 500, FixedU128::from_rational(1, 1_000)));
+		assert_ok!(open(2, DOT, PUSD, 2_000, 500, FixedU128::from_rational(2, 1_000)));
+		assert_ok!(open(3, DOT, PUSD, 2_000, 500, FixedU128::from_rational(2, 1_000)));
+		assert_ok!(open(4, DOT, PUSD, 20_000, 500, FixedU128::from_rational(2, 1_000)));
+		set_price(DOT, FixedU128::from_rational(9, 10));
+		let custody = Vaults::redistribution_account(&DOT, &PUSD);
+		let vault_events_len = vault_events().len();
+
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
+		assert_eq!(held(DOT, custody), 588);
+
+		// Vault 2's share is on hold in custody, and larger than the top-up its own liquidation
+		// leaves behind: the whole vault redistributes, so custody gains the leg less the share.
+		set_price(DOT, FixedU128::from_rational(1, 4));
+		let (touched_2, _) = Vaults::vault_after_touch(DOT, PUSD, 2).expect("vault 2 exists");
+		let share_2 = touched_2.collateral - vault(DOT, PUSD, 2).collateral;
+		assert!(share_2 > 0);
+		let owner_held_2 = held(DOT, 2);
+		assert_eq!(owner_held_2 + share_2, touched_2.collateral);
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 2, 0, 0));
+		let leg_2 = vault_events()
+			.into_iter()
+			.skip(vault_events_len)
+			.find_map(|event| match event {
+				Event::VaultLiquidated { owner: 2, outcome, .. } => Some(outcome),
+				_ => None,
+			})
+			.expect("vault 2 liquidated")
+			.redistribution
+			.collateral;
+		assert!(leg_2 > share_2);
+		assert_eq!(held(DOT, custody), 588 - share_2 + leg_2);
+		assert_eq!(held(DOT, 2), 0);
+
+		// Vault 3's share is also in custody, and a pool covering all of its debt leaves no leg,
+		// so custody releases the share into the seized lot instead of receiving anything.
+		ActiveSpCapacity::set(10_000);
+		let (touched_3, _) = Vaults::vault_after_touch(DOT, PUSD, 3).expect("vault 3 exists");
+		let share_3 = touched_3.collateral - vault(DOT, PUSD, 3).collateral;
+		assert!(share_3 > 0);
+		let custody_before = held(DOT, custody);
+		let pool_before = collateral_balance(DOT, SP_ACCOUNT);
+		assert_ok!(liquidate(KEEPER, DOT, PUSD, 3, 0, 0));
+		let outcome_3 = vault_events()
+			.into_iter()
+			.skip(vault_events_len)
+			.find_map(|event| match event {
+				Event::VaultLiquidated { owner: 3, outcome, .. } => Some(outcome),
+				_ => None,
+			})
+			.expect("vault 3 liquidated");
+		assert_eq!(outcome_3.redistribution, DebtCollateral { debt: 0, collateral: 0 });
+		assert_eq!(held(DOT, custody), custody_before - share_3);
+		assert_eq!(
+			collateral_balance(DOT, SP_ACCOUNT) - pool_before,
+			outcome_3.active_pool.collateral
+		);
+		assert_eq!(
+			held(DOT, custody),
+			branch_state(DOT, PUSD).expect("branch").pending_redistribution_collateral
 		);
 	});
 }
