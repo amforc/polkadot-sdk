@@ -10,6 +10,7 @@ use crate::{
 		AdminLevel, AssetMinimums, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode,
 		BranchState, FrozenReason, FrozenState,
 	},
+	utility_impls::Issuance,
 };
 use frame::{
 	prelude::{
@@ -25,7 +26,7 @@ use frame::{
 	},
 };
 use linked_list_interface::Position;
-use pusd_primitives::{OnBranchLifecycle, ProvidePrice};
+use pusd_primitives::{BranchSnapshot, OnBranchLifecycle, ProvidePrice};
 
 impl<T: Config> Pallet<T> {
 	/// Opens a vault with collateral, debt, and an interest rate.
@@ -529,7 +530,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		target: Option<FrozenReason>,
 	) -> DispatchResult {
-		let (minted, old_mode, new_mode) =
+		let (minted, old_mode, branch) =
 			Self::try_mutate_branch_state(collateral_id, stable_id, |config, state, now| {
 				let old_mode =
 					Self::mode_of(state, config, collateral_id, now).unwrap_or(BranchMode::Normal);
@@ -552,10 +553,13 @@ impl<T: Config> Pallet<T> {
 				state.frozen = target.map(|reason| FrozenState { reason, entered_at: now });
 				let new_mode =
 					Self::mode_of(state, config, collateral_id, now).unwrap_or(BranchMode::Normal);
-				Ok((minted, old_mode, new_mode))
+				Ok((minted, old_mode, BranchSnapshot { mode: new_mode, now }))
 			})?;
-		// Mint interest only after storing the updated market.
-		Self::issue_interest(collateral_id, stable_id, minted)?;
+		// Mint interest only after storing the updated market. The yield route sees the mode just
+		// stored: a freeze sends the whole mint to the fee account.
+		let mut issuance = Issuance::minted(stable_id.clone());
+		Self::issue_interest(collateral_id, stable_id, branch, minted, &mut issuance)?;
+		let new_mode = branch.mode;
 		Self::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),

@@ -26,8 +26,8 @@ pub mod stability_pool;
 pub mod vault_interface;
 pub mod yield_routing;
 
-pub use branch_interface::{BranchInterface, BranchMode};
-pub use debit::{debit_preservation, reducible_debit};
+pub use branch_interface::{BranchInterface, BranchMode, BranchSnapshot};
+pub use debit::{debit_preservation, reducible_debit, refine_debit};
 pub use math::{collateralization_ratio, mul_div_floor, mul_div_rate_floor};
 pub use oracle::{OraclePriceConversion, ProvidePrice, ZERO_ORACLE_PRICE};
 pub use origin::EnsureStableOwnerOrRoot;

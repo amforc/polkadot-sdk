@@ -1,5 +1,6 @@
 //! Branch operating mode and branch-level vault engine operations.
 
+use crate::Millis;
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use frame::deps::sp_runtime::{DispatchError, DispatchResult};
 use scale_info::TypeInfo;
@@ -12,7 +13,16 @@ pub enum BranchMode {
 	Frozen,
 }
 
-/// Branch-level operations of the vault engine, implemented by the vault pallet.
+/// Market state a Stability Pool operation runs under, supplied by the vault engine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BranchSnapshot {
+	/// Market mode, as derived by the vault engine.
+	pub mode: BranchMode,
+	/// Current time.
+	pub now: Millis,
+}
+
+/// Branch-level vault engine operations, implemented by the vaults pallet.
 pub trait BranchInterface<CollateralId, StableId> {
 	/// Returns the market's mode: `Frozen` without a usable oracle price, `Err` if unregistered.
 	fn branch_mode(
