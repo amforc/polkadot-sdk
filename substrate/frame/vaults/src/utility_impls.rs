@@ -24,7 +24,9 @@ use frame::{
 	},
 };
 use linked_list_interface::{ListError, SortedListInterface};
-use pusd_primitives::{collateralization_ratio, CollateralRatio, OnBranchYield, ProvidePrice};
+use pusd_primitives::{
+	collateralization_ratio, BranchSnapshot, CollateralRatio, OnBranchYield, ProvidePrice,
+};
 
 /// Changes the next vault touch would apply.
 pub(crate) struct PendingTouch<Balance> {
@@ -44,6 +46,50 @@ pub(crate) struct TouchedVaultDraft<AccountId, Balance> {
 	pub(crate) vault: Vault<Balance>,
 	pub(crate) status: VaultStatus,
 	pub(crate) now: Millis,
+}
+
+/// Stablecoin one commit issues, drawn first from stablecoin the same operation burns.
+///
+/// Issuing out of a burned credit nets the two supply changes into one; whatever is left of the
+/// credit burns when this drops.
+pub(crate) struct Issuance<T: Config> {
+	stable_id: StableIdOf<T>,
+	burned: Option<StableCreditOf<T>>,
+}
+
+impl<T: Config> Issuance<T> {
+	/// Issues only freshly minted stablecoin.
+	pub(crate) const fn minted(stable_id: StableIdOf<T>) -> Self {
+		Self { stable_id, burned: None }
+	}
+
+	/// Issues out of `burned` first, then mints the shortfall.
+	pub(crate) fn netted(stable_id: StableIdOf<T>, burned: Option<StableCreditOf<T>>) -> Self {
+		if let Some(burned) = burned.as_ref() {
+			debug_assert!(burned.asset() == stable_id, "burned credit of another stablecoin");
+		}
+		Self { stable_id, burned }
+	}
+
+	fn issue(&mut self, amount: BalanceOf<T>) -> Result<StableCreditOf<T>, DispatchError> {
+		let Some(burned) = self.burned.take() else {
+			return Ok(T::StableAssets::issue(self.stable_id.clone(), amount));
+		};
+		let (mut taken, rest) = burned.split(amount);
+		self.burned = Some(rest);
+		let shortfall = amount.saturating_sub(taken.peek());
+		if !shortfall.is_zero() {
+			taken
+				.subsume(T::StableAssets::issue(self.stable_id.clone(), shortfall))
+				.map_err(|minted| {
+					// Both credits are of `stable_id`, so the merge cannot fail.
+					drop(minted);
+					DispatchError::Corruption
+				})?;
+		}
+		debug_assert!(taken.peek() == amount);
+		Ok(taken)
+	}
 }
 
 /// The part of one branch that contributes to derived debt aggregates.
@@ -545,13 +591,18 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Issues market yield and routes the remainder from `T::YieldHook` to `T::FeeAccount`.
+	///
+	/// `branch` is the market as stored at this point: the caller derives it from the state it
+	/// just committed, so the hook does not load the branch again.
 	pub(crate) fn mint_and_route_yield(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		branch: BranchSnapshot,
 		amount: BalanceOf<T>,
+		issuance: &mut Issuance<T>,
 	) -> DispatchResult {
-		let credit = T::StableAssets::issue(stable_id.clone(), amount);
-		let credit = T::YieldHook::distribute_yield(collateral_id, credit);
+		let credit = issuance.issue(amount)?;
+		let credit = T::YieldHook::distribute_yield(collateral_id, branch, credit);
 		Self::resolve_fee_credit(stable_id, credit)
 	}
 
@@ -559,12 +610,14 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn issue_interest(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		branch: BranchSnapshot,
 		amount: BalanceOf<T>,
+		issuance: &mut Issuance<T>,
 	) -> DispatchResult {
 		if amount.is_zero() {
 			return Ok(());
 		}
-		Self::mint_and_route_yield(collateral_id, stable_id, amount)?;
+		Self::mint_and_route_yield(collateral_id, stable_id, branch, amount, issuance)?;
 		Self::deposit_event(Event::InterestIssued {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
@@ -580,11 +633,24 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 	) -> DispatchResult {
-		let minted = Self::try_mutate_branch_state(collateral_id, stable_id, |_, state, now| {
-			Self::accrue_aggregate_interest(state, now)
-		})?;
+		let (minted, branch) =
+			Self::try_mutate_branch_state(collateral_id, stable_id, |config, state, now| {
+				let minted = Self::accrue_aggregate_interest(state, now)?;
+				if minted.is_zero() {
+					return Ok((minted, None));
+				}
+				// The yield route must not fail the accrual: a mode it cannot derive counts as
+				// frozen, which sends the whole mint to the fee account.
+				let mode =
+					Self::mode_of(state, config, collateral_id, now).unwrap_or(BranchMode::Frozen);
+				Ok((minted, Some(BranchSnapshot { mode, now })))
+			})?;
 		// Mint only after storing the updated market.
-		Self::issue_interest(collateral_id, stable_id, minted)
+		if let Some(branch) = branch {
+			let mut issuance = Issuance::minted(stable_id.clone());
+			Self::issue_interest(collateral_id, stable_id, branch, minted, &mut issuance)?;
+		}
+		Ok(())
 	}
 
 	/// Makes the fee account able to receive a one-unit credit for `stable_id`.

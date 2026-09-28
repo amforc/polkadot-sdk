@@ -47,11 +47,24 @@ where
 {
 	let preserved =
 		Assets::reducible_balance(asset.clone(), who, Preservation::Preserve, Fortitude::Polite);
+	refine_debit(limit, preserved, || {
+		Assets::reducible_balance(asset, who, Preservation::Expendable, Fortitude::Polite)
+	})
+}
+
+/// [`reducible_debit`] over balances already read.
+///
+/// `preserved` is the `Preserve` reducible balance. `expendable` returns the `Expendable` one
+/// and is called only when `limit > preserved`.
+pub fn refine_debit<Balance: Ord + Copy>(
+	limit: Balance,
+	preserved: Balance,
+	expendable: impl FnOnce() -> Balance,
+) -> (Balance, Preservation) {
 	if limit <= preserved {
 		return (limit, Preservation::Preserve);
 	}
-	let expendable =
-		Assets::reducible_balance(asset, who, Preservation::Expendable, Fortitude::Polite);
+	let expendable = expendable();
 	debug_assert!(preserved <= expendable);
 	if limit < expendable {
 		(preserved, Preservation::Preserve)

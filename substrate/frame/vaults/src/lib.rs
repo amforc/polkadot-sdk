@@ -70,6 +70,8 @@ pub trait BenchmarkHelper<CollateralId, StableId> {
 	fn clear_oracle_price(collateral_id: CollateralId);
 	/// Moves the benchmark clock forward.
 	fn advance_time(ms: u64);
+	/// Creates the stable asset when the benchmark genesis lacks it, so benchmarks can mint it.
+	fn ensure_stable_asset(stable_id: StableId);
 }
 
 #[frame::pallet]

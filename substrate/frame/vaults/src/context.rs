@@ -8,10 +8,10 @@ mod lifecycle;
 use crate::{
 	pallet::{
 		BalanceOf, BranchOf, CollateralIdOf, Config, Error, Event, HoldReason, Millis, Pallet,
-		StableIdOf, Vaults,
+		StableCreditOf, StableIdOf, Vaults,
 	},
 	types::{DebtBreakdown, DebtCollateral, Vault, VaultListId, VaultRecord, VaultStatus},
-	utility_impls::BranchContribution,
+	utility_impls::{BranchContribution, Issuance},
 };
 use frame::{
 	prelude::*,
@@ -22,7 +22,9 @@ use frame::{
 	},
 };
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
-use pusd_primitives::{collateralization_ratio, CollateralRatio, ProvidePrice};
+use pusd_primitives::{
+	collateralization_ratio, BranchMode, BranchSnapshot, CollateralRatio, ProvidePrice,
+};
 
 struct Context<T: Config> {
 	collateral_id: CollateralIdOf<T>,
@@ -123,6 +125,34 @@ impl<T: Config> Context<T> {
 
 	fn price(&self) -> Result<FixedU128, DispatchError> {
 		self.price.defensive_ok_or(DispatchError::Corruption)
+	}
+
+	/// The market as this operation hands it to the Stability Pool.
+	///
+	/// The mode comes from the loaded state and the cached price, so the pool needs no branch,
+	/// oracle, or clock read of its own. An operation that loaded no price reads the oracle once
+	/// here. A price the oracle cannot give, or a ratio that does not compute, reports `Frozen`:
+	/// the pool then declines, which is what it does for a market it cannot classify.
+	fn branch_snapshot(&self) -> BranchSnapshot {
+		let mode = if self.branch.state.is_frozen() {
+			BranchMode::Frozen
+		} else {
+			let price = match self.price {
+				Some(price) => Ok(price),
+				None => T::Oracle::provide_price(&self.collateral_id),
+			};
+			price
+				.and_then(|price| {
+					Pallet::<T>::mode_at_price(
+						&self.branch.state,
+						&self.branch.config,
+						price,
+						self.now,
+					)
+				})
+				.unwrap_or(BranchMode::Frozen)
+		};
+		BranchSnapshot { mode, now: self.now }
 	}
 
 	fn collateralization_ratio(
@@ -684,11 +714,14 @@ impl<T: Config> VaultOp<T> {
 			Commit::Checked => self.ctx.ensure_mode_rules()?,
 			Commit::Exempt => {},
 		}
-		self.persist(false)
+		self.persist(false, None)
 	}
 
 	/// Writes the vault and the market, then issues what the operation owes.
-	fn persist(self, remove: bool) -> DispatchResult {
+	///
+	/// `burned` is stablecoin the operation took out of circulation. Issuance draws from it before
+	/// minting, and the rest burns here, so the operation changes the supply once.
+	fn persist(self, remove: bool, burned: Option<StableCreditOf<T>>) -> DispatchResult {
 		let VaultOp { ctx, owner, vault, deposit, .. } = self;
 		let collateral_id = ctx.collateral_id.clone();
 		let stable_id = ctx.stable_id.clone();
@@ -701,6 +734,11 @@ impl<T: Config> VaultOp<T> {
 		} else {
 			Vaults::<T>::insert(key, &VaultRecord { vault, deposit });
 		}
+		// Taken before the state moves into storage; the stored row equals it once committed, so
+		// the yield route sees the market the engine just wrote. A commit that mints nothing
+		// takes none, so it reads no oracle.
+		let yield_due = !ctx.pending_interest_mint.is_zero() || !ctx.pending_fee.is_zero();
+		let branch = if yield_due { Some(ctx.branch_snapshot()) } else { None };
 		let Context {
 			now,
 			branch: branch_row,
@@ -718,10 +756,27 @@ impl<T: Config> VaultOp<T> {
 		)?;
 
 		// Mint after writing state.
-		Pallet::<T>::issue_interest(&collateral_id, &stable_id, pending_interest_mint)?;
-		if !pending_fee.is_zero() {
-			Pallet::<T>::mint_and_route_yield(&collateral_id, &stable_id, pending_fee)?;
+		let mut issuance = Issuance::netted(stable_id.clone(), burned);
+		if let Some(branch) = branch {
+			Pallet::<T>::issue_interest(
+				&collateral_id,
+				&stable_id,
+				branch,
+				pending_interest_mint,
+				&mut issuance,
+			)?;
+			if !pending_fee.is_zero() {
+				Pallet::<T>::mint_and_route_yield(
+					&collateral_id,
+					&stable_id,
+					branch,
+					pending_fee,
+					&mut issuance,
+				)?;
+			}
 		}
+		// Burns what issuance did not use.
+		drop(issuance);
 		Ok(())
 	}
 }

@@ -194,7 +194,7 @@ impl<T: Config> VaultOp<T> {
 				.record_redistribution(redistribution, self.ctx.now)
 				.ok_or(Error::<T>::RedistributionWouldOverflow)?;
 		}
-		self.persist(true)
+		self.persist(true, None)
 	}
 
 	/// Closes a debt-free vault and commits its collateral release.
@@ -248,7 +248,7 @@ impl<T: Config> VaultOp<T> {
 			},
 			Commit::Checked | Commit::Exempt => {},
 		}
-		self.persist(true)
+		self.persist(true, None)
 	}
 
 	fn set_status(&mut self, new_status: VaultStatus) -> DispatchResult {
