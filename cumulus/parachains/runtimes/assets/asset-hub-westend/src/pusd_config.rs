@@ -367,9 +367,22 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 		pallet_mock_oracle::Prices::<Runtime>::remove(asset_id);
 	}
 
+	// Writes the moment directly: `set_timestamp` runs Aura's `on_timestamp_set`, which rejects a
+	// clock that runs ahead of the current slot. `RelayTimestamp` reads this value when no relay
+	// slot is recorded, as in benchmarks.
 	fn advance_time(ms: u64) {
-		let now = <pallet_timestamp::Pallet<Runtime>>::get();
-		<pallet_timestamp::Pallet<Runtime>>::set_timestamp(now + ms);
+		pallet_timestamp::Now::<Runtime>::mutate(|now| *now = now.saturating_add(ms));
+	}
+
+	// The benchmark genesis does not create the stablecoin asset, so opening vaults
+	// (which mints stablecoin debt) would fail without it.
+	fn ensure_stable_asset(stable_id: VaultsStableId) {
+		use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
+		if !<Assets as FungiblesInspect<AccountId>>::asset_exists(stable_id) {
+			let asset_owner: AccountId = frame_benchmarking::account("pusd_owner", 0, 0);
+			<Assets as Create<AccountId>>::create(stable_id, asset_owner, true, 1)
+				.expect("create stablecoin asset for benchmark");
+		}
 	}
 }
 
@@ -414,17 +427,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 		let collateral_id = VaultsNativeCollateralId::get();
 		let stable_id: VaultsStableId = BENCHMARK_STABLE_ASSET_ID;
 
-		// The benchmark genesis does not create the stablecoin asset, so opening
-		// vaults (which mints stablecoin debt) and funding the redeemer would fail
-		// without it.
-		{
-			use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
-			if !<Assets as FungiblesInspect<AccountId>>::asset_exists(stable_id) {
-				let asset_owner: AccountId = frame_benchmarking::account("pusd_owner", 0, 0);
-				<Assets as Create<AccountId>>::create(stable_id, asset_owner, true, 1)
-					.expect("create stablecoin asset for benchmark");
-			}
-		}
+		VaultsBenchmarkHelper::ensure_stable_asset(stable_id);
 
 		// `create_branch` validates the oracle price, so set it first.
 		VaultsBenchmarkHelper::set_oracle_price(

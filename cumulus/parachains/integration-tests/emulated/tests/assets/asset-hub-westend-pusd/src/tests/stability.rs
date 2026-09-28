@@ -229,7 +229,7 @@ fn pending_deposit_pro_rata_offset() {
 		let cara = acct(5);
 		sp_deposit_pending(&cara, 500 * PUSD);
 
-		// At 2.1 pUSD/WND the 1.05-weighted seizure for 1,000 pUSD is exactly 500 WND.
+		// At 2.1 pUSD/WND the 1.05-penalized seizure for 1,000 pUSD is exactly 500 WND.
 		feed_price(dot_price(21, 10));
 		liquidate(&liquidated_owner);
 
@@ -304,7 +304,7 @@ fn offset_yield_and_depositor_realization() {
 		let yield_owner = acct(4);
 		open_vault(&yield_owner, 20_000 * WND, 10_000 * PUSD, FixedU128::from_rational(4, 100));
 
-		// At 1.75 pUSD/WND the 1.05-weighted seizure for 2,000 pUSD is
+		// At 1.75 pUSD/WND the 1.05-penalized seizure for 2,000 pUSD is
 		// exactly 1,200 WND.
 		feed_price(dot_price(7, 4));
 		liquidate(&liquidated_owner);
@@ -510,7 +510,7 @@ fn full_depletion_and_scale_crossing_then_realization() {
 		assert_eq!(state.total_active_deposits, 600 * PUSD);
 		assert_eq!(state.total_pending_deposits, 900 * PUSD);
 
-		// At 1.75 pUSD/WND the 1.05-weighted seizure for 1,500 pUSD is exactly 900 WND.
+		// At 1.75 pUSD/WND the 1.05-penalized seizure for 1,500 pUSD is exactly 900 WND.
 		feed_price(dot_price(7, 4));
 		liquidate(&final_casualty);
 

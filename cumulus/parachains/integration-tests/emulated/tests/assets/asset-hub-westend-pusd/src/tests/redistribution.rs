@@ -15,13 +15,7 @@
 
 use crate::imports::*;
 use frame_support::hypothetically;
-use pallet_vaults::types::{BranchState, InterestWeight, Vault};
-
-/// A whole-unit rate-weighted principal, `principal × annual_rate` in stablecoin
-/// units.
-fn weight(whole: Balance) -> InterestWeight<Balance> {
-	InterestWeight { whole, remainder: 0 }
-}
+use pallet_vaults::types::{BranchState, Vault};
 
 /// The first redistribution, 1,000 pUSD / 550 WND, splits 60/40 over the 6,000
 /// and 4,000 WND stakes. The second, 1,555 pUSD / 855.25 WND, counts the earlier
@@ -98,13 +92,13 @@ fn redistribution_with_a_vault_joining_between_events() {
 /// The end state of a two-recipient reconciliation: vault A, vault B, and the market.
 type Reconciled = (Vault<Balance>, Vault<Balance>, BranchState<AccountId, Balance>);
 
-/// Adds 1,000 × 6.4% = 64 pUSD of pending weight at the recipient-average rate.
+/// Adds 1,000 × 6.4% = 64 pUSD of pending accrual rate at the recipient-average rate.
 ///
-/// A touch moves A's 600 × 4% = 24 or B's 400 × 10% = 40 to its principal weight.
+/// A touch moves A's 600 × 4% = 24 or B's 400 × 10% = 40 to its principal accrual rate.
 /// The total remains 64 pUSD and does not depend on which recipient touches
 /// first, so the reversed order runs hypothetically and must reach the same state.
 #[test]
-fn weight_per_stake_reconciliation_is_touch_order_independent() {
+fn per_stake_reconciliation_is_touch_order_independent() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(4, 1));
 		create_branch(&accounting_spec());
@@ -120,13 +114,15 @@ fn weight_per_stake_reconciliation_is_touch_order_independent() {
 		feed_price(dot_price(2, 1));
 		liquidate(&casualty);
 
-		// The redistributed 1,000 pUSD posts 64 of pending weight on top of the
+		// The redistributed 1,000 pUSD posts 64 of pending accrual rate on top of the
 		// recipients' own 3,000 × 4% + 2,000 × 10% = 320.
 		let debt = branch_state().debt;
-		assert_eq!(debt.pending_redistribution_weight, weight(64 * PUSD));
-		assert_eq!(debt.weighted_principal, weight(384 * PUSD));
+		let pending_accrual_rate: Balance = debt.pending_redistribution_accrual_rate.whole();
+		let accrual_rate: Balance = debt.accrual_rate.whole();
+		assert_eq!(pending_accrual_rate, 64 * PUSD);
+		assert_eq!(accrual_rate, 384 * PUSD);
 
-		// A's share of the pending weight is 600 × 4% = 24, B's 400 × 10% = 40.
+		// A's share of the pending accrual rate is 600 × 4% = 24, B's 400 × 10% = 40.
 		let reversed = hypothetically!(reconcile_by_touching(
 			[(&owner_b, 40 * PUSD), (&owner_a, 24 * PUSD)],
 			&owner_a,
@@ -165,7 +161,7 @@ fn weight_per_stake_reconciliation_is_touch_order_independent() {
 }
 
 /// Touches the two recipients in `touch_order` after a year, checks each touch
-/// moves only that recipient's `share` of pending weight, then accrues a second
+/// moves only that recipient's `share` of pending accrual rate, then accrues a second
 /// year and returns the end state.
 fn reconcile_by_touching(
 	touch_order: [(&AccountId, Balance); 2],
@@ -177,16 +173,20 @@ fn reconcile_by_touching(
 	// One year passes before the touches.
 	advance_time(31_557_600_000);
 	poke(first);
-	// The first touch moves its share from pending weight to vault principal.
+	// The first touch moves its share from pending accrual rate to vault principal.
 	// The aggregate does not change.
 	let debt = branch_state().debt;
-	assert_eq!(debt.pending_redistribution_weight, weight(64 * PUSD - first_share));
-	assert_eq!(debt.weighted_principal, weight(384 * PUSD));
+	let pending_accrual_rate: Balance = debt.pending_redistribution_accrual_rate.whole();
+	let accrual_rate: Balance = debt.accrual_rate.whole();
+	assert_eq!(pending_accrual_rate, 64 * PUSD - first_share);
+	assert_eq!(accrual_rate, 384 * PUSD);
 	poke(second);
-	// The second touch drains the pending weight.
+	// The second touch drains the pending accrual rate.
 	let debt = branch_state().debt;
-	assert_eq!(debt.pending_redistribution_weight, weight(0));
-	assert_eq!(debt.weighted_principal, weight(384 * PUSD));
+	let pending_accrual_rate: Balance = debt.pending_redistribution_accrual_rate.whole();
+	let accrual_rate: Balance = debt.accrual_rate.whole();
+	assert_eq!(pending_accrual_rate, 0);
+	assert_eq!(accrual_rate, 384 * PUSD);
 	// One year of interest on the reconciled principals: A 144, B 240.
 	assert_eq!(vault(owner_a).debt.interest, 144 * PUSD);
 	assert_eq!(vault(owner_b).debt.interest, 240 * PUSD);
