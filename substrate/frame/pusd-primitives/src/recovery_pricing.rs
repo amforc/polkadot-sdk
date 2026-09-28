@@ -1,8 +1,7 @@
-//! This module calculates settlement prices for `FinalRecovery` vaults.
+//! Settlement pricing for `FinalRecovery` vaults.
 //!
-//! Price-conversion functions return `None` if `price` is zero or a calculation overflows.
-//! [`insurance_adjusted`] returns `None` when the vault is outside its pricing regime. A caller
-//! must treat `None` as an error.
+//! `None` means a zero price, an overflow, or inputs outside the function's regime. Callers must
+//! treat it as an error.
 
 pub use crate::math::{collateral_for_value_ceil, collateral_for_value_floor};
 use crate::mul_div_floor;
@@ -25,8 +24,7 @@ pub use crate::math::mul_rate_ceil as collateral_value_ceil;
 /// The function uses this formula:
 /// `min(max(0, cr - 100% - buffer), redistribution_penalty)`.
 ///
-/// The `buffer` makes `bonus <= cr - 1`. Thus, the bonus does not decrease the vault CR after a
-/// redemption.
+/// Since `bonus <= cr - 100%`, paying it never lowers the vault's CR.
 pub fn recovery_bonus(
 	cr: FixedU128,
 	buffer: Permill,
@@ -41,12 +39,8 @@ pub fn recovery_bonus(
 	bonus
 }
 
-/// Calculates the collateral payout for a recovery settlement with `CR >= 100%`.
-///
-/// The calculation applies `bonus` to `debt_cancelled` stablecoin at face value:
+/// Returns the collateral paid for `debt_cancelled` at `CR >= 100%`:
 /// `floor(floor(debt_cancelled * (1 + bonus)) / price)`.
-///
-/// Returns `None` if `price` is zero or if a calculation overflows.
 pub fn recovery_bonus_collateral_out<Balance: FixedPointOperand>(
 	debt_cancelled: Balance,
 	bonus: FixedU128,
@@ -56,19 +50,19 @@ pub fn recovery_bonus_collateral_out<Balance: FixedPointOperand>(
 	collateral_for_value_floor(value, price)
 }
 
-/// Contains an insurance-adjusted settlement split.
+/// Split of a below-par vault's debt between the market and the Insurance Fund.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct InsuranceAdjusted<Balance> {
-	/// Debt that redeemers and offset providers can cancel against this vault's collateral.
+	/// Debt redeemers and offset providers cancel against the vault's collateral.
 	pub market_cancel_debt: Balance,
-	/// Debt that the Insurance Fund covers.
+	/// Debt the Insurance Fund covers.
 	pub effective_cover: Balance,
 }
 
-/// Calculates the insurance-adjusted settlement for a recovery vault with `CR < 100%`.
+/// Splits the debt of a recovery vault with `CR < 100%`:
 ///
-/// `collateral_value` is the held collateral value in stablecoin units. The function uses these
-/// formulas:
+/// - `effective_cover = min(insurance_available, debt - collateral_value)`
+/// - `market_cancel_debt = debt - effective_cover`
 ///
 /// - `effective_cover = min(insurance_available, debt - collateral_value)`.
 /// - `market_cancel_debt = debt - effective_cover`.

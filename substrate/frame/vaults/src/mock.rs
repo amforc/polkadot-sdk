@@ -42,7 +42,7 @@ use frame::{
 };
 pub use pallet_linked_list::Position;
 use pusd_primitives::{
-	OffsetLegs, OraclePriceConversion, RedemptionSettlement, StabilityPoolInspect,
+	BranchSnapshot, OffsetLegs, OraclePriceConversion, RedemptionSettlement, StabilityPoolInspect,
 	StabilityPoolOffset, VaultInterface,
 };
 
@@ -249,8 +249,10 @@ impl pusd_primitives::OnBranchYield<AssetId, Credit<AccountId, VaultStableAssets
 {
 	fn distribute_yield(
 		_: &AssetId,
+		branch: BranchSnapshot,
 		credit: Credit<AccountId, VaultStableAssets>,
 	) -> Credit<AccountId, VaultStableAssets> {
+		assert_eq!(branch.now, Timestamp::get(), "the engine passes its own clock");
 		let sp_share = SpFeeShare::get() * credit.peek();
 		let (sp_credit, residual) = credit.split(sp_share);
 		drop(sp_credit);
@@ -498,6 +500,9 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for MockBenchmarkHelper {
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
+
+	// The genesis config already creates every stable asset.
+	fn ensure_stable_asset(_: StableId) {}
 }
 
 /// Builds fresh storage for a test.

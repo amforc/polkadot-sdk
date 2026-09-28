@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// `floor(x * rate)` for the recipient-rate assertions.
-fn weighted(x: Balance, rate: FixedU128) -> Balance {
+fn accrual_rate(x: Balance, rate: FixedU128) -> Balance {
 	rate.saturating_mul_int(x)
 }
 
@@ -72,7 +72,7 @@ fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
 			(
 				allocated_1,
 				allocated_2,
-				final_state.debt.weighted_principal,
+				final_state.debt.accrual_rate,
 				final_state.debt.outstanding(),
 				final_state.debt.pending_redistribution_principal,
 			)
@@ -82,9 +82,9 @@ fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
 	assert_eq!(run(1, 2), run(2, 1));
 }
 
-// Each weight claim and the remaining pool must retain valid time anchors in both touch orders.
+// Claims after a delay must leave the same vaults and pool in both touch orders.
 #[test]
-fn nonzero_time_weight_residue_is_touch_order_independent() {
+fn delayed_redistribution_residue_is_touch_order_independent() {
 	let run = |first, second| {
 		new_test_ext().execute_with(|| {
 			register_market(DOT, PUSD);
@@ -97,20 +97,6 @@ fn nonzero_time_weight_residue_is_touch_order_independent() {
 			assert_eq!(redistribute_for_test(DOT, PUSD, 3, 0).unwrap(), 204);
 
 			assert_ok!(poke(9, DOT, PUSD, first));
-			let after_first = branch_state(DOT, PUSD).unwrap();
-			let tau = after_first.interest_time(Timestamp::get());
-			// The pending residue must have zero accrued interest at the record time.
-			assert!(!after_first.debt.pending_redistribution_weight.is_zero());
-			assert_eq!(
-				after_first.pending_redistribution_weight_time.to_wide(),
-				after_first
-					.debt
-					.pending_redistribution_weight
-					.raw()
-					.checked_mul(tau.into())
-					.unwrap()
-			);
-
 			assert_ok!(poke(9, DOT, PUSD, second));
 			assert_accounting_identity_holds();
 			(branch_state(DOT, PUSD).unwrap(), vault(DOT, PUSD, 1), vault(DOT, PUSD, 2))
@@ -121,15 +107,15 @@ fn nonzero_time_weight_residue_is_touch_order_independent() {
 }
 
 // After a redistribute-everything liquidation, the branch's
-// `debt.weighted_principal` must reflect the economic debt at the recipient's
+// `debt.accrual_rate` must reflect the economic debt at the recipient's
 // actual rate — total economic debt × recipient rate — not the redistributed
 // principal carried at rate=1.0.
 #[test]
-fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
+fn accrual_rate_after_redistribution_matches_avg_recipient_rate() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Liquidatee at 5%, recipient at 20% (distinct rates so the recipient-rate
-		// weighting is genuinely exercised, not masked by equal rates). Both
+		// accrual rate is genuinely exercised, not masked by equal rates). Both
 		// stakes are 1000.
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
@@ -149,11 +135,11 @@ fn weighted_sum_after_redistribution_matches_avg_recipient_rate() {
 		let state = branch_state(DOT, PUSD).expect("branch state");
 		let total_econ = state.debt.principal;
 		// Vault 2 (20%) is the only recipient; ≤3 dust units of ceil/floor mismatch.
-		let expected = weighted(total_econ, rate_pct(20, 100));
-		let actual = state.debt.weighted_principal.whole;
+		let expected = accrual_rate(total_econ, rate_pct(20, 100));
+		let actual: Balance = state.debt.accrual_rate.whole();
 		assert!(
 			actual.abs_diff(expected) <= 3,
-			"weighted_sum after redistribution out of bounds: actual={}, expected={} (20% of {})",
+			"accrual_rate after redistribution out of bounds: actual={}, expected={} (20% of {})",
 			actual,
 			expected,
 			total_econ,
@@ -179,17 +165,19 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		let state_pre = branch_state(DOT, PUSD).unwrap();
 		// Both the owned debt and the pending share use the recipient's rate.
 		assert_eq!(state_pre.debt.pending_redistribution_principal, 501);
-		assert_eq!(state_pre.debt.weighted_principal.whole, 200);
+		let actual: Balance = state_pre.debt.accrual_rate.whole();
+		assert_eq!(actual, 200);
 
 		advance_time(ONE_YEAR_MS);
 		assert_ok!(poke(99, DOT, PUSD, 2));
 
+		// ceil(1_001 × 20%): the vault rounds the owned and the absorbed debt's interest up.
 		let post_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
-		assert_eq!(post_minted - state_pre.debt.minted_interest, 200);
+		assert_eq!(post_minted - state_pre.debt.minted_interest, 201);
 	});
 }
 
-// Recipient touches must preserve the market's rate-weighted projection.
+// Recipient touches must preserve the market's accrual rate projection.
 #[test]
 fn mixed_rate_recipients_materialize_at_their_own_rates() {
 	build_and_execute(|| {
@@ -208,13 +196,13 @@ fn mixed_rate_recipients_materialize_at_their_own_rates() {
 		let state = branch_state(DOT, PUSD).unwrap();
 		let vault_a = vault(DOT, PUSD, 1);
 		let vault_b = vault(DOT, PUSD, 2);
-		let expected = weighted(vault_a.debt.principal, rate_pct(5, 100))
-			.saturating_add(weighted(vault_b.debt.principal, rate_pct(50, 100)));
-		let actual = state.debt.weighted_principal.whole;
+		let expected = accrual_rate(vault_a.debt.principal, rate_pct(5, 100))
+			.saturating_add(accrual_rate(vault_b.debt.principal, rate_pct(50, 100)));
+		let actual: Balance = state.debt.accrual_rate.whole();
 		// One ceil (`average_branch_rate`) against two per-recipient floors.
 		assert!(
 			actual.abs_diff(expected) <= 2,
-			"mixed-rate weighted sum drift too large: actual={}, expected={}",
+			"mixed-rate accrual rate drift too large: actual={}, expected={}",
 			actual,
 			expected,
 		);
@@ -246,7 +234,7 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 		assert_eq!(vault_a.debt.principal, 500 + 251);
 		assert_eq!(vault_a.collateral, 1_000 + 500);
 		// Interest before the change uses the old rate for both principal sources.
-		assert_eq!(vault_a.debt.interest, vault_a_pre.debt.interest + 37);
+		assert_eq!(vault_a.debt.interest, vault_a_pre.debt.interest + 38);
 
 		// An untouched recipient keeps its share pending at its own rate.
 		let vault_b = vault(DOT, PUSD, 2);
@@ -254,9 +242,10 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.debt.pending_redistribution_principal, redistributed - 251);
 		assert_eq!(state.pending_redistribution_collateral, 500);
+		let actual: Balance = state.stakes.accrual_rate.whole();
 		assert_eq!(
-			state.stakes.weighted.whole,
-			weighted(1_000, rate_pct(30, 100)) + weighted(1_000, rate_pct(50, 100))
+			actual,
+			accrual_rate(1_000, rate_pct(30, 100)) + accrual_rate(1_000, rate_pct(50, 100))
 		);
 
 		// Interest after the change uses the new rate for all principal.
@@ -268,12 +257,12 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 	});
 }
 
-// A follow-on `borrow` against a recipient must keep the branch weighted_sum
+// A follow-on `borrow` against a recipient must keep the branch accrual_rate
 // consistent with each vault's own-rate contribution: the borrow first touches
-// the vault to fold in its redistribution share, then updates the weighted-sum
+// the vault to fold in its redistribution share, then updates the accrual-rate
 // bookkeeping so the aggregate still equals Σ (own ib_debt × own rate).
 #[test]
-fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
+fn borrow_after_redistribution_keeps_accrual_rate_consistent() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100))); // A — recipient + borrower
@@ -300,13 +289,13 @@ fn borrow_after_redistribution_keeps_weighted_sum_consistent() {
 		let state = branch_state(DOT, PUSD).unwrap();
 		let vault_a = vault(DOT, PUSD, 1);
 		let vault_b = vault(DOT, PUSD, 2);
-		let expected = weighted(vault_a.debt.principal, rate_pct(5, 100))
-			.saturating_add(weighted(vault_b.debt.principal, rate_pct(50, 100)));
-		let actual = state.debt.weighted_principal.whole;
+		let expected = accrual_rate(vault_a.debt.principal, rate_pct(5, 100))
+			.saturating_add(accrual_rate(vault_b.debt.principal, rate_pct(50, 100)));
+		let actual: Balance = state.debt.accrual_rate.whole();
 		// Same ceil-vs-floor drift as above, plus the borrow's own reconciliation.
 		assert!(
 			actual.abs_diff(expected) <= 2,
-			"weighted_sum drift after borrow: actual={}, expected={}",
+			"accrual_rate drift after borrow: actual={}, expected={}",
 			actual,
 			expected,
 		);
@@ -623,7 +612,7 @@ fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
 // Full-lifecycle identity soak: open → liquidate with a redistribution split
 // → recipient touches → partial repay → redemption → overpay-close. The
 // `try_state` identities (Σ principal exact, Σ floor(rate·stake) exact,
-// weighted-principal bounds) must hold at every stage, not just at the end.
+// accrual rate bounds) must hold at every stage, not just at the end.
 #[test]
 fn full_lifecycle_holds_branch_identities() {
 	fn assert_identities() {
@@ -662,7 +651,7 @@ fn full_lifecycle_holds_branch_identities() {
 		assert_ok!(poke(9, DOT, PUSD, 2));
 		assert_identities();
 
-		// Partial repay exercises the full-contribution weighted-sum swap.
+		// Partial repay exercises the full-contribution accrual rate swap.
 		assert_ok!(repay(2, DOT, PUSD, 2, Some(300)));
 		assert_identities();
 
@@ -731,7 +720,7 @@ fn redistributed_principal_accrues_interest_from_liquidation_moment() {
 	});
 }
 
-// Seeds pending redistribution debt of 502 with rate weight 50.2.
+// Seeds pending redistribution debt of 502 with accrual rate 50.2.
 fn seed_redistributed_recipient() {
 	register_market(DOT, PUSD);
 	assert_ok!(open(1, DOT, PUSD, 10_000, 500, rate_pct(10, 100)));
@@ -766,8 +755,10 @@ fn recipient_owned_redistribution_interest_stays_in_branch_projection() {
 
 		let state = branch_state(DOT, PUSD).unwrap();
 		let vault = vault(DOT, PUSD, 1);
-		assert_eq!(vault.debt.interest, 101);
-		assert!(vault.interest_remainder != 0);
+		assert_eq!(vault.debt.interest, 102, "fee 1 + ceil(1_002 × 10%)");
+		assert!(vault.interest_prepaid != 0);
+		// The unit the touch rounds up was charged ahead of the aggregate, so the projection nets
+		// it.
 		assert_eq!(
 			crate::Pallet::<Test>::accrued_branch_debt(&state, Timestamp::get()),
 			accrued_after_idle_year,

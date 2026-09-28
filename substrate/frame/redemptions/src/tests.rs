@@ -1080,7 +1080,6 @@ fn partial_fill_with_zero_market_cancel_debt_pays_no_cover() {
 		let snapshot = pusd_primitives::RedemptionStepSnapshot {
 			status: pusd_primitives::VaultStatus::FinalRecovery,
 			debt: 400,
-			terminal_interest_charge: 1,
 			collateral: 100,
 			redistribution_penalty: Permill::zero(),
 			initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
@@ -1288,7 +1287,7 @@ fn redeem_charges_the_fee_curve() {
 }
 
 #[test]
-fn full_step_includes_the_terminal_charge() {
+fn full_step_settles_the_rounded_up_debt() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		assert_ok!(open(1, DOT, PUSD, 2_000, 500, rate_pct(10, 100)));
@@ -1296,38 +1295,13 @@ fn full_step_includes_the_terminal_charge() {
 		advance_time(1);
 
 		let snapshot = Vaults::project_redemption_snapshot(&DOT, &PUSD, &1).unwrap();
-		assert_eq!(snapshot.terminal_interest_charge, 1);
 		// The dry run sizes the collateral floor that the execution then meets exactly.
 		let dry = dry_redeem_as(5, DOT, PUSD, 10_000, 6, 1).unwrap();
 		assert_eq!(dry.ordinary_steps, Some(1));
-		assert_eq!(dry.stable_burned, snapshot.debt + 1);
+		assert_eq!(dry.stable_burned, snapshot.debt);
 
 		assert_ok!(redeem(5, DOT, PUSD, 10_000, dry.collateral_out, 6, 1));
 		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
-	});
-}
-
-// A partial payment must preserve the terminal charge for the surviving vault.
-#[test]
-fn partial_redemption_with_terminal_remainder_caps_below_base_debt() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 2_000, 500, rate_pct(10, 100)));
-		mint_stable(PUSD, 5, 10_000);
-		advance_time(1);
-
-		let snapshot = Vaults::project_redemption_snapshot(&DOT, &PUSD, &1).unwrap();
-		assert_eq!(snapshot.terminal_interest_charge, 1);
-		// A spend that buys the whole base debt but not the terminal charge.
-		let spend = spend_for_debt(snapshot.debt);
-		assert_ok!(redeem(5, DOT, PUSD, spend, 0, 6, 1));
-		let settled = last_settlement();
-		assert_eq!(settled.ordinary_steps, Some(1));
-		assert_eq!(settled.stable_burned, snapshot.debt - 1);
-		assert_eq!(vault_debt(DOT, PUSD, 1), 1);
-		// The final settlement must collect the preserved terminal charge.
-		let after = Vaults::project_redemption_snapshot(&DOT, &PUSD, &1).unwrap();
-		assert_eq!(after.terminal_interest_charge, 1);
 	});
 }
 

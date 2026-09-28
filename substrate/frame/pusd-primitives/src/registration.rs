@@ -1,42 +1,30 @@
-//! Market registration / deregistration lifecycle hook.
+//! Market registration and deregistration hooks.
 
 use codec::{DecodeWithMemTracking, MaxEncodedLen};
 use frame::deps::frame_support::pallet_prelude::{DispatchResult, Parameter};
 
-/// Lifecycle hook for `(collateral_id, stable_id)` markets. A market is one
-/// stablecoin against one collateral. `pallet-vaults` calls [`on_registered`]
-/// after registration and [`on_deregistered`] before removal, both with the
-/// stablecoin's market count once the call commits. This lets handlers maintain
-/// either per-market or stablecoin-wide state without duplicating Vaults'
-/// market counter.
+/// Lifecycle hook for `(collateral_id, stable_id)` markets.
 ///
-/// [`RegistrationConfig`] is the handler's own registration payload. Vaults
-/// forwards it without interpreting it, so denomination-sensitive amounts stay
-/// with the pallet that stores them. Tuple composition combines handler
+/// `pallet-vaults` calls [`on_registered`] after registration and [`on_deregistered`] before
+/// removal, passing the stablecoin's market count as of commit, so handlers need no counter of
+/// their own. Both default to no-ops; an `Err` rolls back the extrinsic.
+///
+/// [`RegistrationConfig`] is a per-handler payload that Vaults forwards untouched. Tuples compose
 /// payloads, e.g. `(Option<RedemptionConfig<_>>, StabilityPoolConfig<_>)`.
-///
-/// Both lifecycle methods default to a no-op, so an implementer overrides only
-/// the edge it cares about. Returning `Err` short-circuits the surrounding
-/// extrinsic and rolls the registration (or removal) back.
 ///
 /// [`on_registered`]: OnBranchLifecycle::on_registered
 /// [`on_deregistered`]: OnBranchLifecycle::on_deregistered
 /// [`RegistrationConfig`]: OnBranchLifecycle::RegistrationConfig
 pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
-	/// Handler-specific configuration supplied at market registration.
-	///
-	/// Tuple implementers compose this as a tuple of the inner payloads.
+	/// Handler-specific registration payload; a tuple of payloads for tuple implementations.
 	type RegistrationConfig: Parameter + MaxEncodedLen + DecodeWithMemTracking;
 
-	/// Run when a new market is registered. `stablecoin_markets` includes it, so a count of one
-	/// is the market that seeds whatever the handler keeps per stablecoin. Handlers that keep
-	/// such state decide from that count rather than from their own storage, so the rule they
-	/// enforce is the one a caller can predict.
+	/// Called after a market is registered. `stablecoin_markets` includes it, so `1` marks the
+	/// stablecoin's first market. Handlers with per-stablecoin state should key off this count,
+	/// not their own storage, so callers can predict the outcome.
 	///
-	/// `funder` is the account charged for any refundable setup cost the handler takes, such as
-	/// an asset account deposit. Vaults resolves it the same way it funds its own collateral
-	/// custody: the depositor a signed creation charged, and the market's full administrator
-	/// otherwise. A handler can therefore always name a payer, whoever created the market.
+	/// `funder` pays any refundable setup cost, such as an asset account deposit: the depositor of
+	/// a signed creation, otherwise the market's full administrator.
 	fn on_registered(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
@@ -48,8 +36,7 @@ pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 		Ok(())
 	}
 
-	/// Run when an empty market is removed. `remaining_stablecoin_markets`
-	/// excludes it.
+	/// Called before an empty market is removed. `remaining_stablecoin_markets` excludes it.
 	fn on_deregistered(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
@@ -59,26 +46,20 @@ pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 		Ok(())
 	}
 
-	/// Builds a payload [`on_registered`] accepts for the `stablecoin_markets`-th
-	/// market of a stablecoin.
-	///
-	/// The count is the same one [`on_registered`] receives, so a handler whose
-	/// payload differs between the first market and later ones stays
-	/// constructible for both.
+	/// Builds a valid [`on_registered`] payload for the stablecoin's `stablecoin_markets`-th
+	/// market, covering handlers whose payload differs between the first and later markets.
 	///
 	/// [`on_registered`]: OnBranchLifecycle::on_registered
 	#[cfg(feature = "runtime-benchmarks")]
 	fn benchmark_registration_config(stablecoin_markets: u32) -> Self::RegistrationConfig;
 }
 
-/// Run each handler in order, short-circuiting on the first error so the caller
-/// can roll the transaction back.
+/// Runs each handler in order, stopping at the first error.
 #[impl_trait_for_tuples::impl_for_tuples(8)]
 impl<CollateralId, StableId, AccountId> OnBranchLifecycle<CollateralId, StableId, AccountId>
 	for Tuple
 {
-	// Each payload becomes a field of the composed tuple, so without this the projected
-	// associated types outlive nothing the compiler can name (E0310).
+	// Composed tuple fields need `'static` payload types (E0310).
 	for_tuples!( where #( Tuple::RegistrationConfig: 'static )* );
 
 	for_tuples!( type RegistrationConfig = ( #( Tuple::RegistrationConfig ),* ); );
@@ -90,8 +71,6 @@ impl<CollateralId, StableId, AccountId> OnBranchLifecycle<CollateralId, StableId
 		config: Self::RegistrationConfig,
 		funder: &AccountId,
 	) -> DispatchResult {
-		// Each handler takes its own field by value, so the composed tuple is moved apart
-		// field by field.
 		for_tuples!( #(
 			Tuple::on_registered(
 				collateral_id,

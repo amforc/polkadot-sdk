@@ -11,29 +11,26 @@ use frame::{
 	traits::{tokens::ConversionToAssetBalance, Get},
 };
 
-/// Error for a feed that quotes a price of zero. Distinct from [`DispatchError::Unavailable`] so
-/// that a worthless feed never permits a fallback price source.
+/// Error for a zero price quote. Unlike [`DispatchError::Unavailable`], it never permits a
+/// fallback price source.
 pub const ZERO_ORACLE_PRICE: DispatchError = DispatchError::Other("zero oracle price");
 
-/// Read-only access to a normalised price for a given collateral.
+/// Read-only access to normalized collateral prices.
 pub trait ProvidePrice {
 	type AssetId;
 
-	/// Latest price for `collateral_id`.
+	/// Returns the latest price for `collateral_id`.
 	///
-	/// If no feed exists, this function returns [`DispatchError::Unavailable`] and permits another
-	/// price source. Any other error identifies an unusable feed and prohibits a fallback.
+	/// [`DispatchError::Unavailable`] means no feed exists and permits a fallback source. Any
+	/// other error marks the feed unusable and forbids one.
 	fn provide_price(collateral_id: &Self::AssetId) -> Result<FixedU128, DispatchError>;
 }
 
-/// Converts a `Reference` amount to an asset amount from oracle prices.
+/// Converts a `Reference` amount to an asset amount by the ratio of two [`ProvidePrice`]
+/// quotes, rounding up. `Reference` itself converts 1:1 without a query.
 ///
-/// The conversion uses the ratio of two [`ProvidePrice`] quotes and rounds up. If `asset` is
-/// `Reference`, it returns `balance` unchanged without an oracle query.
-///
-/// If a feed does not exist, the conversion returns [`DispatchError::Unavailable`] unless the
-/// other feed has a different error. A zero quote is an unusable feed and returns
-/// `DispatchError::Other("zero oracle price")`.
+/// A zero quote fails with [`ZERO_ORACLE_PRICE`]. [`DispatchError::Unavailable`] is returned
+/// only if neither feed is unusable, so an untrusted feed never unlocks a fallback.
 pub struct OraclePriceConversion<Oracle, Reference>(PhantomData<(Oracle, Reference)>);
 
 impl<Oracle, Reference, Balance> ConversionToAssetBalance<Balance, Oracle::AssetId, Balance>
@@ -54,20 +51,18 @@ where
 		if asset == reference {
 			return Ok(balance);
 		}
-		// Read both feeds so that an unusable feed takes precedence when the other feed is absent.
-		// A zero quote is classified as unusable before precedence so that it never resolves to
-		// `Unavailable` and permits a fallback.
+		// Read both feeds so an unusable one wins over a missing one. Zero quotes are already
+		// unusable here, so they never resolve to `Unavailable`.
 		let (asset_price, reference_price) =
 			match (Self::usable_price(&asset), Self::usable_price(&reference)) {
-				// Only `Unavailable` permits a fallback, so a missing asset feed beside an unusable
-				// reference feed must surface the reference error, or the fallback would be
-				// unlocked by a feed that cannot be trusted. Otherwise the asset error wins.
+				// A missing asset feed must not hide an unusable reference feed. Otherwise the
+				// asset error wins.
 				(Err(DispatchError::Unavailable), Err(reference_error)) => {
 					return Err(reference_error)
 				},
 				(asset_price, reference_price) => (asset_price?, reference_price?),
 			};
-		// Rounding up means a deposit is never undercharged by a sub-unit.
+		// Round up so a deposit is never undercharged.
 		mul_div(
 			balance.unique_saturated_into(),
 			reference_price.into_inner(),
@@ -79,7 +74,7 @@ where
 }
 
 impl<Oracle: ProvidePrice, Reference> OraclePriceConversion<Oracle, Reference> {
-	/// A feed's quote, with a zero quote reported as an unusable feed.
+	/// Returns the feed's quote, treating zero as an unusable feed.
 	fn usable_price(asset: &Oracle::AssetId) -> Result<FixedU128, DispatchError> {
 		let price = Oracle::provide_price(asset)?;
 		if price.is_zero() {

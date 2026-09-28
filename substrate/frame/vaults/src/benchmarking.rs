@@ -121,6 +121,7 @@ fn full_admin_origin<T: Config>() -> T::RuntimeOrigin {
 
 fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkError> {
 	let asset = T::BenchmarkHelper::collateral_asset_id();
+	T::BenchmarkHelper::ensure_stable_asset(stable::<T>());
 	// `create_branch` validates the oracle price, so set it first.
 	T::BenchmarkHelper::set_oracle_price(
 		asset.clone(),
@@ -526,7 +527,7 @@ mod benchmarks {
 		// collateral) leaves a Dormant husk — zero debt, row intact, collateral
 		// still held, out of the rate index — which is the state this extrinsic
 		// acts on.
-		redeem_debt_only::<T>(&asset, &caller, |snapshot| snapshot.full_payoff())?;
+		redeem_debt_only::<T>(&asset, &caller, |snapshot| snapshot.debt)?;
 
 		#[extrinsic_call]
 		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), None);

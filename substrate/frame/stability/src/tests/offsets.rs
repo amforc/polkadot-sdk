@@ -31,11 +31,11 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 		assert_eq!(collateral_balance(DOT, pool), 400);
 
 		System::assert_has_event(
-			crate::Event::PoolOffsetApplied {
+			crate::Event::OffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				epoch: 0,
-				scale: 0,
+				active: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
+				pending: None,
 			}
 			.into(),
 		);
@@ -125,8 +125,14 @@ fn combined_offset_settles_active_then_pending() {
 		mint_stable(USDX, 2, 40_000);
 		assert_ok!(deposit(2, DOT, USDX, 40_000));
 
-		assert_eq!(Stability::reducible_active(&DOT, &USDX, 60_000), 60_000);
-		assert_eq!(Stability::reducible_pending(&DOT, &USDX, 40_000, 60_000), 40_000);
+		assert_eq!(
+			Stability::reducible_active(&DOT, &USDX, branch_snapshot(&DOT, &USDX), 60_000),
+			60_000
+		);
+		assert_eq!(
+			Stability::reducible_pending(&DOT, &USDX, branch_snapshot(&DOT, &USDX), 40_000, 60_000),
+			40_000
+		);
 		// USDX has a 10_000-unit minimum. Active first preserves the shared
 		// account at 40_000; pending then performs the full expendable drain.
 		// Reversing the order would leave active unable to drain under the
@@ -135,6 +141,7 @@ fn combined_offset_settles_active_then_pending() {
 			assert_ok!(Stability::offset(
 				&DOT,
 				&USDX,
+				branch_snapshot(&DOT, &USDX),
 				OffsetLegs { active: 60_000, pending: 40_000 },
 				OffsetLegs {
 					active: issue_collateral(DOT, 240),
@@ -164,21 +171,13 @@ fn combined_offset_settles_active_then_pending() {
 					.s_collateral,
 				FixedU128::from_rational(1, 250)
 			);
+			// Both legs report in one event.
 			System::assert_has_event(
-				crate::Event::PoolOffsetApplied {
+				crate::Event::OffsetApplied {
 					collateral_id: DOT,
 					stable_id: USDX,
-					epoch: 1,
-					scale: 0,
-				}
-				.into(),
-			);
-			System::assert_has_event(
-				crate::Event::PendingDepositOffsetApplied {
-					collateral_id: DOT,
-					stable_id: USDX,
-					epoch: 1,
-					scale: 0,
+					active: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
+					pending: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
 				}
 				.into(),
 			);
@@ -196,6 +195,7 @@ fn combined_offset_rolls_back_active_when_pending_fails() {
 			hypothetically!(Stability::offset(
 				&DOT,
 				&PUSD,
+				branch_snapshot(&DOT, &PUSD),
 				OffsetLegs { active: 300, pending: 200 },
 				OffsetLegs {
 					active: issue_collateral(DOT, 240),
@@ -216,14 +216,21 @@ fn offset_refuses_stale_sizing_reads() {
 		// 950 would strand 50 below the 100 minimum: the read clamps to 900,
 		// and demanding the unclamped 950 anyway fails exactly. The probe
 		// credit is issued inside the rolled-back hypothetical.
-		assert_eq!(Stability::reducible_active(&DOT, &PUSD, 950), 900);
+		assert_eq!(
+			Stability::reducible_active(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 950),
+			900
+		);
 		// Everything is activated: the pending leg sizes to zero even behind the active
 		// reservation.
-		assert_eq!(Stability::reducible_pending(&DOT, &PUSD, 100, 900), 0);
+		assert_eq!(
+			Stability::reducible_pending(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 100, 900),
+			0
+		);
 		assert_err!(
 			hypothetically!(Stability::offset(
 				&DOT,
 				&PUSD,
+				branch_snapshot(&DOT, &PUSD),
 				OffsetLegs { active: 950, pending: 0 },
 				OffsetLegs {
 					active: issue_collateral(DOT, 400),
@@ -238,6 +245,7 @@ fn offset_refuses_stale_sizing_reads() {
 			assert_ok!(Stability::offset(
 				&DOT,
 				&PUSD,
+				branch_snapshot(&DOT, &PUSD),
 				OffsetLegs { active: 900, pending: 0 },
 				OffsetLegs {
 					active: issue_collateral(DOT, 400),
@@ -260,7 +268,10 @@ fn offset_accepts_sub_minimum_gain_after_registration_touch() {
 		assert_ok!(deposit_and_mature(1, coll.clone(), PUSD, 1_000));
 		// The sizing pass advances the matured cohort in memory, so the offset is quoted
 		// against active capital with the row untouched.
-		assert_eq!(Stability::reducible_active(&coll, &PUSD, 500), 500);
+		assert_eq!(
+			Stability::reducible_active(&coll, &PUSD, branch_snapshot(&coll, &PUSD), 500),
+			500
+		);
 
 		// Registration created the zero-balance asset account, so a 500 gain below the 1_000
 		// minimum settles normally.
