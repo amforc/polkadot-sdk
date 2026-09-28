@@ -1,10 +1,7 @@
 //! Vault operations for redemption flows, keyed by `(collateral_id, stable_id)`.
 
 use crate::{DebtCollateral, VaultStatus};
-use frame::{
-	arithmetic::{One, Saturating, Zero},
-	deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill},
-};
+use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill};
 
 /// Settlement consumed by [`VaultInterface::redeem_step`].
 ///
@@ -25,11 +22,9 @@ pub struct RedemptionSettlement<Credit, Balance> {
 pub struct RedemptionStepSnapshot<Balance> {
 	/// Lifecycle status.
 	pub status: VaultStatus,
-	/// Post-touch base debt, excluding the conditional terminal charge.
+	/// Debt, which a payment of this amount settles in full.
 	pub debt: Balance,
-	/// One-unit charge applied only when this step settles the vault in full.
-	pub terminal_interest_charge: Balance,
-	/// Collateral currently held against the vault.
+	/// Collateral held by the vault.
 	pub collateral: Balance,
 	/// Branch redistribution penalty; caps the recovery bonus.
 	pub redistribution_penalty: Permill,
@@ -42,32 +37,10 @@ impl<Balance: Copy> RedemptionStepSnapshot<Balance> {
 	}
 }
 
-impl<Balance: Copy + Ord + Zero + One + Saturating> RedemptionStepSnapshot<Balance> {
-	/// The payment that settles the vault in full: base debt plus the terminal charge.
-	pub fn full_payoff(&self) -> Balance {
-		self.debt.saturating_add(self.terminal_interest_charge)
-	}
-
-	/// Reserves one base-debt unit for the terminal charge on a partial payment.
-	pub fn partial_cap(&self, limit: Balance) -> Balance {
-		if self.terminal_interest_charge.is_zero() {
-			limit
-		} else {
-			limit.saturating_sub(Balance::one())
-		}
-	}
-
-	/// Returns the largest debt payment within `budget`.
-	///
-	/// Returns the full payoff when possible. Otherwise, returns a payment limited by
-	/// [`Self::partial_cap`].
+impl<Balance: Copy + Ord> RedemptionStepSnapshot<Balance> {
+	/// Returns the largest payment within `budget`.
 	pub fn size_within(&self, budget: Balance) -> Balance {
-		let full_payoff = self.full_payoff();
-		if budget >= full_payoff {
-			full_payoff
-		} else {
-			self.partial_cap(self.debt).min(budget)
-		}
+		self.debt.min(budget)
 	}
 }
 
@@ -100,10 +73,8 @@ pub trait VaultInterface {
 
 	/// Applies one atomic redemption to `owner`'s vault.
 	///
-	/// The payment must use the market stablecoin and must not exceed the full payoff. The
-	/// collateral payment must not exceed the vault collateral. A full payment closes the vault.
-	/// A partial payment must leave base debt when a terminal charge applies. The caller charges
-	/// the redemption fee.
+	/// The payment must be in the market stablecoin and at most the debt; the collateral at most
+	/// the vault's. A full payment clears the debt. The caller charges the redemption fee.
 	///
 	/// An error consumes `settlement.debt_payment` and writes roll back only with the caller's
 	/// transaction, so callers must propagate it and abort the dispatch.

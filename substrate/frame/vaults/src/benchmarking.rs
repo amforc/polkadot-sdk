@@ -518,7 +518,7 @@ mod benchmarks {
 		// collateral) leaves a Dormant husk — zero debt, row intact, collateral
 		// still held, out of the rate index — which is the state this extrinsic
 		// acts on.
-		redeem_debt_only::<T>(&asset, &caller, |snapshot| snapshot.full_payoff())?;
+		redeem_debt_only::<T>(&asset, &caller, |snapshot| snapshot.debt)?;
 
 		#[extrinsic_call]
 		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), None);

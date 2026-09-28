@@ -11,11 +11,9 @@ use crate::{
 use frame::{
 	deps::frame_support::transactional,
 	prelude::*,
-	traits::{
-		fungibles::{
-			Balanced as FungiblesBalanced, BalancedHold as FungiblesBalancedHold,
-			MutateHold as FungiblesMutateHold,
-		},
+	traits::fungibles::{
+		Balanced as FungiblesBalanced, BalancedHold as FungiblesBalancedHold,
+		MutateHold as FungiblesMutateHold,
 	},
 };
 use pusd_primitives::{
@@ -62,7 +60,7 @@ impl<T: Config> Pallet<T> {
 			DispatchError,
 		>,
 	) -> DispatchResult {
-		let mut op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), owner)?;
+		let op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), owner)?;
 		let liquidation = op.prepare_liquidation()?;
 		let post_touch_debt = liquidation.debt;
 		let held = op.vault().collateral;

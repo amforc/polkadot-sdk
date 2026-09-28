@@ -119,20 +119,13 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 			projected = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
 				.expect("snapshot")
 		);
-		// The projection includes the year of pending interest the row lacks.
-		assert_eq!(projected.debt, vault_before.debt.total() + 250);
-		assert_eq!(projected.terminal_interest_charge, 1);
+		// The projection includes the year of pending interest the row lacks, rounded up for the
+		// extra millisecond.
+		assert_eq!(projected.debt, vault_before.debt.total() + 251);
 
 		// A settlement filling the whole projected position is exact, proving
 		// execution touched to the same values the projection reported.
-		assert_ok!(redeem_step(
-			DOT,
-			PUSD,
-			1,
-			3,
-			projected.debt + projected.terminal_interest_charge,
-			projected.collateral,
-		));
+		assert_ok!(redeem_step(DOT, PUSD, 1, 3, projected.debt, projected.collateral,));
 		// The settlement drained the position completely, so the vault closed.
 		assert!(!vault_exists(DOT, PUSD, 1));
 		assert_eq!(held(DOT, 1), held_before - projected.collateral);
@@ -140,7 +133,7 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 }
 
 #[test]
-fn terminal_charge_is_rejected_on_a_base_debt_only_full_step() {
+fn a_step_for_the_projected_debt_clears_it() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
@@ -148,16 +141,14 @@ fn terminal_charge_is_rejected_on_a_base_debt_only_full_step() {
 		advance_time(1);
 		let snapshot =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
-		assert_eq!(snapshot.terminal_interest_charge, 1);
 		assert_noop!(
-			redeem_step(DOT, PUSD, 1, 3, snapshot.debt, 0),
+			redeem_step(DOT, PUSD, 1, 3, snapshot.debt + 1, 0),
 			crate::Error::<Test>::InvalidRedemptionSettlement
 		);
-		assert_ok!(redeem_step(DOT, PUSD, 1, 3, snapshot.debt - 1, 0));
-		let remaining = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
-			.expect("remaining snapshot");
-		assert_eq!(remaining.debt, 1);
-		assert_eq!(remaining.terminal_interest_charge, 1);
+		assert_ok!(redeem_step(DOT, PUSD, 1, 3, snapshot.debt, 0));
+		let vault = vault(DOT, PUSD, 1);
+		assert_eq!(vault.debt.total(), 0);
+		assert_eq!(vault.interest_prepaid, 0);
 	});
 }
 
@@ -354,8 +345,8 @@ fn dormant_vault_with_residual_accrues_interest() {
 		advance_time(365 * ONE_DAY_MS); // ~1 year (365 days)
 		assert_ok!(poke(2, DOT, PUSD, 1));
 		let v_post = vault(DOT, PUSD, 1);
-		// The Dormant residual keeps accruing: floor(155 * 0.5 * 365days / year) = 77.
-		assert_eq!(v_post.debt.interest, 77);
+		// The Dormant residual keeps accruing: ceil(155 * 0.5 * 365days / year) = 78.
+		assert_eq!(v_post.debt.interest, 78);
 	});
 }
 
@@ -421,7 +412,7 @@ fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 		let husk_after = vault(DOT, PUSD, 1);
 		assert_eq!(husk_after.debt.principal, 97);
 		assert_eq!(husk_after.collateral, 950 + 97);
-		// Snapshot correction does not let new collateral increase this allocation weight.
+		// Snapshot correction does not let new collateral increase this allocation share.
 		assert_eq!(husk_after.redistribution_stake, 949);
 		// Redistribution does not put a Dormant vault in the redemption slot.
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
