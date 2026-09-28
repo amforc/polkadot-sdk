@@ -10,18 +10,14 @@ use frame::deps::sp_runtime::{
 	FixedPointNumber, FixedPointOperand, FixedU128, Permill,
 };
 
-/// Calculates the stablecoin value of `collateral` at `price` and rounds the result up.
+/// Returns the stablecoin value of collateral, `ceil(collateral * price)`, or `None` on
+/// overflow.
 ///
-/// The result is `ceil(collateral * price)`. Below-par settlement sizes the shortfall the
-/// Insurance Fund covers from this value, so the fund never covers more than the collateral is
-/// actually short and the redeemer never pays less than the collateral is worth.
-///
-/// Returns `None` if the result does not fit in `Balance`.
+/// Below-par settlement sizes the Insurance Fund cover from this value; rounding up means the
+/// fund never over-covers and the redeemer never underpays.
 pub use crate::math::mul_rate_ceil as collateral_value_ceil;
 
-/// Calculates the bonus for a recovery vault with `CR >= 100%`.
-///
-/// The function uses this formula:
+/// Returns the bonus for a recovery vault with `CR >= 100%`:
 /// `min(max(0, cr - 100% - buffer), redistribution_penalty)`.
 ///
 /// Since `bonus <= cr - 100%`, paying it never lowers the vault's CR.
@@ -64,15 +60,8 @@ pub struct InsuranceAdjusted<Balance> {
 /// - `effective_cover = min(insurance_available, debt - collateral_value)`
 /// - `market_cancel_debt = debt - effective_cover`
 ///
-/// - `effective_cover = min(insurance_available, debt - collateral_value)`.
-/// - `market_cancel_debt = debt - effective_cover`.
-///
-/// The Insurance Fund backs `effective_cover`. `market_cancel_debt` is at least
-/// `collateral_value`, so the market settles at a recovery rate of
-/// `collateral_value / market_cancel_debt <= 1`.
-///
-/// Returns `None` if `collateral_value > debt`. Such a vault is above par and outside this
-/// function's regime.
+/// `collateral_value` is in stablecoin units. Since `market_cancel_debt >= collateral_value`, the
+/// market's recovery rate is at most 1. Returns `None` if `collateral_value > debt` (above par).
 pub fn insurance_adjusted<Balance: Copy + Ord + Saturating>(
 	debt: Balance,
 	collateral_value: Balance,
@@ -88,16 +77,12 @@ pub fn insurance_adjusted<Balance: Copy + Ord + Saturating>(
 	Some(InsuranceAdjusted { market_cancel_debt, effective_cover })
 }
 
-/// Calculates the collateral payout for a recovery settlement with `CR < 100%`.
-///
-/// `debt_cancelled` buys its pro-rata share of the vault `collateral`:
+/// Returns the collateral paid for `debt_cancelled` at `CR < 100%`, its pro-rata share:
 /// `floor(debt_cancelled * collateral / market_cancel_debt)`.
 ///
-/// The share is sized in collateral units rather than priced through the recovery rate, so
-/// cancelling all of `market_cancel_debt` pays the whole collateral exactly and no rounding
-/// dust stays on the vault. `debt_cancelled` must not exceed `market_cancel_debt`.
-///
-/// Returns `None` if `market_cancel_debt` is zero while `debt_cancelled` is not.
+/// Sizing in collateral units rather than through the recovery rate means cancelling all of
+/// `market_cancel_debt` pays out exactly all `collateral`, leaving no dust. Requires
+/// `debt_cancelled <= market_cancel_debt`.
 pub fn recovery_collateral_out<Balance: FixedPointOperand>(
 	debt_cancelled: Balance,
 	collateral: Balance,
