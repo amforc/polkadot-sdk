@@ -65,15 +65,24 @@ fn offsets_size_against_matured_capital_without_a_touch() {
 		// millisecond short. The read-only sizing simulates the advancement and still finds
 		// nothing, and an ordinary offset returns the credit whole.
 		advance_time(8_999);
-		assert_storage_noop!(assert_eq!(Stability::reducible_active(&DOT, &PUSD, 400), 0));
+		assert_storage_noop!(assert_eq!(
+			Stability::reducible_active(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 400),
+			0
+		));
 		assert_storage_noop!(assert_eq!(simulate_offset(DOT, PUSD, 100, 80), (0, 80)));
 
 		// Exactly at t = 10_000 the same call sees the 400 as active, with the row and the pool
 		// untouched.
 		advance_time(1);
 		assert_storage_noop!({
-			assert_eq!(Stability::reducible_active(&DOT, &PUSD, 400), 400);
-			assert_eq!(Stability::reducible_pending(&DOT, &PUSD, 400, 400), 0);
+			assert_eq!(
+				Stability::reducible_active(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 400),
+				400
+			);
+			assert_eq!(
+				Stability::reducible_pending(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 400, 400),
+				0
+			);
 		});
 
 		// The transactional offset commits the same advancement and settles against it:

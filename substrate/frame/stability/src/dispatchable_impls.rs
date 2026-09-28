@@ -31,7 +31,7 @@ use frame::{
 	},
 };
 use pusd_primitives::{
-	debit_preservation, reducible_debit, BranchInterface, BranchMode, Millis,
+	debit_preservation, refine_debit, BranchInterface, BranchMode, BranchSnapshot, Millis,
 	RecoveryOffsetInterface, RecoveryOffsetResult,
 };
 
@@ -40,6 +40,43 @@ use pusd_primitives::{
 pub(crate) enum ClaimKind {
 	Collateral,
 	Yield,
+}
+
+/// The pool account's stablecoin custody, read once for every debit an operation sizes.
+///
+/// Both reducible balances are read up front: they touch the same storage keys, so the second
+/// read costs no extra storage access. It is valid while nothing moves the account's stablecoin,
+/// so an operation reads it after its last change to the account and before its first debit.
+pub(crate) struct PoolCustody<T: Config> {
+	account: T::AccountId,
+	preserved: BalanceOf<T>,
+	expendable: BalanceOf<T>,
+}
+
+impl<T: Config> PoolCustody<T> {
+	pub(crate) fn read(stable_id: &StableIdOf<T>, account: T::AccountId) -> Self {
+		let reducible = |preservation| {
+			T::StableAssets::reducible_balance(
+				stable_id.clone(),
+				&account,
+				preservation,
+				Fortitude::Polite,
+			)
+		};
+		let preserved = reducible(Preservation::Preserve);
+		let expendable = reducible(Preservation::Expendable);
+		Self { account, preserved, expendable }
+	}
+
+	pub(crate) const fn account(&self) -> &T::AccountId {
+		&self.account
+	}
+
+	/// The greatest debit at or below `limit` and its `Preservation`, as
+	/// [`pusd_primitives::reducible_debit`] would size it.
+	fn debit(&self, limit: BalanceOf<T>) -> (BalanceOf<T>, Preservation) {
+		refine_debit(limit, self.preserved, || self.expendable)
+	}
 }
 
 /// Pool and depositor row of one operation, held in memory until commit.
@@ -87,10 +124,10 @@ impl<'a, T: Config> DepositOp<'a, T> {
 		Ok(Self { collateral_id, stable_id, owner, pool, deposit })
 	}
 
-	/// Settles the row at `now`. Due cohorts activate first so the settlement uses the current
-	/// risk classification.
-	fn refresh(&mut self, now: Millis) -> DispatchResult {
-		Pallet::<T>::advance_cohorts(self.collateral_id, self.stable_id, &mut self.pool, now)?;
+	/// Settles the row at `branch.now`. Due cohorts activate first so the settlement uses the
+	/// current risk classification.
+	fn refresh(&mut self, branch: BranchSnapshot) -> DispatchResult {
+		Pallet::<T>::advance_cohorts(self.collateral_id, self.stable_id, &mut self.pool, branch)?;
 		Pallet::<T>::realize_deposit(
 			self.collateral_id,
 			self.stable_id,
@@ -315,12 +352,13 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		pool: &mut StabilityPoolOf<T>,
-		now: Millis,
+		branch: BranchSnapshot,
 	) -> Result<bool, DispatchError> {
-		if Self::ensure_not_frozen(collateral_id, stable_id).is_err() {
-			return Ok(false);
+		match branch.mode {
+			BranchMode::Normal | BranchMode::Safety => {},
+			BranchMode::Frozen => return Ok(false),
 		}
-		let rolls = Self::roll_due_cohorts(pool, now)?;
+		let rolls = Self::roll_due_cohorts(pool, branch.now)?;
 		if rolls.is_empty() {
 			return Ok(false);
 		}
@@ -369,12 +407,12 @@ impl<T: Config> Pallet<T> {
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
 		let pool = Self::load_pool(&collateral_id, &stable_id)?;
-		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
+		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		ensure!(amount >= pool.config.minimum_deposit, Error::<T>::DepositTooSmall);
 
 		let now = T::TimeProvider::now();
 		let mut op = DepositOp::<T>::load_or_fresh(&collateral_id, &stable_id, &who, pool)?;
-		op.refresh(now)?;
+		op.refresh(BranchSnapshot { mode, now })?;
 
 		// One withdrawal funds both halves: the recovery settlement takes its slice from the
 		// credit, and the change becomes the pending deposit. `Expendable` only on a full drain,
@@ -457,21 +495,17 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		// Settling recovery debt reduces risk, so Safety Mode allows it. Only a freeze stops it.
-		Self::ensure_not_frozen(&collateral_id, &stable_id)?;
+		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		// Matured capital must stand in the active total before the offset is sized against it.
-		Self::advance_cohorts(&collateral_id, &stable_id, &mut pool, T::TimeProvider::now())?;
+		let branch = BranchSnapshot { mode, now: T::TimeProvider::now() };
+		Self::advance_cohorts(&collateral_id, &stable_id, &mut pool, branch)?;
 
 		// Size the burn before touching anything.
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		let (funded, preservation) = Self::fund_offset(
-			&pool,
-			&stable_id,
-			&pool_account,
-			Leg::Active,
-			max_stable_in,
-			BalanceOf::<T>::zero(),
-		)
-		.ok_or(Error::<T>::NoRecoveryOffsetPerformed)?;
+		let custody = PoolCustody::<T>::read(&stable_id, pool_account.clone());
+		let (funded, preservation) =
+			Self::fund_offset(&pool, &custody, Leg::Active, max_stable_in, BalanceOf::<T>::zero())
+				.ok_or(Error::<T>::NoRecoveryOffsetPerformed)?;
 
 		let payment = T::StableAssets::withdraw(
 			stable_id.clone(),
@@ -544,7 +578,7 @@ impl<T: Config> Pallet<T> {
 		let mut op = DepositOp::<T>::load(&collateral_id, &stable_id, &who, pool)?;
 
 		let now = T::TimeProvider::now();
-		op.refresh(now)?;
+		op.refresh(BranchSnapshot { mode, now })?;
 
 		let executable_at = now.saturating_add(op.pool.config.safety_withdrawal_delay);
 		op.deposit.withdrawal_request = Some(WithdrawalRequest { amount, executable_at });
@@ -572,10 +606,10 @@ impl<T: Config> Pallet<T> {
 		let mut op = DepositOp::<T>::load(&collateral_id, &stable_id, &who, pool)?;
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 
-		let now = T::TimeProvider::now();
-		op.refresh(now)?;
-
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
+		let now = T::TimeProvider::now();
+		op.refresh(BranchSnapshot { mode, now })?;
+
 		let take = Self::resolve_withdrawal(mode, now, amount, &mut op.deposit)?;
 		ensure!(!take.is_zero(), Error::<T>::NoActiveDeposit);
 
@@ -674,14 +708,12 @@ impl<T: Config> Pallet<T> {
 	/// precision parameters.
 	pub(crate) fn size_offset(
 		pool: &StabilityPoolOf<T>,
-		stable_id: &StableIdOf<T>,
-		pool_account: &T::AccountId,
+		custody: &PoolCustody<T>,
 		leg: Leg,
 		max_debt: BalanceOf<T>,
 		reserved: BalanceOf<T>,
 	) -> Option<(BalanceOf<T>, Preservation)> {
-		let (debt, preservation) =
-			Self::fund_offset(pool, stable_id, pool_account, leg, max_debt, reserved)?;
+		let (debt, preservation) = Self::fund_offset(pool, custody, leg, max_debt, reserved)?;
 		let state = &pool.state;
 		math::update_p_after_offset(
 			state.coords(leg).p,
@@ -692,7 +724,7 @@ impl<T: Config> Pallet<T> {
 		Some((debt, preservation))
 	}
 
-	/// Returns the nonzero debt that `leg` can fund from `pool_account` and the required
+	/// Returns the nonzero debt that `leg` can fund from the pool's `custody` and the required
 	/// `Preservation` rule.
 	///
 	/// Three limits apply:
@@ -706,8 +738,7 @@ impl<T: Config> Pallet<T> {
 	/// both reservations valid against one custody balance.
 	fn fund_offset(
 		pool: &StabilityPoolOf<T>,
-		stable_id: &StableIdOf<T>,
-		pool_account: &T::AccountId,
+		custody: &PoolCustody<T>,
 		leg: Leg,
 		max_debt: BalanceOf<T>,
 		reserved: BalanceOf<T>,
@@ -720,11 +751,7 @@ impl<T: Config> Pallet<T> {
 		if accounting_cap.is_zero() {
 			return None;
 		}
-		let (headroom, preservation) = reducible_debit::<T::StableAssets, _>(
-			stable_id.clone(),
-			pool_account,
-			accounting_cap.saturating_add(reserved),
-		);
+		let (headroom, preservation) = custody.debit(accounting_cap.saturating_add(reserved));
 		let debt = headroom.saturating_sub(reserved).min(accounting_cap);
 		if debt.is_zero() {
 			return None;
@@ -788,19 +815,24 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Settles one exact debt and collateral reservation on `leg`.
+	/// Records one exact debt and collateral reservation on `leg` without moving value.
 	///
-	/// The function burns the stablecoin and allocates all supplied collateral through `S`. A
-	/// reservation mismatch aborts the complete transaction.
-	pub(crate) fn settle_offset(
+	/// A leg with no reservation carries no collateral, which [`Self::offset`] already checked, so
+	/// its credit is dropped. Otherwise the reservation and its credit come back for the caller to
+	/// settle, since both legs move as one. The caller reports both legs in one event.
+	pub(crate) fn record_offset(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-		pool_account: &T::AccountId,
 		leg: Leg,
 		pool: &mut StabilityPoolOf<T>,
-		reservation: OffsetReservation<BalanceOf<T>>,
+		reservation: Option<OffsetReservation<BalanceOf<T>>>,
 		collateral: CollateralCreditOf<T>,
-	) -> DispatchResult {
+	) -> Result<Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>, DispatchError> {
+		let Some(reservation) = reservation else {
+			debug_assert!(collateral.peek().is_zero());
+			drop(collateral);
+			return Ok(None);
+		};
 		ensure!(collateral.asset() == *collateral_id, Error::<T>::OffsetSettlementFailed);
 		// The accounting reads no custody balance, so it can precede the value movement. The
 		// caller's transaction rolls it back when the movement fails.
@@ -812,34 +844,50 @@ impl<T: Config> Pallet<T> {
 			reservation.debt,
 			collateral.peek(),
 		)?;
-		Self::settle_reservation_exact(stable_id, pool_account, reservation, collateral)?;
-		let coords = pool.state.coords(leg);
-		Self::deposit_event(match leg {
-			Leg::Active => Event::PoolOffsetApplied {
-				collateral_id: collateral_id.clone(),
-				stable_id: stable_id.clone(),
-				epoch: coords.epoch,
-				scale: coords.scale,
-			},
-			Leg::Pending => Event::PendingDepositOffsetApplied {
-				collateral_id: collateral_id.clone(),
-				stable_id: stable_id.clone(),
-				epoch: coords.epoch,
-				scale: coords.scale,
-			},
-		});
-		Ok(())
+		Ok(Some((reservation, collateral)))
 	}
 
-	/// Burns the reserved stablecoin and resolves all collateral into pool custody.
+	/// Folds the recorded legs into the one movement that settles both.
 	///
-	/// Exact movement keeps debt cancellation equal to the quoted amount.
-	fn settle_reservation_exact(
+	/// The pending leg was sized with the active debt reserved ahead of it, so its `Preservation`
+	/// is the rule for the summed withdrawal. An offset with no leg never reaches here: the
+	/// caller returns before reserving anything.
+	pub(crate) fn merge_offset_movement(
+		active: Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>,
+		pending: Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>,
+	) -> Result<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>), DispatchError> {
+		match (active, pending) {
+			(Some(active), None) => Ok(active),
+			(None, Some(pending)) => Ok(pending),
+			(Some((active, mut active_collateral)), Some((pending, pending_collateral))) => {
+				let debt =
+					active.debt.checked_add(&pending.debt).ok_or(ArithmeticError::Overflow)?;
+				// Both credits passed the asset check in `record_offset`, so the merge cannot
+				// fail; a refusal still aborts rather than losing a credit.
+				active_collateral.subsume(pending_collateral).map_err(|pending_collateral| {
+					drop(pending_collateral);
+					DispatchError::Corruption
+				})?;
+				let reservation = OffsetReservation { debt, preservation: pending.preservation };
+				Ok((reservation, active_collateral))
+			},
+			(None, None) => {
+				defensive!("an offset with no leg reached settlement");
+				Err(DispatchError::Corruption)
+			},
+		}
+	}
+
+	/// Withdraws the reserved stablecoin and resolves all collateral into pool custody.
+	///
+	/// Exact movement keeps debt cancellation equal to the quoted amount. The withdrawn credit
+	/// comes back for the caller to burn.
+	pub(crate) fn settle_reservation_exact(
 		stable_id: &StableIdOf<T>,
 		pool_account: &T::AccountId,
 		reservation: OffsetReservation<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
-	) -> DispatchResult {
+	) -> Result<StableCreditOf<T>, DispatchError> {
 		let stable_credit = T::StableAssets::withdraw(
 			stable_id.clone(),
 			pool_account,
@@ -857,9 +905,7 @@ impl<T: Config> Pallet<T> {
 			T::CollateralAssets::resolve(pool_account, collateral)
 				.map_err(|_| Error::<T>::OffsetSettlementFailed)?;
 		}
-		// Dropping the withdrawn credit is what cancels the debt.
-		drop(stable_credit);
-		Ok(())
+		Ok(stable_credit)
 	}
 
 	/// Records an offset of `debt` on `leg` that pays `collateral` to its depositors, and creates
@@ -946,24 +992,24 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn do_distribute_yield(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		branch: BranchSnapshot,
 		mut pool: StabilityPoolOf<T>,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
 		if credit.peek().is_zero() {
 			return credit;
 		}
-		// A frozen market, or one whose mode cannot be read, takes no yield.
-		match T::BranchInterface::branch_mode(collateral_id, stable_id) {
-			Ok(BranchMode::Normal) | Ok(BranchMode::Safety) => {},
-			Ok(BranchMode::Frozen) | Err(_) => return credit,
+		// A frozen market takes no yield.
+		match branch.mode {
+			BranchMode::Normal | BranchMode::Safety => {},
+			BranchMode::Frozen => return credit,
 		}
 
 		// Matured capital enters the denominator before the new yield is shared out, so a
 		// deposit earns everything distributed after its deadline and nothing before it.
 		// Advancement is a complete transition of its own: it persists even when the
 		// distribution behind it bails out.
-		let Ok(advanced) =
-			Self::advance_cohorts(collateral_id, stable_id, &mut pool, T::TimeProvider::now())
+		let Ok(advanced) = Self::advance_cohorts(collateral_id, stable_id, &mut pool, branch)
 		else {
 			return credit;
 		};
@@ -1102,15 +1148,13 @@ impl<T: Config> Pallet<T> {
 		frozen: FrozenCheck,
 	) -> Result<DepositOp<'a, T>, DispatchError> {
 		let pool = Self::load_pool(collateral_id, stable_id)?;
-		match frozen {
-			FrozenCheck::Reject => {
-				Self::ensure_not_frozen(collateral_id, stable_id)?;
-			},
-			FrozenCheck::Skip => {},
-		}
+		let mode = match frozen {
+			FrozenCheck::Reject => Self::ensure_not_frozen(collateral_id, stable_id)?,
+			FrozenCheck::Skip => Self::branch_mode_or_frozen(collateral_id, stable_id),
+		};
 		let mut op = DepositOp::<T>::load(collateral_id, stable_id, owner, pool)?;
 
-		op.refresh(T::TimeProvider::now())?;
+		op.refresh(BranchSnapshot { mode, now: T::TimeProvider::now() })?;
 		Ok(op)
 	}
 
@@ -1173,6 +1217,17 @@ impl<T: Config> Pallet<T> {
 			},
 			BranchMode::Frozen => Err(Error::<T>::BranchFrozen.into()),
 		}
+	}
+
+	/// Returns the current mode, counting a market whose mode cannot be read as frozen.
+	///
+	/// Paths that must not fail on an unavailable mode use this: unknown risk stops activation and
+	/// offsets, as a freeze does.
+	pub(crate) fn branch_mode_or_frozen(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> BranchMode {
+		T::BranchInterface::branch_mode(collateral_id, stable_id).unwrap_or(BranchMode::Frozen)
 	}
 
 	/// Returns the current mode or rejects a frozen market.
