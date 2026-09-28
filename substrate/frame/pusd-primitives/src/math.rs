@@ -1,6 +1,5 @@
-//! Checked arithmetic shared by pUSD accounting and price conversions.
-//!
-//! Callers choose rounding and handle failure according to their settlement policy.
+//! Checked arithmetic for pUSD accounting and price conversions. Callers pick the rounding
+//! and handle failure.
 
 use crate::{CollateralRatio, DebtCollateral};
 use frame::arithmetic::{
@@ -8,11 +7,10 @@ use frame::arithmetic::{
 	FixedPointOperand, FixedU128, Rounding, Zero,
 };
 
-/// Returns `value * numerator / denominator`, rounded as specified and checked against `Output`.
+/// Returns `value * numerator / denominator` with `rounding`, converted to `Output`.
 ///
-/// The product uses the SDK's wide arithmetic, so it may exceed `u128` if the quotient fits.
-/// Returns `None` for a zero denominator, quotient overflow, or an out-of-range output.
-/// Raw operands allow fixed-point factors wider than the caller's balance type.
+/// The intermediate product may exceed `u128`, and raw operands let fixed-point factors exceed
+/// the caller's balance type. Returns `None` for a zero denominator or an out-of-range result.
 pub fn mul_div<Output: TryFrom<u128>>(
 	value: u128,
 	numerator: u128,
@@ -31,10 +29,9 @@ pub fn mul_rate_ceil<Balance: FixedPointOperand>(
 	mul_div(value.unique_saturated_into(), rate.into_inner(), FixedU128::DIV, Rounding::Up)
 }
 
-/// The collateralization ratio of `position` at `price`.
+/// Returns the collateralization ratio of `position` at `price`.
 ///
-/// `DebtFree` when `debt == 0`; `Overflow` when the value or the ratio does
-/// not fit.
+/// `DebtFree` for zero debt; `Overflow` if the value or the ratio does not fit.
 pub fn collateralization_ratio<Balance: FixedPointOperand>(
 	position: &DebtCollateral<Balance>,
 	price: FixedU128,
@@ -62,9 +59,9 @@ pub fn mul_div_floor<Balance: FixedPointOperand>(
 	)
 }
 
-/// Returns `floor(value * rate / denominator)` as a `FixedU128` per-unit delta.
+/// Returns `floor(value * rate / denominator)` as a [`FixedU128`] per-unit delta.
 ///
-/// Returns `Some(0)` for a zero value or rate. Returns `None` for a zero denominator or overflow.
+/// `Some(0)` for a zero `value` or `rate`; `None` for a zero denominator or overflow.
 pub fn mul_div_rate_floor<Balance: FixedPointOperand>(
 	value: Balance,
 	rate: FixedU128,

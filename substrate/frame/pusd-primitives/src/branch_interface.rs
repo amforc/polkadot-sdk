@@ -1,4 +1,4 @@
-//! Branch operating mode and the branch-level interface of the vault engine.
+//! Branch operating mode and branch-level vault engine operations.
 
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use frame::deps::sp_runtime::{DispatchError, DispatchResult};
@@ -14,17 +14,14 @@ pub enum BranchMode {
 
 /// Branch-level operations of the vault engine, implemented by the vault pallet.
 pub trait BranchInterface<CollateralId, StableId> {
-	/// Returns the market's operating mode.
-	///
-	/// Reports `Frozen` when no usable oracle price exists, and `Err` when the
-	/// market is not registered.
+	/// Returns the market's mode: `Frozen` without a usable oracle price, `Err` if unregistered.
 	fn branch_mode(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
 	) -> Result<BranchMode, DispatchError>;
 
-	/// Issues the market's pending aggregate interest through its yield route.
+	/// Issues the market's pending interest through its yield route.
 	///
-	/// Fails when the market is not registered. A frozen market issues nothing.
+	/// Fails if the market is unregistered. A frozen market issues nothing.
 	fn accrue_interest(collateral_id: &CollateralId, stable_id: &StableId) -> DispatchResult;
 }

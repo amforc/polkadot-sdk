@@ -1,9 +1,7 @@
 //! # pUSD Primitives
 //!
-//! Shared types and traits for the pUSD protocol pallets (vaults, redemptions,
-//! stability pool, ...). Carries no pallet-specific assumptions:
-//! every type is parameterised over the consumer's `AccountId`, `AssetId`,
-//! `Balance`, and credit/debt imbalance shapes.
+//! Types and traits shared by the pUSD pallets (vaults, redemptions, stability pool).
+//! Everything is generic over the runtime's `AccountId`, `AssetId`, `Balance` and imbalances.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -43,65 +41,57 @@ pub use yield_routing::OnBranchYield;
 /// TODO: Check if this is the best way to handle the "time"
 pub type Millis = u64;
 
+/// Milliseconds in a Julian year (365.25 days).
 pub const MILLIS_PER_YEAR: Millis = 31_557_600_000;
 
-/// Lifecycle status of a vault. The single classification shared by the vault
-/// pallet's storage/events and the redemption surface: queue membership
-/// derives it, target selection returns it, and step pricing keys off it
-/// (`Active` and `Dormant` redeem at face value, `FinalRecovery` at
-/// recovery-settlement pricing).
+/// Vault lifecycle status, shared by the vaults and redemptions pallets.
+///
+/// Redemption pricing keys off it: `Active` and `Dormant` redeem at face value,
+/// `FinalRecovery` at recovery-settlement pricing.
 #[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VaultStatus {
-	/// Debt-bearing vault with `Debt >= MinimumDebt`. In the rate index.
+	/// Debt at or above `MinimumDebt`; in the rate index.
 	Active,
-	/// Below `MinimumDebt` (possibly zero) after redemption. Out of the rate
-	/// index, may be revived to `Active`.
+	/// Debt below `MinimumDebt` (possibly zero) after redemption; out of the rate index.
+	/// May be revived to `Active`.
 	Dormant,
-	/// Below-MCR last-eligible vault parked in the FIFO and resolved by
-	/// recovery redemptions / offsets.
+	/// Below-MCR last eligible vault, queued in the FIFO for recovery redemptions and offsets.
 	FinalRecovery,
 }
 
 impl VaultStatus {
-	/// Debt-bearing vault, present in the rate index.
+	/// Returns `true` for [`Self::Active`].
 	pub fn is_active(&self) -> bool {
 		matches!(self, Self::Active)
 	}
 
-	/// Drained below `minimum_debt`, out of the rate index.
+	/// Returns `true` for [`Self::Dormant`].
 	pub fn is_dormant(&self) -> bool {
 		matches!(self, Self::Dormant)
 	}
 
-	/// Parked in the FIFO awaiting recovery settlement.
+	/// Returns `true` for [`Self::FinalRecovery`].
 	pub fn is_final_recovery(&self) -> bool {
 		matches!(self, Self::FinalRecovery)
 	}
 }
 
-/// Debt and its associated collateral.
-///
-/// The pair is used both for live positions and for amounts assigned by a
-/// settlement path.
+/// A debt amount and its collateral, for live positions or settlement amounts.
 #[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DebtCollateral<Balance> {
-	/// Debt side of the pair.
 	pub debt: Balance,
-	/// Collateral side of the pair.
 	pub collateral: Balance,
 }
 
 /// A position's collateralization ratio.
 ///
-/// A debt-free position has no ratio to compute, yet it is safer than any
-/// position that does: the variant order makes `DebtFree` compare greater
-/// than every `Ratio`, and the [`FixedU128`] comparisons below let a threshold
-/// gate read `cr >= threshold` without special-casing it.
+/// `DebtFree` orders above every `Ratio` and compares greater than any [`FixedU128`], so a
+/// threshold check reads `cr >= threshold` without a special case.
 #[derive(Encode, TypeInfo, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum CollateralRatio {
-	/// `floor(price * collateral / debt)` for a debt-bearing position.
+	/// `floor(price * collateral / debt)`.
 	Ratio(FixedU128),
-	/// The position carries no debt.
+	/// No debt.
 	DebtFree,
 }
 
@@ -123,14 +113,10 @@ impl PartialOrd<FixedU128> for CollateralRatio {
 	}
 }
 
-/// Returns a pallet sub-account for one `(collateral, stable)` market.
+/// Returns the pallet sub-account for a `(collateral, stable)` market.
 ///
-/// The function hashes the complete encoded asset pair with Blake2-256. Thus, long asset
-/// identifiers do not lose bytes before the function calculates the digest.
-///
-/// The digest has a fixed-size byte encoding. [`AccountIdConversion::into_sub_account_truncating`]
-/// truncates the encoded sub-account value only to fit `AccountId`. Different `PalletId` values
-/// keep the sub-accounts of sibling pallets separate.
+/// The seed is the Blake2-256 hash of the encoded pair, so long asset IDs are never truncated;
+/// distinct `PalletId`s keep sibling pallets' sub-accounts apart.
 pub fn market_sub_account<AccountId, CollateralId, StableId>(
 	pallet_id: PalletId,
 	collateral_id: &CollateralId,
