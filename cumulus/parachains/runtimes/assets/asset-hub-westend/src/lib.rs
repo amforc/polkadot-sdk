@@ -2185,6 +2185,7 @@ mod benches {
 		[pallet_staking_async, Staking]
 		[pallet_staking_async_rc_client, StakingRcClientBench::<Runtime>]
 		[pallet_uniques, Uniques]
+		[pallet_vaults, Vaults]
 		[pallet_utility, Utility]
 		[pallet_meta_tx, MetaTx]
 		[pallet_verify_signature, VerifySignature]
