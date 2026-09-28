@@ -131,28 +131,22 @@ impl<T: Config> Pallet<T> {
 		// and the redeemer never pays less than the collateral is worth. It stays within the
 		// below-par split: the regime check floors, so `floor(C) < debt` and `ceil(C) <= debt`.
 		let collateral_value = recovery_pricing::collateral_value_ceil(snapshot.collateral, price)?;
-		let full_payoff = snapshot.full_payoff();
-		let full_shortfall = full_payoff.saturating_sub(collateral_value);
-		let full_cover = Self::insurance_fund_cover(stable_id, full_shortfall);
-		let full_split =
-			recovery_pricing::insurance_adjusted(full_payoff, collateral_value, full_cover)?;
-		if budget >= full_split.market_cancel_debt {
+		let shortfall = snapshot.debt.saturating_sub(collateral_value);
+		let cover = Self::insurance_fund_cover(stable_id, shortfall);
+		let split = recovery_pricing::insurance_adjusted(snapshot.debt, collateral_value, cover)?;
+		if budget >= split.market_cancel_debt {
 			// The market debt buys the whole collateral by definition and the cover cancels the
 			// rest, so the settlement leaves neither debt nor collateral behind.
 			return Some(RecoveryPlan::BelowPar {
-				debt: full_split.market_cancel_debt,
+				debt: split.market_cancel_debt,
 				collateral: snapshot.collateral,
-				insurance_cover: full_split.effective_cover,
+				insurance_cover: split.effective_cover,
 			});
 		}
 
-		// A partial settlement excludes the terminal charge and Insurance Fund cover, so it splits
-		// the base debt: the same split as above when there is no terminal charge.
-		let base_shortfall = snapshot.debt.saturating_sub(collateral_value);
-		let base_cover = Self::insurance_fund_cover(stable_id, base_shortfall);
-		let split =
-			recovery_pricing::insurance_adjusted(snapshot.debt, collateral_value, base_cover)?;
-		let debt = snapshot.partial_cap(split.market_cancel_debt).min(budget);
+		// A partial settlement draws no Insurance Fund cover but prices collateral on the same
+		// split.
+		let debt = budget;
 		let collateral = recovery_pricing::recovery_collateral_out(
 			debt,
 			snapshot.collateral,

@@ -435,8 +435,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Calculates the debt that `stable_budget` buys on this redemption's curve, including the fee.
 	///
-	/// Only the budget limits the walk. The aggregate debt in the curve can exclude a terminal
-	/// charge that a full payoff cancels.
+	/// Only the budget limits the walk.
 	fn ordinary_debt_budget(fee_inputs: &FeeInputs, stable_budget: BalanceOf<T>) -> BalanceOf<T> {
 		fees::max_debt_for_budget(stable_budget, |debt| fee_inputs.curve.fee(debt))
 	}

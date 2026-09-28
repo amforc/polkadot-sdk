@@ -260,6 +260,9 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
+
+	// The genesis config already creates every stable asset.
+	fn ensure_stable_asset(_: StableId) {}
 }
 
 /// Account the redemption `FeeHandler` resolves the pUSD fee into, so tests can
