@@ -4,16 +4,17 @@
 //! `build_and_execute` and end-to-end by the runtime's pre-upgrade hook.
 
 use crate::{
+	math,
 	pallet::{
 		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings, HoldReason,
 		Millis, Pallet, StableIdOf, StablecoinDebt, StablecoinMarkets, Vaults,
 	},
-	types::{InterestWeight, PendingInterest, VaultListId},
+	types::VaultListId,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 use frame::{
-	arithmetic::{CheckedAdd, FixedPointNumber, FixedU128, Zero},
-	deps::sp_runtime::TryRuntimeError,
+	arithmetic::{CheckedAdd, Saturating, Zero},
+	deps::{sp_core::U256, sp_runtime::TryRuntimeError},
 	traits::{
 		fungibles::{Inspect as FungiblesInspect, InspectHold},
 		Convert, Time,
@@ -30,10 +31,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	// Derived-index accumulators, recomputed in full from the authoritative registry.
 	let mut collaterals: BTreeSet<CollateralIdOf<T>> = BTreeSet::new();
 	let mut stablecoin_markets: BTreeMap<CollateralIdOf<T>, u32> = BTreeMap::new();
-	let mut stablecoin_debt: BTreeMap<
-		StableIdOf<T>,
-		(BalanceOf<T>, InterestWeight<BalanceOf<T>>, PendingInterest<BalanceOf<T>>),
-	> = BTreeMap::new();
+	let mut stablecoin_debt: BTreeMap<StableIdOf<T>, (BalanceOf<T>, U256, U256)> = BTreeMap::new();
 	for (collateral_id, stable_id, branch) in Branches::<T>::iter() {
 		collaterals.insert(collateral_id.clone());
 		let markets = stablecoin_markets
@@ -49,13 +47,13 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		if !branch.state.is_frozen() {
 			stable_entry.1 = stable_entry
 				.1
-				.checked_add(&branch.state.debt.weighted_principal)
-				.ok_or("stablecoin active weighted-principal sum overflow")?;
+				.checked_add(branch.state.debt.accrual_rate.to_wide())
+				.ok_or("stablecoin active accrual rate sum overflow")?;
 		}
 		stable_entry.2 = stable_entry
 			.2
 			.checked_add(
-				&Pallet::<T>::branch_pending_interest(&branch.state, now)
+				Pallet::<T>::branch_pending_interest(&branch.state, now)
 					.map_err(|_| "branch pending-interest numerator overflow")?,
 			)
 			.ok_or("stablecoin pending-interest numerator overflow")?;
@@ -96,10 +94,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 
 /// `StablecoinDebt` must equal its full recomputation from `Branches`.
 fn check_stablecoin_debt<T: Config>(
-	mut expected: BTreeMap<
-		StableIdOf<T>,
-		(BalanceOf<T>, InterestWeight<BalanceOf<T>>, PendingInterest<BalanceOf<T>>),
-	>,
+	mut expected: BTreeMap<StableIdOf<T>, (BalanceOf<T>, U256, U256)>,
 	now: Millis,
 ) -> Result<(), TryRuntimeError> {
 	for (stable_id, stored) in StablecoinDebt::<T>::iter() {
@@ -112,8 +107,9 @@ fn check_stablecoin_debt<T: Config>(
 		let elapsed = now.saturating_sub(stored.last_update);
 		let projected = stored
 			.pending_interest
+			.to_wide()
 			.checked_add(
-				&PendingInterest::from_interest_weight(stored.active_weighted_principal, elapsed)
+				math::interest_numerator(stored.active_accrual_rate.to_wide(), elapsed)
 					.ok_or("StablecoinDebt projection overflow")?,
 			)
 			.ok_or("StablecoinDebt projection overflow")?;
@@ -121,8 +117,8 @@ fn check_stablecoin_debt<T: Config>(
 		if stored.outstanding != outstanding {
 			return Err("StablecoinDebt outstanding diverges from Branches".into());
 		}
-		if stored.active_weighted_principal != active {
-			return Err("StablecoinDebt active weight diverges from Branches".into());
+		if stored.active_accrual_rate.to_wide() != active {
+			return Err("StablecoinDebt active accrual rate diverges from Branches".into());
 		}
 		if projected != pending {
 			return Err("StablecoinDebt numerator diverges from Branches".into());
@@ -193,20 +189,22 @@ fn check_branch_identities<T: Config>(
 	if state.debt.last_interest_time > tau {
 		return Err("branch last_interest_time ahead of interest_time(now)".into());
 	}
-	let interest_denominator = PendingInterest::<BalanceOf<T>>::DENOMINATOR;
-	if state.debt.aggregate_interest_remainder >= interest_denominator {
-		return Err("aggregate interest remainder is not normalized".into());
+	if !state.debt.interest_minted_ahead.is_zero() &&
+		!state.debt.pending_interest_attribution.is_zero()
+	{
+		return Err("interest both minted ahead and pending attribution".into());
 	}
-	if state.debt.weighted_principal.remainder >= FixedU128::DIV {
-		return Err("weighted principal remainder is not normalized".into());
+	if state.debt.aggregate_interest_remainder >= math::INTEREST_DENOMINATOR {
+		return Err("aggregate interest remainder is not normalized".into());
 	}
 
 	let mut sum_stake = BalanceOf::<T>::zero();
 	let mut sum_market_collateral = BalanceOf::<T>::zero();
 	let mut sum_principal = BalanceOf::<T>::zero();
 	let mut sum_interest = BalanceOf::<T>::zero();
-	let mut sum_weighted_principal = InterestWeight::<BalanceOf<T>>::default();
-	let mut sum_weighted_stake = InterestWeight::<BalanceOf<T>>::default();
+	let mut sum_accrual_rate = U256::zero();
+	let mut sum_stake_accrual_rate = U256::zero();
+	let mut sum_claimable_accrual_rate = U256::zero();
 	let mut sum_eligible_collateral = BalanceOf::<T>::zero();
 	let mut vault_count: u32 = 0;
 
@@ -216,23 +214,20 @@ fn check_branch_identities<T: Config>(
 		if vault.last_interest_time > tau {
 			return Err("vault last_interest_time ahead of interest_time(now)".into());
 		}
-		if vault.interest_remainder >= interest_denominator {
-			return Err("vault interest remainder is not normalized".into());
+		if vault.interest_prepaid >= math::INTEREST_DENOMINATOR {
+			return Err("vault prepaid interest is not normalized".into());
 		}
 		if vault.redistribution_checkpoint.principal_per_stake >
 			state.redistribution.principal_per_stake ||
 			vault.redistribution_checkpoint.collateral_per_stake >
 				state.redistribution.collateral_per_stake ||
-			vault.redistribution_checkpoint.weight_per_weighted_stake >
-				state.redistribution.weight_per_weighted_stake ||
-			vault.redistribution_checkpoint.weight_time_per_weighted_stake.to_wide() >
-				state.redistribution.weight_time_per_weighted_stake.to_wide()
+			vault.redistribution_checkpoint.principal_time_per_stake.to_wide() >
+				state.redistribution.principal_time_per_stake.to_wide()
 		{
 			return Err("vault redistribution checkpoint is ahead of branch totals".into());
 		}
-		// Debt-free vaults must not retain fractional interest.
-		if vault.debt.total().is_zero() && vault.interest_remainder != 0 {
-			return Err("debt-free vault carries an interest fraction".into());
+		if vault.debt.total().is_zero() && vault.interest_prepaid != 0 {
+			return Err("debt-free vault carries prepaid interest".into());
 		}
 		let in_rate_index = T::VaultLists::contains(rate_list, &owner);
 		let in_recovery = T::VaultLists::contains(recovery_list, &owner);
@@ -258,12 +253,9 @@ fn check_branch_identities<T: Config>(
 		sum_interest = sum_interest
 			.checked_add(&vault.debt.interest)
 			.ok_or("branch interest sum overflow")?;
-		sum_weighted_principal = sum_weighted_principal
-			.checked_add(
-				&InterestWeight::from_principal_rate(vault.debt.principal, vault.annual_rate)
-					.ok_or("weighted principal term overflow")?,
-			)
-			.ok_or("weighted principal sum overflow")?;
+		sum_accrual_rate = sum_accrual_rate
+			.checked_add(math::accrual_rate(vault.debt.principal, vault.annual_rate))
+			.ok_or("accrual rate sum overflow")?;
 		if in_recovery {
 			if !vault.redistribution_stake.is_zero() {
 				return Err("FinalRecovery vault has non-zero redistribution_stake".into());
@@ -287,15 +279,20 @@ fn check_branch_identities<T: Config>(
 			sum_eligible_collateral = sum_eligible_collateral
 				.checked_add(&vault.collateral)
 				.ok_or("eligible collateral sum overflow")?;
-			sum_weighted_stake = sum_weighted_stake
-				.checked_add(
-					&InterestWeight::from_principal_rate(
-						vault.redistribution_stake,
-						vault.annual_rate,
-					)
-					.ok_or("weighted stake term overflow")?,
-				)
-				.ok_or("weighted stake sum overflow")?;
+			let stake_accrual_rate =
+				math::accrual_rate(vault.redistribution_stake, vault.annual_rate);
+			sum_stake_accrual_rate = sum_stake_accrual_rate
+				.checked_add(stake_accrual_rate)
+				.ok_or("stake accrual rate sum overflow")?;
+			let unclaimed = state
+				.redistribution
+				.principal_per_stake
+				.saturating_sub(vault.redistribution_checkpoint.principal_per_stake);
+			let claimable = math::claimable_accrual_rate(stake_accrual_rate, unclaimed)
+				.ok_or("claimable redistribution accrual rate overflow")?;
+			sum_claimable_accrual_rate = sum_claimable_accrual_rate
+				.checked_add(claimable)
+				.ok_or("claimable redistribution accrual rate sum overflow")?;
 		}
 	}
 	if state.vault_count != vault_count {
@@ -305,8 +302,8 @@ fn check_branch_identities<T: Config>(
 	if state.stakes.total != sum_stake {
 		return Err("total_stakes != Σ eligible vault.redistribution_stake".into());
 	}
-	if state.stakes.weighted != sum_weighted_stake {
-		return Err("weighted stakes != exact Σ rate · stake".into());
+	if state.stakes.accrual_rate.to_wide() != sum_stake_accrual_rate {
+		return Err("stake accrual rate != exact Σ rate · stake".into());
 	}
 	if state.debt.principal != sum_principal {
 		return Err("branch principal != Σ vault principal".into());
@@ -317,11 +314,13 @@ fn check_branch_identities<T: Config>(
 	if state.debt.minted_interest != issued_interest {
 		return Err("minted interest != Σ vault interest + pending attribution".into());
 	}
-	let expected_weighted_principal = sum_weighted_principal
-		.checked_add(&state.debt.pending_redistribution_weight)
-		.ok_or("weighted principal plus pending sum overflow")?;
-	if state.debt.weighted_principal != expected_weighted_principal {
-		return Err("weighted principal != row weight + pending redistribution weight".into());
+	let expected_accrual_rate = sum_accrual_rate
+		.checked_add(state.debt.pending_redistribution_accrual_rate.to_wide())
+		.ok_or("accrual rate plus pending sum overflow")?;
+	if state.debt.accrual_rate.to_wide() != expected_accrual_rate {
+		return Err(
+			"accrual rate != Σ vault accrual rate + pending redistribution accrual rate".into()
+		);
 	}
 	let expected_basis = sum_eligible_collateral
 		.checked_add(&state.pending_redistribution_collateral)
@@ -329,14 +328,10 @@ fn check_branch_identities<T: Config>(
 	if state.stakes.collateral_basis != expected_basis {
 		return Err("stake collateral basis != eligible rows + pending collateral".into());
 	}
-	let maximum_weight_time = state
-		.debt
-		.pending_redistribution_weight
-		.raw()
-		.checked_mul(tau.into())
-		.ok_or("pending redistribution weight-time bound overflow")?;
-	if state.pending_redistribution_weight_time.to_wide() > maximum_weight_time {
-		return Err("pending redistribution weight-time exceeds current-time bound".into());
+	// The pool is posted rounded down and claimed rounded up, so the market never projects
+	// interest on an accrual rate that its vaults will not claim.
+	if state.debt.pending_redistribution_accrual_rate.to_wide() > sum_claimable_accrual_rate {
+		return Err("pending redistribution accrual rate exceeds what vaults can claim".into());
 	}
 
 	let redistribution_account = Pallet::<T>::redistribution_account(collateral_id, stable_id);

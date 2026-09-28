@@ -166,12 +166,12 @@ fn poke_emits_interest_accrued() {
 		advance_time(7 * ONE_DAY_MS);
 		assert_ok!(poke(2, DOT, PUSD, 1));
 		// Exact magnitude: 7 days at 50% on 2_000 principal accrues
-		// floor(2_000 * 0.5 * 7days / year) = 19 (interest is on principal, not the fee).
+		// ceil(2_000 * 0.5 * 7days / year) = 20 (interest is on principal, not the fee).
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::InterestAccrued {
 			collateral_id: DOT,
 			stable_id: PUSD,
 			owner: 1,
-			amount: 19,
+			amount: 20,
 		}));
 	});
 }

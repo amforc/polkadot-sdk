@@ -339,66 +339,98 @@ fn liability_free_market_closes_husks_without_ratio_math() {
 	});
 }
 
-// The payoff is the recorded debt plus the terminal interest charge. A capped repayment quoted
-// before more interest accrues must not settle only the debt and leave the charge unpaid; an
-// uncapped repayment uses the live payoff and cannot become stale.
+// A touch rounds accrued interest up and keeps the excess as prepaid interest. Pokes that accrue
+// less than the excess charge nothing, so a third party cannot grow a vault's debt by poking it.
 #[test]
-fn stale_payoff_quote_reverts_while_an_uncapped_repay_settles() {
-	use frame::traits::fungible::Mutate;
-	use pusd_primitives::VaultInterface;
+fn repeated_pokes_charge_one_rounded_unit() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
-		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 100));
+		let opened = vault(DOT, PUSD, 1).debt.total();
 
-		advance_time(ONE_YEAR_MS);
-		let quote = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
-			.expect("payoff quote");
-		assert_eq!(quote.terminal_interest_charge, 0);
-		advance_time(1);
+		for _ in 0..100 {
+			advance_time(1);
+			assert_ok!(poke(2, DOT, PUSD, 1));
+		}
 
-		assert_noop!(
-			repay(1, DOT, PUSD, 1, Some(quote.debt)),
-			crate::Error::<Test>::TerminalChargeUnpaid
-		);
-
-		// `None` is uncapped: it settles whatever the payoff is at execution, so the extra unit of
-		// interest accrued since the quote is paid rather than rejected.
-		assert_ok!(repay(1, DOT, PUSD, 1, None));
 		let vault = vault(DOT, PUSD, 1);
-		assert_eq!(vault.debt.total(), 0);
-		assert_eq!(vault.interest_remainder, 0, "the terminal charge settled the fraction");
-		assert_eq!(stable_balance(PUSD, 1), 600 - quote.debt - 1, "one unit past the stale quote");
+		assert_eq!(vault.debt.total(), opened + 1, "only the first poke rounds up");
+		assert!(vault.interest_prepaid > 0);
 	});
 }
 
-// A full repayment rounds the carried sub-unit interest up to one whole unit: the terminal
-// charge. It settles a rounding remainder, not yield, so it goes only to the fee handler.
+// Repaying the live debt clears it, and the vault forfeits the interest it prepaid.
 #[test]
-fn uncovered_terminal_charge_bypasses_the_yield_split() {
+fn full_repayment_forfeits_prepaid_interest() {
 	use frame::traits::fungible::Mutate;
-	use pusd_primitives::VaultInterface;
 	build_and_execute(|| {
-		SpFeeShare::set(Permill::from_percent(100));
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
 		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
 		advance_time(1);
+		assert_ok!(poke(2, DOT, PUSD, 1));
+		let owed = vault(DOT, PUSD, 1).debt.total();
+		assert!(vault(DOT, PUSD, 1).interest_prepaid > 0);
 
-		let quote = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1)
-			.expect("payoff quote");
-		assert_eq!(quote.terminal_interest_charge, 1);
-		let fee_before = stable_balance(PUSD, FEE_DEST);
-		assert_ok!(repay(1, DOT, PUSD, 1, Some(quote.debt + 1)));
+		let balance_before = stable_balance(PUSD, 1);
+		assert_ok!(repay(1, DOT, PUSD, 1, None));
 
-		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 0);
-		assert_eq!(stable_balance(PUSD, FEE_DEST), fee_before + 1);
-		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::InterestRoundingFeeCharged {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			amount: 1,
-		}));
+		let vault = vault(DOT, PUSD, 1);
+		assert_eq!(vault.debt.total(), 0);
+		assert_eq!(vault.interest_prepaid, 0);
+		assert_eq!(stable_balance(PUSD, 1), balance_before - owed);
+	});
+}
+
+// Interest a touch mints ahead of the aggregate must not be minted again when the aggregate
+// accrues it, or the market keeps an attribution no vault owes and cannot close.
+#[test]
+fn aggregate_accrual_does_not_remint_prepaid_interest() {
+	use frame::traits::fungible::Mutate;
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		// 500 at 10% accrues 50 a year: half a unit every hundredth of a year.
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
+		let opened = vault(DOT, PUSD, 1).debt.total();
+
+		advance_time(ONE_YEAR_MS / 100);
+		assert_ok!(poke(2, DOT, PUSD, 1));
+		assert_eq!(vault(DOT, PUSD, 1).debt.total(), opened + 1, "half a unit rounds up");
+
+		advance_time(ONE_YEAR_MS / 100);
+		assert_ok!(poke(2, DOT, PUSD, 1));
+		assert_eq!(vault(DOT, PUSD, 1).debt.total(), opened + 1, "the prepaid half covers it");
+		let state = branch_state(DOT, PUSD).expect("branch state");
+		assert_eq!(state.debt.pending_interest_attribution, 0, "no second mint");
+		assert_eq!(state.debt.minted_interest, vault(DOT, PUSD, 1).debt.interest);
+
+		assert_ok!(repay(1, DOT, PUSD, 1, None));
+		assert_ok!(close_vault(1, DOT, PUSD, None));
+		let state = branch_state(DOT, PUSD).expect("branch state");
+		assert_eq!(state.debt.minted_interest, 0);
+		assert_eq!(state.debt.pending_interest_attribution, 0);
+		assert!(state.is_removable());
+	});
+}
+
+// Stability cohorts activate without touching vaults, so a branch refresh alone must issue all the
+// yield accrued so far. Two vaults of 500 at 0.1% each accrue half a unit a year, which whole-unit
+// accrual rates would drop entirely.
+#[test]
+fn branch_refresh_issues_sub_unit_rates_without_vault_touches() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 1_000)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(1, 1_000)));
+		let minted_before = branch_state(DOT, PUSD).expect("branch state").debt.minted_interest;
+
+		advance_time(ONE_YEAR_MS);
+		assert_ok!(refresh_branch(9, DOT, PUSD));
+
+		let state = branch_state(DOT, PUSD).expect("branch state");
+		assert_eq!(state.debt.minted_interest - minted_before, 1);
+		assert_eq!(state.debt.pending_interest_attribution, 1);
 	});
 }
 
@@ -459,13 +491,11 @@ fn redemption_slot_rejects_second_owner() {
 	});
 }
 
-// Each full repayment ceils its own sub-unit interest into a terminal charge, and together they
-// must empty the branch-wide `aggregate_interest_remainder`. Settlement order must not change the
-// charges, the issuance, or market removal.
+// Full repayments must empty the market's interest ledger whatever order they settle in. Each vault
+// rounds its own interest up, so together they cover the aggregate the market minted.
 #[test]
-fn terminal_charges_empty_the_shared_remainder_in_either_order() {
+fn full_repayments_empty_the_interest_ledger_in_either_order() {
 	use frame::traits::fungible::Mutate;
-	use pusd_primitives::VaultInterface;
 	let run = |first: u64, second: u64| {
 		new_test_ext().execute_with(|| {
 			register_market(DOT, PUSD);
@@ -475,12 +505,6 @@ fn terminal_charges_empty_the_shared_remainder_in_either_order() {
 			assert_ok!(<Pusd as Mutate<u64>>::mint_into(&2, 1_000));
 			advance_time(10 * ONE_DAY_MS);
 
-			// Each vault must owe a terminal charge for this order-independence test.
-			for owner in [1, 2] {
-				let quote = crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &owner)
-					.expect("payoff quote");
-				assert_eq!(quote.terminal_interest_charge, 1);
-			}
 			for owner in [first, second] {
 				assert_ok!(repay(owner, DOT, PUSD, owner, None));
 				assert_ok!(close_vault(owner, DOT, PUSD, None));

@@ -1,26 +1,103 @@
 //! Storage-free math helpers for vault accounting.
 //!
-//! Interest calculations retain fractional residue until attribution. A terminal settlement
-//! rounds the remaining fraction up once for the protocol.
+//! Every rounding favors the protocol. A vault's debt never falls below its exact accrued interest.
+//! Aggregates stay exact, as wide integers, so markets issue their yield without vault touches.
 //!
 //! Overflow triggers a debug failure and saturates in release.
 
 use frame::{
-	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Rounding, Zero},
+	arithmetic::{CheckedAdd, FixedPointNumber, FixedPointOperand, FixedU128, One, Rounding, Zero},
 	deps::sp_core::U256,
 	traits::Defensive,
 };
 use pusd_primitives::{math::mul_div, MILLIS_PER_YEAR};
 
-/// Splits a wide numerator at `denominator` into whole `Balance` units and a
-/// sub-unit residue. `None` when the whole part overflows `Balance`.
-pub(crate) fn split_wide<Balance: FixedPointOperand>(
-	numerator: U256,
-	denominator: u128,
-) -> Option<(Balance, u128)> {
-	let (whole, remainder) = numerator.div_mod(U256::from(denominator));
+/// Denominator of every interest numerator, `principal × rate-inner × millis`: one whole unit
+/// of interest per year of one whole unit of principal at rate one.
+pub const INTEREST_DENOMINATOR: u128 = FixedU128::DIV * MILLIS_PER_YEAR as u128;
+
+const _: () = assert!(INTEREST_DENOMINATOR < 1 << 127);
+
+/// Returns the exact accrual rate of `principal` at `rate`: `principal × rate-inner`.
+///
+/// Both factors fit `u128`, so the product always fits `U256`.
+pub fn accrual_rate<Balance: FixedPointOperand>(principal: Balance, rate: FixedU128) -> U256 {
+	let principal: u128 = principal.unique_saturated_into();
+	U256::from(principal) * U256::from(rate.into_inner())
+}
+
+/// Returns the interest numerator an accrual rate earns over `elapsed` milliseconds.
+pub fn interest_numerator(accrual_rate: U256, elapsed: u64) -> Option<U256> {
+	accrual_rate.checked_mul(U256::from(elapsed))
+}
+
+/// Returns the accrual rate a vault claims from the pending redistribution pool, rounded up.
+///
+/// The pool is posted rounded down, so the vaults' claims always cover it.
+pub fn claimable_accrual_rate(
+	stake_accrual_rate: U256,
+	unclaimed_per_stake: FixedU128,
+) -> Option<U256> {
+	scale_wide(stake_accrual_rate, U256::from(unclaimed_per_stake.into_inner()), Rounding::Up)
+}
+
+/// Splits an interest numerator into whole units and the residue below one unit.
+pub fn split_interest<Balance: FixedPointOperand>(numerator: U256) -> Option<(Balance, u128)> {
+	let (whole, residue) = numerator.div_mod(U256::from(INTEREST_DENOMINATOR));
 	let whole = Balance::try_from(u128::try_from(whole).ok()?).ok()?;
-	Some((whole, remainder.low_u128()))
+	Some((whole, residue.low_u128()))
+}
+
+/// Returns the whole units of an interest numerator, rounded up.
+pub fn interest_units_ceil<Balance: FixedPointOperand + CheckedAdd + One>(
+	numerator: U256,
+) -> Option<Balance> {
+	let (whole, residue) = split_interest::<Balance>(numerator)?;
+	if residue == 0 {
+		Some(whole)
+	} else {
+		whole.checked_add(&Balance::one())
+	}
+}
+
+/// Charges accrued vault interest rounded up, against the sub-unit excess charged before.
+///
+/// `accrued` is a numerator over [`INTEREST_DENOMINATOR`] and `prepaid` the excess the vault
+/// already paid, below one unit. Returns the whole units to add and the new excess. A touch that
+/// accrues less than the excess charges nothing, so repeated touches cannot add units: the
+/// recorded debt stays within one unit above the exact debt.
+pub fn charge_interest<Balance: FixedPointOperand>(
+	accrued: U256,
+	prepaid: u128,
+) -> Option<(Balance, u128)> {
+	debug_assert!(prepaid < INTEREST_DENOMINATOR);
+	let prepaid = U256::from(prepaid);
+	if accrued <= prepaid {
+		return Some((Balance::zero(), (prepaid - accrued).low_u128()));
+	}
+	let (whole, excess) = (accrued - prepaid).div_mod(U256::from(INTEREST_DENOMINATOR));
+	let (whole, prepaid) = if excess.is_zero() {
+		(whole, 0)
+	} else {
+		(whole.checked_add(U256::one())?, INTEREST_DENOMINATOR - excess.low_u128())
+	};
+	let whole = Balance::try_from(u128::try_from(whole).ok()?).ok()?;
+	Some((whole, prepaid))
+}
+
+/// Returns `value · factor / FixedU128::DIV` with `rounding`.
+///
+/// Splitting `value` at `DIV` keeps the product within 256 bits: the whole part scales exactly and
+/// only the fraction is divided.
+pub fn scale_wide(value: U256, factor: U256, rounding: Rounding) -> Option<U256> {
+	let (whole, fraction) = value.div_mod(U256::from(FixedU128::DIV));
+	let whole = whole.checked_mul(factor)?;
+	let (fraction, residue) = fraction.checked_mul(factor)?.div_mod(U256::from(FixedU128::DIV));
+	let fraction = match rounding {
+		Rounding::Up if !residue.is_zero() => fraction.checked_add(U256::one())?,
+		_ => fraction,
+	};
+	whole.checked_add(fraction)
 }
 
 /// Returns simple interest rounded up.
@@ -44,41 +121,35 @@ pub fn simple_interest_ceil<Balance: FixedPointOperand>(
 
 /// Returns the market's average rate, rounded up.
 ///
-/// `weighted_sum` is the sum of each debt multiplied by its rate. Zero debt returns `1.0`, which
-/// keeps the first vault's fee calculation safe.
+/// `accrual_rate` is the sum of each debt multiplied by its rate, in whole units. Zero debt
+/// returns `1.0`, which keeps the first vault's fee calculation safe.
 pub fn average_branch_rate<Balance: FixedPointOperand>(
-	weighted_sum: Balance,
+	accrual_rate: Balance,
 	total_ib_debt: Balance,
 ) -> FixedU128 {
 	if total_ib_debt.is_zero() {
 		return FixedU128::one();
 	}
-	let w: u128 = weighted_sum.unique_saturated_into();
+	let w: u128 = accrual_rate.unique_saturated_into();
 	let t: u128 = total_ib_debt.unique_saturated_into();
 	let inner = mul_div(w, FixedU128::DIV, t, Rounding::Up).defensive_unwrap_or(u128::MAX);
 	FixedU128::from_inner(inner)
 }
 
-/// Returns a floored redistribution increment and its numerator residue.
+/// Returns the redistribution increment per unit of stake, rounded down.
 ///
-/// The result preserves this identity:
-/// `amount * DIV + carry_in = increment_inner * total_stake + carry_out`.
-/// The residue conserves indivisible value without selecting a recipient.
-pub fn redistribution_per_stake_with_carry<Balance: FixedPointOperand>(
+/// Vaults claim at most the pool, and the last stake bearer claims the whole residue.
+pub fn redistribution_per_stake<Balance: FixedPointOperand>(
 	amount: Balance,
 	total_stake: Balance,
-	carry: u128,
-) -> Option<(FixedU128, u128)> {
-	let amount: u128 = amount.unique_saturated_into();
-	let total: u128 = total_stake.unique_saturated_into();
-	if total == 0 {
-		return None;
-	}
-	let numerator = U256::from(amount)
-		.checked_mul(U256::from(FixedU128::DIV))?
-		.checked_add(U256::from(carry % total))?;
-	let (quotient, remainder) = split_wide::<u128>(numerator, total)?;
-	Some((FixedU128::from_inner(quotient), remainder))
+) -> Option<FixedU128> {
+	mul_div(
+		amount.unique_saturated_into(),
+		FixedU128::DIV,
+		total_stake.unique_saturated_into(),
+		Rounding::Down,
+	)
+	.map(FixedU128::from_inner)
 }
 
 #[cfg(test)]
@@ -87,16 +158,53 @@ mod tests {
 	use frame::arithmetic::Saturating;
 
 	#[test]
-	fn wide_splits_preserve_remainders_and_check_the_output_width() {
-		let numerator = U256::from(u64::MAX) * U256::from(3) + U256::from(2);
-		assert_eq!(split_wide::<u64>(numerator, 3), Some((u64::MAX, 2)));
-		assert_eq!(split_wide::<u64>(numerator + U256::one(), 3), None);
-		assert_eq!(split_wide::<u128>(U256::from(u128::MAX) + U256::one(), 1), None);
-		// Redistribution returns a FixedU128 increment, not a Balance-sized quotient.
+	fn charged_interest_never_falls_below_the_exact_amount() {
+		let unit = INTEREST_DENOMINATOR;
+		// A third of a unit rounds up to one and prepays two thirds.
+		let (charged, prepaid) = charge_interest::<u128>(U256::from(unit / 3), 0).unwrap();
+		assert_eq!(charged, 1);
+		assert_eq!(prepaid, unit - unit / 3);
+		// Touching again inside the prepaid excess charges nothing.
+		let (charged, prepaid_after) =
+			charge_interest::<u128>(U256::from(unit / 3), prepaid).unwrap();
+		assert_eq!(charged, 0);
+		assert_eq!(prepaid_after, prepaid - unit / 3);
+		// An exact multiple leaves no excess.
+		assert_eq!(charge_interest::<u128>(U256::from(unit * 5), 0), Some((5, 0)));
+		assert_eq!(charge_interest::<u64>(U256::from(u128::MAX) * U256::from(unit), 0), None);
+	}
+
+	#[test]
+	fn repeated_touches_charge_the_rounded_up_total_once() {
+		let step = INTEREST_DENOMINATOR / 7;
+		let mut total = 0u128;
+		let mut prepaid = 0;
+		for _ in 0..70 {
+			let (charged, next) = charge_interest::<u128>(U256::from(step), prepaid).unwrap();
+			total += charged;
+			prepaid = next;
+		}
+		let exact = U256::from(step) * U256::from(70u32);
+		let ceil = exact.div_mod(U256::from(INTEREST_DENOMINATOR));
+		let expected = ceil.0.low_u128() + u128::from(!ceil.1.is_zero());
+		assert_eq!(total, expected);
+	}
+
+	#[test]
+	fn scale_wide_rounds_the_fraction_only() {
+		let div = U256::from(FixedU128::DIV);
+		assert_eq!(scale_wide(div * 3, U256::from(5u32), Rounding::Down), Some(U256::from(15u32)));
+		assert_eq!(scale_wide(U256::one(), U256::one(), Rounding::Down), Some(U256::zero()));
+		assert_eq!(scale_wide(U256::one(), U256::one(), Rounding::Up), Some(U256::one()));
+	}
+
+	#[test]
+	fn redistribution_per_stake_rounds_down() {
 		assert_eq!(
-			redistribution_per_stake_with_carry(u64::MAX, 1, 0),
-			Some((FixedU128::from_inner(u128::from(u64::MAX) * FixedU128::DIV), 0)),
+			redistribution_per_stake(1u128, 3),
+			Some(FixedU128::from_inner(FixedU128::DIV / 3))
 		);
+		assert_eq!(redistribution_per_stake(1u128, 0), None);
 	}
 
 	#[test]
@@ -122,7 +230,7 @@ mod tests {
 
 	#[test]
 	fn average_branch_rate_recovers_rate_fraction() {
-		// A weighted value of 500 over 10,000 debt is a 5% rate.
+		// An accrual rate of 500 over 10,000 debt is a 5% rate.
 		let avg = average_branch_rate::<u128>(500, 10_000);
 		assert_eq!(avg, FixedU128::from_rational(5u128, 100u128));
 	}
@@ -147,15 +255,5 @@ mod tests {
 		// An empty market uses 1.0 for its first fee calculation.
 		let avg = average_branch_rate::<u128>(0, 0);
 		assert_eq!(avg, FixedU128::one());
-	}
-
-	#[test]
-	fn redistribution_carry_telescopes_repeated_rounds() {
-		let stake = 3u128;
-		let (first, carry) = redistribution_per_stake_with_carry(1u128, stake, 0).unwrap();
-		let (second, carry) = redistribution_per_stake_with_carry(1u128, stake, carry).unwrap();
-		let (third, carry) = redistribution_per_stake_with_carry(1u128, stake, carry).unwrap();
-		assert_eq!(first.into_inner() + second.into_inner() + third.into_inner(), FixedU128::DIV);
-		assert_eq!(carry, 0);
 	}
 }

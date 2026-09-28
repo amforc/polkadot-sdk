@@ -251,16 +251,16 @@ fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
 		// Route the full credit from here on.
 		SpFeeShare::set(Permill::zero());
 
-		// The 475-unit fee is below the 10_000-unit asset minimum.
+		// The 476-unit fee is below the 10_000-unit asset minimum.
 		let minted_pre = branch_state(XBT, USDX).expect("state").debt.minted_interest;
 		let issuance_pre = total_stable(USDX);
 		advance_time(60_000);
 		assert_ok!(poke(9, XBT, USDX, 1));
 		let minted_delta =
 			branch_state(XBT, USDX).expect("state").debt.minted_interest - minted_pre;
-		assert_eq!(minted_delta, 475);
-		assert_eq!(stable_balance(USDX, FEE_DEST), 475, "sub-ED credit landed");
-		assert_eq!(total_stable(USDX) - issuance_pre, 475, "supply backs the recorded fee");
+		assert_eq!(minted_delta, 476);
+		assert_eq!(stable_balance(USDX, FEE_DEST), 476, "sub-ED credit landed");
+		assert_eq!(total_stable(USDX) - issuance_pre, 476, "supply backs the recorded fee");
 	});
 }
 

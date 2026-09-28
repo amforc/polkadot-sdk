@@ -170,9 +170,9 @@ fn change_rate_to_same_rate_is_no_op() {
 		assert_eq!(post.annual_rate, pre.annual_rate);
 		assert_eq!(post.debt.principal, pre.debt.principal);
 		assert_eq!(post.last_rate_update, pre.last_rate_update);
-		// But interest is settled: exactly floor(10_000 * 0.05 * 1day / year) = 1, and no
-		// upfront fee is added (which would have pushed debt.interest higher).
-		assert_eq!(post.debt.interest, pre.debt.interest + 1);
+		// But interest is settled: ceil(10_000 * 0.05 * 1day / year) = 2, and no upfront fee is
+		// added (which would have pushed debt.interest higher).
+		assert_eq!(post.debt.interest, pre.debt.interest + 2);
 		assert_eq!(post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
 	});
 }

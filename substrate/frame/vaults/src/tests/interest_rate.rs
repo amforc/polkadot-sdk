@@ -408,9 +408,9 @@ fn poke_full_state_changes() {
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
-		// One day at 25% on 2_000 principal materialises exactly
-		// floor(2_000 * 0.25 * 1day / year) = 1 unit on top of the pending open fee.
-		assert_eq!(v_post.debt.interest, v_pre.debt.interest + 1);
+		// One day at 25% on 2_000 principal materialises
+		// ceil(2_000 * 0.25 * 1day / year) = 2 units on top of the pending open fee.
+		assert_eq!(v_post.debt.interest, v_pre.debt.interest + 2);
 	});
 }
 
@@ -557,7 +557,7 @@ fn liquidation_assigns_redistribution_before_later_poke() {
 		// A sole recipient receives the complete pending amount.
 		assert_eq!(vault_a_post.debt.principal, vault_a_pre.debt.principal + redistributed);
 		assert_eq!(vault_a_post.collateral, vault_a_pre.collateral + 1_000);
-		assert_eq!(vault_a_post.debt.interest, 1_012);
+		assert_eq!(vault_a_post.debt.interest, 1_013);
 		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.debt.pending_redistribution_principal, 0);
 		assert_eq!(state.pending_redistribution_collateral, 0);
@@ -565,7 +565,7 @@ fn liquidation_assigns_redistribution_before_later_poke() {
 }
 
 #[test]
-fn long_idle_exact_interest_has_no_terminal_charge() {
+fn long_idle_exact_interest_is_not_rounded() {
 	use pusd_primitives::VaultInterface;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
@@ -574,12 +574,11 @@ fn long_idle_exact_interest_has_no_terminal_charge() {
 		let snapshot =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
 		assert_eq!(snapshot.debt, 1_502);
-		assert_eq!(snapshot.terminal_interest_charge, 0);
 	});
 }
 
 // The open fee is priced by the same checked-borrow path every borrow uses.
-// Pin it against the closed form it must equal: the post-open debt-weighted
+// Pin it against the closed form it must equal: the post-open debt-averaged
 // average rate applied to the new debt over the upfront-fee period.
 #[test]
 fn open_fee_matches_post_open_average_rate_closed_form() {
@@ -593,8 +592,9 @@ fn open_fee_matches_post_open_average_rate_closed_form() {
 		let new_debt: Balance = 1_000;
 		let new_rate = rate_pct(10, 100);
 		let total_ib = state.debt.principal + new_debt;
-		let weighted = state.debt.weighted_principal.whole + new_rate.saturating_mul_int(new_debt);
-		let avg = crate::math::average_branch_rate(weighted, total_ib);
+		let accrual_rate: Balance = state.debt.accrual_rate.whole();
+		let accrual_rate = accrual_rate + new_rate.saturating_mul_int(new_debt);
+		let avg = crate::math::average_branch_rate(accrual_rate, total_ib);
 		let expected = crate::math::simple_interest_ceil(new_debt, avg, config.upfront_fee_period);
 		assert!(expected > 0);
 
@@ -628,8 +628,8 @@ fn poke_cadence_cannot_change_accrued_state() {
 			let vault_1 = vault(DOT, PUSD, 1);
 			let vault_2 = vault(DOT, PUSD, 2);
 			// Both schedules cover the same ten-day simple-interest period.
-			assert_eq!(vault_1.debt.interest - base1, 13_689);
-			assert_eq!(vault_2.debt.interest - base2, 13_689);
+			assert_eq!(vault_1.debt.interest - base1, 13_690);
+			assert_eq!(vault_2.debt.interest - base2, 13_690);
 			let state = branch_state(DOT, PUSD).unwrap();
 			assert_eq!(state.debt.pending_interest_attribution, 0);
 			assert_eq!(state.debt.minted_interest, vault_1.debt.interest + vault_2.debt.interest);
