@@ -1,4 +1,4 @@
-//! Per-market yield hook between the vault engine and the Stability Pool.
+//! Per-market yield hook from the vault engine to the Stability Pool.
 
 /// Called with every stable-coin credit the vault engine mints for a market
 /// (branch interest and upfront fees). The credit's own asset is the market's
@@ -6,10 +6,8 @@
 /// the Stability-Pool share and returns the remainder, which the vault engine
 /// hands to its fee destination. Runtimes without a pool use `()`.
 ///
-/// Must be infallible: yield minting happens on commit paths that cannot
-/// roll back user operations over a routing failure. An implementation that
-/// cannot distribute (no pool row, empty active pool, frozen branch) returns
-/// the credit untouched.
+/// Infallible, since minting runs on commit paths that cannot roll back. When it cannot
+/// distribute (no pool row, empty active pool, frozen branch), it returns the credit untouched.
 pub trait OnBranchYield<CollateralId, Credit> {
 	fn distribute_yield(collateral_id: &CollateralId, credit: Credit) -> Credit;
 }

@@ -1,4 +1,4 @@
-//! Interfaces for Stability Pool offsets in liquidation settlement.
+//! Stability Pool offset interfaces for liquidation settlement.
 
 use frame::deps::{
 	frame_support::{
@@ -8,13 +8,11 @@ use frame::deps::{
 	sp_runtime::traits::Zero,
 };
 
-/// Contains the active and pending values for a Stability Pool offset.
-///
-/// `T` can hold debt amounts or collateral credits.
+/// Per-leg values of a Stability Pool offset: debt amounts or collateral credits.
 pub struct OffsetLegs<T> {
-	/// The value for the active-pool leg.
+	/// Active-pool leg.
 	pub active: T,
-	/// The value for the pending-deposit leg.
+	/// Pending-deposit leg.
 	pub pending: T,
 }
 
@@ -51,10 +49,9 @@ pub trait StabilityPoolInspect<CollateralId, StableId, Balance> {
 pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit>:
 	StabilityPoolInspect<CollateralId, StableId, Balance>
 {
-	/// Cancels `debt` against pool deposits and pays the specified `collateral` to each pool leg.
+	/// Cancels exactly `debt` against pool deposits and pays `collateral` to each leg.
 	///
-	/// The operation uses exact amounts, similar to `Precision::Exact`. These equalities must hold
-	/// when the operation starts:
+	/// Fails unless, at the start:
 	///
 	/// - `debt.active == Self::reducible_active(collateral_id, stable_id, debt.active)`.
 	/// - `debt.pending == Self::reducible_pending(collateral_id, stable_id, debt.pending,
@@ -74,10 +71,8 @@ pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit>
 	) -> DispatchResult;
 }
 
-/// Provides empty Stability Pool limits for a runtime without a pool.
-///
-/// No debt is reducible. An offset succeeds only when both debts and both collateral credits are
-/// zero.
+/// No-op pool for runtimes without one: nothing is reducible, and an offset succeeds only when
+/// all debts and credits are zero.
 impl<CollateralId, StableId, Balance: Zero> StabilityPoolInspect<CollateralId, StableId, Balance>
 	for ()
 {
@@ -100,8 +95,7 @@ impl<CollateralId, StableId, Balance: Zero, CollateralCredit: TryDrop>
 		collateral: OffsetLegs<CollateralCredit>,
 	) -> DispatchResult {
 		let debt_is_zero = debt.active.is_zero() && debt.pending.is_zero();
-		// A successful `TryDrop` proves that a credit is zero. Thus, a nonzero credit cannot
-		// disappear in a successful no-op.
+		// `TryDrop` succeeds only on zero credits, so a nonzero credit cannot vanish here.
 		let active_is_zero = collateral.active.try_drop().is_ok();
 		let pending_is_zero = collateral.pending.try_drop().is_ok();
 		if debt_is_zero && active_is_zero && pending_is_zero {
