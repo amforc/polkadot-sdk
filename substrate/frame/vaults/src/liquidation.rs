@@ -15,10 +15,11 @@ use crate::{
 	context::VaultOp,
 	pallet::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
-		StableIdOf,
+		StableCreditOf, StableIdOf,
 	},
 	types::{DebtCollateral, JitTerms, LiquidationConfig, LiquidationOutcome},
 };
+use core::cmp::Ordering;
 use frame::{
 	arithmetic::{
 		AtLeast32BitUnsigned, CheckedAdd, FixedPointOperand, FixedU128, Permill, Saturating, Zero,
@@ -27,16 +28,22 @@ use frame::{
 	traits::{
 		fungibles::{
 			Balanced as FungiblesBalanced, BalancedHold as FungiblesBalancedHold,
-			Inspect as FungiblesInspect, Mutate as FungiblesMutate,
-			MutateHold as FungiblesMutateHold,
+			Inspect as FungiblesInspect, MutateHold as FungiblesMutateHold,
 		},
 		tokens::{DepositConsequence, Fortitude, Precision, Preservation, Provenance},
 	},
 };
 use pusd_primitives::{
-	math::collateral_for_value_ceil, mul_div_floor, reducible_debit, OffsetLegs,
+	math::collateral_for_value_ceil, mul_div_floor, reducible_debit, BranchSnapshot, OffsetLegs,
 	StabilityPoolInspect, StabilityPoolOffset,
 };
+
+// The pool as one liquidation's quotes read it.
+type PoolQuoteOf<T> = <<T as Config>::StabilityPool as StabilityPoolInspect<
+	CollateralIdOf<T>,
+	StableIdOf<T>,
+	BalanceOf<T>,
+>>::Quote;
 
 #[derive(Clone)]
 pub struct LiquidationSnapshot<Balance> {
@@ -97,11 +104,13 @@ struct LiquidationQuote<Balance> {
 	jit_preservation: Preservation,
 }
 
-// The inputs every candidate quote of one liquidation shares; only the JIT terms vary.
+// The inputs every candidate quote of one liquidation shares; only the JIT terms vary. The pool is
+// read once for all of them, and `None` means it has no capacity.
 struct LiquidationQuoter<'a, T: Config> {
 	keeper: &'a T::AccountId,
 	collateral_id: &'a CollateralIdOf<T>,
 	stable_id: &'a StableIdOf<T>,
+	pool: Option<PoolQuoteOf<T>>,
 	snapshot: &'a LiquidationSnapshot<BalanceOf<T>>,
 	collateral_total: BalanceOf<T>,
 }
@@ -115,9 +124,14 @@ impl<T: Config> Pallet<T> {
 		owner: T::AccountId,
 		jit: JitTerms<BalanceOf<T>>,
 	) -> DispatchResult {
-		let mut op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), &owner)?;
+		let op =
+			VaultOp::<T>::load_for_liquidation(collateral_id.clone(), stable_id.clone(), &owner)?;
 		let snapshot = op.prepare_liquidation()?;
-		let held = op.vault().collateral;
+		let branch = op.branch_snapshot();
+		// The touch left the vault's redistribution share in custody, so the owner holds that much
+		// less than the vault records.
+		let retained = op.retained_redistribution();
+		let held = op.vault().collateral.checked_sub(&retained).ok_or(DispatchError::Corruption)?;
 
 		let (collateral, shortfall) = T::CollateralAssets::slash(
 			collateral_id.clone(),
@@ -135,9 +149,11 @@ impl<T: Config> Pallet<T> {
 			&keeper,
 			&collateral_id,
 			&stable_id,
+			branch,
 			jit,
 			snapshot,
 			collateral,
+			retained,
 		)?;
 
 		Self::deposit_event(Event::VaultLiquidated {
@@ -150,33 +166,60 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Finalizes the vault and transfers the redistribution and owner credits.
+	/// Leaves the redistribution account holding exactly `leg` on the liquidated vault's behalf.
 	///
-	/// The redistribution account holds collateral until recipients materialize it. The owner
-	/// receives surplus as free balance.
+	/// `retained` is what it already holds for the vault. A larger leg takes the difference from
+	/// `credit` and holds it; a smaller one slashes the excess back into `credit`. Either way one
+	/// custody operation replaces the round trip through the owner's account. The credit that
+	/// comes back funds the other legs.
+	pub(crate) fn reconcile_redistribution_custody(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		mut credit: CollateralCreditOf<T>,
+		retained: BalanceOf<T>,
+		leg: BalanceOf<T>,
+	) -> Result<CollateralCreditOf<T>, DispatchError> {
+		let custody = Self::redistribution_account(collateral_id, stable_id);
+		let reason = HoldReason::VaultCollateral.into();
+		match leg.cmp(&retained) {
+			Ordering::Equal => {},
+			Ordering::Greater => {
+				let top_up = leg.saturating_sub(retained);
+				ensure!(top_up <= credit.peek(), Error::<T>::InvalidLiquidationPlan);
+				Self::resolve_collateral(&custody, credit.extract(top_up))?;
+				T::CollateralAssets::hold(collateral_id.clone(), &reason, &custody, top_up)?;
+			},
+			Ordering::Less => {
+				let excess = retained.saturating_sub(leg);
+				let (released, shortfall) =
+					T::CollateralAssets::slash(collateral_id.clone(), &reason, &custody, excess);
+				if !shortfall.is_zero() {
+					defensive!("redistribution custody fell short of the retained share");
+					return Err(DispatchError::Corruption);
+				}
+				if let Err(released) = credit.subsume(released) {
+					// Both credits are the market's collateral, so the merge cannot fail.
+					drop(released);
+					return Err(DispatchError::Corruption);
+				}
+			},
+		}
+		Ok(credit)
+	}
+
+	/// Finalizes the vault and pays the owner's surplus as free balance.
+	///
+	/// The redistribution leg is already in custody: see
+	/// [`Self::reconcile_redistribution_custody`].
 	pub(crate) fn settle_liquidation_custody(
 		op: VaultOp<T>,
 		redistribution: DebtCollateral<BalanceOf<T>>,
-		redistribution_collateral: CollateralCreditOf<T>,
 		owner_collateral: CollateralCreditOf<T>,
+		burned: Option<StableCreditOf<T>>,
 	) -> DispatchResult {
-		debug_assert_eq!(redistribution_collateral.peek(), redistribution.collateral);
 		let owner = op.owner().clone();
-		if redistribution.collateral.is_zero() {
-			drop(redistribution_collateral);
-		} else {
-			let redistribution_account =
-				Self::redistribution_account(op.collateral_id(), op.stable_id());
-			Self::resolve_collateral(&redistribution_account, redistribution_collateral)?;
-			T::CollateralAssets::hold(
-				op.collateral_id().clone(),
-				&HoldReason::VaultCollateral.into(),
-				&redistribution_account,
-				redistribution.collateral,
-			)?;
-		}
 		Self::resolve_collateral(&owner, owner_collateral)?;
-		op.finish_liquidation(redistribution)
+		op.finish_liquidation(redistribution, burned)
 	}
 
 	fn settle_liquidation(
@@ -184,33 +227,95 @@ impl<T: Config> Pallet<T> {
 		keeper: &T::AccountId,
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
+		branch: BranchSnapshot,
 		jit: JitTerms<BalanceOf<T>>,
 		snapshot: LiquidationSnapshot<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
+		retained: BalanceOf<T>,
 	) -> Result<LiquidationOutcome<BalanceOf<T>>, DispatchError> {
 		debug_assert!(snapshot.config.offset_penalty <= snapshot.config.redistribution_penalty);
+		let collateral_total =
+			collateral.peek().checked_add(&retained).ok_or(Error::<T>::ArithmeticOverflow)?;
+		debug_assert_eq!(collateral_total, op.vault().collateral);
 		let quoter = LiquidationQuoter::<T> {
 			keeper,
 			collateral_id,
 			stable_id,
+			pool: T::StabilityPool::quote(collateral_id, stable_id, branch),
 			snapshot: &snapshot,
-			collateral_total: collateral.peek(),
+			collateral_total,
 		};
 		let LiquidationQuote { plan, jit_preservation } = quoter.plan_liquidation(jit)?;
 
-		let (seized, owner_surplus) = collateral.split(plan.seized);
+		// Custody settles first, so the credit left over is exactly what the other legs and the
+		// owner share.
+		let collateral = Self::reconcile_redistribution_custody(
+			collateral_id,
+			stable_id,
+			collateral,
+			retained,
+			plan.collateral.redistribution,
+		)?;
+		let seized_out = plan
+			.seized
+			.checked_sub(&plan.collateral.redistribution)
+			.ok_or(Error::<T>::InvalidLiquidationPlan)?;
+		let (seized, owner_surplus) = collateral.split(seized_out);
 		debug_assert_eq!(owner_surplus.peek(), plan.owner_surplus);
-		let (mut keeper_collateral, mut resolution) = seized.split(plan.keeper_reward);
+		let (keeper_collateral, mut resolution) = seized.split(plan.keeper_reward);
+		let keeper_burned = Self::settle_keeper_legs(
+			keeper,
+			stable_id,
+			&plan,
+			jit,
+			jit_preservation,
+			keeper_collateral,
+			&mut resolution,
+		)?;
+		let pool_burned =
+			Self::settle_pool_legs(collateral_id, stable_id, branch, &plan, &mut resolution)?;
+		let burned = merge_burned::<T>(keeper_burned, pool_burned)?;
 
-		let has_pool_offset = !plan.debt.active_pool.is_zero() || !plan.debt.pending_pool.is_zero();
-		let active_collateral =
-			has_pool_offset.then(|| resolution.extract(plan.collateral.active_pool));
+		// Every leg but the owner's surplus has left the seized credit.
+		if let Err(resolution) = resolution.drop_zero() {
+			drop(resolution);
+			return Err(DispatchError::Corruption);
+		}
+		let leg = |debt, collateral| DebtCollateral { debt, collateral };
+		let touch = op.liquidation_touch()?;
+		let outcome = LiquidationOutcome {
+			active_pool: leg(plan.debt.active_pool, plan.collateral.active_pool),
+			keeper_jit: leg(plan.debt.keeper_jit, plan.collateral.keeper_jit),
+			pending_pool: leg(plan.debt.pending_pool, plan.collateral.pending_pool),
+			redistribution: leg(plan.debt.redistribution, plan.collateral.redistribution),
+			keeper_reward: plan.keeper_reward,
+			owner_surplus: owner_surplus.peek(),
+			touch,
+		};
+		Self::settle_liquidation_custody(op, outcome.redistribution, owner_surplus, burned)?;
+		Ok(outcome)
+	}
+
+	// Withdraws the keeper's JIT stablecoin and pays the reward and the JIT share as one deposit:
+	// the deposit planning checked, so it cannot fail on the keeper's account state. The withdrawn
+	// stablecoin comes back for the commit to burn.
+	fn settle_keeper_legs(
+		keeper: &T::AccountId,
+		stable_id: &StableIdOf<T>,
+		plan: &LiquidationPlan<BalanceOf<T>>,
+		jit: JitTerms<BalanceOf<T>>,
+		jit_preservation: Preservation,
+		mut keeper_collateral: CollateralCreditOf<T>,
+		resolution: &mut CollateralCreditOf<T>,
+	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
+		debug_assert_eq!(keeper_collateral.peek(), plan.keeper_reward);
 		if plan.debt.keeper_jit.is_zero() {
 			debug_assert!(plan.collateral.keeper_jit.is_zero());
 		} else {
 			debug_assert!(plan.collateral.keeper_jit >= jit.min_collateral_out);
 		}
-		Self::burn_jit_stable(keeper, stable_id, plan.debt.keeper_jit, jit_preservation)?;
+		let burned =
+			Self::withdraw_jit_stable(keeper, stable_id, plan.debt.keeper_jit, jit_preservation)?;
 		if let Err(jit_share) =
 			keeper_collateral.subsume(resolution.extract(plan.collateral.keeper_jit))
 		{
@@ -219,42 +324,49 @@ impl<T: Config> Pallet<T> {
 			drop(jit_share);
 			return Err(DispatchError::Corruption);
 		}
-		// The reward and the JIT share reach the keeper as one deposit: the deposit planning
-		// checked, so it cannot fail on the keeper's account state.
 		Self::resolve_collateral(keeper, keeper_collateral)?;
-		if let Some(active_collateral) = active_collateral {
-			let pending_collateral = resolution.extract(plan.collateral.pending_pool);
+		Ok(burned)
+	}
 
-			// One exact call keeps the active and pending pool legs atomic.
-			if plan.debt.active_pool.is_zero() {
-				debug_assert!(active_collateral.peek().is_zero());
-			}
-			if plan.debt.pending_pool.is_zero() {
-				debug_assert!(pending_collateral.peek().is_zero());
-			}
-			T::StabilityPool::offset(
-				collateral_id,
-				stable_id,
-				OffsetLegs { active: plan.debt.active_pool, pending: plan.debt.pending_pool },
-				OffsetLegs { active: active_collateral, pending: pending_collateral },
-			)?;
-		} else {
+	// Hands both pool legs to the Stability Pool in one exact call, which keeps them atomic, and
+	// returns the stablecoin the pool gave up. A plan without pool debt carries no pool collateral
+	// and makes no call.
+	fn settle_pool_legs(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		branch: BranchSnapshot,
+		plan: &LiquidationPlan<BalanceOf<T>>,
+		resolution: &mut CollateralCreditOf<T>,
+	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
+		if plan.debt.active_pool.is_zero() && plan.debt.pending_pool.is_zero() {
 			debug_assert!(plan.collateral.active_pool.is_zero());
 			debug_assert!(plan.collateral.pending_pool.is_zero());
+			return Ok(None);
 		}
-
-		debug_assert_eq!(resolution.peek(), plan.collateral.redistribution);
-		let leg = |debt, collateral| DebtCollateral { debt, collateral };
-		let outcome = LiquidationOutcome {
-			active_pool: leg(plan.debt.active_pool, plan.collateral.active_pool),
-			keeper_jit: leg(plan.debt.keeper_jit, plan.collateral.keeper_jit),
-			pending_pool: leg(plan.debt.pending_pool, plan.collateral.pending_pool),
-			redistribution: leg(plan.debt.redistribution, plan.collateral.redistribution),
-			keeper_reward: plan.keeper_reward,
-			owner_surplus: owner_surplus.peek(),
-		};
-		Self::settle_liquidation_custody(op, outcome.redistribution, resolution, owner_surplus)?;
-		Ok(outcome)
+		let active_collateral = resolution.extract(plan.collateral.active_pool);
+		let pending_collateral = resolution.extract(plan.collateral.pending_pool);
+		if plan.debt.active_pool.is_zero() {
+			debug_assert!(active_collateral.peek().is_zero());
+		}
+		if plan.debt.pending_pool.is_zero() {
+			debug_assert!(pending_collateral.peek().is_zero());
+		}
+		let burned = T::StabilityPool::offset(
+			collateral_id,
+			stable_id,
+			branch,
+			OffsetLegs { active: plan.debt.active_pool, pending: plan.debt.pending_pool },
+			OffsetLegs { active: active_collateral, pending: pending_collateral },
+		)?;
+		let pool_debt = plan
+			.debt
+			.active_pool
+			.checked_add(&plan.debt.pending_pool)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		// The pool must give up exactly the debt it cancels, or the supply would drift.
+		let given_up = burned.as_ref().map_or_else(Zero::zero, |credit| credit.peek());
+		ensure!(given_up == pool_debt, DispatchError::Corruption);
+		Ok(burned)
 	}
 
 	// Whether a planned JIT trade executes: its collateral share must clear the keeper's floor and
@@ -323,26 +435,27 @@ impl<T: Config> Pallet<T> {
 		Ok((funded, preservation))
 	}
 
-	// Burns the keeper's stablecoin for an executed JIT trade. Planning already sized the debt to
-	// what the keeper can burn.
-	fn burn_jit_stable(
+	// Withdraws the keeper's stablecoin for an executed JIT trade. Planning already sized the debt
+	// to what the keeper can pay.
+	fn withdraw_jit_stable(
 		keeper: &T::AccountId,
 		stable_id: &StableIdOf<T>,
 		debt: BalanceOf<T>,
 		preservation: Preservation,
-	) -> DispatchResult {
+	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
 		if debt.is_zero() {
-			return Ok(());
+			return Ok(None);
 		}
-		T::StableAssets::burn_from(
+		let credit = T::StableAssets::withdraw(
 			stable_id.clone(),
 			keeper,
 			debt,
-			preservation,
 			Precision::Exact,
+			preservation,
 			Fortitude::Polite,
 		)?;
-		Ok(())
+		assert!(credit.peek() == debt, "an exact withdrawal moves the whole debt");
+		Ok(Some(credit))
 	}
 
 	fn resolve_collateral(
@@ -404,18 +517,20 @@ impl<T: Config> LiquidationQuoter<'_, T> {
 		&self,
 		jit: JitTerms<BalanceOf<T>>,
 	) -> Result<(LiquidationSplit<BalanceOf<T>>, Preservation), DispatchError> {
-		let Self { keeper, collateral_id, stable_id, snapshot, .. } = *self;
-		let active_pool =
-			T::StabilityPool::reducible_active(collateral_id, stable_id, snapshot.debt);
+		let Self { keeper, stable_id, snapshot, .. } = *self;
+		let pool = self.pool.as_ref();
+		let active_pool = pool
+			.map_or_else(Zero::zero, |pool| T::StabilityPool::quote_active(pool, snapshot.debt));
 		ensure!(active_pool <= snapshot.debt, Error::<T>::InvalidLiquidationPlan);
 		let mut remaining = snapshot.debt.saturating_sub(active_pool);
 		let (keeper_jit, preservation) =
 			Pallet::<T>::size_jit(keeper, stable_id, &snapshot.config, jit, remaining)?;
 		remaining.saturating_reduce(keeper_jit);
-		let pending_pool = if remaining.is_zero() {
-			Zero::zero()
-		} else {
-			T::StabilityPool::reducible_pending(collateral_id, stable_id, remaining, active_pool)
+		let pending_pool = match pool {
+			Some(pool) if !remaining.is_zero() => {
+				T::StabilityPool::quote_pending(pool, remaining, active_pool)
+			},
+			_ => Zero::zero(),
 		};
 		ensure!(pending_pool <= remaining, Error::<T>::InvalidLiquidationPlan);
 		remaining.saturating_reduce(pending_pool);
@@ -426,9 +541,28 @@ impl<T: Config> LiquidationQuoter<'_, T> {
 	}
 }
 
+// Merges the stablecoin the keeper and the pool gave up into the one credit the commit burns.
+fn merge_burned<T: Config>(
+	keeper: Option<StableCreditOf<T>>,
+	pool: Option<StableCreditOf<T>>,
+) -> Result<Option<StableCreditOf<T>>, DispatchError> {
+	match (keeper, pool) {
+		(None, pool) => Ok(pool),
+		(keeper, None) => Ok(keeper),
+		(Some(mut keeper), Some(pool)) => {
+			keeper.subsume(pool).map_err(|pool| {
+				// Both credits are of the market's stablecoin, so the merge cannot fail.
+				drop(pool);
+				DispatchError::Corruption
+			})?;
+			Ok(Some(keeper))
+		},
+	}
+}
+
 // Returns one path's penalty-adjusted value and rounds it up. Thus, a fractional unit cannot
 // decrease the configured penalty for that path.
-fn penalty_weight<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
+fn penalized_debt<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	debt: Balance,
 	penalty: Permill,
 ) -> Option<Balance> {
@@ -445,8 +579,8 @@ fn max_seizable_collateral<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 ) -> Option<Balance> {
 	let total_debt = debt.checked_total()?;
 	let offset_debt = total_debt.checked_sub(&debt.redistribution)?;
-	let value = penalty_weight(offset_debt, config.offset_penalty)?
-		.checked_add(&penalty_weight(debt.redistribution, config.redistribution_penalty)?)?;
+	let value = penalized_debt(offset_debt, config.offset_penalty)?
+		.checked_add(&penalized_debt(debt.redistribution, config.redistribution_penalty)?)?;
 	collateral_for_value_ceil(value, price)
 }
 
@@ -472,22 +606,22 @@ fn allocate_collateral<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	debt: LiquidationSplit<Balance>,
 	config: &LiquidationConfig<Balance>,
 ) -> Option<LiquidationSplit<Balance>> {
-	let weights = LiquidationSplit {
-		active_pool: penalty_weight(debt.active_pool, config.offset_penalty)?,
-		keeper_jit: penalty_weight(debt.keeper_jit, config.offset_penalty)?,
-		pending_pool: penalty_weight(debt.pending_pool, config.offset_penalty)?,
-		redistribution: penalty_weight(debt.redistribution, config.redistribution_penalty)?,
+	let penalized = LiquidationSplit {
+		active_pool: penalized_debt(debt.active_pool, config.offset_penalty)?,
+		keeper_jit: penalized_debt(debt.keeper_jit, config.offset_penalty)?,
+		pending_pool: penalized_debt(debt.pending_pool, config.offset_penalty)?,
+		redistribution: penalized_debt(debt.redistribution, config.redistribution_penalty)?,
 	};
-	let total = weights.checked_total()?;
+	let total = penalized.checked_total()?;
 	if total.is_zero() {
 		return Some(LiquidationSplit::zero());
 	}
-	let share = |weight| mul_div_floor(resolution, weight, total);
+	let share = |debt| mul_div_floor(resolution, debt, total);
 	let mut collateral = LiquidationSplit {
-		active_pool: share(weights.active_pool)?,
-		keeper_jit: share(weights.keeper_jit)?,
-		pending_pool: share(weights.pending_pool)?,
-		redistribution: share(weights.redistribution)?,
+		active_pool: share(penalized.active_pool)?,
+		keeper_jit: share(penalized.keeper_jit)?,
+		pending_pool: share(penalized.pending_pool)?,
+		redistribution: share(penalized.redistribution)?,
 	};
 	let allocated = collateral.checked_total()?;
 	let remainder = resolution.checked_sub(&allocated)?;
@@ -561,7 +695,7 @@ mod tests {
 	// This mixed case protects penalty allocation and conservation when floor division creates a
 	// remainder.
 	#[test]
-	fn mixed_split_is_penalty_weighted_and_allocated_exactly() {
+	fn mixed_split_is_pro_rata_to_penalized_debt_and_exact() {
 		let debt = LiquidationSplit {
 			active_pool: 500,
 			keeper_jit: 200,

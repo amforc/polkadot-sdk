@@ -3,7 +3,7 @@
 use super::{Commit, VaultOp};
 use crate::{
 	liquidation::{final_recovery_keeper_reward, LiquidationSnapshot},
-	pallet::{BalanceOf, Config, Error, Event, Pallet},
+	pallet::{BalanceOf, Config, Error, Event, Pallet, StableCreditOf},
 	recovery,
 	types::{DebtCollateral, Vault, VaultStatus},
 };
@@ -44,7 +44,7 @@ impl<T: Config> VaultOp<T> {
 		ensure!(self.status.is_dormant(), Error::<T>::InvalidVaultStatus);
 		let debt = self.vault.debt.total();
 		ensure!(!debt.is_zero(), Error::<T>::DebtNotDust);
-		ensure!(debt < self.ctx.config.minimum_debt, Error::<T>::DebtNotDust);
+		ensure!(debt < self.ctx.branch.config.minimum_debt, Error::<T>::DebtNotDust);
 		let cr = self.ctx.collateralization_ratio(&self.vault.position())?;
 		ensure!(cr >= FixedU128::one(), Error::<T>::UnsafeCollateralizationRatio);
 		self.sync_dormant_target()
@@ -92,11 +92,15 @@ impl<T: Config> VaultOp<T> {
 		);
 		self.ctx.ensure_below_mcr(&self.vault.position())?;
 		ensure!(self.is_only_stake_bearer(), Error::<T>::NotLastEligibleVault);
-		let reward_due = self.ctx.state.final_recovery_reward_due(&self.ctx.config, self.ctx.now);
+		let reward_due = self
+			.ctx
+			.branch
+			.state
+			.final_recovery_reward_due(&self.ctx.branch.config, self.ctx.now);
 		if self.status.is_active() {
 			self.index_remove()?;
 		} else {
-			self.ctx.state.release_dormant_target(&self.owner);
+			self.ctx.branch.state.release_dormant_target(&self.owner);
 		}
 		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
 		self.set_status(VaultStatus::FinalRecovery)?;
@@ -106,7 +110,7 @@ impl<T: Config> VaultOp<T> {
 		}
 		let reward = self.pay_final_recovery_reward(keeper, price)?;
 		if !reward.is_zero() {
-			self.ctx.state.last_final_recovery_entry = Some(self.ctx.now);
+			self.ctx.branch.state.last_final_recovery_entry = Some(self.ctx.now);
 		}
 		Ok(reward)
 	}
@@ -119,9 +123,9 @@ impl<T: Config> VaultOp<T> {
 	) -> Result<BalanceOf<T>, DispatchError> {
 		let reward = final_recovery_keeper_reward(
 			self.vault.collateral,
-			self.full_payoff()?,
+			self.vault.debt.total(),
 			price,
-			&self.ctx.config.liquidation,
+			&self.ctx.branch.config.liquidation,
 		)
 		.ok_or(Error::<T>::ArithmeticOverflow)?;
 		debug_assert!(reward <= self.vault.collateral);
@@ -237,9 +241,13 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	/// Commits a liquidation and records the residual for redistribution.
+	///
+	/// `burned` is the stablecoin the liquidation withdrew to cancel debt: the commit issues out
+	/// of it and burns the rest.
 	pub(crate) fn finish_liquidation(
 		mut self,
 		redistribution: DebtCollateral<BalanceOf<T>>,
+		burned: Option<StableCreditOf<T>>,
 	) -> DispatchResult {
 		ensure!(redistribution.debt <= self.vault.debt.total(), Error::<T>::InvalidLiquidationPlan);
 		let collateral_out = self
@@ -255,7 +263,7 @@ impl<T: Config> VaultOp<T> {
 				.record_redistribution(redistribution, self.ctx.now)
 				.ok_or(Error::<T>::RedistributionWouldOverflow)?;
 		}
-		self.persist(true, None)
+		self.persist(true, burned)
 	}
 
 	/// Closes a debt-free vault and commits its collateral release.

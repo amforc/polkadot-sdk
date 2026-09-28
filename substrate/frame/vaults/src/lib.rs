@@ -54,7 +54,7 @@ pub use pusd_primitives;
 pub use types::{
 	AssetMinimums, BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate,
 	BranchDebt, BranchMode, BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState,
-	JitTerms, LiquidationConfig, LiquidationOutcome, RedistributionAccumulators,
+	JitTerms, LiquidationConfig, LiquidationOutcome, LiquidationTouch, RedistributionAccumulators,
 	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
 };
 pub use weights::WeightInfo;
@@ -210,6 +210,7 @@ pub mod pallet {
 			StableIdOf<Self>,
 			BalanceOf<Self>,
 			CollateralCreditOf<Self>,
+			StableCreditOf<Self>,
 		>;
 
 		/// Provides UNIX time in milliseconds.

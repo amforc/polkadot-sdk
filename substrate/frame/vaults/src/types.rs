@@ -98,6 +98,25 @@ pub struct LiquidationOutcome<Balance> {
 	pub keeper_reward: Balance,
 	/// Collateral returned to the liquidated vault's owner.
 	pub owner_surplus: Balance,
+	/// What loading the vault realized on it before the waterfall ran.
+	pub touch: LiquidationTouch<Balance>,
+}
+
+/// Pending changes a liquidation realized on the vault before splitting its debt.
+///
+/// An ordinary vault update reports these through [`Event::InterestAccrued`] and
+/// [`Event::RedistributionApplied`]. A liquidation reports them here instead, inside
+/// [`Event::VaultLiquidated`], so it emits one event for the vault rather than three.
+///
+/// [`Event::InterestAccrued`]: crate::Event::InterestAccrued
+/// [`Event::RedistributionApplied`]: crate::Event::RedistributionApplied
+/// [`Event::VaultLiquidated`]: crate::Event::VaultLiquidated
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LiquidationTouch<Balance> {
+	/// Accrued interest added to the vault's debt.
+	pub interest: Balance,
+	/// The vault's share of earlier liquidations: principal added and collateral credited.
+	pub redistribution: DebtCollateral<Balance>,
 }
 
 /// Reason a market is frozen.
