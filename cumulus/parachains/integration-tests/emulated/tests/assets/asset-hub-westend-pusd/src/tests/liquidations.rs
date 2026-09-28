@@ -64,8 +64,9 @@ fn liquidation_fully_covered_by_the_active_stability_pool() {
 }
 
 /// The 1,000 pUSD debt splits into 500 active, 200 JIT, 100 pending, and 200
-/// redistributed. Seizure weighs offsets at 1.05 and redistribution at 1.10.
-/// Collateral uses the same weights. Zero keeper compensation keeps the split round.
+/// redistributed. Seizure penalizes offsets at 1.05 and redistribution at 1.10.
+/// Collateral splits pro rata to the penalized debt. Zero keeper compensation keeps the split
+/// round.
 #[test]
 fn liquidation_splits_across_active_jit_pending_and_redistribution() {
 	AssetHubWestend::execute_with(|| {
@@ -118,7 +119,7 @@ fn liquidation_splits_across_active_jit_pending_and_redistribution() {
 		});
 		assert_ok!(liquidate_with(JitTerms { max_stable: 200 * PUSD, min_collateral_out: 0 }));
 
-		// total weight = 800 × 1.05 + 200 × 1.10 = 1,060 pUSD, so 530 WND is
+		// total penalized debt = 800 × 1.05 + 200 × 1.10 = 1,060 pUSD, so 530 WND is
 		// seized. The 70 WND surplus returns to the owner, with the vault's storage deposit.
 		let (_, deposit) = expected_vault_deposit(&get_native_id(), &liquidated_owner);
 		assert_eq!(native_balance(&liquidated_owner), 70 * WND + get_native_ed() + deposit);

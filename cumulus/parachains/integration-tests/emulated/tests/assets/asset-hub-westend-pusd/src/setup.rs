@@ -477,7 +477,7 @@ pub(crate) fn redistributed_husks() -> [AccountId; 2] {
 	});
 	let owners = [acct(1), acct(2)];
 	for owner in &owners {
-		// The existing redistribution ledger requires non-zero rate-weighted recipient stake.
+		// The existing redistribution ledger requires a non-zero recipient stake accrual rate.
 		open_vault(owner, 1_000 * WND, 500 * PUSD, FixedU128::from_rational(1, 100));
 		assert_ok!(Vaults::repay_for(
 			RuntimeOrigin::signed(owner.clone()),
