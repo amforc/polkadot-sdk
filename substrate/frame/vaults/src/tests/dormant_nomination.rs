@@ -84,4 +84,13 @@ fn nomination_rejects_non_dormant_non_dust_and_underwater_vaults() {
 		assert_ok!(repay(1, DOT, PUSD, 1, None));
 		assert_noop!(nominate_dormant(9, DOT, PUSD, 1), Error::<Test>::DebtNotDust);
 	});
+	// Each husk holds half the stake, so it owes 200 of the 400 redistributed: exactly the
+	// minimum. Debt that size is not dust, and the vault returns through activation instead.
+	build_and_execute(|| {
+		redistribute_to_husks(400);
+		assert_noop!(nominate_dormant(9, DOT, PUSD, 1), Error::<Test>::DebtNotDust);
+		assert_ok!(activate_dormant(9, DOT, PUSD, 1));
+		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 200);
+		assert!(vault_status(DOT, PUSD, 1).is_active());
+	});
 }
