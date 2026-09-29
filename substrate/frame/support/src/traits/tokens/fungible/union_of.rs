@@ -207,7 +207,8 @@ impl<
 	}
 	fn is_sufficient(asset: Self::AssetId) -> bool {
 		match Criterion::convert(asset) {
-			Left(()) => true,
+			// `fungible` has no notion of sufficiency.
+			Left(()) => false,
 			Right(a) => <Right as fungibles::Inspect<AccountId>>::is_sufficient(a),
 		}
 	}
