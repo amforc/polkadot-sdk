@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_events, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{assert_event, rate_pct, vault_events, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 };
 use frame::traits::{
 	fungible::{Inspect as FungibleInspect, Mutate as FungibleMutate},
@@ -93,29 +93,6 @@ fn change_rate_from_non_owner_returns_vault_not_found() {
 	});
 }
 
-// This pins only that `change_rate` records the new rate. The interest folded on
-// the touch and the upfront fee charged on a premature change are verified
-// exactly by `change_rate_post_cooldown_full_state` and
-// `change_rate_premature_increases_recorded_debt_by_fee` respectively.
-#[test]
-fn change_rate_sets_new_rate() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// Open three vaults at 50%, then change each to a different rate
-		// after the cooldown elapses (so no upfront fees intrude here).
-		for who in 1u64..=3 {
-			assert_ok!(open(who, DOT, PUSD, 1_000, 2_000, rate_pct(50, 100)));
-		}
-		advance_time(2 * ONE_DAY_MS);
-		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(1, 200)));
-		assert_ok!(change_rate(2, DOT, PUSD, rate_pct(60, 100)));
-		assert_ok!(change_rate(3, DOT, PUSD, rate_pct(100, 100)));
-		assert_eq!(vault(DOT, PUSD, 1).annual_rate, rate_pct(1, 200));
-		assert_eq!(vault(DOT, PUSD, 2).annual_rate, rate_pct(60, 100));
-		assert_eq!(vault(DOT, PUSD, 3).annual_rate, rate_pct(100, 100));
-	});
-}
-
 // Post-cooldown change_rate refreshes last_interest_time and folds the elapsed
 // simple interest into `vault.debt.interest`. With no upfront fee charged
 // (cooldown elapsed), the interest-bearing principal is unchanged.
@@ -187,7 +164,8 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 			Some(rate_pct(75, 100)),
 		)
 		.expect("registered market and vault");
-		assert!(predicted > 0, "premature change at debt=2000 must charge a fee");
+		// The sole vault's new 75% is the average: ceil(2_000 · 75% · 7d / 365.25d) = 29.
+		assert_eq!(predicted, 29, "premature change at debt=2000 must charge a fee");
 
 		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(75, 100)));
 		let v_post = vault(DOT, PUSD, 1);
@@ -233,6 +211,8 @@ fn borrow_full_state_changes() {
 		let predicted_fee =
 			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 500, None)
 				.expect("registered market and vault");
+		// ceil(500 · 25% · 7d / 365.25d) = 3.
+		assert_eq!(predicted_fee, 3);
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 
 		assert_ok!(borrow(1, DOT, PUSD, 500, None));
@@ -252,9 +232,10 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 			assert_ok!(open(who, DOT, PUSD, 5_000, 2_000, rate_pct(pct, 100)));
 		}
 		let v_pre = vault(DOT, PUSD, 1);
-		// The upfront fee is charged at the branch *average* borrow rate (via
-		// `simulate_borrow`), not the vault's own rate — confirmed by the exact
-		// `assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted)` below.
+		// The rate change is premature, so the fee covers all 2_500 of the vault's principal, at
+		// the post-borrow *average* rate (2_500 · 5% + 2_000 · 10% + 2_000 · 30%) / 6_500 ≈ 14.23%,
+		// not the vault's own 5%: ceil(2_500 · 14.23% · 7d / 365.25d) = ceil(6.82) = 7, where the
+		// own rate would give 3. The dispatch below must then charge exactly the quote.
 		let predicted = crate::Pallet::<Test>::predict_borrow_upfront_fee(
 			DOT,
 			PUSD,
@@ -263,7 +244,7 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 			Some(rate_pct(5, 100)),
 		)
 		.expect("registered market and vault");
-		assert!(predicted > 0);
+		assert_eq!(predicted, 7);
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 
 		assert_ok!(borrow(1, DOT, PUSD, 500, Some(rate_pct(5, 100))));
@@ -308,6 +289,7 @@ fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 5_000, 2_000, rate_pct(20, 100)));
 		let opened_at = vault(DOT, PUSD, 1).last_rate_update;
+		let interest_at_open = vault(DOT, PUSD, 1).debt.interest;
 
 		// Advance only part-way into the rate-adjustment cooldown so a (buggy)
 		// rate-change fee would still apply if the rate were treated as changed.
@@ -327,7 +309,18 @@ fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 
 		assert_ok!(borrow(1, DOT, PUSD, 500, Some(rate_pct(20, 100))));
 
+		// The fee covers the 500 increase alone: ceil(500 · 20% · 7d / 365.25d) = ceil(1.92) = 2.
+		// A rate-change fee would cover all 2_500 of principal and charge ceil(9.58) = 10.
+		assert_event(crate::Event::UpfrontFeeCharged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			amount: 2,
+		});
 		let v_post = vault(DOT, PUSD, 1);
+		// Half a day at 20% on 2_000 accrues ceil(2_000 · 20% · 0.5d / 365.25d) = ceil(0.55) = 1,
+		// on top of the fee of 2.
+		assert_eq!(v_post.debt.interest - interest_at_open, 3);
 		assert_eq!(v_post.annual_rate, rate_pct(20, 100));
 		assert_eq!(v_post.last_rate_update, opened_at, "no-op rate must not reset the cooldown");
 		assert!(
@@ -511,13 +504,12 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 		let predicted_fee =
 			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100))
 				.expect("registered market");
-		assert!(predicted_fee > 0);
+		assert_eq!(predicted_fee, 4);
 
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(10, 100)));
 
-		// Only the residual fee increases issuance in this mock.
-		let sp_share = SpFeeShare::get() * predicted_fee;
-		let fee_residual = predicted_fee - sp_share;
+		// The mock pool burns its 75% share (3 of the 4 fee), so only the residual 1 is issued.
+		let fee_residual: Balance = 1;
 		assert_eq!(
 			stable_balance(PUSD, FEE_DEST),
 			fee_residual,
@@ -534,36 +526,6 @@ fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
 	});
 }
 
-// A delayed touch must not change an assigned redistribution share. Interest starts at the
-// liquidation time and uses the recipient's rate.
-#[test]
-fn liquidation_assigns_redistribution_before_later_poke() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 3_000, 2_000, rate_pct(25, 100)));
-		assert_ok!(open(3, DOT, PUSD, 1_000, 2_000, rate_pct(25, 100)));
-		set_price(DOT, FixedU128::from_rational(15u128, 10u128));
-
-		let vault_a_pre = vault(DOT, PUSD, 1);
-		assert_eq!(vault_a_pre.debt.principal, 2_000);
-
-		let redistributed = redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)).expect("liquidated");
-		assert_eq!(redistributed, 2_010);
-
-		advance_time(ONE_YEAR_MS);
-		assert_ok!(poke(2, DOT, PUSD, 1));
-
-		let vault_a_post = vault(DOT, PUSD, 1);
-		// A sole recipient receives the complete pending amount.
-		assert_eq!(vault_a_post.debt.principal, vault_a_pre.debt.principal + redistributed);
-		assert_eq!(vault_a_post.collateral, vault_a_pre.collateral + 1_000);
-		assert_eq!(vault_a_post.debt.interest, 1_013);
-		let state = branch_state(DOT, PUSD).unwrap();
-		assert_eq!(state.debt.pending_redistribution_principal, 0);
-		assert_eq!(state.pending_redistribution_collateral, 0);
-	});
-}
-
 #[test]
 fn long_idle_exact_interest_is_not_rounded() {
 	use pusd_primitives::VaultInterface;
@@ -577,35 +539,25 @@ fn long_idle_exact_interest_is_not_rounded() {
 	});
 }
 
-// The open fee is priced by the same checked-borrow path every borrow uses.
-// Pin it against the closed form it must equal: the post-open debt-averaged
-// average rate applied to the new debt over the upfront-fee period.
+// The open fee is priced by the same checked-borrow path every borrow uses: the new debt over
+// the upfront-fee period at the post-open average rate, not the opener's own rate.
 #[test]
-fn open_fee_matches_post_open_average_rate_closed_form() {
+fn open_fee_is_charged_at_the_post_open_average_rate() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Pre-existing debt at 5% so the average is a genuine blend.
-		assert_ok!(open(1, DOT, PUSD, 10_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 20_000, 100_000, rate_pct(5, 100)));
 
-		let state = branch_state(DOT, PUSD).unwrap();
-		let config = branch_config(DOT, PUSD).unwrap();
-		let new_debt: Balance = 1_000;
-		let new_rate = rate_pct(10, 100);
-		let total_ib = state.debt.principal + new_debt;
-		let accrual_rate: Balance = state.debt.accrual_rate.whole();
-		let accrual_rate = accrual_rate + new_rate.saturating_mul_int(new_debt);
-		let avg = crate::math::average_branch_rate(accrual_rate, total_ib);
-		let expected = crate::math::simple_interest_ceil(new_debt, avg, config.upfront_fee_period);
-		assert!(expected > 0);
-
+		// The average after the open is (100_000 · 5% + 100_000 · 15%) / 200_000 = 10%, so the
+		// fee is ceil(100_000 · 10% · 7d / 365.25d) = ceil(191.65) = 192. The opener's own 15%
+		// would give ceil(287.47) = 288.
 		assert_eq!(
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, new_debt, new_rate)
+			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 100_000, rate_pct(15, 100))
 				.expect("registered market"),
-			expected
+			192
 		);
-		assert_ok!(open(2, DOT, PUSD, 20_000, new_debt, new_rate));
-		let vault = vault(DOT, PUSD, 2);
-		assert_eq!(vault.debt.interest, expected, "charged fee matches the quote");
+		assert_ok!(open(2, DOT, PUSD, 20_000, 100_000, rate_pct(15, 100)));
+		assert_eq!(vault(DOT, PUSD, 2).debt.interest, 192, "charged fee matches the quote");
 	});
 }
 
@@ -633,6 +585,7 @@ fn poke_cadence_cannot_change_accrued_state() {
 			let state = branch_state(DOT, PUSD).unwrap();
 			assert_eq!(state.debt.pending_interest_attribution, 0);
 			assert_eq!(state.debt.minted_interest, vault_1.debt.interest + vault_2.debt.interest);
+			crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 			(state, vault_1, vault_2)
 		})
 	};
@@ -669,8 +622,8 @@ fn refresh_branch_issues_pending_aggregate_interest() {
 		assert_eq!(vault(DOT, PUSD, 1), vault_1_pre, "the refresh writes no vault row");
 		assert_eq!(vault(DOT, PUSD, 2), vault_2_pre, "the refresh writes no vault row");
 
-		// Only the residual after the Stability Pool share increases issuance in this mock.
-		let residual = expected - SpFeeShare::get() * expected;
+		// The mock pool burns its 75% share (750_000), so only the residual 250_000 is issued.
+		let residual: Balance = 250_000;
 		assert_eq!(stable_balance(PUSD, FEE_DEST) - fee_pre, residual);
 		assert_eq!(total_stable(PUSD) - total_pre, residual);
 

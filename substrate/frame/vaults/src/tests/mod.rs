@@ -34,7 +34,8 @@ pub fn vault_status(
 	stable: StableId,
 	owner: AccountId,
 ) -> crate::types::VaultStatus {
-	crate::Pallet::<Test>::vault_status(collateral, stable, owner).expect("vault status")
+	assert!(crate::Vaults::<Test>::contains_key((&collateral, &stable, &owner)), "vault exists");
+	crate::Pallet::<Test>::vault_status_of(&collateral, &stable, &owner)
 }
 
 /// Asserts that the pallet emitted `event` in the current block.

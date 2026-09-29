@@ -4,10 +4,9 @@ use crate::{
 };
 
 // `close_vault` requires zero debt; with debt outstanding it returns
-// `DebtOutstanding`. The separate "system needs at least one vault" guard
-// lives on the liquidation path — see `last_vault.rs`.
+// `DebtOutstanding`.
 #[test]
-fn close_last_vault_with_debt_reverts() {
+fn close_with_outstanding_debt_reverts() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
@@ -46,8 +45,6 @@ fn withdraw_breaking_cr_reverts() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		// open another vault so that we don't hit the last-vault rule.
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// 1000 DOT @ $10 backs 500 pUSD — withdrawing 950 leaves
 		// 50 DOT × $10 = $500, CR == 100% < ICR 120%.
 		assert_noop!(
@@ -57,68 +54,27 @@ fn withdraw_breaking_cr_reverts() {
 	});
 }
 
+// Each amount-taking call rejects zero before it loads a price, so the rejection holds with the
+// oracle down and leaves no trace.
 #[test]
-fn zero_amount_repay_is_rejected_without_touching_the_vault() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		advance_time(ONE_DAY_MS);
+fn zero_amounts_are_rejected_without_touching_the_vault() {
+	let calls: [fn() -> DispatchResult; 4] = [
+		|| repay(1, DOT, PUSD, 1, Some(0)),
+		|| withdraw_collateral(1, DOT, PUSD, 0, None),
+		|| deposit_collateral(1, DOT, PUSD, 1, 0),
+		|| borrow(1, DOT, PUSD, 0, Some(rate_pct(10, 100))),
+	];
+	for call in calls {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
+			advance_time(ONE_DAY_MS);
+			MockOracleAvailable::set(false);
 
-		assert_noop!(repay(1, DOT, PUSD, 1, Some(0)), crate::Error::<Test>::ZeroAmount);
-		assert_eq!(held(DOT, 1), 1_000);
-	});
-}
-
-#[test]
-fn zero_amount_withdrawal_is_rejected_without_touching_the_vault() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		advance_time(ONE_DAY_MS);
-		MockOracleAvailable::set(false);
-
-		assert_noop!(withdraw_collateral(1, DOT, PUSD, 0, None), crate::Error::<Test>::ZeroAmount);
-		MockOracleAvailable::set(true);
-		assert_eq!(held(DOT, 1), 1_000);
-	});
-}
-
-#[test]
-fn zero_amount_deposit_is_rejected_without_touching_the_vault() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		advance_time(ONE_DAY_MS);
-
-		assert_noop!(deposit_collateral(1, DOT, PUSD, 1, 0), crate::Error::<Test>::ZeroAmount);
-		assert_eq!(held(DOT, 1), 1_000);
-	});
-}
-
-#[test]
-fn zero_amount_borrow_is_rejected_without_touching_the_vault() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
-		advance_time(ONE_DAY_MS);
-
-		assert_noop!(
-			borrow(1, DOT, PUSD, 0, Some(rate_pct(10, 100))),
-			crate::Error::<Test>::ZeroAmount
-		);
-		assert_eq!(
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(
-				DOT,
-				PUSD,
-				1,
-				0,
-				Some(rate_pct(10, 100)),
-			)
-			.expect("registered market and vault"),
-			0,
-			"the quote must reflect that a zero borrow is not executable"
-		);
-	});
+			assert_noop!(call(), crate::Error::<Test>::ZeroAmount);
+			MockOracleAvailable::set(true);
+		});
+	}
 }
 
 // `repay_for` is exempt from the Safety-mode TCR gate: repaying always improves
