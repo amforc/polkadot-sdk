@@ -420,6 +420,11 @@ pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
 		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
+		// Every test here drives the real Vaults pallet, whose invariants its own suite cannot
+		// see; they are reachable from outside the crate only through the try-runtime hook.
+		#[cfg(feature = "try-runtime")]
+		<Vaults as frame::deps::frame_support::traits::Hooks<_>>::try_state(System::block_number())
+			.expect("post-test vaults invariants hold");
 	});
 }
 

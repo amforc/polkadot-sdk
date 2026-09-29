@@ -40,35 +40,6 @@ pub trait StabilityPoolInspect<CollateralId, StableId, Balance> {
 	/// Returns the pending-deposit debt that `quote` can cancel, up to `max_debt`, given the
 	/// offset's `active_debt` (both legs burn from one custody account).
 	fn quote_pending(quote: &Self::Quote, max_debt: Balance, active_debt: Balance) -> Balance;
-
-	/// [`Self::quote_active`] on a fresh quote; zero without one.
-	fn reducible_active(
-		collateral_id: &CollateralId,
-		stable_id: &StableId,
-		branch: BranchSnapshot,
-		max_debt: Balance,
-	) -> Balance
-	where
-		Balance: Zero,
-	{
-		Self::quote(collateral_id, stable_id, branch)
-			.map_or_else(Balance::zero, |quote| Self::quote_active(&quote, max_debt))
-	}
-
-	/// [`Self::quote_pending`] on a fresh quote; zero without one.
-	fn reducible_pending(
-		collateral_id: &CollateralId,
-		stable_id: &StableId,
-		branch: BranchSnapshot,
-		max_debt: Balance,
-		active_debt: Balance,
-	) -> Balance
-	where
-		Balance: Zero,
-	{
-		Self::quote(collateral_id, stable_id, branch)
-			.map_or_else(Balance::zero, |quote| Self::quote_pending(&quote, max_debt, active_debt))
-	}
 }
 
 /// Applies liquidation offsets to Stability Pool markets.
@@ -77,11 +48,10 @@ pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit,
 {
 	/// Cancels exactly `debt` against pool deposits and pays `collateral` to each leg.
 	///
-	/// Fails unless, at the start:
+	/// Fails unless, at the start, both debts are zero or [`Self::quote`] returns a `quote` with:
 	///
-	/// - `debt.active == Self::reducible_active(collateral_id, stable_id, branch, debt.active)`
-	/// - `debt.pending == Self::reducible_pending(collateral_id, stable_id, branch, debt.pending,
-	///   debt.active)`
+	/// - `debt.active == Self::quote_active(&quote, debt.active)`
+	/// - `debt.pending == Self::quote_pending(&quote, debt.pending, debt.active)`
 	///
 	/// Returns the cancelled stablecoin as a credit (`None` if both debts are zero). Dropping it
 	/// burns it; a caller minting stablecoin in the same transaction may mint from it instead,
