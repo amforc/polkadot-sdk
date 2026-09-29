@@ -83,7 +83,7 @@ impl<T: Config<I>, I: 'static> fungibles::Inspect<<T as SystemConfig>::AccountId
 	}
 
 	fn is_sufficient(asset: Self::AssetId) -> bool {
-		Asset::<T, I>::get(asset).is_some_and(|details| details.is_sufficient)
+		Asset::<T, I>::get(asset).map(|x| x.is_sufficient).unwrap_or(false)
 	}
 }
 
