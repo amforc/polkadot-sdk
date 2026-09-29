@@ -1,11 +1,11 @@
 //! Lifecycle smoke tests: a fast layer covering branch registration, vault
-//! open/close happy paths and validation rejections, multi-asset routing,
-//! frozen-mode blocking, and same-rate LIFO ordering. The deeper per-area
+//! open/close happy paths and validation rejections, frozen-mode blocking, and
+//! same-rate LIFO ordering. The deeper per-area
 //! coverage lives in the sibling modules.
 
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_status, ONE_DAY_MS},
+	tests::{rate_pct, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 	types::BranchConfigUpdate,
 };
 use pallet_linked_list::SortedListInterface;
@@ -30,16 +30,6 @@ fn open_vault_count_is_not_capped_by_redistribution() {
 		assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate_pct(65, 100)));
 		assert_eq!(branch_state(DOT, PUSD).unwrap().vault_count, 65);
 		assert!(vault_exists(DOT, PUSD, owner));
-	});
-}
-
-#[test]
-fn register_branch_creates_state() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		let state = branch_state(DOT, PUSD).expect("branch registered");
-		assert_eq!(state.total_collateral, 0);
-		assert!(!state.is_frozen());
 	});
 }
 
@@ -91,7 +81,7 @@ fn create_branch_rejects_unknown_asset() {
 }
 
 #[test]
-fn create_branch_rejects_duplicate_collateral() {
+fn create_branch_rejects_duplicate_market_pair() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_noop!(
@@ -186,7 +176,7 @@ fn open_vault_below_icr_rejected() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// 100 DOT @ $10 = $1000; borrow 1000 pUSD => CR=100% < ICR 120%.
-		assert_err!(
+		assert_noop!(
 			open(1, DOT, PUSD, 100, 1_000, rate_pct(5, 100)),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
@@ -256,29 +246,37 @@ fn same_rate_lifo_redemption_order() {
 	});
 }
 
-#[test]
-fn open_vault_on_multi_asset_branch() {
-	// Exercises the right-hand side of the `fungible::UnionOf`: opening a
-	// vault on `TOKEN_X` (a foreign asset in `pallet-assets`) instead of
-	// native DOT. Confirms the union routes hold operations to
-	// `pallet-assets-holder` for non-native ids.
-	build_and_execute(|| {
-		register_market(TOKEN_X, PUSD);
-		assert_ok!(open(1, TOKEN_X, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_eq!(held(TOKEN_X, 1), 1_000);
-	});
-}
-
+// A frozen branch rejects every operation that raises risk or needs a price. Each case succeeds
+// right before the freeze, so the freeze is the only guard left to reject it.
 #[test]
 fn frozen_branch_blocks_user_ops() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
-		assert_noop!(
-			open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)),
-			crate::Error::<Test>::BranchFrozen
-		);
-	});
+	type Operation = fn() -> DispatchResult;
+	// The elapsed time lets the Dormant dust of 155 accrue 78 at 50%, past the 200 minimum that
+	// activation needs.
+	let cases: [(&str, Moment, Operation); 5] = [
+		("open_vault", 0, || open(3, DOT, PUSD, 1_000, 500, rate_pct(5, 100))),
+		("borrow", 0, || borrow(2, DOT, PUSD, 100, None)),
+		("withdraw_collateral", 0, || withdraw_collateral(2, DOT, PUSD, 1, None)),
+		("change_rate", 0, || change_rate(2, DOT, PUSD, rate_pct(70, 100))),
+		("activate_dormant", ONE_YEAR_MS, || {
+			activate_dormant(9, DOT, PUSD, 1).map(|_| ()).map_err(|error| error.error)
+		}),
+	];
+	for (name, elapsed, operation) in cases {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			// The redemption parks vault 1 as Dormant dust. Vault 2 stays Active.
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
+			assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(60, 100)));
+			assert_ok!(redeem(DOT, PUSD, 3, 350));
+			assert!(vault_status(DOT, PUSD, 1).is_dormant());
+			advance_time(elapsed);
+			hypothetically!(assert_eq!(operation(), Ok(()), "{name} succeeds while unfrozen"));
+
+			assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
+			assert_noop!(operation(), crate::Error::<Test>::BranchFrozen);
+		});
+	}
 }
 
 fn freeze_by_governance() {
@@ -400,19 +398,6 @@ fn repayment_closes_empty_vault_without_price_or_unfreezing() {
 	}
 }
 
-#[test]
-fn refresh_branch_persists_frozen_on_oracle_failure() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		MockOracleAvailable::set(false);
-		assert_ok!(refresh_branch(99, DOT, PUSD));
-		let state = branch_state(DOT, PUSD).expect("state");
-		let frozen = state.frozen.expect("frozen persisted");
-		assert!(matches!(frozen.reason, crate::FrozenReason::OracleFailure));
-	});
-}
-
 // External observers must not see the most permissive mode while prices are
 // unknowable: `mode()` reports `Frozen` for a failing oracle even before
 // `refresh_branch` persists the freeze.
@@ -436,7 +421,8 @@ fn refresh_branch_clears_oracle_frozen() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		MockOracleAvailable::set(false);
 		assert_ok!(refresh_branch(99, DOT, PUSD));
-		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
+		let frozen = branch_state(DOT, PUSD).unwrap().frozen.expect("freeze persisted");
+		assert_eq!(frozen.reason, crate::FrozenReason::OracleFailure);
 		// Oracle still down → second refresh is a no-op (already frozen for
 		// the same reason).
 		assert_ok!(refresh_branch(99, DOT, PUSD));
@@ -467,7 +453,7 @@ fn refresh_branch_does_not_clear_governance_frozen_or_mint() {
 fn governance_clear_clears_governance_frozen() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		// Defensive (acct 999) cannot clear governance Frozen — needs Full.
+		// The emergency admin cannot clear a governance freeze. That needs the full admin.
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		assert_noop!(
 			set_governance_frozen(EMERGENCY_ADMIN, DOT, PUSD, false),

@@ -8,7 +8,7 @@
 
 use crate::{
 	mock::*,
-	tests::{rate_pct, ONE_YEAR_MS},
+	tests::{rate_pct, vault_status, ONE_YEAR_MS},
 	types::BranchConfigUpdate,
 	Error,
 };
@@ -22,7 +22,7 @@ use frame::{
 		AccountTouch,
 	},
 };
-use pusd_primitives::{collateralization_ratio, CollateralRatio};
+use pusd_primitives::CollateralRatio;
 
 fn xbt_vault(owner: AccountId) -> crate::types::Vault<Balance> {
 	crate::mock::vault(XBT, USDX, owner)
@@ -100,20 +100,20 @@ fn lifecycle_exact_at_realistic_scale() {
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
 		assert_eq!(stable_balance(USDX, 1), 5_000 * USD, "borrowed amount minted at scale");
 
+		// ceil(5×10^9 · 5% · 7d / 365.25d) = ceil(4_791_238.88) minor units.
 		let fee = xbt_vault(1).debt.interest;
-		assert!(fee > 0, "upfront fee recorded as interest");
-		let cr = crate::Pallet::<Test>::vault_cr(XBT, USDX, 1).expect("cr");
-		let expected = collateralization_ratio(
-			&pusd_primitives::DebtCollateral {
-				debt: 5_000 * USD + fee,
-				collateral: 1_000 * XBT_UNIT,
-			},
-			FixedU128::from_rational(1u128, 1_000u128),
-		)
-		.expect("cr");
-		assert_eq!(cr, expected);
-		let CollateralRatio::Ratio(expected) = expected else { panic!("vault carries debt") };
-		assert_eq!(expected.trunc(), FixedU128::from_u32(1), "human CR just under 200%");
+		assert_eq!(fee, 4_791_239, "upfront fee recorded as interest");
+		// 10^13 minor units at 10^-3 are worth 10^10 against 5_004_791_239 of debt. The ratio
+		// rounds down to ≈ 1.998, just under 200%.
+		let expected = FixedU128::from_rational_with_rounding(
+			10_000_000_000,
+			5_004_791_239,
+			frame::arithmetic::Rounding::Down,
+		);
+		assert_eq!(
+			crate::Pallet::<Test>::vault_cr(XBT, USDX, 1).expect("cr"),
+			CollateralRatio::Ratio(expected)
+		);
 
 		// One year at 5% on 5×10^9 minor units: exactly 250 USDX of interest.
 		advance_time(ONE_YEAR_MS);
@@ -123,7 +123,7 @@ fn lifecycle_exact_at_realistic_scale() {
 		// Fund the interest, repay to a husk, close, and get the collateral back.
 		assert_ok!(<Assets as FungiblesMutate<AccountId>>::mint_into(USDX, &1, fee + 250 * USD));
 		assert_ok!(repay(1, XBT, USDX, 1, Some(10_000 * USD)));
-		assert!(crate::Pallet::<Test>::vault_status(XBT, USDX, 1).expect("status").is_dormant());
+		assert!(vault_status(XBT, USDX, 1).is_dormant());
 		assert_ok!(close_vault(1, XBT, USDX, None));
 		assert_eq!(held(XBT, 1), 0);
 		assert_eq!(collateral_balance(XBT, 1), 100_000_000 * XBT_UNIT, "genesis balance restored");

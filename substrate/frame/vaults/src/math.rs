@@ -208,31 +208,27 @@ mod tests {
 	}
 
 	#[test]
-	fn simple_interest_ceil_zero_inputs() {
-		assert_eq!(simple_interest_ceil::<u128>(0, FixedU128::one(), 1_000), 0);
-		assert_eq!(simple_interest_ceil::<u128>(1_000, FixedU128::zero(), 1_000), 0);
-		assert_eq!(simple_interest_ceil::<u128>(1_000, FixedU128::one(), 0), 0);
-	}
-
-	#[test]
-	fn simple_interest_ceil_exact_year_has_no_rounding() {
-		let r = FixedU128::saturating_from_rational(10u32, 100u32);
-		let got = simple_interest_ceil::<u128>(1_000_000, r, MILLIS_PER_YEAR);
-		assert_eq!(got, 100_000);
-	}
-
-	#[test]
-	fn simple_interest_ceil_rounds_up_on_remainder() {
-		// A positive fraction rounds up to one.
-		let got = simple_interest_ceil::<u128>(3, FixedU128::one(), 1);
-		assert_eq!(got, 1);
-	}
-
-	#[test]
-	fn average_branch_rate_recovers_rate_fraction() {
-		// An accrual rate of 500 over 10,000 debt is a 5% rate.
-		let avg = average_branch_rate::<u128>(500, 10_000);
-		assert_eq!(avg, FixedU128::from_rational(5u128, 100u128));
+	fn simple_interest_ceil_is_exact_or_rounds_up() {
+		let one = FixedU128::one();
+		let ten_percent = FixedU128::saturating_from_rational(10u32, 100u32);
+		// Each case is `(principal, rate, elapsed milliseconds, interest)`.
+		let cases: [(u128, FixedU128, u64, u128); 5] = [
+			// Any zero input yields no interest.
+			(0, one, 1_000, 0),
+			(1_000, FixedU128::zero(), 1_000, 0),
+			(1_000, one, 0, 0),
+			// An exact year has no rounding.
+			(1_000_000, ten_percent, MILLIS_PER_YEAR, 100_000),
+			// A positive fraction rounds up to one.
+			(3, one, 1, 1),
+		];
+		for (principal, rate, elapsed, interest) in cases {
+			assert_eq!(
+				simple_interest_ceil::<u128>(principal, rate, elapsed),
+				interest,
+				"{principal} at {rate:?} over {elapsed} ms"
+			);
+		}
 	}
 
 	#[test]

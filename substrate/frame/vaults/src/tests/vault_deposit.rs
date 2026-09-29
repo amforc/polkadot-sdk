@@ -3,18 +3,8 @@
 //! The mock settles in the collateral when it is native or sufficient and in native otherwise,
 //! and re-prices sufficient collateral through the oracle or a mock fallback quote.
 
-use crate::{
-	mock::*,
-	pallet::Vaults as VaultRows,
-	tests::rate_pct,
-	types::{Vault, VaultListId},
-};
-use frame::{
-	deps::codec::{Encode, MaxEncodedLen},
-	prelude::TokenError,
-	traits::Footprint,
-};
-use linked_list_interface::SortedListInterface;
+use crate::{mock::*, tests::rate_pct};
+use frame::{prelude::TokenError, traits::Footprint};
 
 const OWNER: AccountId = 1;
 
@@ -33,15 +23,10 @@ fn footprint_includes_vault_record_and_rate_list_node() {
 	build_and_execute(|| {
 		let footprint = Vaults::vault_footprint(&DOT, &PUSD, &OWNER);
 		assert_eq!(footprint.asset, DOT);
-		let vault_key = VaultRows::<Test>::hashed_key_for((&DOT, &PUSD, &OWNER)).len();
-		let ticket = DOT.encoded_size() + Balance::max_encoded_len();
-		let node = <LinkedList as SortedListInterface<_, _>>::node_footprint(
-			&VaultListId::Rate(DOT, PUSD),
-			&OWNER,
-		);
-		let expected =
-			vault_key + Vault::<Balance>::max_encoded_len() + ticket + node.size as usize;
-		assert_eq!(footprint.footprint, Footprint::from_parts(1, expected));
+		// One item of 398 bytes: the 93-byte hashed vault key, the 176-byte max-encoded `Vault`,
+		// the 17-byte deposit ticket (1-byte asset plus 16-byte balance), and the 112-byte
+		// rate-list node.
+		assert_eq!(footprint.footprint, Footprint::from_parts(1, 398));
 	});
 }
 
@@ -131,9 +116,16 @@ fn owner_short_of_the_deposit_cannot_open() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		const NEWCOMER: AccountId = 11;
+		// A balance that covers the collateral but is below the deposit alone.
+		mint_collateral(DOT, NEWCOMER, VAULT_DEPOSIT - 1);
+		assert_noop!(
+			open(NEWCOMER, DOT, PUSD, 100, 200, default_rate()),
+			TokenError::FundsUnavailable
+		);
+
 		// Collateral, deposit, and the existential deposit a hold must leave free.
 		let exact = 1_000 + VAULT_DEPOSIT + 1;
-		mint_collateral(DOT, NEWCOMER, exact - 1);
+		mint_collateral(DOT, NEWCOMER, exact - VAULT_DEPOSIT);
 
 		assert_noop!(
 			open(NEWCOMER, DOT, PUSD, 1_000, 500, default_rate()),

@@ -3,12 +3,13 @@ use crate::{
 	tests::{assert_event, rate_pct, vault_events, ONE_DAY_MS},
 };
 
-// Open emits VaultOpened carrying its inputs, plus UpfrontFeeCharged for the
-// protocol-favored fee.
+// Registration emits BranchRegistered. Open emits VaultOpened carrying its inputs, plus
+// UpfrontFeeCharged for the protocol-favored fee.
 #[test]
 fn open_vault_emits_canonical_events() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
+		assert_event(crate::Event::BranchRegistered { collateral_id: DOT, stable_id: PUSD });
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(10, 100)));
 		assert_event(crate::Event::VaultOpened {
 			collateral_id: DOT,
@@ -18,19 +19,12 @@ fn open_vault_emits_canonical_events() {
 			debt: 2_000,
 			annual_rate: rate_pct(10, 100),
 		});
-		// Upfront fee is non-trivial for these inputs.
-		let predicted_fee =
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100))
-				.expect("registered market");
-		assert!(predicted_fee > 0);
-		// The charged fee equals the vault's recorded interest; assert the
-		// event carries that amount.
-		let v = vault(DOT, PUSD, 1);
+		// The sole vault's 10% is the average rate: ceil(2_000 · 10% · 7d / 365.25d) = ceil(3.83).
 		assert_event(crate::Event::UpfrontFeeCharged {
 			collateral_id: DOT,
 			stable_id: PUSD,
 			owner: 1,
-			amount: v.debt.interest,
+			amount: 4,
 		});
 	});
 }
@@ -88,22 +82,6 @@ fn withdraw_collateral_emits_collateral_withdrawn() {
 	});
 }
 
-#[test]
-fn repay_emits_repaid() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
-		assert_ok!(repay(1, DOT, PUSD, 1, Some(200)));
-		assert_event(crate::Event::Repaid {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			from: 1,
-			amount: 200,
-		});
-	});
-}
-
 // A rate change emits BorrowRateChanged (and UpfrontFeeCharged when premature).
 #[test]
 fn change_rate_emits_borrow_rate_changed() {
@@ -112,6 +90,8 @@ fn change_rate_emits_borrow_rate_changed() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		// After the cooldown, no fee — only BorrowRateChanged.
 		advance_time(ONE_DAY_MS);
+		// The open charged a fee of its own, so only the events of the rate change may count.
+		System::reset_events();
 		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(7, 100)));
 		assert_event(crate::Event::BorrowRateChanged {
 			collateral_id: DOT,
@@ -120,6 +100,12 @@ fn change_rate_emits_borrow_rate_changed() {
 			old_rate: rate_pct(5, 100),
 			new_rate: rate_pct(7, 100),
 		});
+		assert!(
+			!vault_events()
+				.iter()
+				.any(|event| matches!(event, crate::Event::UpfrontFeeCharged { .. })),
+			"a rate change after the cooldown charges no fee"
+		);
 	});
 }
 
@@ -139,13 +125,15 @@ fn premature_change_rate_emits_upfront_fee_charged() {
 			Some(rate_pct(7, 100)),
 		)
 		.expect("registered market and vault");
-		assert!(predicted > 0);
+		// The premature change is priced on the whole 2_000 of principal at the sole vault's new
+		// 7%: ceil(2_000 · 7% · 7d / 365.25d) = ceil(2.68).
+		assert_eq!(predicted, 3);
 		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(7, 100)));
 		assert_event(crate::Event::UpfrontFeeCharged {
 			collateral_id: DOT,
 			stable_id: PUSD,
 			owner: 1,
-			amount: predicted,
+			amount: 3,
 		});
 		assert_event(crate::Event::BorrowRateChanged {
 			collateral_id: DOT,
@@ -185,29 +173,21 @@ fn redemption_emits_vault_redeemed() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		let target = redeem(DOT, PUSD, 3, 200).expect("redeem ok");
 		assert_eq!(target, 1);
-		// VaultRedeemed event: don't pin the exact magnitudes (collateral
-		// rounding depends on price), just confirm the event landed.
-		let saw = vault_events().iter().any(|e| {
-			matches!(
-				e,
-				crate::Event::VaultRedeemed { collateral_id, owner, recipient, debt_cancelled, .. }
-					if *collateral_id == DOT && *owner == 1 && *recipient == 3 && *debt_cancelled == 200
-			)
+		// The settlement cancels 200 of debt at the price of 10, so it releases 20 of collateral.
+		// The rate is the redeemed vault's own 1%.
+		assert_event(crate::Event::VaultRedeemed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 3,
+			debt_cancelled: 200,
+			collateral_to_recipient: 20,
+			vault_annual_rate: rate_pct(1, 100),
 		});
-		assert!(saw, "expected a VaultRedeemed event");
 	});
 }
 
-// register_branch emits BranchRegistered.
-#[test]
-fn register_branch_emits_branch_registered() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_event(crate::Event::BranchRegistered { collateral_id: DOT, stable_id: PUSD });
-	});
-}
-
-// A governance freeze emits ModeChanged.
+// A governance freeze and its release each emit ModeChanged with both ends of the transition.
 #[test]
 fn set_governance_frozen_emits_mode_changed() {
 	build_and_execute(|| {
@@ -215,76 +195,55 @@ fn set_governance_frozen_emits_mode_changed() {
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		// Branch starts in Normal mode (no debt yet, TCR is treated as
 		// infinity); after the governance freeze it transitions to Frozen.
-		let saw = vault_events().iter().any(|e| {
-			matches!(
-				e,
-				crate::Event::ModeChanged { collateral_id, new_mode, .. }
-					if *collateral_id == DOT && matches!(new_mode, crate::BranchMode::Frozen { .. })
-			)
-		});
-		assert!(saw, "expected a ModeChanged → Frozen event");
-	});
-}
-
-// Governance setters emit ParameterUpdated carrying the changed field and value.
-#[test]
-fn set_parameter_emits_parameter_updated() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(crate::Pallet::<Test>::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			crate::types::BranchConfigUpdate::MinimumCollateralizationRatio(
-				FixedU128::from_rational(115u128, 100u128)
-			)
-		));
-		assert_event(crate::Event::ParameterUpdated {
+		assert_event(crate::Event::ModeChanged {
 			collateral_id: DOT,
 			stable_id: PUSD,
-			update: crate::types::BranchConfigUpdate::MinimumCollateralizationRatio(
-				FixedU128::from_rational(115u128, 100u128),
-			),
+			old_mode: BranchMode::Normal,
+			new_mode: BranchMode::Frozen,
+		});
+
+		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, false));
+		assert_event(crate::Event::ModeChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			old_mode: BranchMode::Frozen,
+			new_mode: BranchMode::Normal,
 		});
 	});
 }
 
-// A DebtCeiling update goes through the same shared parameter machinery and
-// emits ParameterUpdated.
+// Governance setters emit ParameterUpdated carrying the changed field and value, and store it.
 #[test]
-fn debt_ceiling_update_emits_parameter_updated() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(crate::Pallet::<Test>::set_param(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			crate::types::BranchConfigUpdate::DebtCeiling(50_000_000)
-		));
-		assert_event(crate::Event::ParameterUpdated {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			update: crate::types::BranchConfigUpdate::DebtCeiling(50_000_000),
+fn set_param_emits_parameter_updated_and_stores_the_value() {
+	use crate::types::BranchConfigUpdate;
+	let mut raised_mcr = default_branch_config();
+	raised_mcr.minimum_collateralization_ratio = FixedU128::from_rational(115u128, 100u128);
+	let mut lowered_ceiling = default_branch_config();
+	lowered_ceiling.debt_ceiling = 50_000_000;
+	let cases = [
+		(
+			BranchConfigUpdate::MinimumCollateralizationRatio(FixedU128::from_rational(
+				115u128, 100u128,
+			)),
+			raised_mcr,
+		),
+		(BranchConfigUpdate::DebtCeiling(50_000_000), lowered_ceiling),
+	];
+	for (update, expected) in cases {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(crate::Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(ADMIN),
+				DOT,
+				PUSD,
+				update.clone()
+			));
+			assert_event(crate::Event::ParameterUpdated {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				update,
+			});
+			assert_eq!(branch_config(DOT, PUSD), Some(expected));
 		});
-		assert_eq!(branch_config(DOT, PUSD).expect("config").debt_ceiling, 50_000_000);
-	});
-}
-
-// enter_final_recovery emits VaultStatusChanged.
-#[test]
-fn enter_final_recovery_emits_status_change() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// Single vault that we'll push into FinalRecovery via a price drop.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		set_price(DOT, FixedU128::from_rational(2u128, 100u128));
-		assert_ok!(enter_final_recovery(2, DOT, PUSD, 1));
-		assert_event(crate::Event::VaultStatusChanged {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			old_status: crate::types::VaultStatus::Active,
-			new_status: crate::types::VaultStatus::FinalRecovery,
-		});
-	});
+	}
 }

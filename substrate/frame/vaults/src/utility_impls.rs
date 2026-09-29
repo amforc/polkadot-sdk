@@ -415,18 +415,6 @@ impl<T: Config> Pallet<T> {
 		VaultStatus::Dormant
 	}
 
-	/// Returns the vault's status, or `None` when the vault does not exist.
-	///
-	/// Not a view: [`Pallet::vault_after_touch`] reports the same status.
-	pub fn vault_status(
-		collateral_id: CollateralIdOf<T>,
-		stable_id: StableIdOf<T>,
-		owner: T::AccountId,
-	) -> Option<VaultStatus> {
-		Vaults::<T>::contains_key((&collateral_id, &stable_id, &owner))
-			.then(|| Self::vault_status_of(&collateral_id, &stable_id, &owner))
-	}
-
 	/// Derive the lifecycle status of an existing vault row from queue/index
 	/// membership. Status is not stored on the row, and the keys must be
 	/// re-supplied because the row does not carry them.

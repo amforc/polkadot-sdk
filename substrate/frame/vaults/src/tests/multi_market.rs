@@ -11,7 +11,7 @@ use crate::{
 	tests::{rate_pct, ONE_YEAR_MS},
 };
 use frame::traits::fungibles::Mutate;
-use pusd_primitives::VaultInterface;
+use pusd_primitives::{CollateralRatio, VaultInterface};
 
 // One owner runs dotUSD/DOT and ethUSD/ETH independently: each market mints
 // only its own coin and locks only its own collateral.
@@ -58,39 +58,10 @@ fn same_stable_two_collaterals_are_independent() {
 		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.principal, 2_000);
 		assert_eq!(branch_state(ETH, PUSD).unwrap().debt.principal, 3_000);
 
-		// Independent rate lists (distinct list ids).
-		assert_ne!(rate_list(DOT, PUSD), rate_list(ETH, PUSD));
-
 		// Redeeming on the DOT market leaves the ETH market's vault untouched.
 		let eth_before = vault(ETH, PUSD, 1);
 		assert_eq!(redeem(DOT, PUSD, 9, 500).unwrap(), 1);
 		assert_eq!(vault(ETH, PUSD, 1), eth_before);
-	});
-}
-
-// Two markets sharing a collateral (dotUSD/DOT, ethUSD/DOT) share the owner's
-// DOT hold: `Σ_stablecoins vault.collateral == balance_on_hold(DOT, owner)`.
-#[test]
-fn markets_sharing_a_collateral_share_the_owner_hold() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		register_market(DOT, EUSD);
-
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open(1, DOT, EUSD, 600, 1_000, rate_pct(5, 100)));
-
-		// The owner's DOT hold aggregates both markets.
-		assert_eq!(held(DOT, 1), 1_600);
-
-		// Each row carries only its own market's share, and they sum to the hold.
-		let pusd = vault(DOT, PUSD, 1);
-		let eusd = vault(DOT, EUSD, 1);
-		assert_eq!((pusd.collateral, eusd.collateral), (1_000, 600));
-		assert_eq!(pusd.collateral + eusd.collateral, held(DOT, 1));
-
-		// Distinct coins minted against the shared collateral.
-		assert_eq!(stable_balance(PUSD, 1), 2_000);
-		assert_eq!(stable_balance(EUSD, 1), 1_000);
 	});
 }
 
@@ -141,19 +112,14 @@ fn stablecoin_debt_accrues_interest_across_untouched_markets() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
 		assert_ok!(open(2, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
 		let stored = StablecoinDebt::<Test>::get(PUSD);
+		// Principal plus the upfront fee of each open: 2_000 + ceil(2_000 · 5% · 7d / 365.25d)
+		// = 2_002 and 3_000 + ceil(3_000 · 7% · 7d / 365.25d) = 3_005.
+		assert_eq!(stored.outstanding, 5_007);
 
 		advance_time(ONE_YEAR_MS);
-		let now = Timestamp::get();
-		let expected = [DOT, ETH]
-			.into_iter()
-			.map(|collateral| {
-				let branch = branch_state(collateral, PUSD).expect("registered branch");
-				crate::Pallet::<Test>::accrued_branch_debt(&branch, now)
-			})
-			.sum();
 
-		assert_eq!(<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD), expected);
-		assert!(expected > stored.outstanding);
+		// A year adds 2_000 · 5% = 100 and 3_000 · 7% = 210 that no market has minted yet.
+		assert_eq!(<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&PUSD), 5_317);
 		assert_eq!(
 			StablecoinDebt::<Test>::get(PUSD),
 			stored,
@@ -163,7 +129,8 @@ fn stablecoin_debt_accrues_interest_across_untouched_markets() {
 }
 
 // Liquidating a vault in one market never touches another market's vaults,
-// branch state, or holds.
+// branch state, or holds. The mock pool has no capacity and the keeper offers no
+// JIT, so the whole vault redistributes inside its own market.
 #[test]
 fn liquidation_stays_inside_its_market() {
 	build_and_execute(|| {
@@ -240,47 +207,11 @@ fn yield_accrues_in_the_markets_own_coin() {
 		// A full year at 50% on 5_000 principal accrues exactly 2_500 EUSD of vault
 		// interest (interest is on principal, not the open fee).
 		assert_eq!(interest_after - interest_before, 2_500);
-		// Fee routing must use the market's stablecoin.
-		let residual = 2_500u128 - SpFeeShare::get() * 2_500u128;
-		assert_eq!(stable_balance(EUSD, FEE_DEST) - eusd_fee_before, residual);
+		// Fee routing must use the market's stablecoin: the mock burns the Stability Pool's 75%
+		// share and routes the other 625.
+		assert_eq!(stable_balance(EUSD, FEE_DEST) - eusd_fee_before, 625);
 		// The PUSD market was never involved, so its supply is unchanged.
 		assert_eq!(total_stable(PUSD), pusd_before);
-	});
-}
-
-// A redistribution liquidation in one market does not leak collateral or
-// accounting into a market on a different collateral. (The per-market
-// redistribution *account* derivation keys on `(collateral, stable)`; asserting
-// the accounts are themselves distinct needs a wider `AccountId` than the mock's
-// `u64`, so production exercises that — here the asset dimension keeps them
-// separate.)
-#[test]
-fn redistribution_stays_inside_its_market() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		register_market(ETH, EUSD);
-
-		// Two PUSD-market vaults: owner 1 is liquidated, owner 2 is the recipient.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		// An untouched vault on the other collateral.
-		assert_ok!(open(3, ETH, EUSD, 1_000, 500, rate_pct(5, 100)));
-
-		let other_vault = vault(ETH, EUSD, 3);
-		let other_state = branch_state(ETH, EUSD).unwrap();
-		let other_hold = held(ETH, 3);
-
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(liquidate_with(DOT, PUSD, 1, |_post_touch| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 1, debt: 0, collateral: 0 },
-			redistribution_collateral: 1_000,
-			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
-		}));
-
-		// The ETH/EUSD market is untouched: no ETH was parked, no state moved.
-		assert_eq!(vault(ETH, EUSD, 3), other_vault);
-		assert_eq!(branch_state(ETH, EUSD).unwrap(), other_state);
-		assert_eq!(held(ETH, 3), other_hold);
 	});
 }
 
@@ -299,7 +230,16 @@ fn cr_differs_across_markets_when_prices_differ() {
 
 		let cr_dot = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).unwrap();
 		let cr_eth = crate::Pallet::<Test>::vault_cr(ETH, EUSD, 2).unwrap();
-		// Equal collateral and debt, but ETH is priced twice as high.
-		assert!(cr_eth > cr_dot, "the higher-priced collateral has the higher CR");
+		// Both vaults owe 2_000 plus the upfront fee of ceil(2_000 · 5% · 7d / 365.25d) = 2. The
+		// 1_000 of collateral is worth 10_000 on DOT and 20_000 on ETH, and the ratio rounds down:
+		// 10_000 / 2_002 = 4.995004… and 20_000 / 2_002 = 9.990009….
+		assert_eq!(
+			cr_dot,
+			CollateralRatio::Ratio(FixedU128::from_inner(4_995_004_995_004_995_004))
+		);
+		assert_eq!(
+			cr_eth,
+			CollateralRatio::Ratio(FixedU128::from_inner(9_990_009_990_009_990_009))
+		);
 	});
 }

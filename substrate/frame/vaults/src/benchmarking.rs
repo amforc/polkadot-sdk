@@ -560,8 +560,8 @@ mod benchmarks {
 		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone());
 
 		assert_eq!(
-			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
-			Some(VaultStatus::FinalRecovery)
+			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
+			VaultStatus::FinalRecovery
 		);
 		Ok(())
 	}
@@ -581,8 +581,8 @@ mod benchmarks {
 		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), hint);
 
 		assert_eq!(
-			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
-			Some(VaultStatus::Active)
+			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
+			VaultStatus::Active
 		);
 		Ok(())
 	}
@@ -600,8 +600,8 @@ mod benchmarks {
 		let remaining = balance::<T>(199);
 		redeem_debt_only::<T>(&asset, &owner, |snapshot| snapshot.debt.saturating_sub(remaining))?;
 		assert_eq!(
-			Pallet::<T>::vault_status(asset.clone(), stable::<T>(), owner.clone()),
-			Some(VaultStatus::Dormant)
+			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
+			VaultStatus::Dormant
 		);
 		// Accrue interest until the fully-accrued debt is back at/above
 		// `minimum_debt`, so the vault is activation-eligible.
@@ -616,8 +616,8 @@ mod benchmarks {
 		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), hint);
 
 		assert_eq!(
-			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
-			Some(VaultStatus::Active)
+			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
+			VaultStatus::Active
 		);
 		Ok(())
 	}
