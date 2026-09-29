@@ -3,8 +3,7 @@
 //! `None` means a zero price, an overflow, or inputs outside the function's regime. Callers must
 //! treat it as an error.
 
-pub use crate::math::{collateral_for_value_ceil, collateral_for_value_floor};
-use crate::mul_div_floor;
+use crate::{math::collateral_for_value_floor, mul_div_floor};
 use frame::deps::sp_runtime::{
 	traits::{CheckedAdd, One, Saturating},
 	FixedPointNumber, FixedPointOperand, FixedU128, Permill,
@@ -135,15 +134,10 @@ mod tests {
 		// CR below 100% (an underwater vault) → still 0, no underflow.
 		let cr = FixedU128::from_rational(99, 100);
 		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::zero());
-	}
-
-	#[test]
-	fn recovery_bonus_never_worsens_cr() {
-		// bonus <= cr - 1 for any inputs; here a huge penalty cannot exceed the
-		// CR-derived excess.
+		// Without a buffer, a 100% penalty cannot lift the bonus past the CR excess, so paying it
+		// never worsens the CR.
 		let cr = FixedU128::from_rational(105, 100);
 		let bonus = recovery_bonus(cr, Permill::zero(), Permill::from_percent(100));
-		assert!(bonus <= cr.saturating_sub(FixedU128::one()));
 		assert_eq!(bonus, FixedU128::from_rational(5, 100));
 	}
 
@@ -169,48 +163,35 @@ mod tests {
 		);
 	}
 
+	/// Verifies the below-par split of debt `D` against collateral value `C` and fund `IF`.
+	///
+	/// The cover is `min(IF, D - C)` and the market cancels the rest, so its recovery rate
+	/// `C / market_cancel` stays at most 1.
 	#[test]
-	fn insurance_adjusted_rejects_above_par() {
+	fn insurance_adjusted_splits_the_shortfall() {
 		// C > D is the `CR > 100%` regime. An unchecked split would price the payout above par.
-		// The boundary C == D stays in range, with the whole debt on the market side.
 		assert_eq!(insurance_adjusted::<u128>(1000, 1001, 0), None);
-		let r = insurance_adjusted::<u128>(1000, 1000, 0).expect("C == D is below-par boundary");
-		assert_eq!(r.effective_cover, 0);
-		assert_eq!(r.market_cancel_debt, 1000);
-	}
-
-	#[test]
-	fn insurance_adjusted_partial_cover() {
-		// D = 1000, C = 800 (shortfall 200), IF = 50.
-		// effective_cover = 50, market_cancel = 950: an effective rate of 800/950 ≈ 0.8421.
-		let r = insurance_adjusted::<u128>(1000, 800, 50).expect("below-par split");
-		assert_eq!(r.effective_cover, 50);
-		assert_eq!(r.market_cancel_debt, 950);
-	}
-
-	#[test]
-	fn insurance_adjusted_empty_fund_puts_all_debt_on_the_market() {
-		// IF = 0 → effective_cover = 0, market_cancel = D: an effective rate of C/D.
-		let r = insurance_adjusted::<u128>(1000, 800, 0).expect("below-par split");
-		assert_eq!(r.effective_cover, 0);
-		assert_eq!(r.market_cancel_debt, 1000);
-	}
-
-	#[test]
-	fn insurance_adjusted_full_cover_zero_market() {
-		// IF covers the whole shortfall and then some: market_cancel = C, at par.
-		// D = 1000, C = 800, IF = 500 → cover = min(500, 200) = 200, market_cancel = 800.
-		let r = insurance_adjusted::<u128>(1000, 800, 500).expect("below-par split");
-		assert_eq!(r.effective_cover, 200);
-		assert_eq!(r.market_cancel_debt, 800);
-	}
-
-	#[test]
-	fn insurance_adjusted_fund_covers_all_debt() {
-		// C = 0 (collateral worthless), IF >= D → market_cancel = 0.
-		let r = insurance_adjusted::<u128>(1000, 0, 1000).expect("below-par split");
-		assert_eq!(r.effective_cover, 1000);
-		assert_eq!(r.market_cancel_debt, 0);
+		// (D, C, IF, effective_cover, market_cancel_debt)
+		let cases: [(u128, u128, u128, u128, u128); 5] = [
+			// The boundary C == D stays in range, with the whole debt on the market side.
+			(1000, 1000, 0, 0, 1000),
+			// A partial cover gives an effective rate of 800/950 ≈ 0.8421.
+			(1000, 800, 50, 50, 950),
+			// An empty fund puts the whole debt on the market, at an effective rate of C/D.
+			(1000, 800, 0, 0, 1000),
+			// A fund beyond the shortfall covers only the shortfall: the market cancels C, at par.
+			(1000, 800, 500, 200, 800),
+			// Worthless collateral and a fund of at least D leave nothing on the market side.
+			(1000, 0, 1000, 1000, 0),
+		];
+		for (debt, value, fund, cover, market) in cases {
+			let split = insurance_adjusted(debt, value, fund).expect("below-par split");
+			assert_eq!(
+				split,
+				InsuranceAdjusted { market_cancel_debt: market, effective_cover: cover },
+				"D = {debt}, C = {value}, IF = {fund}"
+			);
+		}
 	}
 
 	#[test]

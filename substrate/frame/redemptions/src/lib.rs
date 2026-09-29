@@ -42,9 +42,7 @@ mod tests;
 
 pub use pallet::*;
 pub use pusd_primitives;
-pub use types::{
-	RecoveryOffsetQuote, RecoveryRegime, RedemptionConfig, RedemptionState, RedemptionTerms,
-};
+pub use types::{RecoveryRegime, RedemptionConfig, RedemptionState, RedemptionTerms};
 pub use weights::WeightInfo;
 
 /// Runtime-supplied benchmark setup.

@@ -4,25 +4,6 @@ use scale_info::TypeInfo;
 
 pub use pusd_primitives::Millis;
 
-/// Head-of-FIFO quote at shared settlement pricing
-/// ([`crate::Pallet::preview_recovery_offset`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RecoveryOffsetQuote<Balance> {
-	/// No `FinalRecovery` vault is queued, or the head is exitable: deposits
-	/// proceed as ordinary pending deposits, and active-pool recovery offsets
-	/// have no target.
-	NoTarget,
-	/// The head is below par (`CR < 100%`). Recovery offsets are
-	/// unavailable and new pool deposits must be rejected — settlement at
-	/// a discount stays exclusive to the explicit redemption pathway.
-	BelowPar,
-	/// Up to `debt` is cancellable against the head. The collateral the
-	/// settlement pays out arrives with the execution's
-	/// [`pusd_primitives::RecoveryOffsetResult::Applied`]; a quote only sizes the
-	/// burn.
-	Available { debt: Balance },
-}
-
 /// Defines the ordinary-redemption fee policy.
 ///
 /// The fee rate is `min(base_fee + dynamic fee, fee_ceiling)`. Each redemption pays the constant
