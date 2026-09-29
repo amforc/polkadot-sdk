@@ -250,7 +250,7 @@ where
 			keystore_container,
 			select_chain: _,
 			transaction_pool,
-			other: (_, mut telemetry, _, _, _, _),
+			other: (_, mut telemetry, _, _, _),
 		} = Self::new_partial(&config)?;
 
 		// Since this is a dev node, prevent it from connecting to peers.
@@ -271,10 +271,10 @@ where
 				&metrics,
 				&mut net_config,
 			);
-			(proto, *ss_config)
+			(proto, ss_config.clone())
 		});
 
-		let (network, system_rpc_tx, tx_handler_controller, sync_service) =
+		let (network, system_rpc_tx, tx_handler_controller, sync_service, _bitswap_handle) =
 			sc_service::build_network(sc_service::BuildNetworkParams {
 				config: &config,
 				client: client.clone(),
@@ -287,6 +287,7 @@ where
 				warp_sync_config: None,
 				block_relay: None,
 				metrics,
+				gap_sync_body_policy: None,
 			})?;
 
 		let statement_store = statement_handler_proto
@@ -709,7 +710,7 @@ where
 		telemetry: Option<TelemetryHandle>,
 		task_manager: &TaskManager,
 		relay_chain_interface: Arc<dyn RelayChainInterface>,
-		transaction_pool: Arc<TransactionPoolHandle<Block, ParachainClient<Block, RuntimeApi>>>,
+		transaction_pool: Arc<TransactionPoolHandle<Block>>,
 		keystore: KeystorePtr,
 		relay_chain_slot_duration: Duration,
 		para_id: ParaId,
@@ -878,7 +879,7 @@ where
 		telemetry: Option<TelemetryHandle>,
 		task_manager: &TaskManager,
 		relay_chain_interface: Arc<dyn RelayChainInterface>,
-		transaction_pool: Arc<TransactionPoolHandle<Block, ParachainClient<Block, RuntimeApi>>>,
+		transaction_pool: Arc<TransactionPoolHandle<Block>>,
 		keystore: KeystorePtr,
 		relay_chain_slot_duration: Duration,
 		para_id: ParaId,

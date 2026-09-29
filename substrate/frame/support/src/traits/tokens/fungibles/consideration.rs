@@ -43,8 +43,9 @@ use sp_runtime::{traits::Convert, DispatchError, TokenError};
 
 /// A filter for assets whose balance can keep an account alive.
 ///
-/// For a [`fungible::UnionOf`](crate::traits::fungible::UnionOf), this filter accepts the native
-/// asset and all sufficient assets.
+/// For a [`fungible::UnionOf`](crate::traits::fungible::UnionOf), this filter rejects the native
+/// asset, because `fungible` has no notion of sufficiency. [`AssetFootprintPrice`] selects the
+/// native asset through its `Fallback` instead.
 pub struct SufficientAssets<F, AccountId>(PhantomData<(F, AccountId)>);
 impl<F: Inspect<AccountId>, AccountId> Contains<F::AssetId> for SufficientAssets<F, AccountId> {
 	fn contains(asset: &F::AssetId) -> bool {
