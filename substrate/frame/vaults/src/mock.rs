@@ -221,15 +221,16 @@ impl pusd_primitives::ProvidePrice for MockOracle {
 	type AssetId = AssetId;
 
 	fn provide_price(collateral: &AssetId) -> Result<FixedU128, DispatchError> {
+		// Production adapters report a missing price as `Unavailable`. The pallet propagates the
+		// oracle's error, so a pallet error here would let tests assert what no runtime returns.
 		if !MockOracleAvailable::get() {
-			return Err(Error::<Test>::OraclePriceNotAvailable.into());
+			return Err(DispatchError::Unavailable);
 		}
 		MockPrices::get().get(collateral).copied().ok_or(DispatchError::Unavailable)
 	}
 }
 
 parameter_types! {
-	pub const FeeDestAccount: AccountId = FEE_DEST;
 	/// Share of each fee assigned to the Stability Pool.
 	pub static SpFeeShare: Permill = Permill::from_percent(75);
 }
@@ -1164,15 +1165,6 @@ pub fn vault_deposit_held(asset: AssetId, who: AccountId) -> Balance {
 /// Returns a vault's accounting row, panicking when the vault is missing.
 pub fn vault(collateral: AssetId, stable: StableId, owner: AccountId) -> Vault<Balance> {
 	Vaults::vault_of(&collateral, &stable, &owner).expect("vault stored")
-}
-
-/// Returns a vault's accounting row, or `None` when the vault is missing.
-pub fn try_vault(
-	collateral: AssetId,
-	stable: StableId,
-	owner: AccountId,
-) -> Option<Vault<Balance>> {
-	Vaults::vault_of(&collateral, &stable, &owner).ok()
 }
 
 /// Whether a vault row exists.

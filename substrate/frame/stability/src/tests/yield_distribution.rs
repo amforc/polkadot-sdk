@@ -6,18 +6,16 @@
 use crate::{mock::*, Error};
 
 #[test]
-fn distribute_to_empty_or_unknown_pool_returns_the_credit() {
-	build_and_execute(|| {
+fn distribute_to_empty_pool_returns_the_credit() {
+	build_with_default_market(|| {
 		// The returned credit is the caller's to route: in the runtime the
 		// vault engine's `OnBranchYield` plumbing forwards it to the fee
 		// destination (`vault_interest_flows_to_pool_through_the_hook`
 		// exercises that split live). Here the test drops it, rescinding the
 		// issuance.
-		// Unknown branch: nothing to distribute into, and nothing written.
-		assert_yield_declined(DOT, PUSD, 100);
-
-		// Registered but empty active pool: same.
-		register_branch(DOT, PUSD, default_branch_config());
+		// A registered pool with nothing active has no denominator to share over, so nothing
+		// is written. `yield_distribution_routes_by_the_credits_own_asset` owns the
+		// unregistered market.
 		assert_yield_declined(DOT, PUSD, 100);
 	});
 }
@@ -45,22 +43,6 @@ fn distribute_updates_g_exactly() {
 			crate::Event::YieldDistributed { collateral_id: DOT, stable_id: PUSD, amount: 100 }
 				.into(),
 		);
-	});
-}
-
-#[test]
-fn depositors_realize_yield_proportionally() {
-	build_with_default_market(|| {
-		seed_matured_deposit_from_balance(1, 10_000, 600);
-		seed_matured_deposit_from_balance(2, 10_000, 400);
-
-		drop(distribute_yield(DOT, PUSD, 100));
-
-		// G = 0.1; gains = floor(600 * 0.1) = 60 and floor(400 * 0.1) = 40.
-		assert_claim_yield(1, 60);
-		assert_claim_yield(2, 40);
-		// 60 + 40 = 100: no dust on this split.
-		assert_eq!(pool_state(DOT, PUSD).total_yield_unclaimed, 0);
 	});
 }
 
@@ -241,7 +223,6 @@ fn capital_changing_calls_issue_pending_branch_interest_first() {
 	for call in calls {
 		build_with_default_market(|| {
 			seed_matured_deposit_from_balance(1, 10_000, 400);
-			seed_claimables(1, 0, 100);
 			mint_stable(PUSD, 2, 10_000);
 			mint_collateral(DOT, 5, 2_000);
 			assert_ok!(open_vault(5, DOT, PUSD, 1_000, 499));

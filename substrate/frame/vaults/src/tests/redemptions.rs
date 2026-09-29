@@ -1,6 +1,7 @@
 use crate::{
 	mock::*,
 	tests::{rate_pct, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
+	VaultStatus,
 };
 use pallet_linked_list::SortedListInterface;
 use pusd_primitives::{RedemptionSettlement, VaultInterface};
@@ -9,80 +10,47 @@ use pusd_primitives::{RedemptionSettlement, VaultInterface};
 // `repay` operations. The carve-outs are `change_rate` and collateral-only
 // deposits that cannot revive the vault to `Debt >= MinimumDebt`.
 
+// A redemption leaves the vault Active while the remaining debt is at least MinimumDebt (200).
+// Below it the vault turns Dormant and parks in the redemption slot, unless it has no debt left
+// to redeem. The status is read from index membership, so a Dormant vault is out of the rate
+// index.
 #[test]
-fn fully_redeemed_vault_becomes_dormant_and_leaves_rate_index() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// A and B at distinct rates so the redemption order is deterministic
-		// (tail-first picks A first as it has the lower rate).
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+fn redemption_parks_the_vault_below_minimum_debt() {
+	use VaultStatus::{Active, Dormant};
+	// Vault 1 owes 501: 500 plus the upfront fee of ceil(500 · 1% · 7d / 365.25d) = 1. A year
+	// adds 500 · 1% = 5 of pending interest, which the redemption must settle before it cancels
+	// debt. Each case is `(elapsed, redeemed, remaining debt, status, dormant slot)`.
+	let cases: [(Moment, Balance, Balance, VaultStatus, Option<AccountId>); 7] = [
+		(0, 200, 301, Active, None),
+		(0, 301, 200, Active, None),
+		(0, 302, 199, Dormant, Some(1)),
+		(0, 350, 151, Dormant, Some(1)),
+		(0, 501, 0, Dormant, None),
+		(ONE_YEAR_MS, 306, 200, Active, None),
+		(ONE_YEAR_MS, 506, 0, Dormant, None),
+	];
+	for (elapsed, redeemed, remaining, status, slot) in cases {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			// Distinct rates make vault 1, at the lower rate, the redemption target.
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+			assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+			advance_time(elapsed);
 
-		// Let a full year accrue so the redemption must poke the target's pending
-		// interest before cancelling — redeeming at the genesis instant would only
-		// exercise this against pre-touch stored debt.
-		advance_time(ONE_YEAR_MS);
-		let now = pallet_timestamp::Pallet::<Test>::get();
-		// Redeem more than the fully-accrued debt (500 principal + 1 open fee + 5 year
-		// interest = 506) so acct 1's debt is cancelled in full.
-		let target = redeem(DOT, PUSD, 3, 1_000).expect("redeem ok");
-		assert_eq!(target, 1);
+			assert_eq!(redeem(DOT, PUSD, 3, redeemed), Ok(1));
 
-		let v = vault(DOT, PUSD, 1);
-		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(v.debt.principal + v.debt.interest, 0);
-		// The redemption poked the target: its interest clock advanced to now.
-		assert_eq!(v.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
-		let state = branch_state(DOT, PUSD).unwrap();
-		assert_eq!(state.dormant_redemption_target, None);
-		// Rate index no longer contains acct 1.
-		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
-			&rate_list(DOT, PUSD),
-			&1
-		));
-	});
-}
-
-#[test]
-fn redeemed_below_min_debt_becomes_dormant() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-
-		// MinimumDebt = 200 (from default_branch_config). Redeem so acct 1
-		// has < 200 left.
-		assert_ok!(redeem(DOT, PUSD, 3, 350));
-		let v = vault(DOT, PUSD, 1);
-		let total = v.debt.principal + v.debt.interest;
-		// Open fee 1 (500 @ 1%) → total 501; redeem 350 cancels interest-first (1) then
-		// 349 principal, leaving exactly 151, below MinimumDebt 200.
-		assert_eq!(total, 151);
-		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		let state = branch_state(DOT, PUSD).unwrap();
-		assert_eq!(state.dormant_redemption_target, Some(1));
-		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
-			&rate_list(DOT, PUSD),
-			&1
-		));
-	});
-}
-
-#[test]
-fn redeemed_above_min_debt_stays_active() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-
-		// Redeem 200 — leaves acct 1 with ≈ 300 debt, well above MinimumDebt.
-		assert_ok!(redeem(DOT, PUSD, 3, 200));
-		assert!(vault_status(DOT, PUSD, 1).is_active());
-		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(
-			&rate_list(DOT, PUSD),
-			&1
-		));
-	});
+			let vault = vault(DOT, PUSD, 1);
+			assert_eq!(vault.debt.total(), remaining, "redeeming {redeemed}");
+			assert_eq!(vault_status(DOT, PUSD, 1), status, "redeeming {redeemed}");
+			assert_eq!(
+				branch_state(DOT, PUSD).expect("state").dormant_redemption_target,
+				slot,
+				"redeeming {redeemed}"
+			);
+			// Market interest time starts at registration, so the touch stamps the elapsed time.
+			assert_eq!(vault.last_interest_time, elapsed);
+		});
+	}
 }
 
 #[test]
@@ -289,6 +257,11 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 		// Touch alone never re-activates a Dormant, even past MinimumDebt.
 		assert_ok!(poke(9, DOT, PUSD, 1));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "touch never re-activates a Dormant");
+		assert_eq!(
+			branch_state(DOT, PUSD).unwrap().dormant_redemption_target,
+			Some(1),
+			"the touch leaves the dormant slot in place"
+		);
 
 		assert_ok!(activate_dormant(9, DOT, PUSD, 1));
 		assert!(vault_status(DOT, PUSD, 1).is_active());

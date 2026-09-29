@@ -11,8 +11,13 @@ fn providers(who: AccountId) -> u32 {
 	System::providers(&who)
 }
 
-fn empty_deposit_row() -> crate::pallet::DepositOf<Test> {
-	crate::types::Deposit::fresh(crate::types::DepositSnapshot::fresh())
+/// The accumulator rows and the cohort checkpoints stored under the default market, on either
+/// leg and at any coordinates.
+fn default_market_rows() -> (usize, usize) {
+	(
+		crate::PoolSumsStore::<Test>::iter_prefix((DOT, PUSD)).count(),
+		crate::CohortCheckpoints::<Test>::iter_prefix((DOT, PUSD)).count(),
+	)
 }
 
 #[test]
@@ -43,19 +48,10 @@ fn branch_registration_seeds_pool_rows() {
 		// (`Consideration`), pricing the storage.
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert!(providers(pool) >= 1);
-	});
-}
 
-// Native collateral has no asset account to touch: `can_deposit(1)` fails
-// against a production ED and `Balances::touch` is a no-op. Registration must
-// still succeed because the provider reference lets the account receive its
-// own minimum.
-#[test]
-fn native_collateral_registration_does_not_need_a_touch() {
-	build_with_default_market(|| {
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_some());
-		assert!(providers(pool) >= 1);
+		// Native collateral has no asset account to touch: `can_deposit(1)` fails against a
+		// production ED and `Balances::touch` is a no-op. The provider reference is what lets the
+		// account receive its own minimum.
 		assert_ok!(PoolCollateralAssets::can_deposit(
 			DOT,
 			&pool,
@@ -178,14 +174,16 @@ fn branch_registration_rejects_invalid_pool_config() {
 #[test]
 fn branch_removal_blocked_while_depositor_rows_exist() {
 	build_with_default_market(|| {
-		crate::Deposits::<Test>::insert((DOT, PUSD, 5u128), empty_deposit_row());
+		seed_matured_deposit(5, 400);
 
 		assert_noop!(
 			Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
 			Error::<Test>::PoolNotEmpty
 		);
 
-		crate::Deposits::<Test>::remove((DOT, PUSD, 5u128));
+		// The full withdrawal prunes the only row, which unblocks the removal.
+		assert_ok!(withdraw(5, DOT, PUSD, 400, 5));
+		assert!(deposit_row(DOT, PUSD, 5).is_none());
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 	});
 }
@@ -195,11 +193,13 @@ fn branch_removal_tears_down_pool_rows() {
 	build_with_default_market(|| {
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		let providers_before = providers(pool);
+		// Registration seeded one sums row per leg.
+		assert_eq!(default_market_rows(), (2, 0));
 
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 
 		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
-		assert!(!crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 0u32, 0u32)));
+		assert_eq!(default_market_rows(), (0, 0));
 		assert_eq!(providers(pool), providers_before - 1);
 		// A never-used pool holds no dust; the zero-dust path stays silent.
 		assert!(!System::events().iter().any(|record| matches!(
@@ -214,6 +214,25 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 	build_with_default_market(|| {
 		let pool = Stability::pool_account(&DOT, &PUSD);
 
+		// A first depositor takes the active leg across a scale and then an epoch, so that
+		// the market holds rows beyond the two that registration seeds. Leaving 100 of 1e13
+		// crosses one scale: P = floor(1e18 * 1e9 * 100 / 1e13) = 0.01. Burning those 100
+		// depletes the pool and opens epoch 1.
+		set_min_active_pool(10);
+		let unit: Balance = 10_000_000_000_000; // 1e13
+		seed_matured_deposit(3, unit);
+		assert_eq!(simulate_offset(DOT, PUSD, unit - 100, 5_000_000_000_000).debt(), unit - 100);
+		assert_eq!(simulate_offset(DOT, PUSD, 100, 80).debt(), 100);
+		assert_eq!(
+			pool_state(DOT, PUSD).coords,
+			Accumulators { p: FixedU128::one(), epoch: 1, scale: 0 }
+		);
+		// delta_S(0,0) = 5e12 / 1e13 = 0.5 and delta_S(0,1) = 80 * (0.01/100) = 8e-3, which the
+		// row one scale ahead pays through the divisor: 1e13 * (0.5 + 8e-3/1e9) = 5e12 + 80.
+		// Nothing of the deposit survives the depletion, so the claim prunes the row.
+		assert_claim_collateral(3, 5_000_000_000_080);
+		assert!(deposit_row(DOT, PUSD, 3).is_none());
+
 		// Two 150-deposits, then amounts indivisible by the two-way split so
 		// per-row flooring strands residue in the pool aggregates.
 		mint_stable(PUSD, 1, 150);
@@ -223,9 +242,9 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		let leftover = distribute_yield(DOT, PUSD, 101);
 		assert_eq!(leftover.peek(), 0);
 		drop(leftover);
-		let (debt_cancelled, remainder) = simulate_offset(DOT, PUSD, 100, 101);
-		assert_eq!(debt_cancelled, 100);
-		assert_eq!(remainder, 0);
+		let offset = simulate_offset(DOT, PUSD, 100, 101);
+		assert_eq!(offset.debt(), 100);
+		assert_eq!(offset.leftover, 0);
 
 		// Empty every depositor row: full withdrawal plus both claims prune it.
 		for who in [1u128, 2u128] {
@@ -243,7 +262,12 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		assert!(stable_dust > 0);
 		assert!(collateral_dust > 0);
 
+		// Active rows at (0, 0), (0, 1) and (1, 0), and the pending row at (0, 0). Every
+		// checkpoint went with the last settlement of its cohort.
+		assert_eq!(default_market_rows(), (4, 0));
+
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
+		assert_eq!(default_market_rows(), (0, 0));
 
 		// The sweep moved every stranded unit to the dust destination.
 		assert_eq!(stable_balance(PUSD, pool), 0);
@@ -271,6 +295,11 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		assert_eq!(state.total_collateral_gains_unclaimed, 0);
 		assert_eq!(stable_balance(PUSD, pool), 0);
 		assert_eq!(collateral_balance(DOT, pool), 0);
+		// Only the two seeded rows exist, both empty. A row left at (0, 1) would sit one scale
+		// ahead of the first snapshot of the new market and pay it gains it never earned.
+		assert_eq!(default_market_rows(), (2, 0));
+		assert_eq!(active_sums(0, 0), PoolSums::default());
+		assert_eq!(pending_sums(0, 0), PoolSums::default());
 	});
 }
 

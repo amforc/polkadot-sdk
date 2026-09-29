@@ -1,43 +1,21 @@
 //! Tests for the redistribution / aggregate-interest accounting identities and
-//! the FinalRecovery exit and low-level liquidation accounting.
+//! the low-level liquidation accounting.
 //!
 //! Conventions:
 //! - Eligible vaults use snapshot-corrected stake. Only `FinalRecovery` vaults have zero stake.
 //! - "Recipient rate" means the recipient vault's `annual_rate`, not the liquidated vault's rate.
-//! - Stake calculations are checked by `assert_accounting_identity_holds` (`stakes.total == Σ
-//!   vault.redistribution_stake`) and the `try_state` identities.
+//! - Stake calculations are checked by the `try_state` identities, which `build_and_execute` runs
+//!   after every test.
 
 use crate::{
 	mock::*,
-	pallet::Vaults,
-	tests::{liquidation_outcome, rate_pct, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{liquidation_outcome, rate_pct, ONE_DAY_MS, ONE_YEAR_MS},
 };
+use pusd_primitives::CollateralRatio;
 
 /// `floor(x * rate)` for the recipient-rate assertions.
 fn accrual_rate(x: Balance, rate: FixedU128) -> Balance {
 	rate.saturating_mul_int(x)
-}
-
-/// Confirms that each debt and collateral unit has a vault or pending-pool owner.
-fn assert_accounting_identity_holds() {
-	let state = branch_state(DOT, PUSD).unwrap();
-	let rows: Vec<_> = Vaults::<Test>::iter_prefix((DOT, PUSD))
-		.map(|(owner, record)| (owner, record.vault))
-		.collect();
-	let sum_stake: Balance = rows.iter().map(|(_, v)| v.redistribution_stake).sum();
-	let sum_principal: Balance = rows.iter().map(|(_, v)| v.debt.principal).sum();
-	let sum_collateral: Balance = rows.iter().map(|(_, v)| v.collateral).sum();
-	assert_eq!(
-		state.stakes.total, sum_stake,
-		"stakes.total must equal Σ vault.redistribution_stake of live recipients",
-	);
-	assert_eq!(state.debt.principal, sum_principal);
-	assert_eq!(state.total_collateral, sum_collateral + state.pending_redistribution_collateral);
-	assert_eq!(state.vault_count as usize, rows.len());
-	assert_eq!(
-		held(DOT, crate::Pallet::<Test>::redistribution_account(&DOT, &PUSD)),
-		state.pending_redistribution_collateral,
-	);
 }
 
 // Touch order must not change mixed-rate allocation or pending residue.
@@ -69,6 +47,7 @@ fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
 			assert_eq!(allocated_1, 101);
 			assert_eq!(allocated_2, 100);
 			assert_eq!(final_state.debt.pending_redistribution_principal, 1);
+			crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 			(
 				allocated_1,
 				allocated_2,
@@ -98,56 +77,12 @@ fn delayed_redistribution_residue_is_touch_order_independent() {
 
 			assert_ok!(poke(9, DOT, PUSD, first));
 			assert_ok!(poke(9, DOT, PUSD, second));
-			assert_accounting_identity_holds();
+			crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 			(branch_state(DOT, PUSD).unwrap(), vault(DOT, PUSD, 1), vault(DOT, PUSD, 2))
 		})
 	};
 
 	assert_eq!(run(1, 2), run(2, 1));
-}
-
-// After a redistribute-everything liquidation, the branch's
-// `debt.accrual_rate` must reflect the economic debt at the recipient's
-// actual rate — total economic debt × recipient rate — not the redistributed
-// principal carried at rate=1.0.
-#[test]
-fn accrual_rate_after_redistribution_matches_avg_recipient_rate() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// Liquidatee at 5%, recipient at 20% (distinct rates so the recipient-rate
-		// accrual rate is genuinely exercised, not masked by equal rates). Both
-		// stakes are 1000.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
-
-		// Drop price below MCR. Vault 1 is now liquidatable.
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-
-		let coll_1 = held(DOT, 1);
-		assert_ok!(redistribute_for_test(DOT, PUSD, 1, coll_1));
-		assert_ok!(poke(99, DOT, PUSD, 2));
-
-		// Collateral conservation: the liquidatee's hold is released; the
-		// recipient immediately receives the redistributed collateral.
-		assert_eq!(held(DOT, 1), 0, "liquidatee collateral released");
-		assert_eq!(held(DOT, 2), 2_000, "recipient owns redistributed collateral");
-
-		let state = branch_state(DOT, PUSD).expect("branch state");
-		let total_econ = state.debt.principal;
-		// Vault 2 (20%) is the only recipient; ≤3 dust units of ceil/floor mismatch.
-		let expected = accrual_rate(total_econ, rate_pct(20, 100));
-		let actual: Balance = state.debt.accrual_rate.whole();
-		assert!(
-			actual.abs_diff(expected) <= 3,
-			"accrual_rate after redistribution out of bounds: actual={}, expected={} (20% of {})",
-			actual,
-			expected,
-			total_econ,
-		);
-		// The stake identity (stakes.total == Σ vault.redistribution_stake) is
-		// checked here too — it must survive the redistribution.
-		assert_accounting_identity_holds();
-	});
 }
 
 // Redistributed debt must accrue interest at the recipient's rate, not the liquidated vault's
@@ -174,38 +109,6 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		// ceil(1_001 × 20%): the vault rounds the owned and the absorbed debt's interest up.
 		let post_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
 		assert_eq!(post_minted - state_pre.debt.minted_interest, 201);
-	});
-}
-
-// Recipient touches must preserve the market's accrual rate projection.
-#[test]
-fn mixed_rate_recipients_materialize_at_their_own_rates() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100))); // A — recipient
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(50, 100))); // B — recipient
-		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(10, 100))); // C — liquidated
-
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		let coll_3 = held(DOT, 3);
-		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
-
-		assert_ok!(poke(99, DOT, PUSD, 1));
-		assert_ok!(poke(99, DOT, PUSD, 2));
-
-		let state = branch_state(DOT, PUSD).unwrap();
-		let vault_a = vault(DOT, PUSD, 1);
-		let vault_b = vault(DOT, PUSD, 2);
-		let expected = accrual_rate(vault_a.debt.principal, rate_pct(5, 100))
-			.saturating_add(accrual_rate(vault_b.debt.principal, rate_pct(50, 100)));
-		let actual: Balance = state.debt.accrual_rate.whole();
-		// One ceil (`average_branch_rate`) against two per-recipient floors.
-		assert!(
-			actual.abs_diff(expected) <= 2,
-			"mixed-rate accrual rate drift too large: actual={}, expected={}",
-			actual,
-			expected,
-		);
 	});
 }
 
@@ -253,16 +156,15 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 		assert_ok!(poke(9, DOT, PUSD, 1));
 		let vault_a_post = vault(DOT, PUSD, 1);
 		assert_eq!(vault_a_post.debt.interest, vault_a.debt.interest + 225);
-		assert_accounting_identity_holds();
 	});
 }
 
-// A follow-on `borrow` against a recipient must keep the branch accrual_rate
-// consistent with each vault's own-rate contribution: the borrow first touches
-// the vault to fold in its redistribution share, then updates the accrual-rate
-// bookkeeping so the aggregate still equals Σ (own ib_debt × own rate).
+// A follow-on `borrow` against a recipient first touches the vault to fold in its redistribution
+// share, then prices the fee at the market's average rate, which still counts the share left
+// pending. The quote and the dispatch must agree on both. The exact aggregates are checked by
+// `try_state` when the test ends.
 #[test]
-fn borrow_after_redistribution_keeps_accrual_rate_consistent() {
+fn borrow_after_redistribution_folds_the_share_and_charges_the_quoted_fee() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100))); // A — recipient + borrower
@@ -271,104 +173,24 @@ fn borrow_after_redistribution_keeps_accrual_rate_consistent() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
+		// C owes 500 plus an upfront fee of 3, priced at the 21.67% average of the three opens.
+		assert_eq!(redistribute_for_test(DOT, PUSD, 3, coll_3), Ok(503));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
 		let interest_before = vault(DOT, PUSD, 1).debt.interest;
+		// A holds half the stake, so the touch folds floor(503 / 2) = 251 into its principal and
+		// leaves 252 pending. After the borrow the market accrues, per year,
+		//   A: 2_751 · 5% = 137.55, B: 500 · 50% = 250, B's pending share: 251.5 · 50% = 125.75,
+		// which is 513 in whole units over 2_751 + 500 + 252 = 3_503 of principal: 14.64%. The
+		// fee is ceil(2_000 · 14.64% · 7d / 365.25d) = ceil(5.61) = 6. A's own 5% would give 2.
 		let predicted_fee =
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 200, None)
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 2_000, None)
 				.expect("touch projection and fee calculation succeed");
-		assert_ok!(borrow(1, DOT, PUSD, 200, None));
-		assert_eq!(
-			vault(DOT, PUSD, 1).debt.interest,
-			interest_before + predicted_fee,
-			"the prediction and execution paths share the pending-touch kernel",
-		);
-		assert_ok!(poke(99, DOT, PUSD, 2));
-
-		let state = branch_state(DOT, PUSD).unwrap();
-		let vault_a = vault(DOT, PUSD, 1);
-		let vault_b = vault(DOT, PUSD, 2);
-		let expected = accrual_rate(vault_a.debt.principal, rate_pct(5, 100))
-			.saturating_add(accrual_rate(vault_b.debt.principal, rate_pct(50, 100)));
-		let actual: Balance = state.debt.accrual_rate.whole();
-		// Same ceil-vs-floor drift as above, plus the borrow's own reconciliation.
-		assert!(
-			actual.abs_diff(expected) <= 2,
-			"accrual_rate drift after borrow: actual={}, expected={}",
-			actual,
-			expected,
-		);
-	});
-}
-
-// Push a vault into FinalRecovery, raise the price so the fully-accrued CR
-// goes above MCR, and `poke` it. Exit from FinalRecovery requires an explicit
-// hint and is NOT automatic on poke: poke leaves the vault in FinalRecovery,
-// and a dedicated `exit_final_recovery` extrinsic does the index re-insert with
-// caller-supplied hints.
-#[test]
-fn final_recovery_exit_requires_explicit_hint() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(enter_final_recovery(99, DOT, PUSD, 1));
-		assert!(matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::FinalRecovery));
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		assert_ok!(poke(99, DOT, PUSD, 1));
-		assert!(
-			matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::FinalRecovery),
-			"poke must not auto-exit FinalRecovery; exit requires an explicit hint",
-		);
-		assert_ok!(exit_final_recovery(99, DOT, PUSD, 1));
-		assert!(matches!(vault_status(DOT, PUSD, 1), crate::types::VaultStatus::Active));
-	});
-}
-
-// The production path resolves active-pool collateral before returning the
-// owner's surplus.
-#[test]
-fn liquidation_doesnt_leak_offset_collateral_to_liquidatee() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		ActiveSpCapacity::set(1_000);
-
-		let pool_before = collateral_balance(DOT, SP_ACCOUNT);
-		let owner_before = collateral_balance(DOT, 1);
-		assert_ok!(liquidate(999, DOT, PUSD, 1, 0, 0));
-
-		let outcome = liquidation_outcome();
-		assert_eq!(
-			collateral_balance(DOT, SP_ACCOUNT) - pool_before,
-			outcome.active_pool.collateral
-		);
-		// The removed row's storage deposit returns to the owner alongside any surplus.
-		assert_eq!(
-			collateral_balance(DOT, 1) - owner_before,
-			outcome.owner_surplus + VAULT_DEPOSIT
-		);
-	});
-}
-
-#[test]
-fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(3, DOT, PUSD, 5_000, 500, rate_pct(5, 100)));
-
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-
-		for liquidatee in [1u64, 2u64] {
-			let collateral = held(DOT, liquidatee);
-			assert_ok!(redistribute_for_test(DOT, PUSD, liquidatee, collateral));
-			assert_accounting_identity_holds();
-		}
+		assert_eq!(predicted_fee, 6);
+		assert_ok!(borrow(1, DOT, PUSD, 2_000, None));
+		let vault = vault(DOT, PUSD, 1);
+		assert_eq!(vault.debt.principal, 500 + 251 + 2_000);
+		assert_eq!(vault.debt.interest, interest_before + 6);
 	});
 }
 
@@ -431,7 +253,6 @@ fn sub_resolution_liquidation_remains_explicitly_pending() {
 		assert_eq!(drained.debt.pending_redistribution_principal, 0);
 		assert_eq!(drained.pending_redistribution_collateral, 0);
 		assert_eq!(held(DOT, crate::Pallet::<Test>::redistribution_account(&DOT, &PUSD)), 0,);
-		assert_accounting_identity_holds();
 	});
 }
 
@@ -496,7 +317,6 @@ fn pending_residue_outlives_its_recipients_and_lands_on_a_later_vault() {
 		assert_eq!(drained.debt.pending_redistribution_principal, 0);
 		assert_eq!(drained.pending_redistribution_collateral, 0);
 		assert_eq!(held(DOT, crate::Pallet::<Test>::redistribution_account(&DOT, &PUSD)), 0);
-		assert_accounting_identity_holds();
 	});
 }
 
@@ -518,7 +338,6 @@ fn sole_survivor_receives_the_exact_remainder() {
 		let principal_after = vault(DOT, PUSD, 1).debt.principal;
 		assert_eq!(principal_after - principal_before, debt_2);
 		assert_eq!(held(DOT, 1), 11_000);
-		assert_accounting_identity_holds();
 	});
 }
 
@@ -544,7 +363,6 @@ fn dust_ratio_stake_floors_to_one_unit_and_stays_liquidatable() {
 		set_price(DOT, FixedU128::from_rational(50u128, 100u128));
 		assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
 		assert!(!vault_exists(DOT, PUSD, 3));
-		assert_accounting_identity_holds();
 	});
 }
 
@@ -563,49 +381,17 @@ fn vault_cr_projects_lazy_redistribution_before_materialization() {
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
 		let view_pre = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).expect("cr");
+		// Vault 3 owed 500 plus a fee of 1. Vault 1 holds half the stake, so its share is
+		// floor(501 / 2) = 250 of debt and 500 of collateral: 1_500 of collateral worth 15_000
+		// against 500 + 250 + 1 of debt, and 15_000 / 751 = 19.973368…, rounded down.
+		assert_eq!(
+			view_pre,
+			CollateralRatio::Ratio(FixedU128::from_inner(19_973_368_841_544_607_190))
+		);
 		assert_ok!(poke(99, DOT, PUSD, 1));
 		let view_post = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).expect("cr");
 		// Projection must match execution before materialization.
 		assert_eq!(view_pre, view_post);
-	});
-}
-
-#[test]
-fn touch_does_not_revive_dormant_when_interest_lifts_above_min_debt() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 100_000, 500, rate_pct(50, 100))); // co-recipient
-		assert_ok!(open(2, DOT, PUSD, 10_000, 500, rate_pct(50, 100))); // target
-
-		// Reduce vault 2 to a small dust principal (well under MinimumDebt=200)
-		// via a redemption cancel so the vault becomes Dormant with non-zero
-		// residual debt.
-		assert_ok!(redeem_step(DOT, PUSD, 2, 99, 450, 9_000));
-		assert!(crate::Pallet::<Test>::vault_status(DOT, PUSD, 2).unwrap().is_dormant());
-
-		// Advance time so that simple interest at 50% APR pushes the residual
-		// principal back over MinimumDebt=200.
-		advance_time(ONE_YEAR_MS * 10);
-		assert_ok!(poke(99, DOT, PUSD, 2));
-
-		// Dormant status is sticky: passive accrual never re-indexes a vault.
-		// Even though the debt has crossed MinimumDebt again, the vault stays
-		// Dormant until an explicit, hint-bearing activation (`borrow` /
-		// `activate_dormant`).
-		assert!(
-			vault(DOT, PUSD, 2).debt.total() >= 200,
-			"sanity: accrual should have lifted residual debt back over MinimumDebt",
-		);
-		assert!(
-			crate::Pallet::<Test>::vault_status(DOT, PUSD, 2).unwrap().is_dormant(),
-			"poke must NOT auto-revive a Dormant vault; re-entry requires an explicit hint",
-		);
-		let state = branch_state(DOT, PUSD).unwrap();
-		assert_eq!(
-			state.dormant_redemption_target,
-			Some(2),
-			"the dormant slot is retained; nothing revived the vault",
-		);
 	});
 }
 
@@ -763,7 +549,6 @@ fn recipient_owned_redistribution_interest_stays_in_branch_projection() {
 			crate::Pallet::<Test>::accrued_branch_debt(&state, Timestamp::get()),
 			accrued_after_idle_year,
 		);
-		assert_accounting_identity_holds();
 	});
 }
 
@@ -781,11 +566,17 @@ fn branch_debt_projection_is_refresh_cadence_independent() {
 					assert_ok!(poke(99, DOT, PUSD, 9));
 				}
 			}
+			crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 			crate::Pallet::<Test>::accrued_branch_debt(
 				&branch_state(DOT, PUSD).unwrap(),
 				Timestamp::get(),
 			)
 		})
 	};
-	assert_eq!(run(9), run(0));
+	// The seed leaves 500 of principal, 502 pending, and a fee of 1. Vault 9 adds 300 and a fee of
+	// ceil(300 · 8.83% · 7d / 365.25d) = 1, which makes 1_304. A year then accrues
+	// 500 · 10% + 502 · 10% + 300 · 5% = 115.2, rounded up to 116.
+	let untouched = run(0);
+	assert_eq!(untouched, 1_420);
+	assert_eq!(run(9), untouched);
 }

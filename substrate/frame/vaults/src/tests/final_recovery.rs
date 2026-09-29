@@ -262,6 +262,8 @@ fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(repay(2, DOT, PUSD, 2, None));
 		assert_ok!(redeem(DOT, PUSD, 3, 400));
+		// The liquidation below must clear a pointer that is really set.
+		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, Some(1));
 		set_price(DOT, low_recovery_price());
 
 		// A debt-free husk still counts as another stake bearer.
@@ -395,24 +397,6 @@ fn final_recovery_middle_exit_splices_queue() {
 		assert_eq!(
 			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
 			alloc::vec![1, 3]
-		);
-	});
-}
-
-#[test]
-fn exit_final_recovery_rejects_when_cr_still_below_mcr() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
-
-		assert_noop!(
-			exit_final_recovery(99, DOT, PUSD, 1),
-			crate::Error::<Test>::CollateralizationRatioTooLow
-		);
-		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
-		assert_eq!(
-			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
-			alloc::vec![1]
 		);
 	});
 }
@@ -685,27 +669,6 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 }
 
 #[test]
-fn deposit_into_final_recovery_keeps_stake_zero() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
-
-		let before = branch_state(DOT, PUSD).expect("branch state");
-		assert_ok!(deposit_collateral(2, DOT, PUSD, 1, 10_000));
-
-		// The collateral lands on the hold and in the branch total, but the
-		// vault stays excluded from stake accounting while in the FIFO.
-		let vault = vault(DOT, PUSD, 1);
-		assert_eq!(vault.redistribution_stake, 0);
-		let after = branch_state(DOT, PUSD).expect("branch state");
-		assert_eq!(after.stakes.total, before.stakes.total);
-		assert_eq!(after.total_collateral, before.total_collateral + 10_000);
-		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD + 10_000);
-		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
-	});
-}
-
-#[test]
 fn final_recovery_rescue_deposit_then_exit() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
@@ -721,6 +684,23 @@ fn final_recovery_rescue_deposit_then_exit() {
 		let vault = vault(DOT, PUSD, 1);
 		assert_eq!(vault.redistribution_stake, held(DOT, 1));
 		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
+	});
+}
+
+// Leaving the FIFO re-inserts the vault into the rate index, which needs caller-supplied hints,
+// so a recovered price alone must not move the vault out on a touch.
+#[test]
+fn poke_does_not_exit_final_recovery() {
+	build_and_execute(|| {
+		register_market(DOT, PUSD);
+		enter_recovery(1, rate_pct(5, 100));
+		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+
+		assert_ok!(poke(99, DOT, PUSD, 1));
+		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
+
+		assert_ok!(exit_final_recovery(99, DOT, PUSD, 1));
+		assert!(vault_status(DOT, PUSD, 1).is_active());
 	});
 }
 

@@ -694,8 +694,8 @@ mod benchmarks {
 		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), owner.clone());
 
 		assert_eq!(
-			Pallet::<T>::vault_status(asset.clone(), stable::<T>(), owner),
-			Some(VaultStatus::FinalRecovery)
+			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
+			VaultStatus::FinalRecovery
 		);
 		assert!(
 			<T::CollateralAssets as FungiblesInspect<T::AccountId>>::balance(asset, &caller) >
@@ -720,8 +720,8 @@ mod benchmarks {
 		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), hint);
 
 		assert_eq!(
-			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
-			Some(VaultStatus::Active)
+			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
+			VaultStatus::Active
 		);
 		Ok(())
 	}
@@ -739,8 +739,8 @@ mod benchmarks {
 		let remaining = balance::<T>(199);
 		redeem_debt_only::<T>(&asset, &owner, |snapshot| snapshot.debt.saturating_sub(remaining))?;
 		assert_eq!(
-			Pallet::<T>::vault_status(asset.clone(), stable::<T>(), owner.clone()),
-			Some(VaultStatus::Dormant)
+			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
+			VaultStatus::Dormant
 		);
 		// Accrue interest until the fully-accrued debt is back at/above
 		// `minimum_debt`, so the vault is activation-eligible.
@@ -755,8 +755,8 @@ mod benchmarks {
 		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone(), hint);
 
 		assert_eq!(
-			Pallet::<T>::vault_status(asset, stable::<T>(), owner),
-			Some(VaultStatus::Active)
+			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
+			VaultStatus::Active
 		);
 		Ok(())
 	}
@@ -997,9 +997,10 @@ mod benchmarks {
 		// Re-quote after the clock moved, so a runtime with a staleness bound accepts the price.
 		T::BenchmarkHelper::set_oracle_price(asset.clone(), unit_price::<T>(LIQUIDATION_PRICE));
 		let branch = branch_snapshot::<T>(&asset)?;
-		let active_quote = T::StabilityPool::reducible_active(&asset, &stable::<T>(), branch, jit);
-		let pending_quote =
-			T::StabilityPool::reducible_pending(&asset, &stable::<T>(), branch, jit, active_quote);
+		let quote = T::StabilityPool::quote(&asset, &stable::<T>(), branch)
+			.ok_or(BenchmarkError::Stop("seeded pool has no capacity"))?;
+		let active_quote = T::StabilityPool::quote_active(&quote, jit);
+		let pending_quote = T::StabilityPool::quote_pending(&quote, jit, active_quote);
 		assert_eq!(active_quote, jit);
 		assert_eq!(pending_quote, jit);
 		let victim_debt = Vaults::<T>::get((&asset, stable::<T>(), &victim))
@@ -1024,11 +1025,11 @@ mod benchmarks {
 		assert!(!Vaults::<T>::contains_key((&asset, stable::<T>(), &victim)));
 		let max = balance::<T>(u128::MAX);
 		let branch = branch_snapshot::<T>(&asset)?;
-		let active_left = T::StabilityPool::reducible_active(&asset, &stable::<T>(), branch, max);
-		assert!(active_left.is_zero());
-		let pending_left =
-			T::StabilityPool::reducible_pending(&asset, &stable::<T>(), branch, max, max);
-		assert!(pending_left.is_zero());
+		// A market with no quote has no capacity left on either leg.
+		if let Some(quote) = T::StabilityPool::quote(&asset, &stable::<T>(), branch) {
+			assert!(T::StabilityPool::quote_active(&quote, max).is_zero());
+			assert!(T::StabilityPool::quote_pending(&quote, max, max).is_zero());
+		}
 		let stable_after = T::StableAssets::balance(stable::<T>(), &keeper);
 		assert_eq!(keeper_stable.saturating_sub(stable_after), jit);
 		assert!(T::CollateralAssets::balance(asset.clone(), &keeper) > keeper_collateral);

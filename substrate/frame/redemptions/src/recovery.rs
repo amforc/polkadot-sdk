@@ -5,7 +5,7 @@ use crate::{
 		BalanceOf, CollateralIdOf, Config, Error, Pallet, RedemptionConfigOf, RedemptionConfigs,
 		SnapshotOf, StableCreditOf, StableIdOf,
 	},
-	types::{RecoveryOffsetQuote, RecoveryRegime},
+	types::RecoveryRegime,
 };
 use frame::{
 	deps::sp_runtime::{
@@ -69,7 +69,7 @@ impl<Balance: Copy + Zero> RecoveryPlan<Balance> {
 	}
 }
 
-enum OffsetDecision<AccountId, Balance> {
+pub(crate) enum OffsetDecision<AccountId, Balance> {
 	NoTarget,
 	BelowPar,
 	Available { owner: AccountId, debt: Balance, collateral: Balance },
@@ -190,7 +190,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Locate and price the recovery head for an offset, as a pure read.
-	fn offset_decision(
+	pub(crate) fn offset_decision(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		max_debt_to_cancel: BalanceOf<T>,
@@ -214,19 +214,6 @@ impl<T: Config> Pallet<T> {
 			Ok(RecoveryPlan::AbovePar { debt, collateral }) => {
 				OffsetDecision::Available { owner, debt, collateral }
 			},
-		})
-	}
-
-	/// Quote how much debt a Stability Pool may cancel against the recovery head.
-	pub fn preview_recovery_offset(
-		collateral_id: &CollateralIdOf<T>,
-		stable_id: &StableIdOf<T>,
-		max_debt_to_cancel: BalanceOf<T>,
-	) -> Result<RecoveryOffsetQuote<BalanceOf<T>>, DispatchError> {
-		Ok(match Self::offset_decision(collateral_id, stable_id, max_debt_to_cancel)? {
-			OffsetDecision::NoTarget => RecoveryOffsetQuote::NoTarget,
-			OffsetDecision::BelowPar => RecoveryOffsetQuote::BelowPar,
-			OffsetDecision::Available { debt, .. } => RecoveryOffsetQuote::Available { debt },
 		})
 	}
 }

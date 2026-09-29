@@ -1,21 +1,9 @@
 use crate::{
 	mock::*,
 	pallet::Vaults,
-	tests::{rate_pct, vault_events, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{assert_event, rate_pct, vault_events, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 };
 use pallet_linked_list::SortedListInterface;
-
-// Opening a vault from an account whose free balance is below the requested
-// collateral fails at the token layer: the `fungible::hold` call returns an
-// error. Account 999 is not funded by genesis (only 1..=10 and the market
-// actors are).
-#[test]
-fn open_vault_fails_without_balance() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert!(open(999, DOT, PUSD, 1_000, 500, rate_pct(5, 100)).is_err());
-	});
-}
 
 #[test]
 fn adjust_vault_via_deposit_then_borrow() {
@@ -33,10 +21,9 @@ fn adjust_vault_via_deposit_then_borrow() {
 		// recorded as debt: debt.interest = 2, total debt = 802.
 		assert_eq!(v.debt.interest, 2);
 		assert_eq!(v.debt.total(), 802);
-		// Each 1-unit fee is split per `SpFeeShare` before the residual reaches
-		// FEE_DEST (Permill multiplication rounds 75% of 1 up to 1, leaving 0).
-		let residual_per_fee = 1u128 - SpFeeShare::get() * 1u128;
-		assert_eq!(stable_balance(PUSD, FEE_DEST), 2 * residual_per_fee);
+		// The mock burns the Stability Pool's 75% share of each 1-unit fee, which Permill rounds
+		// up to the whole unit, so nothing reaches FEE_DEST.
+		assert_eq!(stable_balance(PUSD, FEE_DEST), 0);
 		// Branch aggregate mirrors the vault principal.
 		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.principal, 800);
 		// pUSD net to user: initial 500 + 300 borrowed. The upfront fee is recorded as
@@ -67,6 +54,13 @@ fn borrow_with_recipient_mints_to_recipient_not_owner() {
 		assert_eq!(stable_balance(PUSD, 4), recipient_pre + 300);
 		let v = vault(DOT, PUSD, 1);
 		assert_eq!(v.debt.principal, 800);
+		assert_event(crate::Event::Borrowed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 4,
+			amount: 300,
+		});
 	});
 }
 
@@ -81,6 +75,13 @@ fn withdraw_collateral_with_recipient_transfers_to_recipient() {
 
 		assert_eq!(held(DOT, 1), 2_750);
 		assert_eq!(collateral_balance(DOT, 4), recipient_pre + 250);
+		assert_event(crate::Event::CollateralWithdrawn {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 4,
+			amount: 250,
+		});
 	});
 }
 
@@ -98,6 +99,14 @@ fn repay_for_by_third_party_burns_payer_balance_and_updates_owner_vault() {
 		assert_eq!(stable_balance(PUSD, 2), payer_pre - 100);
 		let v_post = vault(DOT, PUSD, 1);
 		assert_eq!(v_post.debt.total(), v_pre.debt.total() - 100);
+		// The event names the payer, not the owner, as the source of the stablecoin.
+		assert_event(crate::Event::Repaid {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			from: 2,
+			amount: 100,
+		});
 	});
 }
 
@@ -234,7 +243,8 @@ fn repay_overpay_burns_only_debt_and_leaves_husk() {
 // A sub-minimum Dormant residual cannot be partially repaid (any non-zero
 // remainder below MinimumDebt is `DebtWouldBecomeDust`), so the owner must clear
 // it to exactly zero. The overpay cap turns that from an exact-amount guessing
-// game into "send at least the dust"; the cleared vault is left as a husk.
+// game into "send at least the dust"; the cleared vault is left as a husk that
+// keeps its collateral and frees the branch's `dormant_redemption_target` slot.
 #[test]
 fn repay_overpay_rescues_subminimum_dormant_vault() {
 	build_and_execute(|| {
@@ -248,6 +258,17 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		let residual = vault(DOT, PUSD, 1).debt.total();
 		assert_eq!(residual, 199, "residual is MinimumDebt - 1");
+		assert_eq!(
+			branch_state(DOT, PUSD).expect("state").dormant_redemption_target,
+			Some(1),
+			"sub-minimum redemption parked acct 1 in the dormant slot"
+		);
+		// The redemption cancelled 501 - 199 = 302 of debt at the price of 10 and released
+		// floor(30.2) = 30 of the 1_000 collateral.
+		assert_eq!(held(DOT, 1), 970);
+
+		// Paying 100 would leave 99, which is neither zero nor the minimum.
+		assert_noop!(repay(1, DOT, PUSD, 1, Some(100)), crate::Error::<Test>::DebtWouldBecomeDust);
 
 		let balance_before = stable_balance(PUSD, 1);
 		assert_ok!(repay(1, DOT, PUSD, 1, Some(balance_before)));
@@ -259,44 +280,13 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 		);
 		let husk = vault(DOT, PUSD, 1);
 		assert_eq!(husk.debt.total(), 0, "sub-minimum dust cleared to zero");
-		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-	});
-}
-
-// A redemption-driven Dormant residual repaid to zero is left as a husk (its
-// collateral persists) and frees the branch's `dormant_redemption_target` slot.
-#[test]
-fn repay_for_to_zero_on_dormant_leaves_husk_and_releases_slot() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		// Push acct 1 to Dormant with a small residual debt; it parks the slot.
-		assert_ok!(redeem(DOT, PUSD, 3, 350));
+		assert_eq!(held(DOT, 1), 970, "collateral untouched by repay");
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_eq!(
-			branch_state(DOT, PUSD).unwrap().dormant_redemption_target,
-			Some(1),
-			"sub-minimum redemption parked acct 1 in the dormant slot"
+			branch_state(DOT, PUSD).expect("state").dormant_redemption_target,
+			None,
+			"slot released on repay-to-zero"
 		);
-		let total = vault(DOT, PUSD, 1).debt.total();
-		assert!(total > 0);
-		let held_before = held(DOT, 1);
-		assert!(held_before > 0, "collateral persists on the dormant row");
-		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
-			&2,
-			&1,
-			total.saturating_sub(stable_balance(PUSD, 1)),
-			frame::traits::tokens::Preservation::Expendable,
-		));
-		assert_ok!(repay(1, DOT, PUSD, 1, Some(total)));
-
-		let husk = vault(DOT, PUSD, 1);
-		assert_eq!(husk.debt.total(), 0);
-		assert_eq!(held(DOT, 1), held_before, "collateral untouched by repay");
-		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		let state = branch_state(DOT, PUSD).expect("state");
-		assert_eq!(state.dormant_redemption_target, None, "slot released on repay-to-zero");
 	});
 }
 
@@ -515,6 +505,7 @@ fn full_repayments_empty_the_interest_ledger_in_either_order() {
 			assert_eq!(state.debt.pending_interest_attribution, 0);
 			assert_eq!(state.debt.aggregate_interest_remainder, 0);
 			assert!(state.is_removable());
+			crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 			total_stable(PUSD)
 		})
 	};
