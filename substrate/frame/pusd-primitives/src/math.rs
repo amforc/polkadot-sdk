@@ -98,7 +98,7 @@ pub fn collateral_for_value_ceil<Balance: FixedPointOperand>(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use frame::arithmetic::{FixedPointNumber, One, Saturating};
+	use frame::arithmetic::{FixedPointNumber, One};
 
 	#[test]
 	fn wrappers_preserve_zero_and_output_precision_rules() {
@@ -119,17 +119,6 @@ mod tests {
 	}
 
 	#[test]
-	fn mul_div_rate_floor_round_trips_small_inputs() {
-		let got = mul_div_rate_floor::<u128>(100, FixedU128::one(), 1_000).expect("fits");
-		assert_eq!(got, FixedU128::from_rational(1u128, 10u128));
-	}
-
-	#[test]
-	fn mul_div_rate_zero_value_returns_zero() {
-		assert_eq!(mul_div_rate_floor::<u128>(0, FixedU128::one(), 1_000), Some(FixedU128::zero()));
-	}
-
-	#[test]
 	fn mul_div_rate_floor_overflow_returns_none() {
 		let got = mul_div_rate_floor(u128::MAX / 2, FixedU128::one(), 1);
 		assert!(got.is_none());
@@ -138,12 +127,29 @@ mod tests {
 		assert!(safe.is_some());
 	}
 
+	/// The per-unit delta feeds accumulators that pay out `delta * units`, so a delta rounded up
+	/// would pay out more than came in.
 	#[test]
-	fn mul_div_rate_floor_matches_two_step_when_safe() {
-		let rate = FixedU128::from_rational(5u128, 100u128);
-		let got = mul_div_rate_floor::<u128>(10_000, rate, 100).expect("fits");
-		let two_step = FixedU128::from_rational(10_000u128, 100u128).saturating_mul(rate);
-		assert!(got.into_inner().abs_diff(two_step.into_inner()) <= 1);
+	fn mul_div_rate_floor_is_exact_or_rounds_down() {
+		// 100 · 1 / 1_000 = 0.1.
+		assert_eq!(
+			mul_div_rate_floor::<u128>(100, FixedU128::one(), 1_000),
+			Some(FixedU128::from_inner(100_000_000_000_000_000))
+		);
+		// 10_000 · 5% / 100 = 5.
+		assert_eq!(
+			mul_div_rate_floor::<u128>(10_000, FixedU128::from_rational(5u128, 100u128), 100),
+			Some(FixedU128::from_u32(5))
+		);
+		// 1/3 and 2/3 have no exact value. The nearest value to 2/3 ends in 7.
+		assert_eq!(
+			mul_div_rate_floor::<u128>(1, FixedU128::one(), 3),
+			Some(FixedU128::from_inner(333_333_333_333_333_333))
+		);
+		assert_eq!(
+			mul_div_rate_floor::<u128>(2, FixedU128::one(), 3),
+			Some(FixedU128::from_inner(666_666_666_666_666_666))
+		);
 	}
 
 	#[test]

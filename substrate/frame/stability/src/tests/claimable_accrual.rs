@@ -17,7 +17,7 @@ fn top_up_realizes_offset_gain_into_claimable_not_wallet() {
 		// Offset halves the pool: P = 500/1000 = 0.5, delta_S = C_sp * P/A =
 		// 400 * (1/1000) = 0.4. The gain stays latent — offsets never touch
 		// the row.
-		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
+		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).debt(), 500);
 		assert_eq!(deposit_row(DOT, PUSD, 1).expect("row exists").claimable_collateral, 0);
 
 		// A top-up is the first touch: it realizes the offset gain
@@ -49,7 +49,7 @@ fn sequential_offsets_accumulate_claimable_across_touches() {
 		seed_matured_deposit(2, 1_000);
 
 		// Offset 1 over A = 2000: P = 1 -> 0.5, delta_S = 800 * (1/2000) = 0.4.
-		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).0, 1_000);
+		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).debt(), 1_000);
 		// A top-up touch realizes gain-1 = (1000/1) * 0.4 = 400 into
 		// claimable and sets the snapshot to P = 0.5, S = 0.4.
 		assert_ok!(deposit(1, DOT, PUSD, 400));
@@ -57,7 +57,7 @@ fn sequential_offsets_accumulate_claimable_across_touches() {
 
 		// Offset 2 over A = 1000: P = 0.5 -> 0.25,
 		// delta_S = 400 * (0.5/1000) = 0.2, so S = 0.6.
-		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
+		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).debt(), 500);
 
 		// A withdrawal touch realizes gain-2 = (500/0.5) * (0.6 - 0.4) = 200
 		// against the reset snapshot and accumulates it: 400 + 200 = 600.
@@ -109,15 +109,13 @@ fn withdraw_realizes_yield_into_claimable_never_compounds() {
 #[test]
 fn claim_after_full_withdrawal_pays_earned_gains() {
 	// A fully withdrawn row survives solely to carry its realized gains, and a later
-	// claim pays them and prunes the row. Distinct from
-	// `final_claim_prunes_an_otherwise_empty_row`, which seeds the claimable
-	// directly, here it is earned through an offset.
+	// claim pays them and prunes the row.
 	build_with_default_market(|| {
 		seed_matured_deposit(1, 1_000);
 
 		// Offset: P = 500/1000 = 0.5, delta_S = 400 * (1/1000) = 0.4;
 		// gain = (D0/P0) * delta_S = (1000/1) * 0.4 = 400.
-		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
+		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).debt(), 500);
 
 		// A full withdrawal realizes the 400 gain and drains the compounded
 		// 500 active to zero. The row stays alive on the claimable alone.
@@ -141,7 +139,7 @@ fn permissionless_settlement_realizes_gain_into_owner_claimable() {
 		seed_matured_deposit(1, 1_000);
 
 		// P = 0.5, delta_S = 400 * (1/1000) = 0.4.
-		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).0, 500);
+		assert_eq!(simulate_offset(DOT, PUSD, 500, 400).debt(), 500);
 
 		// A third party settles the row: realization is permissionless, so gain =
 		// (1000/1) * 0.4 = 400 lands in the owner's claimable and the

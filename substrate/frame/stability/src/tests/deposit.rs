@@ -16,12 +16,13 @@ fn deposit_moves_funds_and_queues_pending() {
 
 		// The whole 400 queues in the first cohort at the fresh pending accumulators. Nothing is
 		// active or claimable yet.
-		let mut expected = Deposit::fresh(DepositSnapshot::fresh());
-		expected.pending_deposit = Some(PendingDeposit {
-			amount: 400,
-			cohort: CohortId(0),
-			snapshot: DepositSnapshot::fresh(),
-		});
+		let fresh = DepositSnapshot {
+			coords: Accumulators { p: FixedU128::one(), epoch: 0, scale: 0 },
+			sums: PoolSums::default(),
+		};
+		let mut expected = Deposit::fresh(fresh);
+		expected.pending_deposit =
+			Some(PendingDeposit { amount: 400, cohort: CohortId(0), snapshot: fresh });
 		assert_eq!(deposit_row(DOT, PUSD, 1), Some(expected));
 		// Deposited at t = 1_000 with the 5_000 ms entry delay: 6_000, rounded up to the cohort
 		// boundary at 10_000.
@@ -70,18 +71,35 @@ fn deposit_without_funds_reverts() {
 fn second_deposit_merges_and_resets_delay() {
 	build_with_default_market(|| {
 		mint_stable(PUSD, 1, 1_000);
+		mint_stable(PUSD, 2, 200);
 
+		// Both join cohort 0 at t = 1_000: 6_000, rounded up to the boundary at 10_000.
 		assert_ok!(deposit(1, DOT, PUSD, 400));
-		advance_time(2_000);
+		assert_ok!(deposit(2, DOT, PUSD, 200));
+		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(10_000));
+
+		// The top-up at t = 6_000 lands in the next window, with cohort 0 still open: the
+		// earliest activation is 11_000, rounded up to the boundary at 15_000.
+		advance_time(5_000);
 		assert_ok!(deposit(1, DOT, PUSD, 300));
 
+		// The merge restarts the delay of the whole amount, so the first 400 leaves cohort 0 and
+		// waits out the later deadline with the top-up.
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		let pending = row.pending_deposit.expect("still pending");
 		assert_eq!(pending.amount, 700);
-		// The merge restarts the whole amount's delay: topped up at t = 3_000, so the earliest
-		// activation is 8_000, rounded up to the cohort boundary at 10_000.
-		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(10_000));
-		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 700);
+		assert_eq!(pending.cohort, CohortId(1));
+		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(15_000));
+
+		// The member that stayed behind keeps its cohort, which now carries its 200 alone.
+		assert_eq!(pending_deadline(DOT, PUSD, 2), Some(10_000));
+		let state = pool_state(DOT, PUSD);
+		assert_eq!(state.open_cohorts.len(), 2);
+		let older = &state.open_cohorts[0];
+		let newer = &state.open_cohorts[1];
+		assert_eq!((older.id.0, older.deadline, older.members, older.amount), (0, 10_000, 1, 200));
+		assert_eq!((newer.id.0, newer.deadline, newer.members, newer.amount), (1, 15_000, 1, 700));
+		assert_eq!(state.total_pending_deposits, 900);
 
 		System::assert_last_event(
 			crate::Event::DepositReceived {

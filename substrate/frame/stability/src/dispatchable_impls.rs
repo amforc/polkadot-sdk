@@ -1194,7 +1194,7 @@ impl<T: Config> Pallet<T> {
 	/// - `Normal` permits up to the active deposit and ignores a prior Safety-mode request.
 	/// - `Safety` requires a request at or after `executable_at` and reduces its authorized amount.
 	/// - `Frozen` rejects the withdrawal.
-	pub(crate) fn resolve_withdrawal(
+	fn resolve_withdrawal(
 		mode: BranchMode,
 		now: Millis,
 		amount: BalanceOf<T>,
@@ -1554,7 +1554,7 @@ impl<T: Config> Pallet<T> {
 	/// Returns the bounded sums window required to settle a snapshot.
 	///
 	/// Rows have no gaps within an epoch. Therefore, the first absent row ends the window.
-	pub(crate) fn sums_window(
+	fn sums_window(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		leg: Leg,

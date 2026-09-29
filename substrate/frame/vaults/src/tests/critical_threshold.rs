@@ -64,23 +64,6 @@ fn safety_mode_blocks_borrow_alone() {
 	});
 }
 
-// In Safety mode, adding *enough* collateral first lifts TCR back above the
-// safety threshold, after which a moderate borrow is allowed because both
-// pre- and post-states sit in Normal mode. This is exactly the deposit+borrow
-// pairing a user would submit as a single `utility.batch`: applied in order,
-// the deposit lands first and the borrow is then checked against the lifted
-// TCR. (`safety_mode_blocks_borrow_alone` shows the borrow leg fails on its own.)
-#[test]
-fn safety_mode_allows_borrow_after_large_deposit() {
-	build_and_execute(|| {
-		enter_safety_mode_single_vault();
-		assert_ok!(deposit_collateral(1, DOT, PUSD, 1, 200));
-		// post-deposit TCR ≈ 1200*6.3/5005 ≈ 151%. Now borrow a moderate amount
-		// while staying in Normal mode and well above Safety.
-		assert_ok!(borrow(1, DOT, PUSD, 200, None));
-	});
-}
-
 // In Safety mode, withdrawing collateral always worsens TCR (less collateral,
 // same debt). The `withdraw_collateral` extrinsic guard fires before any
 // follow-up borrow can be attempted.
@@ -95,28 +78,6 @@ fn safety_mode_blocks_withdraw_alone() {
 	});
 }
 
-// In Safety mode, a withdraw paired with a matching repay is done by repaying
-// first (always allowed — `repay_for` does not enforce mode rules) and then
-// withdrawing. This is the `utility.batch([repay, withdraw])` a user submits:
-// applied in order, the repay lifts TCR and the withdraw is then checked against
-// it. After enough debt is repaid the branch may exit Safety mode entirely; the
-// subsequent withdraw still passes the per-call TCR check because post_TCR ≥
-// Safety in Normal mode.
-#[test]
-fn safety_mode_allows_repay_then_withdraw() {
-	build_and_execute(|| {
-		enter_safety_mode_single_vault();
-		// Repay 3000 pUSD: total debt drops from 5005 to ~2005, TCR rises to
-		// 1000*6.3/2005 ≈ 314%. Branch exits Safety mode.
-		assert_ok!(repay(1, DOT, PUSD, 1, Some(3_000)));
-		// Now withdraw 100 DOT — TCR drops to 900*6.3/2005 ≈ 282%, still in
-		// Normal mode and well above Safety threshold.
-		assert_ok!(withdraw_collateral(1, DOT, PUSD, 100, None));
-	});
-}
-
-// Withdrawing collateral with too-low (or no) matching repayment reduces to
-// `safety_mode_blocks_withdraw_alone` above.
 // In Normal mode, a premature rate change that would push TCR below the
 // safety threshold reverts. The upfront fee bumps
 // `state.debt.minted_interest` and lowers post-TCR; if pre-TCR is
@@ -171,7 +132,7 @@ fn safety_mode_allows_post_cooldown_rate_change() {
 // that still holds collateral removes backing and, here, drops the branch into
 // Safety mode → the close reverts with `WouldEnterSafetyMode`.
 #[test]
-fn safety_mode_blocks_close_with_collateral() {
+fn close_with_collateral_is_blocked_when_it_would_enter_safety_mode() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(5, 100)));

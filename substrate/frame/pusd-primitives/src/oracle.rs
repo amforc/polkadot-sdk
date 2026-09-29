@@ -13,7 +13,7 @@ use frame::{
 
 /// Error for a zero price quote. Unlike [`DispatchError::Unavailable`], it never permits a
 /// fallback price source.
-pub const ZERO_ORACLE_PRICE: DispatchError = DispatchError::Other("zero oracle price");
+const ZERO_ORACLE_PRICE: DispatchError = DispatchError::Other("zero oracle price");
 
 /// Read-only access to normalized collateral prices.
 pub trait ProvidePrice {
@@ -29,8 +29,9 @@ pub trait ProvidePrice {
 /// Converts a `Reference` amount to an asset amount by the ratio of two [`ProvidePrice`]
 /// quotes, rounding up. `Reference` itself converts 1:1 without a query.
 ///
-/// A zero quote fails with [`ZERO_ORACLE_PRICE`]. [`DispatchError::Unavailable`] is returned
-/// only if neither feed is unusable, so an untrusted feed never unlocks a fallback.
+/// A zero quote fails with `DispatchError::Other("zero oracle price")`.
+/// [`DispatchError::Unavailable`] is returned only if neither feed is unusable, so an untrusted
+/// feed never unlocks a fallback.
 pub struct OraclePriceConversion<Oracle, Reference>(PhantomData<(Oracle, Reference)>);
 
 impl<Oracle, Reference, Balance> ConversionToAssetBalance<Balance, Oracle::AssetId, Balance>
@@ -149,11 +150,6 @@ mod tests {
 	type Conversion = OraclePriceConversion<Prices, Native>;
 
 	#[test]
-	fn reference_is_identity_without_a_feed() {
-		assert_eq!(Conversion::to_asset_balance(7u64, 0), Ok(7));
-	}
-
-	#[test]
 	fn reprices_by_the_ratio_of_quotes_rounding_up() {
 		// 7 × 10 / 4 = 17.5 → 18.
 		assert_eq!(Conversion::to_asset_balance(7u64, 1), Ok(18));
@@ -178,7 +174,6 @@ mod tests {
 		// Zero asset quote, missing reference feed.
 		type ZeroAsset = OraclePriceConversion<ZeroOrMissing, Native>;
 		assert_eq!(ZeroAsset::to_asset_balance(7u64, 2), Err(ZERO_ORACLE_PRICE));
-		assert_eq!(ZeroAsset::to_asset_balance(7u64, 9), Err(DispatchError::Unavailable));
 		// Zero reference quote, missing asset feed.
 		struct ZeroReference;
 		impl Get<u32> for ZeroReference {

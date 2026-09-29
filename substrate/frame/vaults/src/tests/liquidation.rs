@@ -620,7 +620,8 @@ fn preconditions_rejected_without_side_effects() {
 		assert_ok!(open(2, DOT, PUSD, 2_000, 500, FixedU128::from_rational(2, 1_000)));
 		set_price(DOT, FixedU128::from_rational(9, 10));
 		MockOracleAvailable::set(false);
-		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0), Error::<Test>::OraclePriceNotAvailable);
+		// The pallet propagates the oracle's own error.
+		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0), DispatchError::Unavailable);
 	});
 }
 

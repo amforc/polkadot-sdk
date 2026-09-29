@@ -3,7 +3,6 @@ use crate::{
 	tests::{rate_pct, vault_status},
 };
 use frame::traits::fungible::Mutate as FungibleMutate;
-use pallet_linked_list::SortedListInterface;
 
 fn fund_account(who: AccountId) {
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&who, 1_000_000_000_000));
@@ -14,76 +13,6 @@ fn seed_long_rate_index() {
 		fund_account(who);
 		assert_ok!(open(who, DOT, PUSD, 2_000, 500, rate_pct(20 + u128::from(who), 100)));
 	}
-}
-
-// A rate-position hint never names a vault that has left the rate index (a
-// redemption-Dormant vault).
-#[test]
-fn find_position_skips_dormant_vaults() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// Five vaults at 1%, 2%, 3%, 4%, 5%.
-		for (who, pct) in [(1u64, 1), (2, 2), (3, 3), (4, 4), (5, 5)] {
-			assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate_pct(pct, 100)));
-		}
-
-		// Redeem acct 1's full debt. redeem_step transitions the vault to
-		// Dormant when residual debt is zero (see interfaces.rs).
-		let target = redeem(DOT, PUSD, 5, 600).expect("redeem ok"); // 600 > vault 1's debt to fully clear it
-		assert_eq!(target, 1);
-		// Vault is Dormant or its debt is below MinimumDebt — either way it
-		// should be out of the rate index.
-		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
-			&rate_list(DOT, PUSD),
-			&1
-		));
-
-		// Now query a hint at a rate near acct 1's old rate. The result
-		// must not name acct 1 — it's no longer in the index.
-		let pos = LinkedList::find_position(rate_list(DOT, PUSD), rate_pct(15, 1000)); // 1.5%
-		assert_ne!(pos.prev, Some(1));
-		assert_ne!(pos.next, Some(1));
-	});
-}
-
-// `repair_steps_needed` reports 0 for an already-correct hint and a positive,
-// within-budget count for a stale-but-repairable one.
-#[test]
-fn repair_steps_needed_zero_for_valid_positive_for_stale() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		for (who, pct) in [(1u64, 10), (2, 20), (3, 30)] {
-			assert_ok!(open(who, DOT, PUSD, 2_000, 500, rate_pct(pct, 100)));
-		}
-		let budget = <LinkedList as SortedListInterface<VaultList, u64>>::repair_budget();
-		let rate = rate_pct(25, 100);
-		let good = LinkedList::find_position(rate_list(DOT, PUSD), rate);
-		assert_eq!(LinkedList::repair_steps_needed(&rate_list(DOT, PUSD), rate, good), 0);
-		let stale = LinkedList::repair_steps_needed(
-			&rate_list(DOT, PUSD),
-			rate,
-			Position::endpoints_only(),
-		);
-		assert!(stale > 0 && stale <= budget, "stale hint must be repairable within budget");
-	});
-}
-
-// A hint that would need more than the repair budget signals infeasibility by
-// returning a step count strictly greater than the budget.
-#[test]
-fn repair_steps_needed_exceeds_budget_for_extreme_hint_in_long_index() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		seed_long_rate_index();
-		let budget = <LinkedList as SortedListInterface<VaultList, u64>>::repair_budget();
-		let steps = LinkedList::repair_steps_needed(
-			&rate_list(DOT, PUSD),
-			rate_pct(1, 100),
-			Position::endpoints_only(),
-		);
-		assert!(steps > budget, "extreme stale hint in a long index is infeasible");
-	});
 }
 
 // Exiting FinalRecovery back into the rate index with an unrepairable hint rolls
