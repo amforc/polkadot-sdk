@@ -120,8 +120,10 @@ pub trait Inspect<AccountId>: Sized {
 	/// Returns `true` if an `asset` exists.
 	fn asset_exists(asset: Self::AssetId) -> bool;
 
-	/// Returns `true` if an `asset` is sufficient: a balance of it alone keeps an account alive.
-	fn is_sufficient(_: Self::AssetId) -> bool {
+	/// Returns `true` if the `asset` exists and is sufficient, `false` otherwise.
+	///
+	/// Defaults to `false`; implementations which track sufficiency should override this.
+	fn is_sufficient(_asset: Self::AssetId) -> bool {
 		false
 	}
 }

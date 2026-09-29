@@ -52,7 +52,7 @@ use sc_network::{
 use sc_service::{Configuration, ImportQueue, PartialComponents, TaskManager};
 use sc_statement_store::Store;
 use sc_storage_chain_sync::{
-	IndexedTransactionFetcher, NetworkHandle, StorageChainBlockImport, SyncingHandle,
+	BitswapHandleSlot, IndexedTransactionFetcher, StorageChainBlockImport,
 };
 use sc_sysinfo::HwBench;
 use sc_telemetry::{TelemetryHandle, TelemetryWorker};
@@ -102,7 +102,7 @@ where
 		telemetry: Option<TelemetryHandle>,
 		task_manager: &TaskManager,
 		relay_chain_interface: Arc<dyn RelayChainInterface>,
-		transaction_pool: Arc<TransactionPoolHandle<Block, ParachainClient<Block, RuntimeApi>>>,
+		transaction_pool: Arc<TransactionPoolHandle<Block>>,
 		keystore: KeystorePtr,
 		relay_chain_slot_duration: Duration,
 		para_id: ParaId,
@@ -287,24 +287,18 @@ pub(crate) trait BaseNodeSpec {
 			telemetry
 		});
 
-		let transaction_pool = Arc::from(
-			sc_transaction_pool::Builder::new(
-				task_manager.spawn_essential_handle(),
-				client.clone(),
-				config.role.is_authority().into(),
-			)
-			.with_options(config.transaction_pool.clone())
-			.with_prometheus(config.prometheus_registry())
-			.build(),
-		);
+		let transaction_pool = sc_transaction_pool::Builder::new(
+			task_manager.spawn_essential_handle(),
+			client.clone(),
+			config.role.is_authority().into(),
+		)
+		.with_options(config.transaction_pool.clone())
+		.with_prometheus(config.prometheus_registry())
+		.build();
 
-		let network_handle: NetworkHandle = Arc::new(OnceLock::new());
-		let syncing_handle: SyncingHandle = Arc::new(OnceLock::new());
+		let bitswap_slot: BitswapHandleSlot = Arc::new(OnceLock::new());
 
-		let fetcher = IndexedTransactionFetcher::new(
-			Arc::clone(&network_handle),
-			Arc::clone(&syncing_handle),
-		);
+		let fetcher = IndexedTransactionFetcher::new(Arc::clone(&bitswap_slot));
 
 		let storage_chain_block_import =
 			StorageChainBlockImport::new(client.clone(), client.clone(), fetcher);
@@ -335,8 +329,7 @@ pub(crate) trait BaseNodeSpec {
 				telemetry,
 				telemetry_worker_handle,
 				block_import_auxiliary_data,
-				network_handle,
-				syncing_handle,
+				bitswap_slot,
 			),
 		})
 	}
@@ -346,7 +339,7 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 	type BuildRpcExtensions: BuildRpcExtensions<
 		ParachainClient<Self::Block, Self::RuntimeApi>,
 		ParachainBackend<Self::Block>,
-		TransactionPoolHandle<Self::Block, ParachainClient<Self::Block, Self::RuntimeApi>>,
+		TransactionPoolHandle<Self::Block>,
 		Store,
 	>;
 
@@ -402,8 +395,7 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 				mut telemetry,
 				telemetry_worker_handle,
 				block_import_auxiliary_data,
-				network_handle,
-				syncing_handle,
+				bitswap_slot,
 			) = params.other;
 			let client = params.client.clone();
 			let backend = params.backend.clone();
@@ -438,17 +430,18 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 				parachain_config.prometheus_config.as_ref().map(|config| &config.registry),
 			);
 
-			let statement_handler_proto = node_extra_args.statement_store_config.map(|config| {
-				let proto = new_statement_handler_proto(
-					&*client,
-					&parachain_config,
-					&metrics,
-					&mut net_config,
-				);
-				(proto, config)
-			});
+			let statement_handler_proto =
+				node_extra_args.statement_store_config.clone().map(|config| {
+					let proto = new_statement_handler_proto(
+						&*client,
+						&parachain_config,
+						&metrics,
+						&mut net_config,
+					);
+					(proto, config)
+				});
 
-			let (network, system_rpc_tx, tx_handler_controller, sync_service) =
+			let (network, system_rpc_tx, tx_handler_controller, sync_service, bitswap_handle) =
 				build_network(BuildNetworkParams {
 					parachain_config: &parachain_config,
 					net_config,
@@ -460,13 +453,16 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 					relay_chain_interface: relay_chain_interface.clone(),
 					import_queue: params.import_queue,
 					metrics,
+					gap_sync_body_policy: Some(crate::common::gap_sync_body_policy_provider(
+						client.clone(),
+						parachain_config.blocks_pruning,
+					)),
 				})
 				.await?;
 
-			let _ = network_handle
-				.set(network.clone() as Arc<dyn sc_network::NetworkRequest + Send + Sync>);
-			let _ = syncing_handle.set(sync_service.clone()
-				as Arc<dyn sc_storage_chain_sync::BitswapPeerSource + Send + Sync>);
+			if let Some(handle) = bitswap_handle {
+				let _ = bitswap_slot.set(Arc::new(handle));
+			}
 
 			let peer_id = relay_chain_network.local_peer_id();
 
