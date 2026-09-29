@@ -441,6 +441,11 @@ pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
 		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
+		// Every test here drives the real Vaults pallet, whose invariants its own suite cannot
+		// see; they are reachable from outside the crate only through the try-runtime hook.
+		#[cfg(feature = "try-runtime")]
+		<Vaults as frame::deps::frame_support::traits::Hooks<_>>::try_state(System::block_number())
+			.expect("post-test vaults invariants hold");
 	});
 }
 
@@ -798,18 +803,6 @@ pub fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Bal
 	}
 }
 
-/// Commits aggregate cohort advancement without realizing any depositor row.
-///
-/// Most tests should let their subject operation do this. This narrower fixture exists for tests
-/// of the advancement bookkeeping itself, where adding an offset or yield would change the state
-/// under examination.
-pub fn advance_matured_cohorts(collateral: AssetId, stable: StableId) {
-	let mut pool = crate::Pools::<Test>::get(&collateral, stable).expect("pool registered");
-	let branch = branch_snapshot(&collateral, &stable);
-	assert_ok!(Stability::advance_cohorts(&collateral, &stable, &mut pool, branch));
-	crate::Pools::<Test>::insert(&collateral, stable, pool);
-}
-
 /// The cohort deadline the pending deposit of `who` waits out, read from the open slots.
 pub fn pending_deadline(collateral: AssetId, stable: StableId, who: AccountId) -> Option<Moment> {
 	let pending = deposit_row(collateral.clone(), stable, who)?.pending_deposit?;
@@ -895,6 +888,14 @@ pub fn branch_snapshot(collateral: &AssetId, stable: &StableId) -> BranchSnapsho
 	BranchSnapshot { mode, now: Timestamp::get() }
 }
 
+/// Quotes a market under its current branch, as the liquidation engine reads it.
+///
+/// Every caller probes a registered, unfrozen market, which always quotes.
+pub fn market_quote(collateral: &AssetId, stable: &StableId) -> crate::OffsetQuote<Test> {
+	Stability::quote(collateral, stable, branch_snapshot(collateral, stable))
+		.expect("an unfrozen market quotes")
+}
+
 /// Runs `operation` and checks that it wrote nothing, returning its value.
 ///
 /// The value-returning form of `assert_storage_noop!`, for operations that hand a credit back.
@@ -929,76 +930,81 @@ pub fn issue_collateral(
 
 /// The proportional share of `amount`: `floor(amount * numerator / denominator)`.
 ///
-/// The offset simulations use it to slice collateral pro rata to the debt they burn.
+/// The offset simulation uses it to slice collateral pro rata to the debt each leg burns.
 pub fn pro_rata_floor(amount: Balance, numerator: Balance, denominator: Balance) -> Balance {
 	assert!(numerator <= denominator);
 	assert!(denominator > 0);
 	pusd_primitives::mul_div_floor(amount, numerator, denominator).expect("share of amount fits")
 }
 
-/// Runs an active-pool offset the way the liquidation engine will: read the reducible amount,
-/// cut the matching slice of collateral, and settle.
+/// The legs one [`simulate_offset`] call settled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SimulatedOffset {
+	/// Debt the active pool cancelled.
+	pub active: Balance,
+	/// Debt the pending deposits cancelled.
+	pub pending: Balance,
+	/// Collateral not handed to the pool, returned to the caller.
+	pub leftover: Balance,
+}
+
+impl SimulatedOffset {
+	/// Debt the pool cancelled across both legs.
+	pub fn debt(&self) -> Balance {
+		self.active + self.pending
+	}
+}
+
+/// Offers up to `max_debt` to the pool through its public offset interface.
 ///
-/// Returns the debt cancelled and the collateral left over. The storage layer stands in for the
-/// transaction every production extrinsic runs inside, so a refused settlement rolls back and the
-/// caller simply steps aside, as the trait requires.
+/// One `quote` under the current branch sizes the active leg, then the pending leg behind it,
+/// and a single `offset` settles both, as the trait documents. `collateral_total` backs all of
+/// `max_debt`: each leg takes the pro-rata floor of it for its debt, and the rest stays with the
+/// caller. That split is the test's choice; the pool settles whatever collateral it is handed.
+/// Legs that size to nothing make no call.
+///
+/// A settlement of quoted legs must not be refused, and the pool must give up exactly the debt
+/// it cancels, so either failure panics.
 pub fn simulate_offset(
 	collateral: AssetId,
 	stable: StableId,
 	max_debt: Balance,
-	collateral_for_pool: Balance,
-) -> (Balance, Balance) {
-	frame::deps::frame_support::storage::with_storage_layer(
-		|| -> Result<(Balance, Balance), DispatchError> {
-			let branch = branch_snapshot(&collateral, &stable);
-			let debt = Stability::reducible_active(&collateral, &stable, branch, max_debt);
-			if debt.is_zero() {
-				return Ok((0, collateral_for_pool));
-			}
-			let mut credit = issue_collateral(collateral.clone(), collateral_for_pool);
-			let slice = credit.extract(pro_rata_floor(collateral_for_pool, debt, max_debt));
-			Stability::offset(
-				&collateral,
-				&stable,
-				branch,
-				OffsetLegs { active: debt, pending: 0 },
-				OffsetLegs { active: slice, pending: issue_collateral(collateral.clone(), 0) },
-			)?;
-			Ok((debt, credit.peek()))
+	collateral_total: Balance,
+) -> SimulatedOffset {
+	assert!(max_debt > 0);
+	let branch = branch_snapshot(&collateral, &stable);
+	let (active, pending) = match Stability::quote(&collateral, &stable, branch) {
+		Some(quote) => {
+			let active = Stability::quote_active(&quote, max_debt);
+			assert!(active <= max_debt);
+			let remaining = max_debt - active;
+			let pending = if remaining.is_zero() {
+				0
+			} else {
+				Stability::quote_pending(&quote, remaining, active)
+			};
+			assert!(pending <= remaining);
+			(active, pending)
 		},
+		None => (0, 0),
+	};
+	if active.is_zero() && pending.is_zero() {
+		return SimulatedOffset { active, pending, leftover: collateral_total };
+	}
+	let mut credit = issue_collateral(collateral.clone(), collateral_total);
+	let active_collateral = credit.extract(pro_rata_floor(collateral_total, active, max_debt));
+	let pending_collateral = credit.extract(pro_rata_floor(collateral_total, pending, max_debt));
+	let burned = Stability::offset(
+		&collateral,
+		&stable,
+		branch,
+		OffsetLegs { active, pending },
+		OffsetLegs { active: active_collateral, pending: pending_collateral },
 	)
-	.unwrap_or((0, collateral_for_pool))
-}
-
-/// [`simulate_offset`] for the pending leg.
-pub fn simulate_pending_offset(
-	collateral: AssetId,
-	stable: StableId,
-	max_debt_to_offset: Balance,
-	remaining_collateral: Balance,
-) -> (Balance, Balance) {
-	frame::deps::frame_support::storage::with_storage_layer(
-		|| -> Result<(Balance, Balance), DispatchError> {
-			let branch = branch_snapshot(&collateral, &stable);
-			let debt =
-				Stability::reducible_pending(&collateral, &stable, branch, max_debt_to_offset, 0);
-			if debt.is_zero() {
-				return Ok((0, remaining_collateral));
-			}
-			let mut credit = issue_collateral(collateral.clone(), remaining_collateral);
-			let slice =
-				credit.extract(pro_rata_floor(remaining_collateral, debt, max_debt_to_offset));
-			Stability::offset(
-				&collateral,
-				&stable,
-				branch,
-				OffsetLegs { active: 0, pending: debt },
-				OffsetLegs { active: issue_collateral(collateral.clone(), 0), pending: slice },
-			)?;
-			Ok((debt, credit.peek()))
-		},
-	)
-	.unwrap_or((0, remaining_collateral))
+	.expect("quoted legs settle");
+	let given_up = burned.as_ref().map_or(0, |credit| credit.peek());
+	assert_eq!(given_up, active + pending, "the pool gives up exactly the debt it cancels");
+	SimulatedOffset { active, pending, leftover: credit.peek() }
 }
 
 /// The deposit row of an account, or `None` if it was never created or has been removed.
@@ -1010,33 +1016,15 @@ pub fn deposit_row(
 	crate::Deposits::<Test>::get((collateral, stable, who))
 }
 
-/// What the pending deposit of `who` is worth right now, settled against the live pending
-/// accumulators without writing anything.
-pub fn realized_pending(collateral: AssetId, stable: StableId, who: AccountId) -> Balance {
-	let Some(pending) =
-		deposit_row(collateral.clone(), stable, who).and_then(|d| d.pending_deposit)
-	else {
-		return 0;
-	};
-	let state = pool_state(collateral.clone(), stable);
-	let config = crate::Pools::<Test>::get(collateral.clone(), stable)
-		.expect("pool registered")
-		.config;
-	let realize = || {
-		let window = Stability::sums_window(&collateral, &stable, Leg::Pending, &pending.snapshot)
-			.expect("pending snapshot row exists");
-		crate::math::realize(
-			pending.amount,
-			&pending.snapshot,
-			&state.pending_coords,
-			&window,
-			&config.precision,
-		)
-		.compounded
-	};
-	// Settling against the live accumulators is a pure read.
-	assert_storage_noop!(realize());
-	realize()
+/// The pending amount the next settlement of `who` would store, read through the public view.
+///
+/// Zero when the settlement would leave nothing pending. The view must not write, which the
+/// read checks.
+pub fn pending_after_settlement(collateral: AssetId, stable: StableId, who: AccountId) -> Balance {
+	storage_noop(|| Stability::deposit_after_settlement(collateral, stable, who))
+		.expect("pool and row exist")
+		.pending_deposit
+		.map_or(0, |pending| pending.amount)
 }
 
 /// The live state of a pool. Panics if the market is not registered.
