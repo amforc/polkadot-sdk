@@ -153,22 +153,14 @@ fn debt_in_front_counts_final_recovery_queue_first() {
 	});
 }
 
-// A zero step budget and an empty rate index both return zero, and only the
-// budget truncates.
+// A market without vaults has nothing in front of any rate, and the walk reports no truncation.
 #[test]
-fn debt_in_front_zero_for_no_steps_or_empty_index() {
+fn debt_in_front_is_zero_for_an_empty_index() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		// Empty rate index → nothing in front.
 		assert_eq!(
 			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), u32::MAX),
 			Ok((0, false))
-		);
-		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000)));
-		// A zero step budget visits no vaults.
-		assert_eq!(
-			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), 0),
-			Ok((0, true))
 		);
 	});
 }

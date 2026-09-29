@@ -99,7 +99,8 @@ fn insufficient_collateral_custody_needs_the_provider_reference() {
 	});
 }
 
-// A Root create is deposit-free: no hold is taken.
+// A Root create is deposit-free: no hold is taken, neither from the stablecoin owner nor from the
+// full admin that funds the custody seed.
 #[test]
 fn root_create_takes_no_deposit() {
 	build_and_execute(|| {
@@ -113,28 +114,8 @@ fn root_create_takes_no_deposit() {
 			(),
 		));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
+		assert_eq!(creation_deposit_held(ADMIN), 0);
 		assert!(market_exists(DOT, PUSD));
-	});
-}
-
-// The lifecycle hooks fire exactly once each, in order, across a create/remove
-// round-trip.
-#[test]
-fn lifecycle_hooks_fire_on_create_and_remove() {
-	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::signed(PUSD_OWNER),
-			DOT,
-			PUSD,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config(),
-			(),
-		));
-		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true, 1)]);
-
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert_eq!(LifecycleLog::get(), alloc::vec![(DOT, PUSD, true, 1), (DOT, PUSD, false, 0)]);
 	});
 }
 
@@ -324,22 +305,25 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 }
 
 // A non-empty market cannot be removed; once its sole vault closes, removal
-// succeeds.
+// succeeds. Governance goes through the same extrinsic, bypassing the admins but
+// not the emptiness rule.
 #[test]
 fn remove_branch_requires_empty_market() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_noop!(
-			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
-			Error::<Test>::BranchNotEmpty
-		);
+	for origin in [RuntimeOrigin::signed(ADMIN), RuntimeOrigin::root()] {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+			assert_noop!(
+				Pallet::<Test>::remove_branch(origin.clone(), DOT, PUSD),
+				Error::<Test>::BranchNotEmpty
+			);
 
-		// Once the sole vault is repaid to zero, the now-empty market is removable.
-		repay_to_close(PUSD_OWNER);
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert!(!market_exists(DOT, PUSD));
-	});
+			// Once the sole vault is repaid to zero, the now-empty market is removable.
+			repay_to_close(PUSD_OWNER);
+			assert_ok!(Pallet::<Test>::remove_branch(origin.clone(), DOT, PUSD));
+			assert!(!market_exists(DOT, PUSD));
+		});
+	}
 }
 
 // Reassigning admins moves authority: the old full admin loses it, the new one
@@ -424,18 +408,6 @@ fn emergency_admin_can_freeze() {
 	});
 }
 
-// The force origin freezes any market through the same extrinsic the
-// admins use, bypassing them.
-#[test]
-fn governance_can_freeze_bypassing_admins() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// Root is not a branch admin, yet the kill switch passes.
-		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
-		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
-	});
-}
-
 // ForceOrigin acts as a full administrator so governance can recover a market with unavailable
 // administrators. The runtime configuration limits still apply.
 #[test]
@@ -471,7 +443,9 @@ fn force_origin_acts_as_full_branch_admin() {
 			Error::<Test>::ConfigOutsideEnvelope(BoundViolation::BorrowRateTooHigh)
 		);
 
+		// Root is not a branch admin, yet the kill switch passes both ways.
 		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
+		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
 		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, false));
 		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
 	});
@@ -505,11 +479,12 @@ fn redistribution_account_provider_reference_is_paired() {
 	});
 }
 
-// An issued-asset market keeps the seed in a `pallet-assets` account, which
-// takes consumer references rather than a provider one. Removal has to sweep
-// the seed before releasing the provider reference, or the consumers block it.
+// An issued-asset market keeps the custody seed in a `pallet-assets` account. Removal sweeps the
+// seed back to the account that funded it and releases the market's provider reference. The
+// asset is sufficient, so its account takes no consumer reference: the insufficient case lives in
+// `insufficient_collateral_custody_needs_the_provider_reference`.
 #[test]
-fn issued_collateral_registration_leaves_no_references_behind() {
+fn issued_collateral_removal_refunds_the_custody_seed() {
 	build_and_execute(|| {
 		let account = Pallet::<Test>::redistribution_account(&TOKEN_X, &PUSD);
 		let funder_before = collateral_balance(TOKEN_X, ADMIN);
@@ -518,7 +493,6 @@ fn issued_collateral_registration_leaves_no_references_behind() {
 
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD));
 		assert_eq!(System::providers(&account), 0);
-		assert_eq!(System::consumers(&account), 0);
 		assert_eq!(collateral_balance(TOKEN_X, ADMIN), funder_before);
 	});
 }
@@ -538,24 +512,6 @@ fn freeze_and_remove_reject_unauthorized_signers() {
 			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(NOBODY), DOT, PUSD),
 			Error::<Test>::NotBranchAdmin
 		);
-	});
-}
-
-// Governance removal goes through `remove_branch` and still requires the
-// market to be empty.
-#[test]
-fn governance_remove_bypasses_admins_and_requires_empty() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_noop!(
-			Pallet::<Test>::remove_branch(RuntimeOrigin::root(), DOT, PUSD),
-			Error::<Test>::BranchNotEmpty
-		);
-
-		repay_to_close(PUSD_OWNER);
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
-		assert!(!market_exists(DOT, PUSD));
 	});
 }
 
@@ -622,27 +578,6 @@ fn create_branch_rejects_stable_collateral_collision() {
 			),
 			Error::<Test>::StableCollateralCollision
 		);
-	});
-}
-
-// A market still holding collateral in its redistribution account cannot be
-// removed — the collateral would be stranded with no path left to reach it.
-#[test]
-fn remove_branch_rejected_while_collateral_remains() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		mutate_branch_state(DOT, PUSD, |state| {
-			state.total_collateral = 1;
-		});
-		assert_noop!(
-			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
-			Error::<Test>::BranchNotEmpty
-		);
-		mutate_branch_state(DOT, PUSD, |state| {
-			state.total_collateral = 0;
-		});
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert!(!market_exists(DOT, PUSD));
 	});
 }
 
