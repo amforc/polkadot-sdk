@@ -2209,20 +2209,6 @@ fn increasing_or_decreasing_destroying_asset_should_not_work() {
 }
 
 #[test]
-fn is_sufficient_reflects_asset_details() {
-	build_and_execute(|| {
-		use frame_support::traits::fungibles::Inspect;
-
-		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 0, 1, true, 1));
-		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 1, 1, false, 1));
-
-		assert!(Assets::is_sufficient(0));
-		assert!(!Assets::is_sufficient(1));
-		assert!(!Assets::is_sufficient(2));
-	});
-}
-
-#[test]
 fn asset_id_cannot_be_reused() {
 	build_and_execute(|| {
 		Balances::make_free_balance_be(&1, 100);
@@ -2376,5 +2362,35 @@ fn setting_too_many_reserves_fails() {
 			reserves.clone().try_into();
 		assert!(result.is_err());
 		assert_eq!(Reserves::<Test>::get(0), vec![]);
+	});
+}
+
+#[test]
+fn fungibles_inspect_is_sufficient_works() {
+	build_and_execute(|| {
+		use frame_support::traits::fungibles::Inspect;
+
+		// An unknown asset is not sufficient.
+		assert!(!<Assets as Inspect<u64>>::is_sufficient(0));
+
+		// A sufficient asset reports `true`, an insufficient one `false`.
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 0, 1, true, 1));
+		assert!(<Assets as Inspect<u64>>::is_sufficient(0));
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 1, 1, false, 1));
+		assert!(!<Assets as Inspect<u64>>::is_sufficient(1));
+
+		// Sufficiency changes via `force_asset_status` are reflected.
+		assert_ok!(Assets::force_asset_status(
+			RuntimeOrigin::root(),
+			0,
+			1,
+			1,
+			1,
+			1,
+			1,
+			false,
+			false
+		));
+		assert!(!<Assets as Inspect<u64>>::is_sufficient(0));
 	});
 }
