@@ -107,6 +107,10 @@ fn recovery_offset_can_fully_deplete_the_pool() {
 fn recovery_offset_error_paths() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, recovery_branch_config());
+
+		// No active capital to burn. The pool is sized before the head is looked up, so the empty
+		// pool is what rejects the call: once funded, the same call fails on the missing head.
+		assert_noop!(offset_recovery(DOT, PUSD, 300), Error::<Test>::NoRecoveryOffsetPerformed);
 		prepare_active_pool();
 
 		// No FinalRecovery vault queued.
@@ -175,18 +179,6 @@ fn incoming_recovery_rolls_back_when_deposit_accounting_fails_after_settlement()
 		crate::Deposits::<Test>::mutate((DOT, PUSD, 2), |row| {
 			row.as_mut().unwrap().claimable_collateral = 0;
 		});
-	});
-}
-
-#[test]
-fn recovery_offset_with_empty_pool_is_rejected() {
-	build_and_execute(|| {
-		register_branch(DOT, PUSD, recovery_branch_config());
-		open_standing_vault();
-		park_at_104_percent();
-
-		// A valid head, but no active capital to burn.
-		assert_noop!(offset_recovery(DOT, PUSD, 300), Error::<Test>::NoRecoveryOffsetPerformed);
 	});
 }
 

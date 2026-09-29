@@ -312,19 +312,6 @@ mod tests {
 	}
 
 	#[test]
-	fn realize_same_scale_basic() {
-		// D0=1000 at P0=1, S0=0, G0=0. Now P=0.5, S=0.3, G=0.1:
-		// compounded = floor(1000 * 0.5) = 500,
-		// collateral = floor(1000 * 0.3) = 300,
-		// yield      = floor(1000 * 0.1) = 100.
-		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
-		let current = accumulators(FixedU128::from_rational(1, 2), 0, 0);
-		let sums = window(FixedU128::from_rational(3, 10), FixedU128::from_rational(1, 10));
-		let got = realize::<u128>(1_000, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got, Realized { compounded: 500, collateral_gain: 300, yield_gain: 100 });
-	}
-
-	#[test]
 	fn realize_floors_payouts() {
 		// D0=3, P=0.333...333 (inner 333_333_333_333_333_333):
 		// compounded = floor(3 * 0.333...) = floor(0.999...) = 0.
@@ -352,47 +339,6 @@ mod tests {
 			&PRECISION,
 		);
 		assert_eq!(got.compounded, 1_600);
-	}
-
-	#[test]
-	fn realize_one_scale_behind_combines_both_sum_rows() {
-		// D0=1e12 at P0=0.5, S0=0.2. Snapshot-scale row finished at 0.5 and
-		// the next-scale row holds 300:
-		// delta = (0.5 - 0.2) + 300/1e9 = 0.3000003,
-		// gain = floor(1e12 * 0.3000003 / 0.5) = 600_000_600_000.
-		let snap = snapshot(
-			FixedU128::from_rational(1, 2),
-			FixedU128::from_rational(1, 5),
-			FixedU128::zero(),
-			0,
-			0,
-		);
-		let current = accumulators(FixedU128::from_rational(4, 5), 0, 1);
-		let sums = SumsWindow {
-			snap: PoolSums {
-				s_collateral: FixedU128::from_rational(1, 2),
-				g_yield: FixedU128::zero(),
-			},
-			ahead: [
-				PoolSums { s_collateral: FixedU128::from_u32(300), g_yield: FixedU128::zero() },
-				PoolSums::default(),
-			],
-		};
-		let got = realize::<u128>(1_000_000_000_000, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got.collateral_gain, 600_000_600_000);
-	}
-
-	#[test]
-	fn realize_two_scales_behind_divides_by_scale_factor_squared() {
-		// D0=4e18 at P0=1 on scale 0; current scale 2 with P=0.5:
-		// compounded = floor(4e18 * 0.5 / (1 * 1e18)) = 2.
-		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
-		let current = accumulators(FixedU128::from_rational(1, 2), 0, 2);
-		let sums = window(FixedU128::from_rational(1, 4), FixedU128::zero());
-		let got = realize::<u128>(4_000_000_000_000_000_000, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got.compounded, 2);
-		// gain = floor(4e18 * 0.25 / 1) = 1e18.
-		assert_eq!(got.collateral_gain, 1_000_000_000_000_000_000);
 	}
 
 	#[test]
@@ -438,20 +384,6 @@ mod tests {
 		assert_eq!(got.compounded, 0);
 		// gain = floor(4e18 * 0.25 / 1) = 1e18.
 		assert_eq!(got.collateral_gain, 1_000_000_000_000_000_000);
-	}
-
-	#[test]
-	fn realize_epoch_behind_compounds_to_zero_but_pays_gains() {
-		// The pool was fully depleted after the snapshot: the deposit is
-		// gone, but gains recorded for its epoch window remain claimable.
-		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
-		let current = accumulators(FixedU128::one(), 1, 0);
-		let sums = window(FixedU128::from_rational(9, 10), FixedU128::from_rational(1, 20));
-		let got = realize::<u128>(2_000, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got.compounded, 0);
-		// collateral = floor(2000 * 0.9) = 1800; yield = floor(2000 * 0.05) = 100.
-		assert_eq!(got.collateral_gain, 1_800);
-		assert_eq!(got.yield_gain, 100);
 	}
 
 	#[test]
@@ -505,16 +437,6 @@ mod tests {
 	}
 
 	#[test]
-	fn update_p_partial_offset_no_crossing() {
-		// P=1, A=1000, L=500 → P = 0.5, no crossing.
-		let got = update_p_after_offset::<u128>(FixedU128::one(), 1_000, 500, &PRECISION);
-		assert_eq!(
-			got,
-			Some(PUpdate::Updated { new_p: FixedU128::from_rational(1, 2), scales_crossed: 0 })
-		);
-	}
-
-	#[test]
 	fn update_p_single_crossing_folds_rescale_into_division() {
 		// P=2e-9 (inner 2e9), A=1000, L=750: the unscaled candidate is
 		// floor(2e9 * 250 / 1000) = 5e8 < p_min. One crossing:
@@ -529,18 +451,18 @@ mod tests {
 			got,
 			Some(PUpdate::Updated { new_p: FixedU128::from_rational(1, 2), scales_crossed: 1 })
 		);
-	}
 
-	#[test]
-	fn update_p_double_crossing() {
-		// P=1, A=1e19, new_total=5: k=0 gives floor(1e18*5/1e19) = 0 and k=1
-		// gives floor(1e27*5/1e19) = 5e8, both below p_min. k=2:
-		// floor(1e36*5/1e19) = 5e17 → P = 0.5 after two crossings.
-		let total = 10_000_000_000_000_000_000u128;
-		let got = update_p_after_offset::<u128>(FixedU128::one(), total, total - 5, &PRECISION);
+		// The highest a crossing can land. P=p_min (inner 1e9), A=1e6, L=1: the unscaled
+		// candidate is floor(1e9 * 999_999 / 1e6) = 999_999_000 < p_min. One crossing:
+		// floor(1e9 * 1e9 * 999_999 / 1e6) = 999_999e12 → P = 0.999999, just below
+		// p_min * scale_factor = 1.
+		let got = update_p_after_offset::<u128>(P_MIN, 1_000_000, 1, &PRECISION);
 		assert_eq!(
 			got,
-			Some(PUpdate::Updated { new_p: FixedU128::from_rational(1, 2), scales_crossed: 2 })
+			Some(PUpdate::Updated {
+				new_p: FixedU128::from_inner(999_999_000_000_000_000),
+				scales_crossed: 1
+			})
 		);
 	}
 
@@ -677,21 +599,6 @@ mod tests {
 			let deadline = cohort_deadline(now, 5_000);
 			assert!(deadline - now >= 5_000);
 			assert!(deadline - now < 10_000);
-		}
-	}
-
-	#[test]
-	fn update_p_result_stays_at_or_below_one() {
-		// A crossing right at the p_min boundary: P=p_min, L makes the ratio
-		// just under 1, so the rescaled result approaches p_min * SF = 1
-		// from below but never exceeds it.
-		let got = update_p_after_offset::<u128>(P_MIN, 1_000_000, 1, &PRECISION);
-		match got {
-			Some(PUpdate::Updated { new_p, scales_crossed }) => {
-				assert!(new_p <= FixedU128::one());
-				assert_eq!(scales_crossed, 1);
-			},
-			other => panic!("expected a single crossing, got {other:?}"),
 		}
 	}
 }

@@ -1,73 +1,46 @@
 //! `request_withdraw` and `withdraw`.
 //!
-//! The Normal-Mode path runs end to end, and the Safety-Mode path is checked at its amount and
-//! timing boundaries. A request only exists in Safety Mode, so those tests enter it through the
-//! debt fixture of the mock first. `mode` covers what a Normal-Mode request does instead.
+//! The Normal-Mode path runs end to end, and the Safety-Mode request is checked at its amount
+//! boundaries. A request only exists in Safety Mode, so those tests enter it through the debt
+//! fixture of the mock first. `mode` covers the Safety delay and what a Normal-Mode request does
+//! instead.
 
-use crate::{
-	mock::*,
-	types::{Deposit, DepositSnapshot, WithdrawalRequest},
-	Error,
-};
-use pusd_primitives::BranchMode;
-
-fn active_row(active: Balance, request: Option<WithdrawalRequest<Balance>>) -> Deposit<Balance> {
-	let mut row = Deposit::fresh(DepositSnapshot::fresh());
-	row.active_deposit = active;
-	row.withdrawal_request = request;
-	row
-}
+use crate::{mock::*, types::WithdrawalRequest, Error};
 
 #[test]
-fn withdraw_full_amount_prunes_row() {
-	build_and_execute(|| {
-		seed_pool_with_matured_deposit();
+fn withdraw_pays_at_most_the_active_deposit_and_prunes_the_row() {
+	// The depositor holds 400 active and 600 in its wallet. The exact amount goes back to the
+	// depositor. The over-ask goes to an empty-handed recipient, so the clamped amount is visible
+	// on its own rather than blending into the original mint.
+	let cases: [(Balance, AccountId, Balance, Balance); 2] =
+		[(400, 1, 1_000, 1_000), (1_000, 2, 600, 400)];
+	for (requested, recipient, depositor_balance, recipient_balance) in cases {
+		build_and_execute(|| {
+			seed_pool_with_matured_deposit();
 
-		assert_ok!(withdraw(1, DOT, PUSD, 400, 1));
+			assert_ok!(withdraw(1, DOT, PUSD, requested, recipient));
 
-		assert_eq!(stable_balance(PUSD, 1), 1_000);
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 0);
-		assert!(deposit_row(DOT, PUSD, 1).is_none());
-		let state = pool_state(DOT, PUSD);
-		assert_eq!(state.total_active_deposits, 0);
-		assert_eq!(state.total_pending_deposits, 0);
+			assert_eq!(stable_balance(PUSD, 1), depositor_balance);
+			assert_eq!(stable_balance(PUSD, recipient), recipient_balance);
+			let pool = Stability::pool_account(&DOT, &PUSD);
+			assert_eq!(stable_balance(PUSD, pool), 0);
+			assert!(deposit_row(DOT, PUSD, 1).is_none());
+			let state = pool_state(DOT, PUSD);
+			assert_eq!(state.total_active_deposits, 0);
+			assert_eq!(state.total_pending_deposits, 0);
 
-		System::assert_last_event(
-			crate::Event::WithdrawalExecuted {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				recipient: 1,
-				amount: 400,
-			}
-			.into(),
-		);
-	});
-}
-
-#[test]
-fn withdraw_clamps_to_active_deposit() {
-	build_and_execute(|| {
-		seed_pool_with_matured_deposit();
-
-		// Requesting more than the 400 active takes exactly the 400 — paid
-		// to an empty-handed recipient, so the amount is visible on its own
-		// rather than blending into user 1's original mint.
-		assert_ok!(withdraw(1, DOT, PUSD, 1_000, 2));
-		assert_eq!(stable_balance(PUSD, 2), 400);
-		assert_eq!(stable_balance(PUSD, 1), 600);
-		System::assert_last_event(
-			crate::Event::WithdrawalExecuted {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				recipient: 2,
-				amount: 400,
-			}
-			.into(),
-		);
-	});
+			System::assert_last_event(
+				crate::Event::WithdrawalExecuted {
+					collateral_id: DOT,
+					stable_id: PUSD,
+					depositor: 1,
+					recipient,
+					amount: 400,
+				}
+				.into(),
+			);
+		});
+	}
 }
 
 #[test]
@@ -173,22 +146,4 @@ fn normal_withdraw_ignores_request_and_prunes_it_with_the_row() {
 		// The emptied row takes the leftover request with it.
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 	});
-}
-
-// Pin the partial-consumption boundary directly; `tests/mode.rs` covers the
-// broader Safety flow through the live vaults-derived mode.
-
-#[test]
-fn safety_withdrawal_respects_delay_boundary() {
-	let request = WithdrawalRequest { amount: 250, executable_at: 606_000 };
-	let mut row = active_row(400, Some(request.clone()));
-	// One millisecond early: rejected, request untouched.
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 605_999, 100, &mut row);
-	assert_err!(got, Error::<Test>::SafetyWithdrawalDelayActive);
-	assert_eq!(row.withdrawal_request, Some(request));
-
-	// At exactly `executable_at`: allowed.
-	let got = Stability::resolve_withdrawal(BranchMode::Safety, 606_000, 100, &mut row);
-	assert_ok!(got, 100);
-	assert_eq!(row.withdrawal_request.as_ref().expect("still open").amount, 150);
 }

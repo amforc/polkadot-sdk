@@ -17,7 +17,7 @@ fn multiple_depositor_cohorts_reconcile_to_zero() {
 		drop(distribute_yield(DOT, PUSD, 150));
 		// Offset 1: A = 1500 → 900, P = 0.6, delta_S = floor(300 * 1e18 /
 		// 1500) = 2e17, so S = 0.2.
-		assert_eq!(simulate_offset(DOT, PUSD, 600, 300).0, 600);
+		assert_eq!(simulate_offset(DOT, PUSD, 600, 300).debt(), 600);
 		assert_eq!(pool_state(DOT, PUSD).coords.p, FixedU128::from_rational(3, 5));
 
 		// A third depositor joins at P = 0.6, S = 0.2, G = 0.1: A = 900 + 900.
@@ -28,7 +28,7 @@ fn multiple_depositor_cohorts_reconcile_to_zero() {
 		drop(distribute_yield(DOT, PUSD, 180));
 		// Offset 2: A = 1800 → 900, P = 0.6 → floor(0.6 * 900 / 1800) = 0.3,
 		// delta_S = floor(450 * 0.6 / 1800) = 1.5e17, so S = 0.35.
-		assert_eq!(simulate_offset(DOT, PUSD, 900, 450).0, 900);
+		assert_eq!(simulate_offset(DOT, PUSD, 900, 450).debt(), 900);
 		assert_eq!(pool_state(DOT, PUSD).coords.p, FixedU128::from_rational(3, 10));
 
 		// Collateral: user1 floor(1000 * 0.35) = 350, user2 floor(500 * 0.35)

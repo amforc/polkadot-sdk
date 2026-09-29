@@ -5,6 +5,7 @@
 //! never touched.
 
 use crate::{mock::*, Error};
+use pusd_primitives::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
 
 #[test]
 fn pending_offset_full_depletion_bumps_the_pending_epoch() {
@@ -16,9 +17,9 @@ fn pending_offset_full_depletion_bumps_the_pending_epoch() {
 		// The request exceeds the 300 pending total: full depletion, one
 		// call, no per-depositor iteration cap. The collateral slice is
 		// floor(150 * 300 / 1_000) = 45, so delta_S = 45/300 = 0.15.
-		let (debt_offset, leftover) = simulate_pending_offset(DOT, PUSD, 1_000, 150);
-		assert_eq!(debt_offset, 300);
-		assert_eq!(leftover, 105);
+		let offset = simulate_offset(DOT, PUSD, 1_000, 150);
+		assert_eq!(offset.debt(), 300);
+		assert_eq!(offset.leftover, 105);
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_pending_deposits, 0);
@@ -27,7 +28,7 @@ fn pending_offset_full_depletion_bumps_the_pending_epoch() {
 		// Every row compounds to zero (epoch behind) but keeps its window
 		// gain of floor(100 * 0.15) = 15.
 		for who in 1..=3 {
-			assert_eq!(realized_pending(DOT, PUSD, who), 0);
+			assert_eq!(pending_after_settlement(DOT, PUSD, who), 0);
 			assert_claim_collateral(who, 15);
 			assert!(deposit_row(DOT, PUSD, who).is_none());
 		}
@@ -41,7 +42,10 @@ fn pending_offset_full_depletion_bumps_the_pending_epoch() {
 		// the whole pending amount burns for a zero collateral credit. The flooring loss is
 		// bounded by one collateral base unit per offset and only visible when the credit is
 		// nearly worthless relative to the debt.
-		assert_eq!(simulate_pending_offset(DOT, PUSD, 1_000, 1), (100, 1));
+		assert_eq!(
+			simulate_offset(DOT, PUSD, 1_000, 1),
+			SimulatedOffset { active: 0, pending: 100, leftover: 1 }
+		);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.pending_coords.epoch, 2);
@@ -55,48 +59,74 @@ fn pending_offset_full_depletion_bumps_the_pending_epoch() {
 	});
 }
 
+/// The pending-leg guards of the offset interface, read through the trait.
+/// `offset_without_capacity_quotes_nothing_and_refuses_settlement` owns the guards both legs
+/// share: the unregistered market, the frozen one, and the offset with no debt at all.
 #[test]
-fn pending_offset_noop_cases_pass_remainders_through() {
-	build_and_execute(|| {
-		// Unregistered market: the credit comes back whole and nothing is written.
-		assert_storage_noop!(assert_eq!(simulate_pending_offset(DOT, PUSD, 100, 50), (0, 50)));
+fn pending_leg_without_capacity_quotes_nothing_and_refuses_settlement() {
+	build_with_default_market(|| {
+		// Every refusal consumes its credit, so each probe issues it inside a hypothetical.
+		let offset_pending = |debt: Balance, collateral: Balance| {
+			hypothetically!(Stability::offset(
+				&DOT,
+				&PUSD,
+				branch_snapshot(&DOT, &PUSD),
+				OffsetLegs { active: 0, pending: debt },
+				OffsetLegs {
+					active: issue_collateral(DOT, 0),
+					pending: issue_collateral(DOT, collateral),
+				},
+			))
+		};
 
-		// Empty pending pool: same.
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_storage_noop!(assert_eq!(simulate_pending_offset(DOT, PUSD, 100, 50), (0, 50)));
+		// Empty pending pool: the leg quotes nothing, and a caller that settles past its quote
+		// is refused.
+		assert_eq!(Stability::quote_pending(&market_quote(&DOT, &PUSD), 100, 0), 0);
+		assert_err!(offset_pending(100, 50), Error::<Test>::OffsetSettlementFailed);
 
-		// Zero remaining debt with a populated pending pool: same.
+		// A populated pending pool quotes a real request, so capacity is not what refuses the
+		// call below.
 		seed_deposit(1, 200);
-		assert_storage_noop!(assert_eq!(simulate_pending_offset(DOT, PUSD, 0, 50), (0, 50)));
+		let quote = market_quote(&DOT, &PUSD);
+		assert_eq!(Stability::quote_pending(&quote, 100, 0), 100);
+
+		// Zero remaining debt quotes nothing, and a leg that cancels no debt may carry no
+		// collateral.
+		assert_eq!(Stability::quote_pending(&quote, 0, 0), 0);
+		assert_err!(offset_pending(0, 50), Error::<Test>::OffsetSettlementFailed);
 	});
 }
 
 #[test]
 fn pending_offset_ignores_active_deposits_and_accumulators() {
 	build_with_default_market(|| {
-		mint_stable(PUSD, 1, 600);
-		assert_ok!(deposit_and_mature(1, DOT, PUSD, 600));
+		// The active pool sits at its 100 floor, so a partial offset of it quotes nothing and the
+		// whole debt falls to the pending leg: the only way the quote reaches pending capital
+		// while active capital remains.
+		mint_stable(PUSD, 1, 100);
+		assert_ok!(deposit_and_mature(1, DOT, PUSD, 100));
 		seed_deposit(2, 400);
 		drop(distribute_yield(DOT, PUSD, 60));
 
 		let before = pool_state(DOT, PUSD);
 		let sums_before = active_sums(0, 0);
 
-		let (debt_offset, leftover) = simulate_pending_offset(DOT, PUSD, 200, 100);
-		assert_eq!(debt_offset, 200);
-		assert_eq!(leftover, 0);
+		assert_eq!(
+			simulate_offset(DOT, PUSD, 80, 40),
+			SimulatedOffset { active: 0, pending: 80, leftover: 0 }
+		);
 
 		// Only pending capital moved, so the active side is unchanged down to the last
 		// digit.
 		let after = pool_state(DOT, PUSD);
 		assert_eq!(after.coords, before.coords);
-		assert_eq!(after.total_active_deposits, 600);
-		assert_eq!(after.total_pending_deposits, 200);
+		assert_eq!(after.total_active_deposits, 100);
+		assert_eq!(after.total_pending_deposits, 320);
 		assert_eq!(active_sums(0, 0), sums_before);
-		// The pending pair took the whole hit: P_pending = 200/400 = 0.5,
-		// so the row realizes floor(400 * 0.5) = 200.
-		assert_eq!(after.pending_coords.p, FixedU128::from_rational(1, 2));
-		assert_eq!(realized_pending(DOT, PUSD, 2), 200);
+		// The pending pair took the whole hit: P_pending = 320/400 = 0.8,
+		// so the row realizes floor(400 * 0.8) = 320.
+		assert_eq!(after.pending_coords.p, FixedU128::from_rational(4, 5));
+		assert_eq!(pending_after_settlement(DOT, PUSD, 2), 320);
 
 		// The active depositor's yield claim is untouched.
 		assert_claim_yield(1, 60);
@@ -114,41 +144,14 @@ fn pending_offset_clamps_to_the_minimum_pool_floor() {
 		// exhaustion, and the pending `P` runs on the same precision
 		// parameters): the offset clamps to 100 and the collateral follows
 		// pro-rata, floor(150 * 100 / 150) = 100.
-		let (debt_offset, leftover) = simulate_pending_offset(DOT, PUSD, 150, 150);
-		assert_eq!(debt_offset, 100);
-		assert_eq!(leftover, 50);
+		let offset = simulate_offset(DOT, PUSD, 150, 150);
+		assert_eq!(offset.debt(), 100);
+		assert_eq!(offset.leftover, 50);
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_pending_deposits, 100);
 		assert_eq!(state.pending_coords.p, FixedU128::from_rational(1, 2));
-		assert_eq!(realized_pending(DOT, PUSD, 1), 100);
-	});
-}
-
-#[test]
-fn pending_offset_accepts_sub_minimum_gain_after_registration_touch() {
-	build_and_execute(|| {
-		// Same registration invariant as the active offset: the pool account accepts every positive
-		// gain even when the issued asset's minimum balance is larger.
-		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
-		let coll = AssetId::WithId(77);
-		register_branch(coll.clone(), PUSD, branch_config_for(coll.clone(), PUSD));
-		mint_stable(PUSD, 1, 200);
-		assert_ok!(deposit(1, coll.clone(), PUSD, 200));
-
-		// Gain 500 is below the 1_000 minimum but enters the pre-created account.
-		let (debt_offset, leftover) = simulate_pending_offset(coll.clone(), PUSD, 200, 500);
-		assert_eq!(debt_offset, 200);
-		assert_eq!(leftover, 0);
-		let row = deposit_row(coll.clone(), PUSD, 1).expect("kept");
-		assert_eq!(row.pending_deposit.expect("lazy realization").amount, 200);
-		let state = pool_state(coll.clone(), PUSD);
-		assert_eq!(state.total_pending_deposits, 0);
-		assert_eq!(state.pending_coords.p, FixedU128::one());
-		assert_eq!(state.pending_coords.epoch, 1);
-		let pool = Stability::pool_account(&coll, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 0);
-		assert_eq!(collateral_balance(coll, pool), 500);
+		assert_eq!(pending_after_settlement(DOT, PUSD, 1), 100);
 	});
 }
 
@@ -158,8 +161,8 @@ fn merged_top_up_shares_earlier_backstop_losses() {
 		seed_deposit(1, 200);
 
 		// Backstop halves the pending pool: P_pending = 100/200 = 0.5.
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 100, 0);
-		assert_eq!(debt_offset, 100);
+		let offset = simulate_offset(DOT, PUSD, 100, 0);
+		assert_eq!(offset.debt(), 100);
 
 		// The top-up realizes the loss first — floor(200 * 0.5) = 100 — and
 		// merges at the current pending accumulators: 100 + 300 = 400.
@@ -171,9 +174,9 @@ fn merged_top_up_shares_earlier_backstop_losses() {
 
 		// A second backstop consumption prices the merged amount as one
 		// stake: burning 200 of 400 halves it again to 200.
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 200, 0);
-		assert_eq!(debt_offset, 200);
-		assert_eq!(realized_pending(DOT, PUSD, 1), 200);
+		let offset = simulate_offset(DOT, PUSD, 200, 0);
+		assert_eq!(offset.debt(), 200);
+		assert_eq!(pending_after_settlement(DOT, PUSD, 1), 200);
 
 		// Activation folds the post-loss amount into the active pool.
 		advance_time(10_000);
@@ -187,17 +190,13 @@ fn merged_top_up_shares_earlier_backstop_losses() {
 	});
 }
 
-/// One liquidation cascading through the full waterfall —
-/// active-pool offset, keeper JIT, the pending-deposit backstop, and the
-/// redistribution residual. This Stability test isolates the two pool stages;
-/// keeper JIT and final redistribution are modelled as the arithmetic Vaults
-/// performs around those calls.
+/// One offset that depletes the active pool and the pending backstop together.
 ///
-/// Every stage prices at the same credit-wide ratio 1152.845 / 2200
-/// = 0.52402045… DOT per pUSD — each split is pro-rata against the debt
-/// still standing, so stages differ only by flooring.
+/// Both legs price at the same credit-wide ratio 1152.845 / 2200 = 0.52402045… DOT per pUSD,
+/// because each slice is pro rata against the whole debt. The legs therefore differ only by
+/// flooring, and each floor strands at most one base unit.
 #[test]
-fn full_liquidation_waterfall_active_jit_pending_and_residual() {
+fn active_then_pending_depletion_strands_bounded_dust() {
 	build_and_execute(|| {
 		const DOT_E10: Balance = 10_000_000_000;
 
@@ -206,61 +205,24 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		seed_deposit(2, 250); // pending pool, alongside ...
 		seed_deposit(3, 100); // ... user 3 — consumed pro-rata, not in order.
 
-		// Stage 1 — active offset. The vault owes 2200 pUSD; its post-keeper
-		// resolution collateral is 1152.845 DOT (keeper comp is external, so we
-		// take it as the input). The offered 2200 exceeds the 1501 pool, so the
-		// offset depletes the pool exactly and keeps only the collateral backing
-		// the 1501 it burns; the rest flows on to the next stage.
+		// 2200 pUSD of debt is offered against 1152.845 DOT. The active leg depletes the 1501
+		// pool, and the pending leg quoted behind it depletes the 350 backstop; the 349 pUSD the
+		// pool cannot take stay with the caller, with their share:
+		//   active slice  = floor(11_528_450_000_000 * 1501 / 2200) = 7_865_547_022_727,
+		//   pending slice = floor(11_528_450_000_000 *  350 / 2200) = 1_834_071_590_909,
+		// i.e. 0.52402 DOT per pUSD burned on both legs.
 		let c0 = 1_152_845 * (DOT_E10 / 1_000); // 11_528_450_000_000
-		let (debt_offset1, leftover1) = simulate_offset(DOT, PUSD, 2_200, c0);
-		assert_eq!(debt_offset1, 1_501);
-		// The pool kept floor(11_528_450_000_000 * 1501 / 2200) =
-		// 7_865_547_022_727 (786.5547022727 DOT) of the credit —
-		// 786.5547 / 1501 = 0.52402 DOT per pUSD burned.
-		assert_eq!(leftover1, 3_662_902_977_273); // 366.2902977273 DOT.
+		assert_eq!(
+			simulate_offset(DOT, PUSD, 2_200, c0),
+			SimulatedOffset { active: 1_501, pending: 350, leftover: 1_828_831_386_364 }
+		);
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(state.coords, Accumulators { p: FixedU128::one(), epoch: 1, scale: 0 });
 		let sums = active_sums(0, 0);
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(7_865_547_022_727, 1_501));
-
-		System::assert_has_event(
-			crate::Event::OffsetApplied {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				active: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
-				pending: None,
-			}
-			.into(),
-		);
-
-		// Stage 2 — keeper JIT (performed by Vaults, not a Stability call). It
-		// burns 300 pUSD with keeper liquidity and takes the matching collateral
-		// share off the remainder before the pending backstop runs.
-		let jit_debt = 300;
-		let jit_collateral = pro_rata_floor(leftover1, jit_debt, 699);
-		// 157.2061 / 300 = 0.52402 DOT per pUSD — the same stage price.
-		assert_eq!(jit_collateral, 1_572_061_363_636); // 157.2061363636 DOT.
-		let after_jit_debt = 699 - jit_debt; // 399 pUSD.
-		let after_jit_collat = leftover1 - jit_collateral; // 2_090_841_613_637 = 209.0841613637 DOT.
-		assert_eq!(after_jit_collat, 2_090_841_613_637);
-
-		// Stage 3 — pending-deposit backstop, one pro-rata consumption. The
-		// 350 pending total is fully depleted against the 399 still standing:
-		//   collateral slice = floor(2_090_841_613_637 * 350 / 399)
-		//                    = 1_834_071_590_909  (183.4071590909 DOT),
-		//   delta_S = floor(1_834_071_590_909e18 / 350)
-		//           = 5_240_204_545_454_285_714_285_714_285e-18,
-		//             i.e. 0.5240204545 DOT per pUSD — the same stage price.
-		let (debt_offset2, leftover2) =
-			simulate_pending_offset(DOT, PUSD, after_jit_debt, after_jit_collat);
-		assert_eq!(debt_offset2, 350);
-		// The residual — the 49 pUSD debt still standing + this collateral —
-		// is what Vaults records for redistribution.
-		assert_eq!(leftover2, 256_770_022_728); // 25.6770022728 DOT.
-
-		let state = pool_state(DOT, PUSD);
+		// Pending: delta_S = floor(1_834_071_590_909e18 / 350), 0.5240204545 DOT per pUSD.
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.pending_coords.epoch, 1);
 
@@ -268,13 +230,13 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 			crate::Event::OffsetApplied {
 				collateral_id: DOT,
 				stable_id: PUSD,
-				active: None,
+				active: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
 				pending: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
 			}
 			.into(),
 		);
 
-		// Stage 4 — the consumed pending depositors realize their pro-rata
+		// The consumed pending depositors realize their pro-rata
 		// gains through the pending `S` on claim:
 		//   user 2: floor(250 * delta_S) = 1_310_051_136_363,
 		//   user 3: floor(100 * delta_S) =   524_020_454_545.
@@ -285,7 +247,7 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		assert_claim_collateral(3, 524_020_454_545);
 		assert!(deposit_row(DOT, PUSD, 3).is_none());
 
-		// Stage 5 — the sole active depositor. The depletion compounded its
+		// The sole active depositor. The depletion compounded its
 		// deposit to zero; its collateral is realized through S on claim. The
 		// double-floor (`floor(1501 * floor(collat * 1e18 / 1501) / 1e18)`)
 		// strands 1 base unit in the unclaimed total, so it realizes one less
@@ -294,9 +256,11 @@ fn full_liquidation_waterfall_active_jit_pending_and_residual() {
 		assert_claim_collateral(1, 7_865_547_022_726);
 		assert!(deposit_row(DOT, PUSD, 1).is_none());
 
-		// Every pUSD the pool held (1501 active + 350 pending) was burned.
+		// Every pUSD the pool held (1501 active + 350 pending) was burned, and the two stranded
+		// base units are all the collateral the pool still holds.
 		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert_eq!(stable_balance(PUSD, pool), 0);
+		assert_eq!(pool_state(DOT, PUSD).total_collateral_gains_unclaimed, 2);
 	});
 }
 
@@ -314,9 +278,9 @@ fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 		// the offset rounds down to 40_000. The collateral follows pro-rata
 		// (floor(45_000 * 40_000 / 45_000) = 40_000) and
 		// P_pending = 10_000/50_000 = 0.2.
-		let (debt_offset, leftover) = simulate_pending_offset(DOT, USDX, 45_000, 45_000);
-		assert_eq!(debt_offset, 40_000);
-		assert_eq!(leftover, 5_000);
+		let offset = simulate_offset(DOT, USDX, 45_000, 45_000);
+		assert_eq!(offset.debt(), 40_000);
+		assert_eq!(offset.leftover, 5_000);
 		System::assert_has_event(
 			crate::Event::OffsetApplied {
 				collateral_id: DOT,
@@ -354,7 +318,10 @@ fn pending_deposit_offset_is_shared_pro_rata() {
 		// P_pending = 400/1_400 = 2/7 (inner floor(400e18/1_400) = 285_714_285_714_285_714)
 		// and distributes the 500 collateral at delta_S = 500/1_400 = 5/14
 		// (inner 357_142_857_142_857_142).
-		assert_eq!(simulate_pending_offset(DOT, PUSD, 1_000, 500), (1_000, 0));
+		assert_eq!(
+			simulate_offset(DOT, PUSD, 1_000, 500),
+			SimulatedOffset { active: 0, pending: 1_000, leftover: 0 }
+		);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_pending_deposits, 400);
 		assert_eq!(state.total_collateral_gains_unclaimed, 500);
@@ -379,7 +346,7 @@ fn pending_deposit_offset_is_shared_pro_rata() {
 		// normal path: floor(stake * 5/14) = 107 / 214 / 178, with 1 unit of the 500 stranded in
 		// the unclaimed total.
 		for (who, remaining, gain) in [(1, 85, 107), (2, 171, 214), (3, 142, 178)] {
-			assert_eq!(realized_pending(DOT, PUSD, who), remaining);
+			assert_eq!(pending_after_settlement(DOT, PUSD, who), remaining);
 			assert_ok!(settle(who, who, DOT, PUSD));
 			let row = deposit_row(DOT, PUSD, who).expect("kept: pending remainder + claimable");
 			assert_eq!(row.pending_deposit.as_ref().expect("partially consumed").amount, remaining);

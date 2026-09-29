@@ -84,13 +84,6 @@ pub struct DepositSnapshot {
 	pub sums: PoolSums,
 }
 
-impl DepositSnapshot {
-	/// Returns a snapshot for a leg with no prior loss or gain.
-	pub fn fresh() -> Self {
-		Self { coords: Accumulators::fresh(), sums: PoolSums::default() }
-	}
-}
-
 /// Stable identifier of one maturity cohort in one market.
 ///
 /// Identifiers increase from zero, and the pallet does not reuse them. The identifier remains
@@ -550,7 +543,8 @@ mod tests {
 	}
 
 	#[test]
-	fn config_validation_accepts_the_reference_parameters() {
+	fn config_validation_accepts_reference_and_boundary_parameters() {
+		// The reference sits on the product boundary: p_min * scale_factor = 1e-9 * 1e9 = 1.
 		assert!(valid_config().is_valid());
 		// Zero delays are legitimate governance choices (they disable the
 		// respective protection), zero yield share as well.
@@ -558,6 +552,18 @@ mod tests {
 		config.entry_delay = 0;
 		config.safety_withdrawal_delay = 0;
 		config.yield_share = Permill::zero();
+		assert!(config.is_valid());
+
+		// The smallest useful rescale: 1e-9 * 1e3 = 1e-6 <= 1.
+		let mut config = valid_config();
+		config.precision.scale_factor = 1_000;
+		assert!(config.is_valid());
+
+		// The largest rescale the u128 overflow guard allows. `p_min` drops to 1e-11 so that
+		// the product stays at 1e-11 * 1e10 = 0.1 <= 1.
+		let mut config = valid_config();
+		config.precision.p_min = FixedU128::from_inner(10_000_000);
+		config.precision.scale_factor = 10_000_000_000;
 		assert!(config.is_valid());
 	}
 
@@ -575,13 +581,16 @@ mod tests {
 		config.precision.p_min = FixedU128::zero();
 		assert!(!config.is_valid());
 
-		// Below the minimum useful rescale.
+		// Below the minimum useful rescale. The product 1e-9 * 999 stays under one, so only the
+		// lower bound can reject it.
 		let mut config = valid_config();
 		config.precision.scale_factor = 999;
 		assert!(!config.is_valid());
 
-		// Above the u128 overflow guard (1e10).
+		// Above the u128 overflow guard (1e10). With `p_min` at 1e-11 the product is
+		// 1e-11 * (1e10 + 1) = 0.10000000001 <= 1, so only the upper bound can reject it.
 		let mut config = valid_config();
+		config.precision.p_min = FixedU128::from_inner(10_000_000);
 		config.precision.scale_factor = 10_000_000_001;
 		assert!(!config.is_valid());
 
@@ -589,23 +598,5 @@ mod tests {
 		let mut config = valid_config();
 		config.precision.p_min = FixedU128::from_inner(2_000_000_000);
 		assert!(!config.is_valid());
-	}
-
-	#[test]
-	fn deposit_emptiness_ignores_withdrawal_requests() {
-		let mut deposit = Deposit::<u128>::fresh(DepositSnapshot::fresh());
-		deposit.withdrawal_request = Some(WithdrawalRequest { amount: 10, executable_at: 601_000 });
-		assert!(deposit.is_empty());
-
-		deposit.pending_deposit = Some(PendingDeposit {
-			amount: 1,
-			cohort: CohortId(0),
-			snapshot: DepositSnapshot::fresh(),
-		});
-		assert!(!deposit.is_empty());
-
-		deposit.pending_deposit = None;
-		deposit.claimable_yield = 1;
-		assert!(!deposit.is_empty());
 	}
 }

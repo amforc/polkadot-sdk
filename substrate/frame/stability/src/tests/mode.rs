@@ -27,10 +27,12 @@ fn frozen_branch_blocks_every_value_moving_operation() {
 		assert_noop!(claim_collateral(1, DOT, PUSD, 1), Error::<Test>::BranchFrozen);
 		assert_noop!(claim_yield(1, DOT, PUSD, 1), Error::<Test>::BranchFrozen);
 		assert_noop!(compound(1, DOT, PUSD, 10), Error::<Test>::BranchFrozen);
-		// The infallible offset surfaces step aside on a frozen branch:
-		// zeroed results, credits returned whole, nothing written.
-		assert_storage_noop!(assert_eq!(simulate_offset(DOT, PUSD, 100, 50), (0, 50)));
-		assert_storage_noop!(assert_eq!(simulate_pending_offset(DOT, PUSD, 100, 50), (0, 50)));
+		// A frozen branch quotes nothing, so no leg is sized and no offset is
+		// made: the credit stays whole and nothing is written.
+		assert_storage_noop!(assert_eq!(
+			simulate_offset(DOT, PUSD, 100, 50),
+			SimulatedOffset { active: 0, pending: 0, leftover: 50 }
+		));
 		// Yield routing cannot fail: the frozen pool just takes nothing, and not even the
 		// matured cohort advances.
 		assert_yield_declined(DOT, PUSD, 40);
@@ -76,10 +78,21 @@ fn safety_mode_enforces_two_step_withdrawals() {
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
 		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::SafetyWithdrawalDelayActive);
 
-		// Wait out the full 600_000 ms Safety delay.
-		advance_time(600_000);
+		// The 600_000 ms Safety delay holds until its last millisecond.
+		advance_time(599_999);
+		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::SafetyWithdrawalDelayActive);
+
+		// At exactly `executable_at` a partial exit draws the request down.
+		advance_time(1);
+		assert_ok!(withdraw(1, DOT, PUSD, 100, 1));
+		let request = deposit_row(DOT, PUSD, 1)
+			.expect("row survives")
+			.withdrawal_request
+			.expect("request still open");
+		assert_eq!(request.amount, 150);
+
 		assert_ok!(withdraw(1, DOT, PUSD, 300, 1));
-		// take = min(requested-remaining 250, active 400): the request
+		// take = min(requested-remaining 150, active 300): the request
 		// bounds the exit and is consumed by it.
 		System::assert_last_event(
 			crate::Event::WithdrawalExecuted {
@@ -87,7 +100,7 @@ fn safety_mode_enforces_two_step_withdrawals() {
 				stable_id: PUSD,
 				depositor: 1,
 				recipient: 1,
-				amount: 250,
+				amount: 150,
 			}
 			.into(),
 		);
@@ -108,7 +121,7 @@ fn safety_mode_keeps_deposits_claims_and_offsets_working() {
 		// price, 48 debt seizes 48 / 0.6 = 80 collateral:
 		// delta_S = 80 * (1/400) = 0.2, P = 352/400 = 0.88;
 		// gain = (400/1) * 0.2 = 80, compounded = (400/1) * 0.88 = 352.
-		assert_eq!(simulate_offset(DOT, PUSD, 48, 80).0, 48);
+		assert_eq!(simulate_offset(DOT, PUSD, 48, 80).debt(), 48);
 		assert_claim_collateral(1, 80);
 
 		drop(distribute_yield(DOT, PUSD, 70));

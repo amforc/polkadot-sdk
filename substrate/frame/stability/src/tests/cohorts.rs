@@ -63,31 +63,41 @@ fn offsets_size_against_matured_capital_without_a_touch() {
 
 		// Deposited at t = 1_000: the cohort boundary lands at 10_000, and t = 9_999 is one
 		// millisecond short. The read-only sizing simulates the advancement and still finds
-		// nothing, and an ordinary offset returns the credit whole.
+		// no active capital, so an offset reaches the 400 only through the pending leg.
 		advance_time(8_999);
-		assert_storage_noop!(assert_eq!(
-			Stability::reducible_active(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 400),
-			0
-		));
-		assert_storage_noop!(assert_eq!(simulate_offset(DOT, PUSD, 100, 80), (0, 80)));
+		assert_storage_noop!({
+			let quote = market_quote(&DOT, &PUSD);
+			assert_eq!(Stability::quote_active(&quote, 400), 0);
+			assert_eq!(Stability::quote_pending(&quote, 100, 0), 100);
+		});
+		// The activation view agrees: one millisecond short, the 400 is still pending.
+		let view = Stability::pool_after_activation(DOT, PUSD).expect("pool registered");
+		assert_eq!((view.total_active_deposits, view.total_pending_deposits), (0, 400));
+		assert_eq!(view.open_cohorts.len(), 1);
 
 		// Exactly at t = 10_000 the same call sees the 400 as active, with the row and the pool
 		// untouched.
 		advance_time(1);
 		assert_storage_noop!({
-			assert_eq!(
-				Stability::reducible_active(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 400),
-				400
-			);
-			assert_eq!(
-				Stability::reducible_pending(&DOT, &PUSD, branch_snapshot(&DOT, &PUSD), 400, 400),
-				0
-			);
+			let quote = market_quote(&DOT, &PUSD);
+			assert_eq!(Stability::quote_active(&quote, 400), 400);
+			assert_eq!(Stability::quote_pending(&quote, 400, 400), 0);
 		});
+		// The view reports the classification the quote used, while the stored totals still
+		// count the capital as pending until an operation commits the activation.
+		let view =
+			storage_noop(|| Stability::pool_after_activation(DOT, PUSD)).expect("pool registered");
+		assert_eq!((view.total_active_deposits, view.total_pending_deposits), (400, 0));
+		assert!(view.open_cohorts.is_empty());
+		let stored = pool_state(DOT, PUSD);
+		assert_eq!((stored.total_active_deposits, stored.total_pending_deposits), (0, 400));
 
 		// The transactional offset commits the same advancement and settles against it:
 		// P = 300/400 = 0.75, delta_S = 80 * (1/400) = 0.2.
-		assert_eq!(simulate_offset(DOT, PUSD, 100, 80), (100, 0));
+		assert_eq!(
+			simulate_offset(DOT, PUSD, 100, 80),
+			SimulatedOffset { active: 100, pending: 0, leftover: 0 }
+		);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 300);
 		assert_eq!(state.total_pending_deposits, 0);
@@ -186,10 +196,10 @@ fn settlement_splits_losses_and_gains_at_the_checkpoint() {
 		// Two backstop offsets while pending compose through the accumulators:
 		// P_pending = 300/400 = 0.75, delta_S_pending = 50 * (1/400) = 0.125; then
 		// P_pending = 0.75 * 240/300 = 0.6, delta_S_pending = 30 * (0.75/300) = 0.075.
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 100, 50);
-		assert_eq!(debt_offset, 100);
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 60, 30);
-		assert_eq!(debt_offset, 60);
+		let offset = simulate_offset(DOT, PUSD, 100, 50);
+		assert_eq!(offset.debt(), 100);
+		let offset = simulate_offset(DOT, PUSD, 60, 30);
+		assert_eq!(offset.debt(), 60);
 
 		// Advancement resolves the cohort's units at maturity: floor(400 * 0.6) = 240 moves
 		// into the active pool, and the yield distributes over exactly that:
@@ -201,7 +211,7 @@ fn settlement_splits_losses_and_gains_at_the_checkpoint() {
 		assert_eq!(state.total_pending_deposits, 0);
 
 		// An active offset after activation: P = 120/240 = 0.5, delta_S = 90 * (1/240) = 0.375.
-		assert_eq!(simulate_offset(DOT, PUSD, 120, 90).0, 120);
+		assert_eq!(simulate_offset(DOT, PUSD, 120, 90).debt(), 120);
 
 		// One call settles both phases: the pending leg up to the checkpoint (240 survive,
 		// 400 * 0.2 = 80 collateral), then the survivor as active capital (120 survive, 90
@@ -239,8 +249,8 @@ fn depleted_cohort_activates_nothing_but_keeps_gains_claimable() {
 
 		// The backstop consumes the whole pending stock before maturity:
 		// delta_S_pending = 100 * (1/400) = 0.25, then a pending epoch bump.
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 400, 100);
-		assert_eq!(debt_offset, 400);
+		let offset = simulate_offset(DOT, PUSD, 400, 100);
+		assert_eq!(offset.debt(), 400);
 		assert_eq!(pool_state(DOT, PUSD).pending_coords.epoch, 1);
 
 		// The cohort still advances at its deadline — with nothing surviving — so its members
@@ -401,8 +411,8 @@ fn aggregate_tracks_an_epoch_bump_inside_one_cohort() {
 		// User 1 joins at pending epoch 0; the backstop then consumes the whole stock, bumping
 		// the pending epoch: delta_S_pending = 90 * (1/300) = 0.3 before the bump.
 		assert_ok!(deposit(1, DOT, PUSD, 300));
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, 300, 90);
-		assert_eq!(debt_offset, 300);
+		let offset = simulate_offset(DOT, PUSD, 300, 90);
+		assert_eq!(offset.debt(), 300);
 
 		// User 2 joins the same cohort in the same window, at epoch 1. The join revalues the
 		// aggregate first: user 1's consumed capital compounds to zero across the epoch, so the
@@ -458,8 +468,8 @@ fn pending_scale_crossing_reprices_the_aggregate_through_the_divisor() {
 		// The backstop burns all but 100 of the 1e13 pending stock: the survival ratio 1e-11
 		// forces one rescale, P_pending = 0.01 at scale 1 — as on the active side. The
 		// collateral lands in the row of the pre-crossing scale: delta_S_pending = 1e12 / 1e13.
-		let (debt_offset, _) = simulate_pending_offset(DOT, PUSD, unit - 100, 1_000_000_000_000);
-		assert_eq!(debt_offset, unit - 100);
+		let offset = simulate_offset(DOT, PUSD, unit - 100, 1_000_000_000_000);
+		assert_eq!(offset.debt(), unit - 100);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.pending_coords.scale, 1);
 		assert_eq!(state.pending_coords.p, FixedU128::from_inner(10_000_000_000_000_000));
