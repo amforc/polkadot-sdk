@@ -262,6 +262,8 @@ fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_ok!(repay(2, DOT, PUSD, 2, None));
 		assert_ok!(redeem(DOT, PUSD, 3, 400));
+		// The liquidation below must clear a pointer that is really set.
+		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, Some(1));
 		set_price(DOT, low_recovery_price());
 
 		// A debt-free husk still counts as another stake bearer.
