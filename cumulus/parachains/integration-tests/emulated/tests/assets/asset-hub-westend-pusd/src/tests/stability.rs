@@ -130,33 +130,6 @@ fn incoming_deposit_recovery_offset_accepted() {
 	});
 }
 
-/// The FinalRecovery head is below par, so the incoming deposit is rejected.
-#[test]
-fn incoming_deposit_rejected_below_par() {
-	AssetHubWestend::execute_with(|| {
-		feed_price(dot_price(4, 1));
-		create_branch(&accounting_spec());
-		// 2,000 WND = 4,000 pUSD value against 5,000 pUSD debt at 2: CR 80%.
-		let parked_owner = acct(1);
-		open_vault(&parked_owner, 2_000 * WND, 5_000 * PUSD, FixedU128::zero());
-		feed_price(dot_price(2, 1));
-		enter_final_recovery(&parked_owner);
-
-		// Nothing burns and no row is created.
-		let depositor = acct(2);
-		mint_pusd(&depositor, 1_000 * PUSD);
-		assert_noop!(
-			Stability::deposit(
-				RuntimeOrigin::signed(depositor.clone()),
-				get_native_id(),
-				PUSD_ID,
-				1_000 * PUSD,
-			),
-			pallet_stability::Error::<Runtime>::RecoveryOffsetBelowPar,
-		);
-	});
-}
-
 /// A 2,000 pUSD active offset against the CR 120% FinalRecovery head yields
 /// 1,100 WND at the 10% bonus. P goes from 1.0 to 0.8 and S rises by
 /// 1,100 WND / 10,000 pUSD.

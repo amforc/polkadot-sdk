@@ -408,12 +408,18 @@ pub(crate) fn vault_status_on(
 	collateral_id: &VaultsCollateralId,
 	owner: &AccountId,
 ) -> Option<VaultStatus> {
-	let status;
+	let view;
 	// Reading a status must not write.
 	assert_storage_noop!(
-		status = Vaults::vault_status(collateral_id.clone(), PUSD_ID, owner.clone())
+		view = Vaults::vault_after_touch(collateral_id.clone(), PUSD_ID, owner.clone())
 	);
-	status
+	match view {
+		Ok((_, status)) => Some(status),
+		Err(error) => {
+			assert_eq!(error, pallet_vaults::Error::<Runtime>::VaultNotFound.into());
+			None
+		},
+	}
 }
 
 /// Touches the vault through a throwaway origin, materializing pending

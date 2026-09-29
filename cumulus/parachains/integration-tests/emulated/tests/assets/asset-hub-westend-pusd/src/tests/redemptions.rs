@@ -107,24 +107,16 @@ fn park_dormant_continuation() -> (AccountId, AccountId) {
 	);
 	assert_eq!(collateral_out, 1_400 * WND);
 
+	// 200 pUSD of residual debt is below the 2,000 pUSD branch minimum. The vault
+	// leaves the rate index as Dormant instead of closing, and the branch records
+	// it as the continuation target.
+	let target_vault = vault(&target_owner);
+	assert_eq!(target_vault.debt.total(), 200 * PUSD);
+	assert_eq!(target_vault.collateral, 600 * WND);
+	assert_eq!(vault_status(&target_owner), Some(VaultStatus::Dormant));
+	assert_eq!(branch_state().dormant_redemption_target, Some(target_owner.clone()));
+
 	(target_owner, filler_owner)
-}
-
-/// 200 pUSD of residual debt is below the 2,000 pUSD branch minimum. The vault
-/// leaves the rate index as Dormant instead of closing, and the branch records
-/// it as the continuation target.
-#[test]
-fn ordinary_redemption_parks_a_dormant_continuation_vault() {
-	AssetHubWestend::execute_with(|| {
-		let (target_owner, _) = park_dormant_continuation();
-
-		// Vault after: 200 pUSD debt, 600 WND, status Dormant.
-		let target_vault = vault(&target_owner);
-		assert_eq!(target_vault.debt.total(), 200 * PUSD);
-		assert_eq!(target_vault.collateral, 600 * WND);
-		assert_eq!(vault_status(&target_owner), Some(VaultStatus::Dormant));
-		assert_eq!(branch_state().dormant_redemption_target, Some(target_owner));
-	});
 }
 
 /// Serves the continuation target before the rate index when `FinalRecovery` is empty.
