@@ -73,6 +73,7 @@ type Block = frame_system::mocking::MockBlock<Test>;
 frame_support::construct_runtime!(
 	pub enum Test {
 		System: frame_system,
+		Timestamp: pallet_timestamp,
 		ParachainSystem: cumulus_pallet_parachain_system,
 		Aura: pallet_aura,
 		AuraExt: crate,
@@ -521,6 +522,62 @@ fn block_executor_does_not_influence_proof_size_recordings() {
 	ext.execute_with_recorder(recorder, || {
 		BlockExecutor::<Test, TestExecutive>::execute_verified_block(block);
 	});
+}
+
+// =============================================================================
+// RelayTimestamp tests
+// =============================================================================
+
+mod relay_timestamp_tests {
+	use super::*;
+	use frame_support::traits::{Time, UnixTime};
+
+	type Hook = FixedVelocityConsensusHook<Test, 6000, DEFAULT_TEST_VELOCITY, 1>;
+	type RelayTime = RelayTimestamp<Hook>;
+
+	#[test]
+	fn returns_relay_slot_start() {
+		new_test_ext(10).execute_with(|| {
+			set_relay_slot(10, 1);
+			assert_eq!(<RelayTime as Time>::now(), 60_000);
+			assert_eq!(<RelayTime as UnixTime>::now(), core::time::Duration::from_millis(60_000));
+		});
+	}
+
+	#[test]
+	fn falls_back_to_para_timestamp_before_first_state_proof() {
+		new_test_ext(10).execute_with(|| {
+			assert!(pallet::RelaySlotInfo::<Test>::get().is_none());
+			pallet_timestamp::Now::<Test>::put(42_000u64);
+			assert_eq!(<RelayTime as Time>::now(), 42_000);
+		});
+	}
+
+	/// Paired with the slot-alignment panic in `on_state_proof`: whenever the hook accepts a
+	/// block, the relay-derived time lies within the parachain slot's timestamp window
+	/// `[para_slot * dur, (para_slot + 1) * dur)`. The window edges reuse the accepted cases
+	/// of `test_para_slot_too_high`.
+	#[rstest]
+	#[case::para_slot_equals_relay(6000, 10, 10)]
+	#[case::long_para_slot_window_start(24000, 2, 8)]
+	#[case::long_para_slot_window_end(24000, 2, 11)]
+	#[case::short_para_slot(2000, 30, 10)]
+	fn stays_within_para_slot_window(
+		#[case] para_slot_duration: u64,
+		#[case] para_slot: u64,
+		#[case] relay_slot: u64,
+	) {
+		TestSlotDuration::set_slot_duration(para_slot_duration);
+		new_test_ext(para_slot).execute_with(|| {
+			Hook::on_state_proof(&relay_chain_state_proof(relay_slot));
+
+			// Use the parachain slot's start as the lower bound.
+			let para_timestamp = para_slot * para_slot_duration;
+			let relay_timestamp = <RelayTime as Time>::now();
+			assert!(relay_timestamp >= para_timestamp);
+			assert!(relay_timestamp < para_timestamp + para_slot_duration);
+		});
+	}
 }
 
 // =============================================================================
