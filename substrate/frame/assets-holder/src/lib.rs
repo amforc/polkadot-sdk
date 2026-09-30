@@ -19,9 +19,10 @@
 //!
 //! A pallet capable of holding fungibles from `pallet-assets`. This is an extension of
 //! `pallet-assets`, wrapping [`fungibles::Inspect`](`frame_support::traits::fungibles::Inspect`).
-//! It implements both
+//! It implements
 //! [`fungibles::hold::Inspect`](frame_support::traits::fungibles::hold::Inspect),
-//! [`fungibles::hold::Mutate`](frame_support::traits::fungibles::hold::Mutate), and especially
+//! [`fungibles::hold::Mutate`](frame_support::traits::fungibles::hold::Mutate),
+//! [`fungibles::hold::Balanced`](frame_support::traits::fungibles::hold::Balanced), and especially
 //! [`fungibles::hold::Unbalanced`](frame_support::traits::fungibles::hold::Unbalanced). The
 //! complexity of the operations is `O(1)`.
 //!
@@ -41,6 +42,9 @@
 //!   [`fungibles::hold::Mutate`](frame_support::traits::fungibles::hold::Mutate) and
 //!   [`fungibles::hold::Unbalanced`](frame_support::traits::fungibles::hold::Unbalanced), allowing
 //!   other pallets to manage holds for the `pallet-assets` assets.
+//! - An implementation of [`fungibles::Balanced`](frame_support::traits::fungibles::Balanced) and
+//!   [`fungibles::hold::Balanced`](frame_support::traits::fungibles::hold::Balanced), allowing
+//!   other pallets to manage imbalances and to slash funds on hold.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
