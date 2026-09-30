@@ -27,19 +27,21 @@ fn enter_safety_mode_single_vault() {
 // The vault pallet's
 // liquidation guards are: branch frozen, vault in FinalRecovery, last vault.
 
-// In Safety mode, opening a vault whose CR is above ICR but below the branch
-// TCR strictly lowers TCR — `enforce_mode_rules` rejects the open with
-// `SafetyModeTcrWorsening`.
+// All four positions clear ICR but worsen the already stressed branch's TCR.
 #[test]
-fn safety_mode_blocks_new_vault_that_worsens_tcr() {
-	build_and_execute(|| {
-		enter_safety_mode_single_vault();
-		// New vault B at CR ≈ 123% (above ICR 120%, below TCR_pre 125.87%).
-		assert_noop!(
-			open(2, DOT, PUSD, 100, 510, rate_pct(5, 100)),
-			crate::Error::<Test>::SafetyModeTcrWorsening
-		);
-	});
+fn safety_mode_rejects_tcr_worsening_operations() {
+	let cases: [fn() -> DispatchResult; 4] = [
+		|| open(2, DOT, PUSD, 100, 510, rate_pct(5, 100)),
+		|| borrow(1, DOT, PUSD, 200, None),
+		|| withdraw_collateral(1, DOT, PUSD, 1, None),
+		|| change_rate(1, DOT, PUSD, rate_pct(7, 100)),
+	];
+	for operation in cases {
+		build_and_execute(|| {
+			enter_safety_mode_single_vault();
+			assert_noop!(operation(), crate::Error::<Test>::SafetyModeTcrWorsening);
+		});
+	}
 }
 
 // In Safety mode, opening a large healthy vault that drives TCR up is allowed
@@ -51,30 +53,6 @@ fn safety_mode_allows_new_vault_that_improves_tcr() {
 		enter_safety_mode_single_vault();
 		// New vault B with CR = 630% — improves TCR substantially.
 		assert_ok!(open(2, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
-	});
-}
-
-// In Safety mode, borrowing more pUSD without adding collateral worsens TCR
-// by exactly the upfront-fee proportion → reverts.
-#[test]
-fn safety_mode_blocks_borrow_alone() {
-	build_and_execute(|| {
-		enter_safety_mode_single_vault();
-		assert_noop!(borrow(1, DOT, PUSD, 200, None), crate::Error::<Test>::SafetyModeTcrWorsening);
-	});
-}
-
-// In Safety mode, withdrawing collateral always worsens TCR (less collateral,
-// same debt). The `withdraw_collateral` extrinsic guard fires before any
-// follow-up borrow can be attempted.
-#[test]
-fn safety_mode_blocks_withdraw_alone() {
-	build_and_execute(|| {
-		enter_safety_mode_single_vault();
-		assert_noop!(
-			withdraw_collateral(1, DOT, PUSD, 1, None),
-			crate::Error::<Test>::SafetyModeTcrWorsening
-		);
 	});
 }
 
@@ -95,23 +73,6 @@ fn normal_mode_blocks_premature_rate_change_pulling_into_safety() {
 		assert_noop!(
 			change_rate(1, DOT, PUSD, rate_pct(50, 100)),
 			crate::Error::<Test>::WouldEnterSafetyMode
-		);
-	});
-}
-
-// Once the branch is in Safety mode, a *premature* (fee-charging) rate
-// change is rejected outright — the upfront fee strictly worsens TCR.
-// A *post-cooldown* (zero-fee) rate change is still allowed because the
-// upfront fee is zero and so post_TCR == pre_TCR.
-#[test]
-fn safety_mode_blocks_premature_rate_change() {
-	build_and_execute(|| {
-		enter_safety_mode_single_vault();
-		// Premature change (within cooldown) charges a non-zero upfront fee
-		// → reverts.
-		assert_noop!(
-			change_rate(1, DOT, PUSD, rate_pct(7, 100)),
-			crate::Error::<Test>::SafetyModeTcrWorsening
 		);
 	});
 }
