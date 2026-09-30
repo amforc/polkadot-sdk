@@ -272,17 +272,20 @@ impl<Balance: Ord + Saturating + Copy> Vault<Balance> {
 impl<Balance: Ord + Saturating + Copy + Zero + One> Vault<Balance> {
 	/// Returns the values for one redemption step.
 	///
-	/// Projection and execution use this snapshot to keep all fields consistent.
+	/// Projection and execution use this snapshot to keep all fields consistent. The branch
+	/// parameters it carries are the ones `FinalRecovery` pricing consults.
 	pub(crate) fn redemption_snapshot(
 		&self,
 		status: VaultStatus,
-		redistribution_penalty: Permill,
+		config: &BranchConfig<Balance>,
 	) -> pusd_primitives::RedemptionStepSnapshot<Balance> {
 		pusd_primitives::RedemptionStepSnapshot {
 			status,
 			debt: self.debt.total(),
 			collateral: self.collateral,
-			redistribution_penalty,
+			redistribution_penalty: config.redistribution_penalty,
+			initial_collateralization_ratio: config.initial_collateralization_ratio,
+			minimum_debt: config.minimum_debt,
 		}
 	}
 }
