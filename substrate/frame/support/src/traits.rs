@@ -92,8 +92,8 @@ pub use hooks::{
 pub mod schedule;
 mod storage;
 pub use storage::{
-	Consideration, ConstantStoragePrice, Disabled, Footprint, Incrementable, Instance,
-	LinearStoragePrice, MaybeConsideration, NoDrop, PartialStorageInfoTrait, StorageInfo,
+	AssetFootprint, Consideration, ConstantStoragePrice, Disabled, Footprint, Incrementable,
+	Instance, LinearStoragePrice, MaybeConsideration, NoDrop, PartialStorageInfoTrait, StorageInfo,
 	StorageInfoTrait, StorageInstance, SuppressedDrop, TrackedStorageKey, WhitelistedStorageKeys,
 };
 

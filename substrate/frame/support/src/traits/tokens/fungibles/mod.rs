@@ -27,6 +27,7 @@
 //! [`frame_tokens`]: ../../../../polkadot_sdk_docs/reference_docs/frame_tokens/index.html
 
 pub mod approvals;
+mod consideration;
 mod enumerable;
 pub mod freeze;
 pub mod hold;
@@ -37,6 +38,9 @@ mod regular;
 pub mod roles;
 mod union_of;
 
+pub use consideration::{
+	AssetFootprintPrice, AtLeastMinimumBalance, HoldConsideration, SufficientAssets,
+};
 pub use enumerable::Inspect as InspectEnumerable;
 pub use freeze::{Inspect as InspectFreeze, Mutate as MutateFreeze};
 pub use hold::{
