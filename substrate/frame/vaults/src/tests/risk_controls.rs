@@ -2,7 +2,10 @@
 
 use crate::{
 	mock::*,
-	tests::{rate_pct, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{
+		assert_event, assert_invariants, assert_ok_and_invariants, rate_pct, ONE_DAY_MS,
+		ONE_YEAR_MS,
+	},
 };
 use frame::traits::fungibles::Mutate;
 
@@ -71,13 +74,6 @@ fn repaying_frees_global_ceiling_headroom() {
 	});
 }
 
-/// `try_state` recomputes `StablecoinDebt` from `Branches`. Tests run it between writes, which
-/// the final check in `build_and_execute` cannot see.
-#[track_caller]
-fn assert_aggregate_matches() {
-	crate::try_state::do_try_state::<Test>().expect("all aggregate identities hold");
-}
-
 // The projected ceiling check counts the upfront fee, not just the proposed
 // principal: a borrow whose principal alone fits is rejected once its fee
 // tips the total over.
@@ -107,7 +103,7 @@ fn projected_ceiling_counts_accrued_aggregate_interest() {
 		assert_ok!(Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::root(), PUSD, 2_400));
 		// Stored outstanding after the open: 2_000 + 39 fee (derived above).
 		assert_ok!(open(1, DOT, PUSD, 100_000, 2_000, rate_pct(100, 100)));
-		assert_aggregate_matches();
+		assert_invariants();
 
 		// A year at 100% accrues 2_000 of pending aggregate interest. The
 		// second open projects 2_300 principal + 39 + 2_000 + 6 fee = 4_345
@@ -122,72 +118,30 @@ fn projected_ceiling_counts_accrued_aggregate_interest() {
 	});
 }
 
-// Each debt write must preserve the stablecoin-wide debt aggregate.
+// Check after every write, before later operations can reconcile a broken aggregate.
 #[test]
 fn stablecoin_debt_aggregate_tracks_every_write() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		register_market(DOT, EUSD);
-		assert_aggregate_matches();
-
-		assert_ok!(open(1, DOT, PUSD, 100_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, EUSD, 100_000, 1_000, rate_pct(5, 100)));
-		assert_aggregate_matches();
-
-		assert_ok!(Pallet::<Test>::borrow(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			500,
-			None,
-			None,
-			Position::endpoints_only(),
-		));
-		assert_aggregate_matches();
-
-		// Within the cooldown, the rate change mints an upfront fee.
-		assert_ok!(Pallet::<Test>::change_rate(
-			RuntimeOrigin::signed(1),
-			DOT,
-			PUSD,
-			rate_pct(6, 100),
-			Position::endpoints_only(),
-		));
-		assert_aggregate_matches();
-
+		assert_invariants();
+		assert_ok_and_invariants(open(1, DOT, PUSD, 100_000, 2_000, rate_pct(5, 100)));
+		assert_ok_and_invariants(open(2, DOT, EUSD, 100_000, 1_000, rate_pct(5, 100)));
+		assert_ok_and_invariants(borrow(1, DOT, PUSD, 500, None));
+		// A premature rate change charges the fee into the aggregate.
+		assert_ok_and_invariants(change_rate(1, DOT, PUSD, rate_pct(6, 100)));
 		advance_time(30 * ONE_DAY_MS);
-		assert_ok!(Pallet::<Test>::poke(RuntimeOrigin::signed(9), DOT, PUSD, 1));
-		assert_aggregate_matches();
-
-		assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(500)));
-		assert_aggregate_matches();
-
-		assert_ok!(redeem_from(DOT, PUSD, 1, 9, 300));
-		assert_aggregate_matches();
-
-		// A thin vault, then a price drop below its MCR, then liquidation.
-		assert_ok!(open(3, DOT, PUSD, 40, 300, rate_pct(5, 100)));
-		assert_aggregate_matches();
+		assert_ok_and_invariants(poke(9, DOT, PUSD, 1));
+		assert_ok_and_invariants(repay(1, DOT, PUSD, 1, Some(500)));
+		assert_ok_and_invariants(redeem_from(DOT, PUSD, 1, 9, 300));
+		assert_ok_and_invariants(open(3, DOT, PUSD, 40, 300, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(8u128, 1u128));
 		ActiveSpCapacity::set(1_000);
-		assert_ok!(liquidate(9, DOT, PUSD, 3, 0, 0));
-		assert_aggregate_matches();
-
-		// Freezing flushes pending aggregate interest into the stored state.
+		assert_ok_and_invariants(liquidate(9, DOT, PUSD, 3, 0, 0));
 		advance_time(ONE_DAY_MS);
-		assert_ok!(Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			true
-		));
-		assert_aggregate_matches();
-		assert_ok!(Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(ADMIN),
-			DOT,
-			PUSD,
-			false
-		));
+		// Freezing flushes pending aggregate interest into stored state.
+		assert_ok_and_invariants(set_governance_frozen(ADMIN, DOT, PUSD, true));
+		assert_ok_and_invariants(set_governance_frozen(ADMIN, DOT, PUSD, false));
 	});
 }
 
@@ -221,6 +175,7 @@ fn asset_owner_sets_the_global_ceiling() {
 			PUSD,
 			2_000
 		));
+		assert_event(crate::Event::GlobalDebtCeilingSet { stable_id: PUSD, ceiling: 2_000 });
 		assert_ok!(open(1, DOT, PUSD, 100_000, 1_500, rate_pct(5, 100)));
 		assert_noop!(
 			Pallet::<Test>::set_global_debt_ceiling(RuntimeOrigin::signed(2), PUSD, Balance::MAX),

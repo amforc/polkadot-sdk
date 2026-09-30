@@ -92,104 +92,55 @@ mod tests {
 	struct Prices;
 	impl ProvidePrice for Prices {
 		type AssetId = u32;
-
-		fn provide_price(collateral_id: &u32) -> Result<FixedU128, DispatchError> {
-			match collateral_id {
-				// One unit of asset 0 is worth 10, one unit of asset 1 is worth 4.
+		fn provide_price(asset: &u32) -> Result<FixedU128, DispatchError> {
+			match asset {
 				0 => Ok(FixedU128::from_u32(10)),
 				1 => Ok(FixedU128::from_u32(4)),
 				2 => Ok(FixedU128::zero()),
+				3 => Err(DispatchError::Other("stale")),
 				_ => Err(DispatchError::Unavailable),
 			}
 		}
 	}
 
-	struct ReferencelessPrices;
-	impl ProvidePrice for ReferencelessPrices {
-		type AssetId = u32;
-
-		fn provide_price(collateral_id: &u32) -> Result<FixedU128, DispatchError> {
-			match collateral_id {
-				1 => Err(DispatchError::Other("stale")),
-				_ => Err(DispatchError::Unavailable),
-			}
-		}
-	}
-
-	struct WorthlessReference;
-	impl ProvidePrice for WorthlessReference {
-		type AssetId = u32;
-
-		fn provide_price(collateral_id: &u32) -> Result<FixedU128, DispatchError> {
-			match collateral_id {
-				0 => Ok(FixedU128::zero()),
-				_ => Ok(FixedU128::from_u32(4)),
-			}
-		}
-	}
-
-	struct ZeroOrMissing;
-	impl ProvidePrice for ZeroOrMissing {
-		type AssetId = u32;
-
-		fn provide_price(collateral_id: &u32) -> Result<FixedU128, DispatchError> {
-			match collateral_id {
-				2 => Ok(FixedU128::zero()),
-				_ => Err(DispatchError::Unavailable),
-			}
-		}
-	}
-
-	struct Native;
-	impl Get<u32> for Native {
+	struct Reference<const ID: u32>;
+	impl<const ID: u32> Get<u32> for Reference<ID> {
 		fn get() -> u32 {
-			0
+			ID
 		}
 	}
 
-	type Conversion = OraclePriceConversion<Prices, Native>;
-
 	#[test]
-	fn reprices_by_the_ratio_of_quotes_rounding_up() {
-		// 7 × 10 / 4 = 17.5 → 18.
-		assert_eq!(Conversion::to_asset_balance(7u64, 1), Ok(18));
-		assert_eq!(Conversion::to_asset_balance(8u64, 1), Ok(20));
-	}
-
-	#[test]
-	fn missing_feed_is_unavailable_and_zero_quote_is_not() {
-		assert_eq!(Conversion::to_asset_balance(7u64, 9), Err(DispatchError::Unavailable));
-		assert_eq!(Conversion::to_asset_balance(7u64, 2), Err(ZERO_ORACLE_PRICE));
-	}
-
-	#[test]
-	fn unusable_asset_feed_wins_over_a_missing_reference() {
-		type Referenceless = OraclePriceConversion<ReferencelessPrices, Native>;
-		assert_eq!(Referenceless::to_asset_balance(7u64, 1), Err(DispatchError::Other("stale")));
-		assert_eq!(Referenceless::to_asset_balance(7u64, 9), Err(DispatchError::Unavailable));
-	}
-
-	#[test]
-	fn zero_quote_beside_a_missing_feed_never_permits_a_fallback() {
-		// Zero asset quote, missing reference feed.
-		type ZeroAsset = OraclePriceConversion<ZeroOrMissing, Native>;
-		assert_eq!(ZeroAsset::to_asset_balance(7u64, 2), Err(ZERO_ORACLE_PRICE));
-		// Zero reference quote, missing asset feed.
-		struct ZeroReference;
-		impl Get<u32> for ZeroReference {
-			fn get() -> u32 {
-				2
-			}
+	fn conversion_rounds_up_and_preserves_feed_errors() {
+		type Conversion = OraclePriceConversion<Prices, Reference<0>>;
+		for (balance, asset, expected) in [
+			(7u64, 1, Ok(18)), // 7 * 10 / 4 = 17.5, rounded up.
+			(8, 1, Ok(20)),
+			(7, 9, Err(DispatchError::Unavailable)),
+			(7, 2, Err(ZERO_ORACLE_PRICE)),
+		] {
+			assert_eq!(Conversion::to_asset_balance(balance, asset), expected);
 		}
-		type ZeroRef = OraclePriceConversion<ZeroOrMissing, ZeroReference>;
-		assert_eq!(ZeroRef::to_asset_balance(7u64, 9), Err(ZERO_ORACLE_PRICE));
 	}
 
 	#[test]
-	fn zero_reference_quote_never_prices_a_deposit_at_zero() {
-		type Worthless = OraclePriceConversion<WorthlessReference, Native>;
-		assert_eq!(Worthless::to_asset_balance(7u64, 1), Err(ZERO_ORACLE_PRICE));
-		// The identity path does not consult the feed at all.
-		assert_eq!(Worthless::to_asset_balance(7u64, 0), Ok(7));
+	fn unusable_feed_wins_over_missing_feed_and_identity_skips_quotes() {
+		type MissingReference = OraclePriceConversion<Prices, Reference<9>>;
+		for (asset, expected) in [
+			(3, Err(DispatchError::Other("stale"))),
+			(8, Err(DispatchError::Unavailable)),
+			(2, Err(ZERO_ORACLE_PRICE)),
+			(9, Ok(7)), // Identity succeeds even without a quote.
+		] {
+			assert_eq!(MissingReference::to_asset_balance(7u64, asset), expected);
+		}
+		type ZeroReference = OraclePriceConversion<Prices, Reference<2>>;
+		for (asset, expected) in [
+			(9, Err(ZERO_ORACLE_PRICE)), // Missing asset cannot hide a zero reference.
+			(1, Err(ZERO_ORACLE_PRICE)),
+			(2, Ok(7)), // Identity does not consult the zero quote.
+		] {
+			assert_eq!(ZeroReference::to_asset_balance(7u64, asset), expected);
+		}
 	}
 }
