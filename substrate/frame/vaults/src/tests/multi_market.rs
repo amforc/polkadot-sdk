@@ -10,59 +10,46 @@ use crate::{
 	pallet::StablecoinDebt,
 	tests::{rate_pct, ONE_YEAR_MS},
 };
-use frame::traits::fungibles::Mutate;
 use pusd_primitives::{CollateralRatio, VaultInterface};
 
-// One owner runs dotUSD/DOT and ethUSD/ETH independently: each market mints
-// only its own coin and locks only its own collateral.
+// One owner can share a stablecoin or collateral across markets. Redemption and close
+// change only the selected market and release only its share of the hold.
 #[test]
-fn owner_runs_two_markets_independently() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		register_market(ETH, EUSD);
+fn owner_runs_markets_independently_through_redemption_and_close() {
+	// Balances: (PUSD, other coin); holds: (DOT, other collateral); DOT hold after close.
+	for (collateral, stable, amount, debt, pct, balances, holds, dot_hold_after_close) in [
+		(ETH, EUSD, 500, 1_000, 5, (2_000, 1_000), (1_000, 500), 0),
+		(ETH, PUSD, 1_000, 3_000, 7, (5_000, 5_000), (1_000, 1_000), 0),
+		(DOT, EUSD, 600, 1_000, 5, (2_000, 1_000), (1_600, 1_600), 600),
+	] {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			register_market(collateral.clone(), stable);
+			assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
+			assert_ok!(open(1, collateral.clone(), stable, amount, debt, rate_pct(pct, 100)));
+			assert_eq!((stable_balance(PUSD, 1), stable_balance(stable, 1)), balances);
+			assert_eq!((held(DOT, 1), held(collateral.clone(), 1)), holds);
+			let dot = vault(DOT, PUSD, 1);
+			let other = vault(collateral.clone(), stable, 1);
+			assert_eq!((dot.collateral, dot.debt.principal), (1_000, 2_000));
+			assert_eq!((other.collateral, other.debt.principal), (amount, debt));
+			assert_eq!(branch_state(DOT, PUSD).expect("market").debt.principal, 2_000);
+			let other_state = branch_state(collateral.clone(), stable).expect("market");
+			assert_eq!(other_state.debt.principal, debt);
 
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open(1, ETH, EUSD, 500, 1_000, rate_pct(5, 100)));
-
-		// Each market minted only its own coin.
-		assert_eq!(stable_balance(PUSD, 1), 2_000);
-		assert_eq!(stable_balance(EUSD, 1), 1_000);
-
-		// Each market locked only its own collateral asset.
-		assert_eq!(held(DOT, 1), 1_000);
-		assert_eq!(held(ETH, 1), 500);
-
-		// Distinct rows, each carrying its own market's collateral and principal.
-		let dot = vault(DOT, PUSD, 1);
-		let eth = vault(ETH, EUSD, 1);
-		assert_eq!((dot.collateral, dot.debt.principal), (1_000, 2_000));
-		assert_eq!((eth.collateral, eth.debt.principal), (500, 1_000));
-	});
-}
-
-// The same stablecoin against two collaterals (dotUSD/DOT, dotUSD/ETH) are
-// independent markets with independent debt and rate lists.
-#[test]
-fn same_stable_two_collaterals_are_independent() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		register_market(ETH, PUSD);
-
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open(1, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
-
-		// The same coin is minted from both markets into one balance.
-		assert_eq!(stable_balance(PUSD, 1), 5_000);
-
-		// Independent per-market debt ledgers.
-		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.principal, 2_000);
-		assert_eq!(branch_state(ETH, PUSD).unwrap().debt.principal, 3_000);
-
-		// Redeeming on the DOT market leaves the ETH market's vault untouched.
-		let eth_before = vault(ETH, PUSD, 1);
-		assert_eq!(redeem(DOT, PUSD, 9, 500).unwrap(), 1);
-		assert_eq!(vault(ETH, PUSD, 1), eth_before);
-	});
+			assert_eq!(redeem(DOT, PUSD, 9, 500), Ok(1));
+			assert_eq!(vault(collateral.clone(), stable, 1), other);
+			assert_eq!(branch_state(collateral.clone(), stable), Some(other_state.clone()));
+			mint_stable(PUSD, 1, 10_000);
+			assert_ok!(repay(1, DOT, PUSD, 1, None));
+			assert_ok!(close_vault(1, DOT, PUSD, None));
+			assert!(!vault_exists(DOT, PUSD, 1));
+			assert_eq!(vault(collateral.clone(), stable, 1), other);
+			assert_eq!(branch_state(collateral.clone(), stable), Some(other_state));
+			assert_eq!(held(DOT, 1), dot_hold_after_close);
+			assert_eq!(held(collateral.clone(), 1), amount);
+		});
+	}
 }
 
 // `StablecoinDebt` sums every collateral market issuing one coin, and stays
@@ -79,18 +66,20 @@ fn stablecoin_debt_sums_the_markets_issuing_that_coin() {
 		assert_ok!(open(1, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
 		assert_ok!(open(2, ETH, EUSD, 1_000, 4_000, rate_pct(5, 100)));
 
-		let dot_pusd = branch_state(DOT, PUSD).unwrap().debt.outstanding();
-		let eth_pusd = branch_state(ETH, PUSD).unwrap().debt.outstanding();
-		let eth_eusd = branch_state(ETH, EUSD).unwrap().debt.outstanding();
-
-		// Principal plus the upfront fee the open charges into `minted_interest`,
-		// `ceil(drawn * rate * 7 days / year)`: ceil(2_000 * 5% * 7/365) = 2,
-		// ceil(3_000 * 7% * 7/365) = 5, ceil(4_000 * 5% * 7/365) = 4.
-		assert_eq!((dot_pusd, eth_pusd, eth_eusd), (2_002, 3_005, 4_004));
+		// Principal plus each market's own upfront fee.
+		// ceil(principal × rate × 7 / 365.25): 2_000 × 5% → 2, 3_000 × 7% → 5,
+		// and 4_000 × 5% → 4.
+		assert_eq!(
+			(
+				branch_state(DOT, PUSD).expect("market").debt.outstanding(),
+				branch_state(ETH, PUSD).expect("market").debt.outstanding(),
+				branch_state(ETH, EUSD).expect("market").debt.outstanding(),
+			),
+			(2_002, 3_005, 4_004),
+		);
 
 		// Both PUSD markets, and only those, land in the PUSD total.
 		assert_eq!(StablecoinDebt::<Test>::get(PUSD).outstanding, 5_007);
-		assert_eq!(StablecoinDebt::<Test>::get(PUSD).outstanding, dot_pusd + eth_pusd);
 		assert_eq!(StablecoinDebt::<Test>::get(EUSD).outstanding, 4_004);
 
 		// The aggregate tracks debt leaving as well as arriving: repaying 1_000
@@ -129,8 +118,7 @@ fn stablecoin_debt_accrues_interest_across_untouched_markets() {
 }
 
 // Liquidating a vault in one market never touches another market's vaults,
-// branch state, or holds. The mock pool has no capacity and the keeper offers no
-// JIT, so the whole vault redistributes inside its own market.
+// branch state, or holds. The mock helper fully offsets the liquidated debt.
 #[test]
 fn liquidation_stays_inside_its_market() {
 	build_and_execute(|| {
@@ -155,35 +143,6 @@ fn liquidation_stays_inside_its_market() {
 		assert_eq!(vault(ETH, EUSD, 3), other_vault);
 		assert_eq!(branch_state(ETH, EUSD).unwrap(), other_state);
 		assert_eq!(held(ETH, 3), other_hold);
-	});
-}
-
-// Closing one market on a shared collateral releases only that market's share of
-// the owner's hold; the sibling market's collateral stays locked.
-#[test]
-fn closing_one_market_leaves_shared_collateral_held() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		register_market(DOT, EUSD);
-
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open(1, DOT, EUSD, 600, 1_000, rate_pct(5, 100)));
-		assert_eq!(held(DOT, 1), 1_600);
-
-		// Fund acct 1 to cover the principal plus the upfront fee, then close.
-		<VaultStableAssets as Mutate<AccountId>>::mint_into(PUSD, &1, 10_000)
-			.expect("mint pUSD to repay");
-		let debt = vault(DOT, PUSD, 1).debt.total();
-		assert_ok!(repay(1, DOT, PUSD, 1, Some(debt)));
-		// Repay-to-zero leaves a husk still holding the PUSD market's collateral;
-		// close it to release only that market's share.
-		assert_ok!(close_vault(1, DOT, PUSD, None));
-
-		// Only the PUSD market's 1_000 DOT was released; the EUSD market's 600
-		// DOT remains held against its still-open vault.
-		assert!(!vault_exists(DOT, PUSD, 1));
-		assert_eq!(held(DOT, 1), 600);
-		assert_eq!(vault(DOT, EUSD, 1).collateral, 600);
 	});
 }
 

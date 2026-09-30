@@ -218,10 +218,10 @@ fn debt_includes_accrued_interest() {
 	});
 }
 
-// The interest a liquidation issues comes out of the stablecoin it burns, so the supply moves
-// once: no fresh mint, one burn of what is left.
+// A liquidation burns the debt the keeper cancels and issues the interest its touch accrued, so
+// the supply falls by exactly the difference.
 #[test]
-fn interest_is_issued_out_of_the_burned_stablecoin() {
+fn liquidation_supply_nets_burned_debt_against_issued_interest() {
 	use frame::traits::fungibles::Inspect;
 	build_and_execute(|| {
 		// The mock hook burns the pool's share; route all yield to the fee account instead, so
@@ -231,7 +231,6 @@ fn interest_is_issued_out_of_the_burned_stablecoin() {
 		advance_time(10 * ONE_YEAR_MS);
 		mint_stable(PUSD, KEEPER, 500);
 		let supply_before = <Assets as Inspect<AccountId>>::total_issuance(PUSD);
-		let events_before = System::events().len();
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 500, 0));
 
@@ -245,29 +244,9 @@ fn interest_is_issued_out_of_the_burned_stablecoin() {
 			})
 			.expect("interest issued");
 		assert!(issued > 0);
-		assert!(issued < jit_debt, "the burn covers the issuance");
+		assert!(issued < jit_debt, "the burn exceeds the issuance");
 		let supply_after = <Assets as Inspect<AccountId>>::total_issuance(PUSD);
 		assert_eq!(supply_before - supply_after, jit_debt - issued);
-
-		let asset_events: Vec<_> = System::events()
-			.into_iter()
-			.skip(events_before)
-			.filter_map(|record| match record.event {
-				RuntimeEvent::Assets(event) => Some(event),
-				_ => None,
-			})
-			.collect();
-		assert!(!asset_events
-			.iter()
-			.any(|event| matches!(event, pallet_assets::Event::IssuedCredit { .. })));
-		let burned: Vec<_> = asset_events
-			.iter()
-			.filter_map(|event| match event {
-				pallet_assets::Event::BurnedCredit { amount, .. } => Some(*amount),
-				_ => None,
-			})
-			.collect();
-		assert_eq!(burned, vec![jit_debt - issued]);
 	});
 }
 

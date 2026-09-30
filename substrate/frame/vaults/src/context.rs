@@ -8,13 +8,13 @@ mod lifecycle;
 use crate::{
 	pallet::{
 		BalanceOf, BranchOf, CollateralIdOf, Config, Error, Event, HoldReason, Millis, Pallet,
-		StableCreditOf, StableIdOf, Vaults,
+		StableIdOf, Vaults,
 	},
 	types::{
 		DebtBreakdown, DebtCollateral, LiquidationTouch, Vault, VaultListId, VaultRecord,
 		VaultStatus,
 	},
-	utility_impls::{BranchContribution, Issuance},
+	utility_impls::BranchContribution,
 };
 use frame::{
 	prelude::*,
@@ -823,14 +823,11 @@ impl<T: Config> VaultOp<T> {
 			Commit::Checked => self.ctx.ensure_mode_rules()?,
 			Commit::Exempt => {},
 		}
-		self.persist(false, None)
+		self.persist(false)
 	}
 
 	/// Writes the vault and the market, then issues what the operation owes.
-	///
-	/// `burned` is stablecoin the operation took out of circulation. Issuance draws from it before
-	/// minting, and the rest burns here, so the operation changes the supply once.
-	fn persist(self, remove: bool, burned: Option<StableCreditOf<T>>) -> DispatchResult {
+	fn persist(self, remove: bool) -> DispatchResult {
 		let VaultOp { ctx, owner, vault, deposit, .. } = self;
 		let collateral_id = ctx.collateral_id.clone();
 		let stable_id = ctx.stable_id.clone();
@@ -865,27 +862,12 @@ impl<T: Config> VaultOp<T> {
 		)?;
 
 		// Mint after writing state.
-		let mut issuance = Issuance::netted(stable_id.clone(), burned);
 		if let Some(branch) = branch {
-			Pallet::<T>::issue_interest(
-				&collateral_id,
-				&stable_id,
-				branch,
-				pending_interest_mint,
-				&mut issuance,
-			)?;
+			Pallet::<T>::issue_interest(&collateral_id, &stable_id, branch, pending_interest_mint)?;
 			if !pending_fee.is_zero() {
-				Pallet::<T>::mint_and_route_yield(
-					&collateral_id,
-					&stable_id,
-					branch,
-					pending_fee,
-					&mut issuance,
-				)?;
+				Pallet::<T>::mint_and_route_yield(&collateral_id, &stable_id, branch, pending_fee)?;
 			}
 		}
-		// Burns what issuance did not use.
-		drop(issuance);
 		Ok(())
 	}
 }

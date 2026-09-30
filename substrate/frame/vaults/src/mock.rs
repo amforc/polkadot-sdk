@@ -976,7 +976,6 @@ pub fn redistribute_for_test(
 			collateral: redistribution_collateral,
 		},
 		owner_credit,
-		None,
 	)?;
 	Ok(snapshot.debt)
 }
