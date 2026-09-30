@@ -3,7 +3,7 @@
 use super::{Commit, VaultOp};
 use crate::{
 	liquidation::{final_recovery_keeper_reward, LiquidationSnapshot},
-	pallet::{BalanceOf, Config, Error, Event, Pallet, StableCreditOf},
+	pallet::{BalanceOf, Config, Error, Event, Pallet},
 	recovery,
 	types::{DebtCollateral, Vault, VaultStatus},
 };
@@ -241,13 +241,9 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	/// Commits a liquidation and records the residual for redistribution.
-	///
-	/// `burned` is the stablecoin the liquidation withdrew to cancel debt: the commit issues out
-	/// of it and burns the rest.
 	pub(crate) fn finish_liquidation(
 		mut self,
 		redistribution: DebtCollateral<BalanceOf<T>>,
-		burned: Option<StableCreditOf<T>>,
 	) -> DispatchResult {
 		ensure!(redistribution.debt <= self.vault.debt.total(), Error::<T>::InvalidLiquidationPlan);
 		let collateral_out = self
@@ -263,7 +259,7 @@ impl<T: Config> VaultOp<T> {
 				.record_redistribution(redistribution, self.ctx.now)
 				.ok_or(Error::<T>::RedistributionWouldOverflow)?;
 		}
-		self.persist(true, burned)
+		self.persist(true)
 	}
 
 	/// Closes a debt-free vault and commits its collateral release.
@@ -317,7 +313,7 @@ impl<T: Config> VaultOp<T> {
 			},
 			Commit::Checked | Commit::Exempt => {},
 		}
-		self.persist(true, None)
+		self.persist(true)
 	}
 
 	fn set_status(&mut self, new_status: VaultStatus) -> DispatchResult {

@@ -10,7 +10,6 @@ use crate::{
 		AdminLevel, AssetMinimums, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode,
 		BranchState, FrozenReason, FrozenState,
 	},
-	utility_impls::Issuance,
 };
 use frame::{
 	prelude::{
@@ -587,8 +586,7 @@ impl<T: Config> Pallet<T> {
 			})?;
 		// Mint interest only after storing the updated market. The yield route sees the mode just
 		// stored: a freeze sends the whole mint to the fee account.
-		let mut issuance = Issuance::minted(stable_id.clone());
-		Self::issue_interest(collateral_id, stable_id, branch, minted, &mut issuance)?;
+		Self::issue_interest(collateral_id, stable_id, branch, minted)?;
 		let new_mode = branch.mode;
 		Self::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),
