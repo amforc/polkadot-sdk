@@ -26,17 +26,6 @@ fn top_up_pusd(who: AccountId, donor: AccountId, delta: Balance) {
 }
 
 #[test]
-fn open_sets_annual_rate() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(37, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 2_000, rate_pct(100, 100)));
-		assert_eq!(vault(DOT, PUSD, 1).annual_rate, rate_pct(37, 100));
-		assert_eq!(vault(DOT, PUSD, 2).annual_rate, rate_pct(100, 100));
-	});
-}
-
-#[test]
 fn open_sets_last_interest_time_to_now() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
@@ -129,6 +118,7 @@ fn change_rate_post_cooldown_full_state() {
 			0,
 			"post-cooldown rate change should quote no upfront fee",
 		);
+		System::reset_events();
 		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(75, 100)));
 		let v_post = vault(DOT, PUSD, 1);
 
@@ -140,6 +130,16 @@ fn change_rate_post_cooldown_full_state() {
 		// The defining side effect of a rate change: the cooldown clock is stamped
 		// to the wall-clock moment of the call (`do_change_rate` in `dispatchable_impls.rs`).
 		assert_eq!(v_post.last_rate_update, now_before_call);
+		assert_event(crate::Event::BorrowRateChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			old_rate: rate_pct(50, 100),
+			new_rate: rate_pct(75, 100),
+		});
+		assert!(!vault_events()
+			.iter()
+			.any(|event| matches!(event, crate::Event::UpfrontFeeCharged { .. })));
 	});
 }
 
@@ -171,6 +171,19 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 		let v_post = vault(DOT, PUSD, 1);
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted);
+		assert_event(crate::Event::UpfrontFeeCharged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			amount: 29,
+		});
+		assert_event(crate::Event::BorrowRateChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			old_rate: rate_pct(50, 100),
+			new_rate: rate_pct(75, 100),
+		});
 	});
 }
 
@@ -221,6 +234,13 @@ fn borrow_full_state_changes() {
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted_fee);
+		assert_event(crate::Event::Borrowed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 1,
+			amount: 500,
+		});
 	});
 }
 
@@ -357,24 +377,13 @@ fn repay_full_state_changes() {
 
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 
-		// Entire debt reduces by the repaid amount (since `poke` already
-		// folded prior pending interest into accrued, `repay_for(500)`
-		// removes 500 cleanly from the entire-debt sum).
-		let entire_pre = v_pre.debt.principal + v_pre.debt.interest;
-		let entire_post = v_post.debt.principal + v_post.debt.interest;
-		assert_eq!(entire_post, entire_pre - 500);
-
-		// Recorded debt decreases by the principal portion. Since
-		// accrued_interest > 0 and repay applies to accrued first, principal
-		// reduction is `500 - min(500, accrued)`. Here we kept the accrued
-		// small so the bulk of 500 hit principal.
-		let pay_accrued = core::cmp::min(500, v_pre.debt.interest);
-		let pay_principal = 500 - pay_accrued;
-		assert_eq!(v_post.debt.principal, v_pre.debt.principal - pay_principal);
-		// Interest is settled *before* principal: recorded interest drops by
-		// exactly the accrued portion paid. Here 500 exceeds the small accrued, so
-		// interest is fully cleared and the remainder hits principal.
-		assert_eq!(v_post.debt.interest, v_pre.debt.interest - pay_accrued);
+		// Open fee ceil(3_000 × 25% × 7 / 365.25) = 15 plus one day's interest
+		// ceil(3_000 × 25% / 365.25) = 3 are paid before the principal.
+		assert_eq!(v_pre.debt.principal, 3_000);
+		assert_eq!(v_pre.debt.interest, 18);
+		assert_eq!(v_post.debt.principal, 2_518);
+		assert_eq!(v_post.debt.interest, 0);
+		assert_eq!(v_post.debt.total(), 2_518);
 	});
 }
 // Poke is permissionless, refreshes last_interest_time, materialises
@@ -404,6 +413,12 @@ fn poke_full_state_changes() {
 		// One day at 25% on 2_000 principal materialises
 		// ceil(2_000 * 0.25 * 1day / year) = 2 units on top of the pending open fee.
 		assert_eq!(v_post.debt.interest, v_pre.debt.interest + 2);
+		assert_event(crate::Event::InterestAccrued {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			amount: 2,
+		});
 	});
 }
 
@@ -451,8 +466,6 @@ fn redemption_full_state_changes() {
 		assert_ok!(poke(9, DOT, PUSD, 1));
 		let v_pre = vault(DOT, PUSD, 1);
 		advance_time(ONE_YEAR_MS);
-		// Exact simple interest on acct 1 over the year: 500 principal * 1% = 5.
-		let accrued_year: Balance = 5;
 
 		let now_before_call = pallet_timestamp::Pallet::<Test>::get();
 		// Collateral-leg baselines before the redemption.
@@ -467,18 +480,12 @@ fn redemption_full_state_changes() {
 		// The redemption refreshed acct 1's interest clock — it poked the target.
 		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
 
-		// Entire debt = pre + the freshly-settled year interest − 200 redeemed.
-		let entire_pre = v_pre.debt.principal + v_pre.debt.interest;
-		let entire_post = v_post.debt.principal + v_post.debt.interest;
-		assert_eq!(entire_post, entire_pre + accrued_year - 200);
-
-		// Interest-first cancellation of the 200: the (recorded + freshly accrued)
-		// interest is paid before principal.
-		let interest_at_redeem = v_pre.debt.interest + accrued_year;
-		let pay_accrued = core::cmp::min(200, interest_at_redeem);
-		let pay_principal = 200 - pay_accrued;
-		assert_eq!(v_post.debt.interest, interest_at_redeem - pay_accrued);
-		assert_eq!(v_post.debt.principal, v_pre.debt.principal - pay_principal);
+		// Fee 1 plus a year's interest 5 are paid before 194 principal.
+		assert_eq!(v_pre.debt.principal, 500);
+		assert_eq!(v_pre.debt.interest, 1);
+		assert_eq!(v_post.debt.interest, 0);
+		assert_eq!(v_post.debt.principal, 306);
+		assert_eq!(v_post.debt.total(), 306);
 
 		// Collateral leg: 200 pUSD / price 10 = 20 collateral released from acct 1's
 		// hold to the recipient, who receives it free (not held).
@@ -492,38 +499,67 @@ fn redemption_full_state_changes() {
 		);
 
 		assert!(vault_status(DOT, PUSD, 1).is_active());
+		assert_event(crate::Event::VaultRedeemed {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			recipient: 5,
+			debt_cancelled: 200,
+			collateral_to_recipient: 20,
+			vault_annual_rate: rate_pct(1, 100),
+		});
 	});
 }
 
 // The routed fee must match vault debt, market debt, and the net issuance increase.
 #[test]
 fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		let total_pre = <Pusd as FungibleInspect<AccountId>>::total_issuance();
-		let predicted_fee =
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate_pct(10, 100))
-				.expect("registered market");
-		assert_eq!(predicted_fee, 4);
+	// Fee is ceil(2_000 × rate × 7 / 365.25): 10% → 4, 37% → 15, 100% → 39. The mock pool
+	// burns 75% of it, so the residual is ceil(fee / 4): 1, 4, 10.
+	for (pct, fee, fee_residual) in [(10, 4, 1), (37, 15, 4), (100, 39, 10)] {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			assert_event(crate::Event::BranchRegistered { collateral_id: DOT, stable_id: PUSD });
+			let total_pre = <Pusd as FungibleInspect<AccountId>>::total_issuance();
+			let rate = rate_pct(pct, 100);
+			assert_eq!(
+				crate::Pallet::<Test>::predict_open_upfront_fee(DOT, PUSD, 2_000, rate)
+					.expect("registered market"),
+				fee
+			);
+			assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate));
 
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(10, 100)));
-
-		// The mock pool burns its 75% share (3 of the 4 fee), so only the residual 1 is issued.
-		let fee_residual: Balance = 1;
-		assert_eq!(
-			stable_balance(PUSD, FEE_DEST),
-			fee_residual,
-			"residual fee routed to FEE_DEST in pUSD"
-		);
-
-		let total_post = <Pusd as FungibleInspect<AccountId>>::total_issuance();
-		assert_eq!(total_post, total_pre + 2_000 + fee_residual);
-		assert_eq!(<Pusd as FungibleInspect<AccountId>>::balance(&1), 2_000);
-		let v = vault(DOT, PUSD, 1);
-		assert_eq!(v.debt.interest, predicted_fee);
-		let state = branch_state(DOT, PUSD).unwrap();
-		assert_eq!(state.debt.minted_interest, predicted_fee);
-	});
+			let v = vault(DOT, PUSD, 1);
+			assert_eq!(v.annual_rate, rate);
+			assert_eq!(v.debt.principal, 2_000);
+			assert_eq!(v.debt.interest, fee);
+			assert_eq!(held(DOT, 1), 1_000);
+			assert!(vault_status(DOT, PUSD, 1).is_active());
+			assert_eq!(LinkedList::iter_from_tail(rate_list(DOT, PUSD), 1), vec![1]);
+			assert_eq!(<Pusd as FungibleInspect<AccountId>>::balance(&1), 2_000);
+			assert_eq!(branch_state(DOT, PUSD).expect("branch").debt.minted_interest, fee);
+			// The mock burns its 75% share; only the residual is issued.
+			assert_eq!(stable_balance(PUSD, FEE_DEST), fee_residual);
+			assert_eq!(
+				<Pusd as FungibleInspect<AccountId>>::total_issuance(),
+				total_pre + 2_000 + fee_residual
+			);
+			assert_event(crate::Event::VaultOpened {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				owner: 1,
+				collateral: 1_000,
+				debt: 2_000,
+				annual_rate: rate,
+			});
+			assert_event(crate::Event::UpfrontFeeCharged {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				owner: 1,
+				amount: fee,
+			});
+		});
+	}
 }
 
 #[test]
@@ -615,6 +651,11 @@ fn refresh_branch_issues_pending_aggregate_interest() {
 		let expected: Balance = 1_000_000;
 		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.debt.minted_interest - state_pre.debt.minted_interest, expected);
+		assert_event(crate::Event::InterestIssued {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			amount: expected,
+		});
 		assert_eq!(state.debt.pending_interest_attribution, expected);
 		assert_eq!(state.debt.aggregate_interest_remainder, 0);
 		assert_eq!(state.debt.last_interest_time, state.interest_time(Timestamp::get()));

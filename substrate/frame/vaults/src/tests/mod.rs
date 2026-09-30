@@ -4,7 +4,6 @@ mod basic_ops;
 mod borrower_operations;
 mod critical_threshold;
 mod debt_in_front;
-mod events;
 mod final_recovery;
 mod governance;
 mod hint_helpers;
@@ -52,4 +51,19 @@ pub fn vault_events() -> Vec<crate::Event<Test>> {
 			_ => None,
 		})
 		.collect()
+}
+
+/// Checks accounting at the current checkpoint, including all stablecoin aggregates.
+#[track_caller]
+pub fn assert_invariants() {
+	crate::try_state::do_try_state::<Test>().expect("accounting invariants hold");
+}
+
+/// Asserts success and checks accounting before any subsequent operation can repair it.
+#[track_caller]
+pub fn assert_ok_and_invariants<R: core::fmt::Debug>(
+	result: Result<R, frame::prelude::DispatchError>,
+) {
+	frame::testing_prelude::assert_ok!(result);
+	assert_invariants();
 }

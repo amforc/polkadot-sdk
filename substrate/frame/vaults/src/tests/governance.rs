@@ -1,4 +1,4 @@
-use crate::{mock::*, tests::rate_pct, types::BranchConfigUpdate};
+use crate::{mock::*, tests::*, types::BranchConfigUpdate};
 use frame::traits::fungibles::Mutate as FungiblesMutate;
 
 /// Replacement admins used by the reassignment test.
@@ -15,8 +15,7 @@ fn market_exists(collateral: AssetId, stable: StableId) -> bool {
 /// collateral, so an explicit `close_vault` is needed to empty the market.
 fn repay_to_close(owner: AccountId) {
 	let total = vault(DOT, PUSD, owner).debt.total();
-	// The terminal charge can put the payoff one unit past the recorded debt.
-	<VaultStableAssets as FungiblesMutate<AccountId>>::mint_into(PUSD, &owner, total + 1)
+	<VaultStableAssets as FungiblesMutate<AccountId>>::mint_into(PUSD, &owner, total)
 		.expect("mint repay buffer");
 	assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(owner), DOT, PUSD, owner, None));
 	assert_ok!(Pallet::<Test>::close_vault(RuntimeOrigin::signed(owner), DOT, PUSD, None));
@@ -44,6 +43,7 @@ fn signed_create_takes_deposit_and_remove_refunds() {
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0, "deposit refunded on removal");
 		assert!(!market_exists(DOT, PUSD));
+		assert_event(crate::Event::BranchRemoved { collateral_id: DOT, stable_id: PUSD });
 	});
 }
 
@@ -278,7 +278,29 @@ fn create_branch_rejects_unpriced_collateral() {
 fn full_admin_loosens_within_envelope_but_not_past_floor() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		// 110% -> 106% is a loosening the full admin may apply (floor is 105%).
+		// Successful updates preserve the complete config and emit the field and value.
+		let mut raised_mcr = default_branch_config();
+		raised_mcr.minimum_collateralization_ratio = rate_pct(115, 100);
+		let mut lowered_ceiling = raised_mcr.clone();
+		lowered_ceiling.debt_ceiling = 50_000_000;
+		for (update, expected) in [
+			(BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(115, 100)), raised_mcr),
+			(BranchConfigUpdate::DebtCeiling(50_000_000), lowered_ceiling),
+		] {
+			assert_ok!(Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(ADMIN),
+				DOT,
+				PUSD,
+				update.clone(),
+			));
+			crate::tests::assert_event(crate::Event::ParameterUpdated {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				update,
+			});
+			assert_eq!(branch_config(DOT, PUSD), Some(expected));
+		}
+		// 115% -> 106% is a loosening the full admin may apply (floor is 105%).
 		assert_ok!(Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
@@ -352,6 +374,12 @@ fn set_branch_admins_reassigns_authority() {
 		let info = crate::pallet::Branches::<Test>::get(DOT, PUSD).expect("admins stored");
 		assert_eq!(info.admins.full_admin, NEW_FULL_ADMIN);
 		assert_eq!(info.admins.emergency_admin, NEW_EMERGENCY_ADMIN);
+		assert_event(crate::Event::BranchAdminsChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			full_admin: NEW_FULL_ADMIN,
+			emergency_admin: NEW_EMERGENCY_ADMIN,
+		});
 
 		// The old full admin can no longer act; the new one can.
 		assert_noop!(
@@ -539,46 +567,29 @@ fn registry_has_no_global_cap() {
 	});
 }
 
-// A market whose stablecoin asset does not exist is rejected.
 #[test]
-fn create_branch_rejects_unknown_stable() {
-	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		// Asset id 9_999 was never created.
-		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				DOT,
-				9_999,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config(),
-				(),
-			),
-			Error::<Test>::UnknownStable
-		);
-	});
-}
-
-// A market whose stablecoin is also its own collateral is rejected — otherwise
-// the freely-minted coin could be posted as backing. The cross-market
-// directions live in `tests::stablecoin_markets::cross_role_reuse_rejected_in_both_directions`.
-#[test]
-fn create_branch_rejects_stable_collateral_collision() {
-	build_and_execute(|| {
-		// Self-collision: the collateral asset id equals the stablecoin asset id.
-		set_price(AssetId::WithId(PUSD), FixedU128::from_rational(10u128, 1u128));
-		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				AssetId::WithId(PUSD),
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config(),
-				(),
-			),
-			Error::<Test>::StableCollateralCollision
-		);
-	});
+fn create_branch_rejects_unknown_assets_and_role_collision() {
+	let cases = [
+		(AssetId::WithId(999_999), PUSD, Error::<Test>::UnknownCollateral),
+		(DOT, 9_999, Error::<Test>::UnknownStable),
+		(AssetId::WithId(PUSD), PUSD, Error::<Test>::StableCollateralCollision),
+	];
+	for (collateral, stable, error) in cases {
+		build_and_execute(|| {
+			set_price(collateral.clone(), FixedU128::from_rational(10u128, 1u128));
+			assert_noop!(
+				Pallet::<Test>::create_branch(
+					RuntimeOrigin::root(),
+					collateral.clone(),
+					stable,
+					branch_admins(ADMIN, EMERGENCY_ADMIN),
+					default_branch_config(),
+					(),
+				),
+				error
+			);
+		});
+	}
 }
 
 #[test]
