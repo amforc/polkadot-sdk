@@ -136,7 +136,8 @@ fn stablecoin_debt_aggregate_tracks_every_write() {
 		assert_ok_and_invariants(redeem_from(DOT, PUSD, 1, 9, 300));
 		assert_ok_and_invariants(open(3, DOT, PUSD, 40, 300, rate_pct(5, 100)));
 		set_price(DOT, FixedU128::from_rational(8u128, 1u128));
-		assert_ok_and_invariants(liquidate(DOT, PUSD, 3));
+		ActiveSpCapacity::set(1_000);
+		assert_ok_and_invariants(liquidate(9, DOT, PUSD, 3, 0, 0));
 		advance_time(ONE_DAY_MS);
 		// Freezing flushes pending aggregate interest into stored state.
 		assert_ok_and_invariants(set_governance_frozen(ADMIN, DOT, PUSD, true));

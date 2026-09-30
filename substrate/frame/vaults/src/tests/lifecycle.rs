@@ -177,12 +177,13 @@ fn same_rate_lifo_redemption_order() {
 fn frozen_branch_blocks_user_ops() {
 	type Operation = fn() -> DispatchResult;
 	// The elapsed time lets the Dormant dust of 155 accrue 78 at 50%, past the 200 minimum that
-	// activation needs.
-	let cases: [(&str, Moment, Operation); 5] = [
+	// activation needs and nomination forbids.
+	let cases: [(&str, Moment, Operation); 6] = [
 		("open_vault", 0, || open(3, DOT, PUSD, 1_000, 500, rate_pct(5, 100))),
 		("borrow", 0, || borrow(2, DOT, PUSD, 100, None)),
 		("withdraw_collateral", 0, || withdraw_collateral(2, DOT, PUSD, 1, None)),
 		("change_rate", 0, || change_rate(2, DOT, PUSD, rate_pct(70, 100))),
+		("nominate_dormant", 0, || nominate_dormant(9, DOT, PUSD, 1)),
 		("activate_dormant", ONE_YEAR_MS, || {
 			activate_dormant(9, DOT, PUSD, 1).map(|_| ()).map_err(|error| error.error)
 		}),

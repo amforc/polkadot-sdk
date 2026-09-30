@@ -9,8 +9,8 @@ use crate::{
 		AccountIdLookupOf, BalanceOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings, Pallet,
 		RegistrationConfigOf, StableIdOf, Vaults,
 	},
-	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, VaultListId, VaultStatus},
-	BenchmarkHelper as _,
+	types::{BranchAdmins, BranchConfig, BranchConfigUpdate, JitTerms, VaultListId, VaultStatus},
+	BenchmarkHelper as _, HoldReason,
 };
 use alloc::vec::Vec;
 use frame::{
@@ -18,16 +18,18 @@ use frame::{
 	benchmarking::prelude::*,
 	traits::{
 		fungibles::{
-			Balanced as FungiblesBalanced, Inspect as FungiblesInspect, Mutate as FungiblesMutate,
+			Balanced as FungiblesBalanced, Inspect as FungiblesInspect,
+			InspectHold as FungiblesInspectHold, Mutate as FungiblesMutate,
 		},
 		tokens::Precision,
-		Consideration as _, EnsureOriginWithArg, SaturatedConversion, Zero,
+		Consideration as _, EnsureOriginWithArg, SaturatedConversion, Time, Zero,
 	},
 };
 use frame_system::RawOrigin;
 use linked_list_interface::{Position, SortedListInterface};
 use pusd_primitives::{
-	OnBranchLifecycle, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
+	BranchSnapshot, OnBranchLifecycle, RedemptionSettlement, RedemptionStepSnapshot,
+	StabilityPoolInspect, StabilityPoolOffset, VaultInterface,
 };
 
 const ORACLE_PRICE: u128 = 10;
@@ -45,6 +47,25 @@ const RECOVERY_TRIGGER_PRICE: u32 = 1;
 const ONE_HOUR_MS: u64 = 60 * 60 * 1_000;
 const RECOVERY_VAULT_COLL: u128 = 200;
 
+/// Stability Pool entry delay of the `liquidate` benchmark. A day between the pool deposits and
+/// the liquidation lets the liquidated vault and its market accrue non-zero interest.
+const LIQUIDATION_ENTRY_DELAY_MS: u64 = 24 * ONE_HOUR_MS;
+/// Stablecoin each non-redistribution leg of the `liquidate` waterfall absorbs: the active pool,
+/// the keeper JIT, and the pending pool.
+const LIQUIDATION_LEG_DEBT: u128 = 2_000_000;
+/// Debt of the liquidated vault. It exceeds the three legs, so redistribution takes the rest.
+const LIQUIDATION_VICTIM_DEBT: u128 = 10_000_000;
+/// Debt of each other vault in the `liquidate` market.
+const LIQUIDATION_PEER_DEBT: u128 = 1_000_000;
+/// Collateral of the `liquidate` vaults in collateral units (see [`collateral_unit`]). At
+/// [`LIQUIDATION_PRICE`] the victim and the sacrifice sit below the MCR and the holders far above
+/// it, so they stay safe after absorbing both redistributions.
+const LIQUIDATION_VICTIM_COLL_UNITS: u128 = 6_000_000;
+const LIQUIDATION_SACRIFICE_COLL_UNITS: u128 = 600_000;
+const LIQUIDATION_HOLDER_COLL_UNITS: u128 = 50_000_000;
+/// Stablecoin value of one collateral unit once the `liquidate` benchmark crashes the price.
+const LIQUIDATION_PRICE: u128 = 1;
+
 fn stable<T: Config>() -> StableIdOf<T> {
 	T::BenchmarkHelper::stable_asset_id()
 }
@@ -55,6 +76,29 @@ fn balance<T: Config>(value: u128) -> BalanceOf<T> {
 
 fn rate(numerator: u128, denominator: u128) -> FixedU128 {
 	FixedU128::from_rational(numerator, denominator)
+}
+
+/// Collateral planck per benchmark collateral unit: the collateral's minimum balance.
+///
+/// The fixture amounts are sized for a unit minimum balance. A runtime with a production
+/// existential deposit scales them by this unit, and the `liquidate` benchmark quotes its price
+/// per unit, so every stablecoin-denominated amount stays the same across runtimes.
+fn collateral_unit<T: Config>() -> BalanceOf<T> {
+	let unit = T::CollateralAssets::minimum_balance(T::BenchmarkHelper::collateral_asset_id())
+		.max(balance::<T>(1));
+	assert!(!unit.is_zero());
+	unit
+}
+
+/// `units` collateral units in planck.
+fn collateral_units<T: Config>(units: u128) -> BalanceOf<T> {
+	balance::<T>(units).saturating_mul(collateral_unit::<T>())
+}
+
+/// Oracle price quoting `value` stablecoin per collateral unit.
+fn unit_price<T: Config>(value: u128) -> FixedU128 {
+	let unit: u128 = collateral_unit::<T>().saturated_into();
+	FixedU128::from_rational(value, unit)
 }
 
 fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
@@ -75,7 +119,15 @@ fn default_branch_config<T: Config>() -> BranchConfig<BalanceOf<T>> {
 		maximum_borrow_rate: rate(100, 100),
 		upfront_fee_period: 7 * DAY_MS,
 		rate_adjustment_cooldown: DAY_MS,
-		redistribution_penalty: Permill::from_percent(5),
+		final_recovery_reward_cooldown: ONE_HOUR_MS,
+		liquidation: crate::LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			keeper_flat_compensation_value: balance::<T>(10),
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: balance::<T>(10_000),
+			minimum_jit_contribution: balance::<T>(100),
+			redistribution_penalty: Permill::from_percent(5),
+		},
 	}
 }
 
@@ -123,7 +175,11 @@ fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkEr
 	let fee_account = T::FeeAccount::convert(stable::<T>());
 	fund_collateral::<T>(&asset, &fee_account, balance::<T>(1_000_000_000_000))?;
 	// A Root-created market charges the custody seed to its full admin.
-	fund_collateral::<T>(&asset, &branch_admin_accounts::<T>().0, balance::<T>(ACCOUNT_FUNDING))?;
+	fund_collateral::<T>(
+		&asset,
+		&branch_admin_accounts::<T>().0,
+		collateral_units::<T>(ACCOUNT_FUNDING),
+	)?;
 	Pallet::<T>::create_branch(
 		create_origin::<T>()?,
 		asset.clone(),
@@ -378,6 +434,79 @@ fn recovery_cycle<T: Config>(
 	Ok(owner)
 }
 
+/// Open a vault for a fresh account funded with twice its collateral, at its rate-list position.
+fn open_liquidation_vault<T: Config>(
+	seed: &'static str,
+	asset: &CollateralIdOf<T>,
+	collateral_units_count: u128,
+	debt: u128,
+	annual_rate: FixedU128,
+) -> Result<T::AccountId, BenchmarkError> {
+	let who: T::AccountId = account(seed, 0, 0);
+	let collateral = collateral_units::<T>(collateral_units_count);
+	fund_collateral::<T>(asset, &who, collateral.saturating_mul(balance::<T>(2)))?;
+	let hint =
+		T::VaultLists::find_position(&VaultListId::Rate(asset.clone(), stable::<T>()), annual_rate);
+	Pallet::<T>::open_vault(
+		RawOrigin::Signed(who.clone()).into(),
+		asset.clone(),
+		stable::<T>(),
+		collateral,
+		balance::<T>(debt),
+		annual_rate,
+		hint,
+	)?;
+	assert!(Vaults::<T>::contains_key((asset, stable::<T>(), &who)));
+	Ok(who)
+}
+
+/// Seed the Stability Pool so the next offset rolls a due cohort into the active leg and still
+/// finds pending capital behind it. Leaves the clock one millisecond before the pending deadline,
+/// a full entry delay after the last market accrual.
+fn seed_liquidation_pool<T: Config>(asset: &CollateralIdOf<T>) -> Result<(), BenchmarkError> {
+	let now = T::TimeProvider::now();
+	let active_deadline = T::StabilityPool::benchmark_queue_deposit(
+		asset,
+		&stable::<T>(),
+		0,
+		LIQUIDATION_ENTRY_DELAY_MS,
+		balance::<T>(LIQUIDATION_LEG_DEBT),
+	)?;
+	assert!(active_deadline > now);
+	// The second deposit lands just before the first deadline, so it opens a later cohort.
+	T::BenchmarkHelper::advance_time(active_deadline.saturating_sub(now).saturating_sub(1));
+	let pending_deadline = T::StabilityPool::benchmark_queue_deposit(
+		asset,
+		&stable::<T>(),
+		1,
+		LIQUIDATION_ENTRY_DELAY_MS,
+		balance::<T>(LIQUIDATION_LEG_DEBT),
+	)?;
+	assert!(pending_deadline > active_deadline);
+	let now = T::TimeProvider::now();
+	T::BenchmarkHelper::advance_time(pending_deadline.saturating_sub(now).saturating_sub(1));
+	let now = T::TimeProvider::now();
+	assert!(active_deadline <= now);
+	assert!(now < pending_deadline);
+	Ok(())
+}
+
+/// Collateral the redistribution account holds for vaults that have not yet absorbed it.
+/// The market as the engine hands it to the pool, read the way `liquidate` reads it.
+fn branch_snapshot<T: Config>(asset: &CollateralIdOf<T>) -> Result<BranchSnapshot, BenchmarkError> {
+	let mode = Pallet::<T>::current_mode(asset, &stable::<T>())
+		.map_err(|_| BenchmarkError::Stop("branch mode unavailable"))?;
+	Ok(BranchSnapshot { mode, now: T::TimeProvider::now() })
+}
+
+fn redistribution_held<T: Config>(asset: &CollateralIdOf<T>) -> BalanceOf<T> {
+	T::CollateralAssets::balance_on_hold(
+		asset.clone(),
+		&HoldReason::VaultCollateral.into(),
+		&Pallet::<T>::redistribution_account(asset, &stable::<T>()),
+	)
+}
+
 #[benchmarks]
 mod benchmarks {
 	use super::*;
@@ -554,14 +683,24 @@ mod benchmarks {
 			asset.clone(),
 			FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
 		);
-		let caller: T::AccountId = whitelisted_caller();
+		// A funded keeper can receive the entry reward, so the payout leg is measured.
+		let caller = funded_account::<T>("keeper", &asset)?;
+		let caller_before = <T::CollateralAssets as FungiblesInspect<T::AccountId>>::balance(
+			asset.clone(),
+			&caller,
+		);
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone());
+		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), owner.clone());
 
 		assert_eq!(
 			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
 			VaultStatus::FinalRecovery
+		);
+		assert!(
+			<T::CollateralAssets as FungiblesInspect<T::AccountId>>::balance(asset, &caller) >
+				caller_before,
+			"the entry paid its keeper"
 		);
 		Ok(())
 	}
@@ -619,6 +758,58 @@ mod benchmarks {
 			Pallet::<T>::vault_status_of(&asset, &stable::<T>(), &owner),
 			VaultStatus::Active
 		);
+		Ok(())
+	}
+
+	#[benchmark]
+	fn nominate_dormant() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		let owner: T::AccountId = account("husk", 0, 0);
+		// Two repaid vaults split a liquidation into sub-minimum debt. Leave the allocation
+		// pending so nomination measures the collateral transfer as well as interest minting.
+		for who in [owner.clone(), account("husk", 1, 0)] {
+			fund_collateral::<T>(&asset, &who, balance::<T>(ACCOUNT_FUNDING))?;
+			open_default_vault::<T>(&who, &asset, balance::<T>(SEED_COLL))?;
+			T::StableAssets::mint_into(stable::<T>(), &who, balance::<T>(SEED_DEBT))?;
+			Pallet::<T>::repay_for(
+				RawOrigin::Signed(who.clone()).into(),
+				asset.clone(),
+				stable::<T>(),
+				who,
+				None,
+			)?;
+		}
+		let victim = funded_account::<T>("victim", &asset)?;
+		open_default_vault::<T>(&victim, &asset, balance::<T>(RECOVERY_VAULT_COLL))?;
+		T::BenchmarkHelper::set_oracle_price(
+			asset.clone(),
+			FixedU128::saturating_from_integer(RECOVERY_TRIGGER_PRICE),
+		);
+		let caller: T::AccountId = whitelisted_caller();
+		Pallet::<T>::liquidate(
+			RawOrigin::Signed(caller.clone()).into(),
+			asset.clone(),
+			stable::<T>(),
+			victim,
+			JitTerms {
+				max_stable: BalanceOf::<T>::zero(),
+				min_collateral_out: BalanceOf::<T>::zero(),
+			},
+		)?;
+		T::BenchmarkHelper::advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		let before = Pallet::<T>::vault_of(&asset, &stable::<T>(), &owner)?;
+		assert!(before.debt.total().is_zero());
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone());
+
+		let branch = Pallet::<T>::branch_of(&asset, &stable::<T>())?;
+		let after = Pallet::<T>::vault_of(&asset, &stable::<T>(), &owner)?;
+		assert_eq!(branch.state.dormant_redemption_target, Some(owner));
+		assert!(!after.debt.principal.is_zero());
+		assert!(!after.debt.interest.is_zero());
+		assert!(after.debt.total() < branch.config.minimum_debt);
+		assert!(after.collateral > before.collateral);
 		Ok(())
 	}
 
@@ -750,6 +941,99 @@ mod benchmarks {
 		let branch =
 			Branches::<T>::get(&asset, &stable::<T>()).expect("branch present after register");
 		assert!(branch.state.frozen.is_some());
+		Ok(())
+	}
+
+	/// Worst-case liquidation: every waterfall leg is non-zero and every lazy settlement is due.
+	///
+	/// - The active pool leg first rolls a due cohort, then is depleted into a new epoch.
+	/// - The keeper burns JIT stablecoin and receives its share and the capped reward.
+	/// - The pending pool leg is depleted behind it; redistribution takes the remainder.
+	/// - The victim first absorbs a pending redistribution share and a day of interest, whose mint
+	///   routes yield through the pool.
+	/// - The victim sits mid-list, so its removal relinks both neighbours.
+	#[benchmark]
+	fn liquidate() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		T::BenchmarkHelper::set_oracle_price(asset.clone(), unit_price::<T>(ORACLE_PRICE));
+		let peer_debt = LIQUIDATION_PEER_DEBT;
+		let holder_units = LIQUIDATION_HOLDER_COLL_UNITS;
+		open_liquidation_vault::<T>("holder_high", &asset, holder_units, peer_debt, rate(8, 100))?;
+		let victim = open_liquidation_vault::<T>(
+			"victim",
+			&asset,
+			LIQUIDATION_VICTIM_COLL_UNITS,
+			LIQUIDATION_VICTIM_DEBT,
+			rate(5, 100),
+		)?;
+		open_liquidation_vault::<T>("holder_low", &asset, holder_units, peer_debt, rate(2, 100))?;
+		let sacrifice_units = LIQUIDATION_SACRIFICE_COLL_UNITS;
+		let sacrifice = open_liquidation_vault::<T>(
+			"sacrifice",
+			&asset,
+			sacrifice_units,
+			peer_debt,
+			rate(1, 100),
+		)?;
+		let keeper: T::AccountId = whitelisted_caller();
+		fund_collateral::<T>(&asset, &keeper, collateral_units::<T>(ACCOUNT_FUNDING))?;
+		let jit = balance::<T>(LIQUIDATION_LEG_DEBT);
+		T::StableAssets::mint_into(stable::<T>(), &keeper, jit.saturating_mul(balance::<T>(2)))?;
+
+		// With the pool still empty, the sacrifice redistributes in full, leaving the victim a
+		// pending share to absorb when it is touched.
+		T::BenchmarkHelper::set_oracle_price(asset.clone(), unit_price::<T>(LIQUIDATION_PRICE));
+		let no_jit = JitTerms { max_stable: Zero::zero(), min_collateral_out: Zero::zero() };
+		Pallet::<T>::liquidate(
+			RawOrigin::Signed(keeper.clone()).into(),
+			asset.clone(),
+			stable::<T>(),
+			sacrifice,
+			no_jit,
+		)?;
+		assert!(!redistribution_held::<T>(&asset).is_zero());
+
+		seed_liquidation_pool::<T>(&asset)?;
+		// Re-quote after the clock moved, so a runtime with a staleness bound accepts the price.
+		T::BenchmarkHelper::set_oracle_price(asset.clone(), unit_price::<T>(LIQUIDATION_PRICE));
+		let branch = branch_snapshot::<T>(&asset)?;
+		let quote = T::StabilityPool::quote(&asset, &stable::<T>(), branch)
+			.ok_or(BenchmarkError::Stop("seeded pool has no capacity"))?;
+		let active_quote = T::StabilityPool::quote_active(&quote, jit);
+		let pending_quote = T::StabilityPool::quote_pending(&quote, jit, active_quote);
+		assert_eq!(active_quote, jit);
+		assert_eq!(pending_quote, jit);
+		let victim_debt = Vaults::<T>::get((&asset, stable::<T>(), &victim))
+			.ok_or(BenchmarkError::Stop("victim vault missing"))?
+			.vault
+			.debt
+			.total();
+		assert!(victim_debt > jit.saturating_mul(balance::<T>(3)), "redistribution leg is empty");
+		let keeper_stable = T::StableAssets::balance(stable::<T>(), &keeper);
+		let keeper_collateral = T::CollateralAssets::balance(asset.clone(), &keeper);
+		let held = redistribution_held::<T>(&asset);
+
+		#[extrinsic_call]
+		_(
+			RawOrigin::Signed(keeper.clone()),
+			asset.clone(),
+			stable::<T>(),
+			victim.clone(),
+			JitTerms { max_stable: jit, min_collateral_out: BalanceOf::<T>::zero() },
+		);
+
+		assert!(!Vaults::<T>::contains_key((&asset, stable::<T>(), &victim)));
+		let max = balance::<T>(u128::MAX);
+		let branch = branch_snapshot::<T>(&asset)?;
+		// A market with no quote has no capacity left on either leg.
+		if let Some(quote) = T::StabilityPool::quote(&asset, &stable::<T>(), branch) {
+			assert!(T::StabilityPool::quote_active(&quote, max).is_zero());
+			assert!(T::StabilityPool::quote_pending(&quote, max, max).is_zero());
+		}
+		let stable_after = T::StableAssets::balance(stable::<T>(), &keeper);
+		assert_eq!(keeper_stable.saturating_sub(stable_after), jit);
+		assert!(T::CollateralAssets::balance(asset.clone(), &keeper) > keeper_collateral);
+		assert!(redistribution_held::<T>(&asset) != held);
 		Ok(())
 	}
 

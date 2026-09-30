@@ -8,10 +8,13 @@ mod lifecycle;
 use crate::{
 	pallet::{
 		BalanceOf, BranchOf, CollateralIdOf, Config, Error, Event, HoldReason, Millis, Pallet,
-		StableCreditOf, StableIdOf, Vaults,
+		StableIdOf, Vaults,
 	},
-	types::{DebtBreakdown, DebtCollateral, Vault, VaultListId, VaultRecord, VaultStatus},
-	utility_impls::{BranchContribution, Issuance},
+	types::{
+		DebtBreakdown, DebtCollateral, LiquidationTouch, Vault, VaultListId, VaultRecord,
+		VaultStatus,
+	},
+	utility_impls::BranchContribution,
 };
 use frame::{
 	prelude::*,
@@ -46,6 +49,14 @@ pub(crate) enum Commit {
 	Exempt,
 }
 
+/// Where a touch leaves the vault's pending redistribution share.
+pub(crate) enum ShareCustody {
+	/// Moved onto the owner's hold, as every operation that keeps the vault needs.
+	Owner,
+	/// Left on the redistribution account, for a liquidation that seizes it anyway.
+	Retained,
+}
+
 /// State for one vault operation.
 ///
 /// A commit can only write the vault loaded for `owner`.
@@ -55,6 +66,11 @@ pub struct VaultOp<T: Config> {
 	vault: Vault<BalanceOf<T>>,
 	deposit: T::VaultConsideration,
 	status: VaultStatus,
+	/// Redistribution collateral the vault owns but the redistribution account still holds.
+	retained_redistribution: BalanceOf<T>,
+	/// For a liquidation, what the touch realized. It rides on the liquidation event instead of
+	/// events of its own; `None` for every other operation, which emits them.
+	liquidation_touch: Option<LiquidationTouch<BalanceOf<T>>>,
 }
 
 impl<T: Config> Context<T> {
@@ -353,7 +369,15 @@ impl<T: Config> Context<T> {
 	}
 
 	/// Applies pending interest and redistribution to a vault in memory.
-	fn touch(mut self, owner: &T::AccountId) -> Result<VaultOp<T>, DispatchError> {
+	///
+	/// The vault's redistribution share moves onto the owner's hold, or stays in custody when
+	/// `custody` says so: a liquidation seizes every unit the owner holds, so moving the share
+	/// first only adds a round trip through the owner's account.
+	fn touch(
+		mut self,
+		owner: &T::AccountId,
+		custody: ShareCustody,
+	) -> Result<VaultOp<T>, DispatchError> {
 		debug_assert!(self.pending_fee.is_zero(), "fee charged before touch");
 		let VaultRecord { mut vault, deposit } =
 			Pallet::<T>::record_of(&self.collateral_id, &self.stable_id, owner)?;
@@ -368,28 +392,79 @@ impl<T: Config> Context<T> {
 		// is the protocol's, so the baseline takes it and the operation answers only for its own
 		// change.
 		self.tcr_baseline.debt = Pallet::<T>::accrued_branch_debt(&self.branch.state, self.now);
-		if !pending.redistribution.collateral.is_zero() {
-			T::CollateralAssets::transfer_on_hold(
-				self.collateral_id.clone(),
-				&HoldReason::VaultCollateral.into(),
-				&Pallet::<T>::redistribution_account(&self.collateral_id, &self.stable_id),
-				owner,
-				pending.redistribution.collateral,
-				Precision::Exact,
-				Restriction::OnHold,
-				Fortitude::Polite,
-			)?;
-		}
+		let retained_redistribution = match custody {
+			ShareCustody::Retained => pending.redistribution.collateral,
+			ShareCustody::Owner => {
+				if !pending.redistribution.collateral.is_zero() {
+					T::CollateralAssets::transfer_on_hold(
+						self.collateral_id.clone(),
+						&HoldReason::VaultCollateral.into(),
+						&Pallet::<T>::redistribution_account(&self.collateral_id, &self.stable_id),
+						owner,
+						pending.redistribution.collateral,
+						Precision::Exact,
+						Restriction::OnHold,
+						Fortitude::Polite,
+					)?;
+				}
+				BalanceOf::<T>::zero()
+			},
+		};
 
-		if !pending.interest.is_zero() {
+		let liquidation_touch = match custody {
+			ShareCustody::Retained => Some(LiquidationTouch {
+				interest: pending.interest,
+				redistribution: pending.redistribution,
+			}),
+			ShareCustody::Owner => {
+				Self::emit_touch_events(
+					&self.collateral_id,
+					&self.stable_id,
+					owner,
+					pending.interest,
+					pending.redistribution,
+				);
+				None
+			},
+		};
+		Ok(VaultOp {
+			ctx: self,
+			owner: owner.clone(),
+			vault,
+			deposit,
+			status,
+			retained_redistribution,
+			liquidation_touch,
+		})
+	}
+
+	// Reports what a touch realized on a vault the operation keeps.
+	fn emit_touch_events(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		owner: &T::AccountId,
+		interest: BalanceOf<T>,
+		redistribution: DebtCollateral<BalanceOf<T>>,
+	) {
+		if !interest.is_zero() {
 			Pallet::<T>::deposit_event(Event::InterestAccrued {
-				collateral_id: self.collateral_id.clone(),
-				stable_id: self.stable_id.clone(),
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
 				owner: owner.clone(),
-				amount: pending.interest,
+				amount: interest,
 			});
 		}
-		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, deposit, status })
+		// No other event carries a vault's share: it follows from the stake, which events omit.
+		let DebtCollateral { debt, collateral } = redistribution;
+		if !debt.is_zero() || !collateral.is_zero() {
+			Pallet::<T>::deposit_event(Event::RedistributionApplied {
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
+				owner: owner.clone(),
+				debt,
+				collateral,
+			});
+		}
 	}
 
 	/// Attaches a new vault without touching an existing row.
@@ -413,6 +488,8 @@ impl<T: Config> Context<T> {
 			vault,
 			deposit,
 			status: VaultStatus::Active,
+			retained_redistribution: BalanceOf::<T>::zero(),
+			liquidation_touch: None,
 		};
 		op.sync_stake()?;
 		Ok(op)
@@ -430,7 +507,7 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Self, DispatchError> {
-		Context::<T>::load(collateral_id, stable_id)?.touch(owner)
+		Context::<T>::load(collateral_id, stable_id)?.touch(owner, ShareCustody::Owner)
 	}
 
 	/// Loads an existing vault from an unfrozen branch and applies its pending changes.
@@ -439,7 +516,7 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Self, DispatchError> {
-		Context::<T>::load_unfrozen(collateral_id, stable_id)?.touch(owner)
+		Context::<T>::load_unfrozen(collateral_id, stable_id)?.touch(owner, ShareCustody::Owner)
 	}
 
 	/// Loads an existing vault from an unfrozen branch, caching its price before touching it.
@@ -448,7 +525,20 @@ impl<T: Config> VaultOp<T> {
 		stable_id: StableIdOf<T>,
 		owner: &T::AccountId,
 	) -> Result<Self, DispatchError> {
-		Context::<T>::load_priced(collateral_id, stable_id)?.touch(owner)
+		Context::<T>::load_priced(collateral_id, stable_id)?.touch(owner, ShareCustody::Owner)
+	}
+
+	/// Loads a vault for liquidation: priced, from an unfrozen branch, with its redistribution
+	/// share left in custody.
+	///
+	/// The loaded vault still counts the share, so the owner holds
+	/// [`Self::retained_redistribution`] less than [`Self::vault`] records.
+	pub(crate) fn load_for_liquidation(
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+		owner: &T::AccountId,
+	) -> Result<Self, DispatchError> {
+		Context::<T>::load_priced(collateral_id, stable_id)?.touch(owner, ShareCustody::Retained)
 	}
 
 	/// Prepares a new vault in an unfrozen branch.
@@ -492,6 +582,20 @@ impl<T: Config> VaultOp<T> {
 	/// Returns the current vault state.
 	pub(crate) const fn vault(&self) -> &Vault<BalanceOf<T>> {
 		&self.vault
+	}
+
+	/// What the touch realized, for an operation loaded with [`Self::load_for_liquidation`].
+	pub(crate) fn liquidation_touch(
+		&self,
+	) -> Result<LiquidationTouch<BalanceOf<T>>, DispatchError> {
+		self.liquidation_touch.defensive_ok_or(DispatchError::Corruption)
+	}
+
+	/// Returns the vault's redistribution collateral that the redistribution account still holds.
+	///
+	/// Nonzero only for a vault loaded with [`Self::load_for_liquidation`].
+	pub(crate) const fn retained_redistribution(&self) -> BalanceOf<T> {
+		self.retained_redistribution
 	}
 
 	/// Queries and caches the oracle price for this operation.
@@ -708,20 +812,22 @@ impl<T: Config> VaultOp<T> {
 		Ok(payment)
 	}
 
+	/// The market as this operation hands it to the Stability Pool.
+	pub(crate) fn branch_snapshot(&self) -> BranchSnapshot {
+		self.ctx.branch_snapshot()
+	}
+
 	/// Commits the operation, running the mode gate when `commit` asks for it.
 	pub(crate) fn commit(self, commit: Commit) -> DispatchResult {
 		match commit {
 			Commit::Checked => self.ctx.ensure_mode_rules()?,
 			Commit::Exempt => {},
 		}
-		self.persist(false, None)
+		self.persist(false)
 	}
 
 	/// Writes the vault and the market, then issues what the operation owes.
-	///
-	/// `burned` is stablecoin the operation took out of circulation. Issuance draws from it before
-	/// minting, and the rest burns here, so the operation changes the supply once.
-	fn persist(self, remove: bool, burned: Option<StableCreditOf<T>>) -> DispatchResult {
+	fn persist(self, remove: bool) -> DispatchResult {
 		let VaultOp { ctx, owner, vault, deposit, .. } = self;
 		let collateral_id = ctx.collateral_id.clone();
 		let stable_id = ctx.stable_id.clone();
@@ -756,27 +862,12 @@ impl<T: Config> VaultOp<T> {
 		)?;
 
 		// Mint after writing state.
-		let mut issuance = Issuance::netted(stable_id.clone(), burned);
 		if let Some(branch) = branch {
-			Pallet::<T>::issue_interest(
-				&collateral_id,
-				&stable_id,
-				branch,
-				pending_interest_mint,
-				&mut issuance,
-			)?;
+			Pallet::<T>::issue_interest(&collateral_id, &stable_id, branch, pending_interest_mint)?;
 			if !pending_fee.is_zero() {
-				Pallet::<T>::mint_and_route_yield(
-					&collateral_id,
-					&stable_id,
-					branch,
-					pending_fee,
-					&mut issuance,
-				)?;
+				Pallet::<T>::mint_and_route_yield(&collateral_id, &stable_id, branch, pending_fee)?;
 			}
 		}
-		// Burns what issuance did not use.
-		drop(issuance);
 		Ok(())
 	}
 }
