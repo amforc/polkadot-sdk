@@ -15,7 +15,7 @@ use crate::{
 	context::VaultOp,
 	pallet::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
-		StableCreditOf, StableIdOf,
+		StableIdOf,
 	},
 	types::{DebtCollateral, JitTerms, LiquidationConfig, LiquidationOutcome},
 };
@@ -215,11 +215,10 @@ impl<T: Config> Pallet<T> {
 		op: VaultOp<T>,
 		redistribution: DebtCollateral<BalanceOf<T>>,
 		owner_collateral: CollateralCreditOf<T>,
-		burned: Option<StableCreditOf<T>>,
 	) -> DispatchResult {
 		let owner = op.owner().clone();
 		Self::resolve_collateral(&owner, owner_collateral)?;
-		op.finish_liquidation(redistribution, burned)
+		op.finish_liquidation(redistribution)
 	}
 
 	fn settle_liquidation(
@@ -263,7 +262,7 @@ impl<T: Config> Pallet<T> {
 		let (seized, owner_surplus) = collateral.split(seized_out);
 		debug_assert_eq!(owner_surplus.peek(), plan.owner_surplus);
 		let (keeper_collateral, mut resolution) = seized.split(plan.keeper_reward);
-		let keeper_burned = Self::settle_keeper_legs(
+		Self::settle_keeper_legs(
 			keeper,
 			stable_id,
 			&plan,
@@ -272,9 +271,7 @@ impl<T: Config> Pallet<T> {
 			keeper_collateral,
 			&mut resolution,
 		)?;
-		let pool_burned =
-			Self::settle_pool_legs(collateral_id, stable_id, branch, &plan, &mut resolution)?;
-		let burned = merge_burned::<T>(keeper_burned, pool_burned)?;
+		Self::settle_pool_legs(collateral_id, stable_id, branch, &plan, &mut resolution)?;
 
 		// Every leg but the owner's surplus has left the seized credit.
 		if let Err(resolution) = resolution.drop_zero() {
@@ -292,13 +289,13 @@ impl<T: Config> Pallet<T> {
 			owner_surplus: owner_surplus.peek(),
 			touch,
 		};
-		Self::settle_liquidation_custody(op, outcome.redistribution, owner_surplus, burned)?;
+		Self::settle_liquidation_custody(op, outcome.redistribution, owner_surplus)?;
 		Ok(outcome)
 	}
 
 	// Withdraws the keeper's JIT stablecoin and pays the reward and the JIT share as one deposit:
 	// the deposit planning checked, so it cannot fail on the keeper's account state. The withdrawn
-	// stablecoin comes back for the commit to burn.
+	// stablecoin burns here: it is the debt the JIT leg cancels.
 	fn settle_keeper_legs(
 		keeper: &T::AccountId,
 		stable_id: &StableIdOf<T>,
@@ -307,15 +304,27 @@ impl<T: Config> Pallet<T> {
 		jit_preservation: Preservation,
 		mut keeper_collateral: CollateralCreditOf<T>,
 		resolution: &mut CollateralCreditOf<T>,
-	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
+	) -> DispatchResult {
 		debug_assert_eq!(keeper_collateral.peek(), plan.keeper_reward);
 		if plan.debt.keeper_jit.is_zero() {
 			debug_assert!(plan.collateral.keeper_jit.is_zero());
 		} else {
 			debug_assert!(plan.collateral.keeper_jit >= jit.min_collateral_out);
+			let credit = T::StableAssets::withdraw(
+				stable_id.clone(),
+				keeper,
+				plan.debt.keeper_jit,
+				Precision::Exact,
+				jit_preservation,
+				Fortitude::Polite,
+			)?;
+			assert!(
+				credit.peek() == plan.debt.keeper_jit,
+				"an exact withdrawal moves the whole debt"
+			);
+			// Dropping the credit burns it: the JIT leg cancelled exactly this debt.
+			drop(credit);
 		}
-		let burned =
-			Self::withdraw_jit_stable(keeper, stable_id, plan.debt.keeper_jit, jit_preservation)?;
 		if let Err(jit_share) =
 			keeper_collateral.subsume(resolution.extract(plan.collateral.keeper_jit))
 		{
@@ -324,12 +333,11 @@ impl<T: Config> Pallet<T> {
 			drop(jit_share);
 			return Err(DispatchError::Corruption);
 		}
-		Self::resolve_collateral(keeper, keeper_collateral)?;
-		Ok(burned)
+		Self::resolve_collateral(keeper, keeper_collateral)
 	}
 
 	// Hands both pool legs to the Stability Pool in one exact call, which keeps them atomic, and
-	// returns the stablecoin the pool gave up. A plan without pool debt carries no pool collateral
+	// burns the stablecoin the pool gave up. A plan without pool debt carries no pool collateral
 	// and makes no call.
 	fn settle_pool_legs(
 		collateral_id: &CollateralIdOf<T>,
@@ -337,11 +345,11 @@ impl<T: Config> Pallet<T> {
 		branch: BranchSnapshot,
 		plan: &LiquidationPlan<BalanceOf<T>>,
 		resolution: &mut CollateralCreditOf<T>,
-	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
+	) -> DispatchResult {
 		if plan.debt.active_pool.is_zero() && plan.debt.pending_pool.is_zero() {
 			debug_assert!(plan.collateral.active_pool.is_zero());
 			debug_assert!(plan.collateral.pending_pool.is_zero());
-			return Ok(None);
+			return Ok(());
 		}
 		let active_collateral = resolution.extract(plan.collateral.active_pool);
 		let pending_collateral = resolution.extract(plan.collateral.pending_pool);
@@ -366,7 +374,9 @@ impl<T: Config> Pallet<T> {
 		// The pool must give up exactly the debt it cancels, or the supply would drift.
 		let given_up = burned.as_ref().map_or_else(Zero::zero, |credit| credit.peek());
 		ensure!(given_up == pool_debt, DispatchError::Corruption);
-		Ok(burned)
+		// Dropping the credit burns it: the offset cancelled exactly this debt.
+		drop(burned);
+		Ok(())
 	}
 
 	// Whether a planned JIT trade executes: its collateral share must clear the keeper's floor and
@@ -433,29 +443,6 @@ impl<T: Config> Pallet<T> {
 			return Ok((Zero::zero(), preservation));
 		}
 		Ok((funded, preservation))
-	}
-
-	// Withdraws the keeper's stablecoin for an executed JIT trade. Planning already sized the debt
-	// to what the keeper can pay.
-	fn withdraw_jit_stable(
-		keeper: &T::AccountId,
-		stable_id: &StableIdOf<T>,
-		debt: BalanceOf<T>,
-		preservation: Preservation,
-	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
-		if debt.is_zero() {
-			return Ok(None);
-		}
-		let credit = T::StableAssets::withdraw(
-			stable_id.clone(),
-			keeper,
-			debt,
-			Precision::Exact,
-			preservation,
-			Fortitude::Polite,
-		)?;
-		assert!(credit.peek() == debt, "an exact withdrawal moves the whole debt");
-		Ok(Some(credit))
 	}
 
 	fn resolve_collateral(
@@ -538,25 +525,6 @@ impl<T: Config> LiquidationQuoter<'_, T> {
 			LiquidationSplit { active_pool, keeper_jit, pending_pool, redistribution: remaining },
 			preservation,
 		))
-	}
-}
-
-// Merges the stablecoin the keeper and the pool gave up into the one credit the commit burns.
-fn merge_burned<T: Config>(
-	keeper: Option<StableCreditOf<T>>,
-	pool: Option<StableCreditOf<T>>,
-) -> Result<Option<StableCreditOf<T>>, DispatchError> {
-	match (keeper, pool) {
-		(None, pool) => Ok(pool),
-		(keeper, None) => Ok(keeper),
-		(Some(mut keeper), Some(pool)) => {
-			keeper.subsume(pool).map_err(|pool| {
-				// Both credits are of the market's stablecoin, so the merge cannot fail.
-				drop(pool);
-				DispatchError::Corruption
-			})?;
-			Ok(Some(keeper))
-		},
 	}
 }
 
