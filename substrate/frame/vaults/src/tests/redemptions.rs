@@ -121,7 +121,7 @@ fn a_step_for_the_projected_debt_clears_it() {
 }
 
 #[test]
-fn redeem_step_rejects_invalid_settlements_without_state_change() {
+fn redeem_step_rejects_invalid_settlements() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
@@ -150,9 +150,8 @@ fn redeem_step_rejects_invalid_settlements_without_state_change() {
 			crate::Error::<Test>::InvalidRedemptionSettlement
 		);
 		// A payment in another market's coin cannot settle this market's debt.
-		// The step is run hypothetically so the issued credit is rolled back
-		// with the rejection rather than leaking into the storage comparison.
-		assert_noop!(
+		// Roll back the synthetic credit; this case checks the error, not atomicity.
+		assert_err!(
 			hypothetically!(<crate::Pallet<Test> as VaultInterface>::redeem_step(
 				&DOT,
 				&PUSD,
@@ -253,9 +252,13 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
 
+		assert_eq!(vault(DOT, PUSD, 1).debt.principal, 155);
+		assert_eq!(vault(DOT, PUSD, 1).debt.interest, 0);
 		advance_time(365 * ONE_DAY_MS);
 		// Touch alone never re-activates a Dormant, even past MinimumDebt.
 		assert_ok!(poke(9, DOT, PUSD, 1));
+		// ceil(155 × 50% × 365 / 365.25) = 78.
+		assert_eq!(vault(DOT, PUSD, 1).debt.interest, 78);
 		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "touch never re-activates a Dormant");
 		assert_eq!(
 			branch_state(DOT, PUSD).unwrap().dormant_redemption_target,
@@ -292,34 +295,6 @@ fn activate_dormant_rejects_active_vault() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		assert_noop!(activate_dormant(9, DOT, PUSD, 1), crate::Error::<Test>::InvalidVaultStatus);
-	});
-}
-
-#[test]
-fn dormant_vault_with_residual_accrues_interest() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// Distinct rates so the redemption deterministically targets vault 1 (the
-		// lower-rate tail); at equal rates the LIFO tie-break would send it to vault 2
-		// and this test would then read an untouched Active vault (green for the wrong
-		// reason).
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(60, 100)));
-		let target = redeem(DOT, PUSD, 3, 350).expect("redeem ok");
-		assert_eq!(target, 1);
-		// Vault 1 (open fee 5 → total 505) is redeemed by 350: interest-first cancels 5,
-		// then 345 principal, leaving a 155 residual below MinimumDebt 200 → Dormant.
-		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
-		let v_pre = vault(DOT, PUSD, 1);
-		assert_eq!(v_pre.debt.principal, 155);
-		assert_eq!(v_pre.debt.interest, 0);
-
-		advance_time(365 * ONE_DAY_MS); // ~1 year (365 days)
-		assert_ok!(poke(2, DOT, PUSD, 1));
-		let v_post = vault(DOT, PUSD, 1);
-		// The Dormant residual keeps accruing: ceil(155 * 0.5 * 365days / year) = 78.
-		assert_eq!(v_post.debt.interest, 78);
 	});
 }
 

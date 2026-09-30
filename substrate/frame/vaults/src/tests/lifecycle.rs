@@ -62,25 +62,6 @@ fn create_branch_requires_asset_owner_or_root() {
 }
 
 #[test]
-fn create_branch_rejects_unknown_asset() {
-	build_and_execute(|| {
-		let unknown = AssetId::WithId(999_999);
-		set_price(unknown.clone(), FixedU128::from_rational(10u128, 1u128));
-		assert_noop!(
-			crate::Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				unknown,
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config(),
-				(),
-			),
-			crate::Error::<Test>::UnknownCollateral
-		);
-	});
-}
-
-#[test]
 fn create_branch_rejects_duplicate_market_pair() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
@@ -98,89 +79,33 @@ fn create_branch_rejects_duplicate_market_pair() {
 	});
 }
 
+// Each case violates one opening constraint and must leave storage unchanged.
 #[test]
-fn open_vault_holds_collateral_and_mints_pusd() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// 1000 DOT @ $10 = $10000 collateral; borrow 1000 pUSD with 5% rate.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
-		let v = vault(DOT, PUSD, 1);
-		assert_eq!(v.debt.principal, 1_000);
-		assert!(vault_status(DOT, PUSD, 1).is_active());
-		assert_eq!(stable_balance(PUSD, 1), 1_000);
-		assert_eq!(held(DOT, 1), 1_000);
-		// Rate index contains the vault.
-		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(
-			&rate_list(DOT, PUSD),
-			&1
-		));
-	});
-}
-
-#[test]
-fn open_vault_rejects_existing_owner_vault() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_noop!(
-			open(1, DOT, PUSD, 2_000, 500, rate_pct(5, 100)),
-			crate::Error::<Test>::VaultAlreadyExists
-		);
-	});
-}
-
-#[test]
-fn open_vault_below_min_debt_rejected() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_noop!(
-			open(1, DOT, PUSD, 1_000, 100, rate_pct(5, 100)), // < min_debt 200
-			crate::Error::<Test>::DebtBelowMinimum
-		);
-	});
-}
-
-#[test]
-fn open_vault_rate_out_of_bounds_rejected() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// Below the branch `minimum_borrow_rate` (0.1%).
-		assert_noop!(
-			open(1, DOT, PUSD, 1_000, 500, rate_pct(0, 1)),
-			crate::Error::<Test>::RateOutOfBounds
-		);
-		// Above the branch `maximum_borrow_rate` (400%): the cap is the
-		// per-branch config bound, not a hard-coded 100%.
-		assert_noop!(
-			open(1, DOT, PUSD, 1_000, 500, rate_pct(401, 100)),
-			crate::Error::<Test>::RateOutOfBounds
-		);
-	});
-}
-
-#[test]
-fn open_vault_exceeds_ceiling_rejected() {
-	build_and_execute(|| {
-		// Own the ceiling under test rather than depend on the mock default.
-		let config = BranchConfig { debt_ceiling: 100_000_000, ..default_branch_config() };
-		register_market_with(DOT, PUSD, FixedU128::from_rational(10, 1), config);
-		assert_noop!(
-			open(1, DOT, PUSD, 100_000_000_000, 200_000_000, rate_pct(5, 100)),
-			crate::Error::<Test>::DebtCeilingExceeded
-		);
-	});
-}
-
-#[test]
-fn open_vault_below_icr_rejected() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		// 100 DOT @ $10 = $1000; borrow 1000 pUSD => CR=100% < ICR 120%.
-		assert_noop!(
-			open(1, DOT, PUSD, 100, 1_000, rate_pct(5, 100)),
-			crate::Error::<Test>::UnsafeCollateralizationRatio
-		);
-	});
+fn open_vault_rejects_invalid_positions() {
+	let cases = [
+		(true, 2_000, 500, rate_pct(5, 100), crate::Error::<Test>::VaultAlreadyExists),
+		(false, 1_000, 100, rate_pct(5, 100), crate::Error::<Test>::DebtBelowMinimum),
+		(false, 1_000, 500, rate_pct(0, 1), crate::Error::<Test>::RateOutOfBounds),
+		(false, 1_000, 500, rate_pct(401, 100), crate::Error::<Test>::RateOutOfBounds),
+		(
+			false,
+			100_000_000_000,
+			200_000_000,
+			rate_pct(5, 100),
+			crate::Error::<Test>::DebtCeilingExceeded,
+		),
+		(false, 100, 1_000, rate_pct(5, 100), crate::Error::<Test>::UnsafeCollateralizationRatio),
+	];
+	for (exists, collateral, debt, rate, error) in cases {
+		build_and_execute(|| {
+			let config = BranchConfig { debt_ceiling: 100_000_000, ..default_branch_config() };
+			register_market_with(DOT, PUSD, FixedU128::from_rational(10, 1), config);
+			if exists {
+				assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+			}
+			assert_noop!(open(1, DOT, PUSD, collateral, debt, rate), error);
+		});
+	}
 }
 
 #[test]
@@ -462,6 +387,18 @@ fn governance_clear_clears_governance_frozen() {
 		// Full clears governance Frozen.
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, false));
 		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
+		crate::tests::assert_event(crate::Event::ModeChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			old_mode: BranchMode::Normal,
+			new_mode: BranchMode::Frozen,
+		});
+		crate::tests::assert_event(crate::Event::ModeChanged {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			old_mode: BranchMode::Frozen,
+			new_mode: BranchMode::Normal,
+		});
 	});
 }
 

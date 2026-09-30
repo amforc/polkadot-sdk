@@ -15,19 +15,6 @@ fn liquidate_only_vault_returns_last_vault_error() {
 }
 
 #[test]
-fn liquidate_succeeds_when_a_second_vault_exists() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		// Now the last-vault guard doesn't trip — vault 2 remains as a
-		// redistribution recipient.
-		assert_ok!(liquidate(DOT, PUSD, 1));
-	});
-}
-
-#[test]
 fn execute_liquidation_rejects_healthy_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
@@ -119,37 +106,51 @@ fn execute_liquidation_rejects_collateral_payout_above_held() {
 // `offset.collateral` land on their recipients, and the redistributed debt is
 // derived as `post_touch - offset.debt` (the orchestrator never supplies it).
 #[test]
-fn execute_liquidation_pays_keeper_and_derives_redistributed_debt() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
+fn execute_liquidation_pays_recipients_and_derives_redistributed_debt() {
+	// Mixed settlement splits the 1_000 held: 300 offset + 50 keeper + 650 redistributed, no
+	// owner surplus. Full offset takes 500 and returns the remaining 500 to the owner.
+	for (full_offset, offset_collateral, keeper_collateral, redistribution_collateral, surplus) in
+		[(false, 300, 50, 650, 0), (true, 500, 0, 0, 500)]
+	{
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+			assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+			set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 
-		let keeper_pre = collateral_balance(DOT, 998);
-		let offset_pre = collateral_balance(DOT, 999);
-		let held_1 = held(DOT, 1);
-		let mut post_touch_debt: Balance = 0;
-		assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| {
-			post_touch_debt = post_touch;
-			LiquidationAllocation {
-				offset: OffsetAllocation { collateral_recipient: 999, debt: 200, collateral: 300 },
-				redistribution_collateral: held_1 - 300 - 50,
-				keeper: KeeperCompensation { recipient: 998, collateral: 50 },
-			}
-		}));
+			let owner_pre = collateral_balance(DOT, 1);
+			let keeper_pre = collateral_balance(DOT, 998);
+			let offset_pre = collateral_balance(DOT, 999);
+			let mut redistributed_debt = 0;
+			assert_ok!(liquidate_with(DOT, PUSD, 1, |post_touch| {
+				let offset_debt = if full_offset { post_touch } else { 200 };
+				redistributed_debt = post_touch - offset_debt;
+				LiquidationAllocation {
+					offset: OffsetAllocation {
+						collateral_recipient: 999,
+						debt: offset_debt,
+						collateral: offset_collateral,
+					},
+					redistribution_collateral,
+					keeper: KeeperCompensation { recipient: 998, collateral: keeper_collateral },
+				}
+			}));
 
-		assert_eq!(collateral_balance(DOT, 998), keeper_pre + 50, "keeper compensation paid");
-		assert_eq!(collateral_balance(DOT, 999), offset_pre + 300, "offset collateral paid");
+			assert_eq!(collateral_balance(DOT, 998), keeper_pre + keeper_collateral);
+			assert_eq!(collateral_balance(DOT, 999), offset_pre + offset_collateral);
+			assert_eq!(collateral_balance(DOT, 1), owner_pre + surplus + VAULT_DEPOSIT);
+			assert!(!vault_exists(DOT, PUSD, 1));
+			assert_eq!(held(DOT, 1), 0);
+			assert_eq!(vault_deposit_held(DOT, 1), 0);
 
-		// Vault 2 is the sole recipient with stake 1_000, so the share it absorbs
-		// on touch is exactly the derived redistributed debt (0.301 × 1_000 — no
-		// flooring loss).
-		let v_pre = vault(DOT, PUSD, 2);
-		assert_ok!(poke(9, DOT, PUSD, 2));
-		let v_post = vault(DOT, PUSD, 2);
-		assert_eq!(v_post.debt.principal - v_pre.debt.principal, post_touch_debt - 200);
-	});
+			// The sole recipient receives the exact remainder on touch.
+			let v_pre = vault(DOT, PUSD, 2);
+			assert_ok!(poke(9, DOT, PUSD, 2));
+			let v_post = vault(DOT, PUSD, 2);
+			assert_eq!(v_post.debt.principal - v_pre.debt.principal, redistributed_debt);
+			assert_eq!(v_post.collateral - v_pre.collateral, redistribution_collateral);
+		});
+	}
 }
 
 // Liquidating the vault parked as `dormant_redemption_target` must clear the

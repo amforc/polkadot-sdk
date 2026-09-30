@@ -6,15 +6,23 @@ use crate::{
 use pallet_linked_list::SortedListInterface;
 
 #[test]
-fn adjust_vault_via_deposit_then_borrow() {
+fn deposits_then_borrow_update_vault_and_emit_third_party_source() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
 		// +200 collateral.
 		assert_ok!(deposit_collateral(1, DOT, PUSD, 1, 200));
+		assert_ok!(deposit_collateral(2, DOT, PUSD, 1, 100));
+		assert_event(crate::Event::CollateralDeposited {
+			collateral_id: DOT,
+			stable_id: PUSD,
+			owner: 1,
+			from: 2,
+			amount: 100,
+		});
 		// +300 debt (no rate change). `None` recipient defaults to the owner.
 		assert_ok!(borrow(1, DOT, PUSD, 300, None));
-		assert_eq!(held(DOT, 1), 1_200);
+		assert_eq!(held(DOT, 1), 1_300);
 		let v = vault(DOT, PUSD, 1);
 		assert_eq!(v.debt.principal, 800);
 		// Each op charges a 1-unit upfront fee (open 500 & borrow 300 at 5%), both
@@ -66,23 +74,25 @@ fn borrow_with_recipient_mints_to_recipient_not_owner() {
 
 #[test]
 fn withdraw_collateral_with_recipient_transfers_to_recipient() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 3_000, 500, rate_pct(5, 100)));
-		let recipient_pre = collateral_balance(DOT, 4);
+	for recipient in [1, 4] {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 3_000, 500, rate_pct(5, 100)));
+			let recipient_pre = collateral_balance(DOT, recipient);
 
-		assert_ok!(withdraw_collateral(1, DOT, PUSD, 250, Some(4)));
+			assert_ok!(withdraw_collateral(1, DOT, PUSD, 250, Some(recipient)));
 
-		assert_eq!(held(DOT, 1), 2_750);
-		assert_eq!(collateral_balance(DOT, 4), recipient_pre + 250);
-		assert_event(crate::Event::CollateralWithdrawn {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			recipient: 4,
-			amount: 250,
+			assert_eq!(held(DOT, 1), 2_750);
+			assert_eq!(collateral_balance(DOT, recipient), recipient_pre + 250);
+			assert_event(crate::Event::CollateralWithdrawn {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				owner: 1,
+				recipient,
+				amount: 250,
+			});
 		});
-	});
+	}
 }
 
 #[test]
@@ -131,62 +141,60 @@ fn close_vault_with_recipient_releases_collateral_to_recipient() {
 	});
 }
 
-// Repaying an Active vault's debt to zero does NOT close it: the collateral
-// stays held and the row survives as a zero-debt Dormant husk, out of the rate
-// index. The owner reclaims the collateral with an explicit `close_vault`.
-// Auto-closing would forbid repaying purely to improve branch TCR in Safety
-// mode, which we deliberately allow.
+// Exact and excess repayment both leave a debt-free Dormant row with collateral held.
+// Owners can repay to zero to raise the branch's collateral ratio in Safety mode.
+// Only an explicit close releases the collateral and refunds its deposit.
 #[test]
-fn repay_for_to_zero_leaves_dormant_husk() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		let v = vault(DOT, PUSD, 1);
-		let total = v.debt.principal + v.debt.interest;
-		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
-			&2,
-			&1,
-			v.debt.interest,
-			frame::traits::tokens::Preservation::Expendable,
-		));
-		assert_ok!(repay(1, DOT, PUSD, 1, Some(total)));
+fn exact_and_excess_repayment_leave_husks_until_explicit_close() {
+	for (funding, overpay) in [(1, false), (400, true)] {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+			assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+			assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
+				&2,
+				&1,
+				funding,
+				frame::traits::tokens::Preservation::Expendable,
+			));
+			// 500 principal plus the open fee ceil(500 × 5% × 7 / 365.25) = 1.
+			let total = vault(DOT, PUSD, 1).debt.total();
+			assert_eq!(total, 501);
+			let balance_before = stable_balance(PUSD, 1);
+			let requested = if overpay { balance_before } else { total };
+			assert_ok!(repay(1, DOT, PUSD, 1, Some(requested)));
 
-		// Row survives as a zero-debt husk with its collateral still held.
-		let husk = vault(DOT, PUSD, 1);
-		assert_eq!(husk.debt.total(), 0, "debt cleared to zero");
-		assert_eq!(held(DOT, 1), 1_000, "collateral stays held by the vault");
-		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "zero-debt vault is Dormant");
-		assert!(
-			!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
+			assert_eq!(stable_balance(PUSD, 1), balance_before - total);
+			assert_eq!(vault(DOT, PUSD, 1).debt.total(), 0);
+			assert_eq!(held(DOT, 1), 1_000);
+			assert!(vault_status(DOT, PUSD, 1).is_dormant());
+			assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
 				&rate_list(DOT, PUSD),
-				&1
-			),
-			"husk left the rate index"
-		);
-		assert!(
-			!vault_events().iter().any(|e| matches!(e, crate::Event::VaultClosed { .. })),
-			"repay-to-zero does not auto-close"
-		);
+				&1,
+			));
+			assert_event(crate::Event::Repaid {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				owner: 1,
+				from: 1,
+				amount: total,
+			});
+			assert!(!vault_events().iter().any(|e| matches!(e, crate::Event::VaultClosed { .. })));
 
-		// The owner reclaims the collateral with an explicit close.
-		let collateral_before = collateral_balance(DOT, 1);
-		assert_ok!(close_vault(1, DOT, PUSD, None));
-		assert!(!vault_exists(DOT, PUSD, 1), "close removes the row");
-		assert_eq!(held(DOT, 1), 0, "collateral released on close");
-		assert_eq!(
-			collateral_balance(DOT, 1),
-			collateral_before + 1_000 + VAULT_DEPOSIT,
-			"owner received the collateral and the storage deposit"
-		);
-		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultClosed {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			recipient: 1,
-			collateral: 1_000,
-		}));
-	});
+			let collateral_before = collateral_balance(DOT, 1);
+			assert_ok!(close_vault(1, DOT, PUSD, None));
+			assert!(!vault_exists(DOT, PUSD, 1));
+			assert_eq!(held(DOT, 1), 0);
+			assert_eq!(collateral_balance(DOT, 1), collateral_before + 1_000 + VAULT_DEPOSIT);
+			assert_event(crate::Event::VaultClosed {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				owner: 1,
+				recipient: 1,
+				collateral: 1_000,
+			});
+		});
+	}
 }
 
 // Poking a nonexistent vault is an error, not a silent success — a typo'd
@@ -196,47 +204,6 @@ fn poke_missing_vault_errors() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_noop!(poke(1, DOT, PUSD, 99), crate::Error::<Test>::VaultNotFound);
-	});
-}
-
-// `repay_for` caps at the outstanding debt: over-asking burns only what is
-// owed and leaves the vault as a zero-debt Dormant husk (no auto-close), with
-// a single `Repaid` carrying the actual (capped) amount.
-#[test]
-fn repay_overpay_burns_only_debt_and_leaves_husk() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		// Acct 2's minted pUSD funds the surplus over acct 1's own balance.
-		assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
-			&2,
-			&1,
-			400,
-			frame::traits::tokens::Preservation::Expendable,
-		));
-		let v = vault(DOT, PUSD, 1);
-		let total = v.debt.principal + v.debt.interest;
-		let balance_before = stable_balance(PUSD, 1);
-		assert!(balance_before > total, "overpay setup needs a surplus");
-
-		assert_ok!(repay(1, DOT, PUSD, 1, Some(balance_before)));
-
-		assert_eq!(stable_balance(PUSD, 1), balance_before - total, "only the debt burned");
-		let husk = vault(DOT, PUSD, 1);
-		assert_eq!(husk.debt.total(), 0, "debt cleared");
-		assert_eq!(held(DOT, 1), 1_000, "collateral untouched by repay");
-		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::Repaid {
-			collateral_id: DOT,
-			stable_id: PUSD,
-			owner: 1,
-			from: 1,
-			amount: total,
-		}));
-		assert!(
-			!vault_events().iter().any(|e| matches!(e, crate::Event::VaultClosed { .. })),
-			"overpay-to-zero does not auto-close"
-		);
 	});
 }
 
@@ -329,47 +296,30 @@ fn liability_free_market_closes_husks_without_ratio_math() {
 	});
 }
 
-// A touch rounds accrued interest up and keeps the excess as prepaid interest. Pokes that accrue
-// less than the excess charge nothing, so a third party cannot grow a vault's debt by poking it.
+// Frequent touches charge one rounded unit, and repayment forfeits the prepaid fraction.
 #[test]
-fn repeated_pokes_charge_one_rounded_unit() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
-		let opened = vault(DOT, PUSD, 1).debt.total();
+fn pokes_charge_once_and_full_repayment_forfeits_prepaid_interest() {
+	for pokes in [1, 100] {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+			mint_stable(PUSD, 1, 10);
+			let opened = vault(DOT, PUSD, 1).debt.total();
+			for _ in 0..pokes {
+				advance_time(1);
+				assert_ok!(poke(2, DOT, PUSD, 1));
+			}
+			let owed = vault(DOT, PUSD, 1).debt.total();
+			assert_eq!(owed, opened + 1, "only the first poke rounds up");
+			assert!(vault(DOT, PUSD, 1).interest_prepaid > 0);
 
-		for _ in 0..100 {
-			advance_time(1);
-			assert_ok!(poke(2, DOT, PUSD, 1));
-		}
-
-		let vault = vault(DOT, PUSD, 1);
-		assert_eq!(vault.debt.total(), opened + 1, "only the first poke rounds up");
-		assert!(vault.interest_prepaid > 0);
-	});
-}
-
-// Repaying the live debt clears it, and the vault forfeits the interest it prepaid.
-#[test]
-fn full_repayment_forfeits_prepaid_interest() {
-	use frame::traits::fungible::Mutate;
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
-		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
-		advance_time(1);
-		assert_ok!(poke(2, DOT, PUSD, 1));
-		let owed = vault(DOT, PUSD, 1).debt.total();
-		assert!(vault(DOT, PUSD, 1).interest_prepaid > 0);
-
-		let balance_before = stable_balance(PUSD, 1);
-		assert_ok!(repay(1, DOT, PUSD, 1, None));
-
-		let vault = vault(DOT, PUSD, 1);
-		assert_eq!(vault.debt.total(), 0);
-		assert_eq!(vault.interest_prepaid, 0);
-		assert_eq!(stable_balance(PUSD, 1), balance_before - owed);
-	});
+			let balance_before = stable_balance(PUSD, 1);
+			assert_ok!(repay(1, DOT, PUSD, 1, None));
+			assert_eq!(vault(DOT, PUSD, 1).debt.total(), 0);
+			assert_eq!(vault(DOT, PUSD, 1).interest_prepaid, 0);
+			assert_eq!(stable_balance(PUSD, 1), balance_before - owed);
+		});
+	}
 }
 
 // Interest a touch mints ahead of the aggregate must not be minted again when the aggregate
