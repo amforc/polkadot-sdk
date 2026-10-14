@@ -36,8 +36,7 @@ fn distribute_updates_g_exactly() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_yield_unclaimed, 100);
 		// Pool holds the 1000 active plus the 100 undistributed yield.
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 1_100);
+		assert_eq!(pool_stable_held(DOT, PUSD), 1_100);
 
 		System::assert_last_event(
 			crate::Event::YieldDistributed { collateral_id: DOT, stable_id: PUSD, amount: 100 }
@@ -116,8 +115,7 @@ fn compound_moves_yield_into_active_and_it_earns() {
 		assert_eq!(state.total_active_deposits, 660);
 		assert_eq!(state.total_yield_unclaimed, 0);
 		// Pure accounting: the pool balance did not move.
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 660);
+		assert_eq!(pool_stable_held(DOT, PUSD), 660);
 		System::assert_last_event(
 			crate::Event::YieldCompounded {
 				collateral_id: DOT,
@@ -177,8 +175,7 @@ fn vault_interest_flows_to_pool_through_the_hook() {
 		let sums = active_sums(0, 0);
 		// delta_G = floor(18 * 1e18 / 400) = 4.5e16.
 		assert_eq!(sums.g_yield, FixedU128::from_inner(45_000_000_000_000_000));
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 418);
+		assert_eq!(pool_stable_held(DOT, PUSD), 418);
 		assert_eq!(stable_balance(PUSD, FEE_DEST), 8);
 		System::assert_has_event(
 			crate::Event::YieldDistributed { collateral_id: DOT, stable_id: PUSD, amount: 18 }

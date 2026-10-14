@@ -1,5 +1,4 @@
 use crate::{mock::*, tests::*, types::BranchConfigUpdate};
-use frame::traits::fungibles::Mutate as FungiblesMutate;
 
 /// Replacement admins used by the reassignment test.
 const NEW_FULL_ADMIN: AccountId = 300;
@@ -15,8 +14,7 @@ fn market_exists(collateral: AssetId, stable: StableId) -> bool {
 /// collateral, so an explicit `close_vault` is needed to empty the market.
 fn repay_to_close(owner: AccountId) {
 	let total = vault(DOT, PUSD, owner).debt.total();
-	<VaultStableAssets as FungiblesMutate<AccountId>>::mint_into(PUSD, &owner, total)
-		.expect("mint repay buffer");
+	mint_stable(PUSD, owner, total);
 	assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(owner), DOT, PUSD, owner, None));
 	assert_ok!(Pallet::<Test>::close_vault(RuntimeOrigin::signed(owner), DOT, PUSD, None));
 	assert!(!vault_exists(DOT, PUSD, owner), "close removed the vault");

@@ -56,9 +56,8 @@ fn active_pool_recovery_offset_settles_the_head() {
 
 		// The vault settled 300 of its 500 debt and paid real collateral.
 		assert_eq!(vault_debt(DOT, PUSD, 5), 200);
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 100);
-		assert_eq!(collateral_balance(DOT, pool), 594);
+		assert_eq!(pool_stable_held(DOT, PUSD), 100);
+		assert_eq!(pool_collateral_held(DOT, PUSD), 594);
 
 		// The standard accumulator update: P = 100/400 = 0.25 and
 		// delta_S = floor(594 * 1e18 / 400) = 1.485e18.
@@ -144,9 +143,8 @@ fn active_recovery_rolls_back_when_pool_accounting_fails_after_settlement() {
 
 		// The whole cross-pallet settlement rolled back with the failed plan.
 		assert_eq!(vault_debt(DOT, PUSD, 5), 500);
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 400);
-		assert_eq!(collateral_balance(DOT, pool), 0);
+		assert_eq!(pool_stable_held(DOT, PUSD), 400);
+		assert_eq!(pool_collateral_held(DOT, PUSD), 0);
 
 		crate::Pools::<Test>::mutate(DOT, PUSD, |pool| {
 			pool.as_mut().unwrap().state.total_collateral_gains_unclaimed = 0;
@@ -302,9 +300,8 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 		assert_eq!(state.total_collateral_gains_unclaimed, 990);
 		assert_eq!(state.coords, state_before.coords);
 		assert_eq!(active_sums(0, 0), sums_before);
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 700);
-		assert_eq!(collateral_balance(DOT, pool), 990);
+		assert_eq!(pool_stable_held(DOT, PUSD), 700);
+		assert_eq!(pool_collateral_held(DOT, PUSD), 990);
 
 		// With the head gone, a follow-up deposit queues normally.
 		mint_stable(PUSD, 2, 100);

@@ -180,6 +180,9 @@ fn exact_and_excess_repayment_leave_husks_until_explicit_close() {
 				amount: total,
 			});
 			assert!(!vault_events().iter().any(|e| matches!(e, crate::Event::VaultClosed { .. })));
+			// Nothing is left to repay, and a zero `Repaid` must not pretend otherwise.
+			assert_noop!(repay(1, DOT, PUSD, 1, None), crate::Error::<Test>::NoDebt);
+			assert_noop!(repay(1, DOT, PUSD, 1, Some(1)), crate::Error::<Test>::NoDebt);
 
 			let collateral_before = collateral_balance(DOT, 1);
 			assert_ok!(close_vault(1, DOT, PUSD, None));
@@ -262,7 +265,6 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 // so the last husks close without it.
 #[test]
 fn liability_free_market_closes_husks_without_ratio_math() {
-	use frame::traits::fungible::Mutate;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
@@ -273,8 +275,8 @@ fn liability_free_market_closes_husks_without_ratio_math() {
 		advance_time(ONE_DAY_MS);
 		assert_ok!(poke(9, DOT, PUSD, 2));
 		// Top up both owners so overpay-repays can cover accrued interest.
-		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 100));
-		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&2, 100));
+		mint_stable(PUSD, 1, 100);
+		mint_stable(PUSD, 2, 100);
 
 		assert_ok!(repay(2, DOT, PUSD, 2, Some(10_000)));
 		assert_ok!(repay(1, DOT, PUSD, 1, Some(10_000)));
@@ -326,12 +328,11 @@ fn pokes_charge_once_and_full_repayment_forfeits_prepaid_interest() {
 // accrues it, or the market keeps an attribution no vault owes and cannot close.
 #[test]
 fn aggregate_accrual_does_not_remint_prepaid_interest() {
-	use frame::traits::fungible::Mutate;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// 500 at 10% accrues 50 a year: half a unit every hundredth of a year.
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
-		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
+		mint_stable(PUSD, 1, 10);
 		let opened = vault(DOT, PUSD, 1).debt.total();
 
 		advance_time(ONE_YEAR_MS / 100);
@@ -378,11 +379,10 @@ fn branch_refresh_issues_sub_unit_rates_without_vault_touches() {
 // that issued or attributed interest still prevents removal.
 #[test]
 fn liability_free_close_fails_closed_on_unattributed_liability() {
-	use frame::traits::fungible::Mutate;
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
-		assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 10));
+		mint_stable(PUSD, 1, 10);
 		assert_ok!(repay(1, DOT, PUSD, 1, Some(1_000)));
 		// Isolate each residue so that each guard has independent coverage.
 
@@ -435,14 +435,13 @@ fn redemption_slot_rejects_second_owner() {
 // rounds its own interest up, so together they cover the aggregate the market minted.
 #[test]
 fn full_repayments_empty_the_interest_ledger_in_either_order() {
-	use frame::traits::fungible::Mutate;
 	let run = |first: u64, second: u64| {
 		new_test_ext().execute_with(|| {
 			register_market(DOT, PUSD);
 			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
 			assert_ok!(open(2, DOT, PUSD, 1_400, 700, rate_pct(37, 100)));
-			assert_ok!(<Pusd as Mutate<u64>>::mint_into(&1, 1_000));
-			assert_ok!(<Pusd as Mutate<u64>>::mint_into(&2, 1_000));
+			mint_stable(PUSD, 1, 1_000);
+			mint_stable(PUSD, 2, 1_000);
 			advance_time(10 * ONE_DAY_MS);
 
 			for owner in [first, second] {

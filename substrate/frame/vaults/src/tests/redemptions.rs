@@ -170,14 +170,14 @@ fn redeem_step_rejects_invalid_settlements() {
 #[test]
 fn redeem_step_burns_exactly_the_debt_payment() {
 	use frame::traits::{
-		fungibles::{Balanced, Mutate},
+		fungibles::Balanced,
 		tokens::{Fortitude, Precision, Preservation},
 	};
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		<Assets as Mutate<AccountId>>::mint_into(PUSD, &3, 1_000).expect("mint redeemer pUSD");
+		mint_stable(PUSD, 3, 1_000);
 
 		let issuance_pre = total_stable(PUSD);
 		let redeemer_pre = stable_balance(PUSD, 3);
@@ -376,7 +376,8 @@ fn dormant_borrow_below_min_debt_reverts() {
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
 		assert_ok!(redeem(DOT, PUSD, 3, 480)); // pushes acct 1 to Dormant with tiny debt
-										 // Borrow 1 — total debt would be far below MinimumDebt 200.
+											   // Borrow 1 — total debt would be far below
+											   // MinimumDebt 200.
 		assert_noop!(borrow(1, DOT, PUSD, 1, None), crate::Error::<Test>::DebtBelowMinimum);
 	});
 }
