@@ -364,8 +364,7 @@ pub mod pallet {
 	/// The stablecoin's first market seeds these stablecoin-wide rows, and the
 	/// last one to leave clears them.
 	impl<T: Config>
-		pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId>
-		for Pallet<T>
+		pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId> for Pallet<T>
 	{
 		/// One redemption policy governs every collateral market issuing the
 		/// coin, so only the first market carries it. Later markets must pass
