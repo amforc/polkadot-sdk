@@ -11,8 +11,7 @@ fn deposit_moves_funds_and_queues_pending() {
 		assert_ok!(deposit(1, DOT, PUSD, 400));
 
 		assert_eq!(stable_balance(PUSD, 1), 600);
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 400);
+		assert_eq!(pool_stable_held(DOT, PUSD), 400);
 
 		// The whole 400 queues in the first cohort at the fresh pending accumulators. Nothing is
 		// active or claimable yet.
@@ -129,7 +128,6 @@ fn deposit_in_the_wallet_dead_zone_fails_instead_of_dusting() {
 		assert_ok!(deposit(1, DOT, USDX, 50_000));
 		assert_eq!(stable_balance(USDX, 1), 0);
 
-		let pool = Stability::pool_account(&DOT, &USDX);
-		assert_eq!(stable_balance(USDX, pool), 50_000);
+		assert_eq!(pool_stable_held(DOT, USDX), 50_000);
 	});
 }

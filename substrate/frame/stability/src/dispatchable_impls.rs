@@ -31,7 +31,7 @@ use frame::{
 	},
 };
 use pusd_primitives::{
-	debit_preservation, refine_debit, BranchInterface, BranchMode, BranchSnapshot, Millis,
+	debit_preservation, BranchInterface, BranchMode, BranchSnapshot, Millis,
 	RecoveryOffsetInterface, RecoveryOffsetResult,
 };
 
@@ -44,38 +44,33 @@ pub(crate) enum ClaimKind {
 
 /// The pool account's stablecoin custody, read once for every debit an operation sizes.
 ///
-/// Both reducible balances are read up front: they touch the same storage keys, so the second
-/// read costs no extra storage access. It is valid while nothing moves the account's stablecoin,
-/// so an operation reads it after its last change to the account and before its first debit.
+/// Only the `Preserve` reducible balance is read: the custody float sits beneath the tracked
+/// totals, so that balance is exactly the value the pool may pay out, and an `Expendable` drain
+/// would take the float with it. It is valid while nothing moves the account's stablecoin, so an
+/// operation reads it after its last change to the account and before its first debit.
 pub(crate) struct PoolCustody<T: Config> {
 	account: T::AccountId,
 	preserved: BalanceOf<T>,
-	expendable: BalanceOf<T>,
 }
 
 impl<T: Config> PoolCustody<T> {
 	pub(crate) fn read(stable_id: &StableIdOf<T>, account: T::AccountId) -> Self {
-		let reducible = |preservation| {
-			T::StableAssets::reducible_balance(
-				stable_id.clone(),
-				&account,
-				preservation,
-				Fortitude::Polite,
-			)
-		};
-		let preserved = reducible(Preservation::Preserve);
-		let expendable = reducible(Preservation::Expendable);
-		Self { account, preserved, expendable }
+		let preserved = T::StableAssets::reducible_balance(
+			stable_id.clone(),
+			&account,
+			Preservation::Preserve,
+			Fortitude::Polite,
+		);
+		Self { account, preserved }
 	}
 
 	pub(crate) const fn account(&self) -> &T::AccountId {
 		&self.account
 	}
 
-	/// The greatest debit at or below `limit` and its `Preservation`, as
-	/// [`pusd_primitives::reducible_debit`] would size it.
+	/// The greatest debit at or below `limit` and its `Preservation`.
 	fn debit(&self, limit: BalanceOf<T>) -> (BalanceOf<T>, Preservation) {
-		refine_debit(limit, self.preserved, || self.expendable)
+		(limit.min(self.preserved), Preservation::Preserve)
 	}
 }
 
@@ -731,8 +726,8 @@ impl<T: Config> Pallet<T> {
 	///
 	/// - The capital available in the leg.
 	/// - The required balance after a partial offset.
-	/// - The reducible pool-account balance. It rounds the debt down instead of stranding the pool
-	///   account below its minimum balance.
+	/// - The reducible pool-account balance, which equals the tracked totals while custody is
+	///   intact. A shortfall rounds the debt down to what custody can pay.
 	///
 	/// `reserved` is debt that another leg will burn from the same account first. This input keeps
 	/// both reservations valid against one custody balance.
@@ -777,8 +772,10 @@ impl<T: Config> Pallet<T> {
 
 	/// Pays an exact claim from the pool account.
 	///
-	/// The transfer uses `Expendable` only for a full drain. A partial claim cannot leave the pool
-	/// account below the asset minimum balance.
+	/// The claim is tracked value, and the pool account holds its custody float on top of the
+	/// tracked totals, so `Preserve` always has the minimum balance to leave behind. A full drain
+	/// under `Expendable` would fold any remainder into the payout, and the remainder is not the
+	/// claimant's.
 	fn pay_claim<Assets>(
 		asset_id: Assets::AssetId,
 		pool_account: &T::AccountId,
@@ -788,8 +785,7 @@ impl<T: Config> Pallet<T> {
 	where
 		Assets: frame::traits::fungibles::Mutate<T::AccountId, Balance = BalanceOf<T>>,
 	{
-		let preservation = debit_preservation::<Assets, _>(asset_id.clone(), pool_account, amount);
-		Assets::transfer(asset_id, pool_account, recipient, amount, preservation)?;
+		Assets::transfer(asset_id, pool_account, recipient, amount, Preservation::Preserve)?;
 		Ok(())
 	}
 
@@ -827,7 +823,8 @@ impl<T: Config> Pallet<T> {
 		pool: &mut StabilityPoolOf<T>,
 		reservation: Option<OffsetReservation<BalanceOf<T>>>,
 		collateral: CollateralCreditOf<T>,
-	) -> Result<Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>, DispatchError> {
+	) -> Result<Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>, DispatchError>
+	{
 		let Some(reservation) = reservation else {
 			debug_assert!(collateral.peek().is_zero());
 			drop(collateral);
