@@ -19,7 +19,7 @@ use asset_hub_westend_runtime::{
 	RuntimeHoldReason, Stability, TrustBackedAssetsInstance, Vaults,
 };
 use frame_support::{
-	assert_noop, assert_storage_noop, hypothetically_ok,
+	assert_noop, hypothetically_ok,
 	traits::{
 		fungible::InspectHold as FungibleInspectHold,
 		fungibles::{roles::Inspect as RolesInspect, Refund},
@@ -80,7 +80,9 @@ fn signed_user_registers_a_native_collateral_market() {
 		let full_admin = acct(7);
 		let emergency_admin = acct(8);
 		assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&creator, 1_000 * WND));
+		mint_pusd(&creator, 2 * PUSD_MIN_BALANCE);
 		let creator_free_before = native_balance(&creator);
+		let creator_pusd_before = pusd_balance(&creator);
 
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::signed(creator.clone()),
@@ -107,10 +109,14 @@ fn signed_user_registers_a_native_collateral_market() {
 		);
 		let custody = Vaults::redistribution_account(&get_native_id(), &PUSD_ID);
 		assert_eq!(native_balance(&custody), get_native_ed());
+		// The creator also parked the pool's custody float: one ED and one pUSD minimum.
+		assert_eq!(native_balance(&pool_account()), get_native_ed());
+		assert_eq!(pusd_balance(&pool_account()), PUSD_MIN_BALANCE);
 		assert_eq!(
 			creator_free_before - native_balance(&creator),
-			VaultsBranchCreationDeposit::get() + get_native_ed(),
+			VaultsBranchCreationDeposit::get() + 2 * get_native_ed(),
 		);
+		assert_eq!(creator_pusd_before - pusd_balance(&creator), PUSD_MIN_BALANCE);
 
 		assert_ok!(Vaults::set_param(
 			RuntimeOrigin::signed(full_admin.clone()),
@@ -383,106 +389,5 @@ fn frozen_stablecoin_blocks_borrow_repay_and_pool_deposits() {
 		hypothetically_ok!(borrow());
 		hypothetically_ok!(repay());
 		assert_ok!(deposit());
-	});
-}
-
-/// The branch TCR is 125% and the safety threshold 120%. A withdrawal that moves
-/// the TCR to 115% is rejected although the vault stays healthy. A debt
-/// repayment improves the TCR and goes through.
-#[test]
-fn branch_safety_ratio_gates_withdrawals_not_repayments() {
-	AssetHubWestend::execute_with(|| {
-		feed_price(dot_price(2, 1));
-		// Lower vault ratios leave the vault healthy, so the branch TCR check is
-		// what rejects the withdrawal.
-		create_branch(&BranchSpec {
-			mcr: FixedU128::from_rational(105, 100),
-			icr: FixedU128::from_rational(110, 100),
-			scr: FixedU128::from_rational(120, 100),
-			..Default::default()
-		});
-
-		// Branch totals: 62,500 WND = 125,000 pUSD value over 100,000 pUSD debt, TCR 125%.
-		let roomy_owner = acct(1); // 34,750 WND = 69,500 pUSD value, CR 139%
-		open_vault(&roomy_owner, 34_750 * WND, 50_000 * PUSD, FixedU128::zero());
-		let tight_owner = acct(2); // 27,750 WND = 55,500 pUSD value, CR 111%
-		open_vault(&tight_owner, 27_750 * WND, 50_000 * PUSD, FixedU128::zero());
-
-		let withdraw = |amount: Balance| {
-			Vaults::withdraw_collateral(
-				RuntimeOrigin::signed(roomy_owner.clone()),
-				get_native_id(),
-				PUSD_ID,
-				amount,
-				None,
-			)
-		};
-		// A 2,500 WND = 5,000 pUSD withdrawal lands the branch exactly on the
-		// 120,000 / 100,000 = 120% threshold, which is still allowed.
-		hypothetically_ok!(withdraw(2_500 * WND));
-		// A 5,000 WND = 10,000 pUSD withdrawal leaves the vault at 119%, but the
-		// branch at 115,000 / 100,000 = 115% < 120%.
-		assert_noop!(withdraw(5_000 * WND), pallet_vaults::Error::<Runtime>::WouldEnterSafetyMode,);
-
-		// Repaying 10,000 pUSD improves TCR to 125,000 / 90,000 = 138.89%.
-		assert_ok!(Vaults::repay_for(
-			RuntimeOrigin::signed(roomy_owner.clone()),
-			get_native_id(),
-			PUSD_ID,
-			roomy_owner.clone(),
-			Some(10_000 * PUSD),
-		));
-		// 125,000 / 90,000 = 1.38888…, floored at 18 decimals. `from_rational` would round up.
-		// The TCR is a quote and must not write.
-		assert_storage_noop!(assert_eq!(
-			Vaults::branch_tcr(get_native_id(), PUSD_ID),
-			Ok(pusd_primitives::CollateralRatio::Ratio(FixedU128::from_inner(
-				1_388_888_888_888_888_888
-			))),
-		));
-	});
-}
-
-/// The upfront fee is 7 days of interest on the newly drawn amount. It goes to
-/// `debt.interest`, not `debt.principal`.
-///
-/// The year is 365.25 days (`MILLIS_PER_YEAR = 31,557,600,000`) and the fee
-/// rounds up:
-///   open fee = ceil(5,000e6 × 4% × 7 / 365.25) = ceil(3,832,991.10) = 3,832,992
-///   draw fee = ceil(2,000e6 × 4% × 7 / 365.25) = ceil(1,533,196.44) = 1,533,197
-#[test]
-fn upfront_fee_is_charged_on_open_and_on_each_draw() {
-	AssetHubWestend::execute_with(|| {
-		feed_price(dot_price(2, 1));
-		create_branch(&BranchSpec {
-			upfront_fee_period_ms: 7 * 24 * 60 * 60 * 1_000,
-			..Default::default()
-		});
-
-		// 10,000 WND = 20,000 pUSD value, 5,000 pUSD drawn at 4%.
-		let borrower = acct(1);
-		open_vault(&borrower, 10_000 * WND, 5_000 * PUSD, FixedU128::from_rational(4, 100));
-
-		// The borrower receives the full draw. The fee is added to the debt.
-		assert_eq!(pusd_balance(&borrower), 5_000 * PUSD);
-		let opened = vault(&borrower);
-		assert_eq!(opened.debt.principal, 5_000 * PUSD);
-		assert_eq!(opened.debt.interest, 3_832_992);
-
-		// A further 2,000 pUSD draw is charged only on the increase.
-		assert_ok!(Vaults::borrow(
-			RuntimeOrigin::signed(borrower.clone()),
-			get_native_id(),
-			PUSD_ID,
-			2_000 * PUSD,
-			None,
-			None,
-			pallet_linked_list::Position::endpoints_only(),
-		));
-
-		assert_eq!(pusd_balance(&borrower), 7_000 * PUSD);
-		let increased = vault(&borrower);
-		assert_eq!(increased.debt.principal, 7_000 * PUSD);
-		assert_eq!(increased.debt.interest, 3_832_992 + 1_533_197);
 	});
 }

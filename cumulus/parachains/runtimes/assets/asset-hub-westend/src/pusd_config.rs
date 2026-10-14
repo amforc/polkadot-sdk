@@ -466,9 +466,11 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 			full_admin: <Runtime as frame_system::Config>::Lookup::unlookup(full_admin.clone()),
 			emergency_admin: <Runtime as frame_system::Config>::Lookup::unlookup(emergency_admin),
 		};
-		// A Root-created market charges its full admin one minimum balance of collateral, which
-		// the redistribution account carries until removal refunds it.
+		// A Root-created market charges its full admin the custody seeds: collateral for the
+		// redistribution account and the pool account, and a stablecoin float for the pool.
 		fund_vaults_benchmark_collateral(collateral_id.clone(), &full_admin, 100 * UNITS);
+		<Assets as FungiblesMutate<AccountId>>::mint_into(stable_id, &full_admin, 2 * PUSD)
+			.expect("fund the admin's stablecoin float");
 		// Each handler's own benchmark payload, not the runtime's production parameters: those
 		// carry live minimums that would bind inside a benchmark.
 		let lifecycle_config =
