@@ -180,6 +180,9 @@ fn exact_and_excess_repayment_leave_husks_until_explicit_close() {
 				amount: total,
 			});
 			assert!(!vault_events().iter().any(|e| matches!(e, crate::Event::VaultClosed { .. })));
+			// Nothing is left to repay, and a zero `Repaid` must not pretend otherwise.
+			assert_noop!(repay(1, DOT, PUSD, 1, None), crate::Error::<Test>::NoDebt);
+			assert_noop!(repay(1, DOT, PUSD, 1, Some(1)), crate::Error::<Test>::NoDebt);
 
 			let collateral_before = collateral_balance(DOT, 1);
 			assert_ok!(close_vault(1, DOT, PUSD, None));

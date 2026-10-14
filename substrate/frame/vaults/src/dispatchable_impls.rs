@@ -162,6 +162,9 @@ impl<T: Config> Pallet<T> {
 		// A repayment needs no price and only lowers risk, so a frozen branch still accepts it.
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		let full_payoff = op.vault().debt.total();
+		// A debt-free vault has nothing to repay. Succeeding with a zero `Repaid` would make a
+		// no-op look like a settlement to anyone reading events.
+		ensure!(!full_payoff.is_zero(), Error::<T>::NoDebt);
 		// The live repayment must not exceed the requested amount or payoff.
 		let repay = amount.map_or(full_payoff, |amount| amount.min(full_payoff));
 		T::StableAssets::burn_from(
@@ -414,10 +417,13 @@ impl<T: Config> Pallet<T> {
 			Error::<T>::BranchNotEmpty
 		);
 		let remaining_stablecoin_markets = Self::release_stablecoin_market(&stable_id)?;
+		let funder =
+			Self::custody_funder(branch.deposit.as_ref().map(|(who, _)| who), &branch.admins);
 		T::OnBranchLifecycle::on_deregistered(
 			&collateral_id,
 			&stable_id,
 			remaining_stablecoin_markets,
+			&funder,
 		)?;
 		let removed_outstanding = Branches::<T>::take(&collateral_id, &stable_id)
 			.map(|removed| removed.state.debt.outstanding())
@@ -425,11 +431,7 @@ impl<T: Config> Pallet<T> {
 		defensive_assert!(removed_outstanding.is_zero(), "market removal requires zero debt");
 		// The refund kills the collateral account, so its consumer references are gone before the
 		// provider reference is released.
-		Self::refund_redistribution_custody(
-			&collateral_id,
-			&stable_id,
-			&Self::custody_funder(branch.deposit.as_ref().map(|(who, _)| who), &branch.admins),
-		)?;
+		Self::refund_redistribution_custody(&collateral_id, &stable_id, &funder)?;
 		let redistribution_account = Self::redistribution_account(&collateral_id, &stable_id);
 		if let Err(err) = frame_system::Pallet::<T>::dec_providers(&redistribution_account) {
 			defensive!("redistribution-account provider reference not released", err);

@@ -122,8 +122,15 @@ fn register_default_branch<T: Config>() -> Result<CollateralIdOf<T>, BenchmarkEr
 	// The fee account needs native funds to pay its asset-account deposit.
 	let fee_account = T::FeeAccount::convert(stable::<T>());
 	fund_collateral::<T>(&asset, &fee_account, balance::<T>(1_000_000_000_000))?;
-	// A Root-created market charges the custody seed to its full admin.
-	fund_collateral::<T>(&asset, &branch_admin_accounts::<T>().0, balance::<T>(ACCOUNT_FUNDING))?;
+	// A Root-created market charges the custody seeds to its full admin: collateral for Vaults
+	// and the lifecycle handlers, stablecoin for a handler that parks a float of it.
+	let full_admin = branch_admin_accounts::<T>().0;
+	fund_collateral::<T>(&asset, &full_admin, balance::<T>(ACCOUNT_FUNDING))?;
+	T::StableAssets::mint_into(
+		stable::<T>(),
+		&full_admin,
+		T::StableAssets::minimum_balance(stable::<T>()).saturating_mul(balance::<T>(2)),
+	)?;
 	Pallet::<T>::create_branch(
 		create_origin::<T>()?,
 		asset.clone(),
