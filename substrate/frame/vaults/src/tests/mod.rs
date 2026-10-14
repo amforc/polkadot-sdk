@@ -53,10 +53,10 @@ pub fn vault_events() -> Vec<crate::Event<Test>> {
 		.collect()
 }
 
-/// Checks accounting at the current checkpoint, including all stablecoin aggregates.
+/// Checks accounting at the current checkpoint, including all stablecoin aggregates and supply.
 #[track_caller]
 pub fn assert_invariants() {
-	crate::try_state::do_try_state::<Test>().expect("accounting invariants hold");
+	crate::mock::check_invariants();
 }
 
 /// Asserts success and checks accounting before any subsequent operation can repair it.
