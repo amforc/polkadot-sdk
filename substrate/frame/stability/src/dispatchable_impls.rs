@@ -823,8 +823,7 @@ impl<T: Config> Pallet<T> {
 		pool: &mut StabilityPoolOf<T>,
 		reservation: Option<OffsetReservation<BalanceOf<T>>>,
 		collateral: CollateralCreditOf<T>,
-	) -> Result<Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>, DispatchError>
-	{
+	) -> Result<Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>, DispatchError> {
 		let Some(reservation) = reservation else {
 			debug_assert!(collateral.peek().is_zero());
 			drop(collateral);
