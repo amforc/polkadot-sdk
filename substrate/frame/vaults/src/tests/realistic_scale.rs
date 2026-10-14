@@ -17,7 +17,6 @@ use frame::{
 	prelude::TokenError,
 	traits::{
 		fungible::Inspect as FungibleInspect,
-		fungibles::Mutate as FungiblesMutate,
 		tokens::{Fortitude, Preservation},
 		AccountTouch,
 	},
@@ -121,7 +120,7 @@ fn lifecycle_exact_at_realistic_scale() {
 		assert_eq!(xbt_vault(1).debt.interest, fee + 250 * USD);
 
 		// Fund the interest, repay to a husk, close, and get the collateral back.
-		assert_ok!(<Assets as FungiblesMutate<AccountId>>::mint_into(USDX, &1, fee + 250 * USD));
+		mint_stable(USDX, 1, fee + 250 * USD);
 		assert_ok!(repay(1, XBT, USDX, 1, Some(10_000 * USD)));
 		assert!(vault_status(XBT, USDX, 1).is_dormant());
 		assert_ok!(close_vault(1, XBT, USDX, None));
@@ -338,12 +337,14 @@ fn repay_dusts_sub_ed_payer_remainder() {
 		// Top the owner up to debt + a sub-ED remainder of 5_000 minor units.
 		let debt = xbt_vault(3).debt.total();
 		let top_up = debt - 5_000 * USD + 5_000;
-		assert_ok!(<Assets as FungiblesMutate<AccountId>>::mint_into(USDX, &3, top_up));
+		mint_stable(USDX, 3, top_up);
 		assert_eq!(stable_balance(USDX, 3), debt + 5_000);
 
 		let issuance_pre = total_stable(USDX);
 		assert_ok!(repay(3, XBT, USDX, 3, Some(10_000 * USD)));
 		assert_eq!(stable_balance(USDX, 3), 0, "payer reaped, sub-ED remainder gone");
 		assert_eq!(total_stable(USDX), issuance_pre - debt - 5_000, "remainder burned from supply");
+		// The asset pallet, not the market, burned the dust.
+		record_external_issuance(USDX, -5_000);
 	});
 }
