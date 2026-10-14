@@ -37,12 +37,18 @@ pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 	}
 
 	/// Called before an empty market is removed. `remaining_stablecoin_markets` excludes it.
+	///
+	/// `funder` receives any refundable setup cost that [`on_registered`] charged, resolved the
+	/// same way the registration resolved its payer.
+	///
+	/// [`on_registered`]: OnBranchLifecycle::on_registered
 	fn on_deregistered(
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
 		remaining_stablecoin_markets: u32,
+		funder: &AccountId,
 	) -> DispatchResult {
-		let _ = (collateral_id, stable_id, remaining_stablecoin_markets);
+		let _ = (collateral_id, stable_id, remaining_stablecoin_markets, funder);
 		Ok(())
 	}
 
@@ -87,12 +93,14 @@ impl<CollateralId, StableId, AccountId> OnBranchLifecycle<CollateralId, StableId
 		collateral_id: &CollateralId,
 		stable_id: &StableId,
 		remaining_stablecoin_markets: u32,
+		funder: &AccountId,
 	) -> DispatchResult {
 		for_tuples!( #(
 			Tuple::on_deregistered(
 				collateral_id,
 				stable_id,
 				remaining_stablecoin_markets,
+				funder,
 			)?;
 		)* );
 		Ok(())
