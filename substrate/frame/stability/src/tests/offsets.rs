@@ -28,9 +28,8 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 		assert_eq!(sums.s_collateral, FixedU128::from_inner(400_000_000_000_000_000));
 
 		// 500 of the pool's 1000 stablecoin was burned.
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 500);
-		assert_eq!(collateral_balance(DOT, pool), 400);
+		assert_eq!(pool_stable_held(DOT, PUSD), 500);
+		assert_eq!(pool_collateral_held(DOT, PUSD), 400);
 
 		System::assert_has_event(
 			crate::Event::OffsetApplied {
@@ -198,7 +197,6 @@ fn combined_offset_settles_active_then_pending() {
 				},
 			));
 
-			let pool_account = Stability::pool_account(&DOT, &USDX);
 			let state = pool_state(DOT, USDX);
 			assert_eq!(state.total_active_deposits, 0);
 			assert_eq!(state.total_pending_deposits, 0);
@@ -208,8 +206,8 @@ fn combined_offset_settles_active_then_pending() {
 				state.pending_coords,
 				Accumulators { p: FixedU128::one(), epoch: 1, scale: 0 }
 			);
-			assert_eq!(stable_balance(USDX, pool_account), 0);
-			assert_eq!(collateral_balance(DOT, pool_account), 400);
+			assert_eq!(pool_stable_held(DOT, USDX), 0);
+			assert_eq!(pool_collateral_held(DOT, USDX), 400);
 			assert_eq!(
 				crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Active, 0u32, 0u32))
 					.s_collateral,
@@ -300,34 +298,32 @@ fn compounded_yield_absorbs_offsets() {
 }
 
 #[test]
-fn offset_rounds_down_at_the_pool_minimum_balance_dead_zone() {
+fn offset_has_no_minimum_balance_dead_zone_above_the_custody_float() {
 	build_and_execute(|| {
 		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		// One active depositor plus 6_000 raw units of pending deposit, so
-		// the pool balance exceeds the active total by less than the
+		// the tracked value exceeds the active total by less than the
 		// 10_000-unit USDX minimum.
 		mint_stable(USDX, 1, 100_000);
 		assert_ok!(deposit_and_mature(1, DOT, USDX, 100_000));
 		mint_stable(USDX, 2, 16_000);
 		assert_ok!(deposit(2, DOT, USDX, 6_000));
 
-		let pool = Stability::pool_account(&DOT, &USDX);
-		assert_eq!(stable_balance(USDX, pool), 106_000);
+		assert_eq!(pool_stable_held(DOT, USDX), 106_000);
 
-		// The accounting cap allows the full 100_000 active total, but
-		// burning it would strand 6_000 < 10_000 on the pool account: the
-		// plan rounds the offset down to the preserving limit 96_000, and
-		// the collateral share scales with it: floor(80_000 * 96_000 /
-		// 100_000) = 76_800.
+		// Burning the whole active total leaves 6_000 of pending deposit on
+		// the account, below the asset minimum. The custody float sits
+		// beneath it, so `Preserve` has its minimum to keep and the offset
+		// takes the full 100_000 rather than rounding down to a preserving
+		// limit.
 		let offset = simulate_offset(DOT, USDX, 100_000, 80_000);
-		assert_eq!(offset.debt(), 96_000);
-		assert_eq!(offset.leftover, 80_000 - 76_800);
+		assert_eq!(offset.debt(), 100_000);
+		assert_eq!(offset.leftover, 0);
 
-		// The pool sits exactly at the minimum: alive, no dust burned, and
-		// the balance still backs active 4_000 + pending 6_000.
-		assert_eq!(stable_balance(USDX, pool), USDX_MIN_BALANCE);
+		// The pool holds exactly the pending deposit above its float.
+		assert_eq!(pool_stable_held(DOT, USDX), 6_000);
 		let state = pool_state(DOT, USDX);
-		assert_eq!(state.total_active_deposits, 4_000);
+		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(state.total_pending_deposits, 6_000);
 	});
 }

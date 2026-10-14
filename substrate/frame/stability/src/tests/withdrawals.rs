@@ -22,8 +22,7 @@ fn withdraw_pays_at_most_the_active_deposit_and_prunes_the_row() {
 
 			assert_eq!(stable_balance(PUSD, 1), depositor_balance);
 			assert_eq!(stable_balance(PUSD, recipient), recipient_balance);
-			let pool = Stability::pool_account(&DOT, &PUSD);
-			assert_eq!(stable_balance(PUSD, pool), 0);
+			assert_eq!(pool_stable_held(DOT, PUSD), 0);
 			assert!(deposit_row(DOT, PUSD, 1).is_none());
 			let state = pool_state(DOT, PUSD);
 			assert_eq!(state.total_active_deposits, 0);

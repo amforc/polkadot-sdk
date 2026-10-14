@@ -49,7 +49,7 @@ fn pending_offset_full_depletion_bumps_the_pending_epoch() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.pending_coords.epoch, 2);
-		assert_eq!(stable_balance(PUSD, Stability::pool_account(&DOT, &PUSD)), 0);
+		assert_eq!(pool_stable_held(DOT, PUSD), 0);
 
 		// The row still holds the stale pending leg; realization is lazy. The next touch settles
 		// it to nothing and prunes the empty row.
@@ -258,29 +258,26 @@ fn active_then_pending_depletion_strands_bounded_dust() {
 
 		// Every pUSD the pool held (1501 active + 350 pending) was burned, and the two stranded
 		// base units are all the collateral the pool still holds.
-		let pool = Stability::pool_account(&DOT, &PUSD);
-		assert_eq!(stable_balance(PUSD, pool), 0);
+		assert_eq!(pool_stable_held(DOT, PUSD), 0);
 		assert_eq!(pool_state(DOT, PUSD).total_collateral_gains_unclaimed, 2);
 	});
 }
 
 #[test]
-fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
+fn pending_backstop_has_no_minimum_balance_dead_zone_above_the_custody_float() {
 	build_and_execute(|| {
 		register_branch(DOT, USDX, branch_config_for(DOT, USDX));
 		mint_stable(USDX, 1, 60_000);
 		assert_ok!(deposit(1, DOT, USDX, 50_000));
 
-		let pool = Stability::pool_account(&DOT, &USDX);
-		assert_eq!(stable_balance(USDX, pool), 50_000);
+		assert_eq!(pool_stable_held(DOT, USDX), 50_000);
 
-		// Burning 45_000 would strand 5_000 < 10_000 on the pool account:
-		// the offset rounds down to 40_000. The collateral follows pro-rata
-		// (floor(45_000 * 40_000 / 45_000) = 40_000) and
-		// P_pending = 10_000/50_000 = 0.2.
+		// Burning 45_000 leaves 5_000 < 10_000 of tracked value on the pool account. The
+		// custody float beneath it is what `Preserve` keeps, so the offset takes the full
+		// 45_000 and P_pending = 5_000/50_000 = 0.1.
 		let offset = simulate_offset(DOT, USDX, 45_000, 45_000);
-		assert_eq!(offset.debt(), 40_000);
-		assert_eq!(offset.leftover, 5_000);
+		assert_eq!(offset.debt(), 45_000);
+		assert_eq!(offset.leftover, 0);
 		System::assert_has_event(
 			crate::Event::OffsetApplied {
 				collateral_id: DOT,
@@ -291,15 +288,14 @@ fn pending_backstop_rounds_down_at_the_minimum_balance_dead_zone() {
 			.into(),
 		);
 
-		// The pool sits exactly at the minimum; the row realizes the
-		// unconsumed remainder floor(50_000 * 0.2) = 10_000 and the direct
-		// gain floor(50_000 * 40_000/50_000) = 40_000.
-		assert_eq!(stable_balance(USDX, pool), USDX_MIN_BALANCE);
-		assert_eq!(pool_state(DOT, USDX).total_pending_deposits, 10_000);
+		// The row realizes the unconsumed remainder floor(50_000 * 0.1) = 5_000 and the direct
+		// gain floor(50_000 * 45_000/50_000) = 45_000.
+		assert_eq!(pool_stable_held(DOT, USDX), 5_000);
+		assert_eq!(pool_state(DOT, USDX).total_pending_deposits, 5_000);
 		assert_ok!(settle(1, 1, DOT, USDX));
 		let row = deposit_row(DOT, USDX, 1).expect("row survives");
-		assert_eq!(row.pending_deposit.expect("pending remainder").amount, 10_000);
-		assert_eq!(row.claimable_collateral, 40_000);
+		assert_eq!(row.pending_deposit.expect("pending remainder").amount, 5_000);
+		assert_eq!(row.claimable_collateral, 45_000);
 	});
 }
 
@@ -329,7 +325,7 @@ fn pending_deposit_offset_is_shared_pro_rata() {
 			state.pending_coords,
 			Accumulators { p: FixedU128::from_inner(285_714_285_714_285_714), epoch: 0, scale: 0 }
 		);
-		assert_eq!(stable_balance(PUSD, Stability::pool_account(&DOT, &PUSD)), 400);
+		assert_eq!(pool_stable_held(DOT, PUSD), 400);
 		System::assert_has_event(
 			crate::Event::OffsetApplied {
 				collateral_id: DOT,

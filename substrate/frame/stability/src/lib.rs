@@ -95,8 +95,11 @@
 //! mismatch causes an error, so vault debt and pool balances cannot diverge.
 //!
 //! User payouts round down. Remainders stay in pool custody, which prevents the pool from owing
-//! more than its account holds. Market removal sends unowned remainders to
-//! [`Config::StableDustHandler`] and [`Config::CollateralDustHandler`].
+//! more than its account holds. The pool account also carries a custody float of one minimum
+//! balance per asset, paid by the market creator at registration, so that every exact payout can
+//! leave the asset minimum behind; see [`types::StabilityPool`]. Market removal refunds the float
+//! and sends unowned remainders to [`Config::StableDustHandler`] and
+//! [`Config::CollateralDustHandler`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -131,19 +134,18 @@ pub mod pallet {
 			RecoveryOffsetSource, StabilityPool, StabilityPoolConfig,
 		},
 	};
+	#[cfg(feature = "runtime-benchmarks")]
+	use frame::deps::sp_runtime::traits::One;
 	use frame::{
-		deps::{
-			frame_support::{
-				storage::StorageNMap as _,
-				traits::{
-					fungibles,
-					fungibles::{Balanced as _, Inspect as _, Refund as _},
-					tokens::{Fortitude, Precision, Preservation, Provenance},
-					AccountTouch, EnsureOriginWithArg, OnUnbalanced, Time,
-				},
-				PalletId,
+		deps::frame_support::{
+			storage::StorageNMap as _,
+			traits::{
+				fungibles,
+				fungibles::Inspect as _,
+				tokens::{Fortitude, Precision, Preservation},
+				EnsureOriginWithArg, OnUnbalanced, Time,
 			},
-			sp_runtime::traits::One,
+			PalletId,
 		},
 		prelude::*,
 	};
@@ -209,9 +211,7 @@ pub mod pallet {
 				Self::AccountId,
 				AssetId: Parameter + Member + Ord + MaxEncodedLen,
 				Balance = BalanceOf<Self>,
-			> + fungibles::Balanced<Self::AccountId>
-			+ AccountTouch<CollateralIdOf<Self>, Self::AccountId, Balance: Zero>
-			+ fungibles::Refund<Self::AccountId, AssetId = CollateralIdOf<Self>>;
+			> + fungibles::Balanced<Self::AccountId>;
 
 		/// Clock for the entry delay and the Safety-mode withdrawal delay.
 		type TimeProvider: Time<Moment = Millis>;
@@ -462,9 +462,14 @@ pub mod pallet {
 		/// The pool parameters contradict each other. See
 		/// [`types::StabilityPoolConfig::is_valid`].
 		InvalidStabilityPoolConfig,
-		/// The pool's collateral account still cannot receive a gain after registration created
-		/// it. The pool would have to refuse collateral it owes to depositors.
+		/// The pool account cannot receive its custody float. The pool would have to refuse
+		/// value it owes to depositors.
 		PoolAccountNotReceivable,
+		/// The market creator cannot pay one minimum balance of each asset as the pool's custody
+		/// float.
+		CustodySeedUnavailable,
+		/// The market creator cannot receive the custody float back at market removal.
+		CustodyRefundFailed,
 		/// The pool account already holds a balance, sent before the market was registered. It
 		/// belongs to no depositor, so registration refuses to start from it.
 		PoolAccountNotEmpty,
@@ -757,42 +762,66 @@ pub mod pallet {
 			pusd_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
 		}
 
-		/// Sends unowned balances to the dust handlers and returns the amounts sent.
+		/// Parks one minimum balance of the asset in the pool account, paid by `funder`, and
+		/// returns the amount parked.
 		///
-		/// Market removal requires no deposit rows. Balances that remain are rounding remainders or
-		/// unrelated transfers, not user claims.
+		/// See [`StabilityPool`] for why the pool carries the float. A zero minimum needs none:
+		/// `Preservation::Preserve` then keeps nothing back.
+		fn seed_custody<Assets>(
+			asset_id: Assets::AssetId,
+			pool_account: &T::AccountId,
+			funder: &T::AccountId,
+		) -> Result<BalanceOf<T>, DispatchError>
+		where
+			Assets: fungibles::Balanced<T::AccountId, Balance = BalanceOf<T>>,
+		{
+			let seed = Assets::minimum_balance(asset_id.clone());
+			if seed.is_zero() {
+				return Ok(seed);
+			}
+			// A registration cost must not dust the account that pays it.
+			let credit = Assets::withdraw(
+				asset_id,
+				funder,
+				seed,
+				Precision::Exact,
+				Preservation::Preserve,
+				Fortitude::Polite,
+			)
+			.map_err(|_| Error::<T>::CustodySeedUnavailable)?;
+			Assets::resolve(pool_account, credit).map_err(|credit| {
+				drop(credit);
+				Error::<T>::PoolAccountNotReceivable
+			})?;
+			Ok(seed)
+		}
+
+		/// Empties the pool account: the custody float goes back to `funder`, the rest to the
+		/// dust handlers. Returns the stablecoin and collateral dust.
 		///
-		/// The sweep prevents a later registration of the same market from receiving those
-		/// balances.
-		fn sweep_dust(
+		/// Market removal requires no deposit rows, so beyond the float only rounding remainders
+		/// or unrelated transfers remain, not user claims. Emptying the account also keeps a later
+		/// registration of the same market from inheriting those balances.
+		fn release_custody(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 			pool_account: &T::AccountId,
+			pool: &StabilityPoolOf<T>,
+			funder: &T::AccountId,
 		) -> Result<(BalanceOf<T>, BalanceOf<T>), DispatchError> {
-			let stable_dust = T::StableAssets::balance(stable_id.clone(), pool_account);
-			if !stable_dust.is_zero() {
-				let credit = T::StableAssets::withdraw(
-					stable_id.clone(),
-					pool_account,
-					stable_dust,
-					Precision::Exact,
-					Preservation::Expendable,
-					Fortitude::Polite,
-				)?;
-				T::StableDustHandler::on_unbalanced(credit);
-			}
-			let collateral_dust = T::CollateralAssets::balance(collateral_id.clone(), pool_account);
-			if !collateral_dust.is_zero() {
-				let credit = T::CollateralAssets::withdraw(
+			let stable_dust = Self::release_custody_asset::<T::StableAssets, T::StableDustHandler>(
+				stable_id.clone(),
+				pool_account,
+				pool.custody_stable,
+				funder,
+			)?;
+			let collateral_dust =
+				Self::release_custody_asset::<T::CollateralAssets, T::CollateralDustHandler>(
 					collateral_id.clone(),
 					pool_account,
-					collateral_dust,
-					Precision::Exact,
-					Preservation::Expendable,
-					Fortitude::Polite,
+					pool.custody_collateral,
+					funder,
 				)?;
-				T::CollateralDustHandler::on_unbalanced(credit);
-			}
 			debug_assert!(T::StableAssets::balance(stable_id.clone(), pool_account).is_zero());
 			debug_assert!(
 				T::CollateralAssets::balance(collateral_id.clone(), pool_account).is_zero()
@@ -800,44 +829,42 @@ pub mod pallet {
 			Ok((stable_dust, collateral_dust))
 		}
 
-		/// Ensures the pool account can receive the first offset gain of this collateral.
-		///
-		/// Issued assets whose minimum balance is larger than one need a zero-balance asset
-		/// account created up front; [`AccountTouch`] charges its refundable native deposit to
-		/// `funder`. Native balances have no such account: a one-unit probe always fails
-		/// against a production ED, and `touch` is a no-op. The provider reference taken at
-		/// registration is enough for the account to receive its own minimum, which is the
-		/// native contract (a first gain below ED is dusted).
-		fn ensure_collateral_account(
-			collateral_id: &CollateralIdOf<T>,
+		/// One withdrawal takes the whole balance, so a sub-minimum remainder cannot be left
+		/// behind by the refund and then be stuck.
+		fn release_custody_asset<Assets, DustHandler>(
+			asset_id: Assets::AssetId,
 			pool_account: &T::AccountId,
+			seed: BalanceOf<T>,
 			funder: &T::AccountId,
-		) -> DispatchResult {
-			let can_receive = |amount| {
-				T::CollateralAssets::can_deposit(
-					collateral_id.clone(),
-					pool_account,
-					amount,
-					Provenance::Extant,
-				)
-				.into_result()
-				.is_ok()
-			};
-			if can_receive(BalanceOf::<T>::one()) {
-				return Ok(());
+		) -> Result<BalanceOf<T>, DispatchError>
+		where
+			Assets: fungibles::Balanced<T::AccountId, Balance = BalanceOf<T>>,
+			DustHandler: OnUnbalanced<fungibles::Credit<T::AccountId, Assets>>,
+		{
+			let held = Assets::balance(asset_id.clone(), pool_account);
+			if held.is_zero() {
+				return Ok(held);
 			}
-			T::CollateralAssets::touch(collateral_id.clone(), pool_account, funder)?;
-			if can_receive(BalanceOf::<T>::one()) {
-				return Ok(());
+			let credit = Assets::withdraw(
+				asset_id,
+				pool_account,
+				held,
+				Precision::Exact,
+				Preservation::Expendable,
+				Fortitude::Polite,
+			)?;
+			let (refund, dust) = credit.split(seed.min(held));
+			if refund.peek().is_zero() {
+				drop(refund);
+			} else {
+				Assets::resolve(funder, refund).map_err(|credit| {
+					drop(credit);
+					Error::<T>::CustodyRefundFailed
+				})?;
 			}
-			// `touch` is a no-op for native (and any asset whose account deposit is zero).
-			// Accept the account if it can receive its own minimum.
-			if T::CollateralAssets::deposit_required(collateral_id.clone()).is_zero() &&
-				can_receive(T::CollateralAssets::minimum_balance(collateral_id.clone()))
-			{
-				return Ok(());
-			}
-			Err(Error::<T>::PoolAccountNotReceivable.into())
+			let dust_amount = dust.peek();
+			DustHandler::on_unbalanced(dust);
+			Ok(dust_amount)
 		}
 	}
 
@@ -860,26 +887,38 @@ pub mod pallet {
 				Error::<T>::PoolAccountNotEmpty
 			);
 
-			Pools::<T>::insert(collateral_id, stable_id, StabilityPoolOf::<T>::fresh(config));
+			// The provider reference lets a non-sufficient asset open its account here, and keeps
+			// the account through a zero-minimum asset's full drain.
+			if frame_system::Pallet::<T>::providers(&pool_account) == 0 {
+				frame_system::Pallet::<T>::inc_providers(&pool_account);
+			}
+			let custody_stable =
+				Self::seed_custody::<T::StableAssets>(stable_id.clone(), &pool_account, funder)?;
+			let custody_collateral = Self::seed_custody::<T::CollateralAssets>(
+				collateral_id.clone(),
+				&pool_account,
+				funder,
+			)?;
+
+			Pools::<T>::insert(
+				collateral_id,
+				stable_id,
+				StabilityPoolOf::<T>::fresh(config, custody_stable, custody_collateral),
+			);
 			for leg in Leg::ALL {
 				PoolSumsStore::<T>::insert(
 					(collateral_id, stable_id, leg, 0u32, 0u32),
 					PoolSums::default(),
 				);
 			}
-
-			// A provider reference keeps the pool account alive while it holds nothing, without
-			// locking up an existential deposit.
-			if frame_system::Pallet::<T>::providers(&pool_account) == 0 {
-				frame_system::Pallet::<T>::inc_providers(&pool_account);
-			}
-			Self::ensure_collateral_account(collateral_id, &pool_account, funder)
+			Ok(())
 		}
 
 		fn on_deregistered(
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 			_remaining_stablecoin_markets: u32,
+			funder: &T::AccountId,
 		) -> DispatchResult {
 			// Deposit rows are what guards user funds: active, pending and claimable value all
 			// live on them. Vaults rolls the whole `remove_branch` back on this error, so a market
@@ -889,14 +928,11 @@ pub mod pallet {
 				Error::<T>::PoolNotEmpty
 			);
 
+			let pool =
+				Pools::<T>::get(collateral_id, stable_id).ok_or(Error::<T>::PoolNotRegistered)?;
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			let (stable_amount, collateral_amount) =
-				Self::sweep_dust(collateral_id, stable_id, &pool_account)?;
-			if T::CollateralAssets::deposit_held(collateral_id.clone(), pool_account.clone())
-				.is_some()
-			{
-				T::CollateralAssets::refund(collateral_id.clone(), pool_account.clone())?;
-			}
+				Self::release_custody(collateral_id, stable_id, &pool_account, &pool, funder)?;
 			if !stable_amount.is_zero() || !collateral_amount.is_zero() {
 				Self::deposit_event(Event::DustSwept {
 					collateral_id: collateral_id.clone(),
@@ -923,7 +959,7 @@ pub mod pallet {
 			debug_assert!(removal.maybe_cursor.is_none());
 
 			if frame_system::Pallet::<T>::providers(&pool_account) > 0 {
-				// The sweep emptied the market's own assets, but a third party may have parked
+				// The release emptied the market's own assets, but a third party may have parked
 				// another token here and left a consumer reference behind. The account then stays,
 				// which does no harm.
 				let _ = frame_system::Pallet::<T>::dec_providers(&pool_account);

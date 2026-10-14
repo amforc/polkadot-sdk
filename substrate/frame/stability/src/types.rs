@@ -501,18 +501,35 @@ impl<Balance: Zero> StabilityPoolConfig<Balance> {
 /// Configuration and accounting state of one market's pool.
 ///
 /// Both parts share one lifecycle so configuration cannot exist without its accounting state.
+///
+/// The custody float is one minimum balance of each asset, parked in the pool account at
+/// registration on top of the tracked totals. A transfer under `Preservation::Preserve` must
+/// leave the minimum balance behind. Without the float, the last claim of a drained pool leaves
+/// only a rounding remainder, below that minimum, and is refused. With it, every exact payout of
+/// tracked value leaves at least the float. The amounts are recorded rather than re-read because
+/// an asset's minimum balance can change after registration, while the float only moves at
+/// removal.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 pub struct StabilityPool<Balance> {
 	/// Parameters controlled by the authorized update origin.
 	pub config: StabilityPoolConfig<Balance>,
 	/// Aggregate balances and accumulator positions of the pool.
 	pub state: PoolState<Balance>,
+	/// Stablecoin float held by the pool account on top of the tracked totals.
+	pub custody_stable: Balance,
+	/// Collateral float held by the pool account on top of the tracked totals.
+	pub custody_collateral: Balance,
 }
 
 impl<Balance: Zero> StabilityPool<Balance> {
-	/// Returns a registered pool with the specified parameters and an empty [`PoolState`].
-	pub fn fresh(config: StabilityPoolConfig<Balance>) -> Self {
-		Self { config, state: PoolState::fresh() }
+	/// Returns a registered pool with the specified parameters, the custody float parked in its
+	/// account, and an empty [`PoolState`].
+	pub fn fresh(
+		config: StabilityPoolConfig<Balance>,
+		custody_stable: Balance,
+		custody_collateral: Balance,
+	) -> Self {
+		Self { config, state: PoolState::fresh(), custody_stable, custody_collateral }
 	}
 }
 

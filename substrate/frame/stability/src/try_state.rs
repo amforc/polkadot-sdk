@@ -69,20 +69,31 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 
 		// This holds as an equality, not as an inequality: every stablecoin that enters or leaves
 		// the pool account moves exactly one total with it, and a rounding remainder stays inside
-		// those totals rather than outside them.
+		// those totals rather than outside them. The custody float sits on top and only moves at
+		// removal.
 		let pool_account = Pallet::<T>::pool_account(&collateral_id, &stable_id);
 		let stable_held = T::StableAssets::balance(stable_id.clone(), &pool_account);
 		let stable_owed = state
 			.total_active_deposits
 			.saturating_add(state.total_pending_deposits)
-			.saturating_add(state.total_yield_unclaimed);
+			.saturating_add(state.total_yield_unclaimed)
+			.saturating_add(pool.custody_stable);
 		if stable_held != stable_owed {
 			return Err("pool stablecoin balance diverges from tracked totals".into());
 		}
 		let collateral_held = T::CollateralAssets::balance(collateral_id.clone(), &pool_account);
-		let collateral_owed = state.total_collateral_gains_unclaimed;
+		let collateral_owed =
+			state.total_collateral_gains_unclaimed.saturating_add(pool.custody_collateral);
 		if collateral_held != collateral_owed {
 			return Err("pool collateral balance diverges from tracked totals".into());
+		}
+		// The float is what lets every claim leave the minimum balance behind. A minimum raised
+		// after registration is the one case the float does not cover, and it must be visible.
+		if pool.custody_stable < T::StableAssets::minimum_balance(stable_id.clone()) {
+			return Err("stablecoin custody float below the asset minimum balance".into());
+		}
+		if pool.custody_collateral < T::CollateralAssets::minimum_balance(collateral_id.clone()) {
+			return Err("collateral custody float below the asset minimum balance".into());
 		}
 
 		// The open cohorts themselves: live ids, increasing deadlines, no memberless row, and an

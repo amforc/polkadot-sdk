@@ -32,10 +32,10 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 		let pool = Stability::pool_account(&DOT, &USDX);
 		let sums_before = crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Active, 0u32, 0u32));
 
-		// USDX has a 10_000-unit minimum balance. Emptying the pool asset
-		// account makes a sub-minimum yield credit unresolvable, so the
-		// infallible hook must hand the credit back untouched.
-		burn_stable(USDX, pool, USDX_MIN_BALANCE);
+		// USDX has a 10_000-unit minimum balance. Emptying the pool asset account, deposit and
+		// custody float alike, makes a sub-minimum yield credit unresolvable, so the infallible
+		// hook must hand the credit back untouched.
+		burn_stable(USDX, pool, 2 * USDX_MIN_BALANCE);
 		assert_eq!(stable_balance(USDX, pool), 0);
 
 		let leftover = distribute_yield(DOT, USDX, USDX_MIN_BALANCE - 1);
@@ -56,7 +56,7 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 
 		// Restore the artificial corruption before the post-test try-state
 		// identity check runs.
-		mint_stable(USDX, pool, USDX_MIN_BALANCE);
+		mint_stable(USDX, pool, 2 * USDX_MIN_BALANCE);
 	});
 }
 
