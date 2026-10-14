@@ -7,7 +7,6 @@ use crate::{
 		ONE_YEAR_MS,
 	},
 };
-use frame::traits::fungibles::Mutate;
 
 // A stablecoin whose global ceiling is `0` cannot be borrowed, even though a market can exist.
 #[test]
@@ -66,7 +65,7 @@ fn repaying_frees_global_ceiling_headroom() {
 		);
 
 		// Repay most of owner 1's debt, dropping the collateral debt well below the cap.
-		<VaultStableAssets as Mutate<AccountId>>::mint_into(PUSD, &1, 10_000).unwrap();
+		mint_stable(PUSD, 1, 10_000);
 		assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(1), DOT, PUSD, 1, Some(1_500)));
 
 		// The freed headroom now admits the previously-rejected borrow.

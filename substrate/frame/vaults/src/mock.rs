@@ -256,6 +256,8 @@ impl pusd_primitives::OnBranchYield<AssetId, Credit<AccountId, VaultStableAssets
 		assert_eq!(branch.now, Timestamp::get(), "the engine passes its own clock");
 		let sp_share = SpFeeShare::get() * credit.peek();
 		let (sp_credit, residual) = credit.split(sp_share);
+		// The Stability Pool, not the market, takes this share out of circulation.
+		record_external_issuance(sp_credit.asset(), -signed(sp_credit.peek()));
 		drop(sp_credit);
 		residual
 	}
@@ -294,6 +296,7 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for Record
 		collateral_id: &AssetId,
 		stable_id: &StableId,
 		remaining_stablecoin_markets: u32,
+		_funder: &AccountId,
 	) -> DispatchResult {
 		LifecycleLog::mutate(|l| {
 			l.push((collateral_id.clone(), *stable_id, false, remaining_stablecoin_markets))
@@ -484,6 +487,8 @@ impl
 		if given_up.is_zero() {
 			return Ok(None);
 		}
+		// Stands in for the depositors' stablecoin, which the engine burns against the debt.
+		record_external_issuance(*stable_id, signed(given_up));
 		Ok(Some(<VaultStableAssets as FungiblesBalanced<AccountId>>::issue(*stable_id, given_up)))
 	}
 
@@ -634,12 +639,69 @@ pub fn new_test_ext() -> TestState {
 	ext
 }
 
-/// Runs a test, then checks the pallet's `try_state` invariants against the state it left behind.
+/// Runs a test, then checks the pallet's invariants against the state it left behind.
 pub fn build_and_execute(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
-		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
+		check_invariants();
 	});
+}
+
+parameter_types! {
+	/// Net stablecoin issued outside market debt, per stable asset.
+	///
+	/// Kept in storage so a rolled-back transaction rolls the ledger back with the supply.
+	pub storage ExternalStableIssuance: BTreeMap<StableId, i128> = BTreeMap::new();
+}
+
+/// Records stablecoin issued (`delta > 0`) or burned (`delta < 0`) outside market debt.
+///
+/// Every supply change a test or test hook makes behind the pallet's back must pass here, or
+/// [`check_stable_supply`] reports it.
+pub fn record_external_issuance(stable: StableId, delta: i128) {
+	let mut ledger = ExternalStableIssuance::get();
+	let entry = ledger.entry(stable).or_default();
+	*entry = entry.checked_add(delta).expect("external issuance ledger overflow");
+	ExternalStableIssuance::set(&ledger);
+}
+
+/// Converts a balance into the ledger's signed domain.
+fn signed(amount: Balance) -> i128 {
+	i128::try_from(amount).expect("test balances fit in i128")
+}
+
+/// Checks `try_state` and the stablecoin supply against the market debt ledger.
+#[track_caller]
+pub fn check_invariants() {
+	crate::try_state::do_try_state::<Test>().expect("accounting invariants hold");
+	check_stable_supply();
+}
+
+/// Each stable asset's issuance equals the debt its markets carry plus net external issuance.
+///
+/// `try_state` recomputes aggregates from vault rows, so a debt change that moves rows and
+/// aggregates together passes it even when no stablecoin moved. Supply is the one quantity the
+/// pallet does not write, so this identity catches debt cancelled without its burn and debt
+/// created without its mint.
+#[track_caller]
+pub fn check_stable_supply() {
+	let external = ExternalStableIssuance::get();
+	for stable in [PUSD, EUSD, USDX] {
+		let debt = Branches::<Test>::iter()
+			.filter(|(_, branch_stable, _)| *branch_stable == stable)
+			.map(|(_, _, branch)| signed(branch.state.debt.outstanding()))
+			.fold(0i128, |sum, outstanding| {
+				sum.checked_add(outstanding).expect("debt sum overflow")
+			});
+		let expected = debt
+			.checked_add(external.get(&stable).copied().unwrap_or_default())
+			.expect("expected supply overflow");
+		assert_eq!(
+			signed(total_stable(stable)),
+			expected,
+			"stable {stable} supply != Σ market debt + external issuance",
+		);
+	}
 }
 
 /// Sets the oracle price for a collateral asset.
@@ -1050,6 +1112,8 @@ pub fn settlement(
 	debt_to_cancel: Balance,
 	collateral_to_recipient: Balance,
 ) -> RedemptionSettlement<StableCreditOf<Test>, Balance> {
+	// Stands in for the redeemer's stablecoin, which the market burns against the debt.
+	record_external_issuance(stable, signed(debt_to_cancel));
 	let debt_payment =
 		<VaultStableAssets as FungiblesBalanced<AccountId>>::issue(stable, debt_to_cancel);
 	RedemptionSettlement { debt_payment, collateral_to_recipient }
@@ -1132,6 +1196,7 @@ pub fn mint_collateral(collateral: AssetId, who: AccountId, amount: Balance) {
 
 /// Mints stable assets for liquidation and repayment tests.
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
+	record_external_issuance(stable, signed(amount));
 	<VaultStableAssets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
 		stable, &who, amount,
 	)

@@ -2,10 +2,7 @@
 //! afterwards.
 
 use crate::{mock::*, Error};
-use frame::traits::{
-	fungibles::{Inspect as _, Refund as _},
-	tokens::Provenance,
-};
+use frame::traits::{fungibles::Inspect as _, tokens::Provenance};
 
 fn providers(who: AccountId) -> u32 {
 	System::providers(&who)
@@ -62,59 +59,76 @@ fn branch_registration_seeds_pool_rows() {
 	});
 }
 
-// The pool's asset-account deposit is charged to the same account Vaults charges for the
-// market's collateral custody: the depositor when a signed creation paid one, and the full
-// admin otherwise. Governance can therefore register an issued-collateral market too.
+// The pool's custody float is charged to the same account Vaults charges for the market's
+// collateral custody: the depositor when a signed creation paid one, and the full admin
+// otherwise. Removal returns it to that account. Governance can therefore register an
+// issued-collateral market too.
 #[test]
-fn issued_collateral_account_touch_follows_the_custody_funder() {
+fn custody_float_follows_the_custody_funder() {
 	build_and_execute(|| {
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
-		// The funder also seeds the market's redistribution custody, withdrawn under
-		// `Preserve`, so each candidate needs two minimum balances on hand.
-		mint_collateral(AssetId::WithId(77), 1, 2_000);
-		mint_collateral(AssetId::WithId(77), ADMIN, 2_000);
+		// The funder also seeds the market's redistribution custody. Both withdrawals run under
+		// `Preserve`, so each candidate needs three collateral minimums and two stablecoin
+		// minimums on hand.
 		let collateral = AssetId::WithId(77);
+		for funder in [1, ADMIN] {
+			mint_collateral(collateral.clone(), funder, 3_000);
+			mint_stable(PUSD, funder, 2);
+		}
 		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
 		let pool = Stability::pool_account(&collateral, &PUSD);
 
-		// Root supplies no depositor, so the market's full admin pays.
-		let admin_held_before = native_on_hold(ADMIN);
-		assert_ok!(Vaults::create_branch(
-			RuntimeOrigin::root(),
-			collateral.clone(),
-			PUSD,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			branch_config_for(collateral.clone(), PUSD),
-			registration_config(PUSD),
-		));
-		assert_ok!(Assets::can_deposit(77, &pool, 1, Provenance::Extant).into_result());
-		let (payer, account_deposit) =
-			Assets::deposit_held(77, pool).expect("registration touched the pool account");
-		assert_eq!(payer, ADMIN);
-		assert!(account_deposit > 0);
+		for (origin, funder) in [(RuntimeOrigin::root(), ADMIN), (RuntimeOrigin::signed(1), 1)] {
+			let collateral_before = collateral_balance(collateral.clone(), funder);
+			let stable_before = stable_balance(PUSD, funder);
+			assert_ok!(Vaults::create_branch(
+				origin,
+				collateral.clone(),
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				branch_config_for(collateral.clone(), PUSD),
+				registration_config(PUSD),
+			));
+			let registered = crate::Pools::<Test>::get(&collateral, PUSD).expect("pool registered");
+			assert_eq!(registered.custody_stable, 1);
+			assert_eq!(registered.custody_collateral, 1_000);
+			assert_eq!(collateral_balance(collateral.clone(), pool), 1_000);
+			assert_eq!(stable_balance(PUSD, pool), 1);
+			// Vaults' redistribution seed is the other 1_000 the funder paid.
+			assert_eq!(collateral_balance(collateral.clone(), funder), collateral_before - 2_000);
+			assert_eq!(stable_balance(PUSD, funder), stable_before - 1);
+			assert_ok!(Assets::can_deposit(77, &pool, 1, Provenance::Extant).into_result());
 
-		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
-		assert!(Assets::deposit_held(77, pool).is_none());
-		assert_eq!(native_on_hold(ADMIN), admin_held_before);
+			assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
+			assert_eq!(collateral_balance(collateral.clone(), pool), 0);
+			assert_eq!(stable_balance(PUSD, pool), 0);
+			assert_eq!(collateral_balance(collateral.clone(), funder), collateral_before);
+			assert_eq!(stable_balance(PUSD, funder), stable_before);
+		}
+	});
+}
 
-		// A signed creation pays its own deposit, so the depositor is charged instead.
-		let held_before = native_on_hold(1);
-		assert_ok!(Vaults::create_branch(
-			RuntimeOrigin::signed(1),
-			collateral.clone(),
-			PUSD,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			branch_config_for(collateral.clone(), PUSD),
-			registration_config(PUSD),
-		));
-		let (payer, account_deposit) =
-			Assets::deposit_held(77, pool).expect("registration touched the pool account");
-		assert_eq!(payer, 1);
-		assert!(account_deposit > 0);
-
-		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
-		assert!(Assets::deposit_held(77, pool).is_none());
-		assert_eq!(native_on_hold(1), held_before);
+#[test]
+fn branch_registration_needs_the_funder_to_cover_the_custody_float() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		let collateral = AssetId::WithId(77);
+		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+		// Enough for Vaults' redistribution seed, but the pool float would dust the payer.
+		mint_collateral(collateral.clone(), 1, 2_000);
+		mint_stable(PUSD, 1, 2);
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::signed(1),
+				collateral.clone(),
+				PUSD,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				branch_config_for(collateral.clone(), PUSD),
+				registration_config(PUSD),
+			),
+			Error::<Test>::CustodySeedUnavailable
+		);
+		assert!(crate::Pools::<Test>::get(&collateral, PUSD).is_none());
 	});
 }
 
@@ -192,15 +206,16 @@ fn branch_removal_blocked_while_depositor_rows_exist() {
 fn branch_removal_tears_down_pool_rows() {
 	build_with_default_market(|| {
 		let pool = Stability::pool_account(&DOT, &PUSD);
-		let providers_before = providers(pool);
-		// Registration seeded one sums row per leg.
+		// Registration seeded one sums row per leg, and the float is a second provider.
 		assert_eq!(default_market_rows(), (2, 0));
+		assert_eq!(providers(pool), 2);
 
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 
 		assert!(crate::Pools::<Test>::get(DOT, PUSD).is_none());
 		assert_eq!(default_market_rows(), (0, 0));
-		assert_eq!(providers(pool), providers_before - 1);
+		// The refund took the float's provider with it, and the release took the pallet's.
+		assert_eq!(providers(pool), 0);
 		// A never-used pool holds no dust; the zero-dust path stays silent.
 		assert!(!System::events().iter().any(|record| matches!(
 			record.event,
@@ -212,8 +227,6 @@ fn branch_removal_tears_down_pool_rows() {
 #[test]
 fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 	build_with_default_market(|| {
-		let pool = Stability::pool_account(&DOT, &PUSD);
-
 		// A first depositor takes the active leg across a scale and then an epoch, so that
 		// the market holds rows beyond the two that registration seeds. Leaving 100 of 1e13
 		// crosses one scale: P = floor(1e18 * 1e9 * 100 / 1e13) = 0.01. Burning those 100
@@ -257,8 +270,8 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		// The exact residue is accumulator flooring detail; the property under
 		// test is conservation, so snapshot it and require the scenario to
 		// have actually stranded value on both assets.
-		let stable_dust = stable_balance(PUSD, pool);
-		let collateral_dust = collateral_balance(DOT, pool);
+		let stable_dust = pool_stable_held(DOT, PUSD);
+		let collateral_dust = pool_collateral_held(DOT, PUSD);
 		assert!(stable_dust > 0);
 		assert!(collateral_dust > 0);
 
@@ -269,7 +282,9 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
 		assert_eq!(default_market_rows(), (0, 0));
 
-		// The sweep moved every stranded unit to the dust destination.
+		// The sweep moved every stranded unit to the dust destination, and the float went back
+		// to the funder rather than with it.
+		let pool = Stability::pool_account(&DOT, &PUSD);
 		assert_eq!(stable_balance(PUSD, pool), 0);
 		assert_eq!(collateral_balance(DOT, pool), 0);
 		assert_eq!(stable_balance(PUSD, DUST_DEST), stable_dust);
@@ -285,7 +300,7 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		);
 
 		// Re-registering the same pair starts from a genuinely clean slate:
-		// zero tracked totals against a zero-balance pool account, so the
+		// zero tracked totals against a pool account holding only its float, so the
 		// balance↔totals equality (try_state, run on exit) holds again.
 		register_branch(DOT, PUSD, default_branch_config());
 		let state = pool_state(DOT, PUSD);
@@ -293,8 +308,8 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.total_yield_unclaimed, 0);
 		assert_eq!(state.total_collateral_gains_unclaimed, 0);
-		assert_eq!(stable_balance(PUSD, pool), 0);
-		assert_eq!(collateral_balance(DOT, pool), 0);
+		assert_eq!(pool_stable_held(DOT, PUSD), 0);
+		assert_eq!(pool_collateral_held(DOT, PUSD), 0);
 		// Only the two seeded rows exist, both empty. A row left at (0, 1) would sit one scale
 		// ahead of the first snapshot of the new market and pay it gains it never earned.
 		assert_eq!(default_market_rows(), (2, 0));

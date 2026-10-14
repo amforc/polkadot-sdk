@@ -556,15 +556,20 @@ pub fn register_branch(
 ) {
 	// A market cannot be registered without a live price.
 	set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
-	// Account 1 owns every test stablecoin. The refundable deposit it pays for the market funds
-	// the collateral account the pool needs, and as the depositor it also pays the redistribution
-	// custody seed. That seed is withdrawn under `Preserve`, so it needs two minimum balances.
+	// Account 1 owns every test stablecoin. As the depositor it pays the redistribution custody
+	// seed of Vaults and the pool custody float of Stability, one collateral minimum each,
+	// withdrawn under `Preserve`. The stablecoin float is one stablecoin minimum, also preserved.
 	mint_collateral(
 		collateral.clone(),
 		1,
-		2 * <VaultCollateralAssets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(
+		3 * <VaultCollateralAssets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(
 			collateral.clone(),
 		),
+	);
+	mint_stable(
+		stable,
+		1,
+		2 * <Assets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(stable),
 	);
 	Vaults::create_branch(
 		RuntimeOrigin::signed(1),
@@ -577,8 +582,24 @@ pub fn register_branch(
 	.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
-	// The pool account gets no collateral pre-fund. Registration creates a zero-balance asset
-	// account when one is needed, so every gain stays tracked as pool collateral.
+	// The preserved remainder of the stablecoin float would skew every balance a test reads on
+	// account 1, so registration leaves its stablecoin exactly where it found it.
+	{
+		use frame::traits::{
+			fungibles::{Inspect as FungiblesInspect, Mutate as FungiblesMutate},
+			tokens::{Fortitude, Precision, Preservation},
+		};
+		let remainder = <Assets as FungiblesInspect<AccountId>>::minimum_balance(stable);
+		<Assets as FungiblesMutate<AccountId>>::burn_from(
+			stable,
+			&1,
+			remainder,
+			Preservation::Expendable,
+			Precision::Exact,
+			Fortitude::Force,
+		)
+		.expect("burn the preserved float remainder");
+	}
 }
 
 /// Opens a vault, so that a test can create real market debt and move the TCR.
@@ -642,11 +663,11 @@ pub fn assert_claim_yield(who: AccountId, expected: Balance) {
 	assert_eq!(stable_balance(PUSD, who) - before, expected);
 }
 
-/// The default pool account holds nothing and the aggregates are all zero.
+/// The default pool account holds nothing beyond its custody float and the aggregates are all
+/// zero.
 pub fn assert_pool_fully_drained() {
-	let pool = Stability::pool_account(&DOT, &PUSD);
-	assert_eq!(stable_balance(PUSD, pool), 0);
-	assert_eq!(collateral_balance(DOT, pool), 0);
+	assert_eq!(pool_stable_held(DOT, PUSD), 0);
+	assert_eq!(pool_collateral_held(DOT, PUSD), 0);
 	let state = pool_state(DOT, PUSD);
 	assert_eq!(state.total_active_deposits, 0);
 	assert_eq!(state.total_pending_deposits, 0);
@@ -674,6 +695,19 @@ pub fn stable_balance(stable: StableId, who: AccountId) -> Balance {
 pub fn collateral_balance(collateral: AssetId, who: AccountId) -> Balance {
 	use frame::traits::fungibles::Inspect as FungiblesInspect;
 	<PoolCollateralAssets as FungiblesInspect<AccountId>>::balance(collateral, &who)
+}
+
+/// Stablecoin the pool account holds for depositors: its balance less the custody float.
+pub fn pool_stable_held(collateral: AssetId, stable: StableId) -> Balance {
+	let pool = crate::Pools::<Test>::get(&collateral, stable).expect("pool registered");
+	stable_balance(stable, Stability::pool_account(&collateral, &stable)) - pool.custody_stable
+}
+
+/// Collateral the pool account holds for depositors: its balance less the custody float.
+pub fn pool_collateral_held(collateral: AssetId, stable: StableId) -> Balance {
+	let pool = crate::Pools::<Test>::get(&collateral, stable).expect("pool registered");
+	collateral_balance(collateral.clone(), Stability::pool_account(&collateral, &stable)) -
+		pool.custody_collateral
 }
 
 /// Moves the clock forward.
@@ -798,19 +832,29 @@ pub fn seed_matured_deposit_from_balance(who: AccountId, balance: Balance, amoun
 
 /// Gives an existing default-pool row backed claimable balances without exercising their source.
 pub fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Balance) {
-	let pool = Stability::pool_account(&DOT, &PUSD);
-	crate::Deposits::<Test>::mutate((DOT, PUSD, who), |row| {
+	seed_claimables_in(DOT, who, collateral_gain, yield_gain);
+}
+
+/// [`seed_claimables`] in the `collateral`/pUSD market.
+pub fn seed_claimables_in(
+	collateral: AssetId,
+	who: AccountId,
+	collateral_gain: Balance,
+	yield_gain: Balance,
+) {
+	let pool = Stability::pool_account(&collateral, &PUSD);
+	crate::Deposits::<Test>::mutate((collateral.clone(), PUSD, who), |row| {
 		let row = row.as_mut().expect("deposit row exists");
 		row.claimable_collateral += collateral_gain;
 		row.claimable_yield += yield_gain;
 	});
-	crate::Pools::<Test>::mutate(DOT, PUSD, |pool| {
+	crate::Pools::<Test>::mutate(collateral.clone(), PUSD, |pool| {
 		let state = &mut pool.as_mut().expect("pool registered").state;
 		state.total_collateral_gains_unclaimed += collateral_gain;
 		state.total_yield_unclaimed += yield_gain;
 	});
 	if collateral_gain > 0 {
-		mint_collateral(DOT, pool, collateral_gain);
+		mint_collateral(collateral, pool, collateral_gain);
 	}
 	if yield_gain > 0 {
 		mint_stable(PUSD, pool, yield_gain);

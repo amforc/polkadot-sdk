@@ -748,6 +748,8 @@ pub mod pallet {
 		DormantTargetOccupied,
 		/// The amount is zero.
 		ZeroAmount,
+		/// The vault has no debt to repay.
+		NoDebt,
 		/// The vault is below the ratio required to leave final recovery.
 		CollateralizationRatioTooLow,
 		/// Nomination requires non-zero debt below the market minimum.
@@ -1031,7 +1033,7 @@ pub mod pallet {
 		/// Must be signed by the account paying the stable assets.
 		///
 		/// Any account may repay for a vault owner. `None` settles the full payoff at execution.
-		/// A `Some` amount must be non-zero.
+		/// A `Some` amount must be non-zero, and the vault must carry debt.
 		/// Repayment is allowed during final recovery, while frozen, and without a live price.
 		/// A full payoff closes a vault with no collateral, including while frozen or without a
 		/// live price. A vault with remaining collateral becomes debt-free and dormant.

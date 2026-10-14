@@ -19,8 +19,7 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 
 		let owner_before = collateral_balance(DOT, 1);
 		let keeper_before = collateral_balance(DOT, 4);
-		let pool_account = Stability::pool_account(&DOT, &PUSD);
-		let pool_before = collateral_balance(DOT, pool_account);
+		let pool_before = pool_collateral_held(DOT, PUSD);
 
 		assert_ok!(Vaults::liquidate(
 			RuntimeOrigin::signed(4),
@@ -32,7 +31,7 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 
 		assert!(pallet_vaults::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
-		assert_eq!(collateral_balance(DOT, pool_account) - pool_before, 571);
+		assert_eq!(pool_collateral_held(DOT, PUSD) - pool_before, 571);
 		assert_eq!(collateral_balance(DOT, 4) - keeper_before, 12);
 		// Terminal interest makes debt 501 and reduces the owner surplus to 14.
 		assert_eq!(collateral_balance(DOT, 1) - owner_before, 14);
@@ -40,7 +39,7 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 }
 
 #[test]
-fn sub_minimum_first_gain_settles_into_touched_pool_account() {
+fn sub_minimum_first_gain_settles_into_seeded_pool_account() {
 	build_and_execute(|| {
 		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
 		let collateral = AssetId::WithId(77);
@@ -64,11 +63,12 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 
 		let owner_free_before = collateral_balance(collateral.clone(), 1);
 		let pool_account = Stability::pool_account(&collateral, &PUSD);
-		// Registration touched a zero-balance asset account, so even a one-unit gain can enter it.
+		// Registration parked the asset minimum in the pool account, so even a one-unit gain can
+		// enter it.
 		assert_ok!(Assets::can_deposit(77, &pool_account, 1, Provenance::Extant).into_result());
 
 		// The active-pool gain is below the asset minimum to test prepared custody.
-		// The pre-created account accepts it, so the normal active-first waterfall remains intact.
+		// The seeded account accepts it, so the normal active-first waterfall remains intact.
 		assert_ok!(Vaults::liquidate(
 			RuntimeOrigin::signed(4),
 			collateral.clone(),
@@ -82,8 +82,8 @@ fn sub_minimum_first_gain_settles_into_touched_pool_account() {
 		let state = pool_state(collateral.clone(), PUSD);
 		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(state.total_collateral_gains_unclaimed, 571);
-		assert_eq!(stable_balance(PUSD, pool_account), 0);
-		assert_eq!(collateral_balance(collateral.clone(), pool_account), 571);
+		assert_eq!(pool_stable_held(collateral.clone(), PUSD), 0);
+		assert_eq!(pool_collateral_held(collateral.clone(), PUSD), 571);
 		// Redistribution collateral remains in custody until the recipient is touched.
 		use frame::traits::fungibles::InspectHold;
 		assert_eq!(
@@ -153,13 +153,12 @@ fn liquidation_pool_legs_match_the_quotes_and_one_offset() {
 		set_price(DOT, FixedU128::from_rational(9u128, 10u128));
 	};
 	let pool_view = || {
-		let pool_account = Stability::pool_account(&DOT, &PUSD);
 		(
 			pool_state(DOT, PUSD),
 			active_sums(0, 0),
 			pending_sums(0, 0),
-			stable_balance(PUSD, pool_account),
-			collateral_balance(DOT, pool_account),
+			pool_stable_held(DOT, PUSD),
+			pool_collateral_held(DOT, PUSD),
 		)
 	};
 

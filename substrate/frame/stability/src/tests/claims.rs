@@ -64,3 +64,42 @@ fn claims_pay_out_clear_and_default_to_the_caller() {
 		assert_eq!(stable_balance(PUSD, 1) - stable_before, 55);
 	});
 }
+
+// Regression: without the custody float, the last claims of a drained pool left only a
+// sub-minimum remainder behind and `Preserve` refused them until a new liquidation topped the
+// account up. The float is what every exact payout leaves behind instead.
+#[test]
+fn claims_leaving_a_sub_minimum_remainder_still_pay_out() {
+	build_and_execute(|| {
+		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		let collateral = AssetId::WithId(77);
+		register_branch(collateral.clone(), PUSD, branch_config_for(collateral.clone(), PUSD));
+		let pool = Stability::pool_account(&collateral, &PUSD);
+		for who in [1, 2] {
+			mint_stable(PUSD, who, 100);
+			assert_ok!(deposit(who, collateral.clone(), PUSD, 100));
+		}
+		seed_claimables_in(collateral.clone(), 1, 600, 0);
+		seed_claimables_in(collateral.clone(), 2, 400, 0);
+		assert_eq!(collateral_balance(collateral.clone(), pool), 2_000);
+		// Both payouts are below the asset minimum, so the recipients need accounts first.
+		for recipient in [8, 9] {
+			mint_collateral(collateral.clone(), recipient, 1_000);
+		}
+
+		// 400 of tracked gains stay behind, below the 1_000 minimum; the float sits beneath them.
+		assert_ok!(claim_collateral(1, collateral.clone(), PUSD, 8));
+		assert_eq!(collateral_balance(collateral.clone(), 8), 1_600);
+		assert_eq!(pool_collateral_held(collateral.clone(), PUSD), 400);
+
+		// The last claim empties the tracked gains and leaves exactly the float.
+		assert_ok!(claim_collateral(2, collateral.clone(), PUSD, 9));
+		assert_eq!(collateral_balance(collateral.clone(), 9), 1_400);
+		assert_eq!(pool_collateral_held(collateral.clone(), PUSD), 0);
+		assert_eq!(collateral_balance(collateral.clone(), pool), 1_000);
+		assert_noop!(
+			claim_collateral(2, collateral, PUSD, 2),
+			Error::<Test>::NoClaimableCollateral
+		);
+	});
+}
