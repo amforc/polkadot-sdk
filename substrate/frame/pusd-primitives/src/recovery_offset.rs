@@ -15,8 +15,7 @@ pub enum RecoveryOffsetResult<Balance> {
 	Applied { collateral_out: Balance },
 }
 
-/// Execution of recovery offsets against the `FinalRecovery` FIFO head,
-/// restricted to the `CR >= 100%` (recovery-bonus) regime.
+/// Executes recovery offsets against the `FinalRecovery` FIFO head when `100% <= CR <= ICR`.
 ///
 /// Like redemptions, each call stops after one head, so it never crosses into another recovery
 /// price.
