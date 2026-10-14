@@ -32,14 +32,14 @@ pub mod xcm_config;
 
 // Configurations for next functionality.
 mod bag_thresholds;
+pub mod dotusd_config;
 pub mod governance;
 #[cfg(not(feature = "runtime-benchmarks"))]
 mod migrations;
-pub mod pusd_config;
 pub mod staking;
 
+use dotusd_config::pallet_mock_oracle;
 use governance::{pallet_custom_origins, GeneralAdmin, StakingAdmin};
-use pusd_config::pallet_mock_oracle;
 
 extern crate alloc;
 
@@ -179,7 +179,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: alloc::borrow::Cow::Borrowed("westmint"),
 	impl_name: alloc::borrow::Cow::Borrowed("westmint"),
 	authoring_version: 1,
-	spec_version: 1_025_006,
+	spec_version: 1_026_001,
 	impl_version: 0,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 16,
@@ -2149,6 +2149,9 @@ mod benches {
 		[pallet_psm, Psm]
 		[pallet_recovery, Recovery]
 		[pallet_referenda, Referenda]
+		[pallet_linked_list, LinkedList]
+		[pallet_redemptions, Redemptions]
+		[pallet_stability, Stability]
 		[pallet_session, SessionBench::<Runtime>]
 		[pallet_staking_async, Staking]
 		[pallet_staking_async_rc_client, StakingRcClientBench::<Runtime>]

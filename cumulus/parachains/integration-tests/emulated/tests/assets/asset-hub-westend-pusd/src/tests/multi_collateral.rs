@@ -24,10 +24,7 @@ use asset_hub_westend_runtime::{
 use emulated_integration_tests_common::{snowbridge::SEPOLIA_ID, USDT_ID};
 use frame_support::{
 	assert_noop, hypothetically, hypothetically_ok,
-	traits::{
-		fungibles::Refund,
-		tokens::{Fortitude, Preservation, Provenance},
-	},
+	traits::tokens::{Fortitude, Preservation, Provenance},
 };
 use pallet_vaults::BranchConfigUpdate;
 use sp_runtime::{traits::MaybeEquivalence, TokenError};
@@ -146,18 +143,19 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 /// still needs one.
 ///
 /// The stability pool must accept an offset gain below the collateral's minimum
-/// balance. That needs a pool account created in advance, and someone must pay
-/// its asset-account deposit. Root supplies no depositor, so the full admin pays.
-/// Root creation already charges that account for collateral custody.
+/// balance. That needs the custody float parked in advance, and someone must pay
+/// it. Root supplies no depositor, so the full admin pays. Root creation already
+/// charges that account for collateral custody.
 #[test]
 fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 	AssetHubWestend::execute_with(|| {
 		create_pusd();
 		feed_price_for(eth_id(), eth_price(2_000));
 
-		// The full admin funds both the custody seed and the pool account's deposit.
+		// The full admin funds both custody seeds and the pool's stablecoin float.
 		assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&admin(), 1_000 * WND));
-		fund_collateral(&eth_id(), &admin(), collateral_min_balance(&eth_id()));
+		fund_collateral(&eth_id(), &admin(), 2 * collateral_min_balance(&eth_id()));
+		mint_pusd(&admin(), 2 * PUSD_MIN_BALANCE);
 
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::root(),
@@ -169,14 +167,12 @@ fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 		));
 		assert!(pallet_vaults::Branches::<Runtime>::get(eth_id(), PUSD_ID).is_some());
 
-		// The pool can now take a gain below the collateral's minimum balance. The
-		// full admin paid the deposit.
+		// The pool can now take a gain below the collateral's minimum balance: the
+		// full admin's float sits in the account.
 		let pool = pallet_stability::Pallet::<Runtime>::pool_account(&eth_id(), &PUSD_ID);
-		let (depositor, deposit) =
-			<StabilityCollateral as Refund<AccountId>>::deposit_held(eth_id(), pool.clone())
-				.expect("registration touched the pool account");
-		assert_eq!(depositor, admin(), "Root creation charges the full admin");
-		assert!(deposit > 0);
+		assert_eq!(collateral_free(&eth_id(), &pool), collateral_min_balance(&eth_id()));
+		assert_eq!(pusd_balance(&pool), PUSD_MIN_BALANCE);
+		assert_eq!(collateral_free(&eth_id(), &admin()), collateral_min_balance(&eth_id()));
 		assert_ok!(<StabilityCollateral as Inspect<AccountId>>::can_deposit(
 			eth_id(),
 			&pool,
@@ -236,10 +232,14 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 			collateral_free(&eth_id(), &keeper) - collateral_min_balance(&eth_id()),
 			6_250_000_000_000_000,
 		);
-		// The pool burns the full 10,000 pUSD debt and receives 5.25 − 0.00625 = 5.24375 ETH.
+		// The pool burns the full 10,000 pUSD debt and receives 5.25 − 0.00625 = 5.24375 ETH,
+		// on top of the custody float of one minimum per asset.
 		let pool = pool_account_on(&eth_id());
-		assert_eq!(pusd_balance(&pool), 10_000 * PUSD);
-		assert_eq!(collateral_free(&eth_id(), &pool), 5_243_750_000_000_000_000);
+		assert_eq!(pusd_balance(&pool) - PUSD_MIN_BALANCE, 10_000 * PUSD);
+		assert_eq!(
+			collateral_free(&eth_id(), &pool) - collateral_min_balance(&eth_id()),
+			5_243_750_000_000_000_000
+		);
 		// The liquidated vault is removed.
 		assert_eq!(vault_status_on(&eth_id(), &liquidated_owner), None);
 

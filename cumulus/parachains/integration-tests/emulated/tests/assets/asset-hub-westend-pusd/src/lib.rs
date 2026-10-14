@@ -26,10 +26,7 @@ mod imports {
 		},
 	};
 	pub(crate) use parachains_common::{AccountId, Balance};
-	pub(crate) use sp_runtime::{
-		traits::{One, Zero},
-		FixedU128, MultiAddress, Permill,
-	};
+	pub(crate) use sp_runtime::{traits::Zero, FixedU128, MultiAddress, Permill};
 
 	pub(crate) use emulated_integration_tests_common::xcm_emulator::{
 		TestExt, RELAY_CHAIN_SLOT_DURATION_MILLIS,

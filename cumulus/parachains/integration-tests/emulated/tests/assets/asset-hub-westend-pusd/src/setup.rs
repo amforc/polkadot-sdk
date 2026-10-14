@@ -22,18 +22,13 @@ use asset_hub_westend_runtime::{
 		StabilityCollateral, StableInsuranceAccount, VaultsCollateral, VaultsDepositPolicy,
 		VaultsNativeCollateralId,
 	},
-	Assets, AuraExt, Balances, MockOracle, OriginCaller, Redemptions, Runtime, RuntimeCall,
-	RuntimeEvent, RuntimeHoldReason, Stability, Timestamp, Vaults,
+	Assets, AuraExt, Balances, MockOracle, Redemptions, Runtime, RuntimeHoldReason, Stability,
+	Timestamp, Vaults,
 };
-use emulated_integration_tests_common::macros::DryRunApiV2;
-use frame_support::{
-	assert_noop, assert_storage_noop,
-	storage::{with_transaction, TransactionOutcome},
-};
+use frame_support::{assert_noop, assert_storage_noop};
 use pallet_redemptions::RedemptionTerms;
 use pallet_vaults::JitTerms;
 use pusd_primitives::VaultStatus;
-use sp_runtime::{DispatchError, DispatchResult};
 
 pub(crate) const WND: Balance = 1_000_000_000_000;
 /// The stablecoin's metadata decimals.
@@ -135,12 +130,15 @@ pub(crate) fn accounting_spec() -> BranchSpec {
 /// debt ceiling.
 pub(crate) fn create_branch(spec: &BranchSpec) {
 	create_pusd();
-	// Root creation charges the full admin one ED under `Preserve`, so the admin
-	// needs two ED. `admin()` has no genesis balance.
+	// Root creation charges the full admin two ED under `Preserve` (the Vaults
+	// redistribution seed and the pool custody float), so the admin needs three
+	// ED, plus two stablecoin minimums for the pool's stablecoin float. `admin()`
+	// has no genesis balance.
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(
 		&admin(),
-		get_native_ed().saturating_mul(2),
+		get_native_ed().saturating_mul(3),
 	));
+	mint_pusd(&admin(), PUSD_MIN_BALANCE.saturating_mul(2));
 	assert_ok!(Vaults::create_branch(
 		RuntimeOrigin::root(),
 		get_native_id(),
@@ -186,10 +184,15 @@ pub(crate) fn create_pusd() {
 /// global debt ceiling. The creator then pays every refundable registration
 /// cost, not the full admin.
 pub(crate) fn create_market_signed(collateral_id: VaultsCollateralId, spec: &BranchSpec) {
-	// The creator pays the creation deposit, the pool account's asset deposit,
-	// and the custody seed.
+	// The creator pays the creation deposit and both custody seeds: collateral
+	// for the redistribution account and the pool, stablecoin for the pool.
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&admin(), 1_000 * WND));
-	fund_collateral(&collateral_id, &admin(), collateral_min_balance(&collateral_id));
+	fund_collateral(
+		&collateral_id,
+		&admin(),
+		collateral_min_balance(&collateral_id).saturating_mul(2),
+	);
+	mint_pusd(&admin(), PUSD_MIN_BALANCE.saturating_mul(2));
 	assert_ok!(Vaults::create_branch(
 		RuntimeOrigin::signed(admin()),
 		collateral_id.clone(),
@@ -422,17 +425,6 @@ pub(crate) fn vault_status_on(
 	}
 }
 
-/// Touches the vault through a throwaway origin, materializing pending
-/// redistribution and interest.
-pub(crate) fn poke(owner: &AccountId) {
-	assert_ok!(Vaults::poke(
-		RuntimeOrigin::signed(acct(0xFE)),
-		get_native_id(),
-		PUSD_ID,
-		owner.clone(),
-	));
-}
-
 /// Puts `owner`'s vault in the FinalRecovery FIFO through a throwaway keeper.
 /// The keeper's reward, if any, has its own test.
 pub(crate) fn enter_final_recovery(owner: &AccountId) {
@@ -445,20 +437,6 @@ pub(crate) fn enter_final_recovery(owner: &AccountId) {
 	assert_eq!(vault_status(owner), Some(VaultStatus::FinalRecovery));
 }
 
-/// A fresh native-funded account for keeper duties. Its balance starts at the ED,
-/// so a reward reads as `native_balance(&keeper) - get_native_ed()`.
-pub(crate) fn keeper() -> AccountId {
-	let keeper = acct(0xEE);
-	assert_eq!(native_balance(&keeper), 0, "the keeper is funded once");
-	fund_dot(&keeper, 0);
-	keeper
-}
-
-/// Liquidates without JIT, with a throwaway keeper.
-pub(crate) fn liquidate(owner: &AccountId) {
-	liquidate_on(get_native_id(), owner);
-}
-
 pub(crate) fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId) {
 	let keeper = acct(0xEE);
 	fund_collateral(&collateral_id, &keeper, 0);
@@ -469,47 +447,6 @@ pub(crate) fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId)
 		owner.clone(),
 		JitTerms { max_stable: 0, min_collateral_out: 0 },
 	));
-}
-
-/// Repaid vaults retain stake. With an empty pool, liquidation assigns each 100 pUSD of debt
-/// and 100 WND lazily, without putting either recipient in the redemption slot.
-pub(crate) fn redistributed_husks() -> [AccountId; 2] {
-	feed_price(dot_price(10, 1));
-	create_branch(&BranchSpec {
-		minimum_debt: 200 * PUSD,
-		keeper_flat_compensation_value: 0,
-		keeper_percent_compensation: Permill::zero(),
-		..Default::default()
-	});
-	let owners = [acct(1), acct(2)];
-	for owner in &owners {
-		// The existing redistribution ledger requires a non-zero recipient stake accrual rate.
-		open_vault(owner, 1_000 * WND, 500 * PUSD, FixedU128::from_rational(1, 100));
-		assert_ok!(Vaults::repay_for(
-			RuntimeOrigin::signed(owner.clone()),
-			get_native_id(),
-			PUSD_ID,
-			owner.clone(),
-			None,
-		));
-	}
-	let victim = acct(3);
-	open_vault(&victim, 200 * WND, 200 * PUSD, FixedU128::zero());
-	feed_price(dot_price(1, 1));
-	liquidate(&victim);
-	assert_eq!(branch_state().dormant_redemption_target, None);
-	assert_eq!(branch_state().debt.pending_redistribution_principal, 200 * PUSD);
-	owners
-}
-
-/// Nominates `owner`'s dust vault for the Dormant slot through a throwaway signer.
-pub(crate) fn nominate_dormant(owner: &AccountId) -> DispatchResult {
-	Vaults::nominate_dormant(
-		RuntimeOrigin::signed(acct(0xF0)),
-		get_native_id(),
-		PUSD_ID,
-		owner.clone(),
-	)
 }
 
 /// Funds a fresh `redeemer` with `terms.max_stable_to_spend` plus the stablecoin
@@ -536,77 +473,8 @@ pub(crate) fn redeem(redeemer: &AccountId, terms: RedemptionTerms<Balance>) -> B
 	native_balance(redeemer) - native_before
 }
 
-/// Amounts that a dry run of `Redemptions::redeem` reports through its settlement event.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct DryRedemption {
-	pub stable_burned: Balance,
-	pub fee: Balance,
-	pub collateral_out: Balance,
-	pub steps: u32,
-}
-
-impl DryRedemption {
-	/// Total pUSD that the redeemer would pay.
-	pub(crate) fn stable_in(&self) -> Balance {
-		self.stable_burned + self.fee
-	}
-
-	fn from_events(events: Vec<RuntimeEvent>) -> Option<Self> {
-		events.into_iter().find_map(|event| match event {
-			RuntimeEvent::Redemptions(pallet_redemptions::Event::OrdinaryRedemptionExecuted {
-				stable_burned,
-				collateral_out,
-				fee,
-				steps,
-				..
-			}) => Some(Self { stable_burned, fee, collateral_out, steps }),
-			RuntimeEvent::Redemptions(pallet_redemptions::Event::RecoveryRedemptionExecuted {
-				stable_burned,
-				collateral_out,
-				..
-			}) => Some(Self { stable_burned, fee: 0, collateral_out, steps: 1 }),
-			_ => None,
-		})
-	}
-}
-
-/// Dry-runs a redemption by an account that can pay all of `max_stable_to_spend`, so only the
-/// market bounds the result.
-///
-/// The pallet has no quote of its own. A client dry-runs the call through the runtime's
-/// `DryRunApi` and reads the amounts from the settlement event, and so does this helper. The
-/// funding is rolled back with the dry run, so the call changes nothing.
-pub(crate) fn dry_run_funded_redeem(
-	max_stable_to_spend: Balance,
-) -> Result<DryRedemption, DispatchError> {
-	let redeemer = acct(0xEF);
-	with_transaction(|| {
-		fund_dot(&redeemer, 0);
-		mint_pusd(&redeemer, max_stable_to_spend + PUSD_MIN_BALANCE);
-		let call = RuntimeCall::Redemptions(pallet_redemptions::Call::redeem {
-			collateral_id: get_native_id(),
-			stable_id: PUSD_ID,
-			terms: RedemptionTerms { max_stable_to_spend, min_collateral_out: 0 },
-			recipient: redeemer.clone(),
-			max_steps: 16,
-		});
-		let origin = OriginCaller::system(frame_system::RawOrigin::Signed(redeemer.clone()));
-		let effects = Runtime::dry_run_call(origin, call, xcm::prelude::XCM_VERSION)
-			.expect("the runtime can dry-run a local call");
-		let dry = effects.execution_result.map_err(|failed| failed.error).map(|_post_info| {
-			DryRedemption::from_events(effects.emitted_events)
-				.expect("a successful redemption deposits its settlement event")
-		});
-		TransactionOutcome::Rollback(dry)
-	})
-}
-
 pub(crate) fn pusd_balance(who: &AccountId) -> Balance {
 	<Assets as Inspect<AccountId>>::balance(PUSD_ID, who)
-}
-
-pub(crate) fn pusd_issuance() -> Balance {
-	<Assets as Inspect<AccountId>>::total_issuance(PUSD_ID)
 }
 
 /// Market-level accounting for the native-WND market.
@@ -647,14 +515,6 @@ pub(crate) fn pool_account_on(collateral_id: &VaultsCollateralId) -> AccountId {
 	Stability::pool_account(collateral_id, &PUSD_ID)
 }
 
-/// Mints and deposits, then waits out the entry delay.
-///
-/// The deposit is left matured rather than active. Activation belongs to the next pool
-/// operation the test performs, which is how it happens on chain.
-pub(crate) fn sp_deposit_matured(who: &AccountId, amount: Balance) {
-	sp_deposit_matured_on(get_native_id(), who, amount);
-}
-
 pub(crate) fn sp_deposit_matured_on(
 	collateral_id: VaultsCollateralId,
 	who: &AccountId,
@@ -686,11 +546,6 @@ fn sp_pending_deadline(collateral_id: &VaultsCollateralId, who: &AccountId) -> O
 		.map(|cohort| cohort.deadline)
 }
 
-/// Mints and deposits. The funds stay pending behind the entry delay.
-pub(crate) fn sp_deposit_pending(who: &AccountId, amount: Balance) {
-	sp_deposit_pending_on(get_native_id(), who, amount);
-}
-
 pub(crate) fn sp_deposit_pending_on(
 	collateral_id: VaultsCollateralId,
 	who: &AccountId,
@@ -705,16 +560,6 @@ pub(crate) fn sp_deposit_pending_on(
 	));
 }
 
-pub(crate) fn pool_state() -> pallet_stability::types::PoolState<Balance> {
-	pallet_stability::Pools::<Runtime>::get(get_native_id(), PUSD_ID)
-		.expect("stability pool registered")
-		.state
-}
-
-pub(crate) fn deposit_row(who: &AccountId) -> pallet_stability::types::Deposit<Balance> {
-	deposit_row_on(&get_native_id(), who)
-}
-
 pub(crate) fn deposit_row_on(
 	collateral_id: &VaultsCollateralId,
 	who: &AccountId,
@@ -726,18 +571,6 @@ pub(crate) fn deposit_row_on(
 /// Settled rows that hold nothing are pruned, so a missing row is a valid end state.
 pub(crate) fn deposit_row_exists(collateral_id: &VaultsCollateralId, who: &AccountId) -> bool {
 	pallet_stability::Deposits::<Runtime>::contains_key((collateral_id, PUSD_ID, who.clone()))
-}
-
-/// Claims yield on the native market and checks the stablecoin paid out.
-pub(crate) fn claim_yield_out(who: &AccountId, expected: Balance) {
-	let pusd_before = pusd_balance(who);
-	assert_ok!(Stability::claim_yield(
-		RuntimeOrigin::signed(who.clone()),
-		get_native_id(),
-		PUSD_ID,
-		None,
-	));
-	assert_eq!(pusd_balance(who) - pusd_before, expected);
 }
 
 /// Claims realized collateral and checks transfers in the collateral asset pallet.
@@ -773,34 +606,5 @@ pub(crate) fn claim_collateral_out(
 			None,
 		),
 		expected_error,
-	);
-}
-
-/// Changes the pool configuration through its full-admin `UpdateOrigin`.
-pub(crate) fn mutate_pool_config(
-	tweak: impl FnOnce(&mut pallet_stability::types::StabilityPoolConfig<Balance>),
-) {
-	let mut config = pallet_stability::Pools::<Runtime>::get(get_native_id(), PUSD_ID)
-		.expect("stability pool registered")
-		.config;
-	tweak(&mut config);
-	assert_ok!(Stability::set_stability_pool_config(
-		RuntimeOrigin::signed(admin()),
-		get_native_id(),
-		PUSD_ID,
-		config,
-	));
-}
-
-/// Sets the redemption dynamic fee directly, in place of the redemption history
-/// that would produce it. `last_fee_operation = now` means the value is already
-/// decayed.
-pub(crate) fn set_dynamic_fee(rate: FixedU128) {
-	pallet_redemptions::RedemptionStates::<Runtime>::insert(
-		PUSD_ID,
-		pallet_redemptions::RedemptionState {
-			dynamic_fee: rate,
-			last_fee_operation: Timestamp::get(),
-		},
 	);
 }
