@@ -288,6 +288,7 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for Record
 		collateral_id: &AssetId,
 		stable_id: &StableId,
 		remaining_stablecoin_markets: u32,
+		_funder: &AccountId,
 	) -> DispatchResult {
 		LifecycleLog::mutate(|l| {
 			l.push((collateral_id.clone(), *stable_id, false, remaining_stablecoin_markets))
