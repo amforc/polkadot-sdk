@@ -94,7 +94,7 @@ fn debt_in_front_includes_dormant_redemption_target() {
 		let debt_in_front =
 			|steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), steps);
 		assert_eq!(debt_in_front(u32::MAX), Ok((501 + 701, false))); // principal + fee 1 each, no
-																	 // elapsed time
+															   // elapsed time
 
 		// Redeem vault 1 (entire debt 501) down to 199, one below `MinimumDebt`.
 		assert_ok!(redeem(DOT, PUSD, 3, 302));
