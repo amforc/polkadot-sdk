@@ -138,30 +138,14 @@ impl<'a, T: Config> DepositOp<'a, T> {
 		)
 	}
 
-	/// Applies an incoming deposit to the `FinalRecovery` queue head and returns the unused credit.
+	/// Credits the collateral of an incoming recovery settlement to the row.
 	///
-	/// The depositor receives the collateral from this settlement. The settled stablecoin does not
-	/// enter pool custody, so it has no claim on prior pool gains.
-	fn settle_incoming_recovery(
-		&mut self,
-		pool_account: &T::AccountId,
-		payment: StableCreditOf<T>,
-	) -> Result<StableCreditOf<T>, DispatchError> {
-		let amount = payment.peek();
-		let (result, change) =
-			T::RecoveryOffsets::execute_recovery_offset(self.collateral_id, payment, pool_account)?;
-		let collateral_out = match result {
-			RecoveryOffsetResult::NoTarget => {
-				debug_assert_eq!(change.peek(), amount);
-				return Ok(change);
-			},
-			RecoveryOffsetResult::BelowPar => {
-				// The dropped change unwinds with the failing extrinsic.
-				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
-			},
-			RecoveryOffsetResult::Applied { collateral_out } => collateral_out,
-		};
-
+	/// The settled stablecoin never entered pool custody, so it has no claim on prior pool gains:
+	/// the collateral is a direct credit, not an accumulator update.
+	fn credit_recovery_collateral(&mut self, collateral_out: BalanceOf<T>) -> DispatchResult {
+		if collateral_out.is_zero() {
+			return Ok(());
+		}
 		self.deposit.claimable_collateral = self
 			.deposit
 			.claimable_collateral
@@ -173,12 +157,7 @@ impl<'a, T: Config> DepositOp<'a, T> {
 			.total_collateral_gains_unclaimed
 			.checked_add(&collateral_out)
 			.ok_or(ArithmeticError::Overflow)?;
-		Pallet::<T>::deposit_event(Event::RecoveryOffsetApplied {
-			collateral_id: self.collateral_id.clone(),
-			stable_id: self.stable_id.clone(),
-			source: RecoveryOffsetSource::IncomingDeposit,
-		});
-		Ok(change)
+		Ok(())
 	}
 
 	/// Adds funded stablecoin to pending capital.
@@ -401,13 +380,9 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
-		let pool = Self::load_pool(&collateral_id, &stable_id)?;
+		let minimum_deposit = Self::load_pool(&collateral_id, &stable_id)?.config.minimum_deposit;
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
-		ensure!(amount >= pool.config.minimum_deposit, Error::<T>::DepositTooSmall);
-
-		let now = T::TimeProvider::now();
-		let mut op = DepositOp::<T>::load_or_fresh(&collateral_id, &stable_id, &who, pool)?;
-		op.refresh(BranchSnapshot { mode, now })?;
+		ensure!(amount >= minimum_deposit, Error::<T>::DepositTooSmall);
 
 		// One withdrawal funds both halves: the recovery settlement takes its slice from the
 		// credit, and the change becomes the pending deposit. `Expendable` only on a full drain,
@@ -424,7 +399,34 @@ impl<T: Config> Pallet<T> {
 			Fortitude::Polite,
 		)?;
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		let change = op.settle_incoming_recovery(&pool_account, payment)?;
+		// The settlement runs before the row loads: settling the head re-enters this pallet
+		// through the vault's yield hook, and a row loaded earlier would commit over that yield.
+		let (result, change) =
+			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
+		let collateral_out = match result {
+			RecoveryOffsetResult::NoTarget => {
+				debug_assert_eq!(change.peek(), amount);
+				BalanceOf::<T>::zero()
+			},
+			RecoveryOffsetResult::BelowPar => {
+				// The dropped change unwinds with the failing extrinsic.
+				return Err(Error::<T>::RecoveryOffsetBelowPar.into());
+			},
+			RecoveryOffsetResult::Applied { collateral_out } => {
+				Self::deposit_event(Event::RecoveryOffsetApplied {
+					collateral_id: collateral_id.clone(),
+					stable_id: stable_id.clone(),
+					source: RecoveryOffsetSource::IncomingDeposit,
+				});
+				collateral_out
+			},
+		};
+
+		let now = T::TimeProvider::now();
+		let pool = Self::load_pool(&collateral_id, &stable_id)?;
+		let mut op = DepositOp::<T>::load_or_fresh(&collateral_id, &stable_id, &who, pool)?;
+		op.refresh(BranchSnapshot { mode, now })?;
+		op.credit_recovery_collateral(collateral_out)?;
 		// The settlement can only spend value the credit carried, so the rest is still to queue.
 		let pending_amount = change.peek();
 		Self::resolve_into_pool(&stable_id, &pool_account, change)?;
@@ -492,8 +494,12 @@ impl<T: Config> Pallet<T> {
 		// Settling recovery debt reduces risk, so Safety Mode allows it. Only a freeze stops it.
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		// Matured capital must stand in the active total before the offset is sized against it.
+		// The activation is stored as a transition of its own, because the settlement below
+		// re-enters this pallet through the vault's yield hook and reads the stored row.
 		let branch = BranchSnapshot { mode, now: T::TimeProvider::now() };
-		Self::advance_cohorts(&collateral_id, &stable_id, &mut pool, branch)?;
+		if Self::advance_cohorts(&collateral_id, &stable_id, &mut pool, branch)? {
+			Pools::<T>::insert(&collateral_id, &stable_id, &pool);
+		}
 
 		// Size the burn before touching anything.
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
@@ -532,7 +538,9 @@ impl<T: Config> Pallet<T> {
 		// account.
 		Self::resolve_into_pool(&stable_id, &pool_account, change)?;
 
-		// The recovery interface already moved the value, so only the accounting remains.
+		// The recovery interface already moved the value, so only the accounting remains. It
+		// applies to the stored row, which now carries any yield the settlement routed here.
+		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
 		Self::apply_offset(
 			&collateral_id,
 			&stable_id,
@@ -823,7 +831,8 @@ impl<T: Config> Pallet<T> {
 		pool: &mut StabilityPoolOf<T>,
 		reservation: Option<OffsetReservation<BalanceOf<T>>>,
 		collateral: CollateralCreditOf<T>,
-	) -> Result<Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>, DispatchError> {
+	) -> Result<Option<(OffsetReservation<BalanceOf<T>>, CollateralCreditOf<T>)>, DispatchError>
+	{
 		let Some(reservation) = reservation else {
 			debug_assert!(collateral.peek().is_zero());
 			drop(collateral);

@@ -5,7 +5,7 @@
 //! plus a 1 upfront fee. At the parked price of 0.52 its CR is 104%, so the recovery bonus is 3%
 //! and cancelling debt `D` pays `floor(floor(D * 1.03) / 0.52)` collateral.
 
-use crate::{mock::*, Error};
+use crate::{mock::*, types::StabilityPoolConfig, Error};
 use frame::prelude::ArithmeticError;
 
 /// Open the standing vault (owner 5) and pin its exact debt.
@@ -346,5 +346,85 @@ fn incoming_deposit_fully_used_leaves_no_pending() {
 		// The head keeps its remaining 300 debt and stays in the FIFO.
 		assert_eq!(vault_debt(DOT, PUSD, 5), 300);
 		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 0);
+	});
+}
+
+/// Routes every minted unit to the pool, so the unit of interest the head's touch rounds up inside
+/// the recovery settlement reaches the pool as yield instead of the fee account.
+fn route_all_yield_to_pool() {
+	let config =
+		StabilityPoolConfig { yield_share: Permill::from_percent(100), ..default_pool_config() };
+	assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
+}
+
+/// Parks the head and lets interest run past the unit its last touch charged ahead, so the touch
+/// inside the settlement rounds up a unit the aggregate accrual did not cover.
+fn park_with_unminted_vault_interest() {
+	park_at_104_percent();
+	advance_time(30 * 24 * 3_600 * 1_000);
+	System::reset_events();
+}
+
+/// The settlement re-enters this pallet through the vault's yield hook. The yield it distributes
+/// must survive the commit of the pool row the operation held in memory while it ran: the
+/// post-test `try_state` then proves the pool balance still matches its tracked totals.
+fn assert_settlement_yield_survives(yield_before: Balance) {
+	let distributed: Balance = System::events()
+		.into_iter()
+		.filter_map(|record| match record.event {
+			RuntimeEvent::Stability(crate::Event::YieldDistributed { amount, .. }) => Some(amount),
+			_ => None,
+		})
+		.sum();
+	assert!(distributed > 0, "the operation must route yield to the pool");
+	assert_eq!(pool_state(DOT, PUSD).total_yield_unclaimed, yield_before + distributed);
+}
+
+#[test]
+fn incoming_deposit_keeps_yield_distributed_during_settlement() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, recovery_branch_config());
+		route_all_yield_to_pool();
+		open_standing_vault();
+		prepare_active_pool();
+		park_with_unminted_vault_interest();
+		let yield_before = pool_state(DOT, PUSD).total_yield_unclaimed;
+
+		mint_stable(PUSD, 2, 800);
+		assert_ok!(deposit(2, DOT, PUSD, 800));
+
+		System::assert_has_event(
+			crate::Event::RecoveryOffsetApplied {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				source: crate::types::RecoveryOffsetSource::IncomingDeposit,
+			}
+			.into(),
+		);
+		assert_settlement_yield_survives(yield_before);
+	});
+}
+
+#[test]
+fn active_pool_offset_keeps_yield_distributed_during_settlement() {
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, recovery_branch_config());
+		route_all_yield_to_pool();
+		open_standing_vault();
+		prepare_active_pool();
+		park_with_unminted_vault_interest();
+		let yield_before = pool_state(DOT, PUSD).total_yield_unclaimed;
+
+		assert_ok!(offset_recovery(DOT, PUSD, 300));
+
+		System::assert_has_event(
+			crate::Event::RecoveryOffsetApplied {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				source: crate::types::RecoveryOffsetSource::ActivePool,
+			}
+			.into(),
+		);
+		assert_settlement_yield_survives(yield_before);
 	});
 }
