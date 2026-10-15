@@ -14,6 +14,7 @@ pub trait WeightInfo {
 	fn enter_final_recovery() -> Weight;
 	fn exit_final_recovery() -> Weight;
 	fn activate_dormant() -> Weight;
+	fn nominate_dormant() -> Weight;
 	fn create_branch() -> Weight;
 	fn remove_branch() -> Weight;
 	fn set_param() -> Weight;
@@ -21,6 +22,7 @@ pub trait WeightInfo {
 	fn set_global_debt_ceiling() -> Weight;
 	fn set_governance_frozen() -> Weight;
 	fn refresh_branch() -> Weight;
+	fn liquidate() -> Weight;
 }
 
 impl WeightInfo for () {
@@ -57,6 +59,9 @@ impl WeightInfo for () {
 	fn activate_dormant() -> Weight {
 		Weight::zero()
 	}
+	fn nominate_dormant() -> Weight {
+		Weight::zero()
+	}
 	fn create_branch() -> Weight {
 		Weight::zero()
 	}
@@ -76,6 +81,9 @@ impl WeightInfo for () {
 		Weight::zero()
 	}
 	fn refresh_branch() -> Weight {
+		Weight::zero()
+	}
+	fn liquidate() -> Weight {
 		Weight::zero()
 	}
 }

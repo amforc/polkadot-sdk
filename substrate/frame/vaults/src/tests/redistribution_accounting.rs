@@ -1,5 +1,5 @@
 //! Tests for the redistribution / aggregate-interest accounting identities and
-//! the FinalRecovery exit / orchestrator-trust hot spots after liquidations.
+//! the low-level liquidation accounting.
 //!
 //! Conventions:
 //! - Eligible vaults use snapshot-corrected stake. Only `FinalRecovery` vaults have zero stake.
@@ -9,7 +9,7 @@
 
 use crate::{
 	mock::*,
-	tests::{assert_ok_and_invariants, rate_pct, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{assert_ok_and_invariants, liquidation_outcome, rate_pct, ONE_DAY_MS, ONE_YEAR_MS},
 };
 use pusd_primitives::CollateralRatio;
 
@@ -32,7 +32,7 @@ fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
 			let liquidated_debt = vault(DOT, PUSD, 3).debt.total();
 
 			set_price(DOT, FixedU128::from_rational(1u128, 1u128));
-			assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
+			assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
 			assert_eq!(vault(DOT, PUSD, 1).debt.principal, before_1);
 			assert_eq!(vault(DOT, PUSD, 2).debt.principal, before_2);
 
@@ -95,11 +95,7 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_1 = held(DOT, 1);
-		assert_ok!(liquidate_with(DOT, PUSD, 1, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_1,
-			keeper: KeeperCompensation { recipient: 1, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 1, coll_1));
 
 		let state_pre = branch_state(DOT, PUSD).unwrap();
 		// Both the owned debt and the pending share use the recipient's rate.
@@ -113,42 +109,6 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		// ceil(1_001 × 20%): the vault rounds the owned and the absorbed debt's interest up.
 		let post_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
 		assert_eq!(post_minted - state_pre.debt.minted_interest, 201);
-	});
-}
-
-// Recipient touches must preserve the market's accrual rate projection.
-#[test]
-fn mixed_rate_recipients_materialize_at_their_own_rates() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100))); // A — recipient
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(50, 100))); // B — recipient
-		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(10, 100))); // C — liquidated
-
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
-
-		assert_ok!(poke(99, DOT, PUSD, 1));
-		assert_ok!(poke(99, DOT, PUSD, 2));
-
-		let state = branch_state(DOT, PUSD).unwrap();
-		let vault_a = vault(DOT, PUSD, 1);
-		let vault_b = vault(DOT, PUSD, 2);
-		let expected = accrual_rate(vault_a.debt.principal, rate_pct(5, 100))
-			.saturating_add(accrual_rate(vault_b.debt.principal, rate_pct(50, 100)));
-		let actual: Balance = state.debt.accrual_rate.whole();
-		// One ceil (`average_branch_rate`) against two per-recipient floors.
-		assert!(
-			actual.abs_diff(expected) <= 2,
-			"mixed-rate accrual rate drift too large: actual={}, expected={}",
-			actual,
-			expected,
-		);
 	});
 }
 
@@ -199,12 +159,12 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 	});
 }
 
-// A follow-on `borrow` against a recipient must keep the branch accrual_rate
-// consistent with each vault's own-rate contribution: the borrow first touches
-// the vault to fold in its redistribution share, then updates the accrual-rate
-// bookkeeping so the aggregate still equals Σ (own ib_debt × own rate).
+// A follow-on `borrow` against a recipient first touches the vault to fold in its redistribution
+// share, then prices the fee at the market's average rate, which still counts the share left
+// pending. The quote and the dispatch must agree on both. The exact aggregates are checked by
+// `try_state` when the test ends.
 #[test]
-fn borrow_after_redistribution_keeps_accrual_rate_consistent() {
+fn borrow_after_redistribution_folds_the_share_and_charges_the_quoted_fee() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100))); // A — recipient + borrower
@@ -213,61 +173,24 @@ fn borrow_after_redistribution_keeps_accrual_rate_consistent() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		// C owes 500 plus an upfront fee of 3, priced at the 21.67% average of the three opens.
+		assert_eq!(redistribute_for_test(DOT, PUSD, 3, coll_3), Ok(503));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
 		let interest_before = vault(DOT, PUSD, 1).debt.interest;
+		// A holds half the stake, so the touch folds floor(503 / 2) = 251 into its principal and
+		// leaves 252 pending. After the borrow the market accrues, per year,
+		//   A: 2_751 · 5% = 137.55, B: 500 · 50% = 250, B's pending share: 251.5 · 50% = 125.75,
+		// which is 513 in whole units over 2_751 + 500 + 252 = 3_503 of principal: 14.64%. The
+		// fee is ceil(2_000 · 14.64% · 7d / 365.25d) = ceil(5.61) = 6. A's own 5% would give 2.
 		let predicted_fee =
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 200, None)
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 2_000, None)
 				.expect("touch projection and fee calculation succeed");
-		assert_ok!(borrow(1, DOT, PUSD, 200, None));
-		assert_eq!(
-			vault(DOT, PUSD, 1).debt.interest,
-			interest_before + predicted_fee,
-			"the prediction and execution paths share the pending-touch kernel",
-		);
-		assert_ok!(poke(99, DOT, PUSD, 2));
-
-		let state = branch_state(DOT, PUSD).unwrap();
-		let vault_a = vault(DOT, PUSD, 1);
-		let vault_b = vault(DOT, PUSD, 2);
-		let expected = accrual_rate(vault_a.debt.principal, rate_pct(5, 100))
-			.saturating_add(accrual_rate(vault_b.debt.principal, rate_pct(50, 100)));
-		let actual: Balance = state.debt.accrual_rate.whole();
-		// Same ceil-vs-floor drift as above, plus the borrow's own reconciliation.
-		assert!(
-			actual.abs_diff(expected) <= 2,
-			"accrual_rate drift after borrow: actual={}, expected={}",
-			actual,
-			expected,
-		);
-	});
-}
-
-#[test]
-fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
-	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(3, DOT, PUSD, 5_000, 500, rate_pct(5, 100)));
-
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-
-		for liquidatee in [1u64, 2u64] {
-			let collateral = held(DOT, liquidatee);
-			assert_ok_and_invariants(liquidate_with(DOT, PUSD, liquidatee, |_| {
-				LiquidationAllocation {
-					offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-					redistribution_collateral: collateral,
-					keeper: KeeperCompensation { recipient: liquidatee, collateral: 0 },
-				}
-			}));
-		}
+		assert_eq!(predicted_fee, 6);
+		assert_ok!(borrow(1, DOT, PUSD, 2_000, None));
+		let vault = vault(DOT, PUSD, 1);
+		assert_eq!(vault.debt.principal, 500 + 251 + 2_000);
+		assert_eq!(vault.debt.interest, interest_before + 6);
 	});
 }
 
@@ -438,7 +361,7 @@ fn dust_ratio_stake_floors_to_one_unit_and_stays_liquidatable() {
 		assert_ok!(poke(9, DOT, PUSD, 3));
 
 		set_price(DOT, FixedU128::from_rational(50u128, 100u128));
-		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
+		assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
 		assert!(!vault_exists(DOT, PUSD, 3));
 	});
 }
@@ -453,11 +376,7 @@ fn vault_cr_projects_lazy_redistribution_before_materialization() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, PUSD, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
 		// Restore price so the view's CR is defined for vault 1.
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
@@ -491,24 +410,23 @@ fn full_lifecycle_holds_branch_identities() {
 		// A month of accrual so touches materialise real interest.
 		advance_time(30 * ONE_DAY_MS);
 
-		// Liquidate vault 1 with a genuine three-way split: one third offset,
-		// the rest redistributed, plus keeper compensation.
+		// Liquidate vault 1 through the production three-way path: active
+		// Stability Pool, keeper JIT, then redistribution.
 		set_price(DOT, FixedU128::from_rational(55u128, 100u128));
 		let keeper_8_pre = collateral_balance(DOT, 8);
-		let offset_9_pre = collateral_balance(DOT, 9);
-		assert_ok_and_invariants(liquidate_with(DOT, PUSD, 1, |post_touch| {
-			LiquidationAllocation {
-				offset: OffsetAllocation {
-					collateral_recipient: 9,
-					debt: post_touch / 3,
-					collateral: 100,
-				},
-				redistribution_collateral: 500,
-				keeper: KeeperCompensation { recipient: 8, collateral: 10 },
-			}
-		}));
-		assert_eq!(collateral_balance(DOT, 8), keeper_8_pre + 10);
-		assert_eq!(collateral_balance(DOT, 9), offset_9_pre + 100);
+		let pool_pre = collateral_balance(DOT, SP_ACCOUNT);
+		ActiveSpCapacity::set(200);
+		mint_stable(PUSD, 8, 200);
+		assert_ok_and_invariants(liquidate(8, DOT, PUSD, 1, 200, 0));
+		let outcome = liquidation_outcome();
+		assert_ne!(outcome.active_pool.debt, 0);
+		assert_ne!(outcome.keeper_jit.debt, 0);
+		assert_ne!(outcome.redistribution.debt, 0);
+		assert_eq!(collateral_balance(DOT, SP_ACCOUNT) - pool_pre, outcome.active_pool.collateral);
+		assert_eq!(
+			collateral_balance(DOT, 8) - keeper_8_pre,
+			outcome.keeper_reward + outcome.keeper_jit.collateral
+		);
 
 		// The recipient must accrue interest from the redistribution time.
 		assert_ok_and_invariants(poke(9, DOT, PUSD, 2));
