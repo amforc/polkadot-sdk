@@ -2,7 +2,7 @@
 
 use crate::{
 	mock::*,
-	tests::{assert_event, rate_pct, vault_events, vault_status, ONE_YEAR_MS},
+	tests::{assert_event, liquidation_outcome, percent, vault_events, vault_status, ONE_YEAR_MS},
 };
 use frame::prelude::Pays;
 use pallet_linked_list::SortedListInterface;
@@ -23,7 +23,7 @@ fn low_recovery_price() -> FixedU128 {
 }
 
 fn enter_recovery(who: AccountId, rate: FixedU128) {
-	set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+	set_price(DOT, DEFAULT_PRICE);
 	assert_ok!(open(who, DOT, PUSD, 1_000, 500, rate));
 	set_price(DOT, low_recovery_price());
 	assert_ok!(enter_final_recovery(KEEPER, DOT, PUSD, who));
@@ -47,9 +47,9 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 
-		enter_recovery(1, rate_pct(1, 100));
-		enter_recovery(2, rate_pct(2, 100));
-		enter_recovery(3, rate_pct(3, 100));
+		enter_recovery(1, percent(1));
+		enter_recovery(2, percent(2));
+		enter_recovery(3, percent(3));
 
 		assert_eq!(
 			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
@@ -62,10 +62,7 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 		);
 		// The timestamp and cooldown apply to the market. Thus, only the first entry pays.
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
-		assert_eq!(
-			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
-			Some(Timestamp::get())
-		);
+		assert_eq!(market_state(DOT, PUSD).last_final_recovery_entry, Some(Timestamp::get()));
 	});
 }
 
@@ -73,7 +70,7 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 fn enter_final_recovery_is_an_idempotent_noop() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		advance_time(ONE_YEAR_MS);
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 
@@ -95,7 +92,7 @@ fn final_recovery_entry_pays_the_keeper_from_the_vault() {
 		register_market(DOT, PUSD);
 		assert_eq!(collateral_balance(DOT, KEEPER), 0, "keeper is fresh");
 
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 
 		let remaining = 1_000 - ENTRY_REWARD;
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
@@ -103,7 +100,7 @@ fn final_recovery_entry_pays_the_keeper_from_the_vault() {
 		assert_eq!(vault.collateral, remaining);
 		assert_eq!(held(DOT, 1), remaining);
 		assert_eq!(vault.redistribution_stake, 0);
-		let state = branch_state(DOT, PUSD).expect("state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.total_collateral, remaining);
 		assert_eq!(state.stakes.total, 0);
 		assert_eq!(state.stakes.collateral_basis, 0);
@@ -124,8 +121,8 @@ fn final_recovery_entry_pays_the_keeper_from_the_vault() {
 fn final_recovery_entry_pays_what_liquidation_pays() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(5)));
 		// The pool covers the first liquidation whole, so nothing redistributes onto vault 2.
 		ActiveSpCapacity::set(1_000);
 		set_price(DOT, low_recovery_price());
@@ -135,15 +132,7 @@ fn final_recovery_entry_pays_what_liquidation_pays() {
 		assert_ok!(liquidate(3, DOT, PUSD, 1, 0, 0));
 		let post_info = enter_final_recovery(4, DOT, PUSD, 2).expect("last vault enters recovery");
 
-		let liquidation_reward = System::events()
-			.into_iter()
-			.find_map(|record| match record.event {
-				RuntimeEvent::Vaults(crate::Event::VaultLiquidated { outcome, .. }) => {
-					Some(outcome.keeper_reward)
-				},
-				_ => None,
-			})
-			.expect("vault 1 liquidated");
+		let liquidation_reward = liquidation_outcome().keeper_reward;
 		assert_eq!(liquidation_reward, ENTRY_REWARD);
 		assert_eq!(collateral_balance(DOT, 3) - liquidator_before, liquidation_reward);
 		assert_eq!(collateral_balance(DOT, 4) - entrant_before, liquidation_reward);
@@ -159,15 +148,12 @@ fn final_recovery_entry_pays_what_liquidation_pays() {
 fn final_recovery_reward_cooldown_blocks_flipping() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
-		let first_entry = branch_state(DOT, PUSD)
-			.expect("state")
-			.last_final_recovery_entry
-			.expect("stamped");
-		let cooldown = branch_config(DOT, PUSD).expect("config").final_recovery_reward_cooldown;
+		let first_entry = market_state(DOT, PUSD).last_final_recovery_entry.expect("stamped");
+		let cooldown = market_config(DOT, PUSD).final_recovery_reward_cooldown;
 		let flip = |keeper: AccountId| {
-			set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+			set_price(DOT, DEFAULT_PRICE);
 			assert_ok!(exit_final_recovery(keeper, DOT, PUSD, 1));
 			set_price(DOT, low_recovery_price());
 			enter_final_recovery(keeper, DOT, PUSD, 1).expect("eligible entry succeeds")
@@ -182,10 +168,7 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 		assert_eq!(reward_events(), vec![(1, KEEPER, ENTRY_REWARD)]);
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
 		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD);
-		assert_eq!(
-			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
-			Some(first_entry)
-		);
+		assert_eq!(market_state(DOT, PUSD).last_final_recovery_entry, Some(first_entry));
 
 		// One cooldown from the paid entry is sufficient, unpaid flips in between notwithstanding.
 		// The re-entry is priced on what the vault still holds: the flat 100 plus 0.1% of 899,
@@ -195,10 +178,7 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 		assert_eq!(reward_events(), vec![(1, KEEPER, ENTRY_REWARD), (1, KEEPER, 100)]);
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD + 100);
 		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD - 100);
-		assert_eq!(
-			branch_state(DOT, PUSD).expect("state").last_final_recovery_entry,
-			Some(first_entry + cooldown)
-		);
+		assert_eq!(market_state(DOT, PUSD).last_final_recovery_entry, Some(first_entry + cooldown));
 
 		// A market may switch the protection off, after which every entry pays.
 		assert_ok!(crate::Pallet::<Test>::set_param(
@@ -216,12 +196,12 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
 	build_and_execute(|| {
 		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
-		register_market_with(DOT, PUSD, FixedU128::from_u32(10), config);
-		assert_ok!(open(1, DOT, PUSD, 1_040, 500, rate_pct(5, 100)));
+		register_market_with(DOT, PUSD, DEFAULT_PRICE, config);
+		assert_ok!(open(1, DOT, PUSD, 1_040, 500, percent(5)));
 		assert_ok!(redeem(DOT, PUSD, 3, 400));
 		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 100);
 		assert_eq!(vault(DOT, PUSD, 1).collateral, 1_000);
-		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, Some(1));
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, Some(1));
 
 		// Even the last Dormant vault must be strictly below MCR, not merely at it.
 		set_price(DOT, FixedU128::from_rational(11, 100));
@@ -239,8 +219,8 @@ fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
 		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 100);
 		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, 0);
-		assert_eq!(branch_state(DOT, PUSD).expect("state").stakes.total, 0);
-		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, None);
+		assert_eq!(market_state(DOT, PUSD).stakes.total, 0);
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, None);
 		assert_eq!(LinkedList::node(rate_list(DOT, PUSD), 1), None);
 		assert_eq!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10), vec![1]);
 		assert_event(crate::Event::VaultStatusChanged {
@@ -257,13 +237,13 @@ fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
 fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 	build_and_execute(|| {
 		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
-		register_market_with(DOT, PUSD, FixedU128::from_u32(10), config);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		register_market_with(DOT, PUSD, DEFAULT_PRICE, config);
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(5)));
 		assert_ok!(repay(2, DOT, PUSD, 2, None));
 		assert_ok!(redeem(DOT, PUSD, 3, 400));
 		// The liquidation below must clear a pointer that is really set.
-		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, Some(1));
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, Some(1));
 		set_price(DOT, low_recovery_price());
 
 		// A debt-free husk still counts as another stake bearer.
@@ -273,7 +253,7 @@ fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 		);
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0));
 		assert!(!vault_exists(DOT, PUSD, 1));
-		assert_eq!(branch_state(DOT, PUSD).expect("state").dormant_redemption_target, None);
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, None);
 		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
 	});
 }
@@ -284,8 +264,8 @@ fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
 	build_and_execute(|| {
 		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
-		register_market_with(DOT, PUSD, FixedU128::from_u32(10), config.clone());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		register_market_with(DOT, PUSD, DEFAULT_PRICE, config.clone());
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 		let price = FixedU128::from_rational(1, 100);
 		set_price(DOT, price);
 		assert_eq!(
@@ -307,7 +287,7 @@ fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
 		assert_eq!(vault(DOT, PUSD, 1).debt.total(), 500);
 		assert_eq!(vault(DOT, PUSD, 1).redistribution_stake, 0);
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
-		let state = branch_state(DOT, PUSD).expect("state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.total_collateral, 1_000);
 		assert_eq!(state.stakes.total, 0);
 		assert_eq!(state.last_final_recovery_entry, None);
@@ -319,8 +299,8 @@ fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
 fn enter_final_recovery_rejects_non_last_eligible_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(5)));
 		set_price(DOT, low_recovery_price());
 
 		assert_noop!(
@@ -337,8 +317,8 @@ fn debt_free_husk_keeps_the_branch_out_of_final_recovery() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// The lower rate makes account 1 the first redemption target.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		assert_ok!(redeem(DOT, PUSD, 4, 501));
 		let husk_before = vault(DOT, PUSD, 1);
 		assert_eq!(husk_before.debt.total(), 0);
@@ -358,7 +338,7 @@ fn debt_free_husk_keeps_the_branch_out_of_final_recovery() {
 		let husk = vault(DOT, PUSD, 1);
 		assert_eq!(husk.debt.principal, 501);
 		assert_eq!(husk.collateral, 950 + 1_000);
-		let state = branch_state(DOT, PUSD).expect("state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.debt.pending_redistribution_principal, 0);
 		assert_eq!(state.pending_redistribution_collateral, 0);
 		// Redistribution does not reactivate a Dormant vault.
@@ -372,7 +352,7 @@ fn enter_final_recovery_rejects_vault_above_mcr() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Price $10 → CR = 1000·10/500 = 2000% ≫ MCR 110%, far too healthy for FR.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 
 		assert_noop!(
 			enter_final_recovery(99, DOT, PUSD, 1),
@@ -386,11 +366,11 @@ fn final_recovery_middle_exit_splices_queue() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 
-		enter_recovery(1, rate_pct(1, 100));
-		enter_recovery(2, rate_pct(2, 100));
-		enter_recovery(3, rate_pct(3, 100));
+		enter_recovery(1, percent(1));
+		enter_recovery(2, percent(2));
+		enter_recovery(3, percent(3));
 
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		assert_ok!(exit_final_recovery(42, DOT, PUSD, 2));
 
 		assert!(vault_status(DOT, PUSD, 2).is_active());
@@ -406,7 +386,7 @@ fn exit_final_recovery_rejects_non_final_recovery_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// A plain Active vault is not in the FIFO, so exiting it is invalid.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 		assert_noop!(
 			exit_final_recovery(99, DOT, PUSD, 1),
 			crate::Error::<Test>::InvalidVaultStatus
@@ -418,7 +398,7 @@ fn exit_final_recovery_rejects_non_final_recovery_vault() {
 fn frozen_branch_rejects_enter_final_recovery() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		// The frozen check precedes the CR / last-eligible checks.
 		assert_noop!(enter_final_recovery(99, DOT, PUSD, 1), crate::Error::<Test>::BranchFrozen);
@@ -429,7 +409,7 @@ fn frozen_branch_rejects_enter_final_recovery() {
 fn frozen_branch_rejects_exit_final_recovery() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 		assert_noop!(exit_final_recovery(99, DOT, PUSD, 1), crate::Error::<Test>::BranchFrozen);
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
@@ -442,9 +422,9 @@ fn frozen_branch_rejects_exit_final_recovery() {
 fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		// Restore the price so the recipient's collateral payout is affordable.
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		let full = vault(DOT, PUSD, 1).debt.total();
 
 		assert_ok!(redeem_from(DOT, PUSD, 1, 7, full));
@@ -469,7 +449,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 			"the residual stays held until the owner closes the husk"
 		);
 		assert_eq!(vault.redistribution_stake, residual);
-		let state = branch_state(DOT, PUSD).expect("state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.stakes.total, residual);
 		assert_eq!(state.debt.minted_interest, 0);
 	});
@@ -479,7 +459,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 fn final_recovery_blocks_borrow_withdraw_and_change_rate() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 
 		assert_noop!(borrow(1, DOT, PUSD, 100, None), crate::Error::<Test>::VaultInFinalRecovery);
 		assert_noop!(
@@ -487,7 +467,7 @@ fn final_recovery_blocks_borrow_withdraw_and_change_rate() {
 			crate::Error::<Test>::VaultInFinalRecovery
 		);
 		assert_noop!(
-			change_rate(1, DOT, PUSD, rate_pct(7, 100)),
+			change_rate(1, DOT, PUSD, percent(7)),
 			crate::Error::<Test>::InvalidVaultStatus
 		);
 	});
@@ -499,7 +479,7 @@ fn final_recovery_blocks_borrow_withdraw_and_change_rate() {
 fn final_recovery_accepts_partial_repayment_and_stays_queued() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		let debt_before = vault(DOT, PUSD, 1).debt.total();
 
 		assert_ok!(repay(1, DOT, PUSD, 1, Some(200)));
@@ -517,7 +497,7 @@ fn final_recovery_accepts_partial_repayment_and_stays_queued() {
 fn final_recovery_repayment_cannot_leave_dust() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		let debt = vault(DOT, PUSD, 1).debt.total();
 
 		assert_noop!(
@@ -533,7 +513,7 @@ fn final_recovery_repayment_cannot_leave_dust() {
 fn final_recovery_repayment_then_exit_rejoins_rate_index() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		// The 899 of collateral left after the entry reward is worth 449 at 0.5 against 501 of
 		// debt: still below the 110% MCR.
 		set_price(DOT, FixedU128::from_rational(1u128, 2u128));
@@ -558,7 +538,7 @@ fn final_recovery_repayment_then_exit_rejoins_rate_index() {
 fn final_recovery_full_repayment_leaves_dormant_husk() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		// Cover the upfront fee that the borrowed principal does not include.
 		mint_stable(PUSD, 1, 10);
 
@@ -583,7 +563,7 @@ fn final_recovery_full_repayment_leaves_dormant_husk() {
 			"the residual stays held until the owner closes the husk"
 		);
 		assert_eq!(vault.redistribution_stake, residual);
-		assert_eq!(branch_state(DOT, PUSD).expect("state").stakes.total, residual);
+		assert_eq!(market_state(DOT, PUSD).stakes.total, residual);
 		assert!(vault_exists(DOT, PUSD, 1), "a husk with collateral is not closed");
 	});
 }
@@ -593,7 +573,7 @@ fn final_recovery_full_repayment_leaves_dormant_husk() {
 fn frozen_branch_accepts_deposit_into_final_recovery_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
 
 		assert_ok!(deposit_collateral(2, DOT, PUSD, 1, 10_000));
@@ -608,10 +588,10 @@ fn frozen_branch_accepts_deposit_into_final_recovery_vault() {
 fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
-		enter_recovery(2, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
+		enter_recovery(2, percent(5));
 		// Restore price so CR sits comfortably above MCR after partial redemption.
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		// Redeem most of vault 1's debt — pulls it below MinimumDebt (200) but
 		// leaves a non-zero residual, so it stays in the FR FIFO.
 		assert_ok!(redeem_from(DOT, PUSD, 1, 99, 350));
@@ -633,7 +613,7 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10),
 			alloc::vec![2]
 		);
-		let state = branch_state(DOT, PUSD).expect("state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.dormant_redemption_target, Some(1));
 	});
 }
@@ -645,9 +625,9 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
-		enter_recovery(2, rate_pct(5, 100));
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		enter_recovery(1, percent(5));
+		enter_recovery(2, percent(5));
+		set_price(DOT, DEFAULT_PRICE);
 		// Push both FR vaults below MinimumDebt but non-zero.
 		assert_ok!(redeem_from(DOT, PUSD, 1, 99, 350));
 		assert_ok!(redeem_from(DOT, PUSD, 2, 98, 350));
@@ -655,7 +635,7 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 		// First exit parks vault 1 in the (empty) dormant slot.
 		assert_ok!(exit_final_recovery(99, DOT, PUSD, 1));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, Some(1));
 
 		// Vault 2 also needs the slot, but it is held by a different debt-bearing
 		// vault → the exit is rejected and vault 2 stays in FinalRecovery.
@@ -664,7 +644,7 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 			crate::Error::<Test>::DormantTargetOccupied
 		);
 		assert!(vault_status(DOT, PUSD, 2).is_final_recovery());
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, Some(1));
 	});
 }
 
@@ -672,7 +652,7 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 fn final_recovery_rescue_deposit_then_exit() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 
 		// At the crash price the vault is deep underwater; top up enough
 		// collateral that the fully-accrued CR clears the MCR again, then
@@ -693,8 +673,8 @@ fn final_recovery_rescue_deposit_then_exit() {
 fn poke_does_not_exit_final_recovery() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		enter_recovery(1, percent(5));
+		set_price(DOT, DEFAULT_PRICE);
 
 		assert_ok!(poke(99, DOT, PUSD, 1));
 		assert!(vault_status(DOT, PUSD, 1).is_final_recovery());
@@ -711,18 +691,18 @@ fn redemption_queue_gates_on_final_recovery() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 
-		enter_recovery(1, rate_pct(1, 100));
-		enter_recovery(2, rate_pct(2, 100));
-		enter_recovery(3, rate_pct(3, 100));
+		enter_recovery(1, percent(1));
+		enter_recovery(2, percent(2));
+		enter_recovery(3, percent(3));
 
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		assert_eq!(redeem(DOT, PUSD, 10, 350).expect("redeemed"), 1);
 		assert_ok!(exit_final_recovery(99, DOT, PUSD, 1));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, Some(1));
 
-		assert_ok!(open(4, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		assert_ok!(open(5, DOT, PUSD, 1_000, 500, rate_pct(4, 100)));
+		assert_ok!(open(4, DOT, PUSD, 1_000, 500, percent(2)));
+		assert_ok!(open(5, DOT, PUSD, 1_000, 500, percent(4)));
 
 		assert_eq!(crate::Pallet::<Test>::redemption_queue(DOT, PUSD, 10), alloc::vec![2]);
 	});
@@ -732,12 +712,12 @@ fn redemption_queue_gates_on_final_recovery() {
 fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(1, 100));
-		enter_recovery(2, rate_pct(2, 100));
+		enter_recovery(1, percent(1));
+		enter_recovery(2, percent(2));
 
 		// Exit 1 while priced back up, then push it under again: it re-enters
 		// behind 2 — the queue is FIFO by entry time, not by first entry.
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		assert_ok!(exit_final_recovery(42, DOT, PUSD, 1));
 		set_price(DOT, low_recovery_price());
 		assert_ok!(enter_final_recovery(KEEPER, DOT, PUSD, 1));
@@ -766,7 +746,7 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 fn full_settlement_of_a_final_recovery_vault_closes_it() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		enter_recovery(1, rate_pct(5, 100));
+		enter_recovery(1, percent(5));
 		assert!(vault_deposit_held(DOT, 1) > 0);
 
 		let full =
@@ -780,7 +760,7 @@ fn full_settlement_of_a_final_recovery_vault_closes_it() {
 		assert_eq!(held(DOT, 1), 0);
 		assert_eq!(vault_deposit_held(DOT, 1), 0);
 		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), 10).is_empty());
-		let state = branch_state(DOT, PUSD).expect("state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.vault_count, 0);
 		assert_eq!(state.dormant_redemption_target, None);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::VaultClosed {

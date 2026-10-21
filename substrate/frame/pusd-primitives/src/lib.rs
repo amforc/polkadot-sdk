@@ -5,15 +5,22 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use core::cmp::Ordering;
 use frame::deps::{
 	frame_support::PalletId,
 	sp_io::hashing::blake2_256,
-	sp_runtime::{traits::AccountIdConversion, FixedU128},
+	sp_runtime::{
+		traits::{AccountIdConversion, Zero},
+		FixedU128,
+	},
 };
 use scale_info::TypeInfo;
 
+#[cfg(feature = "runtime-benchmarks")]
+pub mod benchmark_vaults;
 pub mod branch_interface;
 pub mod debit;
 pub mod math;
@@ -26,6 +33,10 @@ pub mod stability_pool;
 pub mod vault_interface;
 pub mod yield_routing;
 
+#[cfg(feature = "runtime-benchmarks")]
+pub use benchmark_vaults::{
+	BenchmarkVault, BenchmarkVaults, RecoveryHeadSeed, RedemptionTargetsSeed,
+};
 pub use branch_interface::{BranchInterface, BranchMode, BranchSnapshot};
 pub use debit::{debit_preservation, reducible_debit, refine_debit};
 pub use math::{collateralization_ratio, mul_div_floor, mul_div_rate_floor};
@@ -80,6 +91,13 @@ impl VaultStatus {
 pub struct DebtCollateral<Balance> {
 	pub debt: Balance,
 	pub collateral: Balance,
+}
+
+impl<Balance: Zero> DebtCollateral<Balance> {
+	/// Returns `true` when both the debt and the collateral are zero.
+	pub fn is_zero(&self) -> bool {
+		self.debt.is_zero() && self.collateral.is_zero()
+	}
 }
 
 /// A position's collateralization ratio.

@@ -1,6 +1,8 @@
 //! `pallet-vaults` test suite.
 
 mod basic_ops;
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmark_seeding;
 mod borrower_operations;
 mod critical_threshold;
 mod debt_in_front;
@@ -32,6 +34,11 @@ pub fn rate_pct(num: u128, denom: u128) -> FixedU128 {
 	FixedU128::from_rational(num, denom)
 }
 
+/// `n` percent, exactly.
+pub const fn percent(n: u128) -> FixedU128 {
+	FixedU128::from_inner(n * (<FixedU128 as frame::arithmetic::FixedPointNumber>::DIV / 100))
+}
+
 pub fn vault_status(
 	collateral: AssetId,
 	stable: StableId,
@@ -42,19 +49,14 @@ pub fn vault_status(
 }
 
 /// Asserts that the pallet emitted `event` in the current block.
+#[track_caller]
 pub fn assert_event(event: crate::Event<Test>) {
 	System::assert_has_event(RuntimeEvent::Vaults(event));
 }
 
 /// Returns every pallet event emitted in the current block, in order.
 pub fn vault_events() -> Vec<crate::Event<Test>> {
-	System::events()
-		.into_iter()
-		.filter_map(|record| match record.event {
-			RuntimeEvent::Vaults(event) => Some(event),
-			_ => None,
-		})
-		.collect()
+	System::read_events_for_pallet::<crate::Event<Test>>()
 }
 
 /// Returns the outcome carried by the first `VaultLiquidated` event of the block.

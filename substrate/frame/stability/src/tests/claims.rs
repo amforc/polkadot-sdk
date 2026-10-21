@@ -16,28 +16,18 @@ fn claims_pay_out_clear_and_default_to_the_caller() {
 
 		// Collateral goes to the caller here, yield to a named recipient.
 		assert_claim_collateral(1, 70);
-		System::assert_last_event(
-			crate::Event::CollateralClaimed {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				recipient: 1,
-				amount: 70,
-			}
-			.into(),
-		);
+		System::assert_last_event(market_event!(CollateralClaimed {
+			depositor: 1,
+			recipient: 1,
+			amount: 70,
+		}));
 		assert_ok!(claim_yield(1, DOT, PUSD, 9));
 		assert_eq!(stable_balance(PUSD, 9), 55);
-		System::assert_last_event(
-			crate::Event::YieldClaimed {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				recipient: 9,
-				amount: 55,
-			}
-			.into(),
-		);
+		System::assert_last_event(market_event!(YieldClaimed {
+			depositor: 1,
+			recipient: 9,
+			amount: 55,
+		}));
 
 		// Both claimables are cleared; the deposited capital keeps the row alive, on both legs.
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives with active deposit");
@@ -71,35 +61,31 @@ fn claims_pay_out_clear_and_default_to_the_caller() {
 #[test]
 fn claims_leaving_a_sub_minimum_remainder_still_pay_out() {
 	build_and_execute(|| {
-		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
-		let collateral = AssetId::WithId(77);
-		register_branch(collateral.clone(), PUSD, branch_config_for(collateral.clone(), PUSD));
-		let pool = Stability::pool_account(&collateral, &PUSD);
+		create_high_min_collateral();
+		register_branch(HIGH_MIN, PUSD, branch_config_for(HIGH_MIN, PUSD));
+		let pool = Stability::pool_account(&HIGH_MIN, &PUSD);
 		for who in [1, 2] {
 			mint_stable(PUSD, who, 100);
-			assert_ok!(deposit(who, collateral.clone(), PUSD, 100));
+			assert_ok!(deposit(who, HIGH_MIN, PUSD, 100));
 		}
-		seed_claimables_in(collateral.clone(), 1, 600, 0);
-		seed_claimables_in(collateral.clone(), 2, 400, 0);
-		assert_eq!(collateral_balance(collateral.clone(), pool), 2_000);
+		seed_claimables_in(HIGH_MIN, 1, 600, 0);
+		seed_claimables_in(HIGH_MIN, 2, 400, 0);
+		assert_eq!(collateral_balance(HIGH_MIN, pool), 2_000);
 		// Both payouts are below the asset minimum, so the recipients need accounts first.
 		for recipient in [8, 9] {
-			mint_collateral(collateral.clone(), recipient, 1_000);
+			mint_collateral(HIGH_MIN, recipient, 1_000);
 		}
 
 		// 400 of tracked gains stay behind, below the 1_000 minimum; the float sits beneath them.
-		assert_ok!(claim_collateral(1, collateral.clone(), PUSD, 8));
-		assert_eq!(collateral_balance(collateral.clone(), 8), 1_600);
-		assert_eq!(pool_collateral_held(collateral.clone(), PUSD), 400);
+		assert_ok!(claim_collateral(1, HIGH_MIN, PUSD, 8));
+		assert_eq!(collateral_balance(HIGH_MIN, 8), 1_600);
+		assert_eq!(pool_collateral_held(HIGH_MIN, PUSD), 400);
 
 		// The last claim empties the tracked gains and leaves exactly the float.
-		assert_ok!(claim_collateral(2, collateral.clone(), PUSD, 9));
-		assert_eq!(collateral_balance(collateral.clone(), 9), 1_400);
-		assert_eq!(pool_collateral_held(collateral.clone(), PUSD), 0);
-		assert_eq!(collateral_balance(collateral.clone(), pool), 1_000);
-		assert_noop!(
-			claim_collateral(2, collateral, PUSD, 2),
-			Error::<Test>::NoClaimableCollateral
-		);
+		assert_ok!(claim_collateral(2, HIGH_MIN, PUSD, 9));
+		assert_eq!(collateral_balance(HIGH_MIN, 9), 1_400);
+		assert_eq!(pool_collateral_held(HIGH_MIN, PUSD), 0);
+		assert_eq!(collateral_balance(HIGH_MIN, pool), 1_000);
+		assert_noop!(claim_collateral(2, HIGH_MIN, PUSD, 2), Error::<Test>::NoClaimableCollateral);
 	});
 }

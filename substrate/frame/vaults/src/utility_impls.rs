@@ -5,16 +5,16 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, Error, Event, Millis, Pallet,
-		StableCreditOf, StableIdOf, StablecoinDebt, VaultRecordOf, Vaults,
+		StableCreditOf, StableIdOf, StablecoinDebt, VaultListIdOf, VaultRecordOf, Vaults,
 	},
 	recovery,
 	types::{
 		AdminLevel, BranchConfig, BranchMode, BranchState, DebtBreakdown, DebtCollateral,
-		StablecoinDebtState, Vault, VaultListId, VaultStatus, Wide,
+		StablecoinDebtState, Vault, VaultListId, VaultStatus,
 	},
 };
 use frame::{
-	arithmetic::{ArithmeticError, Rounding},
+	arithmetic::ArithmeticError,
 	deps::sp_core::U256,
 	prelude::*,
 	traits::{
@@ -49,10 +49,11 @@ pub(crate) struct TouchedVaultDraft<AccountId, Balance> {
 }
 
 /// The part of one branch that contributes to derived debt aggregates.
+#[derive(Default, PartialEq, Debug)]
 pub(crate) struct BranchContribution<Balance> {
-	outstanding: Balance,
-	pending_interest: U256,
-	active_accrual_rate: U256,
+	pub(crate) outstanding: Balance,
+	pub(crate) pending_interest: U256,
+	pub(crate) active_accrual_rate: U256,
 }
 
 impl<T: Config> Pallet<T> {
@@ -89,11 +90,11 @@ impl<T: Config> Pallet<T> {
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 
 		if !pending.interest.is_zero() {
-			vault.debt.interest = vault
+			vault
 				.debt
 				.interest
-				.checked_add(&pending.interest)
-				.ok_or(Error::<T>::ArithmeticOverflow)?;
+				.ensure_add_assign(pending.interest)
+				.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		}
 		vault.interest_prepaid = pending.interest_prepaid;
 		let accounted_before = vault.clone();
@@ -102,15 +103,15 @@ impl<T: Config> Pallet<T> {
 			!pending.accrual_rate.is_zero()
 		{
 			state.consume_redistribution(pending.redistribution, pending.accrual_rate)?;
-			vault.debt.principal = vault
+			vault
 				.debt
 				.principal
-				.checked_add(&pending.redistribution.debt)
-				.ok_or(Error::<T>::ArithmeticOverflow)?;
-			vault.collateral = vault
+				.ensure_add_assign(pending.redistribution.debt)
+				.map_err(|_| Error::<T>::ArithmeticOverflow)?;
+			vault
 				.collateral
-				.checked_add(&pending.redistribution.collateral)
-				.ok_or(Error::<T>::ArithmeticOverflow)?;
+				.ensure_add_assign(pending.redistribution.collateral)
+				.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		}
 		vault.redistribution_checkpoint = state.redistribution;
 		vault.last_interest_time = state.interest_time(now);
@@ -149,9 +150,7 @@ impl<T: Config> Pallet<T> {
 		{
 			let stored = Self::branch_of(collateral_id, stable_id)?;
 			let stored = Self::branch_contribution(&stored.state, now)?;
-			debug_assert!(stored.outstanding == before.outstanding, "branch row moved under an op");
-			debug_assert!(stored.pending_interest == before.pending_interest);
-			debug_assert!(stored.active_accrual_rate == before.active_accrual_rate);
+			debug_assert_eq!(&stored, before, "branch row moved under an op");
 		}
 		Self::update_branch_aggregates(stable_id, now, before, &branch.state)?;
 		Branches::<T>::insert(collateral_id, stable_id, branch);
@@ -186,45 +185,40 @@ impl<T: Config> Pallet<T> {
 		after_state: &BranchState<T::AccountId, BalanceOf<T>>,
 	) -> DispatchResult {
 		let after = Self::branch_contribution(after_state, now)?;
-		let stablecoin_debt = Self::updated_stablecoin_debt(stable_id, before, &after, now)?;
-		if stablecoin_debt.is_empty() {
-			StablecoinDebt::<T>::remove(stable_id);
-		} else {
-			StablecoinDebt::<T>::insert(stable_id, stablecoin_debt);
-		}
-		Ok(())
+		StablecoinDebt::<T>::try_mutate_exists(stable_id, |maybe| {
+			let total = maybe.take().unwrap_or_default();
+			let total = Self::updated_stablecoin_debt(total, before, &after, now)?;
+			*maybe = (!total.is_empty()).then_some(total);
+			Ok(())
+		})
 	}
 
 	/// Advance the stablecoin-wide debt projection to `now`, then replace one
 	/// market's realized debt, pending interest, and active accrual rate.
 	fn updated_stablecoin_debt(
-		stable_id: &StableIdOf<T>,
+		mut total: StablecoinDebtState<BalanceOf<T>>,
 		before: &BranchContribution<BalanceOf<T>>,
 		after: &BranchContribution<BalanceOf<T>>,
 		now: Millis,
 	) -> Result<StablecoinDebtState<BalanceOf<T>>, DispatchError> {
-		let mut total = StablecoinDebt::<T>::get(stable_id);
 		let elapsed = now.saturating_sub(total.last_update);
-		let pending_interest = total
+		let window = math::interest_numerator(total.active_accrual_rate, elapsed)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		total.pending_interest = total
 			.pending_interest
-			.to_wide()
-			.checked_add(
-				math::interest_numerator(total.active_accrual_rate.to_wide(), elapsed)
-					.ok_or(Error::<T>::ArithmeticOverflow)?,
-			)
-			.ok_or(Error::<T>::ArithmeticOverflow)?
+			.ensure_add(window)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?
 			.checked_sub(before.pending_interest)
 			.defensive_ok_or(DispatchError::Corruption)?
-			.checked_add(after.pending_interest)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		total.pending_interest = Wide::from_wide(pending_interest);
+			.ensure_add(after.pending_interest)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		total.last_update = now;
 		total.active_accrual_rate = total
 			.active_accrual_rate
 			.checked_sub(before.active_accrual_rate)
 			.defensive_ok_or(DispatchError::Corruption)?
-			.checked_add(after.active_accrual_rate)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+			.ensure_add(after.active_accrual_rate)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		total.outstanding =
 			Self::shifted_total(total.outstanding, before.outstanding, after.outstanding)?;
 		Ok(total)
@@ -242,13 +236,14 @@ impl<T: Config> Pallet<T> {
 		now: Millis,
 	) -> Result<BalanceOf<T>, DispatchError> {
 		let after = Self::branch_contribution(after_state, now)?;
-		let projected = Self::updated_stablecoin_debt(stable_id, before, &after, now)?;
-		let pending = math::interest_units_ceil(projected.pending_interest.to_wide())
+		let total = StablecoinDebt::<T>::get(stable_id);
+		let projected = Self::updated_stablecoin_debt(total, before, &after, now)?;
+		let pending = math::interest_units_ceil(projected.pending_interest)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		projected
 			.outstanding
-			.checked_add(&pending)
-			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
+			.ensure_add(pending)
+			.map_err(|_| Error::<T>::ArithmeticOverflow.into())
 	}
 
 	/// Derive the complete aggregate contribution of one branch at `now`.
@@ -262,7 +257,7 @@ impl<T: Config> Pallet<T> {
 			active_accrual_rate: if state.is_frozen() {
 				U256::zero()
 			} else {
-				state.debt.accrual_rate.to_wide()
+				state.debt.accrual_rate
 			},
 		})
 	}
@@ -274,7 +269,7 @@ impl<T: Config> Pallet<T> {
 	) -> Result<U256, DispatchError> {
 		let tau = state.interest_time(now);
 		let elapsed = tau.saturating_sub(state.debt.last_interest_time);
-		math::interest_numerator(state.debt.accrual_rate.to_wide(), elapsed)
+		math::interest_numerator(state.debt.accrual_rate, elapsed)
 			.and_then(|window| {
 				window.checked_add(U256::from(state.debt.aggregate_interest_remainder))
 			})
@@ -288,8 +283,8 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn accrued_stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {
 		let debt = StablecoinDebt::<T>::get(stable_id);
 		let elapsed = T::TimeProvider::now().saturating_sub(debt.last_update);
-		math::interest_numerator(debt.active_accrual_rate.to_wide(), elapsed)
-			.and_then(|window| debt.pending_interest.to_wide().checked_add(window))
+		math::interest_numerator(debt.active_accrual_rate, elapsed)
+			.and_then(|window| debt.pending_interest.checked_add(window))
 			.and_then(math::interest_units_ceil)
 			.map_or_else(BalanceOf::<T>::max_value, |accrued| {
 				debt.outstanding.saturating_add(accrued)
@@ -307,8 +302,8 @@ impl<T: Config> Pallet<T> {
 		total
 			.checked_sub(&before)
 			.defensive_ok_or(DispatchError::Corruption)?
-			.checked_add(&after)
-			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
+			.ensure_add(after)
+			.map_err(|_| Error::<T>::ArithmeticOverflow.into())
 	}
 
 	/// Returns a vault, or `VaultNotFound` if it does not exist.
@@ -356,8 +351,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Derive a vault's lifecycle status from queue/index membership.
 	pub(crate) fn vault_status_in(
-		rate_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
-		recovery_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
+		rate_list: &VaultListIdOf<T>,
+		recovery_list: &VaultListIdOf<T>,
 		owner: &T::AccountId,
 	) -> VaultStatus {
 		debug_assert!(matches!(rate_list, VaultListId::Rate(..)));
@@ -441,9 +436,10 @@ impl<T: Config> Pallet<T> {
 		config: &BranchConfig<BalanceOf<T>>,
 		rate: FixedU128,
 	) -> DispatchResult {
-		if rate < config.minimum_borrow_rate || rate > config.maximum_borrow_rate {
-			return Err(Error::<T>::RateOutOfBounds.into());
-		}
+		ensure!(
+			(config.minimum_borrow_rate..=config.maximum_borrow_rate).contains(&rate),
+			Error::<T>::RateOutOfBounds
+		);
 		Ok(())
 	}
 
@@ -474,7 +470,7 @@ impl<T: Config> Pallet<T> {
 		if who == &admins.full_admin {
 			return Ok(AdminLevel::Full);
 		}
-		if matches!(required, AdminLevel::Emergency) && who == &admins.emergency_admin {
+		if required == AdminLevel::Emergency && who == &admins.emergency_admin {
 			return Ok(AdminLevel::Emergency);
 		}
 		Err(Error::<T>::NotBranchAdmin.into())
@@ -785,7 +781,7 @@ impl<T: Config> Pallet<T> {
 				.min(state.pending_redistribution_collateral)
 		};
 
-		let pool_accrual_rate = state.debt.pending_redistribution_accrual_rate.to_wide();
+		let pool_accrual_rate = state.debt.pending_redistribution_accrual_rate;
 		let stake_accrual_rate = math::accrual_rate(vault.redistribution_stake, vault.annual_rate);
 		let accrual_rate = if only_recipient {
 			pool_accrual_rate
@@ -797,18 +793,14 @@ impl<T: Config> Pallet<T> {
 
 		// `τ · ΔA − ΔB` is `Σ d_k · (τ − τ_k)` over the redistributions since the checkpoint.
 		let principal_time = U256::from(delta_principal.into_inner())
-			.checked_mul(U256::from(tau))
-			.ok_or(ArithmeticError::Overflow)?
-			.checked_sub(
+			.ensure_mul(U256::from(tau))?
+			.ensure_sub(
 				redistribution
 					.principal_time_per_stake
-					.to_wide()
-					.checked_sub(snap.principal_time_per_stake.to_wide())
-					.ok_or(ArithmeticError::Underflow)?,
-			)
-			.ok_or(ArithmeticError::Underflow)?;
+					.ensure_sub(snap.principal_time_per_stake)?,
+			)?;
 		let (interest, interest_prepaid) =
-			math::scale_wide(stake_accrual_rate, principal_time, Rounding::Up)
+			math::scale_wide(stake_accrual_rate, principal_time, math::Direction::Up)
 				.and_then(|share| share.checked_add(principal_interest))
 				.ok_or(ArithmeticError::Overflow)
 				.and_then(charge)?;
@@ -864,7 +856,7 @@ impl<T: Config> Pallet<T> {
 	) -> Vault<BalanceOf<T>> {
 		Vault {
 			collateral,
-			debt: DebtBreakdown { principal: Zero::zero(), interest: Zero::zero() },
+			debt: DebtBreakdown::default(),
 			annual_rate,
 			last_interest_time: state.interest_time(now),
 			interest_prepaid: 0,
@@ -875,7 +867,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	fn avg_rate(state: &BranchState<T::AccountId, BalanceOf<T>>) -> FixedU128 {
-		let accrual_rate: BalanceOf<T> = state.debt.accrual_rate.whole();
+		let accrual_rate: BalanceOf<T> = math::whole_units(state.debt.accrual_rate);
 		math::average_branch_rate(
 			accrual_rate,
 			state.debt.principal.saturating_add(state.debt.pending_redistribution_principal),
@@ -903,11 +895,11 @@ impl<T: Config> Pallet<T> {
 			BalanceOf::<T>::zero()
 		};
 		let before = vault.clone();
-		vault.debt.principal = vault
+		vault
 			.debt
 			.principal
-			.checked_add(&debt_increase)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+			.ensure_add_assign(debt_increase)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		vault.annual_rate = new_rate;
 		if rate_changed {
 			vault.last_rate_update = now;
@@ -921,8 +913,11 @@ impl<T: Config> Pallet<T> {
 		);
 		if !fee.is_zero() {
 			let before_fee = vault.clone();
-			vault.debt.interest =
-				vault.debt.interest.checked_add(&fee).ok_or(Error::<T>::ArithmeticOverflow)?;
+			vault
+				.debt
+				.interest
+				.ensure_add_assign(fee)
+				.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 			state.replace_vault(Some(&before_fee), Some(vault))?;
 		}
 		Ok(fee)

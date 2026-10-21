@@ -15,6 +15,7 @@ use alloc::collections::BTreeMap;
 use frame::{
 	arithmetic::{FixedU128, One, Saturating, Zero},
 	deps::{frame_support::traits::fungibles::Inspect as _, sp_runtime::TryRuntimeError},
+	prelude::ensure,
 };
 
 /// Member counts and claims derived from the deposit rows of one market.
@@ -34,26 +35,21 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	for (collateral_id, stable_id, pool) in Pools::<T>::iter() {
 		let state = &pool.state;
 		let config = &pool.config;
-		if !config.is_valid() {
-			return Err("stored stability-pool config fails `is_valid`".into());
-		}
+		ensure!(config.is_valid(), "stored stability-pool config fails `is_valid`");
 		for leg in Leg::ALL {
 			let coords = state.coords(leg);
-			if coords.p > FixedU128::one() {
-				return Err("`P` above one".into());
-			}
-			if coords.p < config.precision.p_min {
-				return Err("`P` below the configured precision floor".into());
-			}
-			if !PoolSumsStore::<T>::contains_key((
-				&collateral_id,
-				&stable_id,
-				leg,
-				coords.epoch,
-				coords.scale,
-			)) {
-				return Err("current `(epoch, scale)` has no sums row".into());
-			}
+			ensure!(coords.p <= FixedU128::one(), "`P` above one");
+			ensure!(coords.p >= config.precision.p_min, "`P` below the configured precision floor");
+			ensure!(
+				PoolSumsStore::<T>::contains_key((
+					&collateral_id,
+					&stable_id,
+					leg,
+					coords.epoch,
+					coords.scale,
+				)),
+				"current `(epoch, scale)` has no sums row"
+			);
 		}
 		// Pending deposits earn no yield. Sharing the row type with the active leg must never let
 		// a yield sum in through the back door.
@@ -62,9 +58,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			stable_id.clone(),
 			Leg::Pending,
 		)) {
-			if !sums.g_yield.is_zero() {
-				return Err("pending sums row carries a nonzero `G`".into());
-			}
+			ensure!(sums.g_yield.is_zero(), "pending sums row carries a nonzero `G`");
 		}
 
 		// This holds as an equality, not as an inequality: every stablecoin that enters or leaves
@@ -78,46 +72,42 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			.saturating_add(state.total_pending_deposits)
 			.saturating_add(state.total_yield_unclaimed)
 			.saturating_add(pool.custody_stable);
-		if stable_held != stable_owed {
-			return Err("pool stablecoin balance diverges from tracked totals".into());
-		}
+		ensure!(stable_held == stable_owed, "pool stablecoin balance diverges from tracked totals");
 		let collateral_held = T::CollateralAssets::balance(collateral_id.clone(), &pool_account);
 		let collateral_owed =
 			state.total_collateral_gains_unclaimed.saturating_add(pool.custody_collateral);
-		if collateral_held != collateral_owed {
-			return Err("pool collateral balance diverges from tracked totals".into());
-		}
+		ensure!(
+			collateral_held == collateral_owed,
+			"pool collateral balance diverges from tracked totals"
+		);
 		// The float is what lets every claim leave the minimum balance behind. A minimum raised
 		// after registration is the one case the float does not cover, and it must be visible.
-		if pool.custody_stable < T::StableAssets::minimum_balance(stable_id.clone()) {
-			return Err("stablecoin custody float below the asset minimum balance".into());
-		}
-		if pool.custody_collateral < T::CollateralAssets::minimum_balance(collateral_id.clone()) {
-			return Err("collateral custody float below the asset minimum balance".into());
-		}
+		ensure!(
+			pool.custody_stable >= T::StableAssets::minimum_balance(stable_id.clone()),
+			"stablecoin custody float below the asset minimum balance"
+		);
+		ensure!(
+			pool.custody_collateral >= T::CollateralAssets::minimum_balance(collateral_id.clone()),
+			"collateral custody float below the asset minimum balance"
+		);
 
 		// The open cohorts themselves: live ids, increasing deadlines, no memberless row, and an
 		// aggregate valued at coordinates the pending leg has actually reached.
 		for cohort in &state.open_cohorts {
-			if cohort.id >= state.next_cohort_id {
-				return Err("open cohort id at or past `next_cohort_id`".into());
-			}
-			if cohort.members == 0 {
-				return Err("open cohort with no members was not cleared".into());
-			}
-			if (cohort.coords.epoch, cohort.coords.scale) >
-				(state.pending_coords.epoch, state.pending_coords.scale)
-			{
-				return Err("open cohort coordinates ahead of the pending leg".into());
-			}
+			ensure!(cohort.id < state.next_cohort_id, "open cohort id at or past `next_cohort_id`");
+			ensure!(cohort.members > 0, "open cohort with no members was not cleared");
+			ensure!(
+				cohort.coords.position() <= state.pending_coords.position(),
+				"open cohort coordinates ahead of the pending leg"
+			);
 		}
-		if state
-			.open_cohorts
-			.windows(2)
-			.any(|pair| pair[0].id == pair[1].id || pair[0].deadline > pair[1].deadline)
-		{
-			return Err("open cohorts have duplicate ids or unordered deadlines".into());
-		}
+		ensure!(
+			!state
+				.open_cohorts
+				.windows(2)
+				.any(|pair| pair[0].id == pair[1].id || pair[0].deadline > pair[1].deadline),
+			"open cohorts have duplicate ids or unordered deadlines"
+		);
 
 		// No set of rows may add up to more than its pool total, on either leg. Rounding keeps
 		// every realized value at or below the total, and the difference belongs to nobody; it
@@ -138,11 +128,10 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 						return Err("pending row references an unknown cohort".into());
 					},
 					(Some(cohort), None) => {
-						let coords = pending.snapshot.coords;
-						if (coords.epoch, coords.scale) > (cohort.coords.epoch, cohort.coords.scale)
-						{
-							return Err("member snapshot ahead of its cohort's coordinates".into());
-						}
+						ensure!(
+							pending.snapshot.coords.position() <= cohort.coords.position(),
+							"member snapshot ahead of its cohort's coordinates"
+						);
 						let (realized, _) = Pallet::<T>::realize_leg(
 							&collateral_id,
 							&stable_id,
@@ -152,13 +141,16 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							&pending.snapshot,
 						)
 						.map_err(|_| "pending snapshot has no sums row")?;
-						if !realized.yield_gain.is_zero() {
-							return Err("pending deposit realized a yield gain".into());
-						}
-						pending_sum = pending_sum.saturating_add(realized.compounded);
-
-						let claims = tallies.claims.entry(pending.cohort).or_default();
-						*claims = claims.saturating_add(realized.compounded);
+						ensure!(
+							realized.yield_gain.is_zero(),
+							"pending deposit realized a yield gain"
+						);
+						pending_sum.saturating_accrue(realized.compounded);
+						tallies
+							.claims
+							.entry(pending.cohort)
+							.or_default()
+							.saturating_accrue(realized.compounded);
 					},
 					(None, Some(checkpoint)) => {
 						let phase_one = Pallet::<T>::realize_between(
@@ -171,14 +163,16 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							&config.precision,
 						)
 						.map_err(|_| "checkpoint window has no sums row")?;
-						if !phase_one.yield_gain.is_zero() {
-							return Err("checkpointed tranche realized a yield gain".into());
-						}
+						ensure!(
+							phase_one.yield_gain.is_zero(),
+							"checkpointed tranche realized a yield gain"
+						);
 						let claims = tallies.claims.entry(pending.cohort).or_default();
-						*claims = claims.saturating_add(phase_one.compounded);
-						if *claims > checkpoint.activated {
-							return Err("member claims exceed the activated cohort capital".into());
-						}
+						claims.saturating_accrue(phase_one.compounded);
+						ensure!(
+							*claims <= checkpoint.activated,
+							"member claims exceed the activated cohort capital"
+						);
 						// The survivor is active capital since the checkpoint: it counts against
 						// the active total, not the pending one.
 						let (phase_two, _) = Pallet::<T>::realize_leg(
@@ -190,7 +184,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							&checkpoint.active_start,
 						)
 						.map_err(|_| "checkpoint active start has no sums row")?;
-						compounded_sum = compounded_sum.saturating_add(phase_two.compounded);
+						compounded_sum.saturating_accrue(phase_two.compounded);
 					},
 				}
 				*tallies.members.entry(pending.cohort).or_default() += 1;
@@ -205,22 +199,25 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				&deposit.snapshot,
 			)
 			.map_err(|_| "deposit snapshot has no sums row")?;
-			compounded_sum = compounded_sum.saturating_add(realized.compounded);
+			compounded_sum.saturating_accrue(realized.compounded);
 		}
-		if pending_sum > state.total_pending_deposits {
-			return Err("realized pending deposits exceed `total_pending_deposits`".into());
-		}
-		if compounded_sum > state.total_active_deposits {
-			return Err("realized deposits exceed `total_active_deposits`".into());
-		}
+		ensure!(
+			pending_sum <= state.total_pending_deposits,
+			"realized pending deposits exceed `total_pending_deposits`"
+		);
+		ensure!(
+			compounded_sum <= state.total_active_deposits,
+			"realized deposits exceed `total_active_deposits`"
+		);
 
 		// The cohort bookkeeping must cover the rows that reference it: member counts move in
 		// step with the rows, and the ceiling-compounded aggregate never falls below the floored
 		// member claims it will have to pay at advancement.
 		for cohort in &state.open_cohorts {
-			if tallies.members.get(&cohort.id).copied().unwrap_or(0) != cohort.members {
-				return Err("open cohort member count diverges from its rows".into());
-			}
+			ensure!(
+				tallies.members.get(&cohort.id).copied().unwrap_or(0) == cohort.members,
+				"open cohort member count diverges from its rows"
+			);
 			let cover = crate::math::compound_ceil(
 				cohort.amount,
 				&cohort.coords,
@@ -229,26 +226,22 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			);
 			let claims =
 				tallies.claims.get(&cohort.id).copied().unwrap_or_else(BalanceOf::<T>::zero);
-			if claims > cover {
-				return Err("member claims exceed the cohort aggregate".into());
-			}
+			ensure!(claims <= cover, "member claims exceed the cohort aggregate");
 		}
 		for (id, checkpoint) in
 			CohortCheckpoints::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
 		{
-			if checkpoint.members == 0 {
-				return Err("memberless checkpoint was not removed".into());
-			}
-			if tallies.members.get(&id).copied().unwrap_or(0) != checkpoint.members {
-				return Err("checkpoint member count diverges from its rows".into());
-			}
-			if state.cohort(id).is_some() {
-				return Err("checkpointed cohort is still open".into());
-			}
+			ensure!(checkpoint.members > 0, "memberless checkpoint was not removed");
+			ensure!(
+				tallies.members.get(&id).copied().unwrap_or(0) == checkpoint.members,
+				"checkpoint member count diverges from its rows"
+			);
+			ensure!(state.cohort(id).is_none(), "checkpointed cohort is still open");
 			for snapshot in [&checkpoint.pending_end, &checkpoint.active_start] {
-				if snapshot.coords.epoch > state.coords.epoch.max(state.pending_coords.epoch) {
-					return Err("checkpoint snapshot epoch ahead of the pool".into());
-				}
+				ensure!(
+					snapshot.coords.epoch <= state.coords.epoch.max(state.pending_coords.epoch),
+					"checkpoint snapshot epoch ahead of the pool"
+				);
 			}
 		}
 	}
@@ -258,43 +251,57 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		let state = Pools::<T>::get(&collateral_id, &stable_id)
 			.ok_or("deposit row without a pool row")?
 			.state;
-		if deposit.snapshot.coords.epoch > state.coords.epoch {
-			return Err("deposit snapshot epoch ahead of the pool".into());
-		}
+		ensure!(
+			deposit.snapshot.coords.epoch <= state.coords.epoch,
+			"deposit snapshot epoch ahead of the pool"
+		);
 		if deposit.snapshot.coords.epoch == state.coords.epoch {
-			if deposit.snapshot.coords.scale > state.coords.scale {
-				return Err("deposit snapshot scale ahead of the pool".into());
-			}
+			ensure!(
+				deposit.snapshot.coords.scale <= state.coords.scale,
+				"deposit snapshot scale ahead of the pool"
+			);
 		}
 
 		let Some(pending) = &deposit.pending_deposit else {
 			continue;
 		};
-		if pending.snapshot.coords.epoch > state.pending_coords.epoch {
-			return Err("pending snapshot epoch ahead of the pending accumulators".into());
-		}
+		ensure!(
+			pending.snapshot.coords.epoch <= state.pending_coords.epoch,
+			"pending snapshot epoch ahead of the pending accumulators"
+		);
 		if pending.snapshot.coords.epoch == state.pending_coords.epoch {
-			if pending.snapshot.coords.scale > state.pending_coords.scale {
-				return Err("pending snapshot scale ahead of the pending accumulators".into());
-			}
+			ensure!(
+				pending.snapshot.coords.scale <= state.pending_coords.scale,
+				"pending snapshot scale ahead of the pending accumulators"
+			);
 		}
-		if !PoolSumsStore::<T>::contains_key((
-			&collateral_id,
-			&stable_id,
-			Leg::Pending,
-			pending.snapshot.coords.epoch,
-			pending.snapshot.coords.scale,
-		)) {
-			return Err("pending snapshot references a pruned sums row".into());
-		}
+		ensure!(
+			PoolSumsStore::<T>::contains_key((
+				&collateral_id,
+				&stable_id,
+				Leg::Pending,
+				pending.snapshot.coords.epoch,
+				pending.snapshot.coords.scale,
+			)),
+			"pending snapshot references a pruned sums row"
+		);
+	}
+
+	// Market removal clears every sums row: no row may outlive its pool.
+	for (collateral_id, stable_id, _leg, _epoch, _scale) in PoolSumsStore::<T>::iter_keys() {
+		ensure!(
+			Pools::<T>::contains_key(&collateral_id, &stable_id),
+			"sums row without a pool row"
+		);
 	}
 
 	// No checkpoint may outlive the rows that reference it: every stored checkpoint belongs to a
 	// registered market, and the per-market loop above already matched member counts.
 	for (collateral_id, stable_id, _id) in CohortCheckpoints::<T>::iter_keys() {
-		if !Pools::<T>::contains_key(&collateral_id, &stable_id) {
-			return Err("cohort checkpoint without a pool row".into());
-		}
+		ensure!(
+			Pools::<T>::contains_key(&collateral_id, &stable_id),
+			"cohort checkpoint without a pool row"
+		);
 	}
 	Ok(())
 }

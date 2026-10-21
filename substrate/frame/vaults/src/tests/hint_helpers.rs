@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_status},
+	tests::{percent, rate_pct, vault_status},
 };
 use frame::traits::fungible::Mutate as FungibleMutate;
 
@@ -23,13 +23,13 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 		register_market(DOT, PUSD);
 		// Account 21 alone enters FinalRecovery after a price crash.
 		fund_account(21);
-		assert_ok!(open(21, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(21, DOT, PUSD, 1_000, 500, percent(1)));
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
 		assert_ok!(enter_final_recovery(99, DOT, PUSD, 21));
 
 		// Restore the price and seed a long index so the tail re-insertion at 1%
 		// needs more than the repair budget.
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		seed_long_rate_index();
 
 		assert_noop!(
@@ -58,9 +58,13 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 				PUSD,
 				1_000,
 				500,
-				rate_pct(1, 100),
+				percent(1),
 				Position::endpoints_only()
-			),
+			)
+			.map_err(|error| {
+				assert_eq!(error.post_info.actual_weight, None);
+				error.error
+			}),
 			crate::Error::<Test>::InvalidPositionHints
 		);
 
@@ -70,13 +74,58 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 }
 
 #[test]
+fn open_vault_refunds_unused_hint_repair_steps() {
+	use crate::WeightInfo;
+	use frame::prelude::GetDispatchInfo;
+	use linked_list_interface::SortedListInterface;
+
+	for steps in 0..=MaxHintRepairSteps::get() {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			seed_long_rate_index();
+			fund_account(21);
+			let hint = Position::between(20 - u64::from(steps), 19 - u64::from(steps));
+			let rate = rate_pct(395, 1000);
+			let call = crate::Call::<Test>::open_vault {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				initial_collateral: 1_000,
+				initial_debt: 500,
+				annual_rate: rate,
+				hint: hint.clone(),
+			};
+			assert_eq!(
+				call.get_dispatch_info().call_weight,
+				<() as WeightInfo>::open_vault(MaxHintRepairSteps::get()),
+			);
+			let post = crate::Pallet::<Test>::open_vault(
+				RuntimeOrigin::signed(21),
+				DOT,
+				PUSD,
+				1_000,
+				500,
+				rate,
+				hint,
+			)
+			.expect("valid hint within the repair budget");
+			assert_eq!(post.actual_weight, Some(<() as WeightInfo>::open_vault(steps)));
+			assert_eq!(
+				LinkedList::neighbors(&VaultList::Rate(DOT, PUSD), &21),
+				Some(Position::between(20, 19)),
+			);
+			crate::tests::assert_invariants();
+		});
+	}
+}
+
+#[test]
 fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		seed_long_rate_index();
 
 		assert_noop!(
-			change_rate(20, DOT, PUSD, rate_pct(1, 100)),
+			change_rate(20, DOT, PUSD, percent(1)),
 			crate::Error::<Test>::InvalidPositionHints
 		);
 	});

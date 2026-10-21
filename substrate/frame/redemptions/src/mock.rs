@@ -218,7 +218,7 @@ impl pallet_vaults::Config for Test {
 	type YieldHook = ();
 	// Registering a market seeds this pallet's redemption config via `on_registered`.
 	type OnBranchLifecycle = Redemptions;
-	type StabilityPool = ();
+	type StabilityPool = BenchmarkSeedablePool;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type BranchConsideration = VaultsConsideration;
@@ -236,29 +236,100 @@ impl pallet_vaults::Config for Test {
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchHelper;
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for VaultsBenchHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
-	}
-
-	fn stable_asset_id() -> StableId {
-		PUSD
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
 	}
 
-	fn clear_oracle_price(collateral_id: AssetId) {
-		clear_price(collateral_id);
-	}
-
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
 
-	// The genesis config already creates every stable asset.
-	fn ensure_stable_asset(_: StableId) {}
+	// The benchmark collateral is native, which exists without being created.
+	fn ensure_collateral_asset(collateral_id: AssetId) {
+		assert_eq!(collateral_id, DOT);
+	}
+
+	// `StoredCeiling` reads only the ceiling row the benchmarks write themselves.
+	fn stage_debt_ceiling(_: StableId) {}
+
+	fn fund_native(who: &AccountId) {
+		<Balances as fungible::Mutate<AccountId>>::mint_into(who, 1_000_000_000_000)
+			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
+	}
+}
+
+/// No Stability Pool: nothing absorbs a liquidation, so it redistributes, exactly as with `()`.
+///
+/// The benchmarks still queue pool cohorts, which a real pool needs for its yield route; this
+/// pool accepts them as deadlines only, so the same staging runs here and on a real runtime.
+pub struct BenchmarkSeedablePool;
+
+impl pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance> for BenchmarkSeedablePool {
+	type Quote = ();
+
+	fn quote(
+		collateral_id: &AssetId,
+		stable_id: &StableId,
+		branch: pusd_primitives::BranchSnapshot,
+	) -> Option<()> {
+		<() as pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote(
+			collateral_id,
+			stable_id,
+			branch,
+		)
+	}
+
+	fn quote_active(quote: &(), max_debt: Balance) -> Balance {
+		<() as pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote_active(
+			quote, max_debt,
+		)
+	}
+
+	fn quote_pending(quote: &(), max_debt: Balance, active_debt: Balance) -> Balance {
+		<() as pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote_pending(
+			quote,
+			max_debt,
+			active_debt,
+		)
+	}
+}
+
+impl<CollateralCredit: frame::deps::frame_support::traits::TryDrop, StableCredit>
+	pusd_primitives::StabilityPoolOffset<AssetId, StableId, Balance, CollateralCredit, StableCredit>
+	for BenchmarkSeedablePool
+{
+	fn offset(
+		collateral_id: &AssetId,
+		stable_id: &StableId,
+		branch: pusd_primitives::BranchSnapshot,
+		debt: pusd_primitives::OffsetLegs<Balance>,
+		collateral: pusd_primitives::OffsetLegs<CollateralCredit>,
+	) -> Result<Option<StableCredit>, DispatchError> {
+		<() as pusd_primitives::StabilityPoolOffset<_, _, _, _, _>>::offset(
+			collateral_id,
+			stable_id,
+			branch,
+			debt,
+			collateral,
+		)
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_queue_deposit(
+		_: &AssetId,
+		_: &StableId,
+		_: u32,
+		entry_delay: u64,
+		_: Balance,
+	) -> Result<u64, DispatchError> {
+		assert!(entry_delay > 0);
+		Ok(Timestamp::get() + entry_delay)
+	}
 }
 
 /// Signs, and pays for, the redemptions a test runs.
@@ -327,33 +398,6 @@ impl pallet_redemptions::Config for Test {
 	type UpdateOrigin = RedemptionsUpdateOrigin;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
-	#[cfg(feature = "runtime-benchmarks")]
-	type BenchmarkHelper = RedemptionsBenchHelper;
-}
-
-#[cfg(feature = "runtime-benchmarks")]
-pub struct RedemptionsBenchHelper;
-#[cfg(feature = "runtime-benchmarks")]
-impl pallet_redemptions::BenchmarkHelper<AssetId, StableId, AccountId, Balance>
-	for RedemptionsBenchHelper
-{
-	fn setup_redeemable_branch(vaults: u32) -> (AssetId, StableId, AccountId, Balance) {
-		use frame::traits::fungible::Mutate as FungibleMutate;
-		register_branch(DOT, PUSD, default_branch_config());
-
-		let debt: Balance = 300;
-		for i in 0..vaults {
-			let who = 1_000 + u64::from(i);
-			let _ = <Balances as FungibleMutate<AccountId>>::mint_into(&who, 10_000_000_000);
-			let rate = FixedU128::from_rational(u128::from(i) + 1, 1_000u128);
-			open(who, DOT, PUSD, 1_000_000, debt, rate).expect("open benchmark vault");
-		}
-
-		let redeemer: AccountId = 1;
-		let budget = debt.saturating_mul(u128::from(vaults).saturating_add(2)).saturating_mul(2);
-		mint_stable(PUSD, redeemer, budget.saturating_mul(2));
-		(DOT, PUSD, redeemer, budget)
-	}
 }
 
 /// Native collateral.
@@ -509,6 +553,8 @@ pub fn open(
 		rate,
 		Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// The `max_steps` that defers to [`crate::Config::MaxRedemptionSteps`].

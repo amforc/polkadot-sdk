@@ -45,15 +45,6 @@ pub use pusd_primitives;
 pub use types::{RecoveryRegime, RedemptionConfig, RedemptionState, RedemptionTerms};
 pub use weights::WeightInfo;
 
-/// Runtime-supplied benchmark setup.
-///
-/// Redemptions delegates setup because the pallet cannot create markets or vaults itself.
-#[cfg(feature = "runtime-benchmarks")]
-pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
-	/// Creates a market with `vaults` redeemable vaults and funds a redeemer.
-	fn setup_redeemable_branch(vaults: u32) -> (CollateralId, StableId, AccountId, Balance);
-}
-
 #[frame::pallet]
 pub mod pallet {
 	use super::*;
@@ -68,24 +59,21 @@ pub mod pallet {
 	use pusd_primitives::{ProvidePrice, RedemptionStepSnapshot, VaultInterface};
 
 	/// Balance type used by stable assets and vault accounting.
-	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
-		<T as frame_system::Config>::AccountId,
-	>>::Balance;
+	pub type BalanceOf<T> =
+		<<T as Config>::StableAssets as fungibles::Inspect<AccountIdFor<T>>>::Balance;
 
 	/// Collateral identifier exposed by [`Config::Vaults`].
 	pub type CollateralIdOf<T> = <<T as Config>::Vaults as VaultInterface>::CollateralId;
 
 	/// Stable asset identifier exposed by [`Config::StableAssets`].
-	pub type StableIdOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
-		<T as frame_system::Config>::AccountId,
-	>>::AssetId;
+	pub type StableIdOf<T> =
+		<<T as Config>::StableAssets as fungibles::Inspect<AccountIdFor<T>>>::AssetId;
 
 	/// UNIX time in milliseconds.
 	pub use pusd_primitives::Millis;
 
 	/// Stable-asset credit consumed by the pallet.
-	pub type StableCreditOf<T> =
-		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
+	pub type StableCreditOf<T> = fungibles::Credit<AccountIdFor<T>, <T as Config>::StableAssets>;
 
 	/// Market redemption configuration used by the runtime.
 	pub type RedemptionConfigOf<T> = RedemptionConfig<BalanceOf<T>>;
@@ -143,15 +131,6 @@ pub mod pallet {
 
 		/// Weights for dispatchable calls.
 		type WeightInfo: weights::WeightInfo;
-
-		/// See [`crate::BenchmarkHelper`].
-		#[cfg(feature = "runtime-benchmarks")]
-		type BenchmarkHelper: crate::BenchmarkHelper<
-			CollateralIdOf<Self>,
-			StableIdOf<Self>,
-			Self::AccountId,
-			BalanceOf<Self>,
-		>;
 	}
 
 	/// Redemption parameters keyed by stable asset.
@@ -307,10 +286,14 @@ pub mod pallet {
 		/// move.
 		///
 		/// Targets are visited from the cheapest borrow rate upward. `max_steps` caps the vaults
-		/// touched; zero uses [`Config::MaxRedemptionSteps`]. Weight is charged for the cap and
-		/// refunded to the steps taken.
+		/// touched; zero uses [`Config::MaxRedemptionSteps`]. Weight is charged for the larger of
+		/// the cap and a `FinalRecovery` settlement, since the head decides the path only at
+		/// execution, and refunded to the path taken: the steps walked, or the recovery settlement.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps)))]
+		#[pallet::weight(
+			T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps))
+				.max(T::WeightInfo::redeem_recovery())
+		)]
 		pub fn redeem(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -320,9 +303,7 @@ pub mod pallet {
 			max_steps: u32,
 		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
-			let steps =
-				Self::do_redeem(&who, &collateral_id, &stable_id, terms, &recipient, max_steps)?;
-			Ok(Some(T::WeightInfo::redeem(steps)).into())
+			Self::do_redeem(&who, &collateral_id, &stable_id, terms, &recipient, max_steps)
 		}
 
 		/// Replaces a stablecoin's redemption configuration, for every collateral
@@ -339,12 +320,12 @@ pub mod pallet {
 			config: RedemptionConfigOf<T>,
 		) -> DispatchResult {
 			T::UpdateOrigin::ensure_origin(origin, &stable_id)?;
-			RedemptionConfigs::<T>::try_mutate(&stable_id, |registered| {
-				let stored = registered.as_mut().ok_or(Error::<T>::StablecoinNotRegistered)?;
-				ensure!(config.is_valid(), Error::<T>::InvalidRedemptionConfig);
-				*stored = config;
-				Ok::<_, DispatchError>(())
-			})?;
+			ensure!(
+				RedemptionConfigs::<T>::contains_key(&stable_id),
+				Error::<T>::StablecoinNotRegistered
+			);
+			ensure!(config.is_valid(), Error::<T>::InvalidRedemptionConfig);
+			RedemptionConfigs::<T>::insert(&stable_id, config);
 			Self::deposit_event(Event::RedemptionConfigUpdated { stable_id });
 			Ok(())
 		}
@@ -364,7 +345,8 @@ pub mod pallet {
 	/// The stablecoin's first market seeds these stablecoin-wide rows, and the
 	/// last one to leave clears them.
 	impl<T: Config>
-		pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId> for Pallet<T>
+		pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId>
+		for Pallet<T>
 	{
 		/// One redemption policy governs every collateral market issuing the
 		/// coin, so only the first market carries it. Later markets must pass

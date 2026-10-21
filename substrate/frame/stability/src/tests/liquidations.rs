@@ -2,14 +2,16 @@
 
 use crate::mock::*;
 use frame::traits::{fungibles::Inspect as _, tokens::Provenance};
-use pusd_primitives::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
+use pusd_primitives::{OffsetLegs, StabilityPoolInspect};
 
 #[test]
 fn vault_liquidation_uses_the_real_stability_pool() {
 	build_and_execute(|| {
-		let mut config = default_branch_config();
-		config.upfront_fee_period = 0;
-		register_branch(DOT, PUSD, config);
+		register_branch(
+			DOT,
+			PUSD,
+			pallet_vaults::BranchConfig { upfront_fee_period: 0, ..default_branch_config() },
+		);
 		assert_ok!(open_vault(1, DOT, PUSD, 600, 500));
 		assert_ok!(open_vault(2, DOT, PUSD, 2_000, 500));
 		// The deposit only matures here: the liquidation itself activates it, so no row touch
@@ -21,13 +23,7 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 		let keeper_before = collateral_balance(DOT, 4);
 		let pool_before = pool_collateral_held(DOT, PUSD);
 
-		assert_ok!(Vaults::liquidate(
-			RuntimeOrigin::signed(4),
-			DOT,
-			PUSD,
-			1,
-			pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
-		));
+		assert_ok!(liquidate(4, DOT, 1));
 
 		assert!(pallet_vaults::pallet::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
@@ -41,97 +37,68 @@ fn vault_liquidation_uses_the_real_stability_pool() {
 #[test]
 fn sub_minimum_first_gain_settles_into_seeded_pool_account() {
 	build_and_execute(|| {
-		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
-		let collateral = AssetId::WithId(77);
-		let mut config = branch_config_for(collateral.clone(), PUSD);
-		config.upfront_fee_period = 0;
-		register_branch(collateral.clone(), PUSD, config);
+		create_high_min_collateral();
+		register_branch(
+			HIGH_MIN,
+			PUSD,
+			pallet_vaults::BranchConfig {
+				upfront_fee_period: 0,
+				..branch_config_for(HIGH_MIN, PUSD)
+			},
+		);
 		for owner in [1, 2] {
-			mint_collateral(collateral.clone(), owner, 5_000);
-			assert_ok!(open_vault(owner, collateral.clone(), PUSD, 3_000, 500));
+			mint_collateral(HIGH_MIN, owner, 5_000);
+			assert_ok!(open_vault(owner, HIGH_MIN, PUSD, 3_000, 500));
 		}
 		// The keeper's reward is itself below this asset's 1_000 minimum, so give account 4 an
 		// account to receive it. The pool's gain is what this test is about.
-		mint_collateral(collateral.clone(), 4, 1_000);
+		mint_collateral(HIGH_MIN, 4, 1_000);
 		// Registration seeded custody with the asset minimum, which a hold's
 		// `Protect` preservation keeps free.
-		let redistribution = Vaults::redistribution_account(&collateral, &PUSD);
+		let redistribution = Vaults::redistribution_account(&HIGH_MIN, &PUSD);
 		mint_stable(PUSD, 3, 100);
-		assert_ok!(deposit_and_mature(3, collateral.clone(), PUSD, 100));
+		assert_ok!(deposit_and_mature(3, HIGH_MIN, PUSD, 100));
 		// floor(0.18 * 3_000) = 540 of value: CR 1.08 sits below the 1.10 MCR.
-		set_price(collateral.clone(), FixedU128::from_rational(9u128, 50u128));
+		set_price(HIGH_MIN, FixedU128::from_rational(9u128, 50u128));
 
-		let owner_free_before = collateral_balance(collateral.clone(), 1);
-		let pool_account = Stability::pool_account(&collateral, &PUSD);
+		let owner_free_before = collateral_balance(HIGH_MIN, 1);
+		let pool_account = Stability::pool_account(&HIGH_MIN, &PUSD);
 		// Registration parked the asset minimum in the pool account, so even a one-unit gain can
 		// enter it.
-		assert_ok!(Assets::can_deposit(77, &pool_account, 1, Provenance::Extant).into_result());
+		assert_ok!(
+			Assets::can_deposit(HIGH_MIN_ID, &pool_account, 1, Provenance::Extant).into_result()
+		);
 
 		// The active-pool gain is below the asset minimum to test prepared custody.
 		// The seeded account accepts it, so the normal active-first waterfall remains intact.
-		assert_ok!(Vaults::liquidate(
-			RuntimeOrigin::signed(4),
-			collateral.clone(),
-			PUSD,
-			1,
-			pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
-		));
+		assert_ok!(liquidate(4, HIGH_MIN, 1));
 
 		// The expected split includes terminal interest and both 5% penalties.
-		assert!(pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 1)).is_none());
-		let state = pool_state(collateral.clone(), PUSD);
+		assert!(pallet_vaults::pallet::Vaults::<Test>::get((HIGH_MIN, PUSD, 1)).is_none());
+		let state = pool_state(HIGH_MIN, PUSD);
 		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(state.total_collateral_gains_unclaimed, 571);
-		assert_eq!(pool_stable_held(collateral.clone(), PUSD), 0);
-		assert_eq!(pool_collateral_held(collateral.clone(), PUSD), 571);
+		assert_eq!(pool_stable_held(HIGH_MIN, PUSD), 0);
+		assert_eq!(pool_collateral_held(HIGH_MIN, PUSD), 571);
 		// Redistribution collateral remains in custody until the recipient is touched.
-		use frame::traits::fungibles::InspectHold;
+		assert_eq!(vault_collateral_on_hold(HIGH_MIN, redistribution), 2_299);
+		assert_eq!(vault_collateral_on_hold(HIGH_MIN, 2), 3_000);
 		assert_eq!(
-			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
-				collateral.clone(),
-				&pallet_vaults::HoldReason::VaultCollateral.into(),
-				&redistribution,
-			),
-			2_299
-		);
-		assert_eq!(
-			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
-				collateral.clone(),
-				&pallet_vaults::HoldReason::VaultCollateral.into(),
-				&2,
-			),
-			3_000
-		);
-		assert_eq!(
-			pallet_vaults::pallet::Vaults::<Test>::get((collateral.clone(), PUSD, 2))
+			pallet_vaults::pallet::Vaults::<Test>::get((HIGH_MIN, PUSD, 2))
 				.unwrap()
 				.vault
 				.collateral,
 			3_000
 		);
-		assert_ok!(Vaults::poke(RuntimeOrigin::signed(4), collateral.clone(), PUSD, 2));
-		assert_eq!(
-			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
-				collateral.clone(),
-				&pallet_vaults::HoldReason::VaultCollateral.into(),
-				&redistribution,
-			),
-			0
-		);
-		assert_eq!(
-			<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
-				collateral.clone(),
-				&pallet_vaults::HoldReason::VaultCollateral.into(),
-				&2,
-			),
-			5_299
-		);
-		assert_eq!(collateral_balance(collateral.clone(), redistribution), 1_000);
-		assert_eq!(collateral_balance(collateral.clone(), 4), 1_000 + 58);
+		assert_ok!(Vaults::poke(RuntimeOrigin::signed(4), HIGH_MIN, PUSD, 2));
+		assert_eq!(vault_collateral_on_hold(HIGH_MIN, redistribution), 0);
+		assert_eq!(vault_collateral_on_hold(HIGH_MIN, 2), 5_299);
+		assert_eq!(collateral_balance(HIGH_MIN, redistribution), 1_000);
+		assert_eq!(collateral_balance(HIGH_MIN, 4), 1_000 + 58);
 		// The owner receives all collateral not required by the liquidation: 2_928 of the 3_000
 		// it pledged was seized. (Account 1 also created the market, so its balance carries the
 		// minimum the seed withdrawal preserved.)
-		assert_eq!(collateral_balance(collateral, 1), owner_free_before + 3_000 - 2_928);
+		assert_eq!(collateral_balance(HIGH_MIN, 1), owner_free_before + 3_000 - 2_928);
 	});
 }
 
@@ -143,9 +110,11 @@ fn sub_minimum_first_gain_settles_into_seeded_pool_account() {
 #[test]
 fn liquidation_pool_legs_match_the_quotes_and_one_offset() {
 	let setup = || {
-		let mut config = default_branch_config();
-		config.upfront_fee_period = 0;
-		register_branch(DOT, PUSD, config);
+		register_branch(
+			DOT,
+			PUSD,
+			pallet_vaults::BranchConfig { upfront_fee_period: 0, ..default_branch_config() },
+		);
 		assert_ok!(open_vault(1, DOT, PUSD, 600, 500));
 		assert_ok!(open_vault(2, DOT, PUSD, 2_000, 500));
 		seed_matured_deposit(3, 300);
@@ -165,13 +134,7 @@ fn liquidation_pool_legs_match_the_quotes_and_one_offset() {
 	let mut real = None;
 	build_and_execute(|| {
 		setup();
-		assert_ok!(Vaults::liquidate(
-			RuntimeOrigin::signed(4),
-			DOT,
-			PUSD,
-			1,
-			pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
-		));
+		assert_ok!(liquidate(4, DOT, 1));
 		let outcome = System::events()
 			.into_iter()
 			.find_map(|record| match record.event {
@@ -198,15 +161,11 @@ fn liquidation_pool_legs_match_the_quotes_and_one_offset() {
 		assert_eq!(Stability::quote_active(&quote, debt), active.debt);
 		assert_eq!(Stability::quote_pending(&quote, debt - active.debt, active.debt), pending.debt);
 
-		let burned = Stability::offset(
-			&DOT,
-			&PUSD,
+		let burned = offset_with(
+			(DOT, PUSD),
 			branch_snapshot(&DOT, &PUSD),
 			OffsetLegs { active: active.debt, pending: pending.debt },
-			OffsetLegs {
-				active: issue_collateral(DOT, active.collateral),
-				pending: issue_collateral(DOT, pending.collateral),
-			},
+			OffsetLegs { active: (DOT, active.collateral), pending: (DOT, pending.collateral) },
 		)
 		.expect("the reported legs settle");
 		assert_eq!(burned.map_or(0, |credit| credit.peek()), active.debt + pending.debt);

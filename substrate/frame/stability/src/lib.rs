@@ -108,6 +108,8 @@ extern crate alloc;
 pub mod types;
 pub mod weights;
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
 mod dispatchable_impls;
 mod interfaces;
 pub use interfaces::OffsetQuote;
@@ -152,27 +154,23 @@ pub mod pallet {
 	use pusd_primitives::{BranchInterface, Millis, OnBranchLifecycle, RecoveryOffsetInterface};
 
 	/// Balance type shared by the stablecoin and collateral asset systems.
-	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
-		<T as frame_system::Config>::AccountId,
-	>>::Balance;
+	pub type BalanceOf<T> =
+		<<T as Config>::StableAssets as fungibles::Inspect<AccountIdFor<T>>>::Balance;
 
 	/// Collateral identifier from [`Config::CollateralAssets`].
-	pub type CollateralIdOf<T> = <<T as Config>::CollateralAssets as fungibles::Inspect<
-		<T as frame_system::Config>::AccountId,
-	>>::AssetId;
+	pub type CollateralIdOf<T> =
+		<<T as Config>::CollateralAssets as fungibles::Inspect<AccountIdFor<T>>>::AssetId;
 
 	/// Stablecoin identifier from [`Config::StableAssets`].
-	pub type StableIdOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
-		<T as frame_system::Config>::AccountId,
-	>>::AssetId;
+	pub type StableIdOf<T> =
+		<<T as Config>::StableAssets as fungibles::Inspect<AccountIdFor<T>>>::AssetId;
 
 	/// Stablecoin credit that the pallet must resolve or burn.
-	pub type StableCreditOf<T> =
-		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
+	pub type StableCreditOf<T> = fungibles::Credit<AccountIdFor<T>, <T as Config>::StableAssets>;
 
 	/// Collateral credit that the pallet must resolve or burn.
 	pub type CollateralCreditOf<T> =
-		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::CollateralAssets>;
+		fungibles::Credit<AccountIdFor<T>, <T as Config>::CollateralAssets>;
 
 	/// Deposit position of one account in one market.
 	pub type DepositOf<T> = Deposit<BalanceOf<T>>;
@@ -292,7 +290,7 @@ pub mod pallet {
 			NMapKey<Twox64Concat, u32>,
 		),
 		PoolSums,
-		ValueQuery,
+		OptionQuery,
 	>;
 
 	/// Activation boundary of each completed maturity cohort.
@@ -538,13 +536,13 @@ pub mod pallet {
 		/// `[entry_delay, 2 * entry_delay)`, unless the delay is zero. A new deposit restarts the
 		/// wait for all pending capital of the depositor.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::deposit())]
+		#[pallet::weight(T::WeightInfo::deposit().max(T::WeightInfo::deposit_no_recovery()))]
 		pub fn deposit(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_deposit(who, collateral_id, stable_id, amount)
@@ -563,13 +561,17 @@ pub mod pallet {
 		///
 		/// Normal mode does not need a request, so this call immediately pays the caller.
 		#[pallet::call_index(1)]
-		#[pallet::weight(T::WeightInfo::request_withdraw())]
+		#[pallet::weight(
+			T::WeightInfo::request_withdraw()
+				.max(T::WeightInfo::request_withdraw_exhausted())
+				.max(T::WeightInfo::request_withdraw_safety())
+		)]
 		pub fn request_withdraw(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_request_withdraw(who, collateral_id, stable_id, amount)
@@ -591,14 +593,14 @@ pub mod pallet {
 		///
 		/// `recipient` selects another beneficiary. `None` pays the caller.
 		#[pallet::call_index(2)]
-		#[pallet::weight(T::WeightInfo::withdraw())]
+		#[pallet::weight(T::WeightInfo::withdraw().max(T::WeightInfo::withdraw_exhausted()))]
 		pub fn withdraw(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 			recipient: Option<T::AccountId>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
 			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
@@ -668,14 +670,16 @@ pub mod pallet {
 		/// The call reduces recovery debt and gives the collateral to active depositors through
 		/// `S`.
 		#[pallet::call_index(5)]
-		#[pallet::weight(T::WeightInfo::offset_recovery())]
+		#[pallet::weight(
+			T::WeightInfo::offset_recovery().saturating_add(T::DbWeight::get().writes(1))
+		)]
 		pub fn offset_recovery(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			max_stable_in: BalanceOf<T>,
 		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			Self::do_offset_recovery(collateral_id, stable_id, max_stable_in)
 		}
 
@@ -690,7 +694,7 @@ pub mod pallet {
 		/// The moved amount immediately absorbs debt and earns gains. This call requires the
 		/// depositor's authority because it exposes claimable yield to pool risk.
 		#[pallet::call_index(6)]
-		#[pallet::weight(T::WeightInfo::compound_yield())]
+		#[pallet::weight(T::WeightInfo::compound_yield().max(T::WeightInfo::claim_yield()))]
 		pub fn compound_yield(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -723,7 +727,7 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			Self::do_settle_deposit(owner, collateral_id, stable_id)
 		}
 
@@ -882,8 +886,11 @@ pub mod pallet {
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			ensure!(
-				T::StableAssets::balance(stable_id.clone(), &pool_account).is_zero() &&
-					T::CollateralAssets::balance(collateral_id.clone(), &pool_account).is_zero(),
+				T::StableAssets::balance(stable_id.clone(), &pool_account).is_zero(),
+				Error::<T>::PoolAccountNotEmpty
+			);
+			ensure!(
+				T::CollateralAssets::balance(collateral_id.clone(), &pool_account).is_zero(),
 				Error::<T>::PoolAccountNotEmpty
 			);
 
@@ -928,8 +935,7 @@ pub mod pallet {
 				Error::<T>::PoolNotEmpty
 			);
 
-			let pool =
-				Pools::<T>::get(collateral_id, stable_id).ok_or(Error::<T>::PoolNotRegistered)?;
+			let pool = Self::load_pool(collateral_id, stable_id)?;
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			let (stable_amount, collateral_amount) =
 				Self::release_custody(collateral_id, stable_id, &pool_account, &pool, funder)?;
@@ -962,7 +968,9 @@ pub mod pallet {
 				// The release emptied the market's own assets, but a third party may have parked
 				// another token here and left a consumer reference behind. The account then stays,
 				// which does no harm.
-				let _ = frame_system::Pallet::<T>::dec_providers(&pool_account);
+				if frame_system::Pallet::<T>::can_dec_provider(&pool_account) {
+					frame_system::Pallet::<T>::dec_providers(&pool_account)?;
+				}
 			}
 			Ok(())
 		}
@@ -984,6 +992,23 @@ pub mod pallet {
 				},
 				yield_share: Permill::from_percent(75),
 			}
+		}
+
+		/// Leaves dust of both assets in the pool account, so removal sweeps it.
+		#[cfg(feature = "runtime-benchmarks")]
+		fn benchmark_stage_deregistration(
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
+		) -> DispatchResult {
+			use frame::traits::fungibles::Mutate as _;
+			let pool_account = Self::pool_account(collateral_id, stable_id);
+			let one = BalanceOf::<T>::one();
+			let stable_dust = T::StableAssets::minimum_balance(stable_id.clone()).max(one);
+			T::StableAssets::mint_into(stable_id.clone(), &pool_account, stable_dust)?;
+			let collateral_dust =
+				T::CollateralAssets::minimum_balance(collateral_id.clone()).max(one);
+			T::CollateralAssets::mint_into(collateral_id.clone(), &pool_account, collateral_dust)?;
+			Ok(())
 		}
 	}
 }

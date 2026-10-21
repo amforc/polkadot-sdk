@@ -5,7 +5,7 @@
 //! math and passes the resulting `RedemptionSettlement` to `redeem_step`.
 
 use crate::{
-	pallet::{CollateralIdOf, Config, Error, StableIdOf},
+	pallet::{CollateralIdOf, Config, Error, StableIdOf, VaultListIdOf},
 	types::VaultListId,
 };
 use frame::prelude::*;
@@ -15,7 +15,7 @@ use linked_list_interface::{fifo_append, SortedListInterface};
 pub fn list_id<T: Config>(
 	collateral_id: &CollateralIdOf<T>,
 	stable_id: &StableIdOf<T>,
-) -> VaultListId<CollateralIdOf<T>, StableIdOf<T>> {
+) -> VaultListIdOf<T> {
 	VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone())
 }
 
