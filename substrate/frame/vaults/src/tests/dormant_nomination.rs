@@ -2,7 +2,7 @@
 
 use crate::{
 	mock::*,
-	tests::{assert_event, rate_pct, vault_status},
+	tests::{assert_event, percent, vault_status},
 	Error, Event,
 };
 use frame::prelude::One;
@@ -11,20 +11,20 @@ use pusd_primitives::VaultInterface;
 /// Two debt-free stake bearers receive a liquidation lazily, outside the redemption indices.
 fn redistribute_to_husks(debt: Balance) {
 	let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
-	register_market_with(DOT, PUSD, FixedU128::from_u32(10), config);
+	register_market_with(DOT, PUSD, DEFAULT_PRICE, config);
 	for owner in [1, 2] {
-		assert_ok!(open(owner, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(owner, DOT, PUSD, 1_000, 500, percent(5)));
 		assert_ok!(repay(owner, DOT, PUSD, owner, None));
 	}
-	assert_ok!(open(3, DOT, PUSD, 200, debt, rate_pct(5, 100)));
+	assert_ok!(open(3, DOT, PUSD, 200, debt, percent(5)));
 	set_price(DOT, FixedU128::one());
 	assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
 }
 
 fn park_vault(remaining: Balance) {
 	let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
-	register_market_with(DOT, PUSD, FixedU128::from_u32(10), config);
-	assert_ok!(open(1, DOT, PUSD, 1_040, 500, rate_pct(50, 100)));
+	register_market_with(DOT, PUSD, DEFAULT_PRICE, config);
+	assert_ok!(open(1, DOT, PUSD, 1_040, 500, percent(50)));
 	assert_ok!(redeem(DOT, PUSD, 3, 500 - remaining));
 }
 
@@ -78,8 +78,8 @@ fn nomination_rejects_non_dormant_non_dust_and_underwater_vaults() {
 			nominate_dormant(9, DOT, PUSD, 1),
 			Error::<Test>::UnsafeCollateralizationRatio
 		);
-		set_price(DOT, FixedU128::from_u32(10));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		set_price(DOT, DEFAULT_PRICE);
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(5)));
 		assert_noop!(nominate_dormant(9, DOT, PUSD, 2), Error::<Test>::InvalidVaultStatus);
 		assert_ok!(repay(1, DOT, PUSD, 1, None));
 		assert_noop!(nominate_dormant(9, DOT, PUSD, 1), Error::<Test>::DebtNotDust);
