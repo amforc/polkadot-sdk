@@ -287,6 +287,14 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		);
 	}
 
+	// Market removal clears every sums row: no row may outlive its pool.
+	for (collateral_id, stable_id, _leg, _epoch, _scale) in PoolSumsStore::<T>::iter_keys() {
+		ensure!(
+			Pools::<T>::contains_key(&collateral_id, &stable_id),
+			"sums row without a pool row"
+		);
+	}
+
 	// No checkpoint may outlive the rows that reference it: every stored checkpoint belongs to a
 	// registered market, and the per-market loop above already matched member counts.
 	for (collateral_id, stable_id, _id) in CohortCheckpoints::<T>::iter_keys() {

@@ -58,15 +58,64 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 				PUSD,
 				1_000,
 				500,
-				rate_pct(1, 100),
+				percent(1),
 				Position::endpoints_only()
-			),
+			)
+			.map_err(|error| {
+				assert_eq!(error.post_info.actual_weight, None);
+				error.error
+			}),
 			crate::Error::<Test>::InvalidPositionHints
 		);
 
 		assert!(!vault_exists(DOT, PUSD, 21));
 		assert_eq!(held(DOT, 21), 0);
 	});
+}
+
+#[test]
+fn open_vault_refunds_unused_hint_repair_steps() {
+	use crate::WeightInfo;
+	use frame::prelude::GetDispatchInfo;
+	use linked_list_interface::SortedListInterface;
+
+	for steps in 0..=MaxHintRepairSteps::get() {
+		build_and_execute(|| {
+			register_market(DOT, PUSD);
+			seed_long_rate_index();
+			fund_account(21);
+			let hint = Position::between(20 - u64::from(steps), 19 - u64::from(steps));
+			let rate = rate_pct(395, 1000);
+			let call = crate::Call::<Test>::open_vault {
+				collateral_id: DOT,
+				stable_id: PUSD,
+				initial_collateral: 1_000,
+				initial_debt: 500,
+				annual_rate: rate,
+				hint: hint.clone(),
+			};
+			assert_eq!(
+				call.get_dispatch_info().call_weight,
+				<() as WeightInfo>::open_vault(MaxHintRepairSteps::get()),
+			);
+			let post = crate::Pallet::<Test>::open_vault(
+				RuntimeOrigin::signed(21),
+				DOT,
+				PUSD,
+				1_000,
+				500,
+				rate,
+				hint,
+			)
+			.expect("valid hint within the repair budget");
+			assert_eq!(post.actual_weight, Some(<() as WeightInfo>::open_vault(steps)));
+			assert_eq!(
+				LinkedList::neighbors(&VaultList::Rate(DOT, PUSD), &21),
+				Some(Position::between(20, 19)),
+			);
+			crate::tests::assert_invariants();
+		});
+	}
 }
 
 #[test]

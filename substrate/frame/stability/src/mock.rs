@@ -255,38 +255,42 @@ impl pallet_vaults::Config for Test {
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchHelper;
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for VaultsBenchHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
-	}
-
-	fn stable_asset_id() -> StableId {
-		PUSD
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
 	}
 
-	fn clear_oracle_price(collateral_id: AssetId) {
-		MockPrices::mutate(|m| {
-			m.remove(&collateral_id);
-		});
-	}
-
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
 
-	// The genesis config already creates every stable asset.
-	fn ensure_stable_asset(_: StableId) {}
+	// The benchmark collateral is native, which exists without being created.
+	fn ensure_collateral_asset(collateral_id: AssetId) {
+		assert_eq!(collateral_id, DOT);
+	}
+
+	// `StoredCeiling` reads only the ceiling row the benchmarks write themselves.
+	fn stage_debt_ceiling(_: StableId) {}
+
+	fn fund_native(who: &AccountId) {
+		use frame::traits::fungible::Mutate as FungibleMutate;
+		<Balances as FungibleMutate<AccountId>>::mint_into(who, 1_000_000_000_000)
+			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
+	}
 }
 
 /// Root as the governance override, or the stored full admin of the market. A production runtime
 /// composes the same pair.
+///
+/// The admin comes first so that its benchmark origin, which reads the market, is the one the
+/// benchmarks measure.
 pub type StabilityUpdateOrigin = EitherOf<
-	AsEnsureOriginWithArg<frame_system::EnsureRoot<AccountId>>,
 	pallet_vaults::EnsureBranchFullAdmin<Test>,
+	AsEnsureOriginWithArg<frame_system::EnsureRoot<AccountId>>,
 >;
 
 /// Where redemption fees go. Recovery offsets charge no fee, so only ordinary redemptions pay
@@ -346,29 +350,6 @@ impl pallet_redemptions::Config for Test {
 	type UpdateOrigin = EnsureAssetOwner;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
-	#[cfg(feature = "runtime-benchmarks")]
-	type BenchmarkHelper = RedemptionsBenchHelper;
-}
-
-#[cfg(feature = "runtime-benchmarks")]
-pub struct RedemptionsBenchHelper;
-#[cfg(feature = "runtime-benchmarks")]
-impl pallet_redemptions::BenchmarkHelper<AssetId, StableId, AccountId, Balance>
-	for RedemptionsBenchHelper
-{
-	fn setup_redeemable_branch(vaults: u32) -> (AssetId, StableId, AccountId, Balance) {
-		register_branch(DOT, PUSD, default_branch_config());
-		let debt: Balance = 300;
-		for i in 0..vaults {
-			let who = 1_000 + AccountId::from(i);
-			mint_collateral(DOT, who, 10_000_000_000);
-			open_vault(who, DOT, PUSD, 1_000_000, debt).expect("open benchmark vault");
-		}
-		let redeemer: AccountId = 1;
-		let budget = debt.saturating_mul(Balance::from(vaults).saturating_add(2)).saturating_mul(2);
-		mint_stable(PUSD, redeemer, budget.saturating_mul(2));
-		(DOT, PUSD, redeemer, budget)
-	}
 }
 
 impl pallet_stability::Config for Test {
@@ -565,6 +546,16 @@ pub fn create_high_min_collateral() {
 	assert_ok!(Assets::force_create(RuntimeOrigin::root(), HIGH_MIN_ID, 1, true, 1_000));
 }
 
+/// Keeper terms that make no just-in-time contribution.
+pub const NO_JIT: pallet_vaults::JitTerms<Balance> =
+	pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 };
+
+/// Liquidates the vault of `owner` in the `collateral`/pUSD market, signed by `keeper`, with
+/// [`NO_JIT`] terms.
+pub fn liquidate(keeper: AccountId, collateral: AssetId, owner: AccountId) -> DispatchResult {
+	Vaults::liquidate(RuntimeOrigin::signed(keeper), collateral, PUSD, owner, NO_JIT)
+}
+
 /// Creates the `collateral`/pUSD market as `origin`, with the default admins, branch
 /// parameters and registration.
 pub fn create_branch_as(origin: RuntimeOrigin, collateral: AssetId) -> DispatchResult {
@@ -653,6 +644,18 @@ pub fn open_vault(
 		debt,
 		FixedU128::from_rational(5u128, 100u128),
 		pallet_linked_list::Position::endpoints_only(),
+	)
+	.map(|_| ())
+	.map_err(|error| error.error)
+}
+
+/// The collateral `who` holds under the vault engine's collateral hold.
+pub fn vault_collateral_on_hold(collateral: AssetId, who: AccountId) -> Balance {
+	use frame::traits::fungibles::InspectHold;
+	<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
+		collateral,
+		&pallet_vaults::HoldReason::VaultCollateral.into(),
+		&who,
 	)
 }
 
@@ -760,6 +763,8 @@ pub fn deposit(
 	amount: Balance,
 ) -> DispatchResult {
 	Stability::deposit(RuntimeOrigin::signed(who), collateral, stable, amount)
+		.map(|_| ())
+		.map_err(|error| error.error)
 }
 
 pub fn request_withdraw(
@@ -769,6 +774,8 @@ pub fn request_withdraw(
 	amount: Balance,
 ) -> DispatchResult {
 	Stability::request_withdraw(RuntimeOrigin::signed(who), collateral, stable, amount)
+		.map(|_| ())
+		.map_err(|error| error.error)
 }
 
 /// Withdraws to a named recipient, signed by `who`.
@@ -780,6 +787,8 @@ pub fn withdraw(
 	recipient: AccountId,
 ) -> DispatchResult {
 	Stability::withdraw(RuntimeOrigin::signed(who), collateral, stable, amount, Some(recipient))
+		.map(|_| ())
+		.map_err(|error| error.error)
 }
 
 pub fn claim_collateral(

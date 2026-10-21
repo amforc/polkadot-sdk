@@ -61,19 +61,42 @@ pub use weights::WeightInfo;
 
 /// Runtime-specific benchmark fixtures and external-state mutation.
 #[cfg(feature = "runtime-benchmarks")]
-pub trait BenchmarkHelper<CollateralId, StableId> {
-	/// Returns a collateral asset ID.
+pub trait BenchmarkHelper<CollateralId, StableId, AccountId> {
+	/// Returns the benchmark collateral.
 	fn collateral_asset_id() -> CollateralId;
-	/// Returns a stable asset ID.
-	fn stable_asset_id() -> StableId;
-	/// Sets the price of a collateral asset.
+	/// Sets the oracle price of a collateral asset.
 	fn set_oracle_price(collateral_id: CollateralId, price: frame::arithmetic::FixedU128);
-	/// Removes the price of a collateral asset.
-	fn clear_oracle_price(collateral_id: CollateralId);
-	/// Moves the benchmark clock forward.
+	/// Moves the benchmark clock forward. [`Config::TimeProvider`] only reads the clock.
 	fn advance_time(ms: u64);
-	/// Creates the stable asset when the benchmark genesis lacks it, so benchmarks can mint it.
-	fn ensure_stable_asset(stable_id: StableId);
+	/// Idempotently creates collateral and any reference feed needed by the deposit policy.
+	/// Benchmarks set the collateral price separately.
+	///
+	/// A runtime hook supports native and holder-backed assets that lack `fungibles::Create`.
+	fn ensure_collateral_asset(collateral_id: CollateralId);
+	/// Stages the costliest global debt-ceiling lookup after stablecoin creation.
+	/// The runtime owns external inputs, such as PSM debt rows; local-only ceilings need no setup.
+	fn stage_debt_ceiling(stable_id: StableId);
+	/// Funds native asset-account and storage deposits; `Config` exposes no native currency.
+	fn fund_native(who: &AccountId);
+}
+
+/// Benchmark-only asset creation and event inspection bounds.
+#[cfg(feature = "runtime-benchmarks")]
+pub trait BenchmarkConfig:
+	Config<
+	StableAssets: frame::traits::fungibles::Create<Self::AccountId, AssetId: From<u32>>,
+	RuntimeEvent: TryInto<Event<Self>>,
+>
+{
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl<T> BenchmarkConfig for T where
+	T: Config<
+		StableAssets: frame::traits::fungibles::Create<T::AccountId, AssetId: From<u32>>,
+		RuntimeEvent: TryInto<Event<T>>,
+	>
+{
 }
 
 #[frame::pallet]
@@ -257,7 +280,11 @@ pub mod pallet {
 
 		/// See [`crate::BenchmarkHelper`].
 		#[cfg(feature = "runtime-benchmarks")]
-		type BenchmarkHelper: crate::BenchmarkHelper<CollateralIdOf<Self>, StableIdOf<Self>>;
+		type BenchmarkHelper: crate::BenchmarkHelper<
+			CollateralIdOf<Self>,
+			StableIdOf<Self>,
+			Self::AccountId,
+		>;
 	}
 
 	/// Reason for holding funds.
@@ -930,9 +957,9 @@ pub mod pallet {
 		///
 		/// The market must not be frozen. The collateral, debt, annual rate, and list hint must
 		/// satisfy the market limits. The collateral is held from the owner, and the stable asset
-		/// is minted to the owner.
+		/// is minted to the owner. Unused hint-repair steps are refunded after a successful open.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::open_vault())]
+		#[pallet::weight(T::WeightInfo::open_vault(T::VaultLists::repair_budget()))]
 		pub fn open_vault(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -941,7 +968,7 @@ pub mod pallet {
 			initial_debt: BalanceOf<T>,
 			annual_rate: FixedU128,
 			hint: Position<T::AccountId>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			Self::do_open_vault(
 				who,
@@ -983,9 +1010,10 @@ pub mod pallet {
 		/// Must be signed by the vault owner.
 		///
 		/// The amount must be non-zero and the vault must remain safe. `recipient` defaults to the
-		/// owner. Removing all collateral from a debt-free vault closes it.
+		/// owner. Removing all collateral from a debt-free vault closes it, so the call is charged
+		/// the costlier of a withdrawal and a close.
 		#[pallet::call_index(2)]
-		#[pallet::weight(T::WeightInfo::withdraw_collateral())]
+		#[pallet::weight(T::WeightInfo::withdraw_collateral().max(T::WeightInfo::close_vault()))]
 		pub fn withdraw_collateral(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -1007,7 +1035,9 @@ pub mod pallet {
 		/// The amount must be non-zero and all debt limits must hold. The call may also change the
 		/// annual rate. `recipient` defaults to the owner.
 		#[pallet::call_index(3)]
-		#[pallet::weight(T::WeightInfo::borrow())]
+		#[pallet::weight(T::WeightInfo::borrow()
+			.max(T::WeightInfo::borrow_relocate(T::VaultLists::repair_budget()))
+			.max(T::WeightInfo::borrow_activate(T::VaultLists::repair_budget())))]
 		pub fn borrow(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -1016,7 +1046,7 @@ pub mod pallet {
 			maybe_new_rate: Option<FixedU128>,
 			recipient: Option<T::AccountId>,
 			hint: Position<T::AccountId>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
 			Self::do_borrow(who, collateral_id, stable_id, amount, maybe_new_rate, recipient, hint)
@@ -1055,14 +1085,15 @@ pub mod pallet {
 		/// The new rate must be within the market limits. A change during the cooldown may charge
 		/// an upfront fee. The hint gives the new place in the rate list.
 		#[pallet::call_index(5)]
-		#[pallet::weight(T::WeightInfo::change_rate())]
+		#[pallet::weight(T::WeightInfo::change_rate()
+			.max(T::WeightInfo::change_rate_relocate(T::VaultLists::repair_budget())))]
 		pub fn change_rate(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			new_rate: FixedU128,
 			hint: Position<T::AccountId>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			Self::do_change_rate(who, collateral_id, stable_id, new_rate, hint)
 		}
@@ -1376,7 +1407,9 @@ pub mod pallet {
 		///   execution, so it should reflect the smallest execution the keeper would accept. A
 		///   trade that would pay less is skipped and the liquidation proceeds without it.
 		#[pallet::call_index(19)]
-		#[pallet::weight(T::WeightInfo::liquidate())]
+		// The benchmark depletes both pool legs. Depleting a leg across two scale changes writes
+		// one more pool-sums row per leg than the depletion it measures.
+		#[pallet::weight(T::WeightInfo::liquidate().saturating_add(T::DbWeight::get().writes(2)))]
 		pub fn liquidate(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -1406,20 +1439,15 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			Self::do_nominate_dormant(owner, collateral_id, stable_id)
 		}
 	}
 
 	/// Provides current vault rates to the sorted list.
-	impl<T: Config> PriorityProvider<VaultListId<CollateralIdOf<T>, StableIdOf<T>>, T::AccountId>
-		for Pallet<T>
-	{
+	impl<T: Config> PriorityProvider<VaultListIdOf<T>, T::AccountId> for Pallet<T> {
 		type Priority = FixedU128;
-		fn priority(
-			list_id: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
-			item: &T::AccountId,
-		) -> Option<FixedU128> {
+		fn priority(list_id: &VaultListIdOf<T>, item: &T::AccountId) -> Option<FixedU128> {
 			match list_id {
 				VaultListId::Rate(collateral_id, stable_id) => {
 					Pallet::<T>::vault_of(collateral_id, stable_id, item)

@@ -108,6 +108,8 @@ extern crate alloc;
 pub mod types;
 pub mod weights;
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
 mod dispatchable_impls;
 mod interfaces;
 pub use interfaces::OffsetQuote;
@@ -534,13 +536,13 @@ pub mod pallet {
 		/// `[entry_delay, 2 * entry_delay)`, unless the delay is zero. A new deposit restarts the
 		/// wait for all pending capital of the depositor.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::deposit())]
+		#[pallet::weight(T::WeightInfo::deposit().max(T::WeightInfo::deposit_no_recovery()))]
 		pub fn deposit(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_deposit(who, collateral_id, stable_id, amount)
@@ -559,13 +561,17 @@ pub mod pallet {
 		///
 		/// Normal mode does not need a request, so this call immediately pays the caller.
 		#[pallet::call_index(1)]
-		#[pallet::weight(T::WeightInfo::request_withdraw())]
+		#[pallet::weight(
+			T::WeightInfo::request_withdraw()
+				.max(T::WeightInfo::request_withdraw_exhausted())
+				.max(T::WeightInfo::request_withdraw_safety())
+		)]
 		pub fn request_withdraw(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_request_withdraw(who, collateral_id, stable_id, amount)
@@ -587,14 +593,14 @@ pub mod pallet {
 		///
 		/// `recipient` selects another beneficiary. `None` pays the caller.
 		#[pallet::call_index(2)]
-		#[pallet::weight(T::WeightInfo::withdraw())]
+		#[pallet::weight(T::WeightInfo::withdraw().max(T::WeightInfo::withdraw_exhausted()))]
 		pub fn withdraw(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
 			recipient: Option<T::AccountId>,
-		) -> DispatchResult {
+		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
 			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
@@ -664,7 +670,9 @@ pub mod pallet {
 		/// The call reduces recovery debt and gives the collateral to active depositors through
 		/// `S`.
 		#[pallet::call_index(5)]
-		#[pallet::weight(T::WeightInfo::offset_recovery())]
+		#[pallet::weight(
+			T::WeightInfo::offset_recovery().saturating_add(T::DbWeight::get().writes(1))
+		)]
 		pub fn offset_recovery(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -686,7 +694,7 @@ pub mod pallet {
 		/// The moved amount immediately absorbs debt and earns gains. This call requires the
 		/// depositor's authority because it exposes claimable yield to pool risk.
 		#[pallet::call_index(6)]
-		#[pallet::weight(T::WeightInfo::compound_yield())]
+		#[pallet::weight(T::WeightInfo::compound_yield().max(T::WeightInfo::claim_yield()))]
 		pub fn compound_yield(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -984,6 +992,23 @@ pub mod pallet {
 				},
 				yield_share: Permill::from_percent(75),
 			}
+		}
+
+		/// Leaves dust of both assets in the pool account, so removal sweeps it.
+		#[cfg(feature = "runtime-benchmarks")]
+		fn benchmark_stage_deregistration(
+			collateral_id: &CollateralIdOf<T>,
+			stable_id: &StableIdOf<T>,
+		) -> DispatchResult {
+			use frame::traits::fungibles::Mutate as _;
+			let pool_account = Self::pool_account(collateral_id, stable_id);
+			let one = BalanceOf::<T>::one();
+			let stable_dust = T::StableAssets::minimum_balance(stable_id.clone()).max(one);
+			T::StableAssets::mint_into(stable_id.clone(), &pool_account, stable_dust)?;
+			let collateral_dust =
+				T::CollateralAssets::minimum_balance(collateral_id.clone()).max(one);
+			T::CollateralAssets::mint_into(collateral_id.clone(), &pool_account, collateral_dust)?;
+			Ok(())
 		}
 	}
 }

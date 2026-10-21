@@ -45,15 +45,6 @@ pub use pusd_primitives;
 pub use types::{RecoveryRegime, RedemptionConfig, RedemptionState, RedemptionTerms};
 pub use weights::WeightInfo;
 
-/// Runtime-supplied benchmark setup.
-///
-/// Redemptions delegates setup because the pallet cannot create markets or vaults itself.
-#[cfg(feature = "runtime-benchmarks")]
-pub trait BenchmarkHelper<CollateralId, StableId, AccountId, Balance> {
-	/// Creates a market with `vaults` redeemable vaults and funds a redeemer.
-	fn setup_redeemable_branch(vaults: u32) -> (CollateralId, StableId, AccountId, Balance);
-}
-
 #[frame::pallet]
 pub mod pallet {
 	use super::*;
@@ -140,15 +131,6 @@ pub mod pallet {
 
 		/// Weights for dispatchable calls.
 		type WeightInfo: weights::WeightInfo;
-
-		/// See [`crate::BenchmarkHelper`].
-		#[cfg(feature = "runtime-benchmarks")]
-		type BenchmarkHelper: crate::BenchmarkHelper<
-			CollateralIdOf<Self>,
-			StableIdOf<Self>,
-			Self::AccountId,
-			BalanceOf<Self>,
-		>;
 	}
 
 	/// Redemption parameters keyed by stable asset.
@@ -304,10 +286,14 @@ pub mod pallet {
 		/// move.
 		///
 		/// Targets are visited from the cheapest borrow rate upward. `max_steps` caps the vaults
-		/// touched; zero uses [`Config::MaxRedemptionSteps`]. Weight is charged for the cap and
-		/// refunded to the steps taken.
+		/// touched; zero uses [`Config::MaxRedemptionSteps`]. Weight is charged for the larger of
+		/// the cap and a `FinalRecovery` settlement, since the head decides the path only at
+		/// execution, and refunded to the path taken: the steps walked, or the recovery settlement.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps)))]
+		#[pallet::weight(
+			T::WeightInfo::redeem(Pallet::<T>::effective_step_cap(*max_steps))
+				.max(T::WeightInfo::redeem_recovery())
+		)]
 		pub fn redeem(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -317,9 +303,7 @@ pub mod pallet {
 			max_steps: u32,
 		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
-			let steps =
-				Self::do_redeem(&who, &collateral_id, &stable_id, terms, &recipient, max_steps)?;
-			Ok(Some(T::WeightInfo::redeem(steps)).into())
+			Self::do_redeem(&who, &collateral_id, &stable_id, terms, &recipient, max_steps)
 		}
 
 		/// Replaces a stablecoin's redemption configuration, for every collateral

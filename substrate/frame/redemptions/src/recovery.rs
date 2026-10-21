@@ -71,8 +71,14 @@ impl<Balance: Copy + Zero> RecoveryPlan<Balance> {
 
 pub(crate) enum OffsetDecision<AccountId, Balance> {
 	NoTarget,
+	/// A head is queued but offers nothing to offset.
+	NotOffsettable,
 	BelowPar,
-	Available { owner: AccountId, debt: Balance, collateral: Balance },
+	Available {
+		owner: AccountId,
+		debt: Balance,
+		collateral: Balance,
+	},
 }
 
 impl<T: Config> Pallet<T> {
@@ -204,13 +210,15 @@ impl<T: Config> Pallet<T> {
 		let snapshot = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?;
 		let plan = Self::price_recovery(stable_id, &snapshot, price, max_debt_to_cancel, &config);
 		Ok(match plan {
-			// An unpriceable or exitable head is no offset target; the pool sees an empty FIFO.
+			// A queued head costs lookup and pricing weight even when it cannot be offset.
 			Err(Error::<T>::NoRedeemableVault | Error::<T>::FinalRecoveryExitRequired) => {
-				OffsetDecision::NoTarget
+				OffsetDecision::NotOffsettable
 			},
 			Err(error) => return Err(error.into()),
 			Ok(RecoveryPlan::BelowPar { .. }) => OffsetDecision::BelowPar,
-			Ok(RecoveryPlan::AbovePar { debt, .. }) if debt.is_zero() => OffsetDecision::NoTarget,
+			Ok(RecoveryPlan::AbovePar { debt, .. }) if debt.is_zero() => {
+				OffsetDecision::NotOffsettable
+			},
 			Ok(RecoveryPlan::AbovePar { debt, collateral }) => {
 				OffsetDecision::Available { owner, debt, collateral }
 			},
@@ -235,6 +243,7 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 		let stable_id = payment.asset();
 		match Self::offset_decision(collateral_id, &stable_id, payment.peek())? {
 			OffsetDecision::NoTarget => Ok((RecoveryOffsetResult::NoTarget, payment)),
+			OffsetDecision::NotOffsettable => Ok((RecoveryOffsetResult::NotOffsettable, payment)),
 			OffsetDecision::BelowPar => Ok((RecoveryOffsetResult::BelowPar, payment)),
 			OffsetDecision::Available { owner, debt, collateral } => {
 				let debt_payment = Self::exact_credit(payment.extract(debt), debt)?;

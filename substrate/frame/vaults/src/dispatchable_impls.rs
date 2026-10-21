@@ -10,6 +10,7 @@ use crate::{
 		AdminLevel, AssetMinimums, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode,
 		BranchState, FrozenReason, FrozenState,
 	},
+	weights::WeightInfo,
 };
 use frame::{
 	prelude::{
@@ -37,7 +38,7 @@ impl<T: Config> Pallet<T> {
 		initial_debt: BalanceOf<T>,
 		annual_rate: FixedU128,
 		hint: Position<T::AccountId>,
-	) -> DispatchResult {
+	) -> DispatchResultWithPostInfo {
 		let op = VaultOp::<T>::open(
 			collateral_id,
 			stable_id,
@@ -55,7 +56,9 @@ impl<T: Config> Pallet<T> {
 			initial_collateral,
 		)?;
 		T::StableAssets::mint_into(op.stable_id().clone(), &owner, initial_debt)?;
-		op.commit(Commit::Checked)
+		let weight = T::WeightInfo::open_vault(op.hint_repair_steps());
+		op.commit(Commit::Checked)?;
+		Ok(Some(weight).into())
 	}
 
 	/// Deposits collateral into a vault.
@@ -128,10 +131,19 @@ impl<T: Config> Pallet<T> {
 		maybe_new_rate: Option<FixedU128>,
 		recipient: T::AccountId,
 		hint: Position<T::AccountId>,
-	) -> DispatchResult {
+	) -> DispatchResultWithPostInfo {
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		let dormant = op.status().is_dormant();
+		let rate_changed = maybe_new_rate.is_some_and(|rate| rate != op.vault().annual_rate);
 		op.borrow(amount, maybe_new_rate, hint)?;
+		let weight = if dormant {
+			T::WeightInfo::borrow_activate(op.hint_repair_steps())
+		} else if rate_changed {
+			T::WeightInfo::borrow_relocate(op.hint_repair_steps())
+		} else {
+			T::WeightInfo::borrow()
+		};
 
 		T::StableAssets::mint_into(op.stable_id().clone(), &recipient, amount)?;
 
@@ -142,7 +154,8 @@ impl<T: Config> Pallet<T> {
 			recipient,
 			amount,
 		});
-		op.commit(Commit::Checked)
+		op.commit(Commit::Checked)?;
+		Ok(Some(weight).into())
 	}
 
 	/// Repays debt for a vault from another account.
@@ -204,14 +217,17 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		new_rate: FixedU128,
 		hint: Position<T::AccountId>,
-	) -> DispatchResult {
+	) -> DispatchResultWithPostInfo {
 		let mut op = VaultOp::<T>::load_unfrozen(collateral_id, stable_id, &owner)?;
 		if !op.change_rate(new_rate, hint)? {
-			return op.commit(Commit::Exempt);
+			op.commit(Commit::Exempt)?;
+			return Ok(Some(T::WeightInfo::change_rate()).into());
 		}
 
 		op.load_price()?;
-		op.commit(Commit::Checked)
+		let weight = T::WeightInfo::change_rate_relocate(op.hint_repair_steps());
+		op.commit(Commit::Checked)?;
+		Ok(Some(weight).into())
 	}
 
 	/// Closes a debt-free vault and sends its collateral to the recipient.

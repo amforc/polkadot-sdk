@@ -66,6 +66,8 @@ pub struct VaultOp<T: Config> {
 	vault: Vault<BalanceOf<T>>,
 	deposit: T::VaultConsideration,
 	status: VaultStatus,
+	/// Hint-repair steps used by successful rate-index mutations in this operation.
+	hint_repair_steps: u32,
 	/// Redistribution collateral the vault owns but the redistribution account still holds.
 	retained_redistribution: BalanceOf<T>,
 	/// For a liquidation, what the touch realized. It rides on the liquidation event instead of
@@ -310,7 +312,7 @@ impl<T: Config> Context<T> {
 			owner,
 			Pallet::<T>::vault_footprint(&self.collateral_id, &self.stable_id, owner),
 		)?;
-		let op = self.attach_new(owner, vault, deposit)?;
+		let mut op = self.attach_new(owner, vault, deposit)?;
 		op.index_insert(hint)?;
 		Ok(op)
 	}
@@ -428,6 +430,7 @@ impl<T: Config> Context<T> {
 			vault,
 			deposit,
 			status,
+			hint_repair_steps: 0,
 			retained_redistribution,
 			liquidation_touch,
 		})
@@ -450,8 +453,8 @@ impl<T: Config> Context<T> {
 			});
 		}
 		// No other event carries a vault's share: it follows from the stake, which events omit.
-		let DebtCollateral { debt, collateral } = redistribution;
-		if !debt.is_zero() || !collateral.is_zero() {
+		if !redistribution.is_zero() {
+			let DebtCollateral { debt, collateral } = redistribution;
 			Pallet::<T>::deposit_event(Event::RedistributionApplied {
 				collateral_id: collateral_id.clone(),
 				stable_id: stable_id.clone(),
@@ -482,6 +485,7 @@ impl<T: Config> Context<T> {
 			vault,
 			deposit,
 			status: VaultStatus::Active,
+			hint_repair_steps: 0,
 			retained_redistribution: BalanceOf::<T>::zero(),
 			liquidation_touch: None,
 		};
@@ -624,11 +628,27 @@ impl<T: Config> VaultOp<T> {
 		self.ctx.rate_list()
 	}
 
+	/// Returns the loaded vault status.
+	pub(crate) const fn status(&self) -> VaultStatus {
+		self.status
+	}
+
+	/// Returns the hint-repair steps used by this operation.
+	pub(crate) const fn hint_repair_steps(&self) -> u32 {
+		self.hint_repair_steps
+	}
+
 	/// Places the vault in the rate index at its current rate.
-	pub(super) fn index_insert(&self, hint: ListPosition<T::AccountId>) -> DispatchResult {
-		T::VaultLists::insert(self.rate_list(), self.owner.clone(), self.vault.annual_rate, hint)
-			.map(|_| ())
-			.map_err(|e| Pallet::<T>::map_error(e).into())
+	pub(super) fn index_insert(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
+		let steps = T::VaultLists::insert(
+			self.rate_list(),
+			self.owner.clone(),
+			self.vault.annual_rate,
+			hint,
+		)
+		.map_err(Pallet::<T>::map_error)?;
+		self.hint_repair_steps.saturating_accrue(steps);
+		Ok(())
 	}
 
 	/// Removes the vault from the rate index, where it must be present.

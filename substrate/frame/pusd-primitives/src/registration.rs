@@ -56,6 +56,16 @@ pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 	/// [`on_registered`]: OnBranchLifecycle::on_registered
 	#[cfg(feature = "runtime-benchmarks")]
 	fn benchmark_registration_config(stablecoin_markets: u32) -> Self::RegistrationConfig;
+
+	/// Stages worst-case removal of an empty market, including custody dust and teardown rows.
+	/// Defaults to no setup.
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_stage_deregistration(
+		_collateral_id: &CollateralId,
+		_stable_id: &StableId,
+	) -> DispatchResult {
+		Ok(())
+	}
 }
 
 /// Runs each handler in order, stopping at the first error.
@@ -107,5 +117,14 @@ impl<CollateralId, StableId, AccountId> OnBranchLifecycle<CollateralId, StableId
 	#[cfg(feature = "runtime-benchmarks")]
 	fn benchmark_registration_config(stablecoin_markets: u32) -> Self::RegistrationConfig {
 		for_tuples!( ( #( Tuple::benchmark_registration_config(stablecoin_markets) ),* ) )
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_stage_deregistration(
+		collateral_id: &CollateralId,
+		stable_id: &StableId,
+	) -> DispatchResult {
+		for_tuples!( #( Tuple::benchmark_stage_deregistration(collateral_id, stable_id)?; )* );
+		Ok(())
 	}
 }

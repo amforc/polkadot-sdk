@@ -20,9 +20,13 @@ use crate::{
 		OpenCohort, PUpdate, PendingDeposit, PoolPrecision, PoolSums, Realized,
 		RecoveryOffsetSource, SumsWindow, WithdrawalRequest,
 	},
+	weights::WeightInfo,
 };
 use frame::{
-	deps::frame_support::storage::{with_transaction, TransactionOutcome},
+	deps::frame_support::{
+		dispatch::WithPostDispatchInfo,
+		storage::{with_transaction, TransactionOutcome},
+	},
 	prelude::*,
 	traits::{
 		fungibles::{Balanced as _, Inspect as _},
@@ -352,12 +356,15 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Applies a stablecoin deposit to recovery debt and then to the stability pool.
+	///
+	/// Refunds to `deposit_no_recovery` only when the `FinalRecovery` queue was empty: any queued
+	/// head is read and priced, whether or not it can be settled.
 	pub(crate) fn do_deposit(
 		who: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
-	) -> DispatchResult {
+	) -> DispatchResultWithPostInfo {
 		let minimum_deposit = Self::load_pool(&collateral_id, &stable_id)?.config.minimum_deposit;
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		ensure!(amount >= minimum_deposit, Error::<T>::DepositTooSmall);
@@ -381,10 +388,14 @@ impl<T: Config> Pallet<T> {
 		// through the vault's yield hook, and a row loaded earlier would commit over that yield.
 		let (result, change) =
 			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
-		let collateral_out = match result {
+		let (queue_empty, collateral_out) = match result {
 			RecoveryOffsetResult::NoTarget => {
 				debug_assert_eq!(change.peek(), amount);
-				BalanceOf::<T>::zero()
+				(true, BalanceOf::<T>::zero())
+			},
+			RecoveryOffsetResult::NotOffsettable => {
+				debug_assert_eq!(change.peek(), amount);
+				(false, BalanceOf::<T>::zero())
 			},
 			RecoveryOffsetResult::BelowPar => {
 				// The dropped change unwinds with the failing extrinsic.
@@ -396,7 +407,7 @@ impl<T: Config> Pallet<T> {
 					stable_id: stable_id.clone(),
 					source: RecoveryOffsetSource::IncomingDeposit,
 				});
-				collateral_out
+				(false, collateral_out)
 			},
 		};
 
@@ -422,7 +433,7 @@ impl<T: Config> Pallet<T> {
 			amount,
 			pending_amount,
 		});
-		Ok(())
+		Ok(queue_empty.then(T::WeightInfo::deposit_no_recovery).into())
 	}
 
 	/// Returns the open cohort that can satisfy the `required` activation deadline.
@@ -499,7 +510,7 @@ impl<T: Config> Pallet<T> {
 			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
 		let collateral_out = match result {
 			// The dropped change unwinds with the failing extrinsic.
-			RecoveryOffsetResult::NoTarget => {
+			RecoveryOffsetResult::NoTarget | RecoveryOffsetResult::NotOffsettable => {
 				return Err(Error::<T>::RecoveryVaultNotFound.into());
 			},
 			RecoveryOffsetResult::BelowPar => {
@@ -546,13 +557,21 @@ impl<T: Config> Pallet<T> {
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
-	) -> DispatchResult {
+	) -> DispatchResultWithPostInfo {
 		let pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		match mode {
 			BranchMode::Normal => {
-				return Self::do_withdraw(who.clone(), collateral_id, stable_id, amount, who);
+				return Self::do_withdraw(who.clone(), collateral_id, stable_id, amount, who)
+					.map(|_| Some(T::WeightInfo::request_withdraw()).into())
+					.map_err(|mut error| {
+						if error.post_info.actual_weight.is_some() {
+							error.post_info.actual_weight =
+								Some(T::WeightInfo::request_withdraw_exhausted());
+						}
+						error
+					});
 			},
 			BranchMode::Safety => {},
 			BranchMode::Frozen => return Err(Error::<T>::BranchFrozen.into()),
@@ -573,7 +592,7 @@ impl<T: Config> Pallet<T> {
 			amount,
 			executable_at,
 		});
-		Ok(())
+		Ok(Some(T::WeightInfo::request_withdraw_safety()).into())
 	}
 
 	/// Pays authorized active stablecoin from pool custody.
@@ -583,7 +602,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		amount: BalanceOf<T>,
 		recipient: T::AccountId,
-	) -> DispatchResult {
+	) -> DispatchResultWithPostInfo {
 		let pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let mut op = DepositOp::<T>::load(&collateral_id, &stable_id, &who, pool)?;
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
@@ -593,18 +612,15 @@ impl<T: Config> Pallet<T> {
 		op.refresh(BranchSnapshot { mode, now })?;
 
 		let take = Self::resolve_withdrawal(mode, now, amount, &mut op.deposit)?;
-		ensure!(!take.is_zero(), Error::<T>::NoActiveDeposit);
+		ensure!(
+			!take.is_zero(),
+			Error::<T>::NoActiveDeposit.with_weight(T::WeightInfo::withdraw_exhausted())
+		);
 
 		// `resolve_withdrawal` bounds `take` by the realized active deposit, which rounding keeps
 		// at or below the pool total.
-		op.deposit.active_deposit =
-			op.deposit.active_deposit.checked_sub(&take).ok_or(ArithmeticError::Underflow)?;
-		op.pool.state.total_active_deposits = op
-			.pool
-			.state
-			.total_active_deposits
-			.checked_sub(&take)
-			.ok_or(ArithmeticError::Underflow)?;
+		op.deposit.active_deposit.ensure_sub_assign(take)?;
+		op.pool.state.total_active_deposits.ensure_sub_assign(take)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
 		Self::pay_claim::<T::StableAssets>(stable_id.clone(), &pool_account, &recipient, take)?;
@@ -617,7 +633,7 @@ impl<T: Config> Pallet<T> {
 			recipient,
 			amount: take,
 		});
-		Ok(())
+		Ok(Some(T::WeightInfo::withdraw()).into())
 	}
 
 	/// Pays one claimable asset from pool custody.

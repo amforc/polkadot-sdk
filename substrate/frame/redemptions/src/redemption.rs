@@ -7,6 +7,7 @@ use crate::{
 		RedemptionConfigs, RedemptionStates, SnapshotOf, StableCreditOf, StableIdOf,
 	},
 	types::{RedemptionState, RedemptionTerms},
+	weights::WeightInfo,
 };
 use frame::{
 	deps::sp_runtime::{
@@ -46,17 +47,13 @@ enum Step<Balance> {
 	Stop,
 }
 
+#[derive(Default)]
 struct OrdinaryResult<Balance> {
-	remaining: Balance,
 	steps: u32,
+	/// The walk ended on a target lookup that found no ordinary target, which is not a step.
+	trailing_lookup: bool,
 	debt: Balance,
 	collateral: Balance,
-}
-
-impl<Balance: Zero> OrdinaryResult<Balance> {
-	fn new(budget: Balance) -> Self {
-		Self { remaining: budget, steps: 0, debt: Zero::zero(), collateral: Zero::zero() }
-	}
 }
 
 impl<T: Config> Pallet<T> {
@@ -100,7 +97,7 @@ impl<T: Config> Pallet<T> {
 		terms: RedemptionTerms<BalanceOf<T>>,
 		recipient: &T::AccountId,
 		max_steps: u32,
-	) -> Result<u32, DispatchError> {
+	) -> DispatchResultWithPostInfo {
 		let config =
 			RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::StablecoinNotRegistered)?;
 		// A budget below the minimum cannot buy it however small the fee.
@@ -114,10 +111,12 @@ impl<T: Config> Pallet<T> {
 		let context = WalkContext { redeemer, collateral_id, stable_id, recipient, price };
 
 		if first_target.1.is_final_recovery() {
-			return Self::redeem_recovery(&context, &config, first_target.0, terms);
+			Self::redeem_recovery(&context, &config, first_target.0, terms)?;
+			return Ok(Some(T::WeightInfo::redeem_recovery()).into());
 		}
 
-		Self::redeem_ordinary(&context, &config, first_target, terms, max_steps)
+		let steps = Self::redeem_ordinary(&context, &config, first_target, terms, max_steps)?;
+		Ok(Some(T::WeightInfo::redeem(steps)).into())
 	}
 
 	/// Settle the `FinalRecovery` FIFO head in one step. The redeemer funds the
@@ -129,7 +128,7 @@ impl<T: Config> Pallet<T> {
 		config: &RedemptionConfigOf<T>,
 		owner: T::AccountId,
 		terms: RedemptionTerms<BalanceOf<T>>,
-	) -> Result<u32, DispatchError> {
+	) -> DispatchResult {
 		let snapshot = T::Vaults::project_redemption_snapshot(
 			context.collateral_id,
 			context.stable_id,
@@ -200,9 +199,11 @@ impl<T: Config> Pallet<T> {
 			collateral_out: plan.collateral(),
 			regime: plan.regime(),
 		});
-		Ok(1)
+		Ok(())
 	}
 
+	/// Runs the ordinary walk and returns the steps it is weighed as: the vaults visited, plus
+	/// one for a trailing lookup that found no further target, which costs no more than a step.
 	fn redeem_ordinary(
 		context: &WalkContext<'_, T>,
 		config: &RedemptionConfigOf<T>,
@@ -252,7 +253,11 @@ impl<T: Config> Pallet<T> {
 		ensure!(result.collateral >= scaled_min, Error::<T>::SlippageExceeded);
 
 		Self::finalize_ordinary(context, &fee_inputs, &result, fee);
-		Ok(result.steps)
+		// A trailing lookup only runs while steps remain under the cap, so the weighed count
+		// never exceeds the cap the call was charged for.
+		let weighed_steps = result.steps.saturating_add(u32::from(result.trailing_lookup));
+		defensive_assert!(weighed_steps <= Self::effective_step_cap(max_steps));
+		Ok(weighed_steps)
 	}
 
 	/// Execute the ordinary Vaults-owned queue. Recovery is handled before this walk starts.
@@ -264,12 +269,15 @@ impl<T: Config> Pallet<T> {
 		first_target: (T::AccountId, pusd_primitives::VaultStatus),
 		payment: &mut StableCreditOf<T>,
 	) -> Result<OrdinaryResult<BalanceOf<T>>, DispatchError> {
-		debug_assert!(payment.peek() >= debt_budget);
-		let mut result = OrdinaryResult::new(debt_budget);
+		defensive_assert!(payment.peek() >= debt_budget);
+		let mut result = OrdinaryResult::<BalanceOf<T>>::default();
+		let mut remaining = debt_budget;
 		let mut cursor = None;
 		let mut next = Some(first_target);
 
-		while result.steps < step_cap {
+		// A spent budget ends the walk before the next lookup, so no step pays for a target it
+		// cannot redeem.
+		while result.steps < step_cap && !remaining.is_zero() {
 			let target = next.take().or_else(|| {
 				T::Vaults::next_redemption_target(
 					context.collateral_id,
@@ -277,21 +285,19 @@ impl<T: Config> Pallet<T> {
 					cursor.as_ref(),
 				)
 			});
-			let Some((owner, status)) = target else {
+			let Some((owner, _)) = target.filter(|(_, status)| !status.is_final_recovery()) else {
+				result.trailing_lookup = true;
 				break;
 			};
-			if result.remaining.is_zero() || status.is_final_recovery() {
-				break;
-			}
 
-			let applied = Self::apply_ordinary_step(context, &owner, result.remaining, payment)?;
+			let applied = Self::apply_ordinary_step(context, &owner, remaining, payment)?;
 			result.steps = result.steps.saturating_add(1);
 
 			match applied {
 				Step::Stop => break,
 				Step::Skip => cursor = Some(owner),
 				Step::Redeem { debt, collateral } => {
-					result.remaining = result.remaining.saturating_sub(debt);
+					remaining = remaining.saturating_sub(debt);
 					result.debt = result.debt.saturating_add(debt);
 					result.collateral = result.collateral.saturating_add(collateral);
 				},

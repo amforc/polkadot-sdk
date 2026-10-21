@@ -9,6 +9,9 @@ use frame::deps::sp_runtime::DispatchError;
 pub enum RecoveryOffsetResult<Balance> {
 	/// No `FinalRecovery` vault is queued.
 	NoTarget,
+	/// A queued head is unpriceable, above the exit threshold, or cancels no debt.
+	/// Its lookup and pricing costs must not receive the empty-queue weight refund.
+	NotOffsettable,
 	/// The head is below par (`CR < 100%`); nothing is offset.
 	BelowPar,
 	/// Debt was cancelled and `collateral_out` sent to the recipient.
@@ -28,9 +31,9 @@ pub trait RecoveryOffsetInterface {
 	/// Cancels head debt in the market of `collateral_id` and the payment's asset, spending up to
 	/// the payment, and sends the priced collateral to `collateral_recipient`. No redemption fee.
 	///
-	/// Returns the outcome and the unspent change; `NoTarget` and `BelowPar` return the whole
-	/// payment. The implementation can only burn what the credit carries, so callers derive the
-	/// cancelled debt as `payment - change`.
+	/// Returns the outcome and the unspent change; `NoTarget`, `NotOffsettable` and `BelowPar`
+	/// return the whole payment. The implementation can only burn what the credit carries, so
+	/// callers derive the cancelled debt as `payment - change`.
 	///
 	/// An `Err` consumes the payment and storage unwinds only with the caller's transaction, so
 	/// callers must abort the extrinsic.

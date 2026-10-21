@@ -364,3 +364,42 @@ fn active_pool_offset_keeps_yield_distributed_during_settlement() {
 		assert_settlement_yield_survives(yield_before);
 	});
 }
+
+// The deposit is charged for a settlement that closes the head, so only a deposit that found no
+// head may report the smaller weight.
+#[test]
+fn deposit_refunds_to_the_no_recovery_weight_only_without_a_head() {
+	build_and_execute(|| {
+		standing_head_with_active_pool();
+		mint_stable(PUSD, 2, 900);
+
+		let settled = Stability::deposit(RuntimeOrigin::signed(2), DOT, PUSD, 800)
+			.expect("the deposit settles the head");
+		assert_vault_redeemed(5, 500, 990);
+		assert_eq!(settled.actual_weight, None);
+
+		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, PUSD, 100)
+			.expect("the deposit queues");
+		assert_eq!(queued.actual_weight, Some(<() as crate::WeightInfo>::deposit_no_recovery()));
+	});
+}
+
+// A head that cannot be offset is still read and priced, so the deposit that meets it keeps the
+// full charge rather than the weight of an empty queue.
+#[test]
+fn deposit_keeps_the_full_weight_for_a_head_it_cannot_offset() {
+	build_and_execute(|| {
+		standing_head_with_active_pool();
+		mint_stable(PUSD, 2, 900);
+		// The registration price lifts the head above the exit threshold.
+		set_price(DOT, REGISTRATION_PRICE);
+
+		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, PUSD, 100)
+			.expect("the deposit queues past the head");
+		assert_eq!(queued.actual_weight, None);
+		assert!(!System::events().into_iter().any(|record| matches!(
+			record.event,
+			RuntimeEvent::Stability(crate::Event::RecoveryOffsetApplied { .. })
+		)));
+	});
+}

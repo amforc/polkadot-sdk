@@ -759,8 +759,8 @@ fn recovery_stops_above_icr() {
 		// CR = 619 · 0.60 / 301 ≈ 123.4%: above the ICR, only the exit remains.
 		set_price(DOT, FixedU128::from_rational(60u128, 100u128));
 		assert_noop!(redeem(RedeemOptions::spend(200)), Error::<Test>::FinalRecoveryExitRequired);
-		assert_ok!(preview_offset(200), RecoveryOffsetQuote::NoTarget);
-		assert_ok!(execute_offset(PUSD, 200), RecoveryOffsetResult::NoTarget);
+		assert_ok!(preview_offset(200), RecoveryOffsetQuote::NotOffsettable);
+		assert_ok!(execute_offset(PUSD, 200), RecoveryOffsetResult::NotOffsettable);
 		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
 
 		// CR = 619 · 0.56 / 301 ≈ 115.2%: above MCR but not ICR. Offsets see a target and a
@@ -1201,6 +1201,7 @@ fn liquidate_redistribute_all(owner: AccountId) {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RecoveryOffsetQuote {
 	NoTarget,
+	NotOffsettable,
 	BelowPar,
 	Available { debt: Balance },
 }
@@ -1210,6 +1211,7 @@ fn preview_offset(max_debt_to_cancel: Balance) -> Result<RecoveryOffsetQuote, Di
 	use crate::recovery::OffsetDecision;
 	Ok(match Redemptions::offset_decision(&DOT, &PUSD, max_debt_to_cancel)? {
 		OffsetDecision::NoTarget => RecoveryOffsetQuote::NoTarget,
+		OffsetDecision::NotOffsettable => RecoveryOffsetQuote::NotOffsettable,
 		OffsetDecision::BelowPar => RecoveryOffsetQuote::BelowPar,
 		OffsetDecision::Available { debt, .. } => RecoveryOffsetQuote::Available { debt },
 	})
@@ -1364,11 +1366,9 @@ fn offset_partial_fill_keeps_head_queued() {
 	});
 }
 
-/// Regression pin for quote/execution parity: a zero `max_debt_to_cancel`
-/// against a recovery-bonus head used to quote `Available { debt: 0 }` while
-/// execution reported `NoTarget`.
+/// Zero-budget quotes and execution must agree even when a recovery bonus applies.
 #[test]
-fn offset_zero_budget_has_no_target() {
+fn offset_zero_budget_is_not_offsettable() {
 	build_and_execute(|| {
 		register_branch(DOT, PUSD, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
@@ -1377,10 +1377,10 @@ fn offset_zero_budget_has_no_target() {
 
 		// A zero budget withdraws nothing, so both paths are pure storage no-ops.
 		assert_storage_noop!({
-			assert_ok!(preview_offset(0), RecoveryOffsetQuote::NoTarget);
+			assert_ok!(preview_offset(0), RecoveryOffsetQuote::NotOffsettable);
 		});
 		assert_storage_noop!({
-			assert_ok!(execute_offset(PUSD, 0), RecoveryOffsetResult::NoTarget);
+			assert_ok!(execute_offset(PUSD, 0), RecoveryOffsetResult::NotOffsettable);
 		});
 	});
 }
@@ -1705,5 +1705,40 @@ fn recovery_bonus_capped_by_penalty() {
 		assert_eq!(vault_debt(DOT, PUSD, 1), 8_000 * UNIT);
 		assert_eq!(held(DOT, 1), 4_900 * UNIT - 5_000);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
+	});
+}
+
+fn redeem_actual_weight(max_stable_to_spend: Balance, max_steps: u32) -> frame::prelude::Weight {
+	Redemptions::redeem(
+		RuntimeOrigin::signed(REDEEMER),
+		DOT,
+		PUSD,
+		crate::RedemptionTerms { max_stable_to_spend, min_collateral_out: 0 },
+		RECIPIENT,
+		max_steps,
+	)
+	.expect("the redemption succeeds")
+	.actual_weight
+	.expect("a redemption reports its actual weight")
+}
+
+// A walk that runs out of targets still paid for the lookup that found none, so it is weighed one
+// step above the vaults it visited; a walk that stops at its cap does no such lookup.
+#[test]
+fn ordinary_walk_weighs_a_trailing_lookup_as_a_step() {
+	use crate::WeightInfo;
+	build_and_execute(|| {
+		register_branch(DOT, PUSD, default_branch_config());
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 10_000, 500, percent(2)));
+		mint_stable(PUSD, REDEEMER, 1_000_000);
+
+		let capped = hypothetically!(redeem_actual_weight(100_000, 1));
+		assert_eq!(capped, <() as WeightInfo>::redeem(1));
+
+		let exhausted = redeem_actual_weight(100_000, 0);
+		assert_eq!(exhausted, <() as WeightInfo>::redeem(3));
+		assert!(vault_status(DOT, PUSD, 1).is_none_or(|status| status.is_dormant()));
+		assert!(vault_status(DOT, PUSD, 2).is_none_or(|status| status.is_dormant()));
 	});
 }

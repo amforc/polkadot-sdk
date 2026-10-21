@@ -323,7 +323,12 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for Record
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]
-	fn benchmark_registration_config(_stablecoin_markets: u32) -> Self::RegistrationConfig {}
+	fn benchmark_registration_config(_stablecoin_markets: u32) -> Self::RegistrationConfig {
+		// Benchmark samples reset storage, but these mock pool knobs are thread-local.
+		ActiveSpCapacity::set(0);
+		PendingSpCapacity::set(0);
+		PendingSpCohorts::set(Vec::new());
+	}
 }
 
 /// Allows root or the stable asset owner to create a market.
@@ -550,31 +555,31 @@ impl pallet_vaults::Config for Test {
 pub struct MockBenchmarkHelper;
 
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for MockBenchmarkHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for MockBenchmarkHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
-	}
-
-	fn stable_asset_id() -> StableId {
-		PUSD
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
 	}
 
-	fn clear_oracle_price(collateral_id: AssetId) {
-		MockPrices::mutate(|prices| {
-			prices.remove(&collateral_id);
-		});
-	}
-
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
 
-	// The genesis config already creates every stable asset.
-	fn ensure_stable_asset(_: StableId) {}
+	// The benchmark collateral is native, which exists without being created.
+	fn ensure_collateral_asset(collateral_id: AssetId) {
+		assert_eq!(collateral_id, DOT);
+	}
+
+	// `StoredCeiling` reads only the ceiling row the benchmarks write themselves.
+	fn stage_debt_ceiling(_: StableId) {}
+
+	fn fund_native(who: &AccountId) {
+		<Balances as fungible::Mutate<AccountId>>::mint_into(who, 1_000_000_000_000)
+			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
+	}
 }
 
 /// Builds fresh storage for a test.
@@ -814,6 +819,8 @@ pub fn open(
 		rate,
 		Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// Calls the production liquidation dispatchable.
@@ -877,6 +884,8 @@ pub fn borrow(
 		None,
 		Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// Calls the `change_rate` dispatchable with endpoint hints.
@@ -893,6 +902,8 @@ pub fn change_rate(
 		new_rate,
 		Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// Calls the `close_vault` dispatchable; `None` returns collateral to the owner.

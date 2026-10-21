@@ -5,6 +5,8 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use core::cmp::Ordering;
 use frame::deps::{
@@ -17,6 +19,8 @@ use frame::deps::{
 };
 use scale_info::TypeInfo;
 
+#[cfg(feature = "runtime-benchmarks")]
+pub mod benchmark_vaults;
 pub mod branch_interface;
 pub mod debit;
 pub mod math;
@@ -29,6 +33,10 @@ pub mod stability_pool;
 pub mod vault_interface;
 pub mod yield_routing;
 
+#[cfg(feature = "runtime-benchmarks")]
+pub use benchmark_vaults::{
+	BenchmarkVault, BenchmarkVaults, RecoveryHeadSeed, RedemptionTargetsSeed,
+};
 pub use branch_interface::{BranchInterface, BranchMode, BranchSnapshot};
 pub use debit::{debit_preservation, reducible_debit, refine_debit};
 pub use math::{collateralization_ratio, mul_div_floor, mul_div_rate_floor};

@@ -8,7 +8,7 @@ use crate::{
 	types::{DebtCollateral, Vault, VaultStatus},
 };
 use frame::{prelude::*, traits::DefensiveOption};
-use linked_list_interface::{Position as ListPosition, SortedListInterface};
+use linked_list_interface::{Outcome, Position as ListPosition, SortedListInterface};
 use pusd_primitives::RedemptionStepSnapshot;
 
 impl<T: Config> VaultOp<T> {
@@ -71,11 +71,19 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	/// Moves an active vault to its new rate-list position.
-	pub(super) fn reindex(&self, hint: ListPosition<T::AccountId>) -> DispatchResult {
+	pub(super) fn reindex(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
-		T::VaultLists::re_insert(self.rate_list(), self.owner.clone(), self.vault.annual_rate, hint)
-			.map(|_| ())
-			.map_err(|e| Pallet::<T>::map_error(e).into())
+		let outcome = T::VaultLists::re_insert(
+			self.rate_list(),
+			self.owner.clone(),
+			self.vault.annual_rate,
+			hint,
+		)
+		.map_err(Pallet::<T>::map_error)?;
+		if let Outcome::Relocated { steps } = outcome {
+			self.hint_repair_steps.saturating_accrue(steps);
+		}
+		Ok(())
 	}
 
 	/// Moves the last unsafe eligible vault into final recovery and returns the reward paid.
@@ -87,7 +95,7 @@ impl<T: Config> VaultOp<T> {
 	) -> Result<BalanceOf<T>, DispatchError> {
 		let price = self.ctx.price()?;
 		ensure!(
-			self.status.is_active() || self.status.is_dormant(),
+			matches!(self.status, VaultStatus::Active | VaultStatus::Dormant),
 			Error::<T>::InvalidVaultStatus
 		);
 		self.ctx.ensure_below_mcr(&self.vault.position())?;
@@ -251,7 +259,7 @@ impl<T: Config> VaultOp<T> {
 			.checked_sub(&redistribution.collateral)
 			.ok_or(Error::<T>::InvalidLiquidationPlan)?;
 		self.detach(collateral_out)?;
-		if !redistribution.debt.is_zero() || !redistribution.collateral.is_zero() {
+		if !redistribution.is_zero() {
 			self.ctx
 				.branch
 				.state
