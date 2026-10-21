@@ -109,7 +109,8 @@ fn launch_pusd_psm() -> (Location, Location) {
 	create_pusd_psm()
 }
 
-/// Calls `Vaults::borrow` for `owner` on the native market.
+/// Calls `Vaults::borrow` for `owner` on the native market. Post-dispatch info
+/// is dropped so callers can assert against plain pallet errors.
 fn borrow(owner: &AccountId, amount: Balance) -> DispatchResult {
 	Vaults::borrow(
 		RuntimeOrigin::signed(owner.clone()),
@@ -120,6 +121,8 @@ fn borrow(owner: &AccountId, amount: Balance) -> DispatchResult {
 		None,
 		pallet_linked_list::Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 // A vault borrow approved under the cap before a PSM mint fails after it, in
