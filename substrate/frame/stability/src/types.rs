@@ -4,7 +4,7 @@ use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
 	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Saturating, Zero},
 	prelude::{BoundedVec, ConstU32, DispatchError},
-	traits::DefensiveOption,
+	traits::{DefensiveOption, DefensiveSaturating},
 };
 use pusd_primitives::Millis;
 use scale_info::TypeInfo;
@@ -15,8 +15,8 @@ use crate::math;
 ///
 /// A deposit stores these coordinates in its snapshot. Their change measures the deposit loss
 /// without an update to every deposit row.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy)]
-#[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(test, feature = "test-utils"), derive(Debug))]
 pub struct Accumulators {
 	/// The fraction of a deposit that survives every offset applied so far.
 	pub p: FixedU128,
@@ -27,7 +27,22 @@ pub struct Accumulators {
 }
 
 /// Where one pool leg stands after an offset: its epoch and scale.
-#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// The derived order compares the epoch first and the scale second, which is the order in which
+/// a leg advances.
+#[derive(
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	TypeInfo,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	PartialOrd,
+	Ord,
+	Debug,
+)]
 pub struct LegCoords {
 	/// Epoch of the leg's coordinates.
 	pub epoch: u32,
@@ -41,6 +56,11 @@ impl Accumulators {
 	/// A new pool leg uses these coordinates so its first deposit has no prior loss.
 	pub fn fresh() -> Self {
 		Self { p: FixedU128::one(), epoch: 0, scale: 0 }
+	}
+
+	/// Returns the `(epoch, scale)` position of these coordinates, without `p`.
+	pub const fn position(&self) -> LegCoords {
+		LegCoords { epoch: self.epoch, scale: self.scale }
 	}
 }
 
@@ -134,7 +154,10 @@ pub struct OpenCohort<Balance> {
 ///
 /// Deadline grouping permits at most two open cohorts. This bound keeps activation work
 /// independent of the depositor count.
-pub type OpenCohorts<Balance> = BoundedVec<OpenCohort<Balance>, ConstU32<2>>;
+pub type OpenCohorts<Balance> = BoundedVec<OpenCohort<Balance>, MaxOpenCohorts>;
+
+/// Bound on the open cohorts of one pool, and on the cohorts one activation resolves.
+pub type MaxOpenCohorts = ConstU32<2>;
 
 impl<Balance: FixedPointOperand> OpenCohort<Balance> {
 	/// Returns an empty cohort at `deadline` and the current pending coordinates.
@@ -375,7 +398,8 @@ impl<Balance> PoolState<Balance> {
 	/// Removes one member from the open cohort with `id` and removes a cohort without members.
 	pub(crate) fn drop_member(&mut self, id: CohortId) {
 		if let Some(cohort) = self.cohort_mut(id) {
-			cohort.members = cohort.members.saturating_sub(1);
+			// A memberless cohort is removed with its last member, so a stored one has one.
+			cohort.members.defensive_saturating_dec();
 			if cohort.members == 0 {
 				self.remove_cohort(id);
 			}

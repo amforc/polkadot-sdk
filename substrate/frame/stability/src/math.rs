@@ -8,10 +8,13 @@
 
 use crate::types::{Accumulators, DepositSnapshot, PUpdate, PoolPrecision, Realized, SumsWindow};
 use frame::{
-	arithmetic::{FixedPointOperand, FixedU128, One, Rounding, Saturating, Zero},
+	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Rounding, Saturating, Zero},
 	traits::Defensive,
 };
-use pusd_primitives::{math::mul_div, Millis};
+use pusd_primitives::{
+	math::{mul_div, mul_ratio},
+	Millis,
+};
 
 /// Maximum number of `P` rescale operations in one offset.
 ///
@@ -34,6 +37,21 @@ pub const SCALE_FACTOR_INT_MAX: u64 = 10_000_000_000;
 ///
 /// The finite span also bounds the accumulator rows required for one settlement.
 pub const SCALE_SPAN: u32 = 2;
+
+/// Returns `true` when `P = 1` times `SCALE_FACTOR_INT_MAX^exp` fits in a `u128` inner value.
+const fn fits_with_unit_p(exp: u32) -> bool {
+	// Widening `u64` to `u128` is lossless; `u128::from` is not usable in a const context.
+	let scale_factor_max = SCALE_FACTOR_INT_MAX as u128;
+	match scale_factor_max.checked_pow(exp) {
+		Some(factor) => factor.checked_mul(<FixedU128 as FixedPointNumber>::DIV).is_some(),
+		None => false,
+	}
+}
+
+// The worst case of `update_p_after_offset` multiplies `P` by `scale_factor^MAX_SCALE_CROSSINGS`.
+const _: () = assert!(fits_with_unit_p(MAX_SCALE_CROSSINGS));
+// The worst case of `compound` divides by `P0 * scale_factor^SCALE_SPAN`.
+const _: () = assert!(fits_with_unit_p(SCALE_SPAN));
 
 /// Applies the principal formula used by [`realize`] and cohort aggregates:
 /// `amount * p_to / (p_from * scale_factor^behind)`, rounded per `rounding`.
@@ -178,8 +196,7 @@ fn gain<Balance: FixedPointOperand>(
 	if delta.is_zero() {
 		return Balance::zero();
 	}
-	mul_div(d.unique_saturated_into(), delta.into_inner(), p0.into_inner(), Rounding::Down)
-		.defensive_unwrap_or_else(Balance::zero)
+	mul_ratio(d, delta, p0, Rounding::Down).defensive_unwrap_or_else(Balance::zero)
 }
 
 /// Caps a partial offset at the `min_active_pool` floor.

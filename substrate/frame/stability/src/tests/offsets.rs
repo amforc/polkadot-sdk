@@ -210,11 +210,13 @@ fn combined_offset_settles_active_then_pending() {
 			assert_eq!(pool_collateral_held(DOT, USDX), 400);
 			assert_eq!(
 				crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Active, 0u32, 0u32))
+					.expect("active sums row exists")
 					.s_collateral,
 				FixedU128::from_rational(1, 250)
 			);
 			assert_eq!(
 				crate::PoolSumsStore::<Test>::get((DOT, USDX, Leg::Pending, 0u32, 0u32))
+					.expect("pending sums row exists")
 					.s_collateral,
 				FixedU128::from_rational(1, 250)
 			);
