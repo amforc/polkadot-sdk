@@ -5,7 +5,7 @@
 //! never touched.
 
 use crate::{mock::*, Error};
-use pusd_primitives::{OffsetLegs, StabilityPoolInspect, StabilityPoolOffset};
+use pusd_primitives::{OffsetLegs, StabilityPoolInspect};
 
 #[test]
 fn pending_offset_full_depletion_bumps_the_pending_epoch() {
@@ -67,15 +67,11 @@ fn pending_leg_without_capacity_quotes_nothing_and_refuses_settlement() {
 	build_with_default_market(|| {
 		// Every refusal consumes its credit, so each probe issues it inside a hypothetical.
 		let offset_pending = |debt: Balance, collateral: Balance| {
-			hypothetically!(Stability::offset(
-				&DOT,
-				&PUSD,
+			hypothetically!(offset_with(
+				(DOT, PUSD),
 				branch_snapshot(&DOT, &PUSD),
 				OffsetLegs { active: 0, pending: debt },
-				OffsetLegs {
-					active: issue_collateral(DOT, 0),
-					pending: issue_collateral(DOT, collateral),
-				},
+				OffsetLegs { active: (DOT, 0), pending: (DOT, collateral) }
 			))
 		};
 
@@ -103,10 +99,9 @@ fn pending_offset_ignores_active_deposits_and_accumulators() {
 		// The active pool sits at its 100 floor, so a partial offset of it quotes nothing and the
 		// whole debt falls to the pending leg: the only way the quote reaches pending capital
 		// while active capital remains.
-		mint_stable(PUSD, 1, 100);
-		assert_ok!(deposit_and_mature(1, DOT, PUSD, 100));
+		seed_matured_deposit(1, 100);
 		seed_deposit(2, 400);
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 
 		let before = pool_state(DOT, PUSD);
 		let sums_before = active_sums(0, 0);
@@ -166,8 +161,7 @@ fn merged_top_up_shares_earlier_backstop_losses() {
 
 		// The top-up realizes the loss first — floor(200 * 0.5) = 100 — and
 		// merges at the current pending accumulators: 100 + 300 = 400.
-		mint_stable(PUSD, 1, 300);
-		assert_ok!(deposit(1, DOT, PUSD, 300));
+		seed_deposit(1, 300);
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		assert_eq!(row.pending_deposit.expect("merged").amount, 400);
 		assert_eq!(pool_state(DOT, PUSD).total_pending_deposits, 400);
@@ -226,15 +220,10 @@ fn active_then_pending_depletion_strands_bounded_dust() {
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.pending_coords.epoch, 1);
 
-		System::assert_has_event(
-			crate::Event::OffsetApplied {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				active: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
-				pending: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(OffsetApplied {
+			active: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
+			pending: Some(crate::types::LegCoords { epoch: 1, scale: 0 }),
+		}));
 
 		// The consumed pending depositors realize their pro-rata
 		// gains through the pending `S` on claim:
@@ -326,15 +315,10 @@ fn pending_deposit_offset_is_shared_pro_rata() {
 			Accumulators { p: FixedU128::from_inner(285_714_285_714_285_714), epoch: 0, scale: 0 }
 		);
 		assert_eq!(pool_stable_held(DOT, PUSD), 400);
-		System::assert_has_event(
-			crate::Event::OffsetApplied {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				active: None,
-				pending: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(OffsetApplied {
+			active: None,
+			pending: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
+		}));
 
 		// Rows realize lazily. Remainders are floor(stake * 2/7): 85 / 171 / 142, with the
 		// 2-unit flooring residue staying inside `total_pending_deposits`. Settlement realizes

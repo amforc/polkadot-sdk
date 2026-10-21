@@ -28,16 +28,11 @@ fn withdraw_pays_at_most_the_active_deposit_and_prunes_the_row() {
 			assert_eq!(state.total_active_deposits, 0);
 			assert_eq!(state.total_pending_deposits, 0);
 
-			System::assert_last_event(
-				crate::Event::WithdrawalExecuted {
-					collateral_id: DOT,
-					stable_id: PUSD,
-					depositor: 1,
-					recipient,
-					amount: 400,
-				}
-				.into(),
-			);
+			System::assert_last_event(market_event!(WithdrawalExecuted {
+				depositor: 1,
+				recipient,
+				amount: 400,
+			}));
 		});
 	}
 }
@@ -86,16 +81,11 @@ fn request_is_recorded_replaced_by_a_new_one_and_survives_deposits() {
 			.withdrawal_request
 			.expect("request recorded");
 		assert_eq!(request, WithdrawalRequest { amount: 250, executable_at });
-		System::assert_last_event(
-			crate::Event::WithdrawalRequested {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				amount: 250,
-				executable_at,
-			}
-			.into(),
-		);
+		System::assert_last_event(market_event!(WithdrawalRequested {
+			depositor: 1,
+			amount: 250,
+			executable_at,
+		}));
 
 		// A new request replaces the old one, delay and all.
 		advance_time(4_000);

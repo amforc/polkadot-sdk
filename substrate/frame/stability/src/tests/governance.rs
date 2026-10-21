@@ -66,43 +66,35 @@ fn branch_registration_seeds_pool_rows() {
 #[test]
 fn custody_float_follows_the_custody_funder() {
 	build_and_execute(|| {
-		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		create_high_min_collateral();
 		// The funder also seeds the market's redistribution custody. Both withdrawals run under
 		// `Preserve`, so each candidate needs three collateral minimums and two stablecoin
 		// minimums on hand.
-		let collateral = AssetId::WithId(77);
 		for funder in [1, ADMIN] {
-			mint_collateral(collateral.clone(), funder, 3_000);
+			mint_collateral(HIGH_MIN, funder, 3_000);
 			mint_stable(PUSD, funder, 2);
 		}
-		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
-		let pool = Stability::pool_account(&collateral, &PUSD);
+		set_price(HIGH_MIN, REGISTRATION_PRICE);
+		let pool = Stability::pool_account(&HIGH_MIN, &PUSD);
 
 		for (origin, funder) in [(RuntimeOrigin::root(), ADMIN), (RuntimeOrigin::signed(1), 1)] {
-			let collateral_before = collateral_balance(collateral.clone(), funder);
+			let collateral_before = collateral_balance(HIGH_MIN, funder);
 			let stable_before = stable_balance(PUSD, funder);
-			assert_ok!(Vaults::create_branch(
-				origin,
-				collateral.clone(),
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				branch_config_for(collateral.clone(), PUSD),
-				registration_config(PUSD),
-			));
-			let registered = crate::Pools::<Test>::get(&collateral, PUSD).expect("pool registered");
+			assert_ok!(create_branch_as(origin, HIGH_MIN));
+			let registered = crate::Pools::<Test>::get(&HIGH_MIN, PUSD).expect("pool registered");
 			assert_eq!(registered.custody_stable, 1);
 			assert_eq!(registered.custody_collateral, 1_000);
-			assert_eq!(collateral_balance(collateral.clone(), pool), 1_000);
+			assert_eq!(collateral_balance(HIGH_MIN, pool), 1_000);
 			assert_eq!(stable_balance(PUSD, pool), 1);
 			// Vaults' redistribution seed is the other 1_000 the funder paid.
-			assert_eq!(collateral_balance(collateral.clone(), funder), collateral_before - 2_000);
+			assert_eq!(collateral_balance(HIGH_MIN, funder), collateral_before - 2_000);
 			assert_eq!(stable_balance(PUSD, funder), stable_before - 1);
-			assert_ok!(Assets::can_deposit(77, &pool, 1, Provenance::Extant).into_result());
+			assert_ok!(Assets::can_deposit(HIGH_MIN_ID, &pool, 1, Provenance::Extant).into_result());
 
-			assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), PUSD));
-			assert_eq!(collateral_balance(collateral.clone(), pool), 0);
+			assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), HIGH_MIN, PUSD));
+			assert_eq!(collateral_balance(HIGH_MIN, pool), 0);
 			assert_eq!(stable_balance(PUSD, pool), 0);
-			assert_eq!(collateral_balance(collateral.clone(), funder), collateral_before);
+			assert_eq!(collateral_balance(HIGH_MIN, funder), collateral_before);
 			assert_eq!(stable_balance(PUSD, funder), stable_before);
 		}
 	});
@@ -111,64 +103,47 @@ fn custody_float_follows_the_custody_funder() {
 #[test]
 fn branch_registration_needs_the_funder_to_cover_the_custody_float() {
 	build_and_execute(|| {
-		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
-		let collateral = AssetId::WithId(77);
-		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+		create_high_min_collateral();
+		set_price(HIGH_MIN, REGISTRATION_PRICE);
 		// Enough for Vaults' redistribution seed, but the pool float would dust the payer.
-		mint_collateral(collateral.clone(), 1, 2_000);
+		mint_collateral(HIGH_MIN, 1, 2_000);
 		mint_stable(PUSD, 1, 2);
 		assert_noop!(
-			Vaults::create_branch(
-				RuntimeOrigin::signed(1),
-				collateral.clone(),
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				branch_config_for(collateral.clone(), PUSD),
-				registration_config(PUSD),
-			),
+			create_branch_as(RuntimeOrigin::signed(1), HIGH_MIN),
 			Error::<Test>::CustodySeedUnavailable
 		);
-		assert!(crate::Pools::<Test>::get(&collateral, PUSD).is_none());
+		assert!(crate::Pools::<Test>::get(&HIGH_MIN, PUSD).is_none());
 	});
 }
 
 #[test]
 fn branch_registration_rejects_prefunded_pool_account() {
 	build_and_execute(|| {
-		assert_ok!(Assets::force_create(RuntimeOrigin::root(), 77, 1, true, 1_000));
+		create_high_min_collateral();
 		// Whoever creates the market funds its redistribution seed: the depositor when there is
 		// one, the full admin otherwise. The withdrawal preserves the payer, so both need two
 		// minimum balances on hand.
-		mint_collateral(AssetId::WithId(77), 1, 2_000);
-		mint_collateral(AssetId::WithId(77), ADMIN, 2_000);
-		let collateral = AssetId::WithId(77);
-		let pool = Stability::pool_account(&collateral, &PUSD);
-		mint_collateral(collateral.clone(), pool, 1_000);
-		set_price(collateral.clone(), FixedU128::from_rational(5u128, 4u128));
+		mint_collateral(HIGH_MIN, 1, 2_000);
+		mint_collateral(HIGH_MIN, ADMIN, 2_000);
+		let pool = Stability::pool_account(&HIGH_MIN, &PUSD);
+		mint_collateral(HIGH_MIN, pool, 1_000);
+		set_price(HIGH_MIN, REGISTRATION_PRICE);
 
 		assert_noop!(
-			Vaults::create_branch(
-				RuntimeOrigin::signed(1),
-				collateral.clone(),
-				PUSD,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				branch_config_for(collateral.clone(), PUSD),
-				registration_config(PUSD),
-			),
+			create_branch_as(RuntimeOrigin::signed(1), HIGH_MIN),
 			Error::<Test>::PoolAccountNotEmpty
 		);
-		assert!(crate::Pools::<Test>::get(collateral, PUSD).is_none());
-		assert_eq!(collateral_balance(AssetId::WithId(77), pool), 1_000);
+		assert!(crate::Pools::<Test>::get(HIGH_MIN, PUSD).is_none());
+		assert_eq!(collateral_balance(HIGH_MIN, pool), 1_000);
 	});
 }
 
 #[test]
 fn branch_registration_rejects_invalid_pool_config() {
 	build_and_execute(|| {
-		let mut bad = default_pool_config();
-		bad.minimum_deposit = 0;
+		let bad = StabilityPoolConfig { minimum_deposit: 0, ..default_pool_config() };
 
-		set_price(DOT, FixedU128::from_rational(5u128, 4u128));
+		set_price(DOT, REGISTRATION_PRICE);
 		assert_noop!(
 			Vaults::create_branch(
 				RuntimeOrigin::root(),
@@ -252,9 +227,7 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		mint_stable(PUSD, 2, 150);
 		assert_ok!(deposit_and_mature(1, DOT, PUSD, 150));
 		assert_ok!(deposit_and_mature(2, DOT, PUSD, 150));
-		let leftover = distribute_yield(DOT, PUSD, 101);
-		assert_eq!(leftover.peek(), 0);
-		drop(leftover);
+		assert_eq!(distribute_yield_leftover(DOT, PUSD, 101), 0);
 		let offset = simulate_offset(DOT, PUSD, 100, 101);
 		assert_eq!(offset.debt(), 100);
 		assert_eq!(offset.leftover, 0);
@@ -289,15 +262,10 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 		assert_eq!(collateral_balance(DOT, pool), 0);
 		assert_eq!(stable_balance(PUSD, DUST_DEST), stable_dust);
 		assert_eq!(collateral_balance(DOT, DUST_DEST), collateral_dust);
-		System::assert_has_event(
-			crate::Event::DustSwept {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				stable_amount: stable_dust,
-				collateral_amount: collateral_dust,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(DustSwept {
+			stable_amount: stable_dust,
+			collateral_amount: collateral_dust,
+		}));
 
 		// Re-registering the same pair starts from a genuinely clean slate:
 		// zero tracked totals against a pool account holding only its float, so the
@@ -363,8 +331,8 @@ fn set_stability_pool_config_checks_the_origin_then_stores_and_emits() {
 #[test]
 fn set_stability_pool_config_validates_and_freezes_precision_parameters() {
 	build_with_default_market(|| {
-		let mut config = default_pool_config();
-		config.minimum_active_pool_balance = 0;
+		let config =
+			StabilityPoolConfig { minimum_active_pool_balance: 0, ..default_pool_config() };
 		assert_noop!(
 			Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config),
 			Error::<Test>::InvalidStabilityPoolConfig

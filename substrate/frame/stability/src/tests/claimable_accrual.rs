@@ -87,7 +87,7 @@ fn withdraw_realizes_yield_into_claimable_never_compounds() {
 		seed_matured_deposit(1, 600);
 
 		// delta_G = Y * (P/A) = 60 * (1/600) = 0.1.
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 
 		// The withdrawal realizes yield = (600/1) * 0.1 = 60 into
 		// `claimable_yield`; the active deposit is only reduced by the 100

@@ -25,21 +25,16 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 		assert_eq!(state.total_collateral_gains_unclaimed, 400);
 		// delta_S = 400 * (1/1000) = 0.4.
 		let sums = active_sums(0, 0);
-		assert_eq!(sums.s_collateral, FixedU128::from_inner(400_000_000_000_000_000));
+		assert_eq!(sums.s_collateral, FixedU128::from_rational(4, 10));
 
 		// 500 of the pool's 1000 stablecoin was burned.
 		assert_eq!(pool_stable_held(DOT, PUSD), 500);
 		assert_eq!(pool_collateral_held(DOT, PUSD), 400);
 
-		System::assert_has_event(
-			crate::Event::OffsetApplied {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				active: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
-				pending: None,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(OffsetApplied {
+			active: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
+			pending: None,
+		}));
 
 		// Compounded: floor(600 * 0.5) = 300; floor(400 * 0.5) = 200.
 		// Gains: floor(600 * 0.4) = 240; floor(400 * 0.4) = 160.
@@ -106,15 +101,11 @@ fn offset_clamps_at_the_floor_then_only_depletion_passes() {
 fn offset_without_capacity_quotes_nothing_and_refuses_settlement() {
 	build_and_execute(|| {
 		let offset_active = |branch: BranchSnapshot, debt: Balance, collateral: Balance| {
-			hypothetically!(Stability::offset(
-				&DOT,
-				&PUSD,
+			hypothetically!(offset_with(
+				(DOT, PUSD),
 				branch,
 				OffsetLegs { active: debt, pending: 0 },
-				OffsetLegs {
-					active: issue_collateral(DOT, collateral),
-					pending: issue_collateral(DOT, 0),
-				},
+				OffsetLegs { active: (DOT, collateral), pending: (DOT, 0) }
 			))
 		};
 
@@ -186,15 +177,11 @@ fn combined_offset_settles_active_then_pending() {
 		// Reversing the order would leave active unable to drain under the
 		// `Preserve` decision made by its sizing pass.
 		hypothetically!({
-			assert_ok!(Stability::offset(
-				&DOT,
-				&USDX,
+			assert_ok!(offset_with(
+				(DOT, USDX),
 				branch_snapshot(&DOT, &USDX),
 				OffsetLegs { active: 60_000, pending: 40_000 },
-				OffsetLegs {
-					active: issue_collateral(DOT, 240),
-					pending: issue_collateral(DOT, 160),
-				},
+				OffsetLegs { active: (DOT, 240), pending: (DOT, 160) }
 			));
 
 			let state = pool_state(DOT, USDX);
@@ -249,30 +236,22 @@ fn offset_refuses_stale_sizing_reads() {
 		// reservation.
 		assert_eq!(Stability::quote_pending(&quote, 100, 900), 0);
 		assert_err!(
-			hypothetically!(Stability::offset(
-				&DOT,
-				&PUSD,
+			hypothetically!(offset_with(
+				(DOT, PUSD),
 				branch_snapshot(&DOT, &PUSD),
 				OffsetLegs { active: 950, pending: 0 },
-				OffsetLegs {
-					active: issue_collateral(DOT, 400),
-					pending: issue_collateral(DOT, 0)
-				},
+				OffsetLegs { active: (DOT, 400), pending: (DOT, 0) }
 			)),
 			Error::<Test>::OffsetSettlementFailed,
 		);
 
 		// The clamped amount itself executes exactly.
 		hypothetically!({
-			assert_ok!(Stability::offset(
-				&DOT,
-				&PUSD,
+			assert_ok!(offset_with(
+				(DOT, PUSD),
 				branch_snapshot(&DOT, &PUSD),
 				OffsetLegs { active: 900, pending: 0 },
-				OffsetLegs {
-					active: issue_collateral(DOT, 400),
-					pending: issue_collateral(DOT, 0)
-				},
+				OffsetLegs { active: (DOT, 400), pending: (DOT, 0) }
 			));
 			assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 100);
 		});
@@ -284,7 +263,7 @@ fn compounded_yield_absorbs_offsets() {
 	build_with_default_market(|| {
 		set_min_active_pool(20);
 		seed_matured_deposit(1, 600);
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 		assert_ok!(compound(1, DOT, PUSD, 60));
 
 		// The compounded 60 is offsettable: A = 660, and the 601 offset

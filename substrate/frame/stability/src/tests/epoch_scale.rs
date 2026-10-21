@@ -15,7 +15,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		seed_matured_deposit(1, 600);
 		seed_matured_deposit(2, 400);
 		// Yield before the depletion: G(0,0) = 100/1000 = 0.1.
-		drop(distribute_yield(DOT, PUSD, 100));
+		distribute_all_yield(100);
 
 		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).debt(), 1_000);
 
@@ -24,7 +24,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		assert_eq!(state.total_active_deposits, 0);
 		// The old epoch's sums row keeps the gains, delta_S = 800 * (1/1000) = 0.8, and the new
 		// epoch's row is seeded empty.
-		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_inner(800_000_000_000_000_000));
+		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(8, 10));
 		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 1u32, 0u32)));
 		assert_eq!(active_sums(1, 0), PoolSums::default());
 
@@ -44,7 +44,7 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		// registration price: P = floor(P * new_A / A) = floor(1 * 250/500) = 0.5,
 		// delta_S(1,0) = 200 * (1/500) = 0.4.
 		seed_matured_deposit(3, 500);
-		drop(distribute_yield(DOT, PUSD, 50));
+		distribute_all_yield(50);
 		assert_eq!(simulate_offset(DOT, PUSD, 250, 200).debt(), 250);
 		// gain = (500/1) * 0.4 = 200; yield = floor(500 * 0.1) = 50; compounded = (500/1) * 0.5
 		// = 250.
@@ -116,19 +116,14 @@ fn scale_crossing_preserves_older_deposits() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(
 			state.coords,
-			Accumulators { p: FixedU128::from_inner(10_000_000_000_000_000), epoch: 0, scale: 1 }
+			Accumulators { p: FixedU128::from_rational(1, 100), epoch: 0, scale: 1 }
 		);
 		assert_eq!(state.total_active_deposits, 100);
 		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 0u32, 1u32)));
-		System::assert_has_event(
-			crate::Event::OffsetApplied {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				active: Some(crate::types::LegCoords { epoch: 0, scale: 1 }),
-				pending: None,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(OffsetApplied {
+			active: Some(crate::types::LegCoords { epoch: 0, scale: 1 }),
+			pending: None,
+		}));
 
 		// A second offset on the new scale leaves 50 of the 100:
 		// delta_S(0,1) = 40 * (0.01/100) = 4e-3 (inner 4e15),

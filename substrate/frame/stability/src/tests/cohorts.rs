@@ -11,35 +11,25 @@ use pusd_primitives::StabilityPoolInspect;
 #[test]
 fn yield_distribution_activates_matured_capital_without_a_touch() {
 	build_with_default_market(|| {
-		mint_stable(PUSD, 1, 1_000);
-		assert_ok!(deposit(1, DOT, PUSD, 400));
+		seed_deposit_from_balance(1, 1_000, 400);
 
 		// Before the deadline the capital is pending: the pool takes no yield for it.
-		let leftover = distribute_yield(DOT, PUSD, 40);
-		assert_eq!(leftover.peek(), 40);
-		drop(leftover);
+		assert_eq!(distribute_yield_leftover(DOT, PUSD, 40), 40);
 
 		// Past the deadline, the distribution itself advances the cohort first: the 400 enters
 		// the denominator without anyone touching the row.
 		advance_time(9_000);
-		let leftover = distribute_yield(DOT, PUSD, 40);
-		assert_eq!(leftover.peek(), 0);
-		drop(leftover);
+		assert_eq!(distribute_yield_leftover(DOT, PUSD, 40), 0);
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 400);
 		assert_eq!(state.total_pending_deposits, 0);
 		assert!(state.open_cohorts.is_empty());
-		System::assert_has_event(
-			crate::Event::CohortActivated {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				cohort: CohortId(0),
-				deadline: 10_000,
-				amount: 400,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(CohortActivated {
+			cohort: CohortId(0),
+			deadline: 10_000,
+			amount: 400,
+		}));
 
 		// The row itself is untouched; it still shows the tranche as pending.
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
@@ -58,8 +48,7 @@ fn yield_distribution_activates_matured_capital_without_a_touch() {
 #[test]
 fn offsets_size_against_matured_capital_without_a_touch() {
 	build_with_default_market(|| {
-		mint_stable(PUSD, 1, 1_000);
-		assert_ok!(deposit(1, DOT, PUSD, 400));
+		seed_deposit_from_balance(1, 1_000, 400);
 
 		// Deposited at t = 1_000: the cohort boundary lands at 10_000, and t = 9_999 is one
 		// millisecond short. The read-only sizing simulates the advancement and still finds
@@ -101,16 +90,11 @@ fn offsets_size_against_matured_capital_without_a_touch() {
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 300);
 		assert_eq!(state.total_pending_deposits, 0);
-		System::assert_has_event(
-			crate::Event::CohortActivated {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				cohort: CohortId(0),
-				deadline: 10_000,
-				amount: 400,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(CohortActivated {
+			cohort: CohortId(0),
+			deadline: 10_000,
+			amount: 400,
+		}));
 		// Aggregate activation did not touch the depositor row.
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		assert_eq!(row.active_deposit, 0);
@@ -122,15 +106,10 @@ fn offsets_size_against_matured_capital_without_a_touch() {
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		assert_eq!(row.active_deposit, 300);
 		assert_eq!(row.claimable_collateral, 80);
-		System::assert_has_event(
-			crate::Event::PendingDepositActivated {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				amount: 400,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(PendingDepositActivated {
+			depositor: 1,
+			amount: 400,
+		}));
 	});
 }
 
@@ -157,24 +136,17 @@ fn two_open_cohorts_roll_together_after_an_idle_stretch() {
 		// One distribution advances both against the same instant and splits over 800:
 		// delta_G = 80 / 800 = 0.1.
 		advance_time(20_000);
-		let leftover = distribute_yield(DOT, PUSD, 80);
-		assert_eq!(leftover.peek(), 0);
-		drop(leftover);
+		assert_eq!(distribute_yield_leftover(DOT, PUSD, 80), 0);
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 800);
 		assert_eq!(state.total_pending_deposits, 0);
 		for (cohort, deadline, amount) in [(0, 10_000, 300), (1, 15_000, 500)] {
-			System::assert_has_event(
-				crate::Event::CohortActivated {
-					collateral_id: DOT,
-					stable_id: PUSD,
-					cohort: CohortId(cohort),
-					deadline,
-					amount,
-				}
-				.into(),
-			);
+			System::assert_has_event(market_event!(CohortActivated {
+				cohort: CohortId(cohort),
+				deadline,
+				amount,
+			}));
 		}
 
 		// Both members realize their post-activation yield, and the last settlement of each
@@ -190,8 +162,7 @@ fn two_open_cohorts_roll_together_after_an_idle_stretch() {
 #[test]
 fn settlement_splits_losses_and_gains_at_the_checkpoint() {
 	build_with_default_market(|| {
-		mint_stable(PUSD, 1, 400);
-		assert_ok!(deposit(1, DOT, PUSD, 400));
+		seed_deposit(1, 400);
 
 		// Two backstop offsets while pending compose through the accumulators:
 		// P_pending = 300/400 = 0.75, delta_S_pending = 50 * (1/400) = 0.125; then
@@ -205,7 +176,7 @@ fn settlement_splits_losses_and_gains_at_the_checkpoint() {
 		// into the active pool, and the yield distributes over exactly that:
 		// delta_G = 60 / 240 = 0.25.
 		advance_time(9_000);
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 240);
 		assert_eq!(state.total_pending_deposits, 0);
@@ -221,15 +192,10 @@ fn settlement_splits_losses_and_gains_at_the_checkpoint() {
 		assert_eq!(row.active_deposit, 120);
 		assert_eq!(row.claimable_collateral, 80 + 90);
 		assert_eq!(row.claimable_yield, 60);
-		System::assert_has_event(
-			crate::Event::PendingDepositActivated {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				amount: 240,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(PendingDepositActivated {
+			depositor: 1,
+			amount: 240,
+		}));
 
 		// Every tracked total reconciles against the claims.
 		assert_claim_collateral(1, 170);
@@ -244,8 +210,7 @@ fn settlement_splits_losses_and_gains_at_the_checkpoint() {
 #[test]
 fn depleted_cohort_activates_nothing_but_keeps_gains_claimable() {
 	build_with_default_market(|| {
-		mint_stable(PUSD, 1, 400);
-		assert_ok!(deposit(1, DOT, PUSD, 400));
+		seed_deposit(1, 400);
 
 		// The backstop consumes the whole pending stock before maturity:
 		// delta_S_pending = 100 * (1/400) = 0.25, then a pending epoch bump.
@@ -257,16 +222,11 @@ fn depleted_cohort_activates_nothing_but_keeps_gains_claimable() {
 		// can realize the gains earned before the depletion.
 		advance_time(9_000);
 		assert_ok!(settle(7, 1, DOT, PUSD));
-		System::assert_has_event(
-			crate::Event::CohortActivated {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				cohort: CohortId(0),
-				deadline: 10_000,
-				amount: 0,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(CohortActivated {
+			cohort: CohortId(0),
+			deadline: 10_000,
+			amount: 0,
+		}));
 		let row = deposit_row(DOT, PUSD, 1).expect("row carries the gain");
 		assert_eq!(row.active_deposit, 0);
 		assert!(row.pending_deposit.is_none());
@@ -281,12 +241,9 @@ fn depleted_cohort_activates_nothing_but_keeps_gains_claimable() {
 #[test]
 fn zero_entry_delay_credits_the_active_pool_at_once() {
 	build_with_default_market(|| {
-		let mut config = default_pool_config();
-		config.entry_delay = 0;
-		assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
+		set_pool_config(StabilityPoolConfig { entry_delay: 0, ..default_pool_config() });
 
-		mint_stable(PUSD, 1, 400);
-		assert_ok!(deposit(1, DOT, PUSD, 400));
+		seed_deposit(1, 400);
 
 		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
 		assert_eq!(row.active_deposit, 400);
@@ -314,9 +271,7 @@ fn raising_the_delay_stretches_the_latest_cohort() {
 		// Governance quadruples the delay. The next deposit needs a deadline of 40_000; with the
 		// the older cohort still open, the latest cohort stretches rather than opening a third.
 		// Its earlier member waits longer, which is the safe direction.
-		let mut config = default_pool_config();
-		config.entry_delay = 20_000;
-		assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
+		set_pool_config(StabilityPoolConfig { entry_delay: 20_000, ..default_pool_config() });
 		assert_ok!(deposit(3, DOT, PUSD, 400));
 		assert_eq!(pending_deadline(DOT, PUSD, 2), Some(40_000));
 		assert_eq!(pending_deadline(DOT, PUSD, 3), Some(40_000));
@@ -345,15 +300,13 @@ fn lowering_the_delay_joins_the_standing_cohort() {
 		// With the delay lowered, the new deposit's requirement (4_000) is already covered by
 		// the standing cohort: it joins and waits until 10_000 — longer than newly required,
 		// never shorter.
-		let mut config = default_pool_config();
-		config.entry_delay = 2_000;
-		assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
+		set_pool_config(StabilityPoolConfig { entry_delay: 2_000, ..default_pool_config() });
 		assert_ok!(deposit(2, DOT, PUSD, 300));
 		assert_eq!(pending_deadline(DOT, PUSD, 1), Some(10_000));
 		assert_eq!(pending_deadline(DOT, PUSD, 2), Some(10_000));
 
 		advance_time(9_000);
-		drop(distribute_yield(DOT, PUSD, 50));
+		distribute_all_yield(50);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 500);
 		assert_eq!(state.total_pending_deposits, 0);
@@ -364,17 +317,15 @@ fn lowering_the_delay_joins_the_standing_cohort() {
 fn freeze_halts_advancement_but_settles_committed_checkpoints() {
 	build_and_execute(|| {
 		seed_branch_with_debt();
-		mint_stable(PUSD, 2, 300);
-		assert_ok!(deposit(2, DOT, PUSD, 300));
+		seed_deposit(2, 300);
 
 		// The cohort advances while the market is healthy; the row stays unsettled.
 		advance_time(9_000);
-		drop(distribute_yield(DOT, PUSD, 70));
+		distribute_all_yield(70);
 		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 700);
 
 		// A later cohort matures during the freeze and stays pending until the market thaws.
-		mint_stable(PUSD, 3, 200);
-		assert_ok!(deposit(3, DOT, PUSD, 200));
+		seed_deposit(3, 200);
 		assert_eq!(pending_deadline(DOT, PUSD, 3), Some(25_000));
 
 		// A frozen market cannot advance cohorts, but settling a row through a checkpoint that
@@ -427,16 +378,11 @@ fn aggregate_tracks_an_epoch_bump_inside_one_cohort() {
 		// At maturity the revalued aggregate activates as it stands.
 		advance_time(9_000);
 		assert_ok!(settle(7, 2, DOT, PUSD));
-		System::assert_has_event(
-			crate::Event::CohortActivated {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				cohort: CohortId(0),
-				deadline: 10_000,
-				amount: 500,
-			}
-			.into(),
-		);
+		System::assert_has_event(market_event!(CohortActivated {
+			cohort: CohortId(0),
+			deadline: 10_000,
+			amount: 500,
+		}));
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_active_deposits, 500);
 		assert_eq!(state.total_pending_deposits, 0);
@@ -472,7 +418,7 @@ fn pending_scale_crossing_reprices_the_aggregate_through_the_divisor() {
 		assert_eq!(offset.debt(), unit - 100);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.pending_coords.scale, 1);
-		assert_eq!(state.pending_coords.p, FixedU128::from_inner(10_000_000_000_000_000));
+		assert_eq!(state.pending_coords.p, FixedU128::from_rational(1, 100));
 		let pending_sums = |scale| pending_sums(0, scale);
 		assert_eq!(pending_sums(0).s_collateral, FixedU128::from_rational(1, 10));
 		assert_eq!(pending_sums(1).s_collateral, FixedU128::zero());
