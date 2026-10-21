@@ -18,6 +18,15 @@ pub const INTEREST_DENOMINATOR: u128 = FixedU128::DIV * MILLIS_PER_YEAR as u128;
 
 const _: () = assert!(INTEREST_DENOMINATOR < 1 << 127);
 
+/// Returns the whole units of an accrual rate, rounded down, saturating at `Balance::max_value()`.
+pub fn whole_units<Balance: FixedPointOperand>(accrual_rate: U256) -> Balance {
+	let whole = accrual_rate / U256::from(FixedU128::DIV);
+	u128::try_from(whole)
+		.ok()
+		.and_then(|whole| Balance::try_from(whole).ok())
+		.unwrap_or_else(Balance::max_value)
+}
+
 /// Returns the exact accrual rate of `principal` at `rate`: `principal × rate-inner`.
 ///
 /// Both factors fit `u128`, so the product always fits `U256`.
@@ -38,7 +47,7 @@ pub fn claimable_accrual_rate(
 	stake_accrual_rate: U256,
 	unclaimed_per_stake: FixedU128,
 ) -> Option<U256> {
-	scale_wide(stake_accrual_rate, U256::from(unclaimed_per_stake.into_inner()), Rounding::Up)
+	scale_wide(stake_accrual_rate, U256::from(unclaimed_per_stake.into_inner()), Direction::Up)
 }
 
 /// Splits an interest numerator into whole units and the residue below one unit.
@@ -85,17 +94,32 @@ pub fn charge_interest<Balance: FixedPointOperand>(
 	Some((whole, prepaid))
 }
 
-/// Returns `value · factor / FixedU128::DIV` with `rounding`.
+/// Direction [`scale_wide`] rounds a truncated fraction.
+///
+/// Narrower than [`Rounding`]: every caller rounds strictly up or down, never to nearest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+	Down,
+	Up,
+}
+
+/// Returns `value · factor / FixedU128::DIV` rounded in `direction`.
 ///
 /// Splitting `value` at `DIV` keeps the product within 256 bits: the whole part scales exactly and
 /// only the fraction is divided.
-pub fn scale_wide(value: U256, factor: U256, rounding: Rounding) -> Option<U256> {
+pub fn scale_wide(value: U256, factor: U256, direction: Direction) -> Option<U256> {
 	let (whole, fraction) = value.div_mod(U256::from(FixedU128::DIV));
 	let whole = whole.checked_mul(factor)?;
 	let (fraction, residue) = fraction.checked_mul(factor)?.div_mod(U256::from(FixedU128::DIV));
-	let fraction = match rounding {
-		Rounding::Up if !residue.is_zero() => fraction.checked_add(U256::one())?,
-		_ => fraction,
+	let fraction = match direction {
+		Direction::Down => fraction,
+		Direction::Up => {
+			if residue.is_zero() {
+				fraction
+			} else {
+				fraction.checked_add(U256::one())?
+			}
+		},
 	};
 	whole.checked_add(fraction)
 }
@@ -115,8 +139,8 @@ pub fn simple_interest_ceil<Balance: FixedPointOperand>(
 	}
 	let p: u128 = principal.unique_saturated_into();
 	let rate_times_delta = rate.into_inner().saturating_mul(u128::from(delta_millis));
-	let denom = FixedU128::DIV.saturating_mul(u128::from(MILLIS_PER_YEAR));
-	mul_div(p, rate_times_delta, denom, Rounding::Up).defensive_unwrap_or_else(Balance::max_value)
+	mul_div(p, rate_times_delta, INTEREST_DENOMINATOR, Rounding::Up)
+		.defensive_unwrap_or_else(Balance::max_value)
 }
 
 /// Returns the market's average rate, rounded up.
@@ -134,22 +158,6 @@ pub fn average_branch_rate<Balance: FixedPointOperand>(
 	let t: u128 = total_ib_debt.unique_saturated_into();
 	let inner = mul_div(w, FixedU128::DIV, t, Rounding::Up).defensive_unwrap_or(u128::MAX);
 	FixedU128::from_inner(inner)
-}
-
-/// Returns the redistribution increment per unit of stake, rounded down.
-///
-/// Vaults claim at most the pool, and the last stake bearer claims the whole residue.
-pub fn redistribution_per_stake<Balance: FixedPointOperand>(
-	amount: Balance,
-	total_stake: Balance,
-) -> Option<FixedU128> {
-	mul_div(
-		amount.unique_saturated_into(),
-		FixedU128::DIV,
-		total_stake.unique_saturated_into(),
-		Rounding::Down,
-	)
-	.map(FixedU128::from_inner)
 }
 
 #[cfg(test)]
@@ -193,18 +201,9 @@ mod tests {
 	#[test]
 	fn scale_wide_rounds_the_fraction_only() {
 		let div = U256::from(FixedU128::DIV);
-		assert_eq!(scale_wide(div * 3, U256::from(5u32), Rounding::Down), Some(U256::from(15u32)));
-		assert_eq!(scale_wide(U256::one(), U256::one(), Rounding::Down), Some(U256::zero()));
-		assert_eq!(scale_wide(U256::one(), U256::one(), Rounding::Up), Some(U256::one()));
-	}
-
-	#[test]
-	fn redistribution_per_stake_rounds_down() {
-		assert_eq!(
-			redistribution_per_stake(1u128, 3),
-			Some(FixedU128::from_inner(FixedU128::DIV / 3))
-		);
-		assert_eq!(redistribution_per_stake(1u128, 0), None);
+		assert_eq!(scale_wide(div * 3, U256::from(5u32), Direction::Down), Some(U256::from(15u32)));
+		assert_eq!(scale_wide(U256::one(), U256::one(), Direction::Down), Some(U256::zero()));
+		assert_eq!(scale_wide(U256::one(), U256::one(), Direction::Up), Some(U256::one()));
 	}
 
 	#[test]

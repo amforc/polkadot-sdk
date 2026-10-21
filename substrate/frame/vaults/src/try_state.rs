@@ -7,14 +7,16 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings, HoldReason,
-		Millis, Pallet, StableIdOf, StablecoinDebt, StablecoinMarkets, Vaults,
+		Millis, Pallet, StableIdOf, StablecoinDebt, StablecoinMarkets, VaultListIdOf, Vaults,
 	},
 	types::VaultListId,
+	utility_impls::BranchContribution,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 use frame::{
 	arithmetic::{CheckedAdd, Saturating, Zero},
 	deps::{sp_core::U256, sp_runtime::TryRuntimeError},
+	prelude::ensure,
 	traits::{
 		fungibles::{Inspect as FungiblesInspect, InspectHold},
 		Convert, Time,
@@ -31,7 +33,8 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	// Derived-index accumulators, recomputed in full from the authoritative registry.
 	let mut collaterals: BTreeSet<CollateralIdOf<T>> = BTreeSet::new();
 	let mut stablecoin_markets: BTreeMap<CollateralIdOf<T>, u32> = BTreeMap::new();
-	let mut stablecoin_debt: BTreeMap<StableIdOf<T>, (BalanceOf<T>, U256, U256)> = BTreeMap::new();
+	let mut stablecoin_debt: BTreeMap<StableIdOf<T>, BranchContribution<BalanceOf<T>>> =
+		BTreeMap::new();
 	for (collateral_id, stable_id, branch) in Branches::<T>::iter() {
 		collaterals.insert(collateral_id.clone());
 		let markets = stablecoin_markets
@@ -40,18 +43,18 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		*markets = markets.checked_add(1).ok_or("stablecoin market count overflow")?;
 		let branch_outstanding = branch.state.debt.outstanding();
 		let stable_entry = stablecoin_debt.entry(stable_id.clone()).or_default();
-		stable_entry.0 = stable_entry
-			.0
+		stable_entry.outstanding = stable_entry
+			.outstanding
 			.checked_add(&branch_outstanding)
 			.ok_or("stablecoin outstanding-debt sum overflow")?;
 		if !branch.state.is_frozen() {
-			stable_entry.1 = stable_entry
-				.1
-				.checked_add(branch.state.debt.accrual_rate.to_wide())
+			stable_entry.active_accrual_rate = stable_entry
+				.active_accrual_rate
+				.checked_add(branch.state.debt.accrual_rate)
 				.ok_or("stablecoin active accrual rate sum overflow")?;
 		}
-		stable_entry.2 = stable_entry
-			.2
+		stable_entry.pending_interest = stable_entry
+			.pending_interest
 			.checked_add(
 				Pallet::<T>::branch_pending_interest(&branch.state, now)
 					.map_err(|_| "branch pending-interest numerator overflow")?,
@@ -71,64 +74,68 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		)?;
 		// The slot exposes redemption dust, so a debt-free Dormant vault cannot occupy it.
 		if let Some(owner) = branch.state.dormant_redemption_target.clone() {
-			let Ok(vault) = Pallet::<T>::vault_of(collateral_id, stable_id, &owner) else {
-				return Err("dormant_redemption_target points at missing vault".into());
-			};
-			if !Pallet::<T>::vault_status_of(collateral_id, stable_id, &owner).is_dormant() {
-				return Err("dormant_redemption_target points at non-Dormant".into());
-			}
-			if vault.debt.total().is_zero() {
-				return Err("dormant_redemption_target points at a debt-free vault".into());
-			}
+			let vault = Pallet::<T>::vault_of(collateral_id, stable_id, &owner)
+				.map_err(|_| "dormant_redemption_target points at missing vault")?;
+			ensure!(
+				Pallet::<T>::vault_status_of(collateral_id, stable_id, &owner).is_dormant(),
+				"dormant_redemption_target points at non-Dormant"
+			);
+			ensure!(
+				!vault.debt.total().is_zero(),
+				"dormant_redemption_target points at a debt-free vault"
+			);
 		}
 	}
 
 	check_owner_holds::<T>(owner_collateral)?;
 	check_stablecoin_markets::<T>(&collaterals, stablecoin_markets)?;
-	if GlobalDebtCeilings::<T>::iter_values().any(|ceiling| ceiling.is_zero()) {
-		return Err("zero GlobalDebtCeilings record stored".into());
-	}
+	ensure!(
+		GlobalDebtCeilings::<T>::iter_values().all(|ceiling| !ceiling.is_zero()),
+		"zero GlobalDebtCeilings record stored"
+	);
 	check_stablecoin_debt::<T>(stablecoin_debt, now)?;
 	Ok(())
 }
 
 /// `StablecoinDebt` must equal its full recomputation from `Branches`.
 fn check_stablecoin_debt<T: Config>(
-	mut expected: BTreeMap<StableIdOf<T>, (BalanceOf<T>, U256, U256)>,
+	mut expected: BTreeMap<StableIdOf<T>, BranchContribution<BalanceOf<T>>>,
 	now: Millis,
 ) -> Result<(), TryRuntimeError> {
 	for (stable_id, stored) in StablecoinDebt::<T>::iter() {
-		if stored.is_empty() {
-			return Err("empty StablecoinDebt record stored".into());
-		}
-		if stored.last_update > now {
-			return Err("StablecoinDebt last_update is ahead of now".into());
-		}
+		ensure!(!stored.is_empty(), "empty StablecoinDebt record stored");
+		ensure!(stored.last_update <= now, "StablecoinDebt last_update is ahead of now");
 		let elapsed = now.saturating_sub(stored.last_update);
 		let projected = stored
 			.pending_interest
-			.to_wide()
 			.checked_add(
-				math::interest_numerator(stored.active_accrual_rate.to_wide(), elapsed)
+				math::interest_numerator(stored.active_accrual_rate, elapsed)
 					.ok_or("StablecoinDebt projection overflow")?,
 			)
 			.ok_or("StablecoinDebt projection overflow")?;
-		let (outstanding, active, pending) = expected.remove(&stable_id).unwrap_or_default();
-		if stored.outstanding != outstanding {
-			return Err("StablecoinDebt outstanding diverges from Branches".into());
-		}
-		if stored.active_accrual_rate.to_wide() != active {
-			return Err("StablecoinDebt active accrual rate diverges from Branches".into());
-		}
-		if projected != pending {
-			return Err("StablecoinDebt numerator diverges from Branches".into());
-		}
+		let BranchContribution {
+			outstanding,
+			pending_interest: pending,
+			active_accrual_rate: active,
+		} = expected.remove(&stable_id).unwrap_or_default();
+		ensure!(
+			stored.outstanding == outstanding,
+			"StablecoinDebt outstanding diverges from Branches"
+		);
+		ensure!(
+			stored.active_accrual_rate == active,
+			"StablecoinDebt active accrual rate diverges from Branches"
+		);
+		ensure!(projected == pending, "StablecoinDebt numerator diverges from Branches");
 	}
-	if expected.into_values().any(|(outstanding, active, pending)| {
-		!outstanding.is_zero() || !active.is_zero() || !pending.is_zero()
-	}) {
-		return Err("stablecoin with debt lacks a StablecoinDebt record".into());
-	}
+	ensure!(
+		expected.into_values().all(|sums| {
+			sums.outstanding.is_zero() &&
+				sums.active_accrual_rate.is_zero() &&
+				sums.pending_interest.is_zero()
+		}),
+		"stablecoin with debt lacks a StablecoinDebt record"
+	);
 	Ok(())
 }
 
@@ -140,13 +147,12 @@ fn check_stablecoin_markets<T: Config>(
 	collaterals: &BTreeSet<CollateralIdOf<T>>,
 	counts: BTreeMap<CollateralIdOf<T>, u32>,
 ) -> Result<(), TryRuntimeError> {
-	if counts.keys().any(|stable_key| collaterals.contains(stable_key)) {
-		return Err("asset used as both collateral and stablecoin across markets".into());
-	}
+	ensure!(
+		!counts.keys().any(|stable_key| collaterals.contains(stable_key)),
+		"asset used as both collateral and stablecoin across markets"
+	);
 	let stored: BTreeMap<CollateralIdOf<T>, u32> = StablecoinMarkets::<T>::iter().collect();
-	if stored != counts {
-		return Err("StablecoinMarkets diverges from its recomputation over Branches".into());
-	}
+	ensure!(stored == counts, "StablecoinMarkets diverges from its recomputation over Branches");
 	Ok(())
 }
 
@@ -164,9 +170,7 @@ fn check_owner_holds<T: Config>(
 			&HoldReason::VaultCollateral.into(),
 			&owner,
 		);
-		if sum != held {
-			return Err("Σ vault.collateral over a collateral's markets != owner hold".into());
-		}
+		ensure!(sum == held, "Σ vault.collateral over a collateral's markets != owner hold");
 	}
 	Ok(())
 }
@@ -179,24 +183,26 @@ fn check_branch_identities<T: Config>(
 	collateral_id: &CollateralIdOf<T>,
 	stable_id: &StableIdOf<T>,
 	branch: &BranchOf<T>,
-	rate_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
-	recovery_list: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
+	rate_list: &VaultListIdOf<T>,
+	recovery_list: &VaultListIdOf<T>,
 	now: Millis,
 	owner_collateral: &mut BTreeMap<(CollateralIdOf<T>, T::AccountId), BalanceOf<T>>,
 ) -> Result<(), TryRuntimeError> {
 	let state = &branch.state;
 	let tau = state.interest_time(now);
-	if state.debt.last_interest_time > tau {
-		return Err("branch last_interest_time ahead of interest_time(now)".into());
-	}
-	if !state.debt.interest_minted_ahead.is_zero() &&
-		!state.debt.pending_interest_attribution.is_zero()
-	{
-		return Err("interest both minted ahead and pending attribution".into());
-	}
-	if state.debt.aggregate_interest_remainder >= math::INTEREST_DENOMINATOR {
-		return Err("aggregate interest remainder is not normalized".into());
-	}
+	ensure!(
+		state.debt.last_interest_time <= tau,
+		"branch last_interest_time ahead of interest_time(now)"
+	);
+	ensure!(
+		state.debt.interest_minted_ahead.is_zero() ||
+			state.debt.pending_interest_attribution.is_zero(),
+		"interest both minted ahead and pending attribution"
+	);
+	ensure!(
+		state.debt.aggregate_interest_remainder < math::INTEREST_DENOMINATOR,
+		"aggregate interest remainder is not normalized"
+	);
 
 	let mut sum_stake = BalanceOf::<T>::zero();
 	let mut sum_market_collateral = BalanceOf::<T>::zero();
@@ -211,29 +217,34 @@ fn check_branch_identities<T: Config>(
 	for (owner, record) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
 		let vault = record.vault;
 		vault_count = vault_count.checked_add(1).ok_or("branch vault count overflow")?;
-		if vault.last_interest_time > tau {
-			return Err("vault last_interest_time ahead of interest_time(now)".into());
-		}
-		if vault.interest_prepaid >= math::INTEREST_DENOMINATOR {
-			return Err("vault prepaid interest is not normalized".into());
-		}
-		if vault.redistribution_checkpoint.principal_per_stake >
-			state.redistribution.principal_per_stake ||
-			vault.redistribution_checkpoint.collateral_per_stake >
-				state.redistribution.collateral_per_stake ||
-			vault.redistribution_checkpoint.principal_time_per_stake.to_wide() >
-				state.redistribution.principal_time_per_stake.to_wide()
-		{
-			return Err("vault redistribution checkpoint is ahead of branch totals".into());
-		}
-		if vault.debt.total().is_zero() && vault.interest_prepaid != 0 {
-			return Err("debt-free vault carries prepaid interest".into());
+		ensure!(
+			vault.last_interest_time <= tau,
+			"vault last_interest_time ahead of interest_time(now)"
+		);
+		ensure!(
+			vault.interest_prepaid < math::INTEREST_DENOMINATOR,
+			"vault prepaid interest is not normalized"
+		);
+		let checkpoint = &vault.redistribution_checkpoint;
+		let totals = &state.redistribution;
+		ensure!(
+			checkpoint.principal_per_stake <= totals.principal_per_stake,
+			"vault redistribution checkpoint is ahead of branch totals"
+		);
+		ensure!(
+			checkpoint.collateral_per_stake <= totals.collateral_per_stake,
+			"vault redistribution checkpoint is ahead of branch totals"
+		);
+		ensure!(
+			checkpoint.principal_time_per_stake <= totals.principal_time_per_stake,
+			"vault redistribution checkpoint is ahead of branch totals"
+		);
+		if vault.debt.total().is_zero() {
+			ensure!(vault.interest_prepaid == 0, "debt-free vault carries prepaid interest");
 		}
 		let in_rate_index = T::VaultLists::contains(rate_list, &owner);
 		let in_recovery = T::VaultLists::contains(recovery_list, &owner);
-		if in_rate_index && in_recovery {
-			return Err("vault in both rate index and recovery FIFO".into());
-		}
+		ensure!(!(in_rate_index && in_recovery), "vault in both rate index and recovery FIFO");
 		// The row carries this market's share of the owner's hold; the cross-market
 		// owner-hold invariant (`Σ_stablecoins vault.collateral == hold`) is
 		// accumulated here and checked once, globally, in `do_try_state`.
@@ -257,20 +268,26 @@ fn check_branch_identities<T: Config>(
 			.checked_add(math::accrual_rate(vault.debt.principal, vault.annual_rate))
 			.ok_or("accrual rate sum overflow")?;
 		if in_recovery {
-			if !vault.redistribution_stake.is_zero() {
-				return Err("FinalRecovery vault has non-zero redistribution_stake".into());
-			}
+			ensure!(
+				vault.redistribution_stake.is_zero(),
+				"FinalRecovery vault has non-zero redistribution_stake"
+			);
 			continue;
 		}
-		if in_rate_index && vault.debt.total().is_zero() {
-			return Err("debt-free vault remains in the rate index".into());
+		if in_rate_index {
+			ensure!(!vault.debt.total().is_zero(), "debt-free vault remains in the rate index");
 		}
 		// Redistribution can give debt to Dormant vaults that ordinary redemption cannot target.
-		if !vault.collateral.is_zero() && vault.redistribution_stake.is_zero() {
-			return Err("eligible vault with collateral has zero redistribution stake".into());
-		}
-		if vault.collateral.is_zero() && !vault.redistribution_stake.is_zero() {
-			return Err("collateral-free vault has redistribution stake".into());
+		if vault.collateral.is_zero() {
+			ensure!(
+				vault.redistribution_stake.is_zero(),
+				"collateral-free vault has redistribution stake"
+			);
+		} else {
+			ensure!(
+				!vault.redistribution_stake.is_zero(),
+				"eligible vault with collateral has zero redistribution stake"
+			);
 		}
 		sum_stake = sum_stake
 			.checked_add(&vault.redistribution_stake)
@@ -295,44 +312,44 @@ fn check_branch_identities<T: Config>(
 				.ok_or("claimable redistribution accrual rate sum overflow")?;
 		}
 	}
-	if state.vault_count != vault_count {
-		return Err("branch vault_count != number of vault rows".into());
-	}
+	ensure!(state.vault_count == vault_count, "branch vault_count != number of vault rows");
 
-	if state.stakes.total != sum_stake {
-		return Err("total_stakes != Σ eligible vault.redistribution_stake".into());
-	}
-	if state.stakes.accrual_rate.to_wide() != sum_stake_accrual_rate {
-		return Err("stake accrual rate != exact Σ rate · stake".into());
-	}
-	if state.debt.principal != sum_principal {
-		return Err("branch principal != Σ vault principal".into());
-	}
+	ensure!(
+		state.stakes.total == sum_stake,
+		"total_stakes != Σ eligible vault.redistribution_stake"
+	);
+	ensure!(
+		state.stakes.accrual_rate == sum_stake_accrual_rate,
+		"stake accrual rate != exact Σ rate · stake"
+	);
+	ensure!(state.debt.principal == sum_principal, "branch principal != Σ vault principal");
 	let issued_interest = sum_interest
 		.checked_add(&state.debt.pending_interest_attribution)
 		.ok_or("issued interest sum overflow")?;
-	if state.debt.minted_interest != issued_interest {
-		return Err("minted interest != Σ vault interest + pending attribution".into());
-	}
+	ensure!(
+		state.debt.minted_interest == issued_interest,
+		"minted interest != Σ vault interest + pending attribution"
+	);
 	let expected_accrual_rate = sum_accrual_rate
-		.checked_add(state.debt.pending_redistribution_accrual_rate.to_wide())
+		.checked_add(state.debt.pending_redistribution_accrual_rate)
 		.ok_or("accrual rate plus pending sum overflow")?;
-	if state.debt.accrual_rate.to_wide() != expected_accrual_rate {
-		return Err(
-			"accrual rate != Σ vault accrual rate + pending redistribution accrual rate".into()
-		);
-	}
+	ensure!(
+		state.debt.accrual_rate == expected_accrual_rate,
+		"accrual rate != Σ vault accrual rate + pending redistribution accrual rate"
+	);
 	let expected_basis = sum_eligible_collateral
 		.checked_add(&state.pending_redistribution_collateral)
 		.ok_or("redistribution collateral basis overflow")?;
-	if state.stakes.collateral_basis != expected_basis {
-		return Err("stake collateral basis != eligible rows + pending collateral".into());
-	}
+	ensure!(
+		state.stakes.collateral_basis == expected_basis,
+		"stake collateral basis != eligible rows + pending collateral"
+	);
 	// The pool is posted rounded down and claimed rounded up, so the market never projects
 	// interest on an accrual rate that its vaults will not claim.
-	if state.debt.pending_redistribution_accrual_rate.to_wide() > sum_claimable_accrual_rate {
-		return Err("pending redistribution accrual rate exceeds what vaults can claim".into());
-	}
+	ensure!(
+		state.debt.pending_redistribution_accrual_rate <= sum_claimable_accrual_rate,
+		"pending redistribution accrual rate exceeds what vaults can claim"
+	);
 
 	let redistribution_account = Pallet::<T>::redistribution_account(collateral_id, stable_id);
 	let held_redistribution = T::CollateralAssets::balance_on_hold(
@@ -340,20 +357,23 @@ fn check_branch_identities<T: Config>(
 		&HoldReason::VaultCollateral.into(),
 		&redistribution_account,
 	);
-	if held_redistribution != state.pending_redistribution_collateral {
-		return Err("redistribution account hold != pending collateral".into());
-	}
+	ensure!(
+		held_redistribution == state.pending_redistribution_collateral,
+		"redistribution account hold != pending collateral"
+	);
 	// A hold must leave the asset's minimum balance free, so the registration seed has to survive
 	// every seizure for the next one to succeed.
 	let custody_free = T::CollateralAssets::balance(collateral_id.clone(), &redistribution_account);
-	if custody_free < T::CollateralAssets::minimum_balance(collateral_id.clone()) {
-		return Err("redistribution account free balance below the collateral minimum".into());
-	}
+	ensure!(
+		custody_free >= T::CollateralAssets::minimum_balance(collateral_id.clone()),
+		"redistribution account free balance below the collateral minimum"
+	);
 	let expected_total_collateral = sum_market_collateral
 		.checked_add(&state.pending_redistribution_collateral)
 		.ok_or("total collateral sum overflow")?;
-	if state.total_collateral != expected_total_collateral {
-		return Err("total_collateral != rows + pending redistribution collateral".into());
-	}
+	ensure!(
+		state.total_collateral == expected_total_collateral,
+		"total_collateral != rows + pending redistribution collateral"
+	);
 	Ok(())
 }
