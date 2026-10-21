@@ -20,6 +20,7 @@
 //! additionally prove that deliberate corruption is detected.
 
 use crate::{mock::*, ListMeta, ListMetas, ListNodes, Node, Position, SortedListInterface};
+use frame::testing_prelude::assert_err;
 
 #[test]
 fn consistent_after_random_op_sequence() {
@@ -44,12 +45,8 @@ fn corrupt_size_detected() {
 		insert(1, 1, 50);
 		insert(1, 2, 30);
 		// Force the count to lie.
-		ListMetas::<Test>::mutate(1, |maybe| {
-			if let Some(m) = maybe {
-				m.len = 99;
-			}
-		});
-		assert!(<LinkedList>::do_try_state().is_err());
+		ListMetas::<Test>::mutate_extant(1, |m| m.len = 99);
+		assert_err!(<LinkedList>::do_try_state(), "forward walk count != ListMetas.len");
 	});
 }
 
@@ -60,12 +57,8 @@ fn corrupt_near_max_size_is_caught_without_preallocating() {
 		insert(1, 2, 30);
 		// A near-`u32::MAX` `len` must be caught by the count check, not size a
 		// huge walk-vector before the walk runs.
-		ListMetas::<Test>::mutate(1, |maybe| {
-			if let Some(m) = maybe {
-				m.len = u32::MAX;
-			}
-		});
-		assert!(<LinkedList>::do_try_state().is_err());
+		ListMetas::<Test>::mutate_extant(1, |m| m.len = u32::MAX);
+		assert_err!(<LinkedList>::do_try_state(), "forward walk count != ListMetas.len");
 	});
 }
 
@@ -74,12 +67,8 @@ fn corrupt_head_tail_mismatch_detected() {
 	build_and_execute_no_post_check(|| {
 		insert(1, 1, 50);
 		// Tail set without head.
-		ListMetas::<Test>::mutate(1, |maybe| {
-			if let Some(m) = maybe {
-				m.head = None;
-			}
-		});
-		assert!(<LinkedList>::do_try_state().is_err());
+		ListMetas::<Test>::mutate_extant(1, |m| m.head = None);
+		assert_err!(<LinkedList>::do_try_state(), "ListMetas.head is None");
 	});
 }
 
@@ -89,20 +78,14 @@ fn corrupt_link_cycle_detected() {
 		insert(1, 1, 50);
 		insert(1, 2, 30);
 		// Forge a cycle: 2.next = 1.
-		ListNodes::<Test>::mutate(1, 2, |maybe| {
-			if let Some(n) = maybe {
-				n.next = Some(1);
-			}
+		corrupt_node(1, 2, |n| n.next = Some(1));
+		// Patch the meta to match. The forged tail (1) still links onward, so
+		// the tail-endpoint check catches the cycle before the walk starts.
+		ListMetas::<Test>::mutate_extant(1, |m| {
+			m.len = 99;
+			m.tail = Some(1);
 		});
-		// Patch the meta to match; the walk should still detect the cycle by
-		// exceeding the visited-count cap.
-		ListMetas::<Test>::mutate(1, |maybe| {
-			if let Some(m) = maybe {
-				m.len = 99;
-				m.tail = Some(1);
-			}
-		});
-		assert!(<LinkedList>::do_try_state().is_err());
+		assert_err!(<LinkedList>::do_try_state(), "tail node has non-None next");
 	});
 }
 
@@ -110,7 +93,7 @@ fn corrupt_link_cycle_detected() {
 fn empty_list_with_stale_size_detected() {
 	build_and_execute_no_post_check(|| {
 		ListMetas::<Test>::insert(1, ListMeta { len: 5, ..Default::default() });
-		assert!(<LinkedList>::do_try_state().is_err());
+		assert_err!(<LinkedList>::do_try_state(), "ListMetas present without ListNodes");
 	});
 }
 
@@ -121,7 +104,7 @@ fn dangling_node_pointer_detected() {
 		insert(1, 2, 30);
 		// 1.next points to a non-existent item.
 		ListNodes::<Test>::insert(1, 1, Node { prev: None, next: Some(999u64), priority: 50u32 });
-		assert!(<LinkedList>::do_try_state().is_err());
+		assert_err!(<LinkedList>::do_try_state(), "forward walk: missing node");
 	});
 }
 
@@ -134,6 +117,9 @@ fn orphan_unreachable_node_detected() {
 		// still see exactly the 2 reachable nodes and `ListMetas.len` agrees,
 		// so only the total-node-count check catches this.
 		ListNodes::<Test>::insert(1, 999u64, Node { prev: None, next: None, priority: 100u32 });
-		assert!(<LinkedList>::do_try_state().is_err());
+		assert_err!(
+			<LinkedList>::do_try_state(),
+			"orphan ListNodes rows: total count differs from chain length"
+		);
 	});
 }

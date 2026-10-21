@@ -130,14 +130,38 @@ pub(crate) fn insert(list_id: ListId, item: ItemId, priority: Priority) -> u32 {
 	LinkedList::insert(list_id, item, priority, hint).expect("insert succeeds in tests")
 }
 
+/// Seed list `1` with items `1..=MaxHintRepairSteps + 4` at priorities 100, 90,
+/// 80, … in head→tail order: longer than the repair budget, so a wrong-end hint
+/// cannot be bridged. Returns the chain length, which is also the tail item id.
+pub(crate) fn build_long_chain() -> u32 {
+	let chain_len = MaxHintRepairSteps::get() + 4;
+	for i in 1..=chain_len {
+		insert(1, u64::from(i), 100 - 10 * i + 10);
+	}
+	chain_len
+}
+
+/// Rewrite the stored node of `(list_id, item)` in place, bypassing every list
+/// invariant. The node must exist.
+pub(crate) fn corrupt_node(
+	list_id: ListId,
+	item: ItemId,
+	corrupt: impl FnOnce(&mut pallet_linked_list::Node<ItemId, Priority>),
+) {
+	pallet_linked_list::ListNodes::<Test>::mutate(list_id, item, |maybe| {
+		corrupt(maybe.as_mut().expect("corrupt_node: the node is stored; qed"));
+	});
+}
+
 /// Items in `list_id` head-to-tail.
 pub(crate) fn dump(list_id: ListId) -> alloc::vec::Vec<(ItemId, Priority)> {
 	use pallet_linked_list::SortedListInterface;
 	let count = LinkedList::count(&list_id);
-	let mut out = alloc::vec::Vec::with_capacity(count as usize);
+	let count = usize::try_from(count).expect("u32 fits in usize on test targets; qed");
+	let mut out = alloc::vec::Vec::with_capacity(count);
 	let mut cursor = LinkedList::head(&list_id);
 	while let Some(item) = cursor {
-		assert!(out.len() <= count as usize, "dump: walk exceeded count (cycle?)");
+		assert!(out.len() <= count, "dump: walk exceeded count (cycle?)");
 		let node = pallet_linked_list::ListNodes::<Test>::get(list_id, item)
 			.expect("listed items are stored; qed");
 		out.push((item, node.priority));
