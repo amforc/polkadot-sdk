@@ -379,13 +379,13 @@ parameter_types! {
 }
 
 impl pallet_linked_list::Config for Runtime {
-	type WeightInfo = ();
+	type WeightInfo = pallet_linked_list::weights::SubstrateWeight<Runtime>;
 	type ListId = pallet_vaults::VaultListId<VaultsCollateralId, VaultsStableId>;
 	type ItemId = AccountId;
 	type Priority = FixedU128;
 	type MaxHintRepairSteps = LinkedListMaxHintRepairSteps;
 	#[cfg(feature = "runtime-benchmarks")]
-	type PriorityProvider = pallet_linked_list::BenchPriorityProvider<Runtime>;
+	type PriorityProvider = pallet_linked_list::BenchPriorityProviderWithPrimary<Runtime, Vaults>;
 	#[cfg(not(feature = "runtime-benchmarks"))]
 	type PriorityProvider = Vaults;
 }

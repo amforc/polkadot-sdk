@@ -19,7 +19,7 @@
 
 use crate::{ListError, Outcome, Position};
 use frame::{
-	arithmetic::{FixedU128, Zero},
+	arithmetic::{CheckedAdd, FixedU128, Zero},
 	traits::Footprint,
 };
 
@@ -46,9 +46,9 @@ pub trait PriorityProvider<ListId, ItemId> {
 	/// hard error.
 	fn priority(list_id: &ListId, item: &ItemId) -> Option<Self::Priority>;
 
-	/// For benchmarks (and `std` test fixtures): pin the authoritative priority
-	/// returned by [`Self::priority`] for `(list_id, item)`.
-	#[cfg(any(feature = "runtime-benchmarks", feature = "std"))]
+	/// Pin the authoritative priority returned by [`Self::priority`] for
+	/// `(list_id, item)`.
+	#[cfg(feature = "runtime-benchmarks")]
 	fn set_priority(_list_id: &ListId, _item: &ItemId, _priority: Self::Priority) {}
 }
 
@@ -73,12 +73,9 @@ where
 {
 	let head = List::head(&list_id);
 	let priority = match &head {
-		Some(head_item) => {
-			let head_priority =
-				List::priority(&list_id, head_item).ok_or(ListError::CorruptList)?;
-			let inner = head_priority.into_inner().checked_add(1).ok_or(ListError::CorruptList)?;
-			FixedU128::from_inner(inner)
-		},
+		Some(head_item) => List::priority(&list_id, head_item)
+			.and_then(|p| p.checked_add(&FixedU128::from_inner(1)))
+			.ok_or(ListError::CorruptList)?,
 		None => FixedU128::zero(),
 	};
 

@@ -37,12 +37,12 @@ fn markets_are_counted_per_stablecoin() {
 		assert_eq!(
 			LifecycleLog::get(),
 			alloc::vec![
-				(DOT, PUSD, true, 1),
-				(DOT, EUSD, true, 1),
-				(TOKEN_X, PUSD, true, 2),
-				(DOT, PUSD, false, 1),
-				(TOKEN_X, PUSD, false, 0),
-				(DOT, EUSD, false, 0),
+				(DOT, PUSD, Lifecycle::Registered, 1),
+				(DOT, EUSD, Lifecycle::Registered, 1),
+				(TOKEN_X, PUSD, Lifecycle::Registered, 2),
+				(DOT, PUSD, Lifecycle::Deregistered, 1),
+				(TOKEN_X, PUSD, Lifecycle::Deregistered, 0),
+				(DOT, EUSD, Lifecycle::Deregistered, 0),
 			]
 		);
 	});
@@ -80,7 +80,7 @@ fn cross_role_reuse_rejected_in_both_directions() {
 		register_market(TOKEN_X, PUSD);
 
 		// A live stablecoin as a new market's collateral.
-		set_price(AssetId::WithId(PUSD), FixedU128::from_rational(10u128, 1u128));
+		set_price(AssetId::WithId(PUSD), DEFAULT_PRICE);
 		assert_noop!(
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
@@ -96,7 +96,7 @@ fn cross_role_reuse_rejected_in_both_directions() {
 		// A live collateral as a new market's stablecoin: TOKEN_X's asset id
 		// (`TOKEN_X_ID`) exists in `pallet-assets`, and its stable key is the
 		// collateral id TOKEN_X itself.
-		set_price(ETH, FixedU128::from_rational(10u128, 1u128));
+		set_price(ETH, DEFAULT_PRICE);
 		assert_noop!(
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
@@ -116,7 +116,7 @@ fn cross_role_reuse_rejected_in_both_directions() {
 #[test]
 fn failed_registration_hook_rolls_back_everything() {
 	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		FailOnRegistered::set(true);
 		assert_noop!(
 			Pallet::<Test>::create_branch(
@@ -153,7 +153,7 @@ fn failed_registration_hook_rolls_back_everything() {
 #[test]
 fn failed_deregistration_hook_rolls_back_everything() {
 	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::signed(PUSD_OWNER),
 			DOT,

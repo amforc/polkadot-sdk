@@ -4,10 +4,11 @@ use crate::{math, Millis};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
 	arithmetic::{
-		ArithmeticError, AtLeast32BitUnsigned, CheckedAdd, CheckedSub, FixedPointOperand,
-		FixedU128, One, Permill, Rounding, Saturating, Zero,
+		ArithmeticError, AtLeast32BitUnsigned, CheckedAdd, CheckedSub, EnsureAdd, EnsureSub,
+		FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Saturating, Zero,
 	},
 	deps::{frame_support::PalletError, sp_core::U256},
+	prelude::ensure,
 };
 pub use pusd_primitives::{BranchMode, DebtCollateral, VaultStatus};
 use scale_info::TypeInfo;
@@ -86,7 +87,7 @@ pub struct FrozenState {
 ///
 /// Vaults store their current debt in this form, and [`Self::cancel`] returns
 /// the cancelled amount in the same form.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug, Default)]
 pub struct DebtBreakdown<Balance> {
 	/// Principal portion of the debt amount.
 	pub principal: Balance,
@@ -125,45 +126,7 @@ pub struct RedistributionAccumulators {
 	///
 	/// A vault's share accrued `rate · stake · (τ · ΔA − ΔB)` by market interest time `τ`, so its
 	/// interest is exact whatever order vaults are touched in.
-	pub principal_time_per_stake: Wide,
-}
-
-/// An unsigned 256-bit value stored as two limbs.
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Wide {
-	pub low: u128,
-	pub high: u128,
-}
-
-impl Wide {
-	pub(crate) fn from_wide(value: U256) -> Self {
-		Self { low: value.low_u128(), high: (value >> 128).low_u128() }
-	}
-
-	pub(crate) fn to_wide(self) -> U256 {
-		(U256::from(self.high) << 128) | U256::from(self.low)
-	}
-
-	pub(crate) fn checked_add(self, other: U256) -> Option<Self> {
-		self.to_wide().checked_add(other).map(Self::from_wide)
-	}
-
-	pub(crate) fn checked_sub(self, other: U256) -> Option<Self> {
-		self.to_wide().checked_sub(other).map(Self::from_wide)
-	}
-
-	pub fn is_zero(&self) -> bool {
-		self.low == 0 && self.high == 0
-	}
-	/// Whole units of an accrual rate, rounded down, saturating at `Balance::max_value()`.
-	pub fn whole<Balance: FixedPointOperand>(&self) -> Balance {
-		use frame::arithmetic::FixedPointNumber;
-		let whole = self.to_wide() / U256::from(FixedU128::DIV);
-		u128::try_from(whole)
-			.ok()
-			.and_then(|whole| Balance::try_from(whole).ok())
-			.unwrap_or_else(Balance::max_value)
-	}
+	pub principal_time_per_stake: U256,
 }
 
 /// State of one vault.
@@ -213,6 +176,7 @@ pub struct VaultRecord<Balance, Deposit> {
 /// Replacing this value is the single ordinary vault-to-branch accounting
 /// primitive. Collateral is intentionally absent: it is managed separately
 /// because redistributed collateral is already included in the branch total.
+#[derive(Default)]
 struct VaultContribution<Balance> {
 	principal: Balance,
 	interest: Balance,
@@ -222,20 +186,9 @@ struct VaultContribution<Balance> {
 	eligible_collateral: Balance,
 }
 
-impl<Balance: FixedPointOperand> VaultContribution<Balance> {
-	fn zero() -> Self {
-		Self {
-			principal: Zero::zero(),
-			interest: Zero::zero(),
-			accrual_rate: U256::zero(),
-			stake: Zero::zero(),
-			stake_accrual_rate: U256::zero(),
-			eligible_collateral: Zero::zero(),
-		}
-	}
-
+impl<Balance: FixedPointOperand + Default> VaultContribution<Balance> {
 	fn of(vault: Option<&Vault<Balance>>) -> Result<Self, ArithmeticError> {
-		let Some(vault) = vault else { return Ok(Self::zero()) };
+		let Some(vault) = vault else { return Ok(Self::default()) };
 		Ok(Self {
 			principal: vault.debt.principal,
 			interest: vault.debt.interest,
@@ -355,58 +308,59 @@ pub enum BranchConfigDefect {
 }
 
 impl<Balance: AtLeast32BitUnsigned + Copy> BranchConfig<Balance> {
-	/// Returns how this configuration contradicts itself, or `None` when it is consistent.
+	/// Checks this configuration is consistent, returning the first way it contradicts itself.
 	///
 	/// Every amount here is denominated in the market's own assets, so its
 	/// magnitude is the creator's choice; `minimums` is the one yardstick those
 	/// assets themselves provide. This rejects only the combinations that
 	/// contradict each other and so cannot describe a working market.
-	/// Runtime-owned floors live in [`BranchConfigBounds::violation`].
-	pub fn structural_defect(
+	/// Runtime-owned floors live in [`BranchConfigBounds::ensure_within`].
+	pub fn ensure_consistent(
 		&self,
 		minimums: &AssetMinimums<Balance>,
-	) -> Option<BranchConfigDefect> {
+	) -> Result<(), BranchConfigDefect> {
 		// A liquidation ratio above the borrow or safety ratio would open
 		// vaults that are already liquidatable.
-		if self.minimum_collateralization_ratio > self.initial_collateralization_ratio {
-			return Some(BranchConfigDefect::LiquidationRatioAboveInitial);
-		}
-		if self.minimum_collateralization_ratio > self.safety_collateralization_ratio {
-			return Some(BranchConfigDefect::LiquidationRatioAboveSafety);
-		}
+		ensure!(
+			self.minimum_collateralization_ratio <= self.initial_collateralization_ratio,
+			BranchConfigDefect::LiquidationRatioAboveInitial
+		);
+		ensure!(
+			self.minimum_collateralization_ratio <= self.safety_collateralization_ratio,
+			BranchConfigDefect::LiquidationRatioAboveSafety
+		);
 		// An empty rate band leaves no rate a vault could open or re-rate at, which stops
 		// borrowing as surely as a zero debt limit does.
-		if self.minimum_borrow_rate > self.maximum_borrow_rate {
-			return Some(BranchConfigDefect::MinimumBorrowRateAboveMaximum);
-		}
-		if let Some(defect) = self.vault_floor_defect(minimums) {
-			return Some(defect);
-		}
-		None
+		ensure!(
+			self.minimum_borrow_rate <= self.maximum_borrow_rate,
+			BranchConfigDefect::MinimumBorrowRateAboveMaximum
+		);
+		self.ensure_vault_floors(minimums)
 	}
 
-	/// Returns how the vault floors fail to describe a vault worth carrying.
+	/// Checks the vault floors describe a vault worth carrying.
 	///
 	/// The floors are all that stands between a market and unbounded dust vaults. Each vault is
 	/// a storage row, a sorted-list node, and a step a redemption may walk, and a vault owing
 	/// less than the stablecoin's minimum balance pays for none of it. Measuring against the
 	/// assets' own minimums holds every market to the same rule rather than the same number.
-	fn vault_floor_defect(&self, minimums: &AssetMinimums<Balance>) -> Option<BranchConfigDefect> {
+	fn ensure_vault_floors(
+		&self,
+		minimums: &AssetMinimums<Balance>,
+	) -> Result<(), BranchConfigDefect> {
 		// A zero debt floor also makes every husk active, since a vault is dormant exactly
 		// while it owes less than the floor.
-		if self.minimum_debt.is_zero() {
-			return Some(BranchConfigDefect::ZeroMinimumDebt);
-		}
-		if self.minimum_collateral.is_zero() {
-			return Some(BranchConfigDefect::ZeroMinimumCollateral);
-		}
-		if self.minimum_debt < minimums.stable {
-			return Some(BranchConfigDefect::MinimumDebtBelowStableMinimum);
-		}
-		if self.minimum_collateral < minimums.collateral {
-			return Some(BranchConfigDefect::MinimumCollateralBelowCollateralMinimum);
-		}
-		None
+		ensure!(!self.minimum_debt.is_zero(), BranchConfigDefect::ZeroMinimumDebt);
+		ensure!(!self.minimum_collateral.is_zero(), BranchConfigDefect::ZeroMinimumCollateral);
+		ensure!(
+			self.minimum_debt >= minimums.stable,
+			BranchConfigDefect::MinimumDebtBelowStableMinimum
+		);
+		ensure!(
+			self.minimum_collateral >= minimums.collateral,
+			BranchConfigDefect::MinimumCollateralBelowCollateralMinimum
+		);
+		Ok(())
 	}
 }
 
@@ -426,9 +380,9 @@ pub struct BranchDebt<Balance> {
 	/// Interest vaults were charged, and the market minted, before its aggregate accrued it.
 	pub interest_minted_ahead: Balance,
 	/// Exact accrual rate of the market's principal, `Σ principal · rate-inner`.
-	pub accrual_rate: Wide,
+	pub accrual_rate: U256,
 	/// Pending redistribution's subset of [`Self::accrual_rate`].
-	pub pending_redistribution_accrual_rate: Wide,
+	pub pending_redistribution_accrual_rate: U256,
 	/// Market interest time of the last aggregate interest update.
 	pub last_interest_time: Millis,
 	/// Aggregate interest below one unit carried across refreshes, over
@@ -499,10 +453,10 @@ pub struct StablecoinDebtState<Balance> {
 	/// Realized debt summed across every market issuing the stablecoin.
 	pub outstanding: Balance,
 	/// Σ `accrual_rate` over the coin's non-frozen markets.
-	pub active_accrual_rate: Wide,
+	pub active_accrual_rate: U256,
 	/// Interest accrued up to `last_update` but not yet minted anywhere, over
 	/// [`math::INTEREST_DENOMINATOR`], so every market's share adds and subtracts exactly.
-	pub pending_interest: Wide,
+	pub pending_interest: U256,
 	/// Time the projection was last advanced.
 	pub last_update: Millis,
 }
@@ -521,7 +475,7 @@ pub struct RedistributionStakeTotals<Balance> {
 	/// Total stake of eligible vaults.
 	pub total: Balance,
 	/// Exact sum of each eligible vault's `stake · annual_rate`.
-	pub accrual_rate: Wide,
+	pub accrual_rate: U256,
 	/// Eligible vault collateral plus collateral still pending in redistribution custody.
 	pub collateral_basis: Balance,
 	/// Total stake captured after the latest redistribution.
@@ -610,8 +564,10 @@ impl<AccountId: PartialEq, Balance> BranchState<AccountId, Balance> {
 	}
 }
 
-impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSub + One>
-	BranchState<AccountId, Balance>
+impl<
+		AccountId,
+		Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSub + One + Default,
+	> BranchState<AccountId, Balance>
 {
 	/// Replace one vault's complete contribution to the market totals.
 	///
@@ -626,31 +582,13 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 	) -> Result<(), ArithmeticError> {
 		let before = VaultContribution::of(before)?;
 		let after = VaultContribution::of(after)?;
-		let shifted = |current: Balance, old: Balance, new: Balance| {
-			current
-				.checked_sub(&old)
-				.ok_or(ArithmeticError::Underflow)?
-				.checked_add(&new)
-				.ok_or(ArithmeticError::Overflow)
-		};
-
 		let principal = shifted(self.debt.principal, before.principal, after.principal)?;
 		let minted_interest = shifted(self.debt.minted_interest, before.interest, after.interest)?;
-		let shifted_wide = |current: Wide, old: U256, new: U256| {
-			current
-				.checked_sub(old)
-				.ok_or(ArithmeticError::Underflow)?
-				.checked_add(new)
-				.ok_or(ArithmeticError::Overflow)
-		};
 		let accrual_rate =
-			shifted_wide(self.debt.accrual_rate, before.accrual_rate, after.accrual_rate)?;
+			shifted(self.debt.accrual_rate, before.accrual_rate, after.accrual_rate)?;
 		let stake = shifted(self.stakes.total, before.stake, after.stake)?;
-		let stake_accrual_rate = shifted_wide(
-			self.stakes.accrual_rate,
-			before.stake_accrual_rate,
-			after.stake_accrual_rate,
-		)?;
+		let stake_accrual_rate =
+			shifted(self.stakes.accrual_rate, before.stake_accrual_rate, after.stake_accrual_rate)?;
 		let collateral_basis = shifted(
 			self.stakes.collateral_basis,
 			before.eligible_collateral,
@@ -714,7 +652,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 				current.checked_sub(&amount)
 			}
 		};
-		let rate = |current: Wide| {
+		let rate = |current: U256| {
 			if post {
 				current.checked_add(accrual_rate)
 			} else {
@@ -746,14 +684,14 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 			return None;
 		}
 		let principal_per_stake =
-			math::redistribution_per_stake(redistributed.debt, self.stakes.total)?;
+			FixedU128::checked_from_rational(redistributed.debt, self.stakes.total)?;
 		let collateral_per_stake =
-			math::redistribution_per_stake(redistributed.collateral, self.stakes.total)?;
+			FixedU128::checked_from_rational(redistributed.collateral, self.stakes.total)?;
 		// Posted from the stored increment, which is what vaults claim against, and rounded down
 		// so the projection never runs ahead of what vaults will owe.
 		let increment = U256::from(principal_per_stake.into_inner());
 		let posted_accrual_rate =
-			math::scale_wide(self.stakes.accrual_rate.to_wide(), increment, Rounding::Down)?;
+			math::scale_wide(self.stakes.accrual_rate, increment, math::Direction::Down)?;
 		let principal_time = increment.checked_mul(U256::from(self.interest_time(now)))?;
 
 		self.redistribution = RedistributionAccumulators {
@@ -797,7 +735,7 @@ impl<AccountId, Balance: FixedPointOperand + Saturating + CheckedAdd + CheckedSu
 }
 
 /// Update to one market parameter.
-#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
+#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BranchConfigUpdate<Balance> {
 	/// Sets the liquidation and final recovery ratio.
 	MinimumCollateralizationRatio(FixedU128),
@@ -915,25 +853,33 @@ pub enum BoundViolation {
 }
 
 impl BranchConfigBounds {
-	/// Returns the limit `config` breaches, or `None` when it is within all of them.
-	pub fn violation<Balance>(&self, config: &BranchConfig<Balance>) -> Option<BoundViolation> {
-		if config.minimum_collateralization_ratio < self.min_minimum_collateralization_ratio {
-			return Some(BoundViolation::MinimumCollateralizationRatioTooLow);
-		}
-		if config.initial_collateralization_ratio < self.min_initial_collateralization_ratio {
-			return Some(BoundViolation::InitialCollateralizationRatioTooLow);
-		}
-		if config.safety_collateralization_ratio < self.min_safety_collateralization_ratio {
-			return Some(BoundViolation::SafetyCollateralizationRatioTooLow);
-		}
-		if config.maximum_borrow_rate > self.max_borrow_rate {
-			return Some(BoundViolation::BorrowRateTooHigh);
-		}
-		None
+	/// Checks `config` is within every limit, returning the first one it breaches.
+	pub fn ensure_within<Balance>(
+		&self,
+		config: &BranchConfig<Balance>,
+	) -> Result<(), BoundViolation> {
+		ensure!(
+			config.minimum_collateralization_ratio >= self.min_minimum_collateralization_ratio,
+			BoundViolation::MinimumCollateralizationRatioTooLow
+		);
+		ensure!(
+			config.initial_collateralization_ratio >= self.min_initial_collateralization_ratio,
+			BoundViolation::InitialCollateralizationRatioTooLow
+		);
+		ensure!(
+			config.safety_collateralization_ratio >= self.min_safety_collateralization_ratio,
+			BoundViolation::SafetyCollateralizationRatioTooLow
+		);
+		ensure!(
+			config.maximum_borrow_rate <= self.max_borrow_rate,
+			BoundViolation::BorrowRateTooHigh
+		);
+		Ok(())
 	}
 }
 
 /// Administrator role for one market.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdminLevel {
 	/// May manage all market settings and lifecycle actions.
 	Full,
@@ -980,6 +926,11 @@ pub struct Branch<AccountId, Balance, Consideration> {
 	pub deposit: Option<(AccountId, Consideration)>,
 }
 
+/// Moves `current` from `old` to `new` without going below zero in between.
+fn shifted<N: EnsureAdd + EnsureSub>(current: N, old: N, new: N) -> Result<N, ArithmeticError> {
+	current.ensure_sub(old)?.ensure_add(new)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -987,25 +938,8 @@ mod tests {
 
 	fn make_branch_state(principal: u128, accrual_rate: U256) -> BranchState<u64, u128> {
 		BranchState {
-			total_collateral: 0,
-			debt: BranchDebt {
-				principal,
-				pending_redistribution_principal: 0,
-				minted_interest: 0,
-				pending_interest_attribution: 0,
-				interest_minted_ahead: 0,
-				accrual_rate: Wide::from_wide(accrual_rate),
-				pending_redistribution_accrual_rate: Wide::default(),
-				last_interest_time: 0,
-				aggregate_interest_remainder: 0,
-			},
-			stakes: RedistributionStakeTotals::default(),
-			redistribution: RedistributionAccumulators::default(),
-			pending_redistribution_collateral: 0,
-			vault_count: 0,
-			interest_epoch: 0,
-			dormant_redemption_target: None,
-			frozen: None,
+			debt: BranchDebt { principal, accrual_rate, ..BranchDebt::default() },
+			..BranchState::fresh(0)
 		}
 	}
 
@@ -1030,7 +964,7 @@ mod tests {
 				.replace_vault(Some(&before), Some(&after))
 				.expect("consistent contribution");
 			assert_eq!(state.debt.principal, principal);
-			assert_eq!(state.debt.accrual_rate.to_wide(), U256::from(accrual_rate));
+			assert_eq!(state.debt.accrual_rate, U256::from(accrual_rate));
 		}
 	}
 

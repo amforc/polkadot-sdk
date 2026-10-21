@@ -21,10 +21,7 @@ use crate::{
 	pallet::*, weights::WeightInfo, ListError, Outcome, Position, PriorityProvider,
 	SortedListInterface,
 };
-use frame::{
-	deps::frame_support::dispatch::{DispatchErrorWithPostInfo, WithPostDispatchInfo},
-	prelude::*,
-};
+use frame::{deps::frame_support::dispatch::WithPostDispatchInfo, prelude::*};
 
 impl<T: Config> Pallet<T> {
 	/// Refresh `(list_id, item)`'s stored priority from [`crate::PriorityProvider`]
@@ -33,7 +30,7 @@ impl<T: Config> Pallet<T> {
 		list_id: T::ListId,
 		item: T::ItemId,
 		hint: Position<T::ItemId>,
-	) -> Result<Weight, DispatchErrorWithPostInfo> {
+	) -> DispatchResultWithPostInfo {
 		// Both fallible calls below surface `ItemNotFound` after only two reads
 		// (provider + node), so it is refunded to the cheapest benchmarked
 		// path; deeper failures consumed the repair-walk budget and keep the
@@ -47,7 +44,7 @@ impl<T: Config> Pallet<T> {
 
 		let Some(real_priority) = T::PriorityProvider::priority(&list_id, &item) else {
 			Self::remove(&list_id, &item).map_err(map_early_exit)?;
-			return Ok(T::WeightInfo::reprioritize_priority_removed());
+			return Ok(Some(T::WeightInfo::reprioritize_priority_removed()).into());
 		};
 
 		// `re_insert` deposits `ItemReinserted` on the mutating paths; that is
@@ -56,10 +53,11 @@ impl<T: Config> Pallet<T> {
 		let outcome =
 			Self::re_insert(list_id, item, real_priority, hint).map_err(map_early_exit)?;
 
-		Ok(match outcome {
+		let weight = match outcome {
 			Outcome::NoOp => T::WeightInfo::reprioritize_no_op(),
 			Outcome::InPlace => T::WeightInfo::reprioritize_in_place(),
 			Outcome::Relocated { steps } => T::WeightInfo::reprioritize_relocate(steps),
-		})
+		};
+		Ok(Some(weight).into())
 	}
 }
