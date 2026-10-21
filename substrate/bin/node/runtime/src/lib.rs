@@ -3390,7 +3390,7 @@ use frame_support::traits::fungibles::{
 	AssetFootprintPrice, AtLeastMinimumBalance, HoldConsideration as FungiblesHoldConsideration,
 	SufficientAssets,
 };
-use pallet_vaults::pusd_primitives::OraclePriceConversion;
+use pallet_vaults::stablecoin_primitives::OraclePriceConversion;
 
 pub type VaultsCollateralId = NativeOrWithId<u32>;
 
@@ -3410,7 +3410,7 @@ pub type VaultsStableId = u32;
 /// surface. The oracle value is interpreted as a `FixedU128` inner
 /// representation: operators submit prices scaled by `10^18`.
 pub struct VaultsOracleAdapter;
-impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
+impl stablecoin_primitives::ProvidePrice for VaultsOracleAdapter {
 	type AssetId = VaultsCollateralId;
 
 	fn provide_price(
@@ -3431,7 +3431,7 @@ impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
 /// `CreateOrigin` for permissionless market creation. Root creates deposit-free
 /// (`None`); the stablecoin asset's owner creates with a refundable deposit
 /// (`Some(who)`); every other origin is rejected.
-pub type VaultsCreateOrigin = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
+pub type VaultsCreateOrigin = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 /// Routes each stablecoin's vault fee remainder to the treasury.
 pub struct VaultsFeeAccount;
@@ -3521,14 +3521,14 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 		<pallet_timestamp::Pallet<Runtime>>::set_timestamp(now + ms);
 	}
 
-	// The benchmark genesis does not create the pUSD asset, so opening vaults
-	// (which mints pUSD debt) would fail without it.
+	// The benchmark genesis does not create the stablecoin asset, so opening vaults
+	// (which mints stablecoin debt) would fail without it.
 	fn ensure_stable_asset(stable_id: VaultsStableId) {
 		use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
 		if !<Assets as FungiblesInspect<AccountId>>::asset_exists(stable_id) {
-			let asset_owner: AccountId = frame_benchmarking::account("pusd_owner", 0, 0);
+			let asset_owner: AccountId = frame_benchmarking::account("stablecoin_owner", 0, 0);
 			<Assets as Create<AccountId>>::create(stable_id, asset_owner, true, 1)
-				.expect("create pUSD asset for benchmark");
+				.expect("create stablecoin asset for benchmark");
 		}
 	}
 }

@@ -191,7 +191,6 @@ std = [
 	"polkadot-runtime-metrics?/std",
 	"polkadot-runtime-parachains?/std",
 	"polkadot-sdk-frame?/std",
-	"pusd-primitives?/std",
 	"sc-executor?/std",
 	"slot-range-helper?/std",
 	"sp-api-proc-macro?/std",
@@ -241,6 +240,7 @@ std = [
 	"sp-virtualization?/std",
 	"sp-wasm-interface?/std",
 	"sp-weights?/std",
+	"stablecoin-primitives?/std",
 	"staging-parachain-info?/std",
 	"staging-xcm-builder?/std",
 	"staging-xcm-executor?/std",
@@ -389,11 +389,11 @@ runtime-benchmarks = [
 	"polkadot-runtime-parachains?/runtime-benchmarks",
 	"polkadot-sdk-frame?/runtime-benchmarks",
 	"polkadot-service?/runtime-benchmarks",
-	"pusd-primitives?/runtime-benchmarks",
 	"sc-client-db?/runtime-benchmarks",
 	"sc-service?/runtime-benchmarks",
 	"sp-runtime?/runtime-benchmarks",
 	"sp-staking?/runtime-benchmarks",
+	"stablecoin-primitives?/runtime-benchmarks",
 	"staging-node-inspect?/runtime-benchmarks",
 	"staging-xcm-builder?/runtime-benchmarks",
 	"staging-xcm-executor?/runtime-benchmarks",
@@ -542,8 +542,8 @@ try-runtime = [
 	"polkadot-runtime-parachains?/try-runtime",
 	"polkadot-sdk-frame?/try-runtime",
 	"polkadot-service?/try-runtime",
-	"pusd-primitives?/try-runtime",
 	"sp-runtime?/try-runtime",
+	"stablecoin-primitives?/try-runtime",
 	"staging-parachain-info?/try-runtime",
 ]
 serde = [
@@ -782,7 +782,6 @@ runtime-full = [
 	"polkadot-runtime-metrics",
 	"polkadot-runtime-parachains",
 	"polkadot-sdk-frame",
-	"pusd-primitives",
 	"sc-chain-spec-derive",
 	"sc-tracing-proc-macro",
 	"slot-range-helper",
@@ -835,6 +834,7 @@ runtime-full = [
 	"sp-virtualization",
 	"sp-wasm-interface",
 	"sp-weights",
+	"stablecoin-primitives",
 	"staging-parachain-info",
 	"staging-xcm",
 	"staging-xcm-builder",
@@ -2018,11 +2018,6 @@ default-features = false
 optional = true
 path = "../substrate/frame"
 
-[dependencies.pusd-primitives]
-default-features = false
-optional = true
-path = "../substrate/frame/pusd-primitives"
-
 [dependencies.sc-chain-spec-derive]
 default-features = false
 optional = true
@@ -2282,6 +2277,11 @@ path = "../substrate/primitives/wasm-interface"
 default-features = false
 optional = true
 path = "../substrate/primitives/weights"
+
+[dependencies.stablecoin-primitives]
+default-features = false
+optional = true
+path = "../substrate/frame/stablecoin-primitives"
 
 [dependencies.staging-parachain-info]
 default-features = false

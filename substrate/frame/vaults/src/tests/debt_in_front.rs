@@ -8,16 +8,16 @@ use crate::{
 #[test]
 fn debt_in_front_sums_lower_rate_vaults_only() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		// Eight vaults: 2 each at 0.5%, 0.6%, 0.7%, 0.8% with distinct debts.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 1000))); // 0.5%
-		assert_ok!(open(2, DOT, PUSD, 1_000, 700, rate_pct(5, 1000)));
-		assert_ok!(open(3, DOT, PUSD, 1_000, 600, rate_pct(6, 1000))); // 0.6%
-		assert_ok!(open(4, DOT, PUSD, 1_000, 800, rate_pct(6, 1000)));
-		assert_ok!(open(5, DOT, PUSD, 1_000, 900, rate_pct(7, 1000))); // 0.7%
-		assert_ok!(open(6, DOT, PUSD, 1_000, 1_000, rate_pct(7, 1000)));
-		assert_ok!(open(7, DOT, PUSD, 1_000, 400, rate_pct(8, 1000))); // 0.8%
-		assert_ok!(open(8, DOT, PUSD, 1_000, 500, rate_pct(8, 1000)));
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(5, 1000))); // 0.5%
+		assert_ok!(open(2, DOT, STABLE, 1_000, 700, rate_pct(5, 1000)));
+		assert_ok!(open(3, DOT, STABLE, 1_000, 600, rate_pct(6, 1000))); // 0.6%
+		assert_ok!(open(4, DOT, STABLE, 1_000, 800, rate_pct(6, 1000)));
+		assert_ok!(open(5, DOT, STABLE, 1_000, 900, rate_pct(7, 1000))); // 0.7%
+		assert_ok!(open(6, DOT, STABLE, 1_000, 1_000, rate_pct(7, 1000)));
+		assert_ok!(open(7, DOT, STABLE, 1_000, 400, rate_pct(8, 1000))); // 0.8%
+		assert_ok!(open(8, DOT, STABLE, 1_000, 500, rate_pct(8, 1000)));
 
 		// Every open charges an upfront fee of exactly 1: the fee is
 		// ceil(principal × avg_rate × 7d/year) and every product here is
@@ -25,11 +25,11 @@ fn debt_in_front_sums_lower_rate_vaults_only() {
 		// `principal + FEE`.
 		const FEE: Balance = 1;
 		for who in 1u64..=8 {
-			let v = vault(DOT, PUSD, who);
+			let v = vault(DOT, STABLE, who);
 			assert_eq!(v.debt.interest, FEE, "upfront fee ceils to 1 at these magnitudes");
 		}
 		let debt_in_front =
-			|rate, steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate, steps);
+			|rate, steps| crate::Pallet::<Test>::debt_in_front(DOT, STABLE, rate, steps);
 
 		// Entire debt at rates strictly < 0.7%: vaults 1..=4.
 		assert_eq!(
@@ -60,12 +60,12 @@ fn debt_in_front_sums_lower_rate_vaults_only() {
 #[test]
 fn debt_in_front_projects_pending_interest_poke_independent() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000))); // 0.5%
-		assert_ok!(open(2, DOT, PUSD, 5_000, 700, rate_pct(6, 1000))); // 0.6%
+		register_market(DOT, STABLE);
+		assert_ok!(open(1, DOT, STABLE, 5_000, 500, rate_pct(5, 1000))); // 0.5%
+		assert_ok!(open(2, DOT, STABLE, 5_000, 700, rate_pct(6, 1000))); // 0.6%
 
 		let debt_in_front =
-			|| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, percent(1), u32::MAX);
+			|| crate::Pallet::<Test>::debt_in_front(DOT, STABLE, percent(1), u32::MAX);
 
 		// One year of unpoked accrual. Projected per-vault entire debt:
 		//   vault 1: 500 + 1 (fee) + ceil(500 × 0.5%) = 504
@@ -75,8 +75,8 @@ fn debt_in_front_projects_pending_interest_poke_independent() {
 
 		// Poking vault 1 moves its pending interest into recorded debt; the
 		// total must not change.
-		assert_ok!(poke(9, DOT, PUSD, 1));
-		let v1 = vault(DOT, PUSD, 1);
+		assert_ok!(poke(9, DOT, STABLE, 1));
+		let v1 = vault(DOT, STABLE, 1);
 		assert_eq!(v1.debt.interest, 4, "fee 1 + year interest 3 settled by the poke");
 		assert_eq!(debt_in_front(), Ok((504 + 706, false)), "projection unchanged by the poke");
 	});
@@ -88,19 +88,19 @@ fn debt_in_front_projects_pending_interest_poke_independent() {
 #[test]
 fn debt_in_front_includes_dormant_redemption_target() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 5_000, 500, rate_pct(5, 1000))); // 0.5%, tail
-		assert_ok!(open(2, DOT, PUSD, 5_000, 700, rate_pct(6, 1000))); // 0.6%
+		register_market(DOT, STABLE);
+		assert_ok!(open(1, DOT, STABLE, 5_000, 500, rate_pct(5, 1000))); // 0.5%, tail
+		assert_ok!(open(2, DOT, STABLE, 5_000, 700, rate_pct(6, 1000))); // 0.6%
 		let debt_in_front =
-			|steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate_pct(1, 100), steps);
+			|steps| crate::Pallet::<Test>::debt_in_front(DOT, STABLE, rate_pct(1, 100), steps);
 		assert_eq!(debt_in_front(u32::MAX), Ok((501 + 701, false))); // principal + fee 1 each, no
 																	 // elapsed time
 
 		// Redeem vault 1 (entire debt 501) down to 199, one below `MinimumDebt`.
-		assert_ok!(redeem(DOT, PUSD, 3, 302));
-		assert!(vault_status(DOT, PUSD, 1).is_dormant());
+		assert_ok!(redeem(DOT, STABLE, 3, 302));
+		assert!(vault_status(DOT, STABLE, 1).is_dormant());
 		assert_eq!(
-			market_state(DOT, PUSD).dormant_redemption_target,
+			market_state(DOT, STABLE).dormant_redemption_target,
 			Some(1),
 			"sub-minimum residual parks vault 1 as the dormant target"
 		);
@@ -121,21 +121,21 @@ fn debt_in_front_includes_dormant_redemption_target() {
 #[test]
 fn debt_in_front_counts_final_recovery_queue_first() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		// The only vault: 70 collateral backing 501 of entire debt (fee 1).
-		assert_ok!(open(1, DOT, PUSD, 70, 500, rate_pct(5, 1000)));
+		assert_ok!(open(1, DOT, STABLE, 70, 500, rate_pct(5, 1000)));
 		// At price 7 its CR is 490/501 < 1.10, and as the last eligible vault it
 		// enters final recovery instead of liquidation.
 		set_price(DOT, FixedU128::from_u32(7));
-		assert_ok!(enter_final_recovery(9, DOT, PUSD, 1));
+		assert_ok!(enter_final_recovery(9, DOT, STABLE, 1));
 		set_price(DOT, DEFAULT_PRICE);
 
 		// Two active vaults join the rate index afterwards.
-		assert_ok!(open(2, DOT, PUSD, 1_000, 700, rate_pct(6, 1000))); // entire debt 701
-		assert_ok!(open(3, DOT, PUSD, 1_000, 900, rate_pct(7, 1000))); // entire debt 901
+		assert_ok!(open(2, DOT, STABLE, 1_000, 700, rate_pct(6, 1000))); // entire debt 701
+		assert_ok!(open(3, DOT, STABLE, 1_000, 900, rate_pct(7, 1000))); // entire debt 901
 
 		let debt_in_front =
-			|rate, steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, rate, steps);
+			|rate, steps| crate::Pallet::<Test>::debt_in_front(DOT, STABLE, rate, steps);
 
 		// The recovery vault counts at every rate; vault 3 at exactly 0.7% does not.
 		assert_eq!(debt_in_front(rate_pct(7, 1000), u32::MAX), Ok((501 + 701, false)));
@@ -147,8 +147,8 @@ fn debt_in_front_counts_final_recovery_queue_first() {
 		// Redeeming vault 2 below `MinimumDebt` parks it as the dormant target:
 		// the walk orders recovery (501), then the dormant residual (199), then
 		// the rate index (901).
-		assert_ok!(redeem_from(DOT, PUSD, 2, 4, 502));
-		assert!(vault_status(DOT, PUSD, 2).is_dormant());
+		assert_ok!(redeem_from(DOT, STABLE, 2, 4, 502));
+		assert!(vault_status(DOT, STABLE, 2).is_dormant());
 		assert_eq!(debt_in_front(percent(1), u32::MAX), Ok((501 + 199 + 901, false)));
 		assert_eq!(debt_in_front(percent(1), 2), Ok((501 + 199, true)));
 	});
@@ -158,9 +158,9 @@ fn debt_in_front_counts_final_recovery_queue_first() {
 #[test]
 fn debt_in_front_is_zero_for_an_empty_index() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		assert_eq!(
-			crate::Pallet::<Test>::debt_in_front(DOT, PUSD, percent(1), u32::MAX),
+			crate::Pallet::<Test>::debt_in_front(DOT, STABLE, percent(1), u32::MAX),
 			Ok((0, false))
 		);
 	});

@@ -1,4 +1,4 @@
-//! Origin checks for the pUSD pallets.
+//! Origin checks for the stablecoin pallets.
 
 use core::marker::PhantomData;
 use frame::{
@@ -13,7 +13,7 @@ use frame::{
 /// (refundable deposit). Other origins are returned unchanged. The benchmark origin is `Root`.
 ///
 /// ```ignore
-/// type CreateOrigin = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
+/// type CreateOrigin = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 /// ```
 pub struct EnsureStableOwnerOrRoot<Assets, AccountId>(PhantomData<(Assets, AccountId)>);
 
