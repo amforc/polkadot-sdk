@@ -25,7 +25,7 @@ use frame::{
 	},
 };
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
-use pusd_primitives::{
+use stablecoin_primitives::{
 	collateralization_ratio, BranchMode, BranchSnapshot, CollateralRatio, ProvidePrice,
 };
 

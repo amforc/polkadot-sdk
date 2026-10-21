@@ -669,7 +669,7 @@ pub use pallet_ranked_collective;
 #[cfg(feature = "pallet-recovery")]
 pub use pallet_recovery;
 
-/// FRAME pallet for the pUSD redemptions engine.
+/// FRAME pallet for a stablecoin redemptions engine.
 #[cfg(feature = "pallet-redemptions")]
 pub use pallet_redemptions;
 
@@ -1079,10 +1079,6 @@ pub use polkadot_statement_distribution;
 /// Stores messages other authorities issue about candidates in Polkadot.
 #[cfg(feature = "polkadot-statement-table")]
 pub use polkadot_statement_table;
-
-/// Shared primitive types and traits for the pUSD protocol pallets.
-#[cfg(feature = "pusd-primitives")]
-pub use pusd_primitives;
 
 /// Collection of allocator implementations.
 #[cfg(feature = "sc-allocator")]
@@ -1561,6 +1557,10 @@ pub use sp_wasm_interface;
 /// Types and traits for interfacing between the host and the wasm runtime.
 #[cfg(feature = "sp-weights")]
 pub use sp_weights;
+
+/// Shared primitive types and traits for the stablecoin protocol pallets.
+#[cfg(feature = "stablecoin-primitives")]
+pub use stablecoin_primitives;
 
 /// Utility for building chain-specification files for Substrate-based runtimes based on
 /// `sp-genesis-builder`.

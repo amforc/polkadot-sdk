@@ -26,7 +26,7 @@ use frame::{
 	},
 };
 use linked_list_interface::Position;
-use pusd_primitives::{BranchSnapshot, OnBranchLifecycle, ProvidePrice};
+use stablecoin_primitives::{BranchSnapshot, OnBranchLifecycle, ProvidePrice};
 
 impl<T: Config> Pallet<T> {
 	/// Opens a vault with collateral, debt, and an interest rate.

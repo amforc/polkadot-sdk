@@ -7,7 +7,7 @@ use crate::{
 	BenchmarkConfig,
 };
 use frame::{deps::sp_runtime::DispatchError, prelude::*};
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BenchmarkVault, BenchmarkVaults, Millis, RecoveryHeadSeed, RedemptionTargetsSeed,
 };
 

@@ -1,7 +1,7 @@
 //! Cross-pallet yield and liquidation contracts of the stability pool.
 //!
-//! `pusd-primitives` defines these contracts so callers depend on protocol behavior, not on this
-//! pallet's storage model.
+//! `stablecoin-primitives` defines these contracts so callers depend on protocol behavior, not on
+//! this pallet's storage model.
 
 use crate::{
 	dispatchable_impls::PoolCustody,
@@ -12,7 +12,7 @@ use crate::{
 	types::Leg,
 };
 use frame::prelude::*;
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BranchMode, BranchSnapshot, OffsetLegs, OnBranchYield, StabilityPoolInspect,
 	StabilityPoolOffset,
 };
@@ -228,9 +228,9 @@ impl<T: Config>
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		depositor: u32,
-		entry_delay: pusd_primitives::Millis,
+		entry_delay: stablecoin_primitives::Millis,
 		amount: BalanceOf<T>,
-	) -> Result<pusd_primitives::Millis, DispatchError> {
+	) -> Result<stablecoin_primitives::Millis, DispatchError> {
 		use frame::traits::fungibles::Mutate as FungiblesMutate;
 		assert!(entry_delay > 0, "a zero entry delay queues nothing");
 		assert!(!amount.is_zero());

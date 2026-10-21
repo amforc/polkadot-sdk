@@ -11,7 +11,7 @@ use frame::{
 	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Rounding, Saturating, Zero},
 	traits::Defensive,
 };
-use pusd_primitives::{
+use stablecoin_primitives::{
 	math::{mul_div, mul_ratio},
 	Millis,
 };
@@ -241,7 +241,7 @@ pub fn delta_sum<Balance: FixedPointOperand>(
 ) -> Option<FixedU128> {
 	debug_assert!(!p.is_zero());
 	debug_assert!(p <= FixedU128::one());
-	pusd_primitives::mul_div_rate_floor(distributed, p, total_active)
+	stablecoin_primitives::mul_div_rate_floor(distributed, p, total_active)
 }
 
 /// Returns `P` after `offset_debt` reduces `total_active`.
@@ -279,7 +279,7 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	let mut factor: u128 = 1;
 	for scales_crossed in 0..=MAX_SCALE_CROSSINGS {
 		let scaled_p = p.into_inner().checked_mul(factor)?;
-		let new_p = pusd_primitives::mul_div_rate_floor(
+		let new_p = stablecoin_primitives::mul_div_rate_floor(
 			new_total,
 			FixedU128::from_inner(scaled_p),
 			total_active,

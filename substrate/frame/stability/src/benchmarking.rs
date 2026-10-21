@@ -39,7 +39,7 @@ use frame::{
 	},
 };
 use frame_system::RawOrigin;
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BenchmarkVault, BenchmarkVaults, BranchMode, BranchSnapshot, Millis, OffsetLegs,
 	StabilityPoolInspect, StabilityPoolOffset,
 };

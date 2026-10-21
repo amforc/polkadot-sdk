@@ -40,7 +40,7 @@ use frame::{
 };
 use frame_system::RawOrigin;
 use linked_list_interface::{Position, SortedListInterface};
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BenchmarkVault, OnBranchLifecycle, StabilityPoolInspect, VaultInterface, MILLIS_PER_YEAR,
 };
 
