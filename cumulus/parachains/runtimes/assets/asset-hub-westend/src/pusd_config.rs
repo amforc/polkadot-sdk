@@ -111,13 +111,13 @@ parameter_types! {
 }
 
 impl pallet_linked_list::Config for Runtime {
-	type WeightInfo = ();
+	type WeightInfo = weights::pallet_linked_list::WeightInfo<Runtime>;
 	type ListId = pallet_vaults::VaultListId<VaultsCollateralId, VaultsStableId>;
 	type ItemId = AccountId;
 	type Priority = FixedU128;
 	type MaxHintRepairSteps = LinkedListMaxHintRepairSteps;
 	#[cfg(feature = "runtime-benchmarks")]
-	type PriorityProvider = pallet_linked_list::BenchPriorityProvider<Runtime>;
+	type PriorityProvider = pallet_linked_list::BenchPriorityProviderWithPrimary<Runtime, Vaults>;
 	#[cfg(not(feature = "runtime-benchmarks"))]
 	type PriorityProvider = Vaults;
 }
@@ -269,7 +269,7 @@ impl pallet_vaults::Config for Runtime {
 	type GlobalDebtCeiling = VaultsGlobalDebtCeiling;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
-	type WeightInfo = ();
+	type WeightInfo = weights::pallet_vaults::WeightInfo<Runtime>;
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = VaultsBenchmarkHelper;
 }
@@ -311,9 +311,7 @@ impl pallet_redemptions::Config for Runtime {
 	type TimeProvider = RelayTimestamp;
 	type UpdateOrigin = VaultsCreateOrigin;
 	type MaxRedemptionSteps = RedemptionsMaxSteps;
-	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
-	#[cfg(feature = "runtime-benchmarks")]
-	type BenchmarkHelper = RedemptionsBenchmarkHelper;
+	type WeightInfo = weights::pallet_redemptions::WeightInfo<Runtime>;
 }
 
 parameter_types! {
@@ -329,42 +327,47 @@ impl pallet_stability::Config for Runtime {
 	type StableDustHandler = ResolveAssetTo<governance::TreasuryAccount, Assets>;
 	type CollateralDustHandler = ResolveAssetTo<governance::TreasuryAccount, StabilityCollateral>;
 	type UpdateOrigin = EitherOf<
-		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
 		pallet_vaults::EnsureBranchFullAdmin<Runtime>,
+		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
 	>;
 	type PalletId = StabilityPalletId;
-	type WeightInfo = ();
+	type WeightInfo = weights::pallet_stability::WeightInfo<Runtime>;
 }
 
-/// Trust-backed asset id the benchmarks mint their stablecoin under. Benchmarks
-/// create the asset themselves, so any id outside the well-known range works.
 #[cfg(feature = "runtime-benchmarks")]
-const BENCHMARK_STABLE_ASSET_ID: VaultsStableId = 50_000_342;
+use frame_support::traits::Get as _;
 
-/// One whole stablecoin unit, at the 6 decimals the benchmarks register it with.
-/// The runtime-wide constant went away with the single-PSM configuration.
+/// A power of ten keeps exact-par prices divisible; greater than one exercises asset scaling.
 #[cfg(feature = "runtime-benchmarks")]
-const PUSD: Balance = 1_000_000;
+const BENCHMARK_COLLATERAL_MIN_BALANCE: Balance = 10_000_000;
+
+/// Sufficient foreign collateral exercises Location keys, holder custody and oracle repricing.
+/// Sufficiency allows payouts to fresh accounts; non-sufficient collateral uses a cheaper
+/// native deposit hold.
+#[cfg(feature = "runtime-benchmarks")]
+fn benchmark_collateral_id() -> VaultsCollateralId {
+	xcm::v5::Location::new(
+		2,
+		[
+			xcm::v5::Junction::GlobalConsensus(EthereumNetwork::get()),
+			xcm::v5::Junction::AccountKey20 { network: None, key: [0xee; 20] },
+		],
+	)
+}
 
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchmarkHelper;
 
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for VaultsBenchmarkHelper {
+impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountId>
+	for VaultsBenchmarkHelper
+{
 	fn collateral_asset_id() -> VaultsCollateralId {
-		VaultsNativeCollateralId::get()
-	}
-
-	fn stable_asset_id() -> VaultsStableId {
-		BENCHMARK_STABLE_ASSET_ID
+		benchmark_collateral_id()
 	}
 
 	fn set_oracle_price(asset_id: VaultsCollateralId, price: FixedU128) {
 		pallet_mock_oracle::Prices::<Runtime>::insert(asset_id, price);
-	}
-
-	fn clear_oracle_price(asset_id: VaultsCollateralId) {
-		pallet_mock_oracle::Prices::<Runtime>::remove(asset_id);
 	}
 
 	// Writes the moment directly: `set_timestamp` runs Aura's `on_timestamp_set`, which rejects a
@@ -374,155 +377,55 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 		pallet_timestamp::Now::<Runtime>::mutate(|now| *now = now.saturating_add(ms));
 	}
 
-	// The benchmark genesis does not create the stablecoin asset, so opening vaults
-	// (which mints stablecoin debt) would fail without it.
-	fn ensure_stable_asset(stable_id: VaultsStableId) {
-		use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
-		if !<Assets as FungiblesInspect<AccountId>>::asset_exists(stable_id) {
-			let asset_owner: AccountId = frame_benchmarking::account("pusd_owner", 0, 0);
-			<Assets as Create<AccountId>>::create(stable_id, asset_owner, true, 1)
-				.expect("create stablecoin asset for benchmark");
+	// Maximal PSM rows and sibling-parachain keys exercise the full debt-ceiling lookup.
+	// Zero debt preserves the ceiling; `insert` retains rows that mutation to zero would delete.
+	fn stage_debt_ceiling(stable_id: VaultsStableId) {
+		let internal = TrustBackedAssetLocation::convert_back(&stable_id)
+			.expect("a two-junction trust-backed location fits the junction limit; qed");
+		let externals = <Runtime as pallet_psm::Config>::MaxExternals::get();
+		for index in 0..externals {
+			pallet_psm::PsmDebt::<Runtime>::insert(
+				&internal,
+				Location::new(1, [Parachain(2000), GeneralIndex(index.into())]),
+				0,
+			);
 		}
-	}
-}
-
-#[cfg(feature = "runtime-benchmarks")]
-fn fund_vaults_benchmark_collateral(
-	asset_id: VaultsCollateralId,
-	who: &AccountId,
-	amount: Balance,
-) {
-	use frame_support::traits::{fungibles::Balanced as FungiblesBalanced, tokens::Precision};
-
-	if System::providers(who) == 0 {
-		System::inc_providers(who);
-	}
-	let debt = <VaultsCollateral as FungiblesBalanced<AccountId>>::deposit(
-		asset_id,
-		who,
-		amount,
-		Precision::Exact,
-	)
-	.expect("fund collateral for benchmark account");
-	drop(debt);
-}
-
-#[cfg(feature = "runtime-benchmarks")]
-use sp_runtime::traits::StaticLookup;
-
-#[cfg(feature = "runtime-benchmarks")]
-pub struct RedemptionsBenchmarkHelper;
-
-#[cfg(feature = "runtime-benchmarks")]
-impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountId, Balance>
-	for RedemptionsBenchmarkHelper
-{
-	fn setup_redeemable_branch(
-		vaults: u32,
-	) -> (VaultsCollateralId, VaultsStableId, AccountId, Balance) {
-		use frame_support::traits::fungibles::Mutate as FungiblesMutate;
-		use frame_system::RawOrigin;
-		use pallet_vaults::{pusd_primitives::OnBranchLifecycle as _, BenchmarkHelper as _};
-
-		let collateral_id = VaultsNativeCollateralId::get();
-		let stable_id: VaultsStableId = BENCHMARK_STABLE_ASSET_ID;
-
-		VaultsBenchmarkHelper::ensure_stable_asset(stable_id);
-
-		// `create_branch` validates the oracle price, so set it first.
-		VaultsBenchmarkHelper::set_oracle_price(
-			collateral_id.clone(),
-			FixedU128::from_rational(10u128, 1u128),
+		assert_eq!(
+			pallet_psm::PsmDebt::<Runtime>::iter_prefix(&internal).count(),
+			usize::try_from(externals).expect("u32 fits usize on every supported target; qed"),
 		);
-		let branch_config = pallet_vaults::BranchConfig {
-			minimum_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
-			initial_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
-			safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
-			debt_ceiling: 1_000_000 * PUSD,
-			minimum_debt: 10 * PUSD,
-			minimum_collateral: {
-				use frame_support::traits::fungibles::Inspect as FungiblesInspect;
-				<VaultsCollateral as FungiblesInspect<AccountId>>::minimum_balance(
-					collateral_id.clone(),
-				)
-			},
-			minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
-			maximum_borrow_rate: FixedU128::from_rational(1u128, 1u128),
-			upfront_fee_period: 7 * 24 * 60 * 60 * 1_000,
-			rate_adjustment_cooldown: 24 * 60 * 60 * 1_000,
-			final_recovery_reward_cooldown: 60 * 60 * 1_000,
-			liquidation: pallet_vaults::LiquidationConfig {
-				offset_penalty: Permill::from_percent(5),
-				keeper_flat_compensation_value: 100,
-				keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
-				keeper_compensation_cap_value: 10_000,
-				minimum_jit_contribution: 100,
-				redistribution_penalty: Permill::from_percent(5),
-			},
-		};
-		let full_admin: AccountId = frame_benchmarking::account("vaults_admin", 0, 0);
-		let emergency_admin: AccountId = frame_benchmarking::account("vaults_emergency", 0, 0);
-		let admins = pallet_vaults::types::BranchAdmins {
-			full_admin: <Runtime as frame_system::Config>::Lookup::unlookup(full_admin.clone()),
-			emergency_admin: <Runtime as frame_system::Config>::Lookup::unlookup(emergency_admin),
-		};
-		// A Root-created market charges its full admin the custody seeds: collateral for the
-		// redistribution account and the pool account, and a stablecoin float for the pool.
-		fund_vaults_benchmark_collateral(collateral_id.clone(), &full_admin, 100 * UNITS);
-		<Assets as FungiblesMutate<AccountId>>::mint_into(stable_id, &full_admin, 2 * PUSD)
-			.expect("fund the admin's stablecoin float");
-		// Each handler's own benchmark payload, not the runtime's production parameters: those
-		// carry live minimums that would bind inside a benchmark.
-		let lifecycle_config =
-			<Runtime as pallet_vaults::Config>::OnBranchLifecycle::benchmark_registration_config(1);
-		pallet_vaults::Pallet::<Runtime>::create_branch(
-			RawOrigin::Root.into(),
-			collateral_id.clone(),
-			stable_id,
-			admins,
-			branch_config,
-			lifecycle_config,
-		)
-		.expect("create branch for benchmark");
-		pallet_vaults::Pallet::<Runtime>::set_global_debt_ceiling(
-			RawOrigin::Root.into(),
-			stable_id,
-			1_000_000_000 * PUSD,
-		)
-		.expect("set global debt ceiling for benchmark");
+	}
 
-		// Native collateral must clear the runtime existential deposit, with
-		// headroom so the vault's collateral hold leaves free balance above it.
-		let collateral: Balance = 1_000 * UNITS;
-		let funding: Balance = collateral.saturating_mul(10);
-		let debt: Balance = 20 * PUSD; // above the 10-PUSD minimum_debt
-		for i in 0..vaults {
-			let owner: AccountId = frame_benchmarking::account("redemption_vault", i, 0);
-			fund_vaults_benchmark_collateral(collateral_id.clone(), &owner, funding);
-			let rate = FixedU128::from_rational(u128::from(i) + 1, 1_000u128);
-			pallet_vaults::Pallet::<Runtime>::open_vault(
-				RawOrigin::Signed(owner).into(),
-				collateral_id.clone(),
-				stable_id,
-				collateral,
-				debt,
-				rate,
-				pallet_linked_list::Position::endpoints_only(),
-			)
-			.expect("open benchmark vault");
+	// Equal prices per minimum balance keep deposit costs equal in native and collateral units.
+	fn ensure_collateral_asset(collateral_id: VaultsCollateralId) {
+		use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
+		let native = VaultsNativeCollateralId::get();
+		if collateral_id == native {
+			return;
 		}
+		if !<ForeignAssets as FungiblesInspect<AccountId>>::asset_exists(collateral_id.clone()) {
+			let asset_owner: AccountId = frame_benchmarking::account("collateral_owner", 0, 0);
+			<ForeignAssets as Create<AccountId>>::create(
+				collateral_id.clone(),
+				asset_owner,
+				true,
+				BENCHMARK_COLLATERAL_MIN_BALANCE,
+			)
+			.expect("the benchmark collateral location is unused; qed");
+		}
+		assert!(<ForeignAssets as FungiblesInspect<AccountId>>::asset_exists(
+			collateral_id.clone()
+		));
+		assert!(<VaultsCollateral as FungiblesInspect<AccountId>>::is_sufficient(collateral_id));
+		pallet_mock_oracle::Prices::<Runtime>::insert(
+			native,
+			FixedU128::from_rational(10, ExistentialDeposit::get()),
+		);
+	}
 
-		let redeemer: AccountId = frame_benchmarking::account("redeemer", 0, 0);
-		// The redeemer receives collateral onto its free balance, so it must exist
-		// above the existential deposit before the redemption pays out.
-		fund_vaults_benchmark_collateral(collateral_id.clone(), &redeemer, funding);
-		let budget = debt.saturating_mul(u128::from(vaults).saturating_add(2)).saturating_mul(2);
-		<Assets as FungiblesMutate<AccountId>>::mint_into(
-			stable_id,
-			&redeemer,
-			budget.saturating_mul(2),
-		)
-		.expect("mint stablecoin for redeemer");
-		(collateral_id, stable_id, redeemer, budget)
+	fn fund_native(who: &AccountId) {
+		use frame_support::traits::fungible::Mutate as FungibleMutate;
+		<Balances as FungibleMutate<AccountId>>::mint_into(who, 1_000 * UNITS)
+			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
 	}
 }
