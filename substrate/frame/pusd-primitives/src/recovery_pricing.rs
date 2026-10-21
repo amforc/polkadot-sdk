@@ -4,9 +4,12 @@
 //! treat it as an error.
 
 use crate::{math::collateral_for_value_floor, mul_div_floor};
-use frame::deps::sp_runtime::{
-	traits::{CheckedAdd, One, Saturating},
-	FixedPointNumber, FixedPointOperand, FixedU128, Permill,
+use frame::deps::{
+	frame_support::defensive_assert,
+	sp_runtime::{
+		traits::{CheckedAdd, One, Saturating},
+		FixedPointNumber, FixedPointOperand, FixedU128, Permill,
+	},
 };
 
 /// Returns the stablecoin value of collateral, `ceil(collateral * price)`, or `None` on
@@ -27,7 +30,7 @@ pub fn recovery_bonus(
 ) -> FixedU128 {
 	let excess = cr.saturating_sub(FixedU128::one()).saturating_sub(FixedU128::from(buffer));
 	let bonus = excess.min(FixedU128::from(redistribution_penalty));
-	debug_assert!(
+	defensive_assert!(
 		bonus <= cr.saturating_sub(FixedU128::one()),
 		"recovery bonus must not worsen CR"
 	);
@@ -72,7 +75,7 @@ pub fn insurance_adjusted<Balance: Copy + Ord + Saturating>(
 	let shortfall = debt.saturating_sub(collateral_value);
 	let effective_cover = core::cmp::min(insurance_available, shortfall);
 	let market_cancel_debt = debt.saturating_sub(effective_cover);
-	debug_assert!(market_cancel_debt >= collateral_value);
+	defensive_assert!(market_cancel_debt >= collateral_value);
 	Some(InsuranceAdjusted { market_cancel_debt, effective_cover })
 }
 
@@ -87,7 +90,7 @@ pub fn recovery_collateral_out<Balance: FixedPointOperand>(
 	collateral: Balance,
 	market_cancel_debt: Balance,
 ) -> Option<Balance> {
-	debug_assert!(debt_cancelled <= market_cancel_debt);
+	defensive_assert!(debt_cancelled <= market_cancel_debt);
 	if debt_cancelled.is_zero() {
 		return Some(Balance::zero());
 	}
