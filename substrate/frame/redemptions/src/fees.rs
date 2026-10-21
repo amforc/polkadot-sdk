@@ -6,7 +6,7 @@ use frame::deps::{
 		ArithmeticError, FixedPointOperand, FixedU128, Permill, Perquintill,
 	},
 };
-use pusd_primitives::math::mul_rate_ceil;
+use stablecoin_primitives::math::mul_rate_ceil;
 
 /// One half in the fixed-point domain of the dynamic fee.
 const HALF: FixedU128 = FixedU128::from_rational(1, 2);
@@ -240,7 +240,8 @@ pub fn scale_floor<Balance: FixedPointOperand>(
 	if denom.is_zero() {
 		return Balance::zero();
 	}
-	pusd_primitives::mul_div_floor(value, num, denom).defensive_unwrap_or_else(Balance::max_value)
+	stablecoin_primitives::mul_div_floor(value, num, denom)
+		.defensive_unwrap_or_else(Balance::max_value)
 }
 
 #[cfg(test)]

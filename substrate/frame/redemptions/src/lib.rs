@@ -15,7 +15,7 @@
 //! Redemption configuration and dynamic fee state are stored per stablecoin, shared by every
 //! collateral market issuing it: the fee nudges how much of the coin is redeemed, whichever
 //! collateral the redeemer used. Market lifecycle is synchronized through
-//! [`pusd_primitives::OnBranchLifecycle`].
+//! [`stablecoin_primitives::OnBranchLifecycle`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -41,7 +41,7 @@ pub mod mock;
 mod tests;
 
 pub use pallet::*;
-pub use pusd_primitives;
+pub use stablecoin_primitives;
 pub use types::{RecoveryRegime, RedemptionConfig, RedemptionState, RedemptionTerms};
 pub use weights::WeightInfo;
 
@@ -65,7 +65,7 @@ pub mod pallet {
 			EnsureOriginWithArg, OnUnbalanced, Time,
 		},
 	};
-	use pusd_primitives::{ProvidePrice, RedemptionStepSnapshot, VaultInterface};
+	use stablecoin_primitives::{ProvidePrice, RedemptionStepSnapshot, VaultInterface};
 
 	/// Balance type used by stable assets and vault accounting.
 	pub type BalanceOf<T> =
@@ -79,7 +79,7 @@ pub mod pallet {
 		<<T as Config>::StableAssets as fungibles::Inspect<AccountIdFor<T>>>::AssetId;
 
 	/// UNIX time in milliseconds.
-	pub use pusd_primitives::Millis;
+	pub use stablecoin_primitives::Millis;
 
 	/// Stable-asset credit consumed by the pallet.
 	pub type StableCreditOf<T> = fungibles::Credit<AccountIdFor<T>, <T as Config>::StableAssets>;
@@ -361,7 +361,7 @@ pub mod pallet {
 	/// The stablecoin's first market seeds these stablecoin-wide rows, and the
 	/// last one to leave clears them.
 	impl<T: Config>
-		pusd_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId>
+		stablecoin_primitives::OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId>
 		for Pallet<T>
 	{
 		/// One redemption policy governs every collateral market issuing the

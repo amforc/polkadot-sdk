@@ -669,7 +669,7 @@ pub use pallet_ranked_collective;
 #[cfg(feature = "pallet-recovery")]
 pub use pallet_recovery;
 
-/// FRAME pallet for the pUSD redemptions engine.
+/// FRAME pallet for a stablecoin redemptions engine.
 #[cfg(feature = "pallet-redemptions")]
 pub use pallet_redemptions;
 

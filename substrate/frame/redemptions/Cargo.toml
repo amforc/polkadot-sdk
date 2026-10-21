@@ -6,7 +6,7 @@ edition.workspace = true
 license = "Apache-2.0"
 homepage.workspace = true
 repository.workspace = true
-description = "FRAME pallet for the pUSD redemptions engine."
+description = "FRAME pallet for a stablecoin redemptions engine."
 
 [lints]
 workspace = true
@@ -17,8 +17,8 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dependencies]
 codec = { workspace = true, features = ["derive"] }
 frame = { workspace = true, features = ["runtime"] }
-pusd-primitives = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
+stablecoin-primitives = { workspace = true }
 
 pallet-assets = { optional = true, workspace = true }
 pallet-assets-holder = { optional = true, workspace = true }
@@ -47,8 +47,8 @@ std = [
 	"pallet-linked-list?/std",
 	"pallet-timestamp?/std",
 	"pallet-vaults?/std",
-	"pusd-primitives/std",
 	"scale-info/std",
+	"stablecoin-primitives/std",
 ]
 runtime-benchmarks = [
 	"frame/runtime-benchmarks",
@@ -58,7 +58,7 @@ runtime-benchmarks = [
 	"pallet-linked-list?/runtime-benchmarks",
 	"pallet-timestamp?/runtime-benchmarks",
 	"pallet-vaults?/runtime-benchmarks",
-	"pusd-primitives/runtime-benchmarks",
+	"stablecoin-primitives/runtime-benchmarks",
 ]
 try-runtime = [
 	"frame/try-runtime",
@@ -68,7 +68,7 @@ try-runtime = [
 	"pallet-linked-list?/try-runtime",
 	"pallet-timestamp?/try-runtime",
 	"pallet-vaults?/try-runtime",
-	"pusd-primitives/try-runtime",
+	"stablecoin-primitives/try-runtime",
 ]
 # Exposes the `mock` runtime to other crates, such as the simulator that drives the real pallets.
 test-utils = [
