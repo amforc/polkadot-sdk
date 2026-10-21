@@ -17,38 +17,37 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
-	governance,
-	pusd_config::{
+	dotusd_config::{
 		StabilityCollateral, StableInsuranceAccount, VaultsCollateral, VaultsDepositPolicy,
 		VaultsNativeCollateralId,
 	},
-	Assets, AuraExt, Balances, MockOracle, Redemptions, Runtime, RuntimeHoldReason, Stability,
-	Timestamp, Vaults,
+	governance, Assets, AuraExt, Balances, MockOracle, Redemptions, Runtime, RuntimeHoldReason,
+	Stability, Timestamp, Vaults,
 };
 use frame_support::{assert_noop, assert_storage_noop};
 use pallet_redemptions::RedemptionTerms;
 use pallet_vaults::JitTerms;
-use pusd_primitives::VaultStatus;
+use stablecoin_primitives::VaultStatus;
 
 pub(crate) const WND: Balance = 1_000_000_000_000;
 /// The stablecoin's metadata decimals.
-pub(crate) const PUSD_DECIMALS: u8 = 6;
-/// One whole stablecoin, at [`PUSD_DECIMALS`].
-pub(crate) const PUSD: Balance = 10u128.pow(PUSD_DECIMALS as u32);
-/// 0.01 pUSD. The stablecoin registers with this minimum balance.
-pub(crate) const PUSD_MIN_BALANCE: Balance = PUSD / 100;
+pub(crate) const DOTUSD_DECIMALS: u8 = 6;
+/// One whole stablecoin, at [`DOTUSD_DECIMALS`].
+pub(crate) const DOTUSD: Balance = 10u128.pow(DOTUSD_DECIMALS as u32);
+/// 0.01 dotUSD. The stablecoin registers with this minimum balance.
+pub(crate) const DOTUSD_MIN_BALANCE: Balance = DOTUSD / 100;
 
-/// Trust-backed asset id for the stablecoin: 7873, the id the dotUSD launch
-/// referendum creates on Polkadot Asset Hub.
-pub(crate) const PUSD_ID: u32 = 7873;
+/// Trust-backed asset id for the stablecoin: 7873, the id dotUSD carries on
+/// Polkadot Asset Hub, where it is live. The emulated tests use the same id.
+pub(crate) const DOTUSD_ID: u32 = 7873;
 
 /// Stablecoin-wide supply cap that exceeds all scenario debt.
-pub(crate) const SCENARIO_GLOBAL_CEILING: Balance = 1_000_000_000 * PUSD;
+pub(crate) const SCENARIO_GLOBAL_CEILING: Balance = 1_000_000_000 * DOTUSD;
 
-/// The Insurance Fund account of pUSD, derived as the runtime derives it. A
+/// The Insurance Fund account of dotUSD, derived as the runtime derives it. A
 /// change to that mapping then fails here instead of funding a wrong account.
 pub(crate) fn insurance_account() -> AccountId {
-	<StableInsuranceAccount as sp_runtime::traits::Convert<u32, AccountId>>::convert(PUSD_ID)
+	<StableInsuranceAccount as sp_runtime::traits::Convert<u32, AccountId>>::convert(DOTUSD_ID)
 }
 
 pub(crate) fn get_native_id() -> VaultsCollateralId {
@@ -67,9 +66,9 @@ pub(crate) fn admin() -> AccountId {
 	acct(0xAD)
 }
 
-/// Returns a pUSD/WND price as pUSD base units per WND planck.
-pub(crate) fn dot_price(pusd_num: u128, pusd_den: u128) -> FixedU128 {
-	FixedU128::from_rational(pusd_num * PUSD, pusd_den * WND)
+/// Returns a dotUSD/WND price as dotUSD base units per WND planck.
+pub(crate) fn dot_price(dotusd_num: u128, dotusd_den: u128) -> FixedU128 {
+	FixedU128::from_rational(dotusd_num * DOTUSD, dotusd_den * WND)
 }
 
 pub(crate) fn feed_price(price: FixedU128) {
@@ -98,10 +97,10 @@ impl Default for BranchSpec {
 			mcr: FixedU128::from_rational(110, 100),
 			icr: FixedU128::from_rational(120, 100),
 			scr: FixedU128::from_rational(120, 100),
-			minimum_debt: 50 * PUSD,
+			minimum_debt: 50 * DOTUSD,
 			// Zero disables the upfront fee.
 			upfront_fee_period_ms: 0,
-			keeper_flat_compensation_value: 2 * PUSD,
+			keeper_flat_compensation_value: 2 * DOTUSD,
 			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
 		}
 	}
@@ -129,7 +128,7 @@ pub(crate) fn accounting_spec() -> BranchSpec {
 /// Creates the stablecoin and a native-WND market for it, and lifts the global
 /// debt ceiling.
 pub(crate) fn create_branch(spec: &BranchSpec) {
-	create_pusd();
+	create_dotusd();
 	// Root creation charges the full admin two ED under `Preserve` (the Vaults
 	// redistribution seed and the pool custody float), so the admin needs three
 	// ED, plus two stablecoin minimums for the pool's stablecoin float. `admin()`
@@ -138,11 +137,11 @@ pub(crate) fn create_branch(spec: &BranchSpec) {
 		&admin(),
 		get_native_ed().saturating_mul(3),
 	));
-	mint_pusd(&admin(), PUSD_MIN_BALANCE.saturating_mul(2));
+	mint_dotusd(&admin(), DOTUSD_MIN_BALANCE.saturating_mul(2));
 	assert_ok!(Vaults::create_branch(
 		RuntimeOrigin::root(),
 		get_native_id(),
-		PUSD_ID,
+		DOTUSD_ID,
 		branch_admins(),
 		branch_config(&get_native_id(), spec),
 		registration_config(),
@@ -157,21 +156,21 @@ pub(crate) fn create_branch(spec: &BranchSpec) {
 /// create the fee account's stablecoin account. That account owns its deposit,
 /// so it needs native balance. A live treasury holds some. The emulated genesis
 /// does not, so the helper funds it.
-pub(crate) fn create_pusd() {
+pub(crate) fn create_dotusd() {
 	advance_time(0);
 	assert_ok!(Assets::force_create(
 		RuntimeOrigin::root(),
-		PUSD_ID.into(),
+		DOTUSD_ID.into(),
 		MultiAddress::Id(admin()),
 		true,
-		PUSD_MIN_BALANCE,
+		DOTUSD_MIN_BALANCE,
 	));
 	assert_ok!(Assets::force_set_metadata(
 		RuntimeOrigin::root(),
-		PUSD_ID.into(),
+		DOTUSD_ID.into(),
 		b"dotUSD".to_vec(),
 		b"dotUSD".to_vec(),
-		PUSD_DECIMALS,
+		DOTUSD_DECIMALS,
 		false,
 	));
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(
@@ -192,11 +191,11 @@ pub(crate) fn create_market_signed(collateral_id: VaultsCollateralId, spec: &Bra
 		&admin(),
 		collateral_min_balance(&collateral_id).saturating_mul(2),
 	);
-	mint_pusd(&admin(), PUSD_MIN_BALANCE.saturating_mul(2));
+	mint_dotusd(&admin(), DOTUSD_MIN_BALANCE.saturating_mul(2));
 	assert_ok!(Vaults::create_branch(
 		RuntimeOrigin::signed(admin()),
 		collateral_id.clone(),
-		PUSD_ID,
+		DOTUSD_ID,
 		branch_admins(),
 		branch_config(&collateral_id, spec),
 		registration_config(),
@@ -204,21 +203,21 @@ pub(crate) fn create_market_signed(collateral_id: VaultsCollateralId, spec: &Bra
 	lift_global_ceiling(SCENARIO_GLOBAL_CEILING);
 }
 
-/// Registration payload `(redemptions, stability)` for a pUSD market. The
+/// Registration payload `(redemptions, stability)` for a dotUSD market. The
 /// redemption policy is stablecoin-wide, so only the first market carries it.
 pub(crate) fn registration_config() -> (
 	Option<pallet_redemptions::RedemptionConfig<Balance>>,
 	pallet_stability::types::StabilityPoolConfig<Balance>,
 ) {
 	let redemption_config =
-		(!pallet_redemptions::RedemptionConfigs::<Runtime>::contains_key(PUSD_ID))
+		(!pallet_redemptions::RedemptionConfigs::<Runtime>::contains_key(DOTUSD_ID))
 			.then(test_redemption_config);
 	(redemption_config, test_stability_config())
 }
 
 fn test_redemption_config() -> pallet_redemptions::RedemptionConfig<Balance> {
 	pallet_redemptions::RedemptionConfig {
-		minimum_redemption_amount: 100 * PUSD,
+		minimum_redemption_amount: 100 * DOTUSD,
 		dynamic_fee_decay_period: 6 * 60 * 60 * 1_000,
 		dynamic_fee_floor: FixedU128::from_rational(0u128, 1u128),
 		dynamic_fee_ceiling: FixedU128::from_rational(1u128, 1u128),
@@ -231,8 +230,8 @@ fn test_redemption_config() -> pallet_redemptions::RedemptionConfig<Balance> {
 
 fn test_stability_config() -> pallet_stability::types::StabilityPoolConfig<Balance> {
 	pallet_stability::types::StabilityPoolConfig {
-		minimum_deposit: 100 * PUSD,
-		minimum_active_pool_balance: 100 * PUSD,
+		minimum_deposit: 100 * DOTUSD,
+		minimum_active_pool_balance: 100 * DOTUSD,
 		entry_delay: u64::from(RELAY_CHAIN_SLOT_DURATION_MILLIS),
 		safety_withdrawal_delay: 10 * 60 * 1_000,
 		precision: pallet_stability::types::PoolPrecision {
@@ -246,7 +245,7 @@ fn test_stability_config() -> pallet_stability::types::StabilityPoolConfig<Balan
 /// One call covers every market of the coin, because the ceiling is
 /// stablecoin-wide. `amount` is in stablecoin units.
 pub(crate) fn lift_global_ceiling(amount: Balance) {
-	assert_ok!(Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), PUSD_ID, amount));
+	assert_ok!(Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), DOTUSD_ID, amount));
 }
 
 pub(crate) fn branch_admins() -> pallet_vaults::types::BranchAdmins<MultiAddress<AccountId, ()>> {
@@ -266,7 +265,7 @@ pub(crate) fn branch_config(
 		minimum_collateralization_ratio: spec.mcr,
 		initial_collateralization_ratio: spec.icr,
 		safety_collateralization_ratio: spec.scr,
-		debt_ceiling: 100_000_000 * PUSD,
+		debt_ceiling: 100_000_000 * DOTUSD,
 		minimum_debt: spec.minimum_debt,
 		minimum_collateral: collateral_min_balance(collateral_id),
 		minimum_borrow_rate: FixedU128::zero(),
@@ -278,8 +277,8 @@ pub(crate) fn branch_config(
 			offset_penalty: Permill::from_percent(5),
 			keeper_flat_compensation_value: spec.keeper_flat_compensation_value,
 			keeper_percent_compensation: spec.keeper_percent_compensation,
-			keeper_compensation_cap_value: 100 * PUSD,
-			minimum_jit_contribution: PUSD,
+			keeper_compensation_cap_value: 100 * DOTUSD,
+			minimum_jit_contribution: DOTUSD,
 			redistribution_penalty: Permill::from_percent(10),
 		},
 	}
@@ -322,7 +321,7 @@ pub(crate) fn expected_vault_deposit(
 	// Pricing a deposit is a quote and must not write.
 	assert_storage_noop!(
 		priced = <VaultsDepositPolicy as sp_runtime::traits::Convert<_, _>>::convert(
-			Vaults::vault_footprint(collateral_id, &PUSD_ID, owner),
+			Vaults::vault_footprint(collateral_id, &DOTUSD_ID, owner),
 		)
 	);
 	priced.expect("vault deposit priced")
@@ -361,8 +360,8 @@ pub(crate) fn collateral_on_hold(collateral_id: &VaultsCollateralId, who: &Accou
 	)
 }
 
-pub(crate) fn mint_pusd(who: &AccountId, amount: Balance) {
-	assert_ok!(<Assets as Mutate<AccountId>>::mint_into(PUSD_ID, who, amount));
+pub(crate) fn mint_dotusd(who: &AccountId, amount: Balance) {
+	assert_ok!(<Assets as Mutate<AccountId>>::mint_into(DOTUSD_ID, who, amount));
 }
 
 pub(crate) fn open_vault(owner: &AccountId, collateral: Balance, debt: Balance, rate: FixedU128) {
@@ -381,7 +380,7 @@ pub(crate) fn open_vault_on(
 	assert_ok!(Vaults::open_vault(
 		RuntimeOrigin::signed(owner.clone()),
 		collateral_id,
-		PUSD_ID,
+		DOTUSD_ID,
 		collateral,
 		debt,
 		rate,
@@ -397,7 +396,7 @@ pub(crate) fn vault_on(
 	collateral_id: &VaultsCollateralId,
 	owner: &AccountId,
 ) -> pallet_vaults::types::Vault<Balance> {
-	pallet_vaults::Vaults::<Runtime>::get((collateral_id, PUSD_ID, owner))
+	pallet_vaults::Vaults::<Runtime>::get((collateral_id, DOTUSD_ID, owner))
 		.expect("vault exists for owner")
 		.vault
 }
@@ -414,7 +413,7 @@ pub(crate) fn vault_status_on(
 	let view;
 	// Reading a status must not write.
 	assert_storage_noop!(
-		view = Vaults::vault_after_touch(collateral_id.clone(), PUSD_ID, owner.clone())
+		view = Vaults::vault_after_touch(collateral_id.clone(), DOTUSD_ID, owner.clone())
 	);
 	match view {
 		Ok((_, status)) => Some(status),
@@ -431,7 +430,7 @@ pub(crate) fn enter_final_recovery(owner: &AccountId) {
 	assert_ok!(Vaults::enter_final_recovery(
 		RuntimeOrigin::signed(acct(0xFE)),
 		get_native_id(),
-		PUSD_ID,
+		DOTUSD_ID,
 		owner.clone(),
 	));
 	assert_eq!(vault_status(owner), Some(VaultStatus::FinalRecovery));
@@ -443,7 +442,7 @@ pub(crate) fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId)
 	assert_ok!(Vaults::liquidate(
 		RuntimeOrigin::signed(keeper),
 		collateral_id,
-		PUSD_ID,
+		DOTUSD_ID,
 		owner.clone(),
 		JitTerms { max_stable: 0, min_collateral_out: 0 },
 	));
@@ -457,29 +456,29 @@ pub(crate) fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId)
 /// that only the minimum balance remains.
 pub(crate) fn redeem(redeemer: &AccountId, terms: RedemptionTerms<Balance>) -> Balance {
 	fund_dot(redeemer, 0);
-	mint_pusd(redeemer, terms.max_stable_to_spend + PUSD_MIN_BALANCE);
+	mint_dotusd(redeemer, terms.max_stable_to_spend + DOTUSD_MIN_BALANCE);
 	let native_before = native_balance(redeemer);
 
 	assert_ok!(Redemptions::redeem(
 		RuntimeOrigin::signed(redeemer.clone()),
 		get_native_id(),
-		PUSD_ID,
+		DOTUSD_ID,
 		terms,
 		redeemer.clone(),
 		16,
 	));
 
-	assert_eq!(pusd_balance(redeemer), PUSD_MIN_BALANCE);
+	assert_eq!(dotusd_balance(redeemer), DOTUSD_MIN_BALANCE);
 	native_balance(redeemer) - native_before
 }
 
-pub(crate) fn pusd_balance(who: &AccountId) -> Balance {
-	<Assets as Inspect<AccountId>>::balance(PUSD_ID, who)
+pub(crate) fn dotusd_balance(who: &AccountId) -> Balance {
+	<Assets as Inspect<AccountId>>::balance(DOTUSD_ID, who)
 }
 
 /// Market-level accounting for the native-WND market.
 pub(crate) fn branch_state() -> pallet_vaults::types::BranchState<AccountId, Balance> {
-	pallet_vaults::Branches::<Runtime>::get(get_native_id(), PUSD_ID)
+	pallet_vaults::Branches::<Runtime>::get(get_native_id(), DOTUSD_ID)
 		.expect("branch registered")
 		.state
 }
@@ -512,7 +511,7 @@ pub(crate) fn pool_account() -> AccountId {
 }
 
 pub(crate) fn pool_account_on(collateral_id: &VaultsCollateralId) -> AccountId {
-	Stability::pool_account(collateral_id, &PUSD_ID)
+	Stability::pool_account(collateral_id, &DOTUSD_ID)
 }
 
 pub(crate) fn sp_deposit_matured_on(
@@ -537,10 +536,13 @@ pub(crate) fn sp_deposit_matured_on(
 
 /// The deadline of the cohort that the pending deposit of `who` waits out.
 fn sp_pending_deadline(collateral_id: &VaultsCollateralId, who: &AccountId) -> Option<u64> {
-	let pending =
-		pallet_stability::Deposits::<Runtime>::get((collateral_id.clone(), PUSD_ID, who.clone()))?
-			.pending_deposit?;
-	pallet_stability::Pools::<Runtime>::get(collateral_id.clone(), PUSD_ID)?
+	let pending = pallet_stability::Deposits::<Runtime>::get((
+		collateral_id.clone(),
+		DOTUSD_ID,
+		who.clone(),
+	))?
+	.pending_deposit?;
+	pallet_stability::Pools::<Runtime>::get(collateral_id.clone(), DOTUSD_ID)?
 		.state
 		.cohort(pending.cohort)
 		.map(|cohort| cohort.deadline)
@@ -551,11 +553,11 @@ pub(crate) fn sp_deposit_pending_on(
 	who: &AccountId,
 	amount: Balance,
 ) {
-	mint_pusd(who, amount);
+	mint_dotusd(who, amount);
 	assert_ok!(Stability::deposit(
 		RuntimeOrigin::signed(who.clone()),
 		collateral_id,
-		PUSD_ID,
+		DOTUSD_ID,
 		amount,
 	));
 }
@@ -564,13 +566,13 @@ pub(crate) fn deposit_row_on(
 	collateral_id: &VaultsCollateralId,
 	who: &AccountId,
 ) -> pallet_stability::types::Deposit<Balance> {
-	pallet_stability::Deposits::<Runtime>::get((collateral_id, PUSD_ID, who.clone()))
+	pallet_stability::Deposits::<Runtime>::get((collateral_id, DOTUSD_ID, who.clone()))
 		.expect("deposit row exists")
 }
 
 /// Settled rows that hold nothing are pruned, so a missing row is a valid end state.
 pub(crate) fn deposit_row_exists(collateral_id: &VaultsCollateralId, who: &AccountId) -> bool {
-	pallet_stability::Deposits::<Runtime>::contains_key((collateral_id, PUSD_ID, who.clone()))
+	pallet_stability::Deposits::<Runtime>::contains_key((collateral_id, DOTUSD_ID, who.clone()))
 }
 
 /// Claims realized collateral and checks transfers in the collateral asset pallet.
@@ -586,7 +588,7 @@ pub(crate) fn claim_collateral_out(
 	assert_ok!(Stability::claim_collateral(
 		RuntimeOrigin::signed(depositor.clone()),
 		collateral_id.clone(),
-		PUSD_ID,
+		DOTUSD_ID,
 		None,
 	));
 
@@ -602,7 +604,7 @@ pub(crate) fn claim_collateral_out(
 		Stability::claim_collateral(
 			RuntimeOrigin::signed(depositor.clone()),
 			collateral_id.clone(),
-			PUSD_ID,
+			DOTUSD_ID,
 			None,
 		),
 		expected_error,

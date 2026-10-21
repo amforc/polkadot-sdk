@@ -25,7 +25,7 @@ use frame_support::traits::{
 	tokens::imbalance::ResolveAssetTo,
 	EitherOf, LinearStoragePrice,
 };
-use pallet_vaults::pusd_primitives::OraclePriceConversion;
+use pallet_vaults::stablecoin_primitives::OraclePriceConversion;
 use sp_runtime::{
 	traits::{AccountIdConversion, Convert, MaybeEquivalence},
 	FixedU128,
@@ -151,7 +151,7 @@ parameter_types! {
 
 /// Bridges the mock oracle to the vault pallet's `ProvidePrice` surface.
 pub struct VaultsOracleAdapter;
-impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
+impl stablecoin_primitives::ProvidePrice for VaultsOracleAdapter {
 	type AssetId = VaultsCollateralId;
 
 	fn provide_price(
@@ -178,7 +178,7 @@ impl Convert<VaultsStableId, VaultsCollateralId> for VaultsStableToCollateralId 
 /// `CreateOrigin` for permissionless market creation. Root creates deposit-free
 /// (`None`); the stablecoin asset's owner creates with a refundable deposit
 /// (`Some(who)`); every other origin is rejected.
-pub type VaultsCreateOrigin = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
+pub type VaultsCreateOrigin = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 /// Routes each stablecoin's vault fee remainder to the treasury.
 pub struct VaultsFeeAccount;
@@ -277,7 +277,7 @@ impl pallet_vaults::Config for Runtime {
 parameter_types! {
 	/// Seeds the per-stablecoin insurance-fund accounts of coins that no PSM
 	/// instance mints against.
-	pub const InsuranceFundPalletId: PalletId = PalletId(*b"pusd/ins");
+	pub const InsuranceFundPalletId: PalletId = PalletId(*b"py/insur");
 }
 
 /// Isolates each stablecoin's Insurance Fund cover in a separate account.

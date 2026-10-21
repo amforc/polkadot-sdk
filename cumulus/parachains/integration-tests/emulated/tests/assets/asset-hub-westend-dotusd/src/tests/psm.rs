@@ -19,7 +19,7 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
-	pusd_config::TrustBackedAssetLocation, Assets, OriginCaller, Psm, Vaults,
+	dotusd_config::TrustBackedAssetLocation, Assets, OriginCaller, Psm, Vaults,
 };
 use emulated_integration_tests_common::USDT_ID;
 use frame_support::{assert_noop, hypothetically_ok};
@@ -34,17 +34,18 @@ const USDT_DECIMALS: u8 = 6;
 const USDT: Balance = 10u128.pow(USDT_DECIMALS as u32);
 
 /// Aggregate debt ceiling of the dotUSD PSM: ten million dotUSD.
-const PSM_MAX_DEBT: Balance = 10_000_000 * PUSD;
+const PSM_MAX_DEBT: Balance = 10_000_000 * DOTUSD;
 /// Smallest swap the PSM accepts: one dotUSD.
-const PSM_MIN_SWAP: Balance = PUSD;
+const PSM_MIN_SWAP: Balance = DOTUSD;
 /// Minting is free.
 const PSM_MINTING_FEE: Permill = Permill::zero();
 /// Redemption charges one basis point.
 const PSM_REDEMPTION_FEE: Permill = Permill::from_parts(100);
 
 /// Trust-backed location of the stablecoin, the key of its PSM instance.
-fn pusd_location() -> Location {
-	TrustBackedAssetLocation::convert_back(&PUSD_ID).expect("trust-backed ids convert to locations")
+fn dotusd_location() -> Location {
+	TrustBackedAssetLocation::convert_back(&DOTUSD_ID)
+		.expect("trust-backed ids convert to locations")
 }
 
 /// Trust-backed location of USDt.
@@ -65,8 +66,8 @@ fn set_usdt_metadata() {
 	));
 }
 
-fn create_pusd_psm() -> (Location, Location) {
-	let internal = pusd_location();
+fn create_dotusd_psm() -> (Location, Location) {
+	let internal = dotusd_location();
 	let external = usdt_location();
 	let root: OriginCaller = frame_system::RawOrigin::<AccountId>::Root.into();
 	assert_ok!(Psm::create_psm(
@@ -102,11 +103,11 @@ fn create_pusd_psm() -> (Location, Location) {
 
 /// Steps 1 and 2 of the referendum on top of a vault market, so vault and PSM
 /// share the stablecoin. `create_branch` already plays step 1.
-fn launch_pusd_psm() -> (Location, Location) {
+fn launch_dotusd_psm() -> (Location, Location) {
 	feed_price(dot_price(2, 1));
 	create_branch(&BranchSpec::default());
 	set_usdt_metadata();
-	create_pusd_psm()
+	create_dotusd_psm()
 }
 
 /// Calls `Vaults::borrow` for `owner` on the native market. Post-dispatch info
@@ -115,7 +116,7 @@ fn borrow(owner: &AccountId, amount: Balance) -> DispatchResult {
 	Vaults::borrow(
 		RuntimeOrigin::signed(owner.clone()),
 		get_native_id(),
-		PUSD_ID,
+		DOTUSD_ID,
 		amount,
 		None,
 		None,
@@ -131,14 +132,14 @@ fn borrow(owner: &AccountId, amount: Balance) -> DispatchResult {
 #[test]
 fn psm_debt_consumes_and_releases_vault_headroom() {
 	AssetHubWestend::execute_with(|| {
-		let (internal, external) = launch_pusd_psm();
+		let (internal, external) = launch_dotusd_psm();
 		// The stored ceiling is the coin's total supply cap across vaults and PSM.
-		lift_global_ceiling(1_000 * PUSD);
+		lift_global_ceiling(1_000 * DOTUSD);
 
 		let owner = acct(1);
-		open_vault(&owner, 1_000 * WND, 600 * PUSD, FixedU128::from_rational(5, 100));
+		open_vault(&owner, 1_000 * WND, 600 * DOTUSD, FixedU128::from_rational(5, 100));
 		// Another 150 dotUSD fits the 1_000 cap while the PSM holds no debt.
-		hypothetically_ok!(borrow(&owner, 150 * PUSD));
+		hypothetically_ok!(borrow(&owner, 150 * DOTUSD));
 
 		let user = acct(2);
 		assert_ok!(<Assets as Mutate<AccountId>>::mint_into(USDT_ID, &user, 300 * USDT));
@@ -149,33 +150,33 @@ fn psm_debt_consumes_and_releases_vault_headroom() {
 			300 * USDT,
 			PSM_MINTING_FEE,
 		));
-		assert_eq!(pusd_balance(&user), 300 * PUSD);
-		assert_eq!(pallet_psm::PsmDebt::<Runtime>::get(&internal, &external), 300 * PUSD);
+		assert_eq!(dotusd_balance(&user), 300 * DOTUSD);
+		assert_eq!(pallet_psm::PsmDebt::<Runtime>::get(&internal, &external), 300 * DOTUSD);
 
 		// The same 150 dotUSD still fits on the vault side alone (600 + 150),
 		// but live PSM debt of 300 leaves vaults only 700.
 		assert_noop!(
-			borrow(&owner, 150 * PUSD),
+			borrow(&owner, 150 * DOTUSD),
 			pallet_vaults::Error::<Runtime>::GlobalDebtCeilingExceeded
 		);
-		hypothetically_ok!(borrow(&owner, PUSD));
+		hypothetically_ok!(borrow(&owner, DOTUSD));
 
 		// A stored ceiling below the live PSM debt leaves vaults no headroom at
 		// all. Existing debt stays where it is, and repayment is never gated.
-		lift_global_ceiling(200 * PUSD);
+		lift_global_ceiling(200 * DOTUSD);
 		assert_noop!(
-			borrow(&owner, PUSD),
+			borrow(&owner, DOTUSD),
 			pallet_vaults::Error::<Runtime>::GlobalDebtCeilingExceeded
 		);
-		assert_eq!(vault(&owner).debt.principal, 600 * PUSD);
+		assert_eq!(vault(&owner).debt.principal, 600 * DOTUSD);
 		hypothetically_ok!(Vaults::repay_for(
 			RuntimeOrigin::signed(owner.clone()),
 			get_native_id(),
-			PUSD_ID,
+			DOTUSD_ID,
 			owner.clone(),
-			Some(100 * PUSD),
+			Some(100 * DOTUSD),
 		));
-		lift_global_ceiling(1_000 * PUSD);
+		lift_global_ceiling(1_000 * DOTUSD);
 
 		// Redeeming the PSM debt returns its headroom to vault borrowers at
 		// once. The live one-basis-point fee goes to the Insurance Fund, so
@@ -184,23 +185,23 @@ fn psm_debt_consumes_and_releases_vault_headroom() {
 			RuntimeOrigin::signed(user.clone()),
 			internal.clone(),
 			external.clone(),
-			300 * PUSD,
+			300 * DOTUSD,
 			PSM_REDEMPTION_FEE,
 		));
-		let fee = PSM_REDEMPTION_FEE.mul_ceil(300 * PUSD);
-		assert_eq!(fee, 3 * PUSD / 100);
-		assert_eq!(pusd_balance(&user), 0);
-		assert_eq!(pusd_balance(&insurance_account()), fee);
+		let fee = PSM_REDEMPTION_FEE.mul_ceil(300 * DOTUSD);
+		assert_eq!(fee, 3 * DOTUSD / 100);
+		assert_eq!(dotusd_balance(&user), 0);
+		assert_eq!(dotusd_balance(&insurance_account()), fee);
 		assert_eq!(<Assets as Inspect<AccountId>>::balance(USDT_ID, &user), 300 * USDT - fee);
 		assert_eq!(pallet_psm::PsmDebt::<Runtime>::get(&internal, &external), fee);
 
 		// Vaults regain all but the fee's worth of headroom: 1_000 − 600 − 0.03.
 		assert_noop!(
-			borrow(&owner, 400 * PUSD - fee + 1),
+			borrow(&owner, 400 * DOTUSD - fee + 1),
 			pallet_vaults::Error::<Runtime>::GlobalDebtCeilingExceeded
 		);
-		assert_ok!(borrow(&owner, 150 * PUSD));
-		assert_eq!(vault(&owner).debt.principal, 750 * PUSD);
+		assert_ok!(borrow(&owner, 150 * DOTUSD));
+		assert_eq!(vault(&owner).debt.principal, 750 * DOTUSD);
 	});
 }
 
@@ -212,7 +213,7 @@ fn psm_debt_consumes_and_releases_vault_headroom() {
 #[test]
 fn redemption_fee_cannot_open_an_empty_insurance_fund() {
 	AssetHubWestend::execute_with(|| {
-		let (internal, external) = launch_pusd_psm();
+		let (internal, external) = launch_dotusd_psm();
 		let user = acct(2);
 		assert_ok!(<Assets as Mutate<AccountId>>::mint_into(USDT_ID, &user, 200 * USDT));
 		assert_ok!(Psm::mint(
@@ -232,14 +233,14 @@ fn redemption_fee_cannot_open_an_empty_insurance_fund() {
 			)
 		};
 
-		assert_eq!(pusd_balance(&insurance_account()), 0);
-		assert_noop!(redeem(PUSD), sp_runtime::TokenError::BelowMinimum);
+		assert_eq!(dotusd_balance(&insurance_account()), 0);
+		assert_noop!(redeem(DOTUSD), sp_runtime::TokenError::BelowMinimum);
 
 		// A 100 dotUSD redemption pays exactly the minimum balance in fees and
 		// opens the account; the one dotUSD redemption then goes through.
-		assert_ok!(redeem(100 * PUSD));
-		assert_eq!(pusd_balance(&insurance_account()), PUSD_MIN_BALANCE);
-		assert_ok!(redeem(PUSD));
-		assert_eq!(pusd_balance(&insurance_account()), PUSD_MIN_BALANCE + PUSD / 10_000);
+		assert_ok!(redeem(100 * DOTUSD));
+		assert_eq!(dotusd_balance(&insurance_account()), DOTUSD_MIN_BALANCE);
+		assert_ok!(redeem(DOTUSD));
+		assert_eq!(dotusd_balance(&insurance_account()), DOTUSD_MIN_BALANCE + DOTUSD / 10_000);
 	});
 }
