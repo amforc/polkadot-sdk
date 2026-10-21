@@ -14,7 +14,7 @@ fn multiple_depositor_cohorts_reconcile_to_zero() {
 		seed_matured_deposit(2, 500);
 
 		// Yield 1 over A = 1500: G = 150/1500 = 0.1.
-		drop(distribute_yield(DOT, PUSD, 150));
+		distribute_all_yield(150);
 		// Offset 1: A = 1500 → 900, P = 0.6, delta_S = floor(300 * 1e18 /
 		// 1500) = 2e17, so S = 0.2.
 		assert_eq!(simulate_offset(DOT, PUSD, 600, 300).debt(), 600);
@@ -25,7 +25,7 @@ fn multiple_depositor_cohorts_reconcile_to_zero() {
 
 		// Yield 2 over A = 1800: delta_G = floor(180 * 0.6 / 1800) = 6e16,
 		// so G = 0.16.
-		drop(distribute_yield(DOT, PUSD, 180));
+		distribute_all_yield(180);
 		// Offset 2: A = 1800 → 900, P = 0.6 → floor(0.6 * 900 / 1800) = 0.3,
 		// delta_S = floor(450 * 0.6 / 1800) = 1.5e17, so S = 0.35.
 		assert_eq!(simulate_offset(DOT, PUSD, 900, 450).debt(), 900);
