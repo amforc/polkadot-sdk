@@ -31,6 +31,7 @@ use frame::{
 			Inspect as FungiblesInspect, MutateHold as FungiblesMutateHold,
 		},
 		tokens::{DepositConsequence, Fortitude, Precision, Preservation, Provenance},
+		DefensiveOption,
 	},
 };
 use pusd_primitives::{
@@ -46,10 +47,10 @@ type PoolQuoteOf<T> = <<T as Config>::StabilityPool as StabilityPoolInspect<
 >>::Quote;
 
 #[derive(Clone)]
-pub struct LiquidationSnapshot<Balance> {
-	pub debt: Balance,
-	pub price: FixedU128,
-	pub config: LiquidationConfig<Balance>,
+pub(crate) struct LiquidationSnapshot<Balance> {
+	pub(crate) debt: Balance,
+	pub(crate) price: FixedU128,
+	pub(crate) config: LiquidationConfig<Balance>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -131,7 +132,11 @@ impl<T: Config> Pallet<T> {
 		// The touch left the vault's redistribution share in custody, so the owner holds that much
 		// less than the vault records.
 		let retained = op.retained_redistribution();
-		let held = op.vault().collateral.checked_sub(&retained).ok_or(DispatchError::Corruption)?;
+		let held = op
+			.vault()
+			.collateral
+			.checked_sub(&retained)
+			.defensive_ok_or(DispatchError::Corruption)?;
 
 		let (collateral, shortfall) = T::CollateralAssets::slash(
 			collateral_id.clone(),
@@ -197,11 +202,8 @@ impl<T: Config> Pallet<T> {
 					defensive!("redistribution custody fell short of the retained share");
 					return Err(DispatchError::Corruption);
 				}
-				if let Err(released) = credit.subsume(released) {
-					// Both credits are the market's collateral, so the merge cannot fail.
-					drop(released);
-					return Err(DispatchError::Corruption);
-				}
+				// Both credits are the market's collateral, so the merge cannot fail.
+				credit.subsume(released).map_err(|_| DispatchError::Corruption)?;
 			},
 		}
 		Ok(credit)
@@ -274,10 +276,7 @@ impl<T: Config> Pallet<T> {
 		Self::settle_pool_legs(collateral_id, stable_id, branch, &plan, &mut resolution)?;
 
 		// Every leg but the owner's surplus has left the seized credit.
-		if let Err(resolution) = resolution.drop_zero() {
-			drop(resolution);
-			return Err(DispatchError::Corruption);
-		}
+		resolution.drop_zero().map_err(|_| DispatchError::Corruption)?;
 		let leg = |debt, collateral| DebtCollateral { debt, collateral };
 		let touch = op.liquidation_touch()?;
 		let outcome = LiquidationOutcome {
@@ -318,21 +317,18 @@ impl<T: Config> Pallet<T> {
 				jit_preservation,
 				Fortitude::Polite,
 			)?;
-			assert!(
-				credit.peek() == plan.debt.keeper_jit,
-				"an exact withdrawal moves the whole debt"
-			);
+			if credit.peek() != plan.debt.keeper_jit {
+				defensive!("an exact withdrawal moves the whole debt");
+				return Err(DispatchError::Corruption);
+			}
 			// Dropping the credit burns it: the JIT leg cancelled exactly this debt.
 			drop(credit);
 		}
-		if let Err(jit_share) =
-			keeper_collateral.subsume(resolution.extract(plan.collateral.keeper_jit))
-		{
-			// Both halves came from the seized credit, so the merge cannot fail; refuse the
-			// settlement and let the dispatch roll back.
-			drop(jit_share);
-			return Err(DispatchError::Corruption);
-		}
+		// Both halves came from the seized credit, so the merge cannot fail; refuse the
+		// settlement and let the dispatch roll back.
+		keeper_collateral
+			.subsume(resolution.extract(plan.collateral.keeper_jit))
+			.map_err(|_| DispatchError::Corruption)?;
 		Self::resolve_collateral(keeper, keeper_collateral)
 	}
 
@@ -450,10 +446,8 @@ impl<T: Config> Pallet<T> {
 		credit: CollateralCreditOf<T>,
 	) -> DispatchResult {
 		let Err(credit) = credit.drop_zero() else { return Ok(()) };
-		T::CollateralAssets::resolve(recipient, credit).map_err(|credit| {
-			drop(credit);
-			Error::<T>::CollateralPayoutFailed.into()
-		})
+		T::CollateralAssets::resolve(recipient, credit)
+			.map_err(|_| Error::<T>::CollateralPayoutFailed.into())
 	}
 }
 
