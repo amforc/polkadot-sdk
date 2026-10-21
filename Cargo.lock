@@ -1826,6 +1826,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "asset-hub-westend-dotusd-integration-tests"
+version = "1.0.0"
+dependencies = [
+ "emulated-integration-tests-common",
+ "frame-support",
+ "frame-system",
+ "pallet-assets",
+ "pallet-aura",
+ "pallet-balances",
+ "pallet-linked-list",
+ "pallet-psm",
+ "pallet-redemptions",
+ "pallet-stability",
+ "pallet-timestamp",
+ "pallet-vaults",
+ "parachains-common",
+ "parity-scale-codec",
+ "sp-consensus-slots",
+ "sp-runtime 31.0.1",
+ "stablecoin-primitives",
+ "staging-xcm",
+ "westend-system-emulated-network",
+]
+
+[[package]]
 name = "asset-hub-westend-emulated-chain"
 version = "0.0.0"
 dependencies = [
@@ -1873,31 +1898,6 @@ dependencies = [
  "westend-runtime",
  "westend-system-emulated-network",
  "xcm-runtime-apis",
-]
-
-[[package]]
-name = "asset-hub-westend-pusd-integration-tests"
-version = "1.0.0"
-dependencies = [
- "emulated-integration-tests-common",
- "frame-support",
- "frame-system",
- "pallet-assets",
- "pallet-aura",
- "pallet-balances",
- "pallet-linked-list",
- "pallet-psm",
- "pallet-redemptions",
- "pallet-stability",
- "pallet-timestamp",
- "pallet-vaults",
- "parachains-common",
- "parity-scale-codec",
- "pusd-primitives",
- "sp-consensus-slots",
- "sp-runtime 31.0.1",
- "staging-xcm",
- "westend-system-emulated-network",
 ]
 
 [[package]]
@@ -2007,7 +2007,6 @@ dependencies = [
  "polkadot-primitives",
  "polkadot-runtime-common",
  "primitive-types 0.13.1",
- "pusd-primitives",
  "scale-info",
  "serde_json",
  "snowbridge-outbound-queue-primitives",
@@ -2038,6 +2037,7 @@ dependencies = [
  "sp-transaction-pool",
  "sp-trie 29.0.0",
  "sp-version 29.0.0",
+ "stablecoin-primitives",
  "staging-parachain-info",
  "staging-xcm",
  "staging-xcm-builder",

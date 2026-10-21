@@ -49,10 +49,10 @@ pallet-delegated-staking = { workspace = true }
 pallet-election-provider-multi-block = { workspace = true }
 pallet-fast-unstake = { workspace = true }
 pallet-indices = { workspace = true }
+pallet-linked-list = { workspace = true }
 pallet-meta-tx = { workspace = true }
 pallet-migrations = { workspace = true }
 pallet-multi-asset-bounties = { workspace = true }
-pallet-linked-list = { workspace = true }
 pallet-multisig = { workspace = true }
 pallet-nft-fractionalization = { workspace = true }
 pallet-nfts = { workspace = true }
@@ -70,10 +70,10 @@ pallet-referenda = { workspace = true }
 pallet-revive = { workspace = true }
 pallet-scheduler = { workspace = true }
 pallet-session = { workspace = true }
+pallet-stability = { workspace = true }
 pallet-staking = { workspace = true }
 pallet-staking-async = { workspace = true }
 pallet-staking-async-rc-client = { workspace = true, features = ["xcm-sender"] }
-pallet-stability = { workspace = true }
 pallet-staking-runtime-api = { workspace = true }
 pallet-state-trie-migration = { workspace = true }
 pallet-sudo = { workspace = true }
@@ -146,7 +146,7 @@ pallet-dap = { workspace = true }
 pallet-message-queue = { workspace = true }
 parachain-info = { workspace = true }
 parachains-common = { workspace = true }
-pusd-primitives = { workspace = true }
+stablecoin-primitives = { workspace = true }
 testnet-parachains-constants = { features = ["westend"], workspace = true }
 
 # Bridges
@@ -210,12 +210,12 @@ runtime-benchmarks = [
 	"pallet-election-provider-multi-block/runtime-benchmarks",
 	"pallet-fast-unstake/runtime-benchmarks",
 	"pallet-indices/runtime-benchmarks",
+	"pallet-linked-list/runtime-benchmarks",
 	"pallet-message-queue/runtime-benchmarks",
 	"pallet-meta-tx/runtime-benchmarks",
 	"pallet-migrations/runtime-benchmarks",
 	"pallet-multi-asset-bounties/runtime-benchmarks",
 	"pallet-multisig/runtime-benchmarks",
-	"pallet-linked-list/runtime-benchmarks",
 	"pallet-nft-fractionalization/runtime-benchmarks",
 	"pallet-nfts/runtime-benchmarks",
 	"pallet-nomination-pools-benchmarking/runtime-benchmarks",
@@ -229,10 +229,8 @@ runtime-benchmarks = [
 	"pallet-referenda/runtime-benchmarks",
 	"pallet-revive/runtime-benchmarks",
 	"pallet-scheduler/runtime-benchmarks",
-	"pallet-stability/runtime-benchmarks",
-	"pallet-vaults/runtime-benchmarks",
-	"pusd-primitives/runtime-benchmarks",
 	"pallet-session/runtime-benchmarks",
+	"pallet-stability/runtime-benchmarks",
 	"pallet-staking-async-rc-client/runtime-benchmarks",
 	"pallet-staking-async/runtime-benchmarks",
 	"pallet-staking/runtime-benchmarks",
@@ -243,6 +241,7 @@ runtime-benchmarks = [
 	"pallet-treasury/runtime-benchmarks",
 	"pallet-uniques/runtime-benchmarks",
 	"pallet-utility/runtime-benchmarks",
+	"pallet-vaults/runtime-benchmarks",
 	"pallet-verify-signature/runtime-benchmarks",
 	"pallet-vesting-precompiles/runtime-benchmarks",
 	"pallet-vesting/runtime-benchmarks",
@@ -260,6 +259,7 @@ runtime-benchmarks = [
 	"snowbridge-runtime-common/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
 	"sp-staking/runtime-benchmarks",
+	"stablecoin-primitives/runtime-benchmarks",
 	"westend-runtime-constants/runtime-benchmarks",
 	"westend-runtime/runtime-benchmarks",
 	"xcm-builder/runtime-benchmarks",
@@ -302,8 +302,8 @@ try-runtime = [
 	"pallet-election-provider-multi-block/try-runtime",
 	"pallet-fast-unstake/try-runtime",
 	"pallet-indices/try-runtime",
-	"pallet-message-queue/try-runtime",
 	"pallet-linked-list/try-runtime",
+	"pallet-message-queue/try-runtime",
 	"pallet-meta-tx/try-runtime",
 	"pallet-migrations/try-runtime",
 	"pallet-multi-asset-bounties/try-runtime",
@@ -343,11 +343,11 @@ try-runtime = [
 	"parachain-info/try-runtime",
 	"parachains-common/try-runtime",
 	"parachains-runtimes-test-utils/try-runtime",
-	"pusd-primitives/try-runtime",
 	"polkadot-runtime-common/try-runtime",
 	"snowbridge-pallet-system-frontend/try-runtime",
 	"snowbridge-runtime-common/try-runtime",
 	"sp-runtime/try-runtime",
+	"stablecoin-primitives/try-runtime",
 	"westend-runtime/try-runtime",
 ]
 std = [
@@ -446,7 +446,6 @@ std = [
 	"parachain-info/std",
 	"parachains-common/std",
 	"polkadot-parachain-primitives/std",
-	"pusd-primitives/std",
 	"polkadot-primitives/std",
 	"polkadot-runtime-common/std",
 	"primitive-types/std",
@@ -478,6 +477,7 @@ std = [
 	"sp-storage/std",
 	"sp-transaction-pool/std",
 	"sp-version/std",
+	"stablecoin-primitives/std",
 	"substrate-wasm-builder",
 	"testnet-parachains-constants/std",
 	"tracing/std",

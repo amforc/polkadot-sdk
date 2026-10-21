@@ -31,14 +31,14 @@ pub mod xcm_config;
 
 // Configurations for next functionality.
 mod bag_thresholds;
+pub mod dotusd_config;
 pub mod governance;
 #[cfg(not(feature = "runtime-benchmarks"))]
 mod migrations;
-pub mod pusd_config;
 pub mod staking;
 
+use dotusd_config::pallet_mock_oracle;
 use governance::{pallet_custom_origins, GeneralAdmin, StakingAdmin};
-use pusd_config::pallet_mock_oracle;
 
 extern crate alloc;
 

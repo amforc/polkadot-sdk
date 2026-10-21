@@ -1,5 +1,5 @@
 [package]
-name = "asset-hub-westend-pusd-integration-tests"
+name = "asset-hub-westend-dotusd-integration-tests"
 version = "1.0.0"
 authors.workspace = true
 edition.workspace = true
@@ -25,9 +25,9 @@ pallet-redemptions = { workspace = true, default-features = true }
 pallet-stability = { workspace = true, default-features = true }
 pallet-timestamp = { workspace = true, default-features = true }
 pallet-vaults = { workspace = true, default-features = true }
-pusd-primitives = { workspace = true, default-features = true }
 sp-consensus-slots = { workspace = true, default-features = true }
 sp-runtime = { workspace = true, default-features = true }
+stablecoin-primitives = { workspace = true, default-features = true }
 
 # Polkadot
 xcm = { workspace = true }

@@ -18,7 +18,7 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
-	pusd_config::{StabilityCollateral, TrustBackedAssetLocation, VaultsCollateral},
+	dotusd_config::{StabilityCollateral, TrustBackedAssetLocation, VaultsCollateral},
 	Balances, Vaults,
 };
 use emulated_integration_tests_common::{snowbridge::SEPOLIA_ID, USDT_ID};
@@ -46,13 +46,13 @@ fn usdt_id() -> VaultsCollateralId {
 	TrustBackedAssetLocation::convert_back(&USDT_ID).expect("trust-backed ids have a location")
 }
 
-fn eth_price(pusd_per_eth: u128) -> FixedU128 {
-	FixedU128::from_rational(pusd_per_eth * PUSD, ETH)
+fn eth_price(dotusd_per_eth: u128) -> FixedU128 {
+	FixedU128::from_rational(dotusd_per_eth * DOTUSD, ETH)
 }
 
 /// One stablecoin, three markets: native WND, trust-backed USDT, bridged ETH.
 ///
-/// Each vault pledges 20,000 pUSD of value against 10,000 pUSD of debt. The
+/// Each vault pledges 20,000 dotUSD of value against 10,000 dotUSD of debt. The
 /// three differ only in the collateral pallet and the decimals.
 #[test]
 fn native_trust_backed_and_foreign_collateral_markets_coexist() {
@@ -60,26 +60,26 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 		feed_price(dot_price(2, 1));
 		create_branch(&BranchSpec::default());
 
-		feed_price_for(usdt_id(), FixedU128::from_rational(PUSD, USDT)); // at par
+		feed_price_for(usdt_id(), FixedU128::from_rational(DOTUSD, USDT)); // at par
 		create_market_signed(usdt_id(), &BranchSpec::default());
 
 		feed_price_for(eth_id(), eth_price(2_000));
 		create_market_signed(eth_id(), &BranchSpec::default());
 
 		let native_owner = acct(1);
-		open_vault(&native_owner, 10_000 * WND, 10_000 * PUSD, FixedU128::zero());
+		open_vault(&native_owner, 10_000 * WND, 10_000 * DOTUSD, FixedU128::zero());
 		let usdt_owner = acct(2);
-		open_vault_on(usdt_id(), &usdt_owner, 20_000 * USDT, 10_000 * PUSD, FixedU128::zero());
+		open_vault_on(usdt_id(), &usdt_owner, 20_000 * USDT, 10_000 * DOTUSD, FixedU128::zero());
 		let eth_owner = acct(3);
-		open_vault_on(eth_id(), &eth_owner, 10 * ETH, 10_000 * PUSD, FixedU128::zero());
+		open_vault_on(eth_id(), &eth_owner, 10 * ETH, 10_000 * DOTUSD, FixedU128::zero());
 
 		assert_eq!(vault(&native_owner).collateral, 10_000 * WND);
 		assert_eq!(vault_on(&usdt_id(), &usdt_owner).collateral, 20_000 * USDT);
 		assert_eq!(vault_on(&eth_id(), &eth_owner).collateral, 10 * ETH);
 		// Same debt, same stablecoin, three collaterals.
-		assert_eq!(pusd_balance(&native_owner), 10_000 * PUSD);
-		assert_eq!(pusd_balance(&usdt_owner), 10_000 * PUSD);
-		assert_eq!(pusd_balance(&eth_owner), 10_000 * PUSD);
+		assert_eq!(dotusd_balance(&native_owner), 10_000 * DOTUSD);
+		assert_eq!(dotusd_balance(&usdt_owner), 10_000 * DOTUSD);
+		assert_eq!(dotusd_balance(&eth_owner), 10_000 * DOTUSD);
 
 		// Each asset pallet holds exactly the vault collateral. The minimum-balance float
 		// is free but not reducible while the hold keeps the account alive.
@@ -106,13 +106,13 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 		}
 
 		// A branch ceiling binds one market only. Lowered to the native market's
-		// 10,000 pUSD of debt, it refuses the next native vault while the USDT
+		// 10,000 dotUSD of debt, it refuses the next native vault while the USDT
 		// market keeps lending.
 		assert_ok!(Vaults::set_param(
 			RuntimeOrigin::signed(admin()),
 			get_native_id(),
-			PUSD_ID,
-			BranchConfigUpdate::DebtCeiling(10_000 * PUSD),
+			DOTUSD_ID,
+			BranchConfigUpdate::DebtCeiling(10_000 * DOTUSD),
 		));
 		let late_owner = acct(4);
 		fund_dot(&late_owner, 1_000 * WND);
@@ -121,9 +121,9 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 			Vaults::open_vault(
 				RuntimeOrigin::signed(late_owner.clone()),
 				get_native_id(),
-				PUSD_ID,
+				DOTUSD_ID,
 				1_000 * WND,
-				1_000 * PUSD,
+				1_000 * DOTUSD,
 				FixedU128::zero(),
 				pallet_linked_list::Position::endpoints_only(),
 			),
@@ -133,7 +133,7 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 			usdt_id(),
 			&late_owner,
 			2_000 * USDT,
-			1_000 * PUSD,
+			1_000 * DOTUSD,
 			FixedU128::zero()
 		));
 	});
@@ -149,29 +149,29 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 #[test]
 fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 	AssetHubWestend::execute_with(|| {
-		create_pusd();
+		create_dotusd();
 		feed_price_for(eth_id(), eth_price(2_000));
 
 		// The full admin funds both custody seeds and the pool's stablecoin float.
 		assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&admin(), 1_000 * WND));
 		fund_collateral(&eth_id(), &admin(), 2 * collateral_min_balance(&eth_id()));
-		mint_pusd(&admin(), 2 * PUSD_MIN_BALANCE);
+		mint_dotusd(&admin(), 2 * DOTUSD_MIN_BALANCE);
 
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::root(),
 			eth_id(),
-			PUSD_ID,
+			DOTUSD_ID,
 			branch_admins(),
 			branch_config(&eth_id(), &BranchSpec::default()),
 			registration_config(),
 		));
-		assert!(pallet_vaults::Branches::<Runtime>::get(eth_id(), PUSD_ID).is_some());
+		assert!(pallet_vaults::Branches::<Runtime>::get(eth_id(), DOTUSD_ID).is_some());
 
 		// The pool can now take a gain below the collateral's minimum balance: the
 		// full admin's float sits in the account.
-		let pool = pallet_stability::Pallet::<Runtime>::pool_account(&eth_id(), &PUSD_ID);
+		let pool = pallet_stability::Pallet::<Runtime>::pool_account(&eth_id(), &DOTUSD_ID);
 		assert_eq!(collateral_free(&eth_id(), &pool), collateral_min_balance(&eth_id()));
-		assert_eq!(pusd_balance(&pool), PUSD_MIN_BALANCE);
+		assert_eq!(dotusd_balance(&pool), DOTUSD_MIN_BALANCE);
 		assert_eq!(collateral_free(&eth_id(), &admin()), collateral_min_balance(&eth_id()));
 		assert_ok!(<StabilityCollateral as Inspect<AccountId>>::can_deposit(
 			eth_id(),
@@ -184,20 +184,20 @@ fn root_registers_a_foreign_collateral_market_charging_the_admin() {
 }
 
 /// Repeats the native liquidation scenario with ETH collateral. Seizure caps at
-/// debt × 1.05 in value. The keeper takes 2 pUSD flat plus 0.1% of the seizure.
+/// debt × 1.05 in value. The keeper takes 2 dotUSD flat plus 0.1% of the seizure.
 /// The rest goes to the pool, and the sole depositor claims all of it.
 #[test]
 fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 	AssetHubWestend::execute_with(|| {
-		create_pusd();
+		create_dotusd();
 		// The vault deposit is priced in WND, so the WND feed must exist too.
 		feed_price(dot_price(2, 1));
 		feed_price_for(eth_id(), eth_price(4_000));
 		create_market_signed(eth_id(), &liquidation_spec());
 
-		// 6 ETH against 10,000 pUSD debt: CR 240% at 4,000, 120% at 2,000.
+		// 6 ETH against 10,000 dotUSD debt: CR 240% at 4,000, 120% at 2,000.
 		let liquidated_owner = acct(1);
-		open_vault_on(eth_id(), &liquidated_owner, 6 * ETH, 10_000 * PUSD, FixedU128::zero());
+		open_vault_on(eth_id(), &liquidated_owner, 6 * ETH, 10_000 * DOTUSD, FixedU128::zero());
 		// The deposit is priced at open; the price move below does not re-price the ticket.
 		let (deposit_asset, deposit) = expected_vault_deposit(&eth_id(), &liquidated_owner);
 		assert_eq!(deposit_asset, eth_id());
@@ -208,12 +208,12 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 			eth_id(),
 			&filler_owner,
 			ETHER_SUPPLY_LIVE - 6 * ETH,
-			10_000 * PUSD,
+			10_000 * DOTUSD,
 			FixedU128::zero(),
 		);
 
 		let depositor = acct(3);
-		sp_deposit_matured_on(eth_id(), &depositor, 20_000 * PUSD);
+		sp_deposit_matured_on(eth_id(), &depositor, 20_000 * DOTUSD);
 
 		feed_price_for(eth_id(), eth_price(2_000)); // CR 120% < MCR 125%
 
@@ -227,15 +227,15 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 			collateral_free(&eth_id(), &liquidated_owner) - owner_free_before,
 			750_000_000_000_000_000 + deposit,
 		);
-		// keeper = 2 pUSD flat / 2,000 + 5.25 × 0.1% = 0.001 + 0.00525 ETH.
+		// keeper = 2 dotUSD flat / 2,000 + 5.25 × 0.1% = 0.001 + 0.00525 ETH.
 		assert_eq!(
 			collateral_free(&eth_id(), &keeper) - collateral_min_balance(&eth_id()),
 			6_250_000_000_000_000,
 		);
-		// The pool burns the full 10,000 pUSD debt and receives 5.25 − 0.00625 = 5.24375 ETH,
+		// The pool burns the full 10,000 dotUSD debt and receives 5.25 − 0.00625 = 5.24375 ETH,
 		// on top of the custody float of one minimum per asset.
 		let pool = pool_account_on(&eth_id());
-		assert_eq!(pusd_balance(&pool) - PUSD_MIN_BALANCE, 10_000 * PUSD);
+		assert_eq!(dotusd_balance(&pool) - DOTUSD_MIN_BALANCE, 10_000 * DOTUSD);
 		assert_eq!(
 			collateral_free(&eth_id(), &pool) - collateral_min_balance(&eth_id()),
 			5_243_750_000_000_000_000
@@ -245,8 +245,8 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 
 		// The sole depositor's gain is the whole pool collateral.
 		claim_collateral_out(&eth_id(), &depositor, 5_243_750_000_000_000_000);
-		// The claim realizes the row. Half of the 20,000 pUSD deposit burned, so P halved.
-		assert_eq!(deposit_row_on(&eth_id(), &depositor).active_deposit, 10_000 * PUSD);
+		// The claim realizes the row. Half of the 20,000 dotUSD deposit burned, so P halved.
+		assert_eq!(deposit_row_on(&eth_id(), &depositor).active_deposit, 10_000 * DOTUSD);
 	});
 }
 
@@ -254,19 +254,19 @@ fn foreign_collateral_liquidation_offsets_and_claims_out_of_the_pool() {
 #[test]
 fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 	AssetHubWestend::execute_with(|| {
-		create_pusd();
+		create_dotusd();
 		// The vault deposit is priced in WND, so the WND feed must exist too.
 		feed_price(dot_price(2, 1));
-		feed_price_for(usdt_id(), FixedU128::from_rational(PUSD, USDT)); // at par
+		feed_price_for(usdt_id(), FixedU128::from_rational(DOTUSD, USDT)); // at par
 		create_market_signed(usdt_id(), &accounting_spec());
 
-		// 14,000 USDT against 10,000 pUSD debt: CR 140% at par, 117.6% at 0.84.
+		// 14,000 USDT against 10,000 dotUSD debt: CR 140% at par, 117.6% at 0.84.
 		let liquidated_owner = acct(1);
 		open_vault_on(
 			usdt_id(),
 			&liquidated_owner,
 			14_000 * USDT,
-			10_000 * PUSD,
+			10_000 * DOTUSD,
 			FixedU128::zero(),
 		);
 		// The deposit is priced at open; the price move below does not re-price the ticket.
@@ -274,14 +274,20 @@ fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 		assert_eq!(deposit_asset, usdt_id());
 		// A healthy vault keeps the branch populated and out of Safety Mode after the liquidation.
 		let filler_owner = acct(2);
-		open_vault_on(usdt_id(), &filler_owner, 1_000_000 * USDT, 10_000 * PUSD, FixedU128::zero());
+		open_vault_on(
+			usdt_id(),
+			&filler_owner,
+			1_000_000 * USDT,
+			10_000 * DOTUSD,
+			FixedU128::zero(),
+		);
 
 		// The depositor holds no USDT. A stablecoin deposit is enough to earn collateral gains.
 		let depositor = acct(3);
-		sp_deposit_matured_on(usdt_id(), &depositor, 25_000 * PUSD);
+		sp_deposit_matured_on(usdt_id(), &depositor, 25_000 * DOTUSD);
 		assert_eq!(collateral_free(&usdt_id(), &depositor), 0);
 
-		feed_price_for(usdt_id(), FixedU128::from_rational(84 * PUSD, 100 * USDT));
+		feed_price_for(usdt_id(), FixedU128::from_rational(84 * DOTUSD, 100 * USDT));
 		liquidate_on(usdt_id(), &liquidated_owner);
 
 		// seized = min(14,000, 10,000 × 1.05 / 0.84) = 12,500 USDT, all to the
@@ -291,8 +297,8 @@ fn trust_backed_collateral_gains_claim_out_to_the_depositor() {
 			1_500 * USDT + collateral_min_balance(&usdt_id()) + deposit,
 		);
 		claim_collateral_out(&usdt_id(), &depositor, 12_500 * USDT);
-		// The claim realizes the row. 10,000 of the 25,000 pUSD deposit burned, so P = 0.6.
-		assert_eq!(deposit_row_on(&usdt_id(), &depositor).active_deposit, 15_000 * PUSD);
+		// The claim realizes the row. 10,000 of the 25,000 dotUSD deposit burned, so P = 0.6.
+		assert_eq!(deposit_row_on(&usdt_id(), &depositor).active_deposit, 15_000 * DOTUSD);
 	});
 }
 
@@ -305,13 +311,13 @@ fn reservable_id() -> VaultsCollateralId {
 }
 
 /// The vault deposit settles in the collateral when that is a sufficient asset, priced from
-/// the oracle: WND at 2 pUSD and USDT at par, so one WND of deposit costs two USDT.
+/// the oracle: WND at 2 dotUSD and USDT at par, so one WND of deposit costs two USDT.
 #[test]
 fn sufficient_collateral_settles_the_vault_deposit_in_itself() {
 	AssetHubWestend::execute_with(|| {
-		create_pusd();
+		create_dotusd();
 		feed_price(dot_price(2, 1));
-		feed_price_for(usdt_id(), FixedU128::from_rational(PUSD, USDT)); // at par
+		feed_price_for(usdt_id(), FixedU128::from_rational(DOTUSD, USDT)); // at par
 		create_market_signed(usdt_id(), &BranchSpec::default());
 		feed_price_for(eth_id(), eth_price(2_000));
 		create_market_signed(eth_id(), &BranchSpec::default());
@@ -323,7 +329,7 @@ fn sufficient_collateral_settles_the_vault_deposit_in_itself() {
 		assert_eq!(native_deposit_asset, get_native_id());
 		let (usdt_deposit_asset, usdt_deposit) = expected_vault_deposit(&usdt_id(), &usdt_owner);
 		assert_eq!(usdt_deposit_asset, usdt_id());
-		// 2 pUSD per WND at 1 pUSD per USDT, in each asset's own decimals, rounded up and
+		// 2 dotUSD per WND at 1 dotUSD per USDT, in each asset's own decimals, rounded up and
 		// floored at the asset's minimum balance. The USDT row is a few bytes larger than the
 		// WND row (a longer collateral id in key and ticket), which the WND price ignores.
 		let usdt_quoted = (native_deposit * 2 * USDT).div_ceil(WND);
@@ -335,28 +341,28 @@ fn sufficient_collateral_settles_the_vault_deposit_in_itself() {
 		assert!(eth_deposit >= eth_quoted.max(collateral_min_balance(&eth_id())));
 		assert!(eth_deposit <= (eth_quoted * 11).div_ceil(10));
 
-		open_vault_on(usdt_id(), &usdt_owner, 20_000 * USDT, 10_000 * PUSD, FixedU128::zero());
+		open_vault_on(usdt_id(), &usdt_owner, 20_000 * USDT, 10_000 * DOTUSD, FixedU128::zero());
 		assert_eq!(vault_deposit_on_hold(&usdt_id(), &usdt_owner), usdt_deposit);
 		assert_eq!(vault_deposit_on_hold(&get_native_id(), &usdt_owner), 0);
 
-		open_vault_on(eth_id(), &eth_owner, 10 * ETH, 10_000 * PUSD, FixedU128::zero());
+		open_vault_on(eth_id(), &eth_owner, 10 * ETH, 10_000 * DOTUSD, FixedU128::zero());
 		assert_eq!(vault_deposit_on_hold(&eth_id(), &eth_owner), eth_deposit);
 		assert_eq!(vault_deposit_on_hold(&get_native_id(), &eth_owner), 0);
 
 		// Closing the vault returns the deposit in the asset it was taken in.
-		mint_pusd(&usdt_owner, 1_000 * PUSD);
+		mint_dotusd(&usdt_owner, 1_000 * DOTUSD);
 		assert_ok!(Vaults::repay_for(
 			RuntimeOrigin::signed(usdt_owner.clone()),
 			usdt_id(),
-			PUSD_ID,
+			DOTUSD_ID,
 			usdt_owner.clone(),
-			Some(100_000 * PUSD),
+			Some(100_000 * DOTUSD),
 		));
 		let free_before_close = collateral_free(&usdt_id(), &usdt_owner);
 		assert_ok!(Vaults::close_vault(
 			RuntimeOrigin::signed(usdt_owner.clone()),
 			usdt_id(),
-			PUSD_ID,
+			DOTUSD_ID,
 			None,
 		));
 		assert_eq!(vault_deposit_on_hold(&usdt_id(), &usdt_owner), 0);
@@ -371,7 +377,7 @@ fn sufficient_collateral_settles_the_vault_deposit_in_itself() {
 #[test]
 fn insufficient_collateral_settles_the_vault_deposit_in_wnd() {
 	AssetHubWestend::execute_with(|| {
-		create_pusd();
+		create_dotusd();
 		feed_price_for(reservable_id(), dot_price(2, 1));
 		create_market_signed(reservable_id(), &BranchSpec::default());
 
@@ -389,9 +395,9 @@ fn insufficient_collateral_settles_the_vault_deposit_in_wnd() {
 			Vaults::open_vault(
 				RuntimeOrigin::signed(owner.clone()),
 				reservable_id(),
-				PUSD_ID,
+				DOTUSD_ID,
 				10_000 * WND,
-				10_000 * PUSD,
+				10_000 * DOTUSD,
 				FixedU128::zero(),
 				pallet_linked_list::Position::endpoints_only(),
 			)
@@ -409,8 +415,8 @@ fn insufficient_collateral_settles_the_vault_deposit_in_wnd() {
 #[test]
 fn unpriceable_sufficient_collateral_cannot_open_a_vault() {
 	AssetHubWestend::execute_with(|| {
-		create_pusd();
-		feed_price_for(usdt_id(), FixedU128::from_rational(PUSD, USDT)); // at par
+		create_dotusd();
+		feed_price_for(usdt_id(), FixedU128::from_rational(DOTUSD, USDT)); // at par
 		create_market_signed(usdt_id(), &BranchSpec::default());
 
 		let owner = acct(1);
@@ -419,9 +425,9 @@ fn unpriceable_sufficient_collateral_cannot_open_a_vault() {
 			Vaults::open_vault(
 				RuntimeOrigin::signed(owner.clone()),
 				usdt_id(),
-				PUSD_ID,
+				DOTUSD_ID,
 				20_000 * USDT,
-				10_000 * PUSD,
+				10_000 * DOTUSD,
 				FixedU128::zero(),
 				pallet_linked_list::Position::endpoints_only(),
 			),
@@ -433,9 +439,9 @@ fn unpriceable_sufficient_collateral_cannot_open_a_vault() {
 		hypothetically_ok!(Vaults::open_vault(
 			RuntimeOrigin::signed(owner.clone()),
 			usdt_id(),
-			PUSD_ID,
+			DOTUSD_ID,
 			20_000 * USDT,
-			10_000 * PUSD,
+			10_000 * DOTUSD,
 			FixedU128::zero(),
 			pallet_linked_list::Position::endpoints_only(),
 		));

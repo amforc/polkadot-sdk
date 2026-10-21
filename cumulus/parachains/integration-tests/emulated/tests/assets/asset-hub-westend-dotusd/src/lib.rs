@@ -33,7 +33,7 @@ mod imports {
 	};
 	pub(crate) use westend_system_emulated_network::{
 		asset_hub_westend_emulated_chain::asset_hub_westend_runtime::{
-			self, pusd_config::VaultsCollateralId, Runtime, RuntimeOrigin,
+			self, dotusd_config::VaultsCollateralId, Runtime, RuntimeOrigin,
 		},
 		AssetHubWestendPara as AssetHubWestend,
 	};
