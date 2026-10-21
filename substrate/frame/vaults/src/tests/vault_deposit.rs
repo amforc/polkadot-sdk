@@ -3,13 +3,13 @@
 //! The mock settles in the collateral when it is native or sufficient and in native otherwise,
 //! and re-prices sufficient collateral through the oracle or a mock fallback quote.
 
-use crate::{mock::*, tests::rate_pct};
+use crate::{mock::*, tests::percent};
 use frame::{prelude::TokenError, traits::Footprint};
 
 const OWNER: AccountId = 1;
 
 fn default_rate() -> FixedU128 {
-	rate_pct(5, 100)
+	percent(5)
 }
 
 fn repay_all(owner: AccountId, collateral: AssetId, stable: StableId) {
@@ -49,8 +49,8 @@ fn native_collateral_pays_the_deposit_in_native() {
 fn sufficient_collateral_pays_the_deposit_in_that_asset_at_the_oracle_rate() {
 	build_and_execute(|| {
 		// 250 native at 10 each are worth 2_500; at 40 per ETH that is 62.5, rounded up.
-		register_market_with(ETH, PUSD, FixedU128::from_rational(40, 1), default_branch_config());
-		set_price(DOT, FixedU128::from_rational(10, 1));
+		register_market_with(ETH, PUSD, FixedU128::from_u32(40), default_branch_config());
+		set_price(DOT, DEFAULT_PRICE);
 		let free_before = collateral_balance(ETH, OWNER);
 
 		assert_ok!(open(OWNER, ETH, PUSD, 1_000, 500, default_rate()));
@@ -92,14 +92,14 @@ fn insufficient_collateral_falls_back_to_native() {
 #[test]
 fn close_refunds_the_original_ticket_to_the_owner_after_a_price_change() {
 	build_and_execute(|| {
-		register_market_with(ETH, PUSD, FixedU128::from_rational(40, 1), default_branch_config());
-		set_price(DOT, FixedU128::from_rational(10, 1));
+		register_market_with(ETH, PUSD, FixedU128::from_u32(40), default_branch_config());
+		set_price(DOT, DEFAULT_PRICE);
 		assert_ok!(open(OWNER, ETH, PUSD, 1_000, 500, default_rate()));
 		assert_eq!(vault_deposit_held(ETH, OWNER), 63);
 		repay_all(OWNER, ETH, PUSD);
 
 		// The current quote is now lower, but the stored ticket still refunds the original 63.
-		set_price(ETH, FixedU128::from_rational(80, 1));
+		set_price(ETH, FixedU128::from_u32(80));
 		let owner_before = collateral_balance(ETH, OWNER);
 		let recipient_before = collateral_balance(ETH, 2);
 

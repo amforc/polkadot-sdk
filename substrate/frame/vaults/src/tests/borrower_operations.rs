@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{rate_pct, ONE_DAY_MS},
+	tests::{percent, ONE_DAY_MS},
 };
 
 // `close_vault` requires zero debt; with debt outstanding it returns
@@ -9,7 +9,7 @@ use crate::{
 fn close_with_outstanding_debt_reverts() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 		assert_noop!(close_vault(1, DOT, PUSD, None), crate::Error::<Test>::DebtOutstanding);
 	});
 }
@@ -21,7 +21,7 @@ fn repay_into_dust_window_reverts() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// borrow=1000, min_debt=200. Repay 850 would leave 150 < 200.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, percent(5)));
 		assert_noop!(repay(1, DOT, PUSD, 1, Some(850)), crate::Error::<Test>::DebtWouldBecomeDust);
 	});
 }
@@ -32,7 +32,7 @@ fn repay_into_dust_window_reverts() {
 fn withdraw_more_than_held_reverts() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 		assert_noop!(
 			withdraw_collateral(1, DOT, PUSD, 2_000, None),
 			crate::Error::<Test>::InsufficientCollateral
@@ -44,7 +44,7 @@ fn withdraw_more_than_held_reverts() {
 fn withdraw_breaking_cr_reverts() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 		// 1000 DOT @ $10 backs 500 pUSD — withdrawing 950 leaves
 		// 50 DOT × $10 = $500, CR == 100% < ICR 120%.
 		assert_noop!(
@@ -62,12 +62,12 @@ fn zero_amounts_are_rejected_without_touching_the_vault() {
 		|| repay(1, DOT, PUSD, 1, Some(0)),
 		|| withdraw_collateral(1, DOT, PUSD, 0, None),
 		|| deposit_collateral(1, DOT, PUSD, 1, 0),
-		|| borrow(1, DOT, PUSD, 0, Some(rate_pct(10, 100))),
+		|| borrow(1, DOT, PUSD, 0, Some(percent(10))),
 	];
 	for call in calls {
 		build_and_execute(|| {
 			register_market(DOT, PUSD);
-			assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(50, 100)));
+			assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, percent(50)));
 			advance_time(ONE_DAY_MS);
 			MockOracleAvailable::set(false);
 
@@ -85,11 +85,11 @@ fn zero_amounts_are_rejected_without_touching_the_vault() {
 fn repay_for_allowed_in_safety_mode() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 5_000, percent(5)));
 		// Drop price into Safety (TCR ≈ 126%, between ICR 120% and Safety 130%).
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		let tcr_before = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
-		assert!(tcr_before < rate_pct(130, 100), "setup must leave the branch in Safety mode");
+		assert!(tcr_before < percent(130), "setup must leave the branch in Safety mode");
 		assert_ok!(repay(1, DOT, PUSD, 1, Some(2_000)));
 		let tcr_after = crate::Pallet::<Test>::branch_tcr(DOT, PUSD).expect("tcr");
 		assert!(tcr_after > tcr_before, "repay improves branch TCR even in Safety mode");
@@ -104,23 +104,17 @@ fn repay_for_allowed_in_safety_mode() {
 fn change_rate_to_same_rate_is_no_op() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 5_000, 10_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 5_000, 10_000, percent(5)));
 		let pre = vault(DOT, PUSD, 1);
 		advance_time(ONE_DAY_MS); // one day of pending interest
-		let now = pallet_timestamp::Pallet::<Test>::get();
+		let now = Timestamp::get();
 		assert_eq!(
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(
-				DOT,
-				PUSD,
-				1,
-				0,
-				Some(rate_pct(5, 100))
-			)
-			.expect("registered market and vault"),
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 0, Some(percent(5)))
+				.expect("registered market and vault"),
 			0,
 			"the quote must reflect that an unchanged rate is a no-op"
 		);
-		assert_ok!(change_rate(1, DOT, PUSD, rate_pct(5, 100)));
+		assert_ok!(change_rate(1, DOT, PUSD, percent(5)));
 		let post = vault(DOT, PUSD, 1);
 		// Rate, principal and cooldown clock are untouched (no real rate change).
 		assert_eq!(post.annual_rate, pre.annual_rate);
@@ -129,6 +123,6 @@ fn change_rate_to_same_rate_is_no_op() {
 		// But interest is settled: ceil(10_000 * 0.05 * 1day / year) = 2, and no upfront fee is
 		// added (which would have pushed debt.interest higher).
 		assert_eq!(post.debt.interest, pre.debt.interest + 2);
-		assert_eq!(post.last_interest_time, branch_state(DOT, PUSD).unwrap().interest_time(now));
+		assert_eq!(post.last_interest_time, market_state(DOT, PUSD).interest_time(now));
 	});
 }

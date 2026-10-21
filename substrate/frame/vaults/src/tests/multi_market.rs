@@ -8,7 +8,7 @@
 use crate::{
 	mock::*,
 	pallet::StablecoinDebt,
-	tests::{rate_pct, ONE_YEAR_MS},
+	tests::{percent, ONE_YEAR_MS},
 };
 use pusd_primitives::{CollateralRatio, VaultInterface};
 
@@ -25,15 +25,15 @@ fn owner_runs_markets_independently_through_redemption_and_close() {
 		build_and_execute(|| {
 			register_market(DOT, PUSD);
 			register_market(collateral.clone(), stable);
-			assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-			assert_ok!(open(1, collateral.clone(), stable, amount, debt, rate_pct(pct, 100)));
+			assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, percent(5)));
+			assert_ok!(open(1, collateral.clone(), stable, amount, debt, percent(pct)));
 			assert_eq!((stable_balance(PUSD, 1), stable_balance(stable, 1)), balances);
 			assert_eq!((held(DOT, 1), held(collateral.clone(), 1)), holds);
 			let dot = vault(DOT, PUSD, 1);
 			let other = vault(collateral.clone(), stable, 1);
 			assert_eq!((dot.collateral, dot.debt.principal), (1_000, 2_000));
 			assert_eq!((other.collateral, other.debt.principal), (amount, debt));
-			assert_eq!(branch_state(DOT, PUSD).expect("market").debt.principal, 2_000);
+			assert_eq!(market_state(DOT, PUSD).debt.principal, 2_000);
 			let other_state = branch_state(collateral.clone(), stable).expect("market");
 			assert_eq!(other_state.debt.principal, debt);
 
@@ -62,18 +62,18 @@ fn stablecoin_debt_sums_the_markets_issuing_that_coin() {
 		register_market(ETH, PUSD);
 		register_market(ETH, EUSD);
 
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open(1, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
-		assert_ok!(open(2, ETH, EUSD, 1_000, 4_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, percent(5)));
+		assert_ok!(open(1, ETH, PUSD, 1_000, 3_000, percent(7)));
+		assert_ok!(open(2, ETH, EUSD, 1_000, 4_000, percent(5)));
 
 		// Principal plus each market's own upfront fee.
 		// ceil(principal × rate × 7 / 365.25): 2_000 × 5% → 2, 3_000 × 7% → 5,
 		// and 4_000 × 5% → 4.
 		assert_eq!(
 			(
-				branch_state(DOT, PUSD).expect("market").debt.outstanding(),
-				branch_state(ETH, PUSD).expect("market").debt.outstanding(),
-				branch_state(ETH, EUSD).expect("market").debt.outstanding(),
+				market_state(DOT, PUSD).debt.outstanding(),
+				market_state(ETH, PUSD).debt.outstanding(),
+				market_state(ETH, EUSD).debt.outstanding(),
 			),
 			(2_002, 3_005, 4_004),
 		);
@@ -98,8 +98,8 @@ fn stablecoin_debt_accrues_interest_across_untouched_markets() {
 		register_market(DOT, PUSD);
 		register_market(ETH, PUSD);
 
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open(2, ETH, PUSD, 1_000, 3_000, rate_pct(7, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, percent(5)));
+		assert_ok!(open(2, ETH, PUSD, 1_000, 3_000, percent(7)));
 		let stored = StablecoinDebt::<Test>::get(PUSD);
 		// Principal plus the upfront fee of each open: 2_000 + ceil(2_000 · 5% · 7d / 365.25d)
 		// = 2_002 and 3_000 + ceil(3_000 · 7% · 7d / 365.25d) = 3_005.
@@ -126,13 +126,13 @@ fn liquidation_stays_inside_its_market() {
 		register_market(ETH, EUSD);
 
 		// Two PUSD-market vaults so the liquidatee is not the last stake-bearer.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(5)));
 		// An untouched vault on the other market.
-		assert_ok!(open(3, ETH, EUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(3, ETH, EUSD, 1_000, 500, percent(5)));
 
 		let other_vault = vault(ETH, EUSD, 3);
-		let other_state = branch_state(ETH, EUSD).unwrap();
+		let other_state = market_state(ETH, EUSD);
 		let other_hold = held(ETH, 3);
 
 		// Drop DOT so owner 1 falls below MCR, then liquidate it.
@@ -141,7 +141,7 @@ fn liquidation_stays_inside_its_market() {
 
 		// The ETH/EUSD market is byte-for-byte untouched.
 		assert_eq!(vault(ETH, EUSD, 3), other_vault);
-		assert_eq!(branch_state(ETH, EUSD).unwrap(), other_state);
+		assert_eq!(market_state(ETH, EUSD), other_state);
 		assert_eq!(held(ETH, 3), other_hold);
 	});
 }
@@ -153,7 +153,7 @@ fn liquidation_stays_inside_its_market() {
 fn yield_accrues_in_the_markets_own_coin() {
 	build_and_execute(|| {
 		register_market(ETH, EUSD);
-		assert_ok!(open(1, ETH, EUSD, 100_000, 5_000, rate_pct(50, 100)));
+		assert_ok!(open(1, ETH, EUSD, 100_000, 5_000, percent(50)));
 
 		let pusd_before = total_stable(PUSD);
 		let interest_before = vault(ETH, EUSD, 1).debt.interest;
@@ -181,11 +181,11 @@ fn cr_differs_across_markets_when_prices_differ() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		register_market(ETH, EUSD);
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
-		set_price(ETH, FixedU128::from_rational(20u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
+		set_price(ETH, FixedU128::from_u32(20));
 
-		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, rate_pct(5, 100)));
-		assert_ok!(open(2, ETH, EUSD, 1_000, 2_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 2_000, percent(5)));
+		assert_ok!(open(2, ETH, EUSD, 1_000, 2_000, percent(5)));
 
 		let cr_dot = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).unwrap();
 		let cr_eth = crate::Pallet::<Test>::vault_cr(ETH, EUSD, 2).unwrap();

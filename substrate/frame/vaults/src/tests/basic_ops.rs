@@ -1,7 +1,7 @@
 use crate::{
 	mock::*,
 	pallet::Vaults,
-	tests::{assert_event, rate_pct, vault_events, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{assert_event, percent, rate_pct, vault_events, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 };
 use pallet_linked_list::SortedListInterface;
 
@@ -9,7 +9,7 @@ use pallet_linked_list::SortedListInterface;
 fn deposits_then_borrow_update_vault_and_emit_third_party_source() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 		// +200 collateral.
 		assert_ok!(deposit_collateral(1, DOT, PUSD, 1, 200));
 		assert_ok!(deposit_collateral(2, DOT, PUSD, 1, 100));
@@ -33,7 +33,7 @@ fn deposits_then_borrow_update_vault_and_emit_third_party_source() {
 		// up to the whole unit, so nothing reaches FEE_DEST.
 		assert_eq!(stable_balance(PUSD, FEE_DEST), 0);
 		// Branch aggregate mirrors the vault principal.
-		assert_eq!(branch_state(DOT, PUSD).unwrap().debt.principal, 800);
+		assert_eq!(market_state(DOT, PUSD).debt.principal, 800);
 		// pUSD net to user: initial 500 + 300 borrowed. The upfront fee is recorded as
 		// debt, not deducted from the minted pUSD the user receives.
 		assert_eq!(stable_balance(PUSD, 1), 800);
@@ -44,7 +44,7 @@ fn deposits_then_borrow_update_vault_and_emit_third_party_source() {
 fn borrow_with_recipient_mints_to_recipient_not_owner() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 2_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 2_000, 500, percent(5)));
 		let owner_pre = stable_balance(PUSD, 1);
 		let recipient_pre = stable_balance(PUSD, 4);
 
@@ -77,7 +77,7 @@ fn withdraw_collateral_with_recipient_transfers_to_recipient() {
 	for recipient in [1, 4] {
 		build_and_execute(|| {
 			register_market(DOT, PUSD);
-			assert_ok!(open(1, DOT, PUSD, 3_000, 500, rate_pct(5, 100)));
+			assert_ok!(open(1, DOT, PUSD, 3_000, 500, percent(5)));
 			let recipient_pre = collateral_balance(DOT, recipient);
 
 			assert_ok!(withdraw_collateral(1, DOT, PUSD, 250, Some(recipient)));
@@ -99,8 +99,8 @@ fn withdraw_collateral_with_recipient_transfers_to_recipient() {
 fn repay_for_by_third_party_burns_payer_balance_and_updates_owner_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 2_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 2_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 2_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, PUSD, 2_000, 500, percent(5)));
 		let payer_pre = stable_balance(PUSD, 2);
 		let v_pre = vault(DOT, PUSD, 1);
 
@@ -124,8 +124,8 @@ fn repay_for_by_third_party_burns_payer_balance_and_updates_owner_vault() {
 fn close_vault_with_recipient_releases_collateral_to_recipient() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		let v = vault(DOT, PUSD, 1);
 		let total = v.debt.total();
 		assert_eq!(redeem(DOT, PUSD, 3, total).expect("redeem ok"), 1);
@@ -149,8 +149,8 @@ fn exact_and_excess_repayment_leave_husks_until_explicit_close() {
 	for (funding, overpay) in [(1, false), (400, true)] {
 		build_and_execute(|| {
 			register_market(DOT, PUSD);
-			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-			assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
+			assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(5)));
 			assert_ok!(<Pusd as frame::traits::fungible::Mutate<u64>>::transfer(
 				&2,
 				&1,
@@ -219,8 +219,8 @@ fn poke_missing_vault_errors() {
 fn repay_overpay_rescues_subminimum_dormant_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		// Redeem acct 1 (the rate-index tail) down to exactly MinimumDebt - 1 (199),
 		// the largest sub-minimum residual, so it parks in the Dormant slot.
 		let debt = vault(DOT, PUSD, 1).debt.total();
@@ -229,7 +229,7 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 		let residual = vault(DOT, PUSD, 1).debt.total();
 		assert_eq!(residual, 199, "residual is MinimumDebt - 1");
 		assert_eq!(
-			branch_state(DOT, PUSD).expect("state").dormant_redemption_target,
+			market_state(DOT, PUSD).dormant_redemption_target,
 			Some(1),
 			"sub-minimum redemption parked acct 1 in the dormant slot"
 		);
@@ -253,7 +253,7 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 		assert_eq!(held(DOT, 1), 970, "collateral untouched by repay");
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_eq!(
-			branch_state(DOT, PUSD).expect("state").dormant_redemption_target,
+			market_state(DOT, PUSD).dormant_redemption_target,
 			None,
 			"slot released on repay-to-zero"
 		);
@@ -267,8 +267,8 @@ fn repay_overpay_rescues_subminimum_dormant_vault() {
 fn liability_free_market_closes_husks_without_ratio_math() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 400, rate_pct(7, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 400, percent(7)));
 		// Distinct timestamps create independent aggregate and vault residue.
 		advance_time(30 * ONE_DAY_MS);
 		assert_ok!(poke(9, DOT, PUSD, 1));
@@ -289,7 +289,7 @@ fn liability_free_market_closes_husks_without_ratio_math() {
 		assert_ok!(close_vault(1, DOT, PUSD, None));
 		assert!(!vault_exists(DOT, PUSD, 1), "last husk closed");
 
-		let state = branch_state(DOT, PUSD).expect("branch state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.debt.principal, 0);
 		assert_eq!(state.stakes.total, 0);
 		assert_eq!(state.debt.minted_interest, 0);
@@ -304,7 +304,7 @@ fn pokes_charge_once_and_full_repayment_forfeits_prepaid_interest() {
 	for pokes in [1, 100] {
 		build_and_execute(|| {
 			register_market(DOT, PUSD);
-			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(10)));
 			mint_stable(PUSD, 1, 10);
 			let opened = vault(DOT, PUSD, 1).debt.total();
 			for _ in 0..pokes {
@@ -331,7 +331,7 @@ fn aggregate_accrual_does_not_remint_prepaid_interest() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// 500 at 10% accrues 50 a year: half a unit every hundredth of a year.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(10)));
 		mint_stable(PUSD, 1, 10);
 		let opened = vault(DOT, PUSD, 1).debt.total();
 
@@ -342,13 +342,13 @@ fn aggregate_accrual_does_not_remint_prepaid_interest() {
 		advance_time(ONE_YEAR_MS / 100);
 		assert_ok!(poke(2, DOT, PUSD, 1));
 		assert_eq!(vault(DOT, PUSD, 1).debt.total(), opened + 1, "the prepaid half covers it");
-		let state = branch_state(DOT, PUSD).expect("branch state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.debt.pending_interest_attribution, 0, "no second mint");
 		assert_eq!(state.debt.minted_interest, vault(DOT, PUSD, 1).debt.interest);
 
 		assert_ok!(repay(1, DOT, PUSD, 1, None));
 		assert_ok!(close_vault(1, DOT, PUSD, None));
-		let state = branch_state(DOT, PUSD).expect("branch state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.debt.minted_interest, 0);
 		assert_eq!(state.debt.pending_interest_attribution, 0);
 		assert!(state.is_removable());
@@ -364,12 +364,12 @@ fn branch_refresh_issues_sub_unit_rates_without_vault_touches() {
 		register_market(DOT, PUSD);
 		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 1_000)));
 		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(1, 1_000)));
-		let minted_before = branch_state(DOT, PUSD).expect("branch state").debt.minted_interest;
+		let minted_before = market_state(DOT, PUSD).debt.minted_interest;
 
 		advance_time(ONE_YEAR_MS);
 		assert_ok!(refresh_branch(9, DOT, PUSD));
 
-		let state = branch_state(DOT, PUSD).expect("branch state");
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.debt.minted_interest - minted_before, 1);
 		assert_eq!(state.debt.pending_interest_attribution, 1);
 	});
@@ -381,7 +381,7 @@ fn branch_refresh_issues_sub_unit_rates_without_vault_touches() {
 fn liability_free_close_fails_closed_on_unattributed_liability() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(10)));
 		mint_stable(PUSD, 1, 10);
 		assert_ok!(repay(1, DOT, PUSD, 1, Some(1_000)));
 		// Isolate each residue so that each guard has independent coverage.
@@ -411,17 +411,17 @@ fn redemption_slot_rejects_second_owner() {
 		redeem_step(DOT, PUSD, owner, 7, snapshot.debt - 150, (snapshot.debt - 150) / 10)
 	}
 	fn parked() -> Option<AccountId> {
-		branch_state(DOT, PUSD).expect("branch state").dormant_redemption_target
+		market_state(DOT, PUSD).dormant_redemption_target
 	}
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		assert_ok!(open(3, DOT, PUSD, 1_000, 500, rate_pct(3, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
+		assert_ok!(open(3, DOT, PUSD, 1_000, 500, percent(3)));
 
 		assert_ok!(park(1));
 		assert_eq!(parked(), Some(1));
-		assert_eq!(park(2).unwrap_err(), crate::Error::<Test>::DormantTargetOccupied.into());
+		assert_noop!(park(2), crate::Error::<Test>::DormantTargetOccupied);
 		assert_eq!(parked(), Some(1), "slot still points at the first owner");
 		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "first dormant intact");
 		assert!(
@@ -438,8 +438,8 @@ fn full_repayments_empty_the_interest_ledger_in_either_order() {
 	let run = |first: u64, second: u64| {
 		new_test_ext().execute_with(|| {
 			register_market(DOT, PUSD);
-			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
-			assert_ok!(open(2, DOT, PUSD, 1_400, 700, rate_pct(37, 100)));
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(10)));
+			assert_ok!(open(2, DOT, PUSD, 1_400, 700, percent(37)));
 			mint_stable(PUSD, 1, 1_000);
 			mint_stable(PUSD, 2, 1_000);
 			advance_time(10 * ONE_DAY_MS);
@@ -454,7 +454,7 @@ fn full_repayments_empty_the_interest_ledger_in_either_order() {
 			assert_eq!(state.debt.pending_interest_attribution, 0);
 			assert_eq!(state.debt.aggregate_interest_remainder, 0);
 			assert!(state.is_removable());
-			crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
+			check_invariants();
 			total_stable(PUSD)
 		})
 	};

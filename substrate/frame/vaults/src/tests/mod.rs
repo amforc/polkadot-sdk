@@ -28,6 +28,11 @@ pub fn rate_pct(num: u128, denom: u128) -> FixedU128 {
 	FixedU128::from_rational(num, denom)
 }
 
+/// `n` percent, exactly.
+pub const fn percent(n: u128) -> FixedU128 {
+	FixedU128::from_inner(n * (<FixedU128 as frame::arithmetic::FixedPointNumber>::DIV / 100))
+}
+
 pub fn vault_status(
 	collateral: AssetId,
 	stable: StableId,

@@ -15,8 +15,8 @@ fn market_exists(collateral: AssetId, stable: StableId) -> bool {
 fn repay_to_close(owner: AccountId) {
 	let total = vault(DOT, PUSD, owner).debt.total();
 	mint_stable(PUSD, owner, total);
-	assert_ok!(Pallet::<Test>::repay_for(RuntimeOrigin::signed(owner), DOT, PUSD, owner, None));
-	assert_ok!(Pallet::<Test>::close_vault(RuntimeOrigin::signed(owner), DOT, PUSD, None));
+	assert_ok!(repay(owner, DOT, PUSD, owner, None));
+	assert_ok!(close_vault(owner, DOT, PUSD, None));
 	assert!(!vault_exists(DOT, PUSD, owner), "close removed the vault");
 }
 
@@ -25,7 +25,7 @@ fn repay_to_close(owner: AccountId) {
 #[test]
 fn signed_create_takes_deposit_and_remove_refunds() {
 	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
 
 		assert_ok!(Pallet::<Test>::create_branch(
@@ -53,7 +53,7 @@ fn signed_create_takes_deposit_and_remove_refunds() {
 fn create_rejects_a_creator_that_cannot_pay_the_custody_seed() {
 	build_and_execute(|| {
 		const PENNILESS_ADMIN: AccountId = 999;
-		set_price(TOKEN_X, FixedU128::from_rational(10u128, 1u128));
+		set_price(TOKEN_X, DEFAULT_PRICE);
 		assert_eq!(collateral_balance(TOKEN_X, PENNILESS_ADMIN), 0);
 		assert_noop!(
 			Pallet::<Test>::create_branch(
@@ -78,7 +78,7 @@ fn insufficient_collateral_custody_needs_the_provider_reference() {
 	build_and_execute(|| {
 		let custody = Pallet::<Test>::redistribution_account(&INSUFFICIENT, &PUSD);
 		assert_eq!(System::providers(&custody), 0);
-		set_price(INSUFFICIENT, FixedU128::from_rational(10u128, 1u128));
+		set_price(INSUFFICIENT, DEFAULT_PRICE);
 
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
@@ -102,7 +102,7 @@ fn insufficient_collateral_custody_needs_the_provider_reference() {
 #[test]
 fn root_create_takes_no_deposit() {
 	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			DOT,
@@ -121,10 +121,10 @@ fn root_create_takes_no_deposit() {
 #[test]
 fn create_branch_rejects_config_outside_envelope() {
 	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		// Envelope floor on MCR is 105%; 104% is outside it.
 		let config = BranchConfig {
-			minimum_collateralization_ratio: rate_pct(104, 100),
+			minimum_collateralization_ratio: percent(104),
 			..default_branch_config()
 		};
 		assert_noop!(
@@ -151,7 +151,7 @@ fn create_branch_rejects_config_outside_envelope() {
 #[test]
 fn zero_vault_floors_are_rejected_on_every_write() {
 	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		let create = |config| {
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
@@ -192,10 +192,10 @@ fn zero_vault_floors_are_rejected_on_every_write() {
 #[test]
 fn inverted_borrow_rate_band_is_rejected_on_every_write() {
 	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		let inverted = BranchConfig {
-			minimum_borrow_rate: rate_pct(300, 100),
-			maximum_borrow_rate: rate_pct(200, 100),
+			minimum_borrow_rate: percent(300),
+			maximum_borrow_rate: percent(200),
 			..default_branch_config()
 		};
 		assert_noop!(
@@ -220,14 +220,14 @@ fn inverted_borrow_rate_band_is_rejected_on_every_write() {
 			)
 		};
 		assert_noop!(
-			narrow(rate_pct(300, 100), rate_pct(200, 100)),
+			narrow(percent(300), percent(200)),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumBorrowRateAboveMaximum)
 		);
 		// A narrowing that leaves the ends in order still applies.
-		assert_ok!(narrow(rate_pct(200, 100), rate_pct(300, 100)));
-		let config = branch_config(DOT, PUSD).expect("config");
-		assert_eq!(config.minimum_borrow_rate, rate_pct(200, 100));
-		assert_eq!(config.maximum_borrow_rate, rate_pct(300, 100));
+		assert_ok!(narrow(percent(200), percent(300)));
+		let config = market_config(DOT, PUSD);
+		assert_eq!(config.minimum_borrow_rate, percent(200));
+		assert_eq!(config.maximum_borrow_rate, percent(300));
 	});
 }
 
@@ -237,7 +237,7 @@ fn inverted_borrow_rate_band_is_rejected_on_every_write() {
 #[test]
 fn create_branch_accepts_any_debt_ceiling() {
 	build_and_execute(|| {
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		let config = BranchConfig { debt_ceiling: u128::MAX, ..default_branch_config() };
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
@@ -247,7 +247,7 @@ fn create_branch_accepts_any_debt_ceiling() {
 			config,
 			(),
 		));
-		assert_eq!(branch_config(DOT, PUSD).expect("config").debt_ceiling, u128::MAX);
+		assert_eq!(market_config(DOT, PUSD).debt_ceiling, u128::MAX);
 	});
 }
 
@@ -277,20 +277,16 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		// Successful updates preserve the complete config and emit the field and value.
-		let mut raised_mcr = default_branch_config();
-		raised_mcr.minimum_collateralization_ratio = rate_pct(115, 100);
-		let mut lowered_ceiling = raised_mcr.clone();
-		lowered_ceiling.debt_ceiling = 50_000_000;
+		let raised_mcr = BranchConfig {
+			minimum_collateralization_ratio: percent(115),
+			..default_branch_config()
+		};
+		let lowered_ceiling = BranchConfig { debt_ceiling: 50_000_000, ..raised_mcr.clone() };
 		for (update, expected) in [
-			(BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(115, 100)), raised_mcr),
+			(BranchConfigUpdate::MinimumCollateralizationRatio(percent(115)), raised_mcr),
 			(BranchConfigUpdate::DebtCeiling(50_000_000), lowered_ceiling),
 		] {
-			assert_ok!(Pallet::<Test>::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				PUSD,
-				update.clone(),
-			));
+			assert_ok!(Pallet::<Test>::set_param(RuntimeOrigin::signed(ADMIN), DOT, PUSD, update,));
 			crate::tests::assert_event(crate::Event::ParameterUpdated {
 				collateral_id: DOT,
 				stable_id: PUSD,
@@ -303,19 +299,16 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			PUSD,
-			BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(106, 100))
+			BranchConfigUpdate::MinimumCollateralizationRatio(percent(106))
 		));
-		assert_eq!(
-			branch_config(DOT, PUSD).unwrap().minimum_collateralization_ratio,
-			rate_pct(106, 100)
-		);
+		assert_eq!(market_config(DOT, PUSD).minimum_collateralization_ratio, percent(106));
 		// 104% is below the envelope floor — even the full admin cannot go there.
 		assert_noop!(
 			Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(ADMIN),
 				DOT,
 				PUSD,
-				BranchConfigUpdate::MinimumCollateralizationRatio(rate_pct(104, 100))
+				BranchConfigUpdate::MinimumCollateralizationRatio(percent(104))
 			),
 			Error::<Test>::ConfigOutsideEnvelope(
 				BoundViolation::MinimumCollateralizationRatioTooLow
@@ -332,7 +325,7 @@ fn remove_branch_requires_empty_market() {
 	for origin in [RuntimeOrigin::signed(ADMIN), RuntimeOrigin::root()] {
 		build_and_execute(|| {
 			register_market(DOT, PUSD);
-			assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+			assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, percent(5)));
 			assert_noop!(
 				Pallet::<Test>::remove_branch(origin.clone(), DOT, PUSD),
 				Error::<Test>::BranchNotEmpty
@@ -390,7 +383,7 @@ fn set_branch_admins_reassigns_authority() {
 			PUSD,
 			true
 		));
-		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
+		assert!(market_state(DOT, PUSD).is_frozen());
 	});
 }
 
@@ -430,7 +423,7 @@ fn emergency_admin_can_freeze() {
 			PUSD,
 			true
 		));
-		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
+		assert!(market_state(DOT, PUSD).is_frozen());
 	});
 }
 
@@ -446,7 +439,7 @@ fn force_origin_acts_as_full_branch_admin() {
 			PUSD,
 			BranchConfigUpdate::MinimumDebt(250)
 		));
-		assert_eq!(branch_config(DOT, PUSD).expect("config").minimum_debt, 250);
+		assert_eq!(market_config(DOT, PUSD).minimum_debt, 250);
 		assert_noop!(
 			Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(9),
@@ -471,9 +464,9 @@ fn force_origin_acts_as_full_branch_admin() {
 
 		// Root is not a branch admin, yet the kill switch passes both ways.
 		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
-		assert!(branch_state(DOT, PUSD).unwrap().is_frozen());
+		assert!(market_state(DOT, PUSD).is_frozen());
 		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, false));
-		assert!(!branch_state(DOT, PUSD).unwrap().is_frozen());
+		assert!(!market_state(DOT, PUSD).is_frozen());
 	});
 }
 
@@ -574,7 +567,7 @@ fn create_branch_rejects_unknown_assets_and_role_collision() {
 	];
 	for (collateral, stable, error) in cases {
 		build_and_execute(|| {
-			set_price(collateral.clone(), FixedU128::from_rational(10u128, 1u128));
+			set_price(collateral.clone(), DEFAULT_PRICE);
 			assert_noop!(
 				Pallet::<Test>::create_branch(
 					RuntimeOrigin::root(),
