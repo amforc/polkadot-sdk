@@ -307,7 +307,12 @@ impl stablecoin_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for 
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]
-	fn benchmark_registration_config(_stablecoin_markets: u32) -> Self::RegistrationConfig {}
+	fn benchmark_registration_config(_stablecoin_markets: u32) -> Self::RegistrationConfig {
+		// Benchmark samples reset storage, but these mock pool knobs are thread-local.
+		ActiveSpCapacity::set(0);
+		PendingSpCapacity::set(0);
+		PendingSpCohorts::set(Vec::new());
+	}
 }
 
 /// Allows root or the stable asset owner to create a branch.

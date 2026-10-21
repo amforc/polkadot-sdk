@@ -284,30 +284,8 @@ impl<T: BenchmarkConfig> Market<T> {
 		Ok(())
 	}
 
-	/// Queues two cohorts, the second just before the first is due, and returns the time from
-	/// which both are due. The clock is left one millisecond before the first deadline.
-	fn queue_two_cohorts(&self) -> Result<Millis, BenchmarkError> {
-		let queue = |index| {
-			<Pallet<T> as StabilityPoolOffset<_, _, _, _, _>>::benchmark_queue_deposit(
-				&self.collateral_id,
-				&self.stable_id,
-				index,
-				ENTRY_DELAY_MS,
-				balance::<T>(COHORT_DEPOSIT),
-			)
-		};
-		let start = T::TimeProvider::now();
-		let first = queue(0)?;
-		assert!(first > start);
-		Seeder::<T>::advance_time(first.saturating_sub(start).saturating_sub(1));
-		let second = queue(1)?;
-		assert!(second > first);
-		assert!(T::TimeProvider::now() < first);
-		Ok(second)
-	}
-
 	fn queue_cohorts(&self) -> Result<([CohortId; 2], Millis), BenchmarkError> {
-		let due = self.queue_two_cohorts()?;
+		let due = Seeder::<T>::queue_pool_cohorts()?;
 		let pool = self.pool()?;
 		let [first, second] = pool.state.open_cohorts.as_slice() else {
 			return Err("expected two open cohorts".into());
