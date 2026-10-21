@@ -22,7 +22,7 @@ mod vault_deposit;
 use crate::mock::{AccountId, AssetId, FixedU128, Moment, RuntimeEvent, StableId, System, Test};
 
 pub const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
-pub const ONE_YEAR_MS: Moment = pusd_primitives::MILLIS_PER_YEAR;
+pub const ONE_YEAR_MS: Moment = stablecoin_primitives::MILLIS_PER_YEAR;
 
 pub fn rate_pct(num: u128, denom: u128) -> FixedU128 {
 	FixedU128::from_rational(num, denom)

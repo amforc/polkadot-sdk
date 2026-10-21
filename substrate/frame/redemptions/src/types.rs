@@ -2,7 +2,7 @@ use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::deps::sp_runtime::{traits::Zero, FixedU128, Permill};
 use scale_info::TypeInfo;
 
-pub use pusd_primitives::Millis;
+pub use stablecoin_primitives::Millis;
 
 /// Defines the ordinary-redemption fee policy.
 ///
