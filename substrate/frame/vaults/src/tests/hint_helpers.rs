@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_status},
+	tests::{percent, rate_pct, vault_status},
 };
 use frame::traits::fungible::Mutate as FungibleMutate;
 
@@ -23,13 +23,13 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 		register_market(DOT, PUSD);
 		// Account 21 alone enters FinalRecovery after a price crash.
 		fund_account(21);
-		assert_ok!(open(21, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(21, DOT, PUSD, 1_000, 500, percent(1)));
 		set_price(DOT, FixedU128::from_rational(1u128, 10u128));
 		assert_ok!(enter_final_recovery(99, DOT, PUSD, 21));
 
 		// Restore the price and seed a long index so the tail re-insertion at 1%
 		// needs more than the repair budget.
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 		seed_long_rate_index();
 
 		assert_noop!(
@@ -76,7 +76,7 @@ fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
 		seed_long_rate_index();
 
 		assert_noop!(
-			change_rate(20, DOT, PUSD, rate_pct(1, 100)),
+			change_rate(20, DOT, PUSD, percent(1)),
 			crate::Error::<Test>::InvalidPositionHints
 		);
 	});
