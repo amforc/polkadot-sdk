@@ -411,7 +411,7 @@ fn redistribution_custody_holds_issued_collateral() {
 		assert_ok!(liquidate(9, XBT, USDX, 1, 0, 0));
 		let first = held(XBT, custody);
 		assert!(first > 0, "seizure reached custody");
-		assert_eq!(first, branch_state(XBT, USDX).unwrap().pending_redistribution_collateral);
+		assert_eq!(first, market_state(XBT, USDX).pending_redistribution_collateral);
 		assert_eq!(collateral_balance(XBT, custody), XBT_ED, "the seed stays free");
 
 		// The seed is a float, not a consumable: the next seizure holds too.

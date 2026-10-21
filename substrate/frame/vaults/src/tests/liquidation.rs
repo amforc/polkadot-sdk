@@ -222,7 +222,6 @@ fn debt_includes_accrued_interest() {
 // the supply falls by exactly the difference.
 #[test]
 fn liquidation_supply_nets_burned_debt_against_issued_interest() {
-	use frame::traits::fungibles::Inspect;
 	build_and_execute(|| {
 		// The mock hook burns the pool's share; route all yield to the fee account instead, so
 		// the only burn is the liquidation's.
@@ -230,7 +229,7 @@ fn liquidation_supply_nets_burned_debt_against_issued_interest() {
 		setup_underwater_vault();
 		advance_time(10 * ONE_YEAR_MS);
 		mint_stable(PUSD, KEEPER, 500);
-		let supply_before = <Assets as Inspect<AccountId>>::total_issuance(PUSD);
+		let supply_before = total_stable(PUSD);
 
 		assert_ok!(liquidate(KEEPER, DOT, PUSD, 1, 500, 0));
 
@@ -245,7 +244,7 @@ fn liquidation_supply_nets_burned_debt_against_issued_interest() {
 			.expect("interest issued");
 		assert!(issued > 0);
 		assert!(issued < jit_debt, "the burn exceeds the issuance");
-		let supply_after = <Assets as Inspect<AccountId>>::total_issuance(PUSD);
+		let supply_after = total_stable(PUSD);
 		assert_eq!(supply_before - supply_after, jit_debt - issued);
 	});
 }
@@ -519,7 +518,7 @@ fn liquidatable_only_below_mcr() {
 
 		// Liquidatability is `CR < MCR`, strictly: at par the vault sits
 		// exactly on the 1.10 MCR (550 / 500) and stays safe.
-		set_price(DOT, FixedU128::from_rational(1, 1));
+		set_price(DOT, FixedU128::from_u32(1));
 		assert_noop!(liquidate(KEEPER, DOT, PUSD, 1, 0, 0), Error::<Test>::VaultNotLiquidatable);
 
 		// One tick below, floor(0.999 * 550) = 549 gives CR 1.098 < 1.10.
@@ -612,9 +611,9 @@ fn config_update_requires_the_branch_admin() {
 		register_branch(DOT, PUSD, liquidation_branch_config());
 		let update = BranchConfigUpdate::OffsetPenalty(Permill::from_percent(10));
 
-		assert_noop!(set_liquidation_param(1, update.clone()), Error::<Test>::NotBranchAdmin);
+		assert_noop!(set_liquidation_param(1, update), Error::<Test>::NotBranchAdmin);
 		assert_noop!(
-			Vaults::set_param(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD, update.clone()),
+			Vaults::set_param(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD, update),
 			Error::<Test>::BranchNotFound
 		);
 
@@ -804,7 +803,7 @@ fn setup_token_scale_vault(
 	debt: Balance,
 ) {
 	register_branch(DOT, PUSD, token_scale_branch_config(liquidation));
-	set_price(DOT, FixedU128::from_rational(4, 1));
+	set_price(DOT, FixedU128::from_u32(4));
 	assert_ok!(open(1, DOT, PUSD, collateral, debt, FixedU128::from_rational(1, 1_000)));
 	assert_ok!(open(
 		2,
@@ -814,7 +813,7 @@ fn setup_token_scale_vault(
 		1_000 * UNIT,
 		FixedU128::from_rational(2, 1_000)
 	));
-	set_price(DOT, FixedU128::from_rational(2, 1));
+	set_price(DOT, FixedU128::from_u32(2));
 }
 
 // The complete waterfall must preserve relative path allocation and collateral when keeper
@@ -954,9 +953,6 @@ fn pending_share_settles_in_custody_without_an_owner_round_trip() {
 			collateral_balance(DOT, SP_ACCOUNT) - pool_before,
 			outcome_3.active_pool.collateral
 		);
-		assert_eq!(
-			held(DOT, custody),
-			branch_state(DOT, PUSD).expect("branch").pending_redistribution_collateral
-		);
+		assert_eq!(held(DOT, custody), market_state(DOT, PUSD).pending_redistribution_collateral);
 	});
 }

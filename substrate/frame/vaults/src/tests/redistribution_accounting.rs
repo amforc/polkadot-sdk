@@ -32,7 +32,7 @@ fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
 			let before_2 = vault(DOT, PUSD, 2).debt.principal;
 			let liquidated_debt = vault(DOT, PUSD, 3).debt.total();
 
-			set_price(DOT, FixedU128::from_rational(1u128, 1u128));
+			set_price(DOT, FixedU128::from_u32(1));
 			assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
 			assert_eq!(vault(DOT, PUSD, 1).debt.principal, before_1);
 			assert_eq!(vault(DOT, PUSD, 2).debt.principal, before_2);
@@ -98,7 +98,7 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		let coll_1 = held(DOT, 1);
 		assert_ok!(redistribute_for_test(DOT, PUSD, 1, coll_1));
 
-		let state_pre = branch_state(DOT, PUSD).unwrap();
+		let state_pre = market_state(DOT, PUSD);
 		// Both the owned debt and the pending share use the recipient's rate.
 		assert_eq!(state_pre.debt.pending_redistribution_principal, 501);
 		let actual: Balance = whole_units(state_pre.debt.accrual_rate);
@@ -108,7 +108,7 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		assert_ok!(poke(99, DOT, PUSD, 2));
 
 		// ceil(1_001 × 20%): the vault rounds the owned and the absorbed debt's interest up.
-		let post_minted = branch_state(DOT, PUSD).unwrap().debt.minted_interest;
+		let post_minted = market_state(DOT, PUSD).debt.minted_interest;
 		assert_eq!(post_minted - state_pre.debt.minted_interest, 201);
 	});
 }
@@ -173,7 +173,7 @@ fn borrow_after_redistribution_folds_the_share_and_charges_the_quoted_fee() {
 		let coll_3 = held(DOT, 3);
 		// C owes 500 plus an upfront fee of 3, priced at the 21.67% average of the three opens.
 		assert_eq!(redistribute_for_test(DOT, PUSD, 3, coll_3), Ok(503));
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 
 		let interest_before = vault(DOT, PUSD, 1).debt.interest;
 		// A holds half the stake, so the touch folds floor(503 / 2) = 251 into its principal and
@@ -348,7 +348,7 @@ fn vault_cr_projects_lazy_redistribution_before_materialization() {
 		let coll_3 = held(DOT, 3);
 		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
 		// Restore price so the view's CR is defined for vault 1.
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 
 		let view_pre = crate::Pallet::<Test>::vault_cr(DOT, PUSD, 1).expect("cr");
 		// Vault 3 owed 500 plus a fee of 1. Vault 1 holds half the stake, so its share is
