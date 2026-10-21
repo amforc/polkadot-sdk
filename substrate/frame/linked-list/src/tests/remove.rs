@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use crate::{mock::*, Event, ListError, ListMetas, ListNodes, SortedListInterface};
-use frame::testing_prelude::{assert_ok, assert_storage_noop, hypothetically};
+use frame::testing_prelude::{assert_err, assert_noop, assert_ok, hypothetically};
 
 #[test]
 fn remove_only_item_clears_head_tail_size() {
@@ -79,10 +79,7 @@ fn remove_middle_splices() {
 #[test]
 fn remove_unknown_errors() {
 	build_and_execute(|| {
-		assert_storage_noop!(assert_eq!(
-			LinkedList::remove(&1, &100),
-			Err(ListError::ItemNotFound)
-		));
+		assert_noop!(LinkedList::remove(&1, &100), ListError::ItemNotFound);
 	});
 }
 
@@ -131,142 +128,124 @@ fn pop_tail_is_lifo_for_same_priority_cluster() {
 }
 
 #[test]
-#[should_panic = "Defensive failure has been triggered"]
+#[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
 fn remove_missing_neighbor_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Drop 100, orphaning 200's prev link.
 		ListNodes::<Test>::remove(1, 100);
-		let _ = LinkedList::remove(&1, &200);
+		assert_err!(LinkedList::remove(&1, &200), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "head pointer disagrees with head-claiming node"]
+#[cfg_attr(debug_assertions, should_panic = "head pointer disagrees with head-claiming node")]
 fn remove_at_node_with_none_prev_but_not_head_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Corrupt node 200's `prev` to `None` so it falsely claims to be the head
 		// (the actual head is 100). The endpoint cross-check trips defensively.
-		ListNodes::<Test>::mutate(1, 200, |maybe| {
-			if let Some(n) = maybe {
-				n.prev = None;
-			}
-		});
-		let _ = LinkedList::remove(&1, &200);
+		corrupt_node(1, 200, |n| n.prev = None);
+		assert_err!(LinkedList::remove(&1, &200), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "tail pointer disagrees with tail-claiming node"]
+#[cfg_attr(debug_assertions, should_panic = "tail pointer disagrees with tail-claiming node")]
 fn remove_at_node_with_none_next_but_not_tail_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Corrupt node 100's `next` to `None` so it falsely claims to be the tail
 		// (the actual tail is 200). The endpoint cross-check trips defensively.
-		ListNodes::<Test>::mutate(1, 100, |maybe| {
-			if let Some(n) = maybe {
-				n.next = None;
-			}
-		});
-		let _ = LinkedList::remove(&1, &100);
+		corrupt_node(1, 100, |n| n.next = None);
+		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "node linked against itself"]
+#[cfg_attr(debug_assertions, should_panic = "node linked against itself")]
 fn remove_at_self_loop_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// Corrupt 100 so its `prev` names itself, forming a self-loop. The
 		// anti-cycle guard trips defensively; production logs and returns
 		// `CorruptList` instead.
-		ListNodes::<Test>::mutate(1, 100, |maybe| {
-			if let Some(node) = maybe {
-				node.prev = Some(100);
-			}
-		});
-		let _ = LinkedList::remove(&1, &100);
+		corrupt_node(1, 100, |node| node.prev = Some(100));
+		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "Defensive failure has been triggered"]
+#[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
 fn remove_at_missing_meta_row_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// Drop the metadata row while the node persists: a present node without a
 		// meta row violates the all-or-nothing invariant.
 		ListMetas::<Test>::remove(1);
-		let _ = LinkedList::remove(&1, &100);
+		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "Defensive failure has been triggered"]
+#[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
 fn remove_at_len_underflow_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// Set `len` to 0 while the node persists. A lone node needs `len == 1`, so
 		// the topology check trips before the decrement can underflow.
-		ListMetas::<Test>::mutate(1, |maybe| {
-			if let Some(meta) = maybe {
-				meta.len = 0;
-			}
-		});
-		let _ = LinkedList::remove(&1, &100);
+		ListMetas::<Test>::mutate_extant(1, |meta| meta.len = 0);
+		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "ListMetas.len incompatible with removed node topology"]
+#[cfg_attr(
+	debug_assertions,
+	should_panic = "ListMetas.len incompatible with removed node topology"
+)]
 fn remove_endpoint_with_undercounted_len_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
 		// Two linked nodes but `len == 1`: removing an endpoint would drop the meta
 		// row and orphan the survivor. The topology check rejects it.
-		ListMetas::<Test>::mutate(1, |maybe| {
-			if let Some(meta) = maybe {
-				meta.len = 1;
-			}
-		});
-		let _ = LinkedList::remove(&1, &100);
+		ListMetas::<Test>::mutate_extant(1, |meta| meta.len = 1);
+		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "ListMetas.len incompatible with removed node topology"]
+#[cfg_attr(
+	debug_assertions,
+	should_panic = "ListMetas.len incompatible with removed node topology"
+)]
 fn remove_sole_node_with_overcounted_len_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// A lone node but `len == 2`: removing it would leave an empty meta row
 		// (`len == 1`, no nodes). The topology check rejects it.
-		ListMetas::<Test>::mutate(1, |maybe| {
-			if let Some(meta) = maybe {
-				meta.len = 2;
-			}
-		});
-		let _ = LinkedList::remove(&1, &100);
+		ListMetas::<Test>::mutate_extant(1, |meta| meta.len = 2);
+		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "Defensive failure has been triggered"]
+#[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
 fn pop_tail_with_missing_tail_node_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// Remove the node but leave `ListMetas.tail` pointing at it.
 		ListNodes::<Test>::remove(1, 100);
-		let _ = LinkedList::pop_tail(&1);
+		assert_err!(LinkedList::pop_tail(&1), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "prev and next name the same neighbor"]
+#[cfg_attr(debug_assertions, should_panic = "prev and next name the same neighbor")]
 fn remove_at_aliased_neighbors_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 90);
@@ -274,28 +253,22 @@ fn remove_at_aliased_neighbors_is_defensive() {
 		// Corrupt 200 into a two-node cycle with 100: both sides name the same
 		// neighbor. Without the guard the two splice writes would target the
 		// same row and the second would clobber the first.
-		ListNodes::<Test>::mutate(1, 200, |maybe| {
-			if let Some(n) = maybe {
-				n.prev = Some(100);
-				n.next = Some(100);
-			}
+		corrupt_node(1, 200, |n| {
+			n.prev = Some(100);
+			n.next = Some(100);
 		});
-		let _ = LinkedList::remove(&1, &200);
+		assert_err!(LinkedList::remove(&1, &200), ListError::CorruptList);
 	});
 }
 
 #[test]
-#[should_panic = "Defensive failure has been triggered"]
+#[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
 fn pop_tail_with_none_tail_on_present_meta_is_defensive() {
 	build_and_execute_defensive(|| {
 		insert(1, 100, 50);
 		// A present meta row with `tail: None` is corruption, not an empty
 		// list; `pop_tail` must not silently report `Ok(None)`.
-		ListMetas::<Test>::mutate(1, |maybe| {
-			if let Some(meta) = maybe {
-				meta.tail = None;
-			}
-		});
-		let _ = LinkedList::pop_tail(&1);
+		ListMetas::<Test>::mutate_extant(1, |meta| meta.tail = None);
+		assert_err!(LinkedList::pop_tail(&1), ListError::CorruptList);
 	});
 }

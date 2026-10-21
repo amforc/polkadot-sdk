@@ -15,21 +15,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, ListError, ListNodes, Position, SortedListInterface};
-use frame::testing_prelude::assert_storage_noop;
+use crate::{mock::*, ListError, Position, SortedListInterface};
+use frame::testing_prelude::{assert_err, assert_noop};
 
 fn build_chain(priorities: &[(ItemId, Priority)]) {
 	for &(item, priority) in priorities {
 		insert(1, item, priority);
-	}
-}
-
-/// Items in head→tail priority order, length deliberately greater than
-/// `MaxHintRepairSteps` so that "wrong-end hint" tests cannot be bridged within
-/// the budget.
-fn build_long_chain() {
-	for i in 1..=(MaxHintRepairSteps::get() + 4) {
-		insert(1, u64::from(i), 100 - 10 * i + 10); // 100, 90, 80, ..., 30 when budget=4
 	}
 }
 
@@ -56,10 +47,10 @@ fn stale_hint_beyond_budget_returns_invalid_hints() {
 		// Long chain so that priority=5 (correct pos = tail) is unreachable from a
 		// head-region hint within `MaxHintRepairSteps`.
 		build_long_chain();
-		assert_storage_noop!(assert_eq!(
+		assert_noop!(
 			LinkedList::insert(1, 99, 5, Position::at_head(1)),
-			Err(ListError::InvalidPositionHints)
-		));
+			ListError::InvalidPositionHints
+		);
 	});
 }
 
@@ -119,29 +110,25 @@ fn strict_mode_zero_budget_accepts_valid_hint_rejects_invalid() {
 		assert_eq!(steps, 0);
 
 		// Any stale hint must fail immediately — no walk loop runs at budget 0.
-		assert_storage_noop!(assert_eq!(
+		assert_noop!(
 			LinkedList::insert(1, 300, 70, Position::at_head(100)),
-			Err(ListError::InvalidPositionHints)
-		));
+			ListError::InvalidPositionHints
+		);
 	});
 }
 
 /// The walk detects the no-progress repair and reports corruption.
 #[test]
-#[should_panic = "repair step made no progress"]
+#[cfg_attr(debug_assertions, should_panic = "repair step made no progress")]
 fn walk_repair_asymmetric_links_is_defensive() {
 	build_and_execute_defensive(|| {
 		build_chain(&[(1, 90), (2, 70), (3, 50)]);
 		// Break the back-link: 2.next still names 3, but 3.prev now names 1.
-		ListNodes::<Test>::mutate(1, 3, |maybe| {
-			if let Some(n) = maybe {
-				n.prev = Some(1);
-			}
-		});
+		corrupt_node(1, 3, |n| n.prev = Some(1));
 		// Hint (2, 3) with priority 60: the prev side is consistent
 		// (2.next == 3) and admits 60, but the broken back-link makes the
 		// position invalid while the reanchor rewrite is a no-op.
-		let _ = LinkedList::insert(1, 99, 60, Position::between(2, 3));
+		assert_err!(LinkedList::insert(1, 99, 60, Position::between(2, 3)), ListError::CorruptList);
 	});
 }
 
@@ -155,8 +142,7 @@ fn inconsistent_hint_one_side_stale_re_anchors() {
 		// Walking from prev=tail toward the head would need more than
 		// `MaxHintRepairSteps` steps. Re-anchoring via `next.prev` lands at
 		// (item 2, item 3) in 1 step.
-		build_long_chain();
-		let chain_len = MaxHintRepairSteps::get() + 4;
+		let chain_len = build_long_chain();
 		let stale_prev = u64::from(chain_len); // tail item id
 		let steps = LinkedList::insert(1, 99, 85, Position::between(stale_prev, 3))
 			.expect("re-anchor handles partially-stale hint within budget");

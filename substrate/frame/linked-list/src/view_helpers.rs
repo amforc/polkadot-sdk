@@ -20,9 +20,7 @@
 
 use crate::{list, pallet::*, ListError, Outcome, Position, SortedListInterface};
 use frame::{
-	deps::frame_support::storage::{
-		transactional::with_transaction_opaque_err, TransactionOutcome,
-	},
+	deps::frame_support::storage::{with_transaction, TransactionOutcome},
 	prelude::*,
 };
 
@@ -84,10 +82,8 @@ pub fn find_re_insert_position<T: Config>(
 	item: &T::ItemId,
 	new_priority: T::Priority,
 ) -> Option<Position<T::ItemId>> {
-	if !ListNodes::<T>::contains_key(list_id, item) {
-		return None;
-	}
-	Some(find_position_skipping::<T>(list_id, new_priority, Some(item)))
+	ListNodes::<T>::contains_key(list_id, item)
+		.then(|| find_position_skipping::<T>(list_id, new_priority, Some(item)))
 }
 
 /// Steps the on-chain repair walk would take from `hint` to reach the insert
@@ -98,10 +94,8 @@ pub fn repair_steps_needed<T: Config>(
 	priority: T::Priority,
 	hint: Position<T::ItemId>,
 ) -> u32 {
-	match list::walk_repair::<T>(list_id, &priority, hint) {
-		Ok(valid) => valid.steps,
-		Err(_) => infeasible_sentinel::<T>(),
-	}
+	list::walk_repair::<T>(list_id, &priority, hint)
+		.map_or_else(|_| infeasible_sentinel::<T>(), |valid| valid.steps)
 }
 
 /// Steps a `re_insert`/`reprioritize` moving `(list_id, item)` to
@@ -116,7 +110,8 @@ pub fn re_insert_steps_needed<T: Config>(
 	new_priority: T::Priority,
 	hint: Position<T::ItemId>,
 ) -> u32 {
-	let dry_run = with_transaction_opaque_err::<Outcome, ListError, _>(|| {
+	// A transactional-layer overflow surfaces as `ListError::Internal`.
+	let dry_run = with_transaction::<Outcome, ListError, _>(|| {
 		TransactionOutcome::Rollback(Pallet::<T>::re_insert(
 			list_id.clone(),
 			item.clone(),
@@ -125,8 +120,8 @@ pub fn re_insert_steps_needed<T: Config>(
 		))
 	});
 	match dry_run {
-		Ok(Ok(Outcome::NoOp | Outcome::InPlace)) => 0,
-		Ok(Ok(Outcome::Relocated { steps })) => steps,
-		Ok(Err(_)) | Err(()) => infeasible_sentinel::<T>(),
+		Ok(Outcome::NoOp | Outcome::InPlace) => 0,
+		Ok(Outcome::Relocated { steps }) => steps,
+		Err(_) => infeasible_sentinel::<T>(),
 	}
 }
