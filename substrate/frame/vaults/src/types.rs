@@ -231,8 +231,8 @@ impl<Balance: Ord + Saturating + Copy + Zero + One> Vault<Balance> {
 		&self,
 		status: VaultStatus,
 		config: &BranchConfig<Balance>,
-	) -> pusd_primitives::RedemptionStepSnapshot<Balance> {
-		pusd_primitives::RedemptionStepSnapshot {
+	) -> stablecoin_primitives::RedemptionStepSnapshot<Balance> {
+		stablecoin_primitives::RedemptionStepSnapshot {
 			status,
 			debt: self.debt.total(),
 			collateral: self.collateral,

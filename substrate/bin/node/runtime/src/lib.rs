@@ -3596,7 +3596,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 	) -> (VaultsCollateralId, VaultsStableId, AccountId, Balance) {
 		use frame_support::traits::fungibles::Mutate as FungiblesMutate;
 		use frame_system::RawOrigin;
-		use pallet_vaults::{pusd_primitives::OnBranchLifecycle as _, BenchmarkHelper as _};
+		use pallet_vaults::{stablecoin_primitives::OnBranchLifecycle as _, BenchmarkHelper as _};
 
 		let collateral_id = VaultsCollateralId::Native;
 		let stable_id: VaultsStableId = BENCHMARK_STABLE_ASSET_ID;
@@ -3686,7 +3686,7 @@ impl pallet_redemptions::BenchmarkHelper<VaultsCollateralId, VaultsStableId, Acc
 			&redeemer,
 			budget.saturating_mul(2),
 		)
-		.expect("mint pusd for redeemer");
+		.expect("mint stablecoin for redeemer");
 		(collateral_id, stable_id, redeemer, budget)
 	}
 }
