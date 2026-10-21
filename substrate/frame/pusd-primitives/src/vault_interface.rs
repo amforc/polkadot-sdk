@@ -1,7 +1,10 @@
 //! Vault operations for redemption flows, keyed by `(collateral_id, stable_id)`.
 
 use crate::{DebtCollateral, VaultStatus};
-use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::Permill};
+use frame::deps::{
+	frame_support::pallet_prelude::{DispatchError, DispatchResult},
+	sp_runtime::Permill,
+};
 
 /// Settlement consumed by [`VaultInterface::redeem_step`].
 ///
@@ -84,7 +87,7 @@ pub trait VaultInterface {
 		owner: &Self::AccountId,
 		recipient: &Self::AccountId,
 		settlement: RedemptionSettlement<Self::StableCredit, Self::Balance>,
-	) -> Result<(), DispatchError>;
+	) -> DispatchResult;
 
 	/// Returns the total debt of `stable_id` across its markets, including interest accrued since
 	/// each market's last touch.

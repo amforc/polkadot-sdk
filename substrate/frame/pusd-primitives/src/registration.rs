@@ -26,13 +26,12 @@ pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 	/// `funder` pays any refundable setup cost, such as an asset account deposit: the depositor of
 	/// a signed creation, otherwise the market's full administrator.
 	fn on_registered(
-		collateral_id: &CollateralId,
-		stable_id: &StableId,
-		stablecoin_markets: u32,
-		config: Self::RegistrationConfig,
-		funder: &AccountId,
+		_collateral_id: &CollateralId,
+		_stable_id: &StableId,
+		_stablecoin_markets: u32,
+		_config: Self::RegistrationConfig,
+		_funder: &AccountId,
 	) -> DispatchResult {
-		let _ = (collateral_id, stable_id, stablecoin_markets, config, funder);
 		Ok(())
 	}
 
@@ -43,12 +42,11 @@ pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 	///
 	/// [`on_registered`]: OnBranchLifecycle::on_registered
 	fn on_deregistered(
-		collateral_id: &CollateralId,
-		stable_id: &StableId,
-		remaining_stablecoin_markets: u32,
-		funder: &AccountId,
+		_collateral_id: &CollateralId,
+		_stable_id: &StableId,
+		_remaining_stablecoin_markets: u32,
+		_funder: &AccountId,
 	) -> DispatchResult {
-		let _ = (collateral_id, stable_id, remaining_stablecoin_markets, funder);
 		Ok(())
 	}
 

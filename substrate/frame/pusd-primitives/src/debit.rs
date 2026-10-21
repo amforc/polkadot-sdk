@@ -1,8 +1,11 @@
 //! Debit sizing around the minimum-balance boundary.
 
-use frame::deps::frame_support::traits::{
-	fungibles,
-	tokens::{Fortitude, Preservation},
+use frame::deps::frame_support::{
+	defensive_assert,
+	traits::{
+		fungibles,
+		tokens::{Fortitude, Preservation},
+	},
 };
 
 /// Returns the [`Preservation`] for debiting exactly `amount` without folding dust.
@@ -65,7 +68,7 @@ pub fn refine_debit<Balance: Ord + Copy>(
 		return (limit, Preservation::Preserve);
 	}
 	let expendable = expendable();
-	debug_assert!(preserved <= expendable);
+	defensive_assert!(preserved <= expendable);
 	if limit < expendable {
 		(preserved, Preservation::Preserve)
 	} else {
