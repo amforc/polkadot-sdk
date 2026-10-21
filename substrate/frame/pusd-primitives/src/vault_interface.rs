@@ -2,7 +2,7 @@
 
 use crate::{DebtCollateral, VaultStatus};
 use frame::deps::{
-	frame_support::pallet_prelude::DispatchError,
+	frame_support::pallet_prelude::{DispatchError, DispatchResult},
 	sp_runtime::{FixedU128, Permill},
 };
 
@@ -92,7 +92,7 @@ pub trait VaultInterface {
 		owner: &Self::AccountId,
 		recipient: &Self::AccountId,
 		settlement: RedemptionSettlement<Self::StableCredit, Self::Balance>,
-	) -> Result<(), DispatchError>;
+	) -> DispatchResult;
 
 	/// Returns the total debt of `stable_id` across its markets, including interest accrued since
 	/// each market's last touch.

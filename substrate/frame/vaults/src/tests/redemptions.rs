@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{percent, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 	VaultStatus,
 };
 use pallet_linked_list::SortedListInterface;
@@ -33,8 +33,8 @@ fn redemption_parks_the_vault_below_minimum_debt() {
 		build_and_execute(|| {
 			register_market(DOT, PUSD);
 			// Distinct rates make vault 1, at the lower rate, the redemption target.
-			assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-			assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+			assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+			assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 			advance_time(elapsed);
 
 			assert_eq!(redeem(DOT, PUSD, 3, redeemed), Ok(1));
@@ -43,7 +43,7 @@ fn redemption_parks_the_vault_below_minimum_debt() {
 			assert_eq!(vault.debt.total(), remaining, "redeeming {redeemed}");
 			assert_eq!(vault_status(DOT, PUSD, 1), status, "redeeming {redeemed}");
 			assert_eq!(
-				branch_state(DOT, PUSD).expect("state").dormant_redemption_target,
+				market_state(DOT, PUSD).dormant_redemption_target,
 				slot,
 				"redeeming {redeemed}"
 			);
@@ -58,7 +58,7 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
 		assert_noop!(redeem_step(DOT, PUSD, 99, 3, 1, 0), crate::Error::<Test>::VaultNotFound);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
 		// A frozen branch must reject settlement, like every other price-dependent
 		// path; the gate fires before any vault is touched or priced.
 		assert_ok!(set_governance_frozen(ADMIN, DOT, PUSD, true));
@@ -74,8 +74,8 @@ fn redeem_step_rejects_frozen_branch_and_missing_vault() {
 fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(60, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(50)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(60)));
 		advance_time(ONE_YEAR_MS + 1);
 
 		let vault_before = vault(DOT, PUSD, 1);
@@ -104,8 +104,8 @@ fn projected_redemption_snapshot_matches_execution_without_mutating_state() {
 fn a_step_for_the_projected_debt_clears_it() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(10, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(20, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(10)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(20)));
 		advance_time(1);
 		let snapshot =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
@@ -124,8 +124,8 @@ fn a_step_for_the_projected_debt_clears_it() {
 fn redeem_step_rejects_invalid_settlements() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		let snapshot =
 			crate::Pallet::<Test>::project_redemption_snapshot(&DOT, &PUSD, &1).expect("snapshot");
 
@@ -175,8 +175,8 @@ fn redeem_step_burns_exactly_the_debt_payment() {
 	};
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		mint_stable(PUSD, 3, 1_000);
 
 		let issuance_pre = total_stable(PUSD);
@@ -218,11 +218,11 @@ fn redeem_step_burns_exactly_the_debt_payment() {
 fn dormant_pointer_clears_when_last_dormant_fully_redeemed() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		// Push acct 1 to Dormant via partial-below-MinDebt.
 		assert_ok!(redeem(DOT, PUSD, 3, 350));
-		let state = branch_state(DOT, PUSD).unwrap();
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.dormant_redemption_target, Some(1));
 		// Now redeem acct 1's full residual. next_redemption_target prefers
 		// dormant_redemption_target, so this hits acct 1 again.
@@ -230,7 +230,7 @@ fn dormant_pointer_clears_when_last_dormant_fully_redeemed() {
 		let residual = v.debt.principal + v.debt.interest;
 		let target = redeem(DOT, PUSD, 3, residual).expect("redeem residual ok");
 		assert_eq!(target, 1);
-		let state = branch_state(DOT, PUSD).unwrap();
+		let state = market_state(DOT, PUSD);
 		assert_eq!(state.dormant_redemption_target, None);
 	});
 }
@@ -246,11 +246,11 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 		// Vault 1 carries the lower rate so it sits at the redemption tail; its
 		// rate is still high enough that accrued interest lifts the dormant
 		// remainder back over MinimumDebt (200) within a year.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(50, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(60, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(50)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(60)));
 		assert_ok!(redeem(DOT, PUSD, 3, 350));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, Some(1));
 
 		assert_eq!(vault(DOT, PUSD, 1).debt.principal, 155);
 		assert_eq!(vault(DOT, PUSD, 1).debt.interest, 0);
@@ -261,7 +261,7 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 		assert_eq!(vault(DOT, PUSD, 1).debt.interest, 78);
 		assert!(vault_status(DOT, PUSD, 1).is_dormant(), "touch never re-activates a Dormant");
 		assert_eq!(
-			branch_state(DOT, PUSD).unwrap().dormant_redemption_target,
+			market_state(DOT, PUSD).dormant_redemption_target,
 			Some(1),
 			"the touch leaves the dormant slot in place"
 		);
@@ -272,7 +272,7 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 			&rate_list(DOT, PUSD),
 			&1
 		));
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, None);
 	});
 }
 
@@ -280,8 +280,8 @@ fn activate_dormant_revives_when_accrued_debt_reaches_minimum() {
 fn activate_dormant_rejects_below_minimum_debt() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		assert_ok!(redeem(DOT, PUSD, 3, 350)); // vault 1 → Dormant, debt ~150 < 200
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		assert_noop!(activate_dormant(9, DOT, PUSD, 1), crate::Error::<Test>::DebtBelowMinimum);
@@ -293,7 +293,7 @@ fn activate_dormant_rejects_below_minimum_debt() {
 fn activate_dormant_rejects_active_vault() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
 		assert_noop!(activate_dormant(9, DOT, PUSD, 1), crate::Error::<Test>::InvalidVaultStatus);
 	});
 }
@@ -306,9 +306,9 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 		// Distinct rates so the rate-index tail is deterministic — acct 1 at
 		// the lower rate sits at the tail, where the redemption helper picks
 		// it first.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		assert_ok!(open(3, DOT, PUSD, 200, 200, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
+		assert_ok!(open(3, DOT, PUSD, 200, 200, percent(5)));
 		assert_ok!(redeem(DOT, PUSD, 4, 350)); // leaves acct 1 Dormant with debt
 
 		let vault_dormant_pre = vault(DOT, PUSD, 1);
@@ -326,7 +326,7 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 		// Dormant debt must not remove a vault from redistribution.
 		let gained = vault_dormant_post.debt.principal - vault_dormant_pre.debt.principal;
 		assert_eq!(gained, 98);
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, Some(1));
 	});
 }
 
@@ -336,18 +336,18 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
-		assert_ok!(open(3, DOT, PUSD, 200, 200, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
+		assert_ok!(open(3, DOT, PUSD, 200, 200, percent(5)));
 		assert_ok!(redeem(DOT, PUSD, 4, 700));
 
 		let husk_before = vault(DOT, PUSD, 1);
 		assert_eq!(husk_before.debt.total(), 0);
 		assert_eq!(husk_before.collateral, 950);
 		assert_eq!(husk_before.redistribution_stake, 950, "a debt-free husk stays eligible");
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, None);
 
-		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
+		set_price(DOT, FixedU128::from_u32(1));
 		assert_ok!(redistribute_for_test(DOT, PUSD, 3, held(DOT, 3)));
 		assert_ok!(poke(2, DOT, PUSD, 1));
 
@@ -359,7 +359,7 @@ fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 		assert_eq!(husk_after.redistribution_stake, 949);
 		// Redistribution does not put a Dormant vault in the redemption slot.
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, None);
 	});
 }
 
@@ -373,11 +373,11 @@ fn dormant_borrow_below_min_debt_reverts() {
 		// Distinct rates so the rate-index tail is deterministic — acct 1 at
 		// the lower rate sits at the tail, where the redemption helper picks
 		// it first.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		assert_ok!(redeem(DOT, PUSD, 3, 480)); // pushes acct 1 to Dormant with tiny debt
-										 // Borrow 1 — total debt would be far below
-										 // MinimumDebt 200.
+											   // Borrow 1 — total debt would be far below
+											   // MinimumDebt 200.
 		assert_noop!(borrow(1, DOT, PUSD, 1, None), crate::Error::<Test>::DebtBelowMinimum);
 	});
 }
@@ -388,8 +388,8 @@ fn dormant_borrow_below_min_debt_reverts() {
 fn dormant_revived_by_borrow_then_accepts_deposit() {
 	build_and_execute(|| {
 		register_market(DOT, PUSD);
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		assert_ok!(redeem(DOT, PUSD, 3, 350));
 		assert!(vault_status(DOT, PUSD, 1).is_dormant());
 		// While Dormant it is out of the rate index and parked as the redemption target.
@@ -397,7 +397,7 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 			&rate_list(DOT, PUSD),
 			&1
 		));
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, Some(1));
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, Some(1));
 
 		// A deposit alone cannot revive a Dormant vault → rejected (so it must not
 		// lead a batch).
@@ -414,7 +414,7 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 			&rate_list(DOT, PUSD),
 			&1
 		));
-		assert_eq!(branch_state(DOT, PUSD).unwrap().dormant_redemption_target, None);
+		assert_eq!(market_state(DOT, PUSD).dormant_redemption_target, None);
 
 		// ...after which the deposit leg of the batch is accepted.
 		let held_before = held(DOT, 1);
@@ -430,11 +430,11 @@ fn dormant_vault_cannot_change_rate() {
 		// Distinct rates so the rate-index tail is deterministic — acct 1 at
 		// the lower rate sits at the tail, where the redemption helper picks
 		// it first.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, rate_pct(2, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
 		assert_ok!(redeem(DOT, PUSD, 3, 350));
 		assert_noop!(
-			change_rate(1, DOT, PUSD, rate_pct(7, 100)),
+			change_rate(1, DOT, PUSD, percent(7)),
 			crate::Error::<Test>::InvalidVaultStatus
 		);
 	});
@@ -446,8 +446,8 @@ fn redemption_is_path_independent_across_chunks() {
 		register_market(DOT, PUSD);
 		register_market(TOKEN_X, PUSD);
 		// Identical vaults on the two markets (same owner, collateral, debt, rate).
-		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, rate_pct(5, 100)));
-		assert_ok!(open(1, TOKEN_X, PUSD, 1_000, 1_000, rate_pct(5, 100)));
+		assert_ok!(open(1, DOT, PUSD, 1_000, 1_000, percent(5)));
+		assert_ok!(open(1, TOKEN_X, PUSD, 1_000, 1_000, percent(5)));
 		let dot_pre = vault(DOT, PUSD, 1);
 		let tokenx_pre = vault(TOKEN_X, PUSD, 1);
 		assert_eq!(dot_pre.debt.total(), tokenx_pre.debt.total());

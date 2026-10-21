@@ -25,13 +25,11 @@ fn distribute_updates_g_exactly() {
 	build_with_default_market(|| {
 		seed_matured_deposit_from_balance(1, 10_000, 1_000);
 
-		let leftover = distribute_yield(DOT, PUSD, 100);
-		assert!(leftover.peek().is_zero());
-		drop(leftover);
+		assert_eq!(distribute_yield_leftover(DOT, PUSD, 100), 0);
 
 		// delta_G = floor(100 * P / A) = floor(100 * 1e18 / 1000) = 1e17.
 		let sums = active_sums(0, 0);
-		assert_eq!(sums.g_yield, FixedU128::from_inner(100_000_000_000_000_000));
+		assert_eq!(sums.g_yield, FixedU128::from_rational(1, 10));
 
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.total_yield_unclaimed, 100);
@@ -51,7 +49,7 @@ fn flooring_dust_accumulates_until_teardown() {
 		seed_matured_deposit_from_balance(1, 10_000, 600);
 		seed_matured_deposit_from_balance(2, 10_000, 2_400);
 
-		drop(distribute_yield(DOT, PUSD, 100));
+		distribute_all_yield(100);
 
 		// delta_G = floor(100 * 1e18 / 3000) = 33_333_333_333_333_333.
 		// Gains: floor(600 * inner / 1e18) = 19 (exactly 19.999...98),
@@ -64,7 +62,7 @@ fn flooring_dust_accumulates_until_teardown() {
 
 		// Live-market interactions do not redistribute the residue: no flow
 		// reads it back, so later distributions add their own remainder.
-		drop(distribute_yield(DOT, PUSD, 100));
+		distribute_all_yield(100);
 		assert_ok!(claim_yield(1, DOT, PUSD, 1));
 		assert_ok!(claim_yield(2, DOT, PUSD, 2));
 		assert_eq!(pool_state(DOT, PUSD).total_yield_unclaimed, 4);
@@ -81,7 +79,7 @@ fn late_depositor_earns_only_after_their_snapshot() {
 		seed_matured_deposit_from_balance(1, 10_000, 600);
 
 		// First distribution belongs to user 1 alone: G = 60/600 = 0.1.
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 
 		// User 2 waits behind the ordinary delay at G0 = 0.1. The second distribution itself
 		// activates the matured cohort before sharing the new yield.
@@ -89,7 +87,7 @@ fn late_depositor_earns_only_after_their_snapshot() {
 		advance_time(9_000);
 
 		// Second distribution splits over A = 1000: G = 0.1 + 0.1 = 0.2.
-		drop(distribute_yield(DOT, PUSD, 100));
+		distribute_all_yield(100);
 
 		// User 1: floor(600 * (0.2 - 0)) = 120 (all of the first, 60% of
 		// the second). User 2: floor(400 * (0.2 - 0.1)) = 40.
@@ -103,7 +101,7 @@ fn late_depositor_earns_only_after_their_snapshot() {
 fn compound_moves_yield_into_active_and_it_earns() {
 	build_with_default_market(|| {
 		seed_matured_deposit_from_balance(1, 10_000, 600);
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 
 		// Asking for more than the 60 claimable compounds exactly the 60.
 		assert_ok!(compound(1, DOT, PUSD, 1_000));
@@ -116,19 +114,11 @@ fn compound_moves_yield_into_active_and_it_earns() {
 		assert_eq!(state.total_yield_unclaimed, 0);
 		// Pure accounting: the pool balance did not move.
 		assert_eq!(pool_stable_held(DOT, PUSD), 660);
-		System::assert_last_event(
-			crate::Event::YieldCompounded {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				amount: 60,
-			}
-			.into(),
-		);
+		System::assert_last_event(market_event!(YieldCompounded { depositor: 1, amount: 60 }));
 
 		// The compounded amount earns from here on: G moves by 66/660 = 0.1
 		// and the whole 660 realizes floor(660 * 0.1) = 66.
-		drop(distribute_yield(DOT, PUSD, 66));
+		distribute_all_yield(66);
 		assert_claim_yield(1, 66);
 	});
 }
@@ -140,7 +130,7 @@ fn compound_with_nothing_claimable_reverts() {
 
 		assert_noop!(compound(1, DOT, PUSD, 60), Error::<Test>::NoYieldToCompound);
 		// A zero request is equally nothing to compound.
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 		assert_noop!(compound(1, DOT, PUSD, 0), Error::<Test>::NoYieldToCompound);
 	});
 }
@@ -174,7 +164,7 @@ fn vault_interest_flows_to_pool_through_the_hook() {
 		assert_eq!(state.total_yield_unclaimed, 18);
 		let sums = active_sums(0, 0);
 		// delta_G = floor(18 * 1e18 / 400) = 4.5e16.
-		assert_eq!(sums.g_yield, FixedU128::from_inner(45_000_000_000_000_000));
+		assert_eq!(sums.g_yield, FixedU128::from_rational(45, 1_000));
 		assert_eq!(pool_stable_held(DOT, PUSD), 418);
 		assert_eq!(stable_balance(PUSD, FEE_DEST), 8);
 		System::assert_has_event(
@@ -194,7 +184,7 @@ fn pending_deposits_earn_no_yield() {
 		// User 2's deposit is still pending when the yield arrives.
 		seed_deposit_from_balance(2, 10_000, 400);
 
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 
 		// The whole distribution went to the 600 active: G = 0.1. User 2 remains pending and has
 		// no yield to claim.
@@ -232,7 +222,7 @@ fn capital_changing_calls_issue_pending_branch_interest_first() {
 					.into(),
 			);
 			// delta_G = floor(18 * 1e18 / 400): spread over the 400 active before the call.
-			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_inner(45_000_000_000_000_000));
+			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(45, 1_000));
 		});
 	}
 }

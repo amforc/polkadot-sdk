@@ -8,7 +8,7 @@
 
 use crate::{
 	mock::*,
-	tests::{rate_pct, vault_events, vault_status, ONE_YEAR_MS},
+	tests::{percent, vault_events, vault_status, ONE_YEAR_MS},
 	types::BranchConfigUpdate,
 	Error,
 };
@@ -54,7 +54,7 @@ fn register_realistic_market() {
 #[test]
 fn fee_account_pays_its_own_asset_account_deposit() {
 	build_and_execute(|| {
-		set_price(TOKEN_X, FixedU128::from_rational(10u128, 1u128));
+		set_price(TOKEN_X, DEFAULT_PRICE);
 		let deposit = <Assets as AccountTouch<StableId, AccountId>>::deposit_required(USDX);
 		let spendable = |who| {
 			<Balances as FungibleInspect<AccountId>>::reducible_balance(
@@ -96,7 +96,7 @@ fn fee_account_pays_its_own_asset_account_deposit() {
 fn lifecycle_exact_at_realistic_scale() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		assert_eq!(stable_balance(USDX, 1), 5_000 * USD, "borrowed amount minted at scale");
 
 		// ceil(5×10^9 · 5% · 7d / 365.25d) = ceil(4_791_238.88) minor units.
@@ -136,7 +136,7 @@ fn lifecycle_exact_at_realistic_scale() {
 #[test]
 fn create_branch_rejects_debt_floor_below_stable_minimum() {
 	build_and_execute(|| {
-		set_price(TOKEN_X, FixedU128::from_rational(10u128, 1u128));
+		set_price(TOKEN_X, DEFAULT_PRICE);
 		let config = BranchConfig { minimum_debt: USDX_ED - 1, ..usdx_branch_config() };
 		assert_noop!(
 			crate::Pallet::<Test>::create_branch(
@@ -214,7 +214,7 @@ fn vault_floors_below_the_asset_minimum_are_rejected_on_every_write() {
 fn borrow_below_stable_ed_depends_on_recipient() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 
 		let borrow_to = |recipient: AccountId| {
 			crate::Pallet::<Test>::borrow(
@@ -244,19 +244,18 @@ fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
 		// Start with a zero fee balance to test the sub-minimum credit.
 		SpFeeShare::set(Permill::from_percent(100));
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		assert_eq!(stable_balance(USDX, FEE_DEST), 0, "touched at registration, still empty");
 
 		// Route the full credit from here on.
 		SpFeeShare::set(Permill::zero());
 
 		// The 476-unit fee is below the 10_000-unit asset minimum.
-		let minted_pre = branch_state(XBT, USDX).expect("state").debt.minted_interest;
+		let minted_pre = market_state(XBT, USDX).debt.minted_interest;
 		let issuance_pre = total_stable(USDX);
 		advance_time(60_000);
 		assert_ok!(poke(9, XBT, USDX, 1));
-		let minted_delta =
-			branch_state(XBT, USDX).expect("state").debt.minted_interest - minted_pre;
+		let minted_delta = market_state(XBT, USDX).debt.minted_interest - minted_pre;
 		assert_eq!(minted_delta, 476);
 		assert_eq!(stable_balance(USDX, FEE_DEST), 476, "sub-ED credit landed");
 		assert_eq!(total_stable(USDX) - issuance_pre, 476, "supply backs the recorded fee");
@@ -269,7 +268,7 @@ fn frozen_stable_fails_fee_resolution_loudly() {
 	build_and_execute(|| {
 		SpFeeShare::set(Permill::zero());
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		advance_time(60_000);
 		assert_ok!(Assets::freeze_asset(RuntimeOrigin::signed(1), USDX));
 		assert_noop!(poke(9, XBT, USDX, 1), Error::<Test>::FeeResolutionFailed);
@@ -296,8 +295,8 @@ fn crash_price_with_flat_keeper_value(value: Balance) {
 fn liquidation_plans_out_a_sub_ed_keeper_leg() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		crash_price_with_flat_keeper_value(500);
 		let custody = Vaults::redistribution_account(&XBT, &USDX);
 		let custody_before = held(XBT, custody);
@@ -318,7 +317,7 @@ fn liquidation_plans_out_a_sub_ed_keeper_leg() {
 fn final_recovery_entry_plans_out_a_sub_ed_keeper_reward() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		crash_price_with_flat_keeper_value(500);
 
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
@@ -340,8 +339,8 @@ fn final_recovery_entry_plans_out_a_sub_ed_keeper_reward() {
 fn liquidation_drops_a_jit_share_the_keeper_cannot_receive() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		crash_price_with_flat_keeper_value(500);
 		mint_stable(USDX, 998, USD);
 		let custody = Vaults::redistribution_account(&XBT, &USDX);
@@ -367,8 +366,8 @@ fn liquidation_drops_a_jit_share_the_keeper_cannot_receive() {
 fn reward_above_ed_carries_a_sub_ed_jit_share() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		crash_price_with_flat_keeper_value(2_000);
 		mint_stable(USDX, 998, USD);
 		let custody = Vaults::redistribution_account(&XBT, &USDX);
@@ -403,9 +402,9 @@ fn redistribution_custody_holds_issued_collateral() {
 
 		// Vaults 1 and 2 sit at par, vault 3 at 400%, so two liquidations still
 		// leave an eligible recipient.
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		assert_ok!(open(3, XBT, USDX, 4_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+		assert_ok!(open(3, XBT, USDX, 4_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		set_price(XBT, FixedU128::from_rational(1u128, 2_000u128));
 
 		// No Stability capital, so the whole seizure lands in custody.
@@ -434,8 +433,8 @@ fn redistribution_custody_holds_issued_collateral() {
 fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
-		assert_ok!(open(2, XBT, USDX, 2_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+		assert_ok!(open(2, XBT, USDX, 2_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		// Vault 1 falls just below par while vault 2 remains healthy.
 		set_price(XBT, FixedU128::from_rational(1u128, 2_000u128));
 
@@ -467,7 +466,7 @@ fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
 fn redemption_reverts_on_sub_ed_recipient_leg() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 
 		assert_eq!(collateral_balance(XBT, 997), 0, "recipient is fresh");
 		assert_noop!(
@@ -486,7 +485,7 @@ fn redemption_reverts_on_sub_ed_recipient_leg() {
 fn repay_dusts_sub_ed_payer_remainder() {
 	build_and_execute(|| {
 		register_realistic_market();
-		assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, rate_pct(5, 100)));
+		assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 
 		// Top the owner up to debt + a sub-ED remainder of 5_000 minor units.
 		let debt = xbt_vault(3).debt.total();

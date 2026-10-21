@@ -19,15 +19,15 @@ fn offsets_move_p_and_s_yield_moves_g() {
 		assert_eq!(simulate_offset(DOT, PUSD, 200, 160).debt(), 200);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.coords.p, FixedU128::from_rational(4, 5));
-		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_inner(160_000_000_000_000_000));
+		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(16, 100));
 		assert_eq!(active_sums(0, 0).g_yield, FixedU128::zero());
 
 		// Yield: delta_G = 80 * (0.8/800) = 0.08; P and S are untouched.
-		drop(distribute_yield(DOT, PUSD, 80));
+		distribute_all_yield(80);
 		let state = pool_state(DOT, PUSD);
 		assert_eq!(state.coords.p, FixedU128::from_rational(4, 5));
-		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_inner(160_000_000_000_000_000));
-		assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_inner(80_000_000_000_000_000));
+		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(16, 100));
+		assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(8, 100));
 
 		// Offset 2 compounds P multiplicatively and adds to S:
 		// P = 0.8 * (400/800) = 0.4, delta_S = 320 * (0.8/800) = 0.32,
@@ -39,8 +39,8 @@ fn offsets_move_p_and_s_yield_moves_g() {
 			state.coords,
 			Accumulators { p: FixedU128::from_rational(2, 5), epoch: 0, scale: 0 }
 		);
-		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_inner(480_000_000_000_000_000));
-		assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_inner(80_000_000_000_000_000));
+		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(48, 100));
+		assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(8, 100));
 	});
 }
 

@@ -315,8 +315,10 @@ impl<T: Config> Pallet<T> {
 			Error::<T>::StableCollateralCollision
 		);
 		StablecoinMarkets::<T>::try_mutate(&stable_key, |maybe| {
-			let markets =
-				maybe.unwrap_or_default().checked_add(1).ok_or(Error::<T>::ArithmeticOverflow)?;
+			let markets = maybe
+				.unwrap_or_default()
+				.ensure_add(1)
+				.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 			*maybe = Some(markets);
 			Ok(markets)
 		})
@@ -327,19 +329,13 @@ impl<T: Config> Pallet<T> {
 	/// The entry is removed with its last market.
 	fn release_stablecoin_market(stable_id: &StableIdOf<T>) -> Result<u32, DispatchError> {
 		let stable_key = T::StableToCollateralId::convert(stable_id.clone());
-		StablecoinMarkets::<T>::try_mutate(&stable_key, |maybe| match maybe {
-			Some(markets) if *markets > 0 => {
-				*markets -= 1;
-				let remaining = *markets;
-				if remaining == 0 {
-					*maybe = None;
-				}
-				Ok(remaining)
-			},
-			_ => {
-				defensive!("stablecoin market count missing or under-counted on release");
-				Err(DispatchError::Corruption)
-			},
+		StablecoinMarkets::<T>::try_mutate(&stable_key, |maybe| {
+			let remaining = maybe
+				.and_then(|markets| markets.checked_sub(1))
+				.defensive_proof("stablecoin market count missing or under-counted on release")
+				.ok_or(DispatchError::Corruption)?;
+			*maybe = (remaining > 0).then_some(remaining);
+			Ok(remaining)
 		})
 	}
 
@@ -361,12 +357,10 @@ impl<T: Config> Pallet<T> {
 			collateral: T::CollateralAssets::minimum_balance(collateral_id.clone()),
 			stable: T::StableAssets::minimum_balance(stable_id.clone()),
 		};
-		if let Some(defect) = config.structural_defect(&minimums) {
-			return Err(Error::<T>::InvalidBranchConfig(defect).into());
-		}
-		if let Some(violation) = T::BranchConfigBounds::get().violation(config) {
-			return Err(Error::<T>::ConfigOutsideEnvelope(violation).into());
-		}
+		config.ensure_consistent(&minimums).map_err(Error::<T>::InvalidBranchConfig)?;
+		T::BranchConfigBounds::get()
+			.ensure_within(config)
+			.map_err(Error::<T>::ConfigOutsideEnvelope)?;
 		Ok(())
 	}
 
@@ -505,13 +499,13 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		Branches::<T>::try_mutate_exists(&collateral_id, &stable_id, |maybe| -> DispatchResult {
 			let branch = maybe.as_mut().ok_or(Error::<T>::BranchNotFound)?;
-			if matches!(level, AdminLevel::Emergency) {
+			if level == AdminLevel::Emergency {
 				ensure!(
 					update.is_defensive(&branch.config),
 					Error::<T>::DefensiveActionNotDefensive
 				);
 			}
-			update.clone().apply_to(&mut branch.config);
+			update.apply_to(&mut branch.config);
 			Self::ensure_config_allowed(&collateral_id, &stable_id, &branch.config)?;
 			Ok(())
 		})?;
@@ -577,7 +571,7 @@ impl<T: Config> Pallet<T> {
 						Zero::zero()
 					},
 					(None, None) | (Some(_), Some(_)) => {
-						debug_assert!(false, "callers gate on the current frozen state");
+						defensive!("callers gate on the current frozen state");
 						Zero::zero()
 					},
 				};

@@ -102,19 +102,16 @@ pub mod pallet {
 	};
 
 	/// Balance type used by collateral and stable assets.
-	pub type BalanceOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
-		<T as frame_system::Config>::AccountId,
-	>>::Balance;
+	pub type BalanceOf<T> =
+		<<T as Config>::CollateralAssets as FungiblesInspect<AccountIdFor<T>>>::Balance;
 
 	/// Collateral identifier exposed by [`Config::CollateralAssets`].
-	pub type CollateralIdOf<T> = <<T as Config>::CollateralAssets as FungiblesInspect<
-		<T as frame_system::Config>::AccountId,
-	>>::AssetId;
+	pub type CollateralIdOf<T> =
+		<<T as Config>::CollateralAssets as FungiblesInspect<AccountIdFor<T>>>::AssetId;
 
 	/// Stable asset identifier exposed by [`Config::StableAssets`].
-	pub type StableIdOf<T> = <<T as Config>::StableAssets as FungiblesInspect<
-		<T as frame_system::Config>::AccountId,
-	>>::AssetId;
+	pub type StableIdOf<T> =
+		<<T as Config>::StableAssets as FungiblesInspect<AccountIdFor<T>>>::AssetId;
 
 	/// Account lookup type used by administrator calls.
 	pub type AccountIdLookupOf<T> = <<T as frame_system::Config>::Lookup as StaticLookup>::Source;
@@ -126,22 +123,21 @@ pub mod pallet {
 	pub type RegistrationConfigOf<T> = <<T as Config>::OnBranchLifecycle as OnBranchLifecycle<
 		CollateralIdOf<T>,
 		StableIdOf<T>,
-		<T as frame_system::Config>::AccountId,
+		AccountIdFor<T>,
 	>>::RegistrationConfig;
 
 	/// Stable-asset credit produced by the pallet.
-	pub type StableCreditOf<T> =
-		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
+	pub type StableCreditOf<T> = fungibles::Credit<AccountIdFor<T>, <T as Config>::StableAssets>;
 	/// Collateral credit produced by the pallet.
 	pub type CollateralCreditOf<T> =
-		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::CollateralAssets>;
+		fungibles::Credit<AccountIdFor<T>, <T as Config>::CollateralAssets>;
+
+	/// List identifier for one of this pallet's per-market lists.
+	pub type VaultListIdOf<T> = VaultListId<CollateralIdOf<T>, StableIdOf<T>>;
 
 	/// Market record used by the runtime.
-	pub type BranchOf<T> = crate::types::Branch<
-		<T as frame_system::Config>::AccountId,
-		BalanceOf<T>,
-		<T as Config>::BranchConsideration,
-	>;
+	pub type BranchOf<T> =
+		crate::types::Branch<AccountIdFor<T>, BalanceOf<T>, <T as Config>::BranchConsideration>;
 
 	/// Stored vault record: the accounting row with its storage deposit.
 	pub type VaultRecordOf<T> =
@@ -837,7 +833,7 @@ pub mod pallet {
 			match Self::priority_redemption_target(&collateral_id, &stable_id) {
 				Some((owner, _)) => vec![owner],
 				None => T::VaultLists::iter_from_tail(VaultListId::Rate(collateral_id, stable_id))
-					.take(n as usize)
+					.take(n.saturated_into())
 					.collect(),
 			}
 		}
@@ -865,10 +861,10 @@ pub mod pallet {
 					.chain(accrued.dormant_redemption_target.clone())
 					.chain(below_rate);
 			let mut total = BalanceOf::<T>::zero();
-			for owner in in_front.by_ref().take(max_steps as usize) {
+			for owner in in_front.by_ref().take(max_steps.saturated_into()) {
 				let debt =
 					Self::projected_vault_debt(&collateral_id, &stable_id, &owner, &accrued, now)?;
-				total = total.checked_add(&debt).ok_or(Error::<T>::ArithmeticOverflow)?;
+				total.ensure_add_assign(debt).map_err(|_| Error::<T>::ArithmeticOverflow)?;
 			}
 			Ok((total, in_front.next().is_some()))
 		}
@@ -1103,7 +1099,7 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
 		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			VaultOp::<T>::refresh(collateral_id, stable_id, &owner)
 		}
 
@@ -1144,7 +1140,7 @@ pub mod pallet {
 			owner: T::AccountId,
 			hint: Position<T::AccountId>,
 		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			Self::do_exit_final_recovery(owner, collateral_id, stable_id, hint)
 		}
 
@@ -1252,7 +1248,7 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			Self::do_refresh_branch(&collateral_id, &stable_id)
 		}
 
@@ -1322,7 +1318,7 @@ pub mod pallet {
 			owner: T::AccountId,
 			hint: Position<T::AccountId>,
 		) -> DispatchResultWithPostInfo {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			Self::do_activate_dormant(owner, collateral_id, stable_id, hint)?;
 			Ok(Pays::No.into())
 		}
@@ -1344,7 +1340,7 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			ceiling: BalanceOf<T>,
 		) -> DispatchResult {
-			let _ = T::CreateOrigin::ensure_origin(origin, &stable_id)?;
+			T::CreateOrigin::ensure_origin(origin, &stable_id)?;
 			Self::do_set_global_debt_ceiling(stable_id, ceiling);
 			Ok(())
 		}

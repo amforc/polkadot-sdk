@@ -10,7 +10,10 @@ use core::cmp::Ordering;
 use frame::deps::{
 	frame_support::PalletId,
 	sp_io::hashing::blake2_256,
-	sp_runtime::{traits::AccountIdConversion, FixedU128},
+	sp_runtime::{
+		traits::{AccountIdConversion, Zero},
+		FixedU128,
+	},
 };
 use scale_info::TypeInfo;
 
@@ -80,6 +83,13 @@ impl VaultStatus {
 pub struct DebtCollateral<Balance> {
 	pub debt: Balance,
 	pub collateral: Balance,
+}
+
+impl<Balance: Zero> DebtCollateral<Balance> {
+	/// Returns `true` when both the debt and the collateral are zero.
+	pub fn is_zero(&self) -> bool {
+		self.debt.is_zero() && self.collateral.is_zero()
+	}
 }
 
 /// A position's collateralization ratio.

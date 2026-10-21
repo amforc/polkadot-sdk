@@ -14,7 +14,7 @@ fn frozen_branch_blocks_every_value_moving_operation() {
 	build_and_execute(|| {
 		seed_branch_with_debt();
 		assert_ok!(deposit(1, DOT, PUSD, 300));
-		drop(distribute_yield(DOT, PUSD, 60));
+		distribute_all_yield(60);
 		// Let the 300's cohort mature, so the freeze provably blocks its advancement.
 		advance_time(9_000);
 
@@ -94,16 +94,11 @@ fn safety_mode_enforces_two_step_withdrawals() {
 		assert_ok!(withdraw(1, DOT, PUSD, 300, 1));
 		// take = min(requested-remaining 150, active 300): the request
 		// bounds the exit and is consumed by it.
-		System::assert_last_event(
-			crate::Event::WithdrawalExecuted {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				recipient: 1,
-				amount: 150,
-			}
-			.into(),
-		);
+		System::assert_last_event(market_event!(WithdrawalExecuted {
+			depositor: 1,
+			recipient: 1,
+			amount: 150,
+		}));
 		assert_noop!(withdraw(1, DOT, PUSD, 100, 1), Error::<Test>::WithdrawalRequestMissing);
 	});
 }
@@ -124,7 +119,7 @@ fn safety_mode_keeps_deposits_claims_and_offsets_working() {
 		assert_eq!(simulate_offset(DOT, PUSD, 48, 80).debt(), 48);
 		assert_claim_collateral(1, 80);
 
-		drop(distribute_yield(DOT, PUSD, 70));
+		distribute_all_yield(70);
 		// A = 352 after the offset: delta_G = 70 * (0.88/352) = 0.175;
 		// the claim realizes against the post-claim snapshot (P0 = 0.88):
 		// yield = floor(352 * 0.175 / 0.88) = 70.
@@ -141,16 +136,11 @@ fn normal_mode_request_forwards_to_withdraw() {
 		// so the call executes as a direct withdrawal to the caller and
 		// records nothing.
 		assert_ok!(request_withdraw(1, DOT, PUSD, 250));
-		System::assert_last_event(
-			crate::Event::WithdrawalExecuted {
-				collateral_id: DOT,
-				stable_id: PUSD,
-				depositor: 1,
-				recipient: 1,
-				amount: 250,
-			}
-			.into(),
-		);
+		System::assert_last_event(market_event!(WithdrawalExecuted {
+			depositor: 1,
+			recipient: 1,
+			amount: 250,
+		}));
 		assert_eq!(stable_balance(PUSD, 1), 850);
 		let row = deposit_row(DOT, PUSD, 1).expect("row survives");
 		assert_eq!(row.active_deposit, 150);

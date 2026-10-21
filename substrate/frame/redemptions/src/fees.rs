@@ -3,7 +3,7 @@ use frame::deps::{
 	frame_support::traits::Defensive,
 	sp_runtime::{
 		traits::{CheckedAdd, CheckedDiv, One, Saturating, Zero},
-		ArithmeticError, FixedPointNumber, FixedPointOperand, FixedU128, Permill,
+		ArithmeticError, FixedPointOperand, FixedU128, Permill, Perquintill,
 	},
 };
 use pusd_primitives::math::mul_rate_ceil;
@@ -102,9 +102,7 @@ impl DynamicFeeCurve {
 	/// The result has a maximum of one because an amount above the total debt cannot represent a
 	/// larger share.
 	fn redeemed_share(&self, redeemed: u128) -> FixedU128 {
-		FixedU128::checked_from_rational(redeemed, self.debt)
-			.unwrap_or_else(FixedU128::one)
-			.min(FixedU128::one())
+		Perquintill::from_rational(redeemed, self.debt).into()
 	}
 
 	/// Calculates the rise of the dynamic fee that redemption of `redeemed` causes: its debt share
@@ -248,6 +246,7 @@ pub fn scale_floor<Balance: FixedPointOperand>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use frame::deps::sp_runtime::FixedPointNumber;
 
 	const HOUR: u64 = 3_600_000;
 
