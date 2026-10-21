@@ -46,7 +46,7 @@ where
 	let one = T::Priority::one();
 	let two = one.saturating_add(one);
 
-	let mut priorities = Vec::with_capacity(count as usize);
+	let mut priorities = Vec::with_capacity(count.saturated_into());
 	let mut current = two;
 	for _ in 0..count {
 		priorities.push(current);
@@ -54,7 +54,7 @@ where
 	}
 	priorities.reverse();
 
-	let mut items = Vec::with_capacity(count as usize);
+	let mut items = Vec::with_capacity(count.saturated_into());
 	for (index, priority) in (0..count).zip(&priorities) {
 		let item: T::ItemId = account("seed", index, 0);
 		let hint = Pallet::<T>::find_position(list_id.clone(), *priority);
@@ -94,7 +94,7 @@ mod benchmarks {
 			Position::endpoints_only(),
 		);
 
-		assert_eq!(ListNodes::<T>::get(&list_id, &target).map(|n| n.priority), Some(priorities[1]));
+		assert_eq!(Pallet::<T>::priority(&list_id, &target), Some(priorities[1]));
 		Ok(())
 	}
 
@@ -121,7 +121,7 @@ mod benchmarks {
 			Position::endpoints_only(),
 		);
 
-		assert_eq!(ListNodes::<T>::get(&list_id, &target).map(|n| n.priority), Some(new_priority));
+		assert_eq!(Pallet::<T>::priority(&list_id, &target), Some(new_priority));
 		assert_eq!(Pallet::<T>::head(&list_id), Some(seeded[0].clone()));
 		assert_eq!(Pallet::<T>::tail(&list_id), Some(seeded[2].clone()));
 		Ok(())
@@ -135,7 +135,7 @@ mod benchmarks {
 	) -> Result<(), BenchmarkError> {
 		let list_id = T::ListId::default();
 		let (seeded, priorities) = seed_chain::<T>(&list_id, s + 5)?;
-		let s = s as usize;
+		let s: usize = s.saturated_into();
 		let target = seeded[s + 3].clone();
 		let new_priority = priorities[0].saturating_sub(T::Priority::one());
 		let hint = Position::between(seeded[s].clone(), seeded[s + 1].clone());

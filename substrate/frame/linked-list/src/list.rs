@@ -39,6 +39,27 @@ pub struct Node<ItemId, Priority> {
 	pub priority: Priority,
 }
 
+/// The stored [`Node`] type of a pallet instance.
+pub type NodeOf<T> = Node<<T as Config>::ItemId, <T as Config>::Priority>;
+
+/// The `(prev, next)` neighbor rows of a position, each `None` for an endpoint
+/// or a missing row.
+pub type Neighbors<T> = (Option<NodeOf<T>>, Option<NodeOf<T>>);
+
+/// Raise a defensive failure for `proof` and yield [`ListError::CorruptList`].
+/// Paired with `ensure!` so every storage-consistency guard reads as the
+/// invariant it upholds.
+pub(crate) fn corrupt(proof: &'static str) -> ListError {
+	defensive!(proof);
+	ListError::CorruptList
+}
+
+/// Whether `position` names `item` on either side: a self-link, which would
+/// form a cycle.
+fn links_to<ItemId: PartialEq>(position: &Position<ItemId>, item: &ItemId) -> bool {
+	position.prev.as_ref() == Some(item) || position.next.as_ref() == Some(item)
+}
+
 impl<ItemId, Priority> Node<ItemId, Priority> {
 	/// Consume the node into its `(prev, next)` [`Position`].
 	pub fn into_position(self) -> Position<ItemId> {
@@ -49,10 +70,7 @@ impl<ItemId, Priority> Node<ItemId, Priority> {
 /// Fetch the stored nodes flanking `pos`: `(prev, next)`, each `None` for an
 /// endpoint or a missing row. Feeds the pure position predicates and repair
 /// steps, which never read storage themselves.
-pub fn neighbor_nodes<T: Config>(
-	list_id: &T::ListId,
-	pos: &Position<T::ItemId>,
-) -> (Option<Node<T::ItemId, T::Priority>>, Option<Node<T::ItemId, T::Priority>>) {
+pub fn neighbor_nodes<T: Config>(list_id: &T::ListId, pos: &Position<T::ItemId>) -> Neighbors<T> {
 	(
 		pos.prev.as_ref().and_then(|p| ListNodes::<T>::get(list_id, p)),
 		pos.next.as_ref().and_then(|n| ListNodes::<T>::get(list_id, n)),
@@ -127,44 +145,41 @@ pub fn validate_node_links<T: Config>(
 	list_id: &T::ListId,
 	item: &T::ItemId,
 	position: &Position<T::ItemId>,
-	prev_node: Option<&Node<T::ItemId, T::Priority>>,
-	next_node: Option<&Node<T::ItemId, T::Priority>>,
+	prev_node: Option<&NodeOf<T>>,
+	next_node: Option<&NodeOf<T>>,
 ) -> Result<(), ListError> {
 	// Anti-cycle guard: a node's own links must never name itself.
-	if position.prev.as_ref() == Some(item) || position.next.as_ref() == Some(item) {
-		defensive!("validate_node_links: node linked against itself");
-		return Err(ListError::CorruptList);
-	}
-	if position.prev.is_some() && position.prev == position.next {
-		defensive!("validate_node_links: prev and next name the same neighbor");
-		return Err(ListError::CorruptList);
-	}
-	if position.prev.is_some() && prev_node.is_none() {
-		defensive!("validate_node_links: prev neighbor row is missing");
-		return Err(ListError::CorruptList);
-	}
-	if position.next.is_some() && next_node.is_none() {
-		defensive!("validate_node_links: next neighbor row is missing");
-		return Err(ListError::CorruptList);
-	}
-	if prev_node.is_some_and(|node| node.next.as_ref() != Some(item)) {
-		defensive!("validate_node_links: prev neighbor does not link back to item");
-		return Err(ListError::CorruptList);
-	}
-	if next_node.is_some_and(|node| node.prev.as_ref() != Some(item)) {
-		defensive!("validate_node_links: next neighbor does not link back to item");
-		return Err(ListError::CorruptList);
-	}
+	ensure!(!links_to(position, item), corrupt("validate_node_links: node linked against itself"));
+	ensure!(
+		position.prev.is_none() || position.prev != position.next,
+		corrupt("validate_node_links: prev and next name the same neighbor")
+	);
+	ensure!(
+		position.prev.is_none() || prev_node.is_some(),
+		corrupt("validate_node_links: prev neighbor row is missing")
+	);
+	ensure!(
+		position.next.is_none() || next_node.is_some(),
+		corrupt("validate_node_links: next neighbor row is missing")
+	);
+	ensure!(
+		prev_node.is_none_or(|node| node.next.as_ref() == Some(item)),
+		corrupt("validate_node_links: prev neighbor does not link back to item")
+	);
+	ensure!(
+		next_node.is_none_or(|node| node.prev.as_ref() == Some(item)),
+		corrupt("validate_node_links: next neighbor does not link back to item")
+	);
 	if position.prev.is_none() || position.next.is_none() {
 		let meta = ListMetas::<T>::get(list_id).defensive_ok_or(ListError::CorruptList)?;
-		if position.prev.is_none() && meta.head.as_ref() != Some(item) {
-			defensive!("validate_node_links: head pointer disagrees with head-claiming node");
-			return Err(ListError::CorruptList);
-		}
-		if position.next.is_none() && meta.tail.as_ref() != Some(item) {
-			defensive!("validate_node_links: tail pointer disagrees with tail-claiming node");
-			return Err(ListError::CorruptList);
-		}
+		ensure!(
+			position.prev.is_some() || meta.head.as_ref() == Some(item),
+			corrupt("validate_node_links: head pointer disagrees with head-claiming node")
+		);
+		ensure!(
+			position.next.is_some() || meta.tail.as_ref() == Some(item),
+			corrupt("validate_node_links: tail pointer disagrees with tail-claiming node")
+		);
 	}
 	Ok(())
 }
@@ -296,10 +311,10 @@ pub fn walk_repair<T: Config>(
 		let progressed = try_clamp_dangling(&mut current, pn, nn) ||
 			try_reanchor_inconsistent(priority, &mut current, pn, nn, meta.as_ref()) ||
 			try_walk_priority(priority, &mut current, pn, nn);
-		if !progressed || current == before {
-			defensive!("walk_repair: repair step made no progress");
-			return Err(ListError::CorruptList);
-		}
+		ensure!(
+			progressed && current != before,
+			corrupt("walk_repair: repair step made no progress")
+		);
 	}
 
 	crate::log!(debug, "walk_repair: stale hint exceeded MaxHintRepairSteps ({} steps)", budget,);
@@ -312,21 +327,17 @@ pub fn walk_repair<T: Config>(
 fn assert_position_admits<T: Config>(
 	priority: &T::Priority,
 	position: &Position<T::ItemId>,
-	prev_node: Option<&Node<T::ItemId, T::Priority>>,
-	next_node: Option<&Node<T::ItemId, T::Priority>>,
+	prev_node: Option<&NodeOf<T>>,
+	next_node: Option<&NodeOf<T>>,
 ) -> Result<(), ListError> {
-	if let Some(prev) = prev_node {
-		if prev.next != position.next || prev.priority < *priority {
-			defensive!("insert_at: prev neighbor rejects the resolved position");
-			return Err(ListError::CorruptList);
-		}
-	}
-	if let Some(next) = next_node {
-		if next.prev != position.prev || *priority <= next.priority {
-			defensive!("insert_at: next neighbor rejects the resolved position");
-			return Err(ListError::CorruptList);
-		}
-	}
+	ensure!(
+		prev_node.is_none_or(|prev| prev.next == position.next && prev.priority >= *priority),
+		corrupt("insert_at: prev neighbor rejects the resolved position")
+	);
+	ensure!(
+		next_node.is_none_or(|next| next.prev == position.prev && *priority > next.priority),
+		corrupt("insert_at: next neighbor rejects the resolved position")
+	);
 	Ok(())
 }
 
@@ -350,19 +361,19 @@ fn update_meta_for_insert<T: Config>(
 	// No meta row means an empty list, so the only valid hint is
 	// `endpoints_only`. Any neighbor hint means nodes exist without a meta
 	// row: reject it as corruption instead of building a list over the orphans.
-	if list_created && *position != Position::endpoints_only() {
-		defensive!("insert_at: neighbor hint into absent list metadata");
-		return Err(ListError::CorruptList);
-	}
+	ensure!(
+		!list_created || *position == Position::endpoints_only(),
+		corrupt("insert_at: neighbor hint into absent list metadata")
+	);
 	let mut meta = meta.unwrap_or_default();
-	if position.prev.is_none() && meta.head != position.next {
-		defensive!("insert_at: head pointer disagrees with head-side insert");
-		return Err(ListError::CorruptList);
-	}
-	if position.next.is_none() && meta.tail != position.prev {
-		defensive!("insert_at: tail pointer disagrees with tail-side insert");
-		return Err(ListError::CorruptList);
-	}
+	ensure!(
+		position.prev.is_some() || meta.head == position.next,
+		corrupt("insert_at: head pointer disagrees with head-side insert")
+	);
+	ensure!(
+		position.next.is_some() || meta.tail == position.prev,
+		corrupt("insert_at: tail pointer disagrees with tail-side insert")
+	);
 	// Caller-reachable capacity limit, not corruption: a list can legitimately
 	// hold `u32::MAX` items, so overflow stays a graceful `ListTooLong` rather
 	// than the `defensive!` posture of the surrounding consistency checks.
@@ -394,17 +405,12 @@ pub fn insert_at<T: Config>(
 	priority: T::Priority,
 	position: Position<T::ItemId>,
 ) -> Result<bool, ListError> {
-	if ListNodes::<T>::contains_key(list_id, item) {
-		return Err(ListError::ItemAlreadyExists);
-	}
+	ensure!(!ListNodes::<T>::contains_key(list_id, item), ListError::ItemAlreadyExists);
 
 	// Anti-cycle guard: a node must never be linked against itself. Checked
 	// before the fetches so a self-naming hint surfaces as the cycle it is
 	// rather than as a missing-neighbor row.
-	if position.prev.as_ref() == Some(item) || position.next.as_ref() == Some(item) {
-		defensive!("insert_at: item linked against itself");
-		return Err(ListError::CorruptList);
-	}
+	ensure!(!links_to(&position, item), corrupt("insert_at: item linked against itself"));
 
 	// A dangling side surfaces as `insert_at_inner`'s side/node disagreement.
 	let (prev_node, next_node) = neighbor_nodes::<T>(list_id, &position);
@@ -430,20 +436,17 @@ pub fn insert_at_inner<T: Config>(
 	let ValidPosition { position, steps: _, prev_node, next_node, meta } = valid;
 	// Anti-cycle guard: a node must never be linked against itself. `walk_repair`
 	// never yields such a position, so reaching it is internal corruption.
-	if position.prev.as_ref() == Some(item) || position.next.as_ref() == Some(item) {
-		defensive!("insert_at: item linked against itself");
-		return Err(ListError::CorruptList);
-	}
+	ensure!(!links_to(&position, item), corrupt("insert_at: item linked against itself"));
 	// Each `Some` side must come with its stored node; a dangling side here is
 	// corruption (the wrapper and `walk_repair` both guarantee agreement).
-	if position.prev.is_some() != prev_node.is_some() {
-		defensive!("insert_at: prev side and prev node disagree");
-		return Err(ListError::CorruptList);
-	}
-	if position.next.is_some() != next_node.is_some() {
-		defensive!("insert_at: next side and next node disagree");
-		return Err(ListError::CorruptList);
-	}
+	ensure!(
+		position.prev.is_some() == prev_node.is_some(),
+		corrupt("insert_at: prev side and prev node disagree")
+	);
+	ensure!(
+		position.next.is_some() == next_node.is_some(),
+		corrupt("insert_at: next side and next node disagree")
+	);
 
 	assert_position_admits::<T>(&priority, &position, prev_node.as_ref(), next_node.as_ref())?;
 
@@ -519,10 +522,10 @@ fn update_meta_for_remove<T: Config>(
 		let neighbors = u32::from(vacated.prev.is_some()) + u32::from(vacated.next.is_some());
 		let len_matches_topology =
 			if neighbors == 0 { meta.len == 1 } else { meta.len > neighbors };
-		if !len_matches_topology {
-			defensive!("remove_at: ListMetas.len incompatible with removed node topology");
-			return Err(ListError::CorruptList);
-		}
+		ensure!(
+			len_matches_topology,
+			corrupt("remove_at: ListMetas.len incompatible with removed node topology")
+		);
 		meta.len = meta.len.checked_sub(1).defensive_ok_or(ListError::CorruptList)?;
 		// We removed the head iff the vacated gap has no `prev` side; the new
 		// head is then the gap's `next` (`None` once the list empties).
@@ -548,8 +551,7 @@ pub fn linked_neighbors<T: Config>(
 	list_id: &T::ListId,
 	item: &T::ItemId,
 	position: &Position<T::ItemId>,
-) -> Result<(Option<Node<T::ItemId, T::Priority>>, Option<Node<T::ItemId, T::Priority>>), ListError>
-{
+) -> Result<Neighbors<T>, ListError> {
 	let (prev_node, next_node) = neighbor_nodes::<T>(list_id, position);
 	validate_node_links::<T>(list_id, item, position, prev_node.as_ref(), next_node.as_ref())?;
 	Ok((prev_node, next_node))
@@ -564,8 +566,8 @@ pub fn unlink<T: Config>(
 	list_id: &T::ListId,
 	item: &T::ItemId,
 	vacated: Position<T::ItemId>,
-	prev_node: Option<Node<T::ItemId, T::Priority>>,
-	next_node: Option<Node<T::ItemId, T::Priority>>,
+	prev_node: Option<NodeOf<T>>,
+	next_node: Option<NodeOf<T>>,
 ) -> Result<bool, ListError> {
 	debug_assert_eq!(vacated.prev.is_some(), prev_node.is_some(), "unvalidated prev side");
 	debug_assert_eq!(vacated.next.is_some(), next_node.is_some(), "unvalidated next side");

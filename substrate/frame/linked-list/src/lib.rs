@@ -220,7 +220,7 @@ pub mod pallet {
 		/// than `n` if the list has fewer items.
 		pub fn iter_from_tail(list_id: T::ListId, n: u32) -> alloc::vec::Vec<T::ItemId> {
 			<Self as SortedListInterface<T::ListId, T::ItemId>>::iter_from_tail(list_id)
-				.take(n as usize)
+				.take(n.saturated_into())
 				.collect()
 		}
 

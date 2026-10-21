@@ -110,6 +110,22 @@ pub enum ListError {
 	Internal,
 }
 
+/// Lets list implementations run their mutations under
+/// [`with_storage_layer`](frame::deps::frame_support::storage::with_storage_layer),
+/// whose only own failure is the transactional nesting limit.
+impl From<DispatchError> for ListError {
+	fn from(error: DispatchError) -> Self {
+		match error {
+			// The nesting limit is environmental, not caller input or corruption.
+			DispatchError::Transactional(_) => Self::Internal,
+			other => {
+				defensive!("ListError: unexpected DispatchError from a storage layer", other);
+				Self::Internal
+			},
+		}
+	}
+}
+
 /// Outcome of [`crate::SortedListInterface::re_insert`]. Distinguishes the
 /// three branches so callers can charge the matching weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
