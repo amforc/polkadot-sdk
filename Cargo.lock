@@ -15453,8 +15453,8 @@ dependencies = [
  "pallet-timestamp",
  "parity-scale-codec",
  "polkadot-sdk-frame",
- "pusd-primitives",
  "scale-info",
+ "stablecoin-primitives",
 ]
 
 [[package]]
@@ -17965,7 +17965,6 @@ dependencies = [
  "polkadot-service",
  "polkadot-statement-distribution",
  "polkadot-statement-table",
- "pusd-primitives",
  "sc-allocator 23.0.0",
  "sc-authority-discovery",
  "sc-basic-authorship",
@@ -18084,6 +18083,7 @@ dependencies = [
  "sp-virtualization-test-fixture",
  "sp-wasm-interface 20.0.0",
  "sp-weights 27.0.0",
+ "stablecoin-primitives",
  "staging-chain-spec-builder",
  "staging-node-inspect",
  "staging-parachain-info",
@@ -19442,16 +19442,6 @@ dependencies = [
  "proc-macro2 1.0.95",
  "quote 1.0.40",
  "syn 2.0.98",
-]
-
-[[package]]
-name = "pusd-primitives"
-version = "0.1.0"
-dependencies = [
- "impl-trait-for-tuples",
- "parity-scale-codec",
- "polkadot-sdk-frame",
- "scale-info",
 ]
 
 [[package]]
@@ -26719,6 +26709,16 @@ name = "stable_deref_trait"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
+
+[[package]]
+name = "stablecoin-primitives"
+version = "0.1.0"
+dependencies = [
+ "impl-trait-for-tuples",
+ "parity-scale-codec",
+ "polkadot-sdk-frame",
+ "scale-info",
+]
 
 [[package]]
 name = "staging-chain-spec-builder"

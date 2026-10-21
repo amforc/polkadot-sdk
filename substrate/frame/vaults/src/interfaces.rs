@@ -16,7 +16,7 @@ use frame::{
 		MutateHold as FungiblesMutateHold,
 	},
 };
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BranchInterface, BranchMode, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
 

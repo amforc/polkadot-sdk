@@ -10,7 +10,7 @@ use frame::{
 	deps::sp_core::U256,
 	traits::Defensive,
 };
-use pusd_primitives::{math::mul_div, MILLIS_PER_YEAR};
+use stablecoin_primitives::{math::mul_div, MILLIS_PER_YEAR};
 
 /// Denominator of every interest numerator, `principal × rate-inner × millis`: one whole unit
 /// of interest per year of one whole unit of principal at rate one.

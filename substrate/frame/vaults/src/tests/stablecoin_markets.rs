@@ -16,32 +16,32 @@ fn markets_of(asset: AssetId) -> Option<u32> {
 #[test]
 fn markets_are_counted_per_stablecoin() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		register_market(DOT, EUSD);
-		register_market(TOKEN_X, PUSD);
+		register_market(TOKEN_X, STABLE);
 
 		assert_eq!(markets_of(DOT), None);
 		assert_eq!(markets_of(TOKEN_X), None);
-		assert_eq!(markets_of(AssetId::WithId(PUSD)), Some(2));
+		assert_eq!(markets_of(AssetId::WithId(STABLE)), Some(2));
 		assert_eq!(markets_of(AssetId::WithId(EUSD)), Some(1));
 
-		// Removing one of PUSD's two markets keeps the count.
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert_eq!(markets_of(AssetId::WithId(PUSD)), Some(1));
+		// Removing one of STABLE's two markets keeps the count.
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
+		assert_eq!(markets_of(AssetId::WithId(STABLE)), Some(1));
 
 		// Removing the final markets deletes the entries.
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD));
-		assert_eq!(markets_of(AssetId::WithId(PUSD)), None);
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, STABLE));
+		assert_eq!(markets_of(AssetId::WithId(STABLE)), None);
 		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, EUSD));
 		assert_eq!(markets_of(AssetId::WithId(EUSD)), None);
 		assert_eq!(
 			LifecycleLog::get(),
 			alloc::vec![
-				(DOT, PUSD, Lifecycle::Registered, 1),
+				(DOT, STABLE, Lifecycle::Registered, 1),
 				(DOT, EUSD, Lifecycle::Registered, 1),
-				(TOKEN_X, PUSD, Lifecycle::Registered, 2),
-				(DOT, PUSD, Lifecycle::Deregistered, 1),
-				(TOKEN_X, PUSD, Lifecycle::Deregistered, 0),
+				(TOKEN_X, STABLE, Lifecycle::Registered, 2),
+				(DOT, STABLE, Lifecycle::Deregistered, 1),
+				(TOKEN_X, STABLE, Lifecycle::Deregistered, 0),
 				(DOT, EUSD, Lifecycle::Deregistered, 0),
 			]
 		);
@@ -55,14 +55,14 @@ fn markets_are_counted_per_stablecoin() {
 #[test]
 fn roles_are_reusable_once_no_live_market_holds_them() {
 	build_and_execute(|| {
-		register_market(TOKEN_X, PUSD);
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD));
-		assert_eq!(markets_of(AssetId::WithId(PUSD)), None);
+		register_market(TOKEN_X, STABLE);
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, STABLE));
+		assert_eq!(markets_of(AssetId::WithId(STABLE)), None);
 
 		// The retired stablecoin returns as a collateral (ADMIN funds the
 		// custody seed of every Root-created market, so it needs the coin)...
-		mint_stable(PUSD, ADMIN, 1_000_000_000_000);
-		register_market(AssetId::WithId(PUSD), EUSD);
+		mint_stable(STABLE, ADMIN, 1_000_000_000_000);
+		register_market(AssetId::WithId(STABLE), EUSD);
 		// ...and the retired collateral returns as a stablecoin.
 		register_market(ETH, TOKEN_X_ID);
 
@@ -77,14 +77,14 @@ fn roles_are_reusable_once_no_live_market_holds_them() {
 #[test]
 fn cross_role_reuse_rejected_in_both_directions() {
 	build_and_execute(|| {
-		register_market(TOKEN_X, PUSD);
+		register_market(TOKEN_X, STABLE);
 
 		// A live stablecoin as a new market's collateral.
-		set_price(AssetId::WithId(PUSD), DEFAULT_PRICE);
+		set_price(AssetId::WithId(STABLE), DEFAULT_PRICE);
 		assert_noop!(
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
-				AssetId::WithId(PUSD),
+				AssetId::WithId(STABLE),
 				EUSD,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
@@ -120,30 +120,30 @@ fn failed_registration_hook_rolls_back_everything() {
 		FailOnRegistered::set(true);
 		assert_noop!(
 			Pallet::<Test>::create_branch(
-				RuntimeOrigin::signed(PUSD_OWNER),
+				RuntimeOrigin::signed(STABLECOIN_OWNER),
 				DOT,
-				PUSD,
+				STABLE,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
 				(),
 			),
 			DispatchError::Other("on_registered failure")
 		);
-		assert!(crate::pallet::Branches::<Test>::get(DOT, PUSD).is_none());
-		assert_eq!(markets_of(AssetId::WithId(PUSD)), None);
-		assert_eq!(creation_deposit_held(PUSD_OWNER), 0, "deposit hold rolled back");
+		assert!(crate::pallet::Branches::<Test>::get(DOT, STABLE).is_none());
+		assert_eq!(markets_of(AssetId::WithId(STABLE)), None);
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0, "deposit hold rolled back");
 
 		// The same creation lands once the sibling stops failing.
 		FailOnRegistered::set(false);
 		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::signed(PUSD_OWNER),
+			RuntimeOrigin::signed(STABLECOIN_OWNER),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
 			(),
 		));
-		assert_eq!(creation_deposit_held(PUSD_OWNER), MarketDepositBase::get());
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), MarketDepositBase::get());
 	});
 }
 
@@ -155,9 +155,9 @@ fn failed_deregistration_hook_rolls_back_everything() {
 	build_and_execute(|| {
 		set_price(DOT, DEFAULT_PRICE);
 		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::signed(PUSD_OWNER),
+			RuntimeOrigin::signed(STABLECOIN_OWNER),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
 			(),
@@ -165,17 +165,17 @@ fn failed_deregistration_hook_rolls_back_everything() {
 
 		FailOnDeregistered::set(true);
 		assert_noop!(
-			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD),
+			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE),
 			DispatchError::Other("on_deregistered failure")
 		);
-		assert!(crate::pallet::Branches::<Test>::get(DOT, PUSD).is_some());
-		assert_eq!(markets_of(AssetId::WithId(PUSD)), Some(1));
-		assert_eq!(creation_deposit_held(PUSD_OWNER), MarketDepositBase::get());
+		assert!(crate::pallet::Branches::<Test>::get(DOT, STABLE).is_some());
+		assert_eq!(markets_of(AssetId::WithId(STABLE)), Some(1));
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), MarketDepositBase::get());
 
 		// The removal lands once the sibling stops failing.
 		FailOnDeregistered::set(false);
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
-		assert_eq!(markets_of(AssetId::WithId(PUSD)), None);
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0);
+		assert_eq!(markets_of(AssetId::WithId(STABLE)), None);
 	});
 }

@@ -1,7 +1,7 @@
 //! Test runtime for `pallet-vaults`.
 //!
 //! Native collateral uses `Balances`. Issued collateral uses `AssetsHolder`. Stable assets use
-//! `pallet-assets`, with [`PUSD`] as the default and [`EUSD`] as the second test asset.
+//! `pallet-assets`, with [`STABLE`] as the default and [`EUSD`] as the second test asset.
 
 use alloc::collections::BTreeMap;
 
@@ -39,7 +39,7 @@ use frame::{
 	},
 };
 pub use pallet_linked_list::Position;
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BranchSnapshot, OraclePriceConversion, RedemptionSettlement, VaultInterface,
 };
 
@@ -63,8 +63,8 @@ pub const DEFAULT_PRICE: FixedU128 = FixedU128::from_u32(10);
 pub const EMERGENCY_ADMIN: AccountId = 101;
 /// Account that receives the protocol fee remainder.
 pub const FEE_DEST: AccountId = 200;
-/// Owner allowed to create a PUSD market with a deposit.
-pub const PUSD_OWNER: AccountId = 1;
+/// Owner allowed to create a STABLE market with a deposit.
+pub const STABLECOIN_OWNER: AccountId = 1;
 
 /// Native collateral used by most tests.
 pub const DOT: AssetId = AssetId::Native;
@@ -84,7 +84,7 @@ pub const COLL_D_ID: AssetIdForAssets = 4;
 pub const COLL_D: AssetId = AssetId::WithId(COLL_D_ID);
 
 /// Default stable asset.
-pub const PUSD: StableId = 1_000;
+pub const STABLE: StableId = 1_000;
 /// Second stable asset.
 pub const EUSD: StableId = 1_001;
 
@@ -204,10 +204,10 @@ pub type VaultCollateralAssets =
 pub type VaultStableAssets = Assets;
 
 parameter_types! {
-	pub const PusdAssetId: AssetIdForAssets = PUSD;
+	pub const StableAssetId: AssetIdForAssets = STABLE;
 }
 /// Single-asset view of the default stable asset.
-pub type Pusd = ItemOf<Assets, PusdAssetId, AccountId>;
+pub type Stable = ItemOf<Assets, StableAssetId, AccountId>;
 
 /// Test oracle with one price per collateral asset.
 pub struct MockOracle;
@@ -215,7 +215,7 @@ parameter_types! {
 	pub static MockPrices: BTreeMap<AssetId, FixedU128> = BTreeMap::new();
 	pub static MockOracleAvailable: bool = true;
 }
-impl pusd_primitives::ProvidePrice for MockOracle {
+impl stablecoin_primitives::ProvidePrice for MockOracle {
 	type AssetId = AssetId;
 
 	fn provide_price(collateral: &AssetId) -> Result<FixedU128, DispatchError> {
@@ -243,7 +243,7 @@ impl ConvertTrait<StableId, AccountId> for FeeAccounts {
 
 /// Burns the test Stability Pool fee share and returns the remainder.
 pub struct MockYieldHook;
-impl pusd_primitives::OnBranchYield<AssetId, Credit<AccountId, VaultStableAssets>>
+impl stablecoin_primitives::OnBranchYield<AssetId, Credit<AccountId, VaultStableAssets>>
 	for MockYieldHook
 {
 	fn distribute_yield(
@@ -279,7 +279,7 @@ parameter_types! {
 
 /// Records market lifecycle calls and supports forced failures.
 pub struct RecordingLifecycle;
-impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for RecordingLifecycle {
+impl stablecoin_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for RecordingLifecycle {
 	type RegistrationConfig = ();
 
 	fn on_registered(
@@ -324,7 +324,7 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for Record
 /// Allows root or the stable asset owner to create a market.
 ///
 /// Root pays no deposit. The asset owner does.
-pub type EnsureAssetOwner = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
+pub type EnsureAssetOwner = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 parameter_types! {
 	pub const MarketDepositReason: RuntimeHoldReason =
@@ -389,7 +389,7 @@ pub type VaultDepositConsideration = FungiblesHoldConsideration<
 >;
 
 parameter_types! {
-	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
+	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
 	pub TestBranchConfigBounds: BranchConfigBounds = BranchConfigBounds {
 		min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
 		min_initial_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
@@ -430,7 +430,7 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for MockBenchmarkHelper {
 	}
 
 	fn stable_asset_id() -> StableId {
-		PUSD
+		STABLE
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
@@ -460,7 +460,7 @@ pub fn new_test_ext() -> TestState {
 				(ETH_ID, 1, true, 1),
 				(COLL_C_ID, 1, true, 1),
 				(COLL_D_ID, 1, true, 1),
-				(PUSD, 1, true, 1),
+				(STABLE, 1, true, 1),
 				(EUSD, 1, true, 1),
 				(USDX, 1, true, USDX_ED),
 				(XBT_ID, 1, true, XBT_ED),
@@ -557,7 +557,7 @@ pub fn check_invariants() {
 #[track_caller]
 pub fn check_stable_supply() {
 	let external = ExternalStableIssuance::get();
-	for stable in [PUSD, EUSD, USDX] {
+	for stable in [STABLE, EUSD, USDX] {
 		let debt = Branches::<Test>::iter()
 			.filter(|(_, branch_stable, _)| *branch_stable == stable)
 			.map(|(_, _, branch)| signed(branch.state.debt.outstanding()))
@@ -649,7 +649,7 @@ pub fn register_market(collateral: AssetId, stable: StableId) {
 /// Creates all ten mock markets without global debt limits.
 pub fn register_ten_markets() {
 	for collateral in [DOT, TOKEN_X, ETH, COLL_C, COLL_D] {
-		for stable in [PUSD, EUSD] {
+		for stable in [STABLE, EUSD] {
 			create_market(collateral.clone(), stable, DEFAULT_PRICE, default_branch_config());
 		}
 	}

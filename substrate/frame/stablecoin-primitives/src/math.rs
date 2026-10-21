@@ -1,4 +1,4 @@
-//! Checked arithmetic for pUSD accounting and price conversions. Callers pick the rounding
+//! Checked arithmetic for stablecoin accounting and price conversions. Callers pick the rounding
 //! and handle failure.
 
 use crate::{CollateralRatio, DebtCollateral};
