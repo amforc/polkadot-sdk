@@ -10,7 +10,7 @@ use crate::{
 };
 use frame::{
 	deps::sp_runtime::{
-		traits::{Saturating, Zero},
+		traits::{EnsureAdd, Saturating, Zero},
 		ArithmeticError, FixedU128,
 	},
 	prelude::*,
@@ -73,10 +73,10 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn collateral_price(
 		collateral_id: &CollateralIdOf<T>,
 	) -> Result<FixedU128, Error<T>> {
-		let price =
-			T::Oracle::provide_price(collateral_id).map_err(|_| Error::<T>::OracleUnavailable)?;
-		ensure!(!price.is_zero(), Error::<T>::OracleUnavailable);
-		Ok(price)
+		T::Oracle::provide_price(collateral_id)
+			.ok()
+			.filter(|price| !price.is_zero())
+			.ok_or(Error::<T>::OracleUnavailable)
 	}
 
 	fn fee_inputs(
@@ -176,12 +176,11 @@ impl<T: Config> Pallet<T> {
 		};
 		if !insurance_cover.is_zero() {
 			let cover = Self::withdraw_insurance_cover(context.stable_id, insurance_cover)?;
-			if let Err(cover) = debt_payment.subsume(cover) {
-				// Both credits carry `stable_id`, so the merge cannot fail;
-				// refuse the settlement and let the dispatch roll back.
-				drop(cover);
-				return Err(Error::<T>::InsuranceFundWithdrawFailed.into());
-			}
+			// Both credits carry `stable_id`, so the merge cannot fail;
+			// refuse the settlement and let the dispatch roll back.
+			debt_payment
+				.subsume(cover)
+				.map_err(|_| Error::<T>::InsuranceFundWithdrawFailed)?;
 		}
 
 		T::Vaults::redeem_step(
@@ -228,7 +227,7 @@ impl<T: Config> Pallet<T> {
 		let mut payment = Self::debit_redeemer(
 			context.stable_id,
 			context.redeemer,
-			debt_budget.checked_add(&planned_fee).ok_or(ArithmeticError::Overflow)?,
+			debt_budget.ensure_add(planned_fee)?,
 			Preservation::Preserve,
 		)?;
 		let result = Self::execute_ordinary_walk(
@@ -338,7 +337,7 @@ impl<T: Config> Pallet<T> {
 		budget: BalanceOf<T>,
 		payment: &mut StableCreditOf<T>,
 	) -> Result<Step<BalanceOf<T>>, DispatchError> {
-		debug_assert!(payment.peek() >= budget);
+		defensive_assert!(payment.peek() >= budget);
 		let snapshot = T::Vaults::project_redemption_snapshot(
 			context.collateral_id,
 			context.stable_id,
@@ -411,12 +410,8 @@ impl<T: Config> Pallet<T> {
 		credit: StableCreditOf<T>,
 		amount: BalanceOf<T>,
 	) -> Result<StableCreditOf<T>, DispatchError> {
-		if credit.peek() == amount {
-			Ok(credit)
-		} else {
-			drop(credit);
-			Err(DispatchError::Corruption)
-		}
+		ensure!(credit.peek() == amount, DispatchError::Corruption);
+		Ok(credit)
 	}
 
 	/// The stablecoin the redeemer can pay under `preservation`, net of freezes.
@@ -456,10 +451,8 @@ impl<T: Config> Pallet<T> {
 		if change.peek().is_zero() {
 			return Ok(());
 		}
-		<T::StableAssets as FungiblesBalanced<_>>::resolve(redeemer, change).map_err(|change| {
-			drop(change);
-			DispatchError::Corruption
-		})
+		<T::StableAssets as FungiblesBalanced<_>>::resolve(redeemer, change)
+			.map_err(|_| DispatchError::Corruption)
 	}
 
 	fn finalize_ordinary(

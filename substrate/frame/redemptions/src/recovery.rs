@@ -169,7 +169,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		cover: BalanceOf<T>,
 	) -> Result<StableCreditOf<T>, DispatchError> {
-		debug_assert!(!cover.is_zero());
+		defensive_assert!(!cover.is_zero());
 		let account = T::InsuranceFundAccount::convert(stable_id.clone());
 		let preservation =
 			debit_preservation::<T::StableAssets, _>(stable_id.clone(), &account, cover);
@@ -237,8 +237,7 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 			OffsetDecision::NoTarget => Ok((RecoveryOffsetResult::NoTarget, payment)),
 			OffsetDecision::BelowPar => Ok((RecoveryOffsetResult::BelowPar, payment)),
 			OffsetDecision::Available { owner, debt, collateral } => {
-				let debt_payment = payment.extract(debt);
-				debug_assert_eq!(debt_payment.peek(), debt);
+				let debt_payment = Self::exact_credit(payment.extract(debt), debt)?;
 				T::Vaults::redeem_step(
 					collateral_id,
 					&stable_id,
