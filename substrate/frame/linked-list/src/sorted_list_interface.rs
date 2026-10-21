@@ -25,10 +25,7 @@ use crate::{list, pallet::*, view_helpers, ListError, Outcome, Position, SortedL
 use frame::{
 	deps::{
 		codec::MaxEncodedLen,
-		frame_support::{
-			storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
-			traits::DefensiveOption,
-		},
+		frame_support::{storage::with_storage_layer, traits::DefensiveOption},
 	},
 	prelude::*,
 	traits::Footprint,
@@ -63,9 +60,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		priority: T::Priority,
 		hint: Position<T::ItemId>,
 	) -> Result<u32, ListError> {
-		if ListNodes::<T>::contains_key(&list_id, &item) {
-			return Err(ListError::ItemAlreadyExists);
-		}
+		ensure!(!ListNodes::<T>::contains_key(&list_id, &item), ListError::ItemAlreadyExists);
 		let valid = list::walk_repair::<T>(&list_id, &priority, hint)?;
 		let steps = valid.steps;
 		let list_created = list::insert_at_inner::<T>(&list_id, &item, priority, valid)?;
@@ -92,8 +87,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 				// The item id came from the meta row, so a missing node row is
 				// internal inconsistency, not a caller error.
 				ListError::ItemNotFound => {
-					defensive!("pop_tail: tail pointer names a missing node");
-					ListError::CorruptList
+					list::corrupt("pop_tail: tail pointer names a missing node")
 				},
 				other => other,
 			})?;
@@ -150,28 +144,18 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 
 		// Slow path: splice + re-insert. Wrapped in a nested storage layer so
 		// that an `InvalidPositionHints` after `unlink` rolls back cleanly.
-		let outer = with_transaction_opaque_err::<u32, ListError, _>(|| {
-			let inner = (|| -> Result<u32, ListError> {
-				// The item never leaves the list, so the lifecycle flags from
-				// `unlink`/`insert_at_inner` are intentionally dropped — emitting
-				// `ListRemoved`/`ListCreated` here would churn a single-item relocate.
-				// The rows validated above are unchanged, so unlink with them
-				// rather than re-reading and re-validating through `remove_at`.
-				list::unlink::<T>(&list_id, &item, existing_position, prev_node, next_node)?;
-				let valid = list::walk_repair::<T>(&list_id, &new_priority, hint)?;
-				let steps = valid.steps;
-				list::insert_at_inner::<T>(&list_id, &item, new_priority, valid)?;
-				Ok(steps)
-			})();
-			if inner.is_ok() {
-				TransactionOutcome::Commit(inner)
-			} else {
-				TransactionOutcome::Rollback(inner)
-			}
-		});
-		// `Err(())` only fires on transactional-layer nesting overflow: an
-		// environmental limit, not a hint problem — surface it as such.
-		let steps = outer.map_err(|()| ListError::Internal)??;
+		let steps = with_storage_layer(|| -> Result<u32, ListError> {
+			// The item never leaves the list, so the lifecycle flags from
+			// `unlink`/`insert_at_inner` are intentionally dropped — emitting
+			// `ListRemoved`/`ListCreated` here would churn a single-item relocate.
+			// The rows validated above are unchanged, so unlink with them
+			// rather than re-reading and re-validating through `remove_at`.
+			list::unlink::<T>(&list_id, &item, existing_position, prev_node, next_node)?;
+			let valid = list::walk_repair::<T>(&list_id, &new_priority, hint)?;
+			let steps = valid.steps;
+			list::insert_at_inner::<T>(&list_id, &item, new_priority, valid)?;
+			Ok(steps)
+		})?;
 		Self::deposit_event(Event::ItemReinserted { list_id, item, old_priority, new_priority });
 		Ok(Outcome::Relocated { steps })
 	}
@@ -194,7 +178,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 
 	fn node_footprint(list_id: &T::ListId, item: &T::ItemId) -> Footprint {
 		let key = ListNodes::<T>::hashed_key_for(list_id, item).len();
-		let node = crate::list::Node::<T::ItemId, T::Priority>::max_encoded_len();
+		let node = list::NodeOf::<T>::max_encoded_len();
 		Footprint::from_parts(1, key.saturating_add(node))
 	}
 
