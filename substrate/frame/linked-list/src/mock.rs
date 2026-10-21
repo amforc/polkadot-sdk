@@ -53,16 +53,24 @@ parameter_types! {
 }
 
 pub struct StaticPriorityProvider;
+
+impl StaticPriorityProvider {
+	pub(crate) fn pin_priority(list_id: ListId, item: ItemId, priority: Priority) {
+		StaticPriorities::mutate(|m| {
+			m.insert((list_id, item), priority);
+		});
+	}
+}
+
 impl pallet_linked_list::PriorityProvider<ListId, ItemId> for StaticPriorityProvider {
 	type Priority = Priority;
 	fn priority(list_id: &ListId, item: &ItemId) -> Option<Priority> {
 		StaticPriorities::get().get(&(*list_id, *item)).copied()
 	}
 
+	#[cfg(feature = "runtime-benchmarks")]
 	fn set_priority(list_id: &ListId, item: &ItemId, priority: Priority) {
-		StaticPriorities::mutate(|m| {
-			m.insert((*list_id, *item), priority);
-		});
+		Self::pin_priority(*list_id, *item, priority);
 	}
 }
 

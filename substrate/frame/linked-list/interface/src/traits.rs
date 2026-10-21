@@ -46,9 +46,9 @@ pub trait PriorityProvider<ListId, ItemId> {
 	/// hard error.
 	fn priority(list_id: &ListId, item: &ItemId) -> Option<Self::Priority>;
 
-	/// For benchmarks (and `std` test fixtures): pin the authoritative priority
-	/// returned by [`Self::priority`] for `(list_id, item)`.
-	#[cfg(any(feature = "runtime-benchmarks", feature = "std"))]
+	/// Pin the authoritative priority returned by [`Self::priority`] for
+	/// `(list_id, item)`.
+	#[cfg(feature = "runtime-benchmarks")]
 	fn set_priority(_list_id: &ListId, _item: &ItemId, _priority: Self::Priority) {}
 }
 
