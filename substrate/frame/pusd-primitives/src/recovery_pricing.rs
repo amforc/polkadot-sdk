@@ -113,7 +113,8 @@ mod tests {
 	fn recovery_bonus_capped_by_penalty_and_buffer() {
 		let penalty = Permill::from_percent(5);
 		let buffer = FixedU128::from_rational(1, 100); // 1%
-												 // CR = 130% → excess = 30% - 1% = 29%, capped at 5%.
+													   // CR = 130% → excess = 30% - 1% = 29%,
+													   // capped at 5%.
 		let cr = FixedU128::from_rational(130, 100);
 		assert_eq!(recovery_bonus(cr, buffer, penalty), FixedU128::from_rational(5, 100));
 		// CR = 102% → excess = 2% - 1% = 1% < 5% cap.

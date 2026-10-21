@@ -3,8 +3,8 @@
 
 use crate::{CollateralRatio, DebtCollateral};
 use frame::arithmetic::{
-	helpers_128bit::multiply_by_rational_with_rounding, ArithmeticError, FixedPointNumber,
-	FixedPointOperand, FixedU128, Rounding, Zero,
+	helpers_128bit::multiply_by_rational_with_rounding, ArithmeticError, EnsureFixedPointNumber,
+	FixedPointOperand, FixedU128, One, Rounding, Zero,
 };
 
 /// Returns `value * numerator / denominator` with `rounding`, converted to `Output`.
@@ -21,12 +21,30 @@ pub fn mul_div<Output: TryFrom<u128>>(
 		.and_then(|raw| Output::try_from(raw).ok())
 }
 
+/// Returns `value * numerator / denominator` with `rounding`, for fixed-point factors.
+///
+/// The factors are divided at full precision, so `numerator / denominator` is never rounded on
+/// its own. Returns `None` for a zero denominator or a result that does not fit in `Balance`.
+pub fn mul_ratio<Balance: FixedPointOperand>(
+	value: Balance,
+	numerator: FixedU128,
+	denominator: FixedU128,
+	rounding: Rounding,
+) -> Option<Balance> {
+	mul_div(
+		value.unique_saturated_into(),
+		numerator.into_inner(),
+		denominator.into_inner(),
+		rounding,
+	)
+}
+
 /// Returns `ceil(value * rate)`, or `None` if the result does not fit in `Balance`.
 pub fn mul_rate_ceil<Balance: FixedPointOperand>(
 	value: Balance,
 	rate: FixedU128,
 ) -> Option<Balance> {
-	mul_div(value.unique_saturated_into(), rate.into_inner(), FixedU128::DIV, Rounding::Up)
+	mul_ratio(value, rate, FixedU128::one(), Rounding::Up)
 }
 
 /// Returns the collateralization ratio of `position` at `price`.
@@ -39,10 +57,9 @@ pub fn collateralization_ratio<Balance: FixedPointOperand>(
 	if position.debt.is_zero() {
 		return Ok(CollateralRatio::DebtFree);
 	}
-	let value = price.checked_mul_int(position.collateral).ok_or(ArithmeticError::Overflow)?;
-	FixedU128::checked_from_rational(value, position.debt)
-		.map(CollateralRatio::Ratio)
-		.ok_or(ArithmeticError::Overflow)
+	// A nonzero debt leaves `Overflow` as the only failure of either step.
+	let value = price.ensure_mul_int(position.collateral)?;
+	FixedU128::ensure_from_rational(value, position.debt).map(CollateralRatio::Ratio)
 }
 
 /// Returns `floor(value * numerator / denominator)`; see [`mul_div`] for failure conditions.
@@ -84,7 +101,7 @@ pub fn collateral_for_value_floor<Balance: FixedPointOperand>(
 	value: Balance,
 	price: FixedU128,
 ) -> Option<Balance> {
-	mul_div(value.unique_saturated_into(), FixedU128::DIV, price.into_inner(), Rounding::Down)
+	mul_ratio(value, FixedU128::one(), price, Rounding::Down)
 }
 
 /// Returns `ceil(value / price)`, or `None` for a zero price or output overflow.
@@ -92,7 +109,7 @@ pub fn collateral_for_value_ceil<Balance: FixedPointOperand>(
 	value: Balance,
 	price: FixedU128,
 ) -> Option<Balance> {
-	mul_div(value.unique_saturated_into(), FixedU128::DIV, price.into_inner(), Rounding::Up)
+	mul_ratio(value, FixedU128::one(), price, Rounding::Up)
 }
 
 #[cfg(test)]

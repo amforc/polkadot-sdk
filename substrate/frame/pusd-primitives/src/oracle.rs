@@ -1,11 +1,11 @@
 //! TODO: Oracle trait surface and price conversions.
 
-use crate::math::mul_div;
+use crate::math::mul_ratio;
 use core::marker::PhantomData;
 use frame::{
 	arithmetic::{Rounding, Zero},
 	deps::{
-		frame_support::pallet_prelude::DispatchError,
+		frame_support::{ensure, pallet_prelude::DispatchError},
 		sp_runtime::{ArithmeticError, FixedPointOperand, FixedU128},
 	},
 	traits::{tokens::ConversionToAssetBalance, Get},
@@ -64,13 +64,8 @@ where
 				(asset_price, reference_price) => (asset_price?, reference_price?),
 			};
 		// Round up so a deposit is never undercharged.
-		mul_div(
-			balance.unique_saturated_into(),
-			reference_price.into_inner(),
-			asset_price.into_inner(),
-			Rounding::Up,
-		)
-		.ok_or_else(|| ArithmeticError::Overflow.into())
+		mul_ratio(balance, reference_price, asset_price, Rounding::Up)
+			.ok_or_else(|| ArithmeticError::Overflow.into())
 	}
 }
 
@@ -78,9 +73,7 @@ impl<Oracle: ProvidePrice, Reference> OraclePriceConversion<Oracle, Reference> {
 	/// Returns the feed's quote, treating zero as an unusable feed.
 	fn usable_price(asset: &Oracle::AssetId) -> Result<FixedU128, DispatchError> {
 		let price = Oracle::provide_price(asset)?;
-		if price.is_zero() {
-			return Err(ZERO_ORACLE_PRICE);
-		}
+		ensure!(!price.is_zero(), ZERO_ORACLE_PRICE);
 		Ok(price)
 	}
 }

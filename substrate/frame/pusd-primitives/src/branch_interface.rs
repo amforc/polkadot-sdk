@@ -13,6 +13,16 @@ pub enum BranchMode {
 	Frozen,
 }
 
+impl BranchMode {
+	/// Returns `true` for [`Self::Frozen`], the mode that admits no capital or yield changes.
+	pub const fn is_frozen(self) -> bool {
+		match self {
+			Self::Normal | Self::Safety => false,
+			Self::Frozen => true,
+		}
+	}
+}
+
 /// Market state a Stability Pool operation runs under, supplied by the vault engine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BranchSnapshot {
