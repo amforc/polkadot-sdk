@@ -39,6 +39,8 @@ fn open_native_vault(owner: &AccountId) -> sp_runtime::DispatchResult {
 		FixedU128::zero(),
 		pallet_linked_list::Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// A stablecoin minimum balance above one unit requires the fee account's
