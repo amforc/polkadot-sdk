@@ -8,6 +8,7 @@
 //!   after every test.
 
 use crate::{
+	math::whole_units,
 	mock::*,
 	tests::{assert_ok_and_invariants, rate_pct, ONE_DAY_MS, ONE_YEAR_MS},
 };
@@ -104,7 +105,7 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		let state_pre = branch_state(DOT, PUSD).unwrap();
 		// Both the owned debt and the pending share use the recipient's rate.
 		assert_eq!(state_pre.debt.pending_redistribution_principal, 501);
-		let actual: Balance = state_pre.debt.accrual_rate.whole();
+		let actual: Balance = whole_units(state_pre.debt.accrual_rate);
 		assert_eq!(actual, 200);
 
 		advance_time(ONE_YEAR_MS);
@@ -141,7 +142,7 @@ fn mixed_rate_recipients_materialize_at_their_own_rates() {
 		let vault_b = vault(DOT, PUSD, 2);
 		let expected = accrual_rate(vault_a.debt.principal, rate_pct(5, 100))
 			.saturating_add(accrual_rate(vault_b.debt.principal, rate_pct(50, 100)));
-		let actual: Balance = state.debt.accrual_rate.whole();
+		let actual: Balance = whole_units(state.debt.accrual_rate);
 		// One ceil (`average_branch_rate`) against two per-recipient floors.
 		assert!(
 			actual.abs_diff(expected) <= 2,
@@ -185,7 +186,7 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 		let state = branch_state(DOT, PUSD).unwrap();
 		assert_eq!(state.debt.pending_redistribution_principal, redistributed - 251);
 		assert_eq!(state.pending_redistribution_collateral, 500);
-		let actual: Balance = state.stakes.accrual_rate.whole();
+		let actual: Balance = whole_units(state.stakes.accrual_rate);
 		assert_eq!(
 			actual,
 			accrual_rate(1_000, rate_pct(30, 100)) + accrual_rate(1_000, rate_pct(50, 100))
@@ -237,7 +238,7 @@ fn borrow_after_redistribution_keeps_accrual_rate_consistent() {
 		let vault_b = vault(DOT, PUSD, 2);
 		let expected = accrual_rate(vault_a.debt.principal, rate_pct(5, 100))
 			.saturating_add(accrual_rate(vault_b.debt.principal, rate_pct(50, 100)));
-		let actual: Balance = state.debt.accrual_rate.whole();
+		let actual: Balance = whole_units(state.debt.accrual_rate);
 		// Same ceil-vs-floor drift as above, plus the borrow's own reconciliation.
 		assert!(
 			actual.abs_diff(expected) <= 2,
