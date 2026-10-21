@@ -6,8 +6,8 @@ use frame::{
 	prelude::{BoundedVec, ConstU32, DispatchError},
 	traits::{DefensiveOption, DefensiveSaturating},
 };
-use pusd_primitives::Millis;
 use scale_info::TypeInfo;
+use stablecoin_primitives::Millis;
 
 use crate::math;
 

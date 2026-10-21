@@ -151,7 +151,9 @@ pub mod pallet {
 		},
 		prelude::*,
 	};
-	use pusd_primitives::{BranchInterface, Millis, OnBranchLifecycle, RecoveryOffsetInterface};
+	use stablecoin_primitives::{
+		BranchInterface, Millis, OnBranchLifecycle, RecoveryOffsetInterface,
+	};
 
 	/// Balance type shared by the stablecoin and collateral asset systems.
 	pub type BalanceOf<T> =
@@ -763,7 +765,7 @@ pub mod pallet {
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 		) -> T::AccountId {
-			pusd_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
+			stablecoin_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
 		}
 
 		/// Parks one minimum balance of the asset in the pool account, paid by `funder`, and

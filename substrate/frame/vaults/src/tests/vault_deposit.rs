@@ -21,7 +21,7 @@ fn repay_all(owner: AccountId, collateral: AssetId, stable: StableId) {
 #[test]
 fn footprint_includes_vault_record_and_rate_list_node() {
 	build_and_execute(|| {
-		let footprint = Vaults::vault_footprint(&DOT, &PUSD, &OWNER);
+		let footprint = Vaults::vault_footprint(&DOT, &STABLE, &OWNER);
 		assert_eq!(footprint.asset, DOT);
 		// One item of 398 bytes: the 93-byte hashed vault key, the 176-byte max-encoded `Vault`,
 		// the 17-byte deposit ticket (1-byte asset plus 16-byte balance), and the 112-byte
@@ -33,10 +33,10 @@ fn footprint_includes_vault_record_and_rate_list_node() {
 #[test]
 fn native_collateral_pays_the_deposit_in_native() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		let free_before = collateral_balance(DOT, OWNER);
 
-		assert_ok!(open(OWNER, DOT, PUSD, 1_000, 500, default_rate()));
+		assert_ok!(open(OWNER, DOT, STABLE, 1_000, 500, default_rate()));
 
 		assert_eq!(vault_deposit_held(DOT, OWNER), VAULT_DEPOSIT);
 		// The collateral and its storage deposit use separate holds.
@@ -49,11 +49,11 @@ fn native_collateral_pays_the_deposit_in_native() {
 fn sufficient_collateral_pays_the_deposit_in_that_asset_at_the_oracle_rate() {
 	build_and_execute(|| {
 		// 250 native at 10 each are worth 2_500; at 40 per ETH that is 62.5, rounded up.
-		register_market_with(ETH, PUSD, FixedU128::from_u32(40), default_branch_config());
+		register_market_with(ETH, STABLE, FixedU128::from_u32(40), default_branch_config());
 		set_price(DOT, DEFAULT_PRICE);
 		let free_before = collateral_balance(ETH, OWNER);
 
-		assert_ok!(open(OWNER, ETH, PUSD, 1_000, 500, default_rate()));
+		assert_ok!(open(OWNER, ETH, STABLE, 1_000, 500, default_rate()));
 
 		assert_eq!(vault_deposit_held(ETH, OWNER), 63);
 		assert_eq!(vault_deposit_held(DOT, OWNER), 0);
@@ -64,11 +64,11 @@ fn sufficient_collateral_pays_the_deposit_in_that_asset_at_the_oracle_rate() {
 #[test]
 fn unpriceable_sufficient_collateral_rejects_the_open_atomically() {
 	build_and_execute(|| {
-		register_market(TOKEN_X, PUSD);
+		register_market(TOKEN_X, STABLE);
 		MockFallbackRate::set(None);
 
 		assert_noop!(
-			open(OWNER, TOKEN_X, PUSD, 1_000, 500, default_rate()),
+			open(OWNER, TOKEN_X, STABLE, 1_000, 500, default_rate()),
 			DispatchError::Unavailable
 		);
 	});
@@ -77,10 +77,10 @@ fn unpriceable_sufficient_collateral_rejects_the_open_atomically() {
 #[test]
 fn insufficient_collateral_falls_back_to_native() {
 	build_and_execute(|| {
-		register_market(INSUFFICIENT, PUSD);
+		register_market(INSUFFICIENT, STABLE);
 		let native_before = collateral_balance(DOT, ADMIN);
 
-		assert_ok!(open(ADMIN, INSUFFICIENT, PUSD, 1_000, 500, default_rate()));
+		assert_ok!(open(ADMIN, INSUFFICIENT, STABLE, 1_000, 500, default_rate()));
 
 		assert_eq!(vault_deposit_held(DOT, ADMIN), VAULT_DEPOSIT);
 		assert_eq!(vault_deposit_held(INSUFFICIENT, ADMIN), 0);
@@ -92,18 +92,18 @@ fn insufficient_collateral_falls_back_to_native() {
 #[test]
 fn close_refunds_the_original_ticket_to_the_owner_after_a_price_change() {
 	build_and_execute(|| {
-		register_market_with(ETH, PUSD, FixedU128::from_u32(40), default_branch_config());
+		register_market_with(ETH, STABLE, FixedU128::from_u32(40), default_branch_config());
 		set_price(DOT, DEFAULT_PRICE);
-		assert_ok!(open(OWNER, ETH, PUSD, 1_000, 500, default_rate()));
+		assert_ok!(open(OWNER, ETH, STABLE, 1_000, 500, default_rate()));
 		assert_eq!(vault_deposit_held(ETH, OWNER), 63);
-		repay_all(OWNER, ETH, PUSD);
+		repay_all(OWNER, ETH, STABLE);
 
 		// The current quote is now lower, but the stored ticket still refunds the original 63.
 		set_price(ETH, FixedU128::from_u32(80));
 		let owner_before = collateral_balance(ETH, OWNER);
 		let recipient_before = collateral_balance(ETH, 2);
 
-		assert_ok!(close_vault(OWNER, ETH, PUSD, Some(2)));
+		assert_ok!(close_vault(OWNER, ETH, STABLE, Some(2)));
 
 		assert_eq!(collateral_balance(ETH, 2), recipient_before + 1_000);
 		assert_eq!(collateral_balance(ETH, OWNER), owner_before + 63);
@@ -114,12 +114,12 @@ fn close_refunds_the_original_ticket_to_the_owner_after_a_price_change() {
 #[test]
 fn owner_short_of_the_deposit_cannot_open() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		const NEWCOMER: AccountId = 11;
 		// A balance that covers the collateral but is below the deposit alone.
 		mint_collateral(DOT, NEWCOMER, VAULT_DEPOSIT - 1);
 		assert_noop!(
-			open(NEWCOMER, DOT, PUSD, 100, 200, default_rate()),
+			open(NEWCOMER, DOT, STABLE, 100, 200, default_rate()),
 			TokenError::FundsUnavailable
 		);
 
@@ -128,12 +128,12 @@ fn owner_short_of_the_deposit_cannot_open() {
 		mint_collateral(DOT, NEWCOMER, exact - VAULT_DEPOSIT);
 
 		assert_noop!(
-			open(NEWCOMER, DOT, PUSD, 1_000, 500, default_rate()),
+			open(NEWCOMER, DOT, STABLE, 1_000, 500, default_rate()),
 			TokenError::FundsUnavailable
 		);
 
 		mint_collateral(DOT, NEWCOMER, 1);
-		assert_ok!(open(NEWCOMER, DOT, PUSD, 1_000, 500, default_rate()));
+		assert_ok!(open(NEWCOMER, DOT, STABLE, 1_000, 500, default_rate()));
 		assert_eq!(vault_deposit_held(DOT, NEWCOMER), VAULT_DEPOSIT);
 	});
 }
@@ -141,9 +141,9 @@ fn owner_short_of_the_deposit_cannot_open() {
 #[test]
 fn markets_on_one_collateral_aggregate_the_hold() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		register_market(DOT, EUSD);
-		assert_ok!(open(OWNER, DOT, PUSD, 1_000, 500, default_rate()));
+		assert_ok!(open(OWNER, DOT, STABLE, 1_000, 500, default_rate()));
 		assert_ok!(open(OWNER, DOT, EUSD, 1_000, 500, default_rate()));
 		assert_eq!(vault_deposit_held(DOT, OWNER), 2 * VAULT_DEPOSIT);
 

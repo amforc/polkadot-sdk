@@ -3393,7 +3393,7 @@ use frame_support::traits::fungibles::{
 	AssetFootprintPrice, AtLeastMinimumBalance, HoldConsideration as FungiblesHoldConsideration,
 	SufficientAssets,
 };
-use pallet_vaults::pusd_primitives::OraclePriceConversion;
+use pallet_vaults::stablecoin_primitives::OraclePriceConversion;
 
 pub type VaultsCollateralId = NativeOrWithId<u32>;
 
@@ -3416,7 +3416,7 @@ pub type VaultsStableId = u32;
 /// surface. The oracle value is interpreted as a `FixedU128` inner
 /// representation: operators submit prices scaled by `10^18`.
 pub struct VaultsOracleAdapter;
-impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
+impl stablecoin_primitives::ProvidePrice for VaultsOracleAdapter {
 	type AssetId = VaultsCollateralId;
 
 	fn provide_price(
@@ -3437,7 +3437,7 @@ impl pusd_primitives::ProvidePrice for VaultsOracleAdapter {
 /// `CreateOrigin` for permissionless market creation. Root creates deposit-free
 /// (`None`); the stablecoin asset's owner creates with a refundable deposit
 /// (`Some(who)`); every other origin is rejected.
-pub type VaultsCreateOrigin = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
+pub type VaultsCreateOrigin = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 /// Routes each stablecoin's vault fee remainder to the treasury.
 pub struct VaultsFeeAccount;

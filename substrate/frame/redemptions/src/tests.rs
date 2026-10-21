@@ -31,12 +31,12 @@ fn redemption_events() -> Vec<Event<Test>> {
 	System::read_events_for_pallet::<Event<Test>>()
 }
 
-/// The PUSD spend, debt plus fee, that buys exactly `debt` in an ordinary redemption now.
+/// The STABLE spend, debt plus fee, that buys exactly `debt` in an ordinary redemption now.
 fn spend_for_debt(debt: Balance) -> Balance {
-	let config = crate::RedemptionConfigs::<Test>::get(PUSD).expect("PUSD is registered");
+	let config = crate::RedemptionConfigs::<Test>::get(STABLE).expect("STABLE is registered");
 	let decayed =
-		crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee_at(Timestamp::get(), &config);
-	let curve = crate::fees::DynamicFeeCurve::try_new(decayed, stablecoin_debt(PUSD), &config)
+		crate::RedemptionStates::<Test>::get(STABLE).dynamic_fee_at(Timestamp::get(), &config);
+	let curve = crate::fees::DynamicFeeCurve::try_new(decayed, stablecoin_debt(STABLE), &config)
 		.expect("test debt fits u128");
 	debt + curve.fee(debt)
 }
@@ -53,7 +53,7 @@ fn branch_tcr(collateral: AssetId, stable: StableId) -> CollateralRatio {
 
 /// The fully accrued debt of `who`, read through Vaults' projected snapshot.
 fn projected_full_debt(who: AccountId) -> Balance {
-	Vaults::project_redemption_snapshot(&DOT, &PUSD, &who).expect("snapshot").debt
+	Vaults::project_redemption_snapshot(&DOT, &STABLE, &who).expect("snapshot").debt
 }
 
 /// The regime of the latest recovery settlement.
@@ -64,10 +64,10 @@ fn last_recovery_regime() -> Option<RecoveryRegime> {
 	})
 }
 
-/// The `(DOT, PUSD)` vault's collateralization ratio at `price`.
+/// The `(DOT, STABLE)` vault's collateralization ratio at `price`.
 fn vault_cr(who: AccountId, price: FixedU128) -> FixedU128 {
 	let Ok(CollateralRatio::Ratio(cr)) = collateralization_ratio(
-		&DebtCollateral { debt: vault_debt(DOT, PUSD, who), collateral: held(DOT, who) },
+		&DebtCollateral { debt: vault_debt(DOT, STABLE, who), collateral: held(DOT, who) },
 		price,
 	) else {
 		panic!("fixture must carry debt with a finite CR");
@@ -80,17 +80,17 @@ fn vault_cr(who: AccountId, price: FixedU128) -> FixedU128 {
 #[test]
 fn config_lives_until_the_last_market_leaves() {
 	build_and_execute(|| {
-		assert!(crate::RedemptionConfigs::<Test>::get(PUSD).is_none());
-		register_branch(DOT, PUSD, default_branch_config());
-		let cfg = crate::RedemptionConfigs::<Test>::get(PUSD).expect("seeded on registration");
+		assert!(crate::RedemptionConfigs::<Test>::get(STABLE).is_none());
+		register_branch(DOT, STABLE, default_branch_config());
+		let cfg = crate::RedemptionConfigs::<Test>::get(STABLE).expect("seeded on registration");
 		assert_eq!(cfg, default_redemption_config());
-		set_dynamic_fee(PUSD, FixedU128::from_rational(3u128, 100u128));
+		set_dynamic_fee(STABLE, FixedU128::from_rational(3u128, 100u128));
 
 		set_price(TOKEN_X, FixedU128::one());
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::root(),
 			TOKEN_X,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
 			None,
@@ -98,22 +98,22 @@ fn config_lives_until_the_last_market_leaves() {
 
 		// The second market joins the coin's existing fee state untouched.
 		assert_eq!(
-			crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee,
+			crate::RedemptionStates::<Test>::get(STABLE).dynamic_fee,
 			FixedU128::from_rational(3u128, 100u128)
 		);
-		assert!(crate::RedemptionConfigs::<Test>::contains_key(PUSD));
+		assert!(crate::RedemptionConfigs::<Test>::contains_key(STABLE));
 
-		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), TOKEN_X, PUSD));
-		assert!(crate::RedemptionConfigs::<Test>::contains_key(PUSD));
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), TOKEN_X, STABLE));
+		assert!(crate::RedemptionConfigs::<Test>::contains_key(STABLE));
 		assert_eq!(
-			crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee,
+			crate::RedemptionStates::<Test>::get(STABLE).dynamic_fee,
 			FixedU128::from_rational(3u128, 100u128)
 		);
 
 		// The last market out clears both rows.
-		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, PUSD));
-		assert!(crate::RedemptionConfigs::<Test>::get(PUSD).is_none());
-		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee, FixedU128::zero());
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, STABLE));
+		assert!(crate::RedemptionConfigs::<Test>::get(STABLE).is_none());
+		assert_eq!(crate::RedemptionStates::<Test>::get(STABLE).dynamic_fee, FixedU128::zero());
 	});
 }
 
@@ -127,7 +127,7 @@ fn config_comes_only_with_the_first_market() {
 			Vaults::create_branch(
 				RuntimeOrigin::root(),
 				DOT,
-				PUSD,
+				STABLE,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
 				None,
@@ -140,7 +140,7 @@ fn config_comes_only_with_the_first_market() {
 			Vaults::create_branch(
 				RuntimeOrigin::root(),
 				DOT,
-				PUSD,
+				STABLE,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
 				Some(invalid),
@@ -148,14 +148,14 @@ fn config_comes_only_with_the_first_market() {
 			Error::<Test>::InvalidRedemptionConfig
 		);
 
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 
 		set_price(TOKEN_X, FixedU128::one());
 		assert_noop!(
 			Vaults::create_branch(
 				RuntimeOrigin::root(),
 				TOKEN_X,
-				PUSD,
+				STABLE,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
 				Some(default_redemption_config()),
@@ -174,15 +174,15 @@ fn config_comes_only_with_the_first_market() {
 fn redeem_rejects_below_minimum() {
 	build_and_execute(|| {
 		let minimum = default_redemption_config().minimum_redemption_amount;
-		register_branch(DOT, PUSD, default_branch_config());
-		mint_stable(PUSD, REDEEMER, 1_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		mint_stable(STABLE, REDEEMER, 1_000);
 		assert_noop!(
 			redeem(RedeemOptions::spend(minimum - 1)),
 			Error::<Test>::BelowMinimumRedemptionAmount
 		);
 
 		hypothetically!({
-			assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
+			assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 			assert_noop!(
 				redeem(RedeemOptions::spend(minimum - 1)),
 				Error::<Test>::BelowMinimumRedemptionAmount
@@ -204,7 +204,7 @@ fn redeem_rejects_below_minimum() {
 #[test]
 fn redeem_rejects_unregistered_coin() {
 	build_and_execute(|| {
-		mint_stable(PUSD, REDEEMER, 1_000);
+		mint_stable(STABLE, REDEEMER, 1_000);
 		assert_noop!(redeem(RedeemOptions::spend(200)), Error::<Test>::StablecoinNotRegistered);
 	});
 }
@@ -212,10 +212,10 @@ fn redeem_rejects_unregistered_coin() {
 #[test]
 fn redeem_rejects_frozen_branch() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
-		mint_stable(PUSD, REDEEMER, 1_000);
-		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, PUSD, true));
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		mint_stable(STABLE, REDEEMER, 1_000);
+		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, STABLE, true));
 		// Frozen-mode enforcement lives vault-side: projecting the first target's snapshot
 		// rejects the frozen branch before any settlement, so nothing needs rolling back.
 		assert_noop!(redeem(RedeemOptions::spend(200)), pallet_vaults::Error::<Test>::BranchFrozen);
@@ -225,8 +225,8 @@ fn redeem_rejects_frozen_branch() {
 #[test]
 fn redeem_rejects_empty_queue() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		mint_stable(PUSD, REDEEMER, 1_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		mint_stable(STABLE, REDEEMER, 1_000);
 		assert_noop!(redeem(RedeemOptions::spend(200)), Error::<Test>::NoRedeemableVault);
 	});
 }
@@ -234,18 +234,18 @@ fn redeem_rejects_empty_queue() {
 #[test]
 fn ordinary_redeems_lowest_rate_vault_first() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
-		let v1_before = vault_debt(DOT, PUSD, 1);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
+		let v1_before = vault_debt(DOT, STABLE, 1);
 		let v1_held_before = held(DOT, 1);
-		let v2_before = vault_debt(DOT, PUSD, 2);
+		let v2_before = vault_debt(DOT, STABLE, 2);
 		let v2_held_before = held(DOT, 2);
-		let redeemer_before = Assets::balance(PUSD, REDEEMER);
-		let fee_dest_before = Assets::balance(PUSD, FEE_DEST);
+		let redeemer_before = Assets::balance(STABLE, REDEEMER);
+		let fee_dest_before = Assets::balance(STABLE, FEE_DEST);
 		let recipient_before = collateral_balance(DOT, RECIPIENT);
-		let supply_before = Assets::total_supply(PUSD);
+		let supply_before = Assets::total_supply(STABLE);
 
 		// Each vault owes 501, 500 plus a one-unit upfront fee, so the coin's debt is 1_002.
 		// Cancelling 201, a 20.06% share, lifts the dynamic fee by half that share to 10.03%, and
@@ -255,17 +255,17 @@ fn ordinary_redeems_lowest_rate_vault_first() {
 
 		// The lowest-rate vault absorbs the whole fill, in debt and in held
 		// collateral; the higher-rate vault is untouched in both.
-		assert_eq!(v1_before - vault_debt(DOT, PUSD, 1), 201);
+		assert_eq!(v1_before - vault_debt(DOT, STABLE, 1), 201);
 		assert_eq!(v1_held_before - held(DOT, 1), 160);
-		assert_eq!(vault_debt(DOT, PUSD, 2), v2_before);
+		assert_eq!(vault_debt(DOT, STABLE, 2), v2_before);
 		assert_eq!(held(DOT, 2), v2_held_before);
 		assert_eq!(settled.figures(), (201, 12, 160));
 		assert_eq!(settled.ordinary_steps, Some(1));
 		// The redeemer pays the debt and the fee, the fee reaches `FEE_DEST`, only the debt is
 		// burned, and the recipient receives the collateral.
-		assert_eq!(redeemer_before - Assets::balance(PUSD, REDEEMER), 213);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST) - fee_dest_before, 12);
-		assert_eq!(supply_before - Assets::total_supply(PUSD), 201);
+		assert_eq!(redeemer_before - Assets::balance(STABLE, REDEEMER), 213);
+		assert_eq!(Assets::balance(STABLE, FEE_DEST) - fee_dest_before, 12);
+		assert_eq!(supply_before - Assets::total_supply(STABLE), 201);
 		assert_eq!(collateral_balance(DOT, RECIPIENT) - recipient_before, 160);
 	});
 }
@@ -273,12 +273,12 @@ fn ordinary_redeems_lowest_rate_vault_first() {
 #[test]
 fn ordinary_walk_stops_at_step_cap_or_barrier() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
 		// Vault 2 has a much higher collateral ratio than vault 1. Thus, a price can put vault 1
 		// below par while vault 2 stays eligible for redemption.
-		assert_ok!(open(2, DOT, PUSD, 10_000, 500, percent(2)));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		assert_ok!(open(2, DOT, STABLE, 10_000, 500, percent(2)));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 
 		// A one-step cap ends the walk with budget and a second target to spare. A caller sees
 		// it as a walk that used every step and spent less than its budget.
@@ -296,7 +296,7 @@ fn ordinary_walk_stops_at_step_cap_or_barrier() {
 		// Park a Dormant husk at the priority slot and sink the price: the
 		// underwater Dormant head is a barrier that ends the walk below the cap.
 		assert_ok!(redeem(RedeemOptions::spend(spend_for_debt(DORMANT_FILL_DEBT))));
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_dormant());
 		set_price(DOT, FixedU128::from_rational(15, 100));
 		assert!(
 			vault_cr(2, FixedU128::from_rational(15, 100)) > FixedU128::one(),
@@ -307,7 +307,7 @@ fn ordinary_walk_stops_at_step_cap_or_barrier() {
 		// The barrier is not permanent: liquidating the husk clears the priority slot, and the
 		// walk reaches the healthy vault behind it.
 		liquidate_redistribute_all(1);
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none(), "husk gone");
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, STABLE, 1)).is_none(), "husk gone");
 		let unblocked = dry_redeem(RedeemOptions::spend(100_000)).expect("vault 2 is redeemable");
 		assert_eq!(unblocked.ordinary_steps, Some(1));
 		assert_eq!(unblocked.stable_burned, projected_full_debt(2));
@@ -317,23 +317,23 @@ fn ordinary_walk_stops_at_step_cap_or_barrier() {
 #[test]
 fn ordinary_walk_skips_underwater_vaults() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		// Open the well-collateralized vaults first so the thin low-rate vaults
 		// don't briefly push the fresh branch into Safety mode at the genesis price.
-		assert_ok!(open(3, DOT, PUSD, 3_000, 240, percent(3)));
-		assert_ok!(open(4, DOT, PUSD, 3_000, 240, percent(4)));
-		assert_ok!(open(1, DOT, PUSD, 250, 240, percent(1)));
-		assert_ok!(open(2, DOT, PUSD, 260, 240, percent(2)));
+		assert_ok!(open(3, DOT, STABLE, 3_000, 240, percent(3)));
+		assert_ok!(open(4, DOT, STABLE, 3_000, 240, percent(4)));
+		assert_ok!(open(1, DOT, STABLE, 250, 240, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 260, 240, percent(2)));
 		set_price(DOT, FixedU128::from_rational(9, 10));
-		mint_stable(PUSD, OTHER_REDEEMER, 1_000_000);
-		let v1_before = vault_debt(DOT, PUSD, 1);
+		mint_stable(STABLE, OTHER_REDEEMER, 1_000_000);
+		let v1_before = vault_debt(DOT, STABLE, 1);
 		let v1_held_before = held(DOT, 1);
-		let v2_before = vault_debt(DOT, PUSD, 2);
+		let v2_before = vault_debt(DOT, STABLE, 2);
 		let v2_held_before = held(DOT, 2);
-		let v3_before = vault_debt(DOT, PUSD, 3);
-		let v4_before = vault_debt(DOT, PUSD, 4);
-		let redeemer_before = Assets::balance(PUSD, OTHER_REDEEMER);
-		let supply_before = Assets::total_supply(PUSD);
+		let v3_before = vault_debt(DOT, STABLE, 3);
+		let v4_before = vault_debt(DOT, STABLE, 4);
+		let redeemer_before = Assets::balance(STABLE, OTHER_REDEEMER);
+		let supply_before = Assets::total_supply(STABLE);
 		let settled = redeem(RedeemOptions {
 			who: OTHER_REDEEMER,
 			recipient: OTHER_RECIPIENT,
@@ -344,23 +344,23 @@ fn ordinary_walk_skips_underwater_vaults() {
 		assert_eq!(settled.stable_burned, v3_before + v4_before);
 		// The underwater prefix (vaults 1-2) is skipped: its debt and held collateral are
 		// untouched.
-		assert_eq!(vault_debt(DOT, PUSD, 1), v1_before);
+		assert_eq!(vault_debt(DOT, STABLE, 1), v1_before);
 		assert_eq!(held(DOT, 1), v1_held_before);
-		assert_eq!(vault_debt(DOT, PUSD, 2), v2_before);
+		assert_eq!(vault_debt(DOT, STABLE, 2), v2_before);
 		assert_eq!(held(DOT, 2), v2_held_before);
 		// The healthy vaults behind it drain fully.
-		assert_eq!(vault_debt(DOT, PUSD, 3), 0);
-		assert_eq!(vault_debt(DOT, PUSD, 4), 0);
+		assert_eq!(vault_debt(DOT, STABLE, 3), 0);
+		assert_eq!(vault_debt(DOT, STABLE, 4), 0);
 		// Collateral is paid at face value, floored per step at price 0.9 (= debt * 10 / 9).
 		assert_eq!(settled.collateral_out, v3_before * 10 / 9 + v4_before * 10 / 9);
 		// The walk ends well inside the 2_000 budget, so the redeemer is refunded everything
 		// but the burned debt and its fee.
 		assert!(settled.stable_burned + settled.fee < 2_000);
 		assert_eq!(
-			redeemer_before - Assets::balance(PUSD, OTHER_REDEEMER),
+			redeemer_before - Assets::balance(STABLE, OTHER_REDEEMER),
 			settled.stable_burned + settled.fee
 		);
-		assert_eq!(supply_before - Assets::total_supply(PUSD), settled.stable_burned);
+		assert_eq!(supply_before - Assets::total_supply(STABLE), settled.stable_burned);
 	});
 }
 
@@ -369,9 +369,9 @@ fn ordinary_walk_skips_underwater_vaults() {
 #[test]
 fn slippage_floor_scales_to_partial_fill() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 
 		// The 1_000 offer fills the whole 501 debt for `floor(501 / 1.25) = 400` collateral.
 		// Redeeming the coin's whole debt lifts the dynamic fee by 1/2 to 50%, so the fee is
@@ -388,7 +388,7 @@ fn slippage_floor_scales_to_partial_fill() {
 			min_collateral_out: 637,
 			..RedeemOptions::spend(1_000)
 		}));
-		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
+		assert_eq!(vault_debt(DOT, STABLE, 1), 0);
 	});
 }
 
@@ -397,10 +397,10 @@ fn slippage_floor_scales_to_partial_fill() {
 #[test]
 fn slippage_floor_catches_fee_climb() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 100_000, 50_000, percent(5)));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
-		mint_stable(PUSD, OTHER_REDEEMER, 1_000_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 100_000, 50_000, percent(5)));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
+		mint_stable(STABLE, OTHER_REDEEMER, 1_000_000);
 
 		let quote = dry_redeem(RedeemOptions::spend(10_000)).expect("quote");
 
@@ -435,9 +435,9 @@ fn slippage_floor_catches_fee_climb() {
 #[test]
 fn redeem_rejects_fee_leaving_debt_below_minimum() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
-		mint_stable(PUSD, REDEEMER, 1_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		mint_stable(STABLE, REDEEMER, 1_000);
 
 		// The 100 minimum is a 19.96% share of the 501 coin debt, so the dynamic fee rises 9.98%
 		// and the fee is `ceil(100 · (4.99% + 0.5%)) = 6`: 106 buys exactly 100 debt, 105 only 99.
@@ -449,7 +449,7 @@ fn redeem_rejects_fee_leaving_debt_below_minimum() {
 		);
 
 		// With a balance short of the budget, the balance is what fails.
-		mint_stable(PUSD, OTHER_REDEEMER, 105);
+		mint_stable(STABLE, OTHER_REDEEMER, 105);
 		assert_noop!(
 			redeem(RedeemOptions {
 				who: OTHER_REDEEMER,
@@ -467,13 +467,13 @@ fn redeem_rejects_fee_leaving_debt_below_minimum() {
 #[test]
 fn fee_rate_view_reports_next_starting_rate() {
 	build_and_execute(|| {
-		assert_eq!(Redemptions::current_fee_rate(PUSD), None, "no market issues PUSD yet");
+		assert_eq!(Redemptions::current_fee_rate(STABLE), None, "no market issues STABLE yet");
 
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000_000, 500_000, percent(5)));
-		mint_stable(PUSD, REDEEMER, 2_000_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000_000, 500_000, percent(5)));
+		mint_stable(STABLE, REDEEMER, 2_000_000);
 		let base_fee = FixedU128::from(default_redemption_config().base_fee);
-		assert_eq!(Redemptions::current_fee_rate(PUSD), Some(base_fee));
+		assert_eq!(Redemptions::current_fee_rate(STABLE), Some(base_fee));
 
 		// The 100_000 buys 95_015 of the 500_480 debt. The dynamic fee rises by half of that
 		// share, `floor(floor(95_015e18 / 500_480) / 2)`, to 9.4924%. The fee on the 4.7462%
@@ -482,14 +482,14 @@ fn fee_rate_view_reports_next_starting_rate() {
 		let settled = redeem(RedeemOptions::spend(100_000)).expect("redemption succeeds");
 		assert_eq!(settled.figures(), (95_015, 4_985, 76_012));
 		let raised = FixedU128::from_inner(94_923_873_081_841_432);
-		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee, raised);
-		assert_eq!(Redemptions::current_fee_rate(PUSD), Some(raised + base_fee));
+		assert_eq!(crate::RedemptionStates::<Test>::get(STABLE).dynamic_fee, raised);
+		assert_eq!(Redemptions::current_fee_rate(STABLE), Some(raised + base_fee));
 
 		// 24h at the 6h half-life is four whole half-lives:
 		// `floor(94_923_873_081_841_432 / 16) = 5_932_742_067_615_089`, plus the base fee.
 		advance_time(24 * HOUR_MS);
 		let rate = FixedU128::from_inner(5_932_742_067_615_089) + base_fee;
-		assert_eq!(Redemptions::current_fee_rate(PUSD), Some(rate));
+		assert_eq!(Redemptions::current_fee_rate(STABLE), Some(rate));
 
 		// A sized redemption climbs from that rate, so it pays more than the rate alone charges.
 		// A day of interest on the remaining 405_465 is `ceil(55.51) = 56`, so the debt is
@@ -503,26 +503,26 @@ fn fee_rate_view_reports_next_starting_rate() {
 		// The view needs no redeemable vault, which a redemption does.
 		set_price(DOT, FixedU128::from_rational(1, 100));
 		assert_noop!(redeem(RedeemOptions::spend(100_000)), Error::<Test>::NoRedeemableVault);
-		assert_eq!(Redemptions::current_fee_rate(PUSD), Some(rate));
+		assert_eq!(Redemptions::current_fee_rate(STABLE), Some(rate));
 	});
 }
 
-/// The fee belongs to the coin, whichever collateral backs it: a DOT/PUSD redemption raises the
-/// fee a TOKEN_X/PUSD redeemer pays next, and the share redeemed counts both markets' debt.
+/// The fee belongs to the coin, whichever collateral backs it: a DOT/STABLE redemption raises the
+/// fee a TOKEN_X/STABLE redeemer pays next, and the share redeemed counts both markets' debt.
 #[test]
 fn fee_is_shared_across_markets_on_a_coin() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		register_branch(TOKEN_X, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
+		register_branch(TOKEN_X, STABLE, default_branch_config());
 
-		assert_ok!(open(1, DOT, PUSD, 100_000, 50_000, percent(5)));
+		assert_ok!(open(1, DOT, STABLE, 100_000, 50_000, percent(5)));
 		mint_collateral(TOKEN_X_ID, 2, 200_000);
-		assert_ok!(open(2, TOKEN_X, PUSD, 100_000, 50_000, percent(5)));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		assert_ok!(open(2, TOKEN_X, STABLE, 100_000, 50_000, percent(5)));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 
 		// Both markets' debt is the denominator, so a redemption moves the fee half as far as it
-		// would against DOT/PUSD alone.
-		assert_eq!(stablecoin_debt(PUSD), 2 * 50_048);
+		// would against DOT/STABLE alone.
+		assert_eq!(stablecoin_debt(STABLE), 2 * 50_048);
 
 		// Each redemption cancels 10_000. The first lifts the dynamic fee from zero by
 		// `10_000 / 100_096 / 2 = 4.995%` and pays `ceil(10_000 · (2.498% + 0.5%)) = 300`. The
@@ -532,22 +532,22 @@ fn fee_is_shared_across_markets_on_a_coin() {
 		assert_eq!((dot.stable_burned, dot.fee), (10_000, 300));
 
 		// The TOKEN_X redeemer, who redeemed nothing, now pays the raised rate.
-		let debt_before = vault_debt(TOKEN_X, PUSD, 2);
+		let debt_before = vault_debt(TOKEN_X, STABLE, 2);
 		let token_x = redeem(RedeemOptions { collateral: TOKEN_X, ..RedeemOptions::spend(10_828) })
 			.expect("redemption succeeds");
-		assert_eq!(debt_before - vault_debt(TOKEN_X, PUSD, 2), 10_000);
+		assert_eq!(debt_before - vault_debt(TOKEN_X, STABLE, 2), 10_000);
 		assert_eq!((token_x.stable_burned, token_x.fee), (10_000, 828));
 	});
 }
 
-/// The `(old, new)` dynamic fees that each PUSD `RedemptionDynamicFeeUpdated` event reports, in
+/// The `(old, new)` dynamic fees that each STABLE `RedemptionDynamicFeeUpdated` event reports, in
 /// order.
 fn dynamic_fee_updates() -> Vec<(FixedU128, FixedU128)> {
 	redemption_events()
 		.into_iter()
 		.filter_map(|event| match event {
 			Event::RedemptionDynamicFeeUpdated {
-				stable_id: PUSD,
+				stable_id: STABLE,
 				old_dynamic_fee,
 				new_dynamic_fee,
 			} => Some((old_dynamic_fee, new_dynamic_fee)),
@@ -563,7 +563,7 @@ fn redeem_in_sequence(
 	debts: &[(Balance, Moment)],
 ) -> (Balance, FixedU128, Vec<(FixedU128, FixedU128)>) {
 	hypothetically!({
-		let fee_before = Assets::balance(PUSD, FEE_DEST);
+		let fee_before = Assets::balance(STABLE, FEE_DEST);
 		let collateral_before = collateral_balance(DOT, RECIPIENT);
 		let total: Balance = debts.iter().map(|&(debt, _)| debt).sum();
 		for &(debt, idle_ms) in debts {
@@ -573,8 +573,8 @@ fn redeem_in_sequence(
 		// Every unit of debt buys the same collateral at the 1.25 price, however it is split.
 		assert_eq!(collateral_balance(DOT, RECIPIENT) - collateral_before, total * 4 / 5);
 		(
-			Assets::balance(PUSD, FEE_DEST) - fee_before,
-			crate::RedemptionStates::<Test>::get(PUSD).dynamic_fee,
+			Assets::balance(STABLE, FEE_DEST) - fee_before,
+			crate::RedemptionStates::<Test>::get(STABLE).dynamic_fee,
 			dynamic_fee_updates(),
 		)
 	})
@@ -593,11 +593,11 @@ fn redeem_in_sequence(
 #[test]
 fn fee_split_redemption_pays_first_half_climb() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		// One vault owes 500_480: 500_000 plus a 480-unit seven-day upfront fee.
-		assert_ok!(open(1, DOT, PUSD, 1_000_000, 500_000, percent(5)));
-		mint_stable(PUSD, REDEEMER, 2_000_000);
-		assert_eq!(vault_debt(DOT, PUSD, 1), 500_480);
+		assert_ok!(open(1, DOT, STABLE, 1_000_000, 500_000, percent(5)));
+		mint_stable(STABLE, REDEEMER, 2_000_000);
+		assert_eq!(vault_debt(DOT, STABLE, 1), 500_480);
 
 		let zero = FixedU128::zero();
 		let (at_once_fee, at_once_dynamic_fee, at_once_updates) =
@@ -646,76 +646,76 @@ fn fee_split_redemption_pays_first_half_climb() {
 #[test]
 fn ordinary_serves_dormant_slot_first() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 
 		assert_ok!(redeem(RedeemOptions::spend(spend_for_debt(DORMANT_FILL_DEBT))));
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_dormant());
 
-		let v2_before = vault_debt(DOT, PUSD, 2);
-		let v1_residual = vault_debt(DOT, PUSD, 1);
+		let v2_before = vault_debt(DOT, STABLE, 2);
+		let v1_residual = vault_debt(DOT, STABLE, 1);
 		// Dormant vault 1 has left the rate index, so only the Dormant slot, served first, can
 		// reach it.
 		let settled =
 			redeem(RedeemOptions::spend(spend_for_debt(100))).expect("redemption succeeds");
 		// Cancelling less than the residual keeps the husk's row readable.
 		assert_eq!(v1_residual, 141);
-		assert_eq!(v1_residual - vault_debt(DOT, PUSD, 1), 100);
+		assert_eq!(v1_residual - vault_debt(DOT, STABLE, 1), 100);
 		// Collateral paid is the face-value amount for the debt cancelled.
 		assert_eq!(settled.collateral_out, 80);
 		// Priority: the ordinary vault behind the Dormant slot is untouched.
-		assert_eq!(vault_debt(DOT, PUSD, 2), v2_before);
+		assert_eq!(vault_debt(DOT, STABLE, 2), v2_before);
 	});
 }
 
 #[test]
 fn ordinary_continues_past_drained_dormant_slot() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 
 		// A sub-minimum residual parks vault 1 as the dormant redemption target.
 		assert_ok!(redeem(RedeemOptions::spend(spend_for_debt(DORMANT_FILL_DEBT))));
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
-		let v1_residual = vault_debt(DOT, PUSD, 1);
-		let v2_debt = vault_debt(DOT, PUSD, 2);
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_dormant());
+		let v1_residual = vault_debt(DOT, STABLE, 1);
+		let v2_debt = vault_debt(DOT, STABLE, 2);
 
 		// A budget beyond both targets drains the dormant slot and continues into the rate index.
 		let settled = redeem(RedeemOptions::spend(100_000)).expect("redemption succeeds");
 		assert_eq!(settled.ordinary_steps, Some(2));
 		assert_eq!(settled.stable_burned, v1_residual + v2_debt);
-		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
-		assert_eq!(vault_debt(DOT, PUSD, 2), 0);
+		assert_eq!(vault_debt(DOT, STABLE, 1), 0);
+		assert_eq!(vault_debt(DOT, STABLE, 2), 0);
 	});
 }
 
-/// Opens `who`'s DOT/PUSD vault and parks it in `FinalRecovery` at `recovery_price`.
+/// Opens `who`'s DOT/STABLE vault and parks it in `FinalRecovery` at `recovery_price`.
 fn setup_final_recovery(who: AccountId, coll: Balance, debt: Balance, recovery_price: FixedU128) {
 	// Earlier `FinalRecovery` vaults may have left the price depressed.
 	set_price(DOT, DEFAULT_PRICE);
-	assert_ok!(open(who, DOT, PUSD, coll, debt, percent(5)));
+	assert_ok!(open(who, DOT, STABLE, coll, debt, percent(5)));
 	set_price(DOT, recovery_price);
-	assert_ok!(enter_final_recovery(DOT, PUSD, who));
-	assert!(vault_status(DOT, PUSD, who).expect("fr vault").is_final_recovery());
+	assert_ok!(enter_final_recovery(DOT, STABLE, who));
+	assert!(vault_status(DOT, STABLE, who).expect("fr vault").is_final_recovery());
 }
 
 #[test]
 fn recovery_bonus_improves_vault_cr() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		// Price 0.52 parks the FinalRecovery vault's CR barely above 100%, the
 		// regime where an overpaid bonus could actually damage the vault.
 		let price = RECOVERY_PRICE_ABOVE_PAR;
 		setup_final_recovery(1, 1_000, 500, price);
 		// A live dynamic fee makes "recovery leaves the fee state alone" meaningful.
-		set_dynamic_fee(PUSD, FixedU128::from_rational(3u128, 100u128));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
-		let debt_before = vault_debt(DOT, PUSD, 1);
-		let fee_state_before = crate::RedemptionStates::<Test>::get(PUSD);
+		set_dynamic_fee(STABLE, FixedU128::from_rational(3u128, 100u128));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
+		let debt_before = vault_debt(DOT, STABLE, 1);
+		let fee_state_before = crate::RedemptionStates::<Test>::get(STABLE);
 		let recipient_before = collateral_balance(DOT, RECIPIENT);
 
 		let cr_before = vault_cr(1, price);
@@ -729,8 +729,8 @@ fn recovery_bonus_improves_vault_cr() {
 		assert_eq!(settled.figures(), (200, 0, 394), "recovery bonus payout");
 		assert_eq!(collateral_balance(DOT, RECIPIENT) - recipient_before, 394);
 		assert_eq!(settled.ordinary_steps, None, "recovery must not settle as ordinary");
-		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD), fee_state_before);
-		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before - 200);
+		assert_eq!(crate::RedemptionStates::<Test>::get(STABLE), fee_state_before);
+		assert_eq!(vault_debt(DOT, STABLE, 1), debt_before - 200);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
 
 		// The 1% buffer keeps the bonus strictly below CR − 100%, so paying it
@@ -745,16 +745,16 @@ fn recovery_bonus_improves_vault_cr() {
 #[test]
 fn recovery_stops_above_icr() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 
 		// CR = 550/501 ≈ 109.8%: the capped 5% bonus pays floor(210 / 0.55) = 381.
 		set_price(DOT, FixedU128::from_rational(55u128, 100u128));
 		let settled = redeem(RedeemOptions::spend(200)).expect("redemption succeeds");
 		assert_eq!(settled.collateral_out, 381);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
-		let debt_before = vault_debt(DOT, PUSD, 1);
+		let debt_before = vault_debt(DOT, STABLE, 1);
 
 		// CR = 619 · 0.60 / 301 ≈ 123.4%: above the ICR, only the exit remains.
 		set_price(DOT, FixedU128::from_rational(60u128, 100u128));
@@ -770,14 +770,14 @@ fn recovery_stops_above_icr() {
 		let settled = redeem(RedeemOptions::spend(100)).expect("redemption succeeds");
 		assert_eq!(settled.figures(), (100, 0, 187));
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
-		assert_eq!(vault_debt(DOT, PUSD, 1), 201);
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
+		assert_eq!(vault_debt(DOT, STABLE, 1), 201);
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_final_recovery());
 
 		// CR = 432 · 0.56 / 201 ≈ 120.4%: the head exits and is ordinary again.
 		assert_ok!(Vaults::exit_final_recovery(
 			RuntimeOrigin::signed(REDEEMER),
 			DOT,
-			PUSD,
+			STABLE,
 			1,
 			pallet_linked_list::Position::endpoints_only()
 		));
@@ -795,37 +795,37 @@ fn recovery_stops_above_icr() {
 #[test]
 fn recovery_sub_minimum_head_above_mcr_settles_at_face_value() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
-		mint_stable(PUSD, REDEEMER, 1_000_000);
-		let debt = vault_debt(DOT, PUSD, 1);
+		mint_stable(STABLE, REDEEMER, 1_000_000);
+		let debt = vault_debt(DOT, STABLE, 1);
 		assert_ok!(redeem(RedeemOptions::spend(debt - 150)));
-		assert_eq!(vault_debt(DOT, PUSD, 1), 150);
+		assert_eq!(vault_debt(DOT, STABLE, 1), 150);
 
 		set_price(DOT, DEFAULT_PRICE);
 		assert_ok!(preview_offset(100), RecoveryOffsetQuote::Available { debt: 100 });
 		let settled = redeem(RedeemOptions::spend(100)).expect("redemption succeeds");
 		// No bonus: floor(100 / 1.25) = 80, and no fee.
 		assert_eq!(settled.figures(), (100, 0, 80));
-		assert_eq!(vault_debt(DOT, PUSD, 1), 50);
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
+		assert_eq!(vault_debt(DOT, STABLE, 1), 50);
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_final_recovery());
 	});
 }
 
 #[test]
 fn recovery_head_served_before_ordinary_vaults() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
 		// Open the ordinary vault at a healthy price, then settle at 0.54, where the
 		// head's CR ≈ 107.8% is below the 110% exit gate.
 		set_price(DOT, DEFAULT_PRICE);
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 		let price = FixedU128::from_rational(54u128, 100u128);
 		set_price(DOT, price);
-		let v1_before = vault_debt(DOT, PUSD, 1);
-		let v2_before = vault_debt(DOT, PUSD, 2);
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		let v1_before = vault_debt(DOT, STABLE, 1);
+		let v2_before = vault_debt(DOT, STABLE, 2);
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 
 		// Beyond the 106% at which the cap starts binding, the bonus must come out
 		// clamped to exactly the 5% redistribution penalty rather than the raw excess.
@@ -839,9 +839,9 @@ fn recovery_head_served_before_ordinary_vaults() {
 		assert_eq!(settled.ordinary_steps, None, "a recovery settlement");
 		assert_eq!(settled.figures(), (200, 0, 388));
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
-		assert_eq!(v1_before - vault_debt(DOT, PUSD, 1), 200);
+		assert_eq!(v1_before - vault_debt(DOT, STABLE, 1), 200);
 		// The ordinary vault is untouched.
-		assert_eq!(vault_debt(DOT, PUSD, 2), v2_before);
+		assert_eq!(vault_debt(DOT, STABLE, 2), v2_before);
 	});
 }
 
@@ -850,14 +850,14 @@ fn recovery_head_served_before_ordinary_vaults() {
 #[test]
 fn insurance_cover_rounds_collateral_value_up() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		// 1_000 units at 0.4005 are worth 400.5 pUSD against 501 of debt.
+		register_branch(DOT, STABLE, default_branch_config());
+		// 1_000 units at 0.4005 are worth 400.5 STABLE against 501 of debt.
 		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(4_005u128, 10_000u128));
-		assert_eq!(vault_debt(DOT, PUSD, 1), 501);
-		mint_stable(PUSD, insurance_account(PUSD), 1_000);
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		assert_eq!(vault_debt(DOT, STABLE, 1), 501);
+		mint_stable(STABLE, insurance_account(STABLE), 1_000);
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 		let recipient_before = collateral_balance(DOT, RECIPIENT);
-		let supply_before = Assets::total_supply(PUSD);
+		let supply_before = Assets::total_supply(STABLE);
 
 		// The value rounds up to 401, so the flush fund covers a shortfall of 100 rather than
 		// 101, and the redeemer pays 401 for collateral worth 400.5: the half unit rounds
@@ -866,18 +866,18 @@ fn insurance_cover_rounds_collateral_value_up() {
 		assert_eq!(settled.figures(), (401, 0, 1_000));
 		assert_eq!(settled.insurance_cover, 100);
 		// The redeemer pays the 401 and the fund the 100 cover; both are burned.
-		assert_eq!(Assets::balance(PUSD, REDEEMER), 1_000_000 - 401);
-		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 900);
-		assert_eq!(supply_before - Assets::total_supply(PUSD), 501);
+		assert_eq!(Assets::balance(STABLE, REDEEMER), 1_000_000 - 401);
+		assert_eq!(Assets::balance(STABLE, insurance_account(STABLE)), 900);
+		assert_eq!(supply_before - Assets::total_supply(STABLE), 501);
 		assert_eq!(collateral_balance(DOT, RECIPIENT) - recipient_before, 1_000);
-		assert_eq!(vault_status(DOT, PUSD, 1), None, "vault settled and closed");
+		assert_eq!(vault_status(DOT, STABLE, 1), None, "vault settled and closed");
 	});
 }
 
 #[test]
 fn config_update_stores_and_validates() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		// Every field differs from the seeded default, so a field that the call failed to store
 		// would show.
 		let cfg = RedemptionConfig {
@@ -890,10 +890,10 @@ fn config_update_stores_and_validates() {
 			dynamic_fee_increase_divisor: FixedU128::from_u32(4),
 			final_recovery_bonus_buffer: Permill::from_percent(2),
 		};
-		assert_ok!(Redemptions::set_redemption_config(RuntimeOrigin::root(), PUSD, cfg.clone()));
-		assert_eq!(crate::RedemptionConfigs::<Test>::get(PUSD), Some(cfg.clone()));
+		assert_ok!(Redemptions::set_redemption_config(RuntimeOrigin::root(), STABLE, cfg.clone()));
+		assert_eq!(crate::RedemptionConfigs::<Test>::get(STABLE), Some(cfg.clone()));
 		System::assert_last_event(RuntimeEvent::Redemptions(Event::RedemptionConfigUpdated {
-			stable_id: PUSD,
+			stable_id: STABLE,
 		}));
 
 		// One mutation per invalid-config axis `validate` guards.
@@ -919,7 +919,7 @@ fn config_update_stores_and_validates() {
 			let mut bad = cfg.clone();
 			mutate(&mut bad);
 			assert_noop!(
-				Redemptions::set_redemption_config(RuntimeOrigin::root(), PUSD, bad),
+				Redemptions::set_redemption_config(RuntimeOrigin::root(), STABLE, bad),
 				Error::<Test>::InvalidRedemptionConfig
 			);
 		}
@@ -928,11 +928,11 @@ fn config_update_stores_and_validates() {
 
 /// Only Root and the coin's `pallet-assets` owner set the redemption config, as Vaults requires
 /// for `create_branch`. The config governs every market on the coin, so no market admin may:
-/// the DOT/PUSD admin would otherwise price TOKEN_X/PUSD redemptions.
+/// the DOT/STABLE admin would otherwise price TOKEN_X/STABLE redemptions.
 #[test]
 fn config_update_requires_coin_owner_or_root() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		let other_admin: AccountId = 55;
 		// A Root-created market charges its full admin the custody seed.
 		mint_collateral(TOKEN_X_ID, other_admin, 2);
@@ -940,31 +940,35 @@ fn config_update_requires_coin_owner_or_root() {
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::root(),
 			TOKEN_X,
-			PUSD,
+			STABLE,
 			branch_admins(other_admin, other_admin),
 			default_branch_config(),
 			None,
 		));
-		let mut cfg = crate::RedemptionConfigs::<Test>::get(PUSD).unwrap();
+		let mut cfg = crate::RedemptionConfigs::<Test>::get(STABLE).unwrap();
 		cfg.minimum_redemption_amount = 250;
 
 		// This market's full admin, its emergency admin, and the sibling market's full admin.
 		for wrong in [ADMIN, EMERGENCY_ADMIN, other_admin] {
 			assert_noop!(
-				Redemptions::set_redemption_config(RuntimeOrigin::signed(wrong), PUSD, cfg.clone()),
+				Redemptions::set_redemption_config(
+					RuntimeOrigin::signed(wrong),
+					STABLE,
+					cfg.clone()
+				),
 				BadOrigin
 			);
 		}
 
 		use frame::traits::fungibles::roles::Inspect as _;
-		assert_eq!(Assets::owner(PUSD), Some(STABLECOIN_OWNER));
+		assert_eq!(Assets::owner(STABLE), Some(STABLECOIN_OWNER));
 		assert_ok!(Redemptions::set_redemption_config(
 			RuntimeOrigin::signed(STABLECOIN_OWNER),
-			PUSD,
+			STABLE,
 			cfg
 		));
 		assert_eq!(
-			crate::RedemptionConfigs::<Test>::get(PUSD).unwrap().minimum_redemption_amount,
+			crate::RedemptionConfigs::<Test>::get(STABLE).unwrap().minimum_redemption_amount,
 			250
 		);
 	});
@@ -975,7 +979,7 @@ fn config_update_rejects_unregistered_coin() {
 	build_and_execute(|| {
 		let cfg = default_redemption_config();
 		assert_noop!(
-			Redemptions::set_redemption_config(RuntimeOrigin::root(), PUSD, cfg),
+			Redemptions::set_redemption_config(RuntimeOrigin::root(), STABLE, cfg),
 			Error::<Test>::StablecoinNotRegistered
 		);
 	});
@@ -984,7 +988,7 @@ fn config_update_rejects_unregistered_coin() {
 #[test]
 fn insurance_fund_drains_head_by_head() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		// Recovery price 0.10 → both vaults sit below 100% CR (insurance-adjusted).
 		let rp = FixedU128::from_rational(1u128, 10u128);
 		setup_final_recovery(1, 1_000, 500, rp);
@@ -994,8 +998,8 @@ fn insurance_fund_drains_head_by_head() {
 		// is exposed to redemption.
 		assert_eq!(recovery_queue(), vec![1u64, 2u64]);
 
-		let debt1 = vault_debt(DOT, PUSD, 1);
-		let debt2 = vault_debt(DOT, PUSD, 2);
+		let debt1 = vault_debt(DOT, STABLE, 1);
+		let debt2 = vault_debt(DOT, STABLE, 2);
 		// 500 principal + the 1-unit 7-day upfront fee each.
 		assert_eq!(debt1, 501);
 		assert_eq!(debt2, 501);
@@ -1003,21 +1007,21 @@ fn insurance_fund_drains_head_by_head() {
 		// drains it and the next head must settle against a then-empty fund.
 		let collateral_value_1 = rp.saturating_mul_int(held(DOT, 1));
 		let shortfall_1 = debt1 - collateral_value_1;
-		mint_stable(PUSD, insurance_account(PUSD), shortfall_1);
-		// Another coin's fund account holds pUSD too, but it is no cover for this market.
-		mint_stable(PUSD, insurance_account(USDX), 1_000_000);
-		mint_stable(PUSD, REDEEMER, 10_000);
+		mint_stable(STABLE, insurance_account(STABLE), shortfall_1);
+		// Another coin's fund account holds STABLE too, but it is no cover for this market.
+		mint_stable(STABLE, insurance_account(USDX), 1_000_000);
+		mint_stable(STABLE, REDEEMER, 10_000);
 
 		// First transaction settles only the FIFO head (vault 1). The full payout leaves
 		// neither debt nor collateral, so the vault closes and its row is removed.
 		let first = redeem(RedeemOptions::spend(10_000)).expect("redemption succeeds");
-		assert_eq!(vault_status(DOT, PUSD, 1), None, "head settled and closed");
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_none());
+		assert_eq!(vault_status(DOT, STABLE, 1), None, "head settled and closed");
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, STABLE, 1)).is_none());
 		assert_eq!(held(DOT, 1), 0);
 		// A below-par owner has no equity claim on any of the collateral.
 		System::assert_has_event(RuntimeEvent::Vaults(pallet_vaults::Event::VaultClosed {
 			collateral_id: DOT,
-			stable_id: PUSD,
+			stable_id: STABLE,
 			owner: 1,
 			recipient: 1,
 			collateral: 0,
@@ -1028,19 +1032,23 @@ fn insurance_fund_drains_head_by_head() {
 		// vault's entire 1_000 collateral.
 		assert_eq!(first.figures(), (collateral_value_1, 0, 1_000));
 		assert_eq!(first.insurance_cover, shortfall_1);
-		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0, "head 1 drained the fund");
+		assert_eq!(
+			Assets::balance(STABLE, insurance_account(STABLE)),
+			0,
+			"head 1 drained the fund"
+		);
 		// Head-only: vault 2 is untouched and becomes the new FIFO head.
-		assert_eq!(vault_debt(DOT, PUSD, 2), debt2);
-		assert!(vault_status(DOT, PUSD, 2).expect("vault 2").is_final_recovery());
+		assert_eq!(vault_debt(DOT, STABLE, 2), debt2);
+		assert!(vault_status(DOT, STABLE, 2).expect("vault 2").is_final_recovery());
 		assert_eq!(recovery_queue(), vec![2u64]);
 
 		// Second transaction settles vault 2 against the now-empty fund: the
 		// recovery rate falls to C/D, so the redeemer covers the entire debt and
-		// pUSD holders absorb the shortfall. A full settlement pays the whole
+		// STABLE holders absorb the shortfall. A full settlement pays the whole
 		// collateral, so this vault closes exactly like vault 1 did.
 		let second = redeem(RedeemOptions::spend(10_000)).expect("redemption succeeds");
-		assert_eq!(vault_status(DOT, PUSD, 2), None, "second head settled and closed");
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 2)).is_none());
+		assert_eq!(vault_status(DOT, STABLE, 2), None, "second head settled and closed");
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, STABLE, 2)).is_none());
 		assert_eq!(held(DOT, 2), 0);
 		assert!(recovery_queue().is_empty(), "FIFO drained");
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
@@ -1048,7 +1056,7 @@ fn insurance_fund_drains_head_by_head() {
 		// the vault's 1_000 units.
 		assert_eq!(second.figures(), (debt2, 0, 1_000));
 		assert_eq!(second.insurance_cover, 0, "no fund left to burn");
-		assert_eq!(Assets::balance(PUSD, insurance_account(USDX)), 1_000_000);
+		assert_eq!(Assets::balance(STABLE, insurance_account(USDX)), 1_000_000);
 		assert!(
 			second.stable_burned > first.stable_burned,
 			"drained fund pushes the loss onto the redeemer"
@@ -1059,26 +1067,26 @@ fn insurance_fund_drains_head_by_head() {
 #[test]
 fn insurance_fund_burned_only_on_full_settlement() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		// Recovery price 0.40 → CR < 100% with a partial Insurance Fund cover.
 		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(40u128, 100u128));
-		mint_stable(PUSD, insurance_account(PUSD), 50);
-		mint_stable(PUSD, REDEEMER, 10_000);
-		let debt_before = vault_debt(DOT, PUSD, 1);
+		mint_stable(STABLE, insurance_account(STABLE), 50);
+		mint_stable(STABLE, REDEEMER, 10_000);
+		let debt_before = vault_debt(DOT, STABLE, 1);
 		let recipient_before = collateral_balance(DOT, RECIPIENT);
 
 		// The fund stays untouched until the market-side debt is gone.
 		let first = redeem(RedeemOptions::spend(200)).expect("redemption succeeds");
-		assert!(pallet_vaults::Vaults::<Test>::get((DOT, PUSD, 1)).is_some(), "still settling");
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
+		assert!(pallet_vaults::Vaults::<Test>::get((DOT, STABLE, 1)).is_some(), "still settling");
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_final_recovery());
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
 		// Recovery is fee-free, so 200 cancels 200 of the `D − 50 = 451` market-side debt and
 		// buys `floor(200 · 1_000 / 451) = 443` of the 1_000 collateral units.
 		assert_eq!(first.figures(), (200, 0, 443));
 		assert_eq!(collateral_balance(DOT, RECIPIENT) - recipient_before, 443);
 		assert_eq!(first.insurance_cover, 0, "fund untouched mid-settlement");
-		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 50);
-		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 200);
+		assert_eq!(Assets::balance(STABLE, insurance_account(STABLE)), 50);
+		assert_eq!(debt_before - vault_debt(DOT, STABLE, 1), 200);
 
 		// The price changes before the second transaction, so the split is re-read from live
 		// state: at 0.30 the remaining 557 collateral units are valued at 168 (167.1 rounded
@@ -1090,47 +1098,47 @@ fn insurance_fund_burned_only_on_full_settlement() {
 		let second = redeem(RedeemOptions::spend(10_000)).expect("redemption succeeds");
 		assert_eq!(second.figures(), (251, 0, 557));
 		assert_eq!(second.insurance_cover, 50, "cover burned on completion");
-		assert_eq!(vault_status(DOT, PUSD, 1), None, "vault settled and closed");
+		assert_eq!(vault_status(DOT, STABLE, 1), None, "vault settled and closed");
 		assert_eq!(held(DOT, 1), 0);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::InsuranceAdjusted));
-		assert_eq!(Assets::balance(PUSD, insurance_account(PUSD)), 0);
+		assert_eq!(Assets::balance(STABLE, insurance_account(STABLE)), 0);
 	});
 }
 
 #[test]
 fn ordinary_allowed_in_safety_mode() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		// Put the branch in Safety mode (TCR below 130%) while the vault stays above par.
 		set_price(DOT, FixedU128::from_rational(6u128, 10u128));
 		assert!(
-			branch_tcr(DOT, PUSD) < FixedU128::from_rational(130u128, 100u128),
+			branch_tcr(DOT, STABLE) < FixedU128::from_rational(130u128, 100u128),
 			"fixture must put the branch below the safety threshold"
 		);
 
-		let debt_before = vault_debt(DOT, PUSD, 1);
-		mint_stable(PUSD, REDEEMER, 1_000_000);
-		let tcr_before = branch_tcr(DOT, PUSD);
+		let debt_before = vault_debt(DOT, STABLE, 1);
+		mint_stable(STABLE, REDEEMER, 1_000_000);
+		let tcr_before = branch_tcr(DOT, STABLE);
 
 		// 223 buys 201 of the 501 coin debt, a 40.12% share, so the dynamic fee rises 20.06% and
 		// the fee is `ceil(201 · (10.03% + 0.5%)) = 22`. At 0.6, 201 debt pays
 		// `floor(201 / 0.6) = 335` collateral.
 		let settled = redeem(RedeemOptions::spend(223)).expect("redemption succeeds");
-		assert_eq!(debt_before - vault_debt(DOT, PUSD, 1), 201);
+		assert_eq!(debt_before - vault_debt(DOT, STABLE, 1), 201);
 		assert_eq!(settled.figures(), (201, 22, 335));
 		// A face-value redemption removes debt and at most equal-value collateral, so a TCR above
 		// 1 can only rise: why Safety mode still permits it.
-		assert!(branch_tcr(DOT, PUSD) > tcr_before, "redemption must raise TCR");
+		assert!(branch_tcr(DOT, STABLE) > tcr_before, "redemption must raise TCR");
 	});
 }
 
 #[test]
 fn redeem_rejects_missing_or_zero_price() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
-		mint_stable(PUSD, REDEEMER, 1_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		mint_stable(STABLE, REDEEMER, 1_000);
 
 		clear_price(DOT);
 		assert_noop!(redeem(RedeemOptions::spend(201)), Error::<Test>::OracleUnavailable);
@@ -1141,17 +1149,17 @@ fn redeem_rejects_missing_or_zero_price() {
 	});
 }
 
-/// The interest-clock value stamped on a `(DOT, PUSD)` vault at its last poke.
+/// The interest-clock value stamped on a `(DOT, STABLE)` vault at its last poke.
 fn vault_interest_time(who: AccountId) -> Moment {
-	pallet_vaults::Vaults::<Test>::get((DOT, PUSD, who))
+	pallet_vaults::Vaults::<Test>::get((DOT, STABLE, who))
 		.expect("vault")
 		.vault
 		.last_interest_time
 }
 
-/// The interest-clock value a `(DOT, PUSD)` poke at `now` writes onto a touched vault.
+/// The interest-clock value a `(DOT, STABLE)` poke at `now` writes onto a touched vault.
 fn branch_interest_time(now: Moment) -> Moment {
-	pallet_vaults::Branches::<Test>::get(DOT, PUSD)
+	pallet_vaults::Branches::<Test>::get(DOT, STABLE)
 		.expect("branch")
 		.state
 		.interest_time(now)
@@ -1160,12 +1168,12 @@ fn branch_interest_time(now: Moment) -> Moment {
 #[test]
 fn ordinary_accrues_interest_before_cancelling() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		// A year at 100% APR makes the accrued interest large.
-		assert_ok!(open(1, DOT, PUSD, 1_000_000, 500_000, percent(100)));
-		let debt_at_open = vault_debt(DOT, PUSD, 1);
+		assert_ok!(open(1, DOT, STABLE, 1_000_000, 500_000, percent(100)));
+		let debt_at_open = vault_debt(DOT, STABLE, 1);
 		let stamped_at_open = vault_interest_time(1);
-		mint_stable(PUSD, REDEEMER, 2_000_000);
+		mint_stable(STABLE, REDEEMER, 2_000_000);
 
 		advance_time(ONE_YEAR_MS);
 
@@ -1177,7 +1185,7 @@ fn ordinary_accrues_interest_before_cancelling() {
 		// The redemption advances the target's interest clock and cancels from the accrued debt.
 		assert_eq!(vault_interest_time(1), branch_interest_time(Timestamp::get()));
 		assert!(vault_interest_time(1) > stamped_at_open);
-		assert_eq!(vault_debt(DOT, PUSD, 1), accrued - 1_005);
+		assert_eq!(vault_debt(DOT, STABLE, 1), accrued - 1_005);
 		// 1_011 buys 1_005 debt for `floor(1_005 / 1.25) = 804` collateral. The coin debt counts
 		// a year of interest accrued without a market touch, so the dynamic fee rises about
 		// `1_005 / 1_009_583 / 2 = 0.0498%` and the fee is `ceil(1_005 · (0.0249% + 0.5%)) = 6`.
@@ -1185,7 +1193,7 @@ fn ordinary_accrues_interest_before_cancelling() {
 	});
 }
 
-/// Liquidates `owner`'s DOT/PUSD vault entirely by redistribution.
+/// Liquidates `owner`'s DOT/STABLE vault entirely by redistribution.
 fn liquidate_redistribute_all(owner: AccountId) {
 	Vaults::liquidate(
 		RuntimeOrigin::signed(99),
@@ -1206,10 +1214,10 @@ enum RecoveryOffsetQuote {
 	Available { debt: Balance },
 }
 
-/// Quotes a `(DOT, PUSD)` recovery offset through the decision that execution prices with.
+/// Quotes a `(DOT, STABLE)` recovery offset through the decision that execution prices with.
 fn preview_offset(max_debt_to_cancel: Balance) -> Result<RecoveryOffsetQuote, DispatchError> {
 	use crate::recovery::OffsetDecision;
-	Ok(match Redemptions::offset_decision(&DOT, &PUSD, max_debt_to_cancel)? {
+	Ok(match Redemptions::offset_decision(&DOT, &STABLE, max_debt_to_cancel)? {
 		OffsetDecision::NoTarget => RecoveryOffsetQuote::NoTarget,
 		OffsetDecision::NotOffsettable => RecoveryOffsetQuote::NotOffsettable,
 		OffsetDecision::BelowPar => RecoveryOffsetQuote::BelowPar,
@@ -1217,10 +1225,10 @@ fn preview_offset(max_debt_to_cancel: Balance) -> Result<RecoveryOffsetQuote, Di
 	})
 }
 
-/// The `(DOT, PUSD)` `FinalRecovery` FIFO, head first.
+/// The `(DOT, STABLE)` `FinalRecovery` FIFO, head first.
 fn recovery_queue() -> Vec<AccountId> {
 	let queue =
-		LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, PUSD), RECOVERY_QUEUE_LEN_MAX);
+		LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, STABLE), RECOVERY_QUEUE_LEN_MAX);
 	assert!(queue.len() < RECOVERY_QUEUE_LEN_MAX as usize, "the read must see the whole queue");
 	queue
 }
@@ -1287,44 +1295,44 @@ fn execute_offset_inner(
 #[test]
 fn offset_settles_head_as_previewed() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
 		setup_final_recovery(2, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
 		// At 0.54 both queued vaults sit at CR ≈ 107.8%: inside the recovery-bonus
 		// regime offsets are restricted to, and below the 110% exit gate.
 		set_price(DOT, FixedU128::from_rational(54u128, 100u128));
 		assert_eq!(recovery_queue(), vec![1u64, 2u64]);
-		let debt1 = vault_debt(DOT, PUSD, 1);
+		let debt1 = vault_debt(DOT, STABLE, 1);
 		// 500 principal + the 1-unit 7-day upfront fee.
 		assert_eq!(debt1, 501);
-		let debt2 = vault_debt(DOT, PUSD, 2);
-		mint_stable(PUSD, REDEEMER, 10_000);
-		let payer_before = Assets::balance(PUSD, REDEEMER);
+		let debt2 = vault_debt(DOT, STABLE, 2);
+		mint_stable(STABLE, REDEEMER, 10_000);
+		let payer_before = Assets::balance(STABLE, REDEEMER);
 		let recipient_before = collateral_balance(DOT, RECIPIENT);
-		let fee_before = Assets::balance(PUSD, FEE_DEST);
-		let issuance_before = Assets::total_supply(PUSD);
+		let fee_before = Assets::balance(STABLE, FEE_DEST);
+		let issuance_before = Assets::total_supply(STABLE);
 
 		// The quote sizes exactly the burn the execution then performs.
 		assert_ok!(preview_offset(10_000), RecoveryOffsetQuote::Available { debt: debt1 });
 		// CR = 540/501 ≈ 107.8% caps the bonus at the 5% redistribution
 		// penalty: collateral = floor(floor(501 · 1.05) / 0.54) = 974.
 		assert_ok!(
-			execute_offset(PUSD, 10_000),
+			execute_offset(STABLE, 10_000),
 			RecoveryOffsetResult::Applied { collateral_out: 974 }
 		);
 
 		// The drained head flips to Dormant and leaves the FIFO; the next
 		// head is untouched.
-		assert_eq!(vault_debt(DOT, PUSD, 1), 0);
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_dormant());
+		assert_eq!(vault_debt(DOT, STABLE, 1), 0);
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_dormant());
 		assert_eq!(recovery_queue(), vec![2u64]);
-		assert_eq!(vault_debt(DOT, PUSD, 2), debt2);
+		assert_eq!(vault_debt(DOT, STABLE, 2), debt2);
 		// The burn is fee-free, so issuance falls by exactly the cancelled
 		// debt and nothing reaches the fee destination.
-		assert_eq!(payer_before - Assets::balance(PUSD, REDEEMER), debt1);
+		assert_eq!(payer_before - Assets::balance(STABLE, REDEEMER), debt1);
 		assert_eq!(collateral_balance(DOT, RECIPIENT) - recipient_before, 974);
-		assert_eq!(Assets::balance(PUSD, FEE_DEST), fee_before);
-		assert_eq!(issuance_before - Assets::total_supply(PUSD), debt1);
+		assert_eq!(Assets::balance(STABLE, FEE_DEST), fee_before);
+		assert_eq!(issuance_before - Assets::total_supply(STABLE), debt1);
 	});
 }
 
@@ -1333,15 +1341,15 @@ fn offset_settles_head_as_previewed() {
 #[test]
 fn offset_partial_fill_keeps_head_queued() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
 		set_price(DOT, FixedU128::from_rational(54u128, 100u128));
 		// A live dynamic fee makes "the offset leaves the fee state alone" meaningful.
-		set_dynamic_fee(PUSD, FixedU128::from_rational(3u128, 100u128));
-		let state_before = crate::RedemptionStates::<Test>::get(PUSD);
-		let debt_before = vault_debt(DOT, PUSD, 1);
-		mint_stable(PUSD, REDEEMER, 10_000);
-		let payer_before = Assets::balance(PUSD, REDEEMER);
+		set_dynamic_fee(STABLE, FixedU128::from_rational(3u128, 100u128));
+		let state_before = crate::RedemptionStates::<Test>::get(STABLE);
+		let debt_before = vault_debt(DOT, STABLE, 1);
+		mint_stable(STABLE, REDEEMER, 10_000);
+		let payer_before = Assets::balance(STABLE, REDEEMER);
 		let recipient_before = collateral_balance(DOT, RECIPIENT);
 		System::reset_events();
 
@@ -1350,18 +1358,18 @@ fn offset_partial_fill_keeps_head_queued() {
 		assert_ok!(preview_offset(200), RecoveryOffsetQuote::Available { debt: 200 });
 		// 5%-capped bonus: floor(floor(200 · 1.05) / 0.54) = 388.
 		assert_ok!(
-			execute_offset(PUSD, 200),
+			execute_offset(STABLE, 200),
 			RecoveryOffsetResult::Applied { collateral_out: 388 }
 		);
 
-		assert_eq!(crate::RedemptionStates::<Test>::get(PUSD), state_before);
+		assert_eq!(crate::RedemptionStates::<Test>::get(STABLE), state_before);
 		assert_eq!(redemption_events(), vec![]);
 
 		// The partially settled head keeps its place at the FIFO front.
-		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before - 200);
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
+		assert_eq!(vault_debt(DOT, STABLE, 1), debt_before - 200);
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_final_recovery());
 		assert_eq!(recovery_queue(), vec![1u64]);
-		assert_eq!(payer_before - Assets::balance(PUSD, REDEEMER), 200);
+		assert_eq!(payer_before - Assets::balance(STABLE, REDEEMER), 200);
 		assert_eq!(collateral_balance(DOT, RECIPIENT) - recipient_before, 388);
 	});
 }
@@ -1370,10 +1378,10 @@ fn offset_partial_fill_keeps_head_queued() {
 #[test]
 fn offset_zero_budget_is_not_offsettable() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
 		set_price(DOT, FixedU128::from_rational(54u128, 100u128));
-		mint_stable(PUSD, REDEEMER, 1_000);
+		mint_stable(STABLE, REDEEMER, 1_000);
 
 		// A zero budget withdraws nothing, so both paths are pure storage no-ops.
 		assert_storage_noop!({
@@ -1388,25 +1396,25 @@ fn offset_zero_budget_is_not_offsettable() {
 #[test]
 fn offset_refuses_below_par_head() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		// Price 0.40 parks the head below par (CR < 100%): settlement at a
 		// discount stays exclusive to the redemption pathway.
 		setup_final_recovery(1, 1_000, 500, FixedU128::from_rational(40u128, 100u128));
-		let debt_before = vault_debt(DOT, PUSD, 1);
+		let debt_before = vault_debt(DOT, STABLE, 1);
 		let held_before = held(DOT, 1);
-		mint_stable(PUSD, REDEEMER, 10_000);
-		let payer_before = Assets::balance(PUSD, REDEEMER);
+		mint_stable(STABLE, REDEEMER, 10_000);
+		let payer_before = Assets::balance(STABLE, REDEEMER);
 
 		assert_storage_noop!({
 			assert_ok!(preview_offset(10_000), RecoveryOffsetQuote::BelowPar);
 		});
 		// Execution withdraws and refunds the payment, which leaves asset events behind, so
 		// the refusal is checked field by field rather than by storage root.
-		assert_ok!(execute_offset(PUSD, 10_000), RecoveryOffsetResult::BelowPar);
-		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
+		assert_ok!(execute_offset(STABLE, 10_000), RecoveryOffsetResult::BelowPar);
+		assert_eq!(vault_debt(DOT, STABLE, 1), debt_before);
 		assert_eq!(held(DOT, 1), held_before);
-		assert_eq!(Assets::balance(PUSD, REDEEMER), payer_before);
-		assert!(vault_status(DOT, PUSD, 1).expect("vault 1").is_final_recovery());
+		assert_eq!(Assets::balance(STABLE, REDEEMER), payer_before);
+		assert!(vault_status(DOT, STABLE, 1).expect("vault 1").is_final_recovery());
 	});
 }
 
@@ -1416,41 +1424,41 @@ fn offset_ignores_ordinary_vaults() {
 		// Unregistered market: the target-first fast path answers before the
 		// config lookup could report `StablecoinNotRegistered`.
 		assert_ok!(preview_offset(1_000), RecoveryOffsetQuote::NoTarget);
-		assert_ok!(execute_offset(PUSD, 1_000), RecoveryOffsetResult::NoTarget);
+		assert_ok!(execute_offset(STABLE, 1_000), RecoveryOffsetResult::NoTarget);
 
 		// An ordinary vault is not an offset target either: offsets exist
 		// only for the FinalRecovery FIFO head.
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(5)));
-		let debt_before = vault_debt(DOT, PUSD, 1);
-		mint_stable(PUSD, REDEEMER, 1_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		let debt_before = vault_debt(DOT, STABLE, 1);
+		mint_stable(STABLE, REDEEMER, 1_000);
 
 		assert_ok!(preview_offset(1_000), RecoveryOffsetQuote::NoTarget);
-		assert_ok!(execute_offset(PUSD, 1_000), RecoveryOffsetResult::NoTarget);
-		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
+		assert_ok!(execute_offset(STABLE, 1_000), RecoveryOffsetResult::NoTarget);
+		assert_eq!(vault_debt(DOT, STABLE, 1), debt_before);
 	});
 }
 
 #[test]
 fn offset_rejects_frozen_branch() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
 		set_price(DOT, DEFAULT_PRICE);
-		mint_stable(PUSD, REDEEMER, 1_000);
-		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, PUSD, true));
+		mint_stable(STABLE, REDEEMER, 1_000);
+		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, STABLE, true));
 
 		// Frozen-mode enforcement lives vault-side: the head is still queued, so both paths
 		// project its snapshot, and the projection rejects the frozen branch.
 		assert_noop!(preview_offset(200), pallet_vaults::Error::<Test>::BranchFrozen);
-		assert_noop!(execute_offset(PUSD, 200), pallet_vaults::Error::<Test>::BranchFrozen);
+		assert_noop!(execute_offset(STABLE, 200), pallet_vaults::Error::<Test>::BranchFrozen);
 	});
 }
 
 #[test]
 fn offset_payment_asset_selects_market() {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		setup_final_recovery(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR);
 
 		// Queue a settleable head in the sibling USDX market too.
@@ -1462,7 +1470,7 @@ fn offset_payment_asset_selects_market() {
 		// Both heads settle at 0.54, inside the bonus regime and below the exit gate.
 		set_price(DOT, FixedU128::from_rational(54u128, 100u128));
 
-		let pusd_debt_before = vault_debt(DOT, PUSD, 1);
+		let stable_debt_before = vault_debt(DOT, STABLE, 1);
 		let usdx_debt_before = vault_debt(DOT, USDX, 2);
 		mint_stable(USDX, REDEEMER, 100 * USDX_UNIT);
 		let issuance_before = Assets::total_supply(USDX);
@@ -1475,9 +1483,9 @@ fn offset_payment_asset_selects_market() {
 			Ok(RecoveryOffsetResult::Applied { .. })
 		));
 
-		// The USDX head absorbed the full budget; the PUSD market never moved.
+		// The USDX head absorbed the full budget; the STABLE market never moved.
 		assert_eq!(vault_debt(DOT, USDX, 2), usdx_debt_before - 100 * USDX_UNIT);
-		assert_eq!(vault_debt(DOT, PUSD, 1), pusd_debt_before);
+		assert_eq!(vault_debt(DOT, STABLE, 1), stable_debt_before);
 		assert_eq!(Assets::balance(USDX, REDEEMER), 0);
 		assert_eq!(issuance_before - Assets::total_supply(USDX), 100 * USDX_UNIT);
 	});
@@ -1683,11 +1691,11 @@ fn recovery_bonus_capped_by_penalty() {
 		config.liquidation.keeper_percent_compensation = Permill::from_rational(1u32, 1_000u32);
 		register_branch(DOT, PUSD, config);
 
-		// The test opens above the 140% ICR and then sets 1 DOT = 2 pUSD. At this price, 6_000 DOT
-		// has a value of 12_000 pUSD against 10_000 debt, which gives a 120% CR.
+		// The test opens above the 140% ICR and then sets 1 DOT = 2 STABLE. At this price,
+		// 6_000 DOT has a value of 12_000 STABLE against 10_000 debt, which gives a 120% CR.
 		set_price(DOT, FixedU128::from_rational(4, 1));
 		let rate = FixedU128::from_rational(1, 1_000);
-		assert_ok!(open(1, DOT, PUSD, 6_000 * UNIT, 10_000 * UNIT, rate));
+		assert_ok!(open(1, DOT, STABLE, 6_000 * UNIT, 10_000 * UNIT, rate));
 		set_price(DOT, FixedU128::from_rational(2, 1));
 		// The keeper terms are in raw units, so the entry pays its keeper the cap: a 10_000 value
 		// is 5_000 units, or 5 DOT, at 2. The 5-unit flat plus 0.1% of the 5_250_000-unit
@@ -1695,12 +1703,12 @@ fn recovery_bonus_capped_by_penalty() {
 		assert_ok!(enter_final_recovery(DOT, PUSD, 1));
 		assert_eq!(held(DOT, 1), 6_000 * UNIT - 5_000);
 
-		mint_stable(PUSD, REDEEMER, 1_000_000 * UNIT);
+		mint_stable(STABLE, REDEEMER, 1_000_000 * UNIT);
 
 		let settled = redeem(RedeemOptions::spend(2_000 * UNIT)).expect("redemption succeeds");
 
 		// raw_bonus = 120% - 100% - 1% = 19%, capped by the 10% penalty. So
-		// 2_000 * 1.10 = 2_200 pUSD of value, or 1_100 DOT. Recovery redemptions are fee-free.
+		// 2_000 * 1.10 = 2_200 STABLE of value, or 1_100 DOT. Recovery redemptions are fee-free.
 		assert_eq!(settled.figures(), (2_000 * UNIT, 0, 1_100 * UNIT));
 		assert_eq!(vault_debt(DOT, PUSD, 1), 8_000 * UNIT);
 		assert_eq!(held(DOT, 1), 4_900 * UNIT - 5_000);

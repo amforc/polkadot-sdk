@@ -1,6 +1,6 @@
 //! Test runtime for `pallet-redemptions`.
 //! Native collateral ([`DOT`]) lives in `Balances`, issued collateral ([`TOKEN_X`]) in
-//! `pallet-assets` behind `AssetsHolder`. Stablecoins are plain `pallet-assets` ids: [`PUSD`] is
+//! `pallet-assets` behind `AssetsHolder`. Stablecoins are plain `pallet-assets` ids: [`STABLE`] is
 //! the unit-scale coin most tests use, [`USDX`] a 6-decimals coin for scale tests.
 //!
 //! The `test-utils` feature exposes this runtime to other crates.
@@ -23,7 +23,7 @@ use frame::{
 	},
 };
 use pallet_linked_list::Position;
-use pusd_primitives::{ProvidePrice, VaultInterface};
+use stablecoin_primitives::{ProvidePrice, VaultInterface};
 
 pub type AccountId = u64;
 pub type Balance = u128;
@@ -115,7 +115,7 @@ impl pallet_assets_holder::Config for Test {
 
 parameter_types! {
 	pub const MaxHintRepairSteps: u32 = 16;
-	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
+	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
 }
 
 impl pallet_linked_list::Config for Test {
@@ -188,7 +188,7 @@ pub fn branch_admins(
 
 /// Root acts deposit-free (`None`), the stablecoin's owner with a deposit (`Some(who)`), and
 /// anyone else is rejected.
-pub type EnsureAssetOwner = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
+pub type EnsureAssetOwner = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 /// Flat 1_000-unit refundable creation deposit, held in native balance.
 pub type VaultsConsideration = HoldConsideration<
@@ -408,7 +408,7 @@ pub const TOKEN_X_ID: AssetIdForAssets = 1;
 pub const TOKEN_X: AssetId = AssetId::WithId(TOKEN_X_ID);
 
 /// Unit-scale stablecoin.
-pub const PUSD: StableId = 1_000;
+pub const STABLE: StableId = 1_000;
 
 /// A 6-decimals stablecoin with a realistic 0.01-coin minimum balance.
 pub const USDX: StableId = 6_000;
@@ -425,7 +425,7 @@ pub fn new_test_ext() -> TestState {
 		assets: pallet_assets::GenesisConfig {
 			assets: vec![
 				(TOKEN_X_ID, 1, true, 1),
-				(PUSD, STABLECOIN_OWNER, true, 1),
+				(STABLE, STABLECOIN_OWNER, true, 1),
 				(USDX, STABLECOIN_OWNER, true, USDX_MIN_BALANCE),
 			],
 			metadata: vec![(USDX, b"USDX".to_vec(), b"USDX".to_vec(), 6)],
@@ -438,7 +438,7 @@ pub fn new_test_ext() -> TestState {
 			// The fee and insurance accounts pay native asset-account deposits, and a
 			// Root-created market takes its custody seed from its full admin.
 			balances: (1u64..=10u64)
-				.chain([insurance_account(PUSD), FEE_DEST, VAULT_FEE_DEST, ADMIN])
+				.chain([insurance_account(STABLE), FEE_DEST, VAULT_FEE_DEST, ADMIN])
 				.map(|i| (i, 1_000_000_000_000))
 				.collect(),
 			..Default::default()
@@ -508,7 +508,7 @@ pub fn usdx_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	}
 }
 
-/// The collateral price that [`register_branch`] opens every market at: 1 unit = 1.25 pUSD.
+/// The collateral price that [`register_branch`] opens every market at: 1 unit = 1.25 STABLE.
 pub const DEFAULT_PRICE: FixedU128 = FixedU128::from_rational(5, 4);
 
 /// Registers the `(collateral, stable)` market at [`DEFAULT_PRICE`] under [`GLOBAL_CEILING`],
@@ -572,13 +572,13 @@ pub struct RedeemOptions {
 }
 
 impl RedeemOptions {
-	/// [`REDEEMER`] spends up to `max_stable_to_spend` on `(DOT, PUSD)` and [`RECIPIENT`]
+	/// [`REDEEMER`] spends up to `max_stable_to_spend` on `(DOT, STABLE)` and [`RECIPIENT`]
 	/// receives the collateral, with no slippage floor and [`MAX_STEPS_CONFIGURED`].
 	pub fn spend(max_stable_to_spend: Balance) -> Self {
 		Self {
 			who: REDEEMER,
 			collateral: DOT,
-			stable: PUSD,
+			stable: STABLE,
 			max_stable_to_spend,
 			min_collateral_out: 0,
 			recipient: RECIPIENT,

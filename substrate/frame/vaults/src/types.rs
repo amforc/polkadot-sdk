@@ -10,8 +10,8 @@ use frame::{
 	deps::{frame_support::PalletError, sp_core::U256},
 	prelude::ensure,
 };
-pub use pusd_primitives::{BranchMode, DebtCollateral, VaultStatus};
 use scale_info::TypeInfo;
+pub use stablecoin_primitives::{BranchMode, DebtCollateral, VaultStatus};
 
 /// Identifies a Vaults list for one market and use case.
 ///
@@ -286,8 +286,8 @@ impl<Balance: Ord + Saturating + Copy + Zero + One> Vault<Balance> {
 		&self,
 		status: VaultStatus,
 		config: &BranchConfig<Balance>,
-	) -> pusd_primitives::RedemptionStepSnapshot<Balance> {
-		pusd_primitives::RedemptionStepSnapshot {
+	) -> stablecoin_primitives::RedemptionStepSnapshot<Balance> {
+		stablecoin_primitives::RedemptionStepSnapshot {
 			status,
 			debt: self.debt.total(),
 			collateral: self.collateral,
@@ -727,7 +727,7 @@ impl<
 		if self.stakes.snapshot_collateral.is_zero() {
 			return Some(collateral);
 		}
-		let stake = pusd_primitives::mul_div_floor(
+		let stake = stablecoin_primitives::mul_div_floor(
 			collateral,
 			self.stakes.snapshot_total,
 			self.stakes.snapshot_collateral,

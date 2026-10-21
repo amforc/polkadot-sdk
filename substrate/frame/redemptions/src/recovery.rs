@@ -14,7 +14,7 @@ use frame::{
 	},
 	prelude::*,
 };
-use pusd_primitives::{
+use stablecoin_primitives::{
 	debit_preservation, recovery_pricing, reducible_debit, CollateralRatio,
 	RecoveryOffsetInterface, RecoveryOffsetResult, RedemptionSettlement, VaultInterface,
 };
@@ -92,11 +92,14 @@ impl<T: Config> Pallet<T> {
 	) -> Result<RecoveryPlan<BalanceOf<T>>, Error<T>> {
 		ensure!(snapshot.status.is_final_recovery(), Error::<T>::NoRedeemableVault);
 
-		let ratio = match pusd_primitives::collateralization_ratio(&snapshot.position(), price) {
-			Ok(CollateralRatio::Ratio(ratio)) => ratio,
-			// A head without debt has nothing to settle, and an overflowing ratio gets no plan.
-			Ok(CollateralRatio::DebtFree) | Err(_) => return Err(Error::<T>::NoRedeemableVault),
-		};
+		let ratio =
+			match stablecoin_primitives::collateralization_ratio(&snapshot.position(), price) {
+				Ok(CollateralRatio::Ratio(ratio)) => ratio,
+				// A head without debt has nothing to settle, and an overflowing ratio gets no plan.
+				Ok(CollateralRatio::DebtFree) | Err(_) => {
+					return Err(Error::<T>::NoRedeemableVault)
+				},
+			};
 		// The bonus keeps settlement attractive past MCR, so redeemers push the head up to ICR
 		// and it exits with the buffer a borrower opens with rather than one tick above the
 		// liquidation line. Above ICR only the exit remains, unless a sub-minimum debt could be

@@ -433,7 +433,6 @@ members = [
 	"substrate/frame/proxy",
 	"substrate/frame/psm",
 	"substrate/frame/psm/remote-tests",
-	"substrate/frame/pusd-primitives",
 	"substrate/frame/ranked-collective",
 	"substrate/frame/recovery",
 	"substrate/frame/redemptions",
@@ -462,6 +461,7 @@ members = [
 	"substrate/frame/session/benchmarking",
 	"substrate/frame/society",
 	"substrate/frame/stability",
+	"substrate/frame/stablecoin-primitives",
 	"substrate/frame/staking",
 	"substrate/frame/staking-async",
 	"substrate/frame/staking-async/ah-client",
@@ -1220,7 +1220,6 @@ prometheus-parse = { version = "0.2.2" }
 proptest = { version = "1" }
 prost = { version = "0.12.4" }
 prost-build = { version = "0.13.2" }
-pusd-primitives = { path = "substrate/frame/pusd-primitives", default-features = false }
 pyroscope = { version = "0.5.8" }
 pyroscope_pprofrs = { version = "0.2.8" }
 quick_cache = { version = "0.3" }
@@ -1438,6 +1437,7 @@ sqlx = { version = "0.8.2" }
 ss58-registry = { version = "1.34.0", default-features = false }
 ssz_rs = { version = "0.9.0", default-features = false }
 ssz_rs_derive = { version = "0.9.0", default-features = false }
+stablecoin-primitives = { path = "substrate/frame/stablecoin-primitives", default-features = false }
 static_assertions = { version = "1.1.0", default-features = false }
 static_init = { version = "1.0.4" }
 strum = { version = "0.26.3", default-features = false }

@@ -21,7 +21,7 @@ use frame::{
 		OnUnbalanced, Time,
 	},
 };
-use pusd_primitives::{
+use stablecoin_primitives::{
 	math::collateral_for_value_floor, reducible_debit, CollateralRatio, ProvidePrice,
 	RedemptionSettlement, VaultInterface,
 };
@@ -207,7 +207,7 @@ impl<T: Config> Pallet<T> {
 	fn redeem_ordinary(
 		context: &WalkContext<'_, T>,
 		config: &RedemptionConfigOf<T>,
-		first_target: (T::AccountId, pusd_primitives::VaultStatus),
+		first_target: (T::AccountId, stablecoin_primitives::VaultStatus),
 		terms: RedemptionTerms<BalanceOf<T>>,
 		max_steps: u32,
 	) -> Result<u32, DispatchError> {
@@ -266,7 +266,7 @@ impl<T: Config> Pallet<T> {
 		context: &WalkContext<'_, T>,
 		step_cap: u32,
 		debt_budget: BalanceOf<T>,
-		first_target: (T::AccountId, pusd_primitives::VaultStatus),
+		first_target: (T::AccountId, stablecoin_primitives::VaultStatus),
 		payment: &mut StableCreditOf<T>,
 	) -> Result<OrdinaryResult<BalanceOf<T>>, DispatchError> {
 		defensive_assert!(payment.peek() >= debt_budget);
@@ -314,12 +314,12 @@ impl<T: Config> Pallet<T> {
 		if snapshot.status.is_final_recovery() {
 			return Step::Stop;
 		}
-		let redeemable = match pusd_primitives::collateralization_ratio(&snapshot.position(), price)
-		{
-			Ok(CollateralRatio::Ratio(ratio)) => ratio >= FixedU128::one(),
-			// Nothing to redeem without debt, and an overflowing ratio is not guessed at.
-			Ok(CollateralRatio::DebtFree) | Err(_) => false,
-		};
+		let redeemable =
+			match stablecoin_primitives::collateralization_ratio(&snapshot.position(), price) {
+				Ok(CollateralRatio::Ratio(ratio)) => ratio >= FixedU128::one(),
+				// Nothing to redeem without debt, and an overflowing ratio is not guessed at.
+				Ok(CollateralRatio::DebtFree) | Err(_) => false,
+			};
 		if !redeemable {
 			return if snapshot.status.is_dormant() { Step::Stop } else { Step::Skip };
 		}
