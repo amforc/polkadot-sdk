@@ -92,7 +92,7 @@ fn debt_in_front_includes_dormant_redemption_target() {
 		assert_ok!(open(1, DOT, STABLE, 5_000, 500, rate_pct(5, 1000))); // 0.5%, tail
 		assert_ok!(open(2, DOT, STABLE, 5_000, 700, rate_pct(6, 1000))); // 0.6%
 		let debt_in_front =
-			|steps| crate::Pallet::<Test>::debt_in_front(DOT, PUSD, percent(1), steps);
+			|steps| crate::Pallet::<Test>::debt_in_front(DOT, STABLE, percent(1), steps);
 		// Each vault owes principal plus a fee of 1; no interest has elapsed.
 		assert_eq!(debt_in_front(u32::MAX), Ok((501 + 701, false)));
 

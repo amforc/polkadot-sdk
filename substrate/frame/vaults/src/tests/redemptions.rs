@@ -302,18 +302,18 @@ fn activate_dormant_rejects_active_vault() {
 #[test]
 fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		// Distinct rates make account 1 the first redemption target.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
-		assert_ok!(open(3, DOT, PUSD, 200, 200, percent(5)));
-		assert_ok!(redeem(DOT, PUSD, 4, 350)); // leaves acct 1 Dormant with debt
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
+		assert_ok!(open(3, DOT, STABLE, 200, 200, percent(5)));
+		assert_ok!(redeem(DOT, STABLE, 4, 350)); // leaves acct 1 Dormant with debt
 
 		let vault_dormant_pre = vault(DOT, STABLE, 1);
 		// At 1.0 vault 3 (200 collateral, ~200 debt) sits under MCR while 1 and 2 stay above it.
 		set_price(DOT, FixedU128::from_u32(1));
 		// An empty pool sends the residual to both eligible vaults.
-		assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
 		assert_eq!(
 			vault(DOT, STABLE, 1).debt.principal,
 			vault_dormant_pre.debt.principal,
@@ -367,14 +367,15 @@ fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 #[test]
 fn dormant_borrow_below_min_debt_reverts() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		// Distinct rates make account 1 the first redemption target.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
-		assert_ok!(redeem(DOT, PUSD, 3, 480)); // pushes acct 1 to Dormant with tiny debt
-											   // Borrowing 1 still leaves debt below the minimum of
-											   // 200.
-		assert_noop!(borrow(1, DOT, PUSD, 1, None), crate::Error::<Test>::DebtBelowMinimum);
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
+		assert_ok!(redeem(DOT, STABLE, 3, 480)); // pushes acct 1 to Dormant with tiny debt
+												 // Borrowing 1 still leaves debt below the minimum
+												 // of
+												 // 200.
+		assert_noop!(borrow(1, DOT, STABLE, 1, None), crate::Error::<Test>::DebtBelowMinimum);
 	});
 }
 
@@ -422,11 +423,11 @@ fn dormant_revived_by_borrow_then_accepts_deposit() {
 #[test]
 fn dormant_vault_cannot_change_rate() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		// Distinct rates make account 1 the first redemption target.
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
-		assert_ok!(open(2, DOT, PUSD, 1_000, 500, percent(2)));
-		assert_ok!(redeem(DOT, PUSD, 3, 350));
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
+		assert_ok!(redeem(DOT, STABLE, 3, 350));
 		assert_noop!(
 			change_rate(1, DOT, STABLE, percent(7)),
 			crate::Error::<Test>::InvalidVaultStatus

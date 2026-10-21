@@ -269,15 +269,17 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for VaultsBenc
 /// pool accepts them as deadlines only, so the same staging runs here and on a real runtime.
 pub struct BenchmarkSeedablePool;
 
-impl pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance> for BenchmarkSeedablePool {
+impl stablecoin_primitives::StabilityPoolInspect<AssetId, StableId, Balance>
+	for BenchmarkSeedablePool
+{
 	type Quote = ();
 
 	fn quote(
 		collateral_id: &AssetId,
 		stable_id: &StableId,
-		branch: pusd_primitives::BranchSnapshot,
+		branch: stablecoin_primitives::BranchSnapshot,
 	) -> Option<()> {
-		<() as pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote(
+		<() as stablecoin_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote(
 			collateral_id,
 			stable_id,
 			branch,
@@ -285,13 +287,13 @@ impl pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance> for Bench
 	}
 
 	fn quote_active(quote: &(), max_debt: Balance) -> Balance {
-		<() as pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote_active(
+		<() as stablecoin_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote_active(
 			quote, max_debt,
 		)
 	}
 
 	fn quote_pending(quote: &(), max_debt: Balance, active_debt: Balance) -> Balance {
-		<() as pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote_pending(
+		<() as stablecoin_primitives::StabilityPoolInspect<AssetId, StableId, Balance>>::quote_pending(
 			quote,
 			max_debt,
 			active_debt,
@@ -300,17 +302,22 @@ impl pusd_primitives::StabilityPoolInspect<AssetId, StableId, Balance> for Bench
 }
 
 impl<CollateralCredit: frame::deps::frame_support::traits::TryDrop, StableCredit>
-	pusd_primitives::StabilityPoolOffset<AssetId, StableId, Balance, CollateralCredit, StableCredit>
-	for BenchmarkSeedablePool
+	stablecoin_primitives::StabilityPoolOffset<
+		AssetId,
+		StableId,
+		Balance,
+		CollateralCredit,
+		StableCredit,
+	> for BenchmarkSeedablePool
 {
 	fn offset(
 		collateral_id: &AssetId,
 		stable_id: &StableId,
-		branch: pusd_primitives::BranchSnapshot,
-		debt: pusd_primitives::OffsetLegs<Balance>,
-		collateral: pusd_primitives::OffsetLegs<CollateralCredit>,
+		branch: stablecoin_primitives::BranchSnapshot,
+		debt: stablecoin_primitives::OffsetLegs<Balance>,
+		collateral: stablecoin_primitives::OffsetLegs<CollateralCredit>,
 	) -> Result<Option<StableCredit>, DispatchError> {
-		<() as pusd_primitives::StabilityPoolOffset<_, _, _, _, _>>::offset(
+		<() as stablecoin_primitives::StabilityPoolOffset<_, _, _, _, _>>::offset(
 			collateral_id,
 			stable_id,
 			branch,

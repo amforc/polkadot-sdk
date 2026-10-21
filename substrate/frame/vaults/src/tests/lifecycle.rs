@@ -179,11 +179,11 @@ fn frozen_branch_blocks_user_ops() {
 	// The elapsed time lets the Dormant dust of 155 accrue 78 at 50%, past the 200 minimum that
 	// activation needs and nomination forbids.
 	let cases: [(&str, Moment, Operation); 6] = [
-		("open_vault", 0, || open(3, DOT, PUSD, 1_000, 500, percent(5))),
-		("borrow", 0, || borrow(2, DOT, PUSD, 100, None)),
-		("withdraw_collateral", 0, || withdraw_collateral(2, DOT, PUSD, 1, None)),
-		("change_rate", 0, || change_rate(2, DOT, PUSD, percent(70))),
-		("nominate_dormant", 0, || nominate_dormant(9, DOT, PUSD, 1)),
+		("open_vault", 0, || open(3, DOT, STABLE, 1_000, 500, percent(5))),
+		("borrow", 0, || borrow(2, DOT, STABLE, 100, None)),
+		("withdraw_collateral", 0, || withdraw_collateral(2, DOT, STABLE, 1, None)),
+		("change_rate", 0, || change_rate(2, DOT, STABLE, percent(70))),
+		("nominate_dormant", 0, || nominate_dormant(9, DOT, STABLE, 1)),
 		("activate_dormant", ONE_YEAR_MS, || {
 			activate_dormant(9, DOT, STABLE, 1).map(|_| ()).map_err(|error| error.error)
 		}),

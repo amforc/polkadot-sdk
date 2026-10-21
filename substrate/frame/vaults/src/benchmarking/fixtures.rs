@@ -1,5 +1,5 @@
 //! Benchmark fixtures shared by the pallet's own benchmarks and its
-//! [`BenchmarkVaults`](pusd_primitives::BenchmarkVaults) implementation.
+//! [`BenchmarkVaults`](stablecoin_primitives::BenchmarkVaults) implementation.
 //!
 //! Collateral is always counted in collateral units (see [`collateral_unit`]) and prices are
 //! quoted per unit, so the fixtures run unchanged on a runtime with a production existential
@@ -30,7 +30,7 @@ use frame::{
 };
 use frame_system::RawOrigin;
 use linked_list_interface::{Position, SortedListInterface};
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BenchmarkVault, BranchSnapshot, CollateralRatio, OnBranchLifecycle as _, ProvidePrice,
 	RecoveryHeadSeed, RedemptionSettlement, RedemptionTargetsSeed, StabilityPoolOffset,
 	VaultInterface,
@@ -673,7 +673,7 @@ pub(crate) fn projected_debt<T: BenchmarkConfig>(
 }
 
 /// Stages an exact-par `FinalRecovery` head, as documented on
-/// [`pusd_primitives::BenchmarkVaults::stage_recovery_head`].
+/// [`stablecoin_primitives::BenchmarkVaults::stage_recovery_head`].
 pub(crate) fn stage_recovery_head<T: BenchmarkConfig>(
 	elapsed: u64,
 ) -> Result<RecoveryHeadSeed<T::AccountId, BalanceOf<T>>, DispatchError> {
@@ -707,13 +707,13 @@ pub(crate) fn stage_recovery_head<T: BenchmarkConfig>(
 		.ok_or("recovery head price overflowed")?;
 	T::BenchmarkHelper::set_oracle_price(asset, price);
 
-	let staged = pusd_primitives::collateralization_ratio(&snapshot.position(), price)
+	let staged = stablecoin_primitives::collateralization_ratio(&snapshot.position(), price)
 		.map_err(|_| "recovery head ratio overflowed")?;
 	let CollateralRatio::Ratio(staged) = staged else {
 		return Err("recovery head carries no debt".into());
 	};
 	// Exact par: the debt buys back every planck of collateral, so a full settlement closes.
-	let payout = pusd_primitives::math::collateral_for_value_floor(snapshot.debt, price);
+	let payout = stablecoin_primitives::math::collateral_for_value_floor(snapshot.debt, price);
 	ensure!(staged == FixedU128::one(), "collateral unit does not admit an exact par price");
 	ensure!(
 		payout == Some(snapshot.collateral),
@@ -723,7 +723,7 @@ pub(crate) fn stage_recovery_head<T: BenchmarkConfig>(
 }
 
 /// Seeds redemption targets, as documented on
-/// [`pusd_primitives::BenchmarkVaults::seed_redemption_targets`].
+/// [`stablecoin_primitives::BenchmarkVaults::seed_redemption_targets`].
 pub(crate) fn seed_redemption_targets<T: BenchmarkConfig>(
 	count: u32,
 	elapsed: u64,

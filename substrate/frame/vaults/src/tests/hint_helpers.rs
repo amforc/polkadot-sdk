@@ -81,14 +81,14 @@ fn open_vault_refunds_unused_hint_repair_steps() {
 
 	for steps in 0..=MaxHintRepairSteps::get() {
 		build_and_execute(|| {
-			register_market(DOT, PUSD);
+			register_market(DOT, STABLE);
 			seed_long_rate_index();
 			fund_account(21);
 			let hint = Position::between(20 - u64::from(steps), 19 - u64::from(steps));
 			let rate = rate_pct(395, 1000);
 			let call = crate::Call::<Test>::open_vault {
 				collateral_id: DOT,
-				stable_id: PUSD,
+				stable_id: STABLE,
 				initial_collateral: 1_000,
 				initial_debt: 500,
 				annual_rate: rate,
@@ -101,7 +101,7 @@ fn open_vault_refunds_unused_hint_repair_steps() {
 			let post = crate::Pallet::<Test>::open_vault(
 				RuntimeOrigin::signed(21),
 				DOT,
-				PUSD,
+				STABLE,
 				1_000,
 				500,
 				rate,
@@ -110,7 +110,7 @@ fn open_vault_refunds_unused_hint_repair_steps() {
 			.expect("valid hint within the repair budget");
 			assert_eq!(post.actual_weight, Some(<() as WeightInfo>::open_vault(steps)));
 			assert_eq!(
-				LinkedList::neighbors(&VaultList::Rate(DOT, PUSD), &21),
+				LinkedList::neighbors(&VaultList::Rate(DOT, STABLE), &21),
 				Some(Position::between(20, 19)),
 			);
 			crate::tests::assert_invariants();

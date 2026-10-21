@@ -551,13 +551,13 @@ pub fn create_high_min_collateral() {
 pub const NO_JIT: pallet_vaults::JitTerms<Balance> =
 	pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 };
 
-/// Liquidates the vault of `owner` in the `collateral`/pUSD market, signed by `keeper`, with
+/// Liquidates the vault of `owner` in the `collateral`/[`STABLE`] market, signed by `keeper`, with
 /// [`NO_JIT`] terms.
 pub fn liquidate(keeper: AccountId, collateral: AssetId, owner: AccountId) -> DispatchResult {
-	Vaults::liquidate(RuntimeOrigin::signed(keeper), collateral, PUSD, owner, NO_JIT)
+	Vaults::liquidate(RuntimeOrigin::signed(keeper), collateral, STABLE, owner, NO_JIT)
 }
 
-/// Creates the `collateral`/pUSD market as `origin`, with the default admins, branch
+/// Creates the `collateral`/[`STABLE`] market as `origin`, with the default admins, branch
 /// parameters and registration.
 pub fn create_branch_as(origin: RuntimeOrigin, collateral: AssetId) -> DispatchResult {
 	Vaults::create_branch(

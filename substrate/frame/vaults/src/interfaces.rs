@@ -6,7 +6,7 @@ use crate::{
 	types::VaultStatus,
 };
 use frame::prelude::*;
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BranchInterface, BranchMode, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
 

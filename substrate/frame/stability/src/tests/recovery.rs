@@ -372,14 +372,14 @@ fn active_pool_offset_keeps_yield_distributed_during_settlement() {
 fn deposit_refunds_to_the_no_recovery_weight_only_without_a_head() {
 	build_and_execute(|| {
 		standing_head_with_active_pool();
-		mint_stable(PUSD, 2, 900);
+		mint_stable(STABLE, 2, 900);
 
-		let settled = Stability::deposit(RuntimeOrigin::signed(2), DOT, PUSD, 800)
+		let settled = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 800)
 			.expect("the deposit settles the head");
 		assert_vault_redeemed(5, 500, 990);
 		assert_eq!(settled.actual_weight, None);
 
-		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, PUSD, 100)
+		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 100)
 			.expect("the deposit queues");
 		assert_eq!(queued.actual_weight, Some(<() as crate::WeightInfo>::deposit_no_recovery()));
 	});
@@ -391,11 +391,11 @@ fn deposit_refunds_to_the_no_recovery_weight_only_without_a_head() {
 fn deposit_keeps_the_full_weight_for_a_head_it_cannot_offset() {
 	build_and_execute(|| {
 		standing_head_with_active_pool();
-		mint_stable(PUSD, 2, 900);
+		mint_stable(STABLE, 2, 900);
 		// The registration price lifts the head above the exit threshold.
 		set_price(DOT, REGISTRATION_PRICE);
 
-		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, PUSD, 100)
+		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 100)
 			.expect("the deposit queues past the head");
 		assert_eq!(queued.actual_weight, None);
 		assert!(!System::events().into_iter().any(|record| matches!(

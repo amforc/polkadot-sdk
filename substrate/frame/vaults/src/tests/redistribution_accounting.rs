@@ -33,9 +33,9 @@ fn later_touch_order_cannot_change_mixed_rate_liquidation_allocations() {
 			let liquidated_debt = vault(DOT, STABLE, 3).debt.total();
 
 			set_price(DOT, FixedU128::from_u32(1));
-			assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
-			assert_eq!(vault(DOT, PUSD, 1).debt.principal, before_1);
-			assert_eq!(vault(DOT, PUSD, 2).debt.principal, before_2);
+			assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
+			assert_eq!(vault(DOT, STABLE, 1).debt.principal, before_1);
+			assert_eq!(vault(DOT, STABLE, 2).debt.principal, before_2);
 
 			advance_time(ONE_YEAR_MS);
 			assert_ok!(poke(99, DOT, STABLE, first));
@@ -96,9 +96,9 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(20)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_1 = held(DOT, 1);
-		assert_ok!(redistribute_for_test(DOT, PUSD, 1, coll_1));
+		assert_ok!(redistribute_for_test(DOT, STABLE, 1, coll_1));
 
-		let state_pre = market_state(DOT, PUSD);
+		let state_pre = market_state(DOT, STABLE);
 		// Both the owned debt and the pending share use the recipient's rate.
 		assert_eq!(state_pre.debt.pending_redistribution_principal, 501);
 		let actual: Balance = whole_units(state_pre.debt.accrual_rate);
@@ -108,7 +108,7 @@ fn aggregate_interest_post_redistribution_accrues_at_recipient_rates() {
 		assert_ok!(poke(99, DOT, STABLE, 2));
 
 		// ceil(1_001 × 20%): the vault rounds the owned and the absorbed debt's interest up.
-		let post_minted = market_state(DOT, PUSD).debt.minted_interest;
+		let post_minted = market_state(DOT, STABLE).debt.minted_interest;
 		assert_eq!(post_minted - state_pre.debt.minted_interest, 201);
 	});
 }
@@ -173,21 +173,21 @@ fn borrow_after_redistribution_folds_the_share_and_charges_the_quoted_fee() {
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
 		// C owes 500 plus an upfront fee of 3, priced at the 21.67% average of the three opens.
-		assert_eq!(redistribute_for_test(DOT, PUSD, 3, coll_3), Ok(503));
+		assert_eq!(redistribute_for_test(DOT, STABLE, 3, coll_3), Ok(503));
 		set_price(DOT, DEFAULT_PRICE);
 
-		let interest_before = vault(DOT, PUSD, 1).debt.interest;
+		let interest_before = vault(DOT, STABLE, 1).debt.interest;
 		// A holds half the stake, so the touch folds floor(503 / 2) = 251 into its principal and
 		// leaves 252 pending. After the borrow the market accrues, per year,
 		//   A: 2_751 · 5% = 137.55, B: 500 · 50% = 250, B's pending share: 251.5 · 50% = 125.75,
 		// which is 513 in whole units over 2_751 + 500 + 252 = 3_503 of principal: 14.64%. The
 		// fee is ceil(2_000 · 14.64% · 7d / 365.25d) = ceil(5.61) = 6. A's own 5% would give 2.
 		let predicted_fee =
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, PUSD, 1, 2_000, None)
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 2_000, None)
 				.expect("touch projection and fee calculation succeed");
 		assert_eq!(predicted_fee, 6);
-		assert_ok!(borrow(1, DOT, PUSD, 2_000, None));
-		let vault = vault(DOT, PUSD, 1);
+		assert_ok!(borrow(1, DOT, STABLE, 2_000, None));
+		let vault = vault(DOT, STABLE, 1);
 		assert_eq!(vault.debt.principal, 500 + 251 + 2_000);
 		assert_eq!(vault.debt.interest, interest_before + 6);
 	});
@@ -332,8 +332,8 @@ fn dust_ratio_stake_floors_to_one_unit_and_stays_liquidatable() {
 		assert_ok!(poke(9, DOT, STABLE, 3));
 
 		set_price(DOT, FixedU128::from_rational(50u128, 100u128));
-		assert_ok!(liquidate(99, DOT, PUSD, 3, 0, 0));
-		assert!(!vault_exists(DOT, PUSD, 3));
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
+		assert!(!vault_exists(DOT, STABLE, 3));
 	});
 }
 
@@ -347,7 +347,7 @@ fn vault_cr_projects_lazy_redistribution_before_materialization() {
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(redistribute_for_test(DOT, PUSD, 3, coll_3));
+		assert_ok!(redistribute_for_test(DOT, STABLE, 3, coll_3));
 		// Restore price so the view's CR is defined for vault 1.
 		set_price(DOT, DEFAULT_PRICE);
 
@@ -387,8 +387,8 @@ fn full_lifecycle_holds_branch_identities() {
 		let keeper_8_pre = collateral_balance(DOT, 8);
 		let pool_pre = collateral_balance(DOT, SP_ACCOUNT);
 		ActiveSpCapacity::set(200);
-		mint_stable(PUSD, 8, 200);
-		assert_ok_and_invariants(liquidate(8, DOT, PUSD, 1, 200, 0));
+		mint_stable(STABLE, 8, 200);
+		assert_ok_and_invariants(liquidate(8, DOT, STABLE, 1, 200, 0));
 		let outcome = liquidation_outcome();
 		assert_ne!(outcome.active_pool.debt, 0);
 		assert_ne!(outcome.keeper_jit.debt, 0);

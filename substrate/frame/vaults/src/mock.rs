@@ -41,7 +41,7 @@ use frame::{
 	},
 };
 pub use pallet_linked_list::Position;
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BranchSnapshot, OffsetLegs, OraclePriceConversion, RedemptionSettlement, StabilityPoolInspect,
 	StabilityPoolOffset, VaultInterface,
 };
@@ -66,8 +66,8 @@ pub const DEFAULT_PRICE: FixedU128 = FixedU128::from_u32(10);
 pub const EMERGENCY_ADMIN: AccountId = 101;
 /// Account that receives the protocol fee remainder.
 pub const FEE_DEST: AccountId = 200;
-/// Owner allowed to create a PUSD market with a deposit.
-pub const PUSD_OWNER: AccountId = 1;
+/// Owner allowed to create a STABLE market with a deposit.
+pub const STABLECOIN_OWNER: AccountId = 1;
 /// Account that receives collateral consumed by the mocked Stability Pool.
 pub const SP_ACCOUNT: AccountId = 777;
 
@@ -404,7 +404,7 @@ parameter_types! {
 	pub static PendingSpCohorts: Vec<(u64, Balance)> = Vec::new();
 	pub static PendingSpInspectionCalls: u32 = 0;
 	pub static SpOffsetCalls: u32 = 0;
-	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
+	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
 	pub TestBranchConfigBounds: BranchConfigBounds = BranchConfigBounds {
 		min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
 		min_initial_collateralization_ratio: FixedU128::from_rational(110u128, 100u128),
@@ -1035,7 +1035,7 @@ pub fn redistribute_for_test(
 	)?;
 	Vaults::settle_liquidation_custody(
 		op,
-		pusd_primitives::DebtCollateral {
+		stablecoin_primitives::DebtCollateral {
 			debt: snapshot.debt,
 			collateral: redistribution_collateral,
 		},

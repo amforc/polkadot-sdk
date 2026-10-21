@@ -4,7 +4,9 @@ use crate::{
 	benchmarking::fixtures::redistribution_held, mock::*, pallet::Vaults, types::VaultStatus,
 };
 use frame::{arithmetic::One, traits::fungibles::Balanced};
-use pusd_primitives::{BenchmarkVaults, CollateralRatio, RedemptionSettlement, VaultInterface};
+use stablecoin_primitives::{
+	BenchmarkVaults, CollateralRatio, RedemptionSettlement, VaultInterface,
+};
 
 type Seeder = Pallet<Test>;
 
@@ -61,7 +63,7 @@ fn recovery_head_settles_in_full_and_closes() {
 		assert_eq!(snapshot.debt, head.debt);
 		assert_eq!(snapshot.collateral, head.collateral);
 		assert_eq!(
-			pusd_primitives::collateralization_ratio(&snapshot.position(), head.price),
+			stablecoin_primitives::collateralization_ratio(&snapshot.position(), head.price),
 			Ok(CollateralRatio::Ratio(FixedU128::one()))
 		);
 		let payment = <VaultStableAssets as Balanced<AccountId>>::issue(stable, head.debt);

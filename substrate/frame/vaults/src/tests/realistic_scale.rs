@@ -449,7 +449,7 @@ fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
 		// `keeper_balance - 1` is above the preserving limit `funded` but below
 		// the full expendable balance, so `reducible_debit` must round it down.
 		assert_eq!(
-			pusd_primitives::reducible_debit::<Assets, _>(USDX, &3, keeper_balance - 1),
+			stablecoin_primitives::reducible_debit::<Assets, _>(USDX, &3, keeper_balance - 1),
 			(funded, Preservation::Preserve)
 		);
 		assert_ok!(liquidate(3, XBT, USDX, 1, keeper_balance - 1, 0));

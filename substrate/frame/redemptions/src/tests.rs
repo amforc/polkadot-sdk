@@ -3,7 +3,7 @@ use crate::{
 	types::{RecoveryRegime, RedemptionConfig},
 	Error, Event,
 };
-use pusd_primitives::{
+use stablecoin_primitives::{
 	collateralization_ratio, reducible_debit, CollateralRatio, DebtCollateral,
 	RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
 };
@@ -760,8 +760,8 @@ fn recovery_stops_above_icr() {
 		set_price(DOT, FixedU128::from_rational(60u128, 100u128));
 		assert_noop!(redeem(RedeemOptions::spend(200)), Error::<Test>::FinalRecoveryExitRequired);
 		assert_ok!(preview_offset(200), RecoveryOffsetQuote::NotOffsettable);
-		assert_ok!(execute_offset(PUSD, 200), RecoveryOffsetResult::NotOffsettable);
-		assert_eq!(vault_debt(DOT, PUSD, 1), debt_before);
+		assert_ok!(execute_offset(STABLE, 200), RecoveryOffsetResult::NotOffsettable);
+		assert_eq!(vault_debt(DOT, STABLE, 1), debt_before);
 
 		// CR = 619 · 0.56 / 301 ≈ 115.2%: above MCR but not ICR. Offsets see a target and a
 		// redemption still pays the capped 5% bonus, floor(105 / 0.56) = 187, with no fee.
@@ -1198,7 +1198,7 @@ fn liquidate_redistribute_all(owner: AccountId) {
 	Vaults::liquidate(
 		RuntimeOrigin::signed(99),
 		DOT,
-		PUSD,
+		STABLE,
 		owner,
 		pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
 	)
@@ -1388,7 +1388,7 @@ fn offset_zero_budget_is_not_offsettable() {
 			assert_ok!(preview_offset(0), RecoveryOffsetQuote::NotOffsettable);
 		});
 		assert_storage_noop!({
-			assert_ok!(execute_offset(PUSD, 0), RecoveryOffsetResult::NotOffsettable);
+			assert_ok!(execute_offset(STABLE, 0), RecoveryOffsetResult::NotOffsettable);
 		});
 	});
 }
@@ -1689,7 +1689,7 @@ fn recovery_bonus_capped_by_penalty() {
 		// reward left in the vault.
 		config.liquidation.keeper_flat_compensation_value = 10;
 		config.liquidation.keeper_percent_compensation = Permill::from_rational(1u32, 1_000u32);
-		register_branch(DOT, PUSD, config);
+		register_branch(DOT, STABLE, config);
 
 		// The test opens above the 140% ICR and then sets 1 DOT = 2 STABLE. At this price,
 		// 6_000 DOT has a value of 12_000 STABLE against 10_000 debt, which gives a 120% CR.
@@ -1700,7 +1700,7 @@ fn recovery_bonus_capped_by_penalty() {
 		// The keeper terms are in raw units, so the entry pays its keeper the cap: a 10_000 value
 		// is 5_000 units, or 5 DOT, at 2. The 5-unit flat plus 0.1% of the 5_250_000-unit
 		// seizure would be more.
-		assert_ok!(enter_final_recovery(DOT, PUSD, 1));
+		assert_ok!(enter_final_recovery(DOT, STABLE, 1));
 		assert_eq!(held(DOT, 1), 6_000 * UNIT - 5_000);
 
 		mint_stable(STABLE, REDEEMER, 1_000_000 * UNIT);
@@ -1710,7 +1710,7 @@ fn recovery_bonus_capped_by_penalty() {
 		// raw_bonus = 120% - 100% - 1% = 19%, capped by the 10% penalty. So
 		// 2_000 * 1.10 = 2_200 STABLE of value, or 1_100 DOT. Recovery redemptions are fee-free.
 		assert_eq!(settled.figures(), (2_000 * UNIT, 0, 1_100 * UNIT));
-		assert_eq!(vault_debt(DOT, PUSD, 1), 8_000 * UNIT);
+		assert_eq!(vault_debt(DOT, STABLE, 1), 8_000 * UNIT);
 		assert_eq!(held(DOT, 1), 4_900 * UNIT - 5_000);
 		assert_eq!(last_recovery_regime(), Some(RecoveryRegime::RecoveryBonus));
 	});
@@ -1720,7 +1720,7 @@ fn redeem_actual_weight(max_stable_to_spend: Balance, max_steps: u32) -> frame::
 	Redemptions::redeem(
 		RuntimeOrigin::signed(REDEEMER),
 		DOT,
-		PUSD,
+		STABLE,
 		crate::RedemptionTerms { max_stable_to_spend, min_collateral_out: 0 },
 		RECIPIENT,
 		max_steps,
@@ -1736,17 +1736,17 @@ fn redeem_actual_weight(max_stable_to_spend: Balance, max_steps: u32) -> frame::
 fn ordinary_walk_weighs_a_trailing_lookup_as_a_step() {
 	use crate::WeightInfo;
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_ok!(open(1, DOT, PUSD, 1_000, 500, percent(1)));
-		assert_ok!(open(2, DOT, PUSD, 10_000, 500, percent(2)));
-		mint_stable(PUSD, REDEEMER, 1_000_000);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 10_000, 500, percent(2)));
+		mint_stable(STABLE, REDEEMER, 1_000_000);
 
 		let capped = hypothetically!(redeem_actual_weight(100_000, 1));
 		assert_eq!(capped, <() as WeightInfo>::redeem(1));
 
 		let exhausted = redeem_actual_weight(100_000, 0);
 		assert_eq!(exhausted, <() as WeightInfo>::redeem(3));
-		assert!(vault_status(DOT, PUSD, 1).is_none_or(|status| status.is_dormant()));
-		assert!(vault_status(DOT, PUSD, 2).is_none_or(|status| status.is_dormant()));
+		assert!(vault_status(DOT, STABLE, 1).is_none_or(|status| status.is_dormant()));
+		assert!(vault_status(DOT, STABLE, 2).is_none_or(|status| status.is_dormant()));
 	});
 }

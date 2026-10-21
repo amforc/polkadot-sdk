@@ -24,7 +24,7 @@ use frame::{
 	},
 };
 use frame_system::RawOrigin;
-use pusd_primitives::{recovery_pricing, BenchmarkVaults, ProvidePrice, VaultInterface};
+use stablecoin_primitives::{recovery_pricing, BenchmarkVaults, ProvidePrice, VaultInterface};
 
 /// Interest the staged vaults accrue before the measured call, so its first settlement mints
 /// interest through the yield route.

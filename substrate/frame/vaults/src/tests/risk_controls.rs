@@ -129,13 +129,13 @@ fn stablecoin_debt_aggregate_tracks_every_write() {
 		// A premature rate change charges the fee into the aggregate.
 		assert_ok_and_invariants(change_rate(1, DOT, STABLE, percent(6)));
 		advance_time(30 * ONE_DAY_MS);
-		assert_ok_and_invariants(poke(9, DOT, PUSD, 1));
-		assert_ok_and_invariants(repay(1, DOT, PUSD, 1, Some(500)));
-		assert_ok_and_invariants(redeem_from(DOT, PUSD, 1, 9, 300));
-		assert_ok_and_invariants(open(3, DOT, PUSD, 40, 300, percent(5)));
+		assert_ok_and_invariants(poke(9, DOT, STABLE, 1));
+		assert_ok_and_invariants(repay(1, DOT, STABLE, 1, Some(500)));
+		assert_ok_and_invariants(redeem_from(DOT, STABLE, 1, 9, 300));
+		assert_ok_and_invariants(open(3, DOT, STABLE, 40, 300, percent(5)));
 		set_price(DOT, FixedU128::from_u32(8));
 		ActiveSpCapacity::set(1_000);
-		assert_ok_and_invariants(liquidate(9, DOT, PUSD, 3, 0, 0));
+		assert_ok_and_invariants(liquidate(9, DOT, STABLE, 3, 0, 0));
 		advance_time(ONE_DAY_MS);
 		// Freezing flushes pending aggregate interest into stored state.
 		assert_ok_and_invariants(set_governance_frozen(ADMIN, DOT, STABLE, true));
