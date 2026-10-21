@@ -461,6 +461,7 @@ members = [
 	"substrate/frame/session/benchmarking",
 	"substrate/frame/society",
 	"substrate/frame/stability",
+	"substrate/frame/stablecoin-primitives",
 	"substrate/frame/staking",
 	"substrate/frame/staking-async",
 	"substrate/frame/staking-async/ah-client",
@@ -1219,7 +1220,6 @@ prometheus-parse = { version = "0.2.2" }
 proptest = { version = "1" }
 prost = { version = "0.12.4" }
 prost-build = { version = "0.13.2" }
-pusd-primitives = { path = "substrate/frame/pusd-primitives", default-features = false }
 pyroscope = { version = "0.5.8" }
 pyroscope_pprofrs = { version = "0.2.8" }
 quick_cache = { version = "0.3" }

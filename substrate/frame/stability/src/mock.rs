@@ -5,7 +5,7 @@
 //! exercise the wiring as well as the pallet.
 //!
 //! Two conventions run through the tests. Collateral [`DOT`] is native and routes to `Balances`,
-//! while `AssetId::WithId` routes to `AssetsHolder`. Stablecoin [`PUSD`] holds to a unit, and
+//! while `AssetId::WithId` routes to `AssetsHolder`. Stablecoin [`STABLE`] holds to a unit, and
 //! [`USDX`] has six decimals, which the scale tests need.
 
 use crate as pallet_stability;
@@ -31,7 +31,7 @@ use frame::{
 		AsEnsureOriginWithArg, Convert, IdentityLookup, LinearStoragePrice,
 	},
 };
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BranchSnapshot, OffsetLegs, ProvidePrice, StabilityPoolInspect, StabilityPoolOffset,
 };
 
@@ -128,8 +128,8 @@ impl pallet_assets_holder::Config for Test {
 
 parameter_types! {
 	pub const MaxHintRepairSteps: u32 = 16;
-	pub const VaultsPalletId: PalletId = PalletId(*b"pusd/vlt");
-	pub const StabilityPalletId: PalletId = PalletId(*b"pusd/stb");
+	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
+	pub const StabilityPalletId: PalletId = PalletId(*b"py/stabl");
 }
 
 impl pallet_linked_list::Config for Test {
@@ -155,7 +155,8 @@ pub type PoolCollateralAssets =
 
 /// A price source the tests drive with [`set_price`].
 ///
-/// Prices are keyed by collateral alone. Stablecoins are taken to hold to a dollar.
+/// Prices are keyed by collateral alone. Stablecoins are taken to hold to one unit of the price's
+/// quote.
 pub struct MockOracle;
 parameter_types! {
 	pub static MockPrices: alloc::collections::BTreeMap<AssetId, FixedU128> =
@@ -203,7 +204,7 @@ pub fn branch_admins(
 
 /// Who may register a market: Root pays no deposit, the owner of the stablecoin pays one, and
 /// anyone else is refused.
-pub type EnsureAssetOwner = pusd_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
+pub type EnsureAssetOwner = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
 /// A flat, refundable 1_000-unit registration deposit, held in native balance.
 pub type VaultsConsideration = HoldConsideration<
@@ -260,7 +261,7 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
 	}
 
 	fn stable_asset_id() -> StableId {
-		PUSD
+		STABLE
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
@@ -356,17 +357,17 @@ impl pallet_redemptions::BenchmarkHelper<AssetId, StableId, AccountId, Balance>
 	for RedemptionsBenchHelper
 {
 	fn setup_redeemable_branch(vaults: u32) -> (AssetId, StableId, AccountId, Balance) {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		let debt: Balance = 300;
 		for i in 0..vaults {
 			let who = 1_000 + AccountId::from(i);
 			mint_collateral(DOT, who, 10_000_000_000);
-			open_vault(who, DOT, PUSD, 1_000_000, debt).expect("open benchmark vault");
+			open_vault(who, DOT, STABLE, 1_000_000, debt).expect("open benchmark vault");
 		}
 		let redeemer: AccountId = 1;
 		let budget = debt.saturating_mul(Balance::from(vaults).saturating_add(2)).saturating_mul(2);
-		mint_stable(PUSD, redeemer, budget.saturating_mul(2));
-		(DOT, PUSD, redeemer, budget)
+		mint_stable(STABLE, redeemer, budget.saturating_mul(2));
+		(DOT, STABLE, redeemer, budget)
 	}
 }
 
@@ -399,7 +400,7 @@ pub const HIGH_MIN: AssetId = AssetId::WithId(HIGH_MIN_ID);
 pub const REGISTRATION_PRICE: FixedU128 = FixedU128::from_rational(5, 4);
 
 /// The stablecoin the helpers mint by default. One coin is one raw unit.
-pub const PUSD: StableId = 1_000;
+pub const STABLE: StableId = 1_000;
 
 /// A stablecoin with six decimals, so that the tests can check the pallet against a realistic
 /// denomination rather than against a unit.
@@ -414,7 +415,7 @@ pub fn new_test_ext() -> TestState {
 		assets: pallet_assets::GenesisConfig {
 			assets: vec![
 				(TOKEN_X_ID, 1, true, 1),
-				(PUSD, 1, true, 1),
+				(STABLE, 1, true, 1),
 				(USDX, 1, true, USDX_MIN_BALANCE),
 			],
 			metadata: vec![(USDX, b"USDX".to_vec(), b"USDX".to_vec(), 6)],
@@ -466,7 +467,7 @@ pub fn build_and_execute(test: impl FnOnce()) {
 /// [`build_and_execute`] with the default market already registered.
 pub fn build_with_default_market(test: impl FnOnce()) {
 	build_and_execute(|| {
-		register_branch(DOT, PUSD, default_branch_config());
+		register_branch(DOT, STABLE, default_branch_config());
 		test();
 	});
 }
@@ -551,16 +552,16 @@ pub fn create_high_min_collateral() {
 	assert_ok!(Assets::force_create(RuntimeOrigin::root(), HIGH_MIN_ID, 1, true, 1_000));
 }
 
-/// Creates the `collateral`/pUSD market as `origin`, with the default admins, branch
+/// Creates the `collateral`/[`STABLE`] market as `origin`, with the default admins, branch
 /// parameters and registration.
 pub fn create_branch_as(origin: RuntimeOrigin, collateral: AssetId) -> DispatchResult {
 	Vaults::create_branch(
 		origin,
 		collateral.clone(),
-		PUSD,
+		STABLE,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
-		branch_config_for(collateral, PUSD),
-		registration_config(PUSD),
+		branch_config_for(collateral, STABLE),
+		registration_config(STABLE),
 	)
 }
 
@@ -670,23 +671,23 @@ pub fn mint_collateral(collateral: AssetId, who: AccountId, amount: Balance) {
 /// Claims the collateral of `who` in the default market, paid to itself, and checks the payout.
 pub fn assert_claim_collateral(who: AccountId, expected: Balance) {
 	let before = collateral_balance(DOT, who);
-	assert_ok!(claim_collateral(who, DOT, PUSD, who));
+	assert_ok!(claim_collateral(who, DOT, STABLE, who));
 	assert_eq!(collateral_balance(DOT, who) - before, expected);
 }
 
 /// Claims the yield of `who` in the default market, paid to itself, and checks the payout.
 pub fn assert_claim_yield(who: AccountId, expected: Balance) {
-	let before = stable_balance(PUSD, who);
-	assert_ok!(claim_yield(who, DOT, PUSD, who));
-	assert_eq!(stable_balance(PUSD, who) - before, expected);
+	let before = stable_balance(STABLE, who);
+	assert_ok!(claim_yield(who, DOT, STABLE, who));
+	assert_eq!(stable_balance(STABLE, who) - before, expected);
 }
 
 /// The default pool account holds nothing beyond its custody float and the aggregates are all
 /// zero.
 pub fn assert_pool_fully_drained() {
-	assert_eq!(pool_stable_held(DOT, PUSD), 0);
-	assert_eq!(pool_collateral_held(DOT, PUSD), 0);
-	let state = pool_state(DOT, PUSD);
+	assert_eq!(pool_stable_held(DOT, STABLE), 0);
+	assert_eq!(pool_collateral_held(DOT, STABLE), 0);
+	let state = pool_state(DOT, STABLE);
 	assert_eq!(state.total_active_deposits, 0);
 	assert_eq!(state.total_pending_deposits, 0);
 	assert_eq!(state.total_collateral_gains_unclaimed, 0);
@@ -695,13 +696,13 @@ pub fn assert_pool_fully_drained() {
 
 /// The active-leg sums row of the default market at the given coordinates.
 pub fn active_sums(epoch: u32, scale: u32) -> PoolSums {
-	crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Active, epoch, scale))
+	crate::PoolSumsStore::<Test>::get((DOT, STABLE, Leg::Active, epoch, scale))
 		.expect("active sums row exists")
 }
 
 /// The pending-leg sums row of the default market at the given coordinates.
 pub fn pending_sums(epoch: u32, scale: u32) -> PoolSums {
-	crate::PoolSumsStore::<Test>::get((DOT, PUSD, Leg::Pending, epoch, scale))
+	crate::PoolSumsStore::<Test>::get((DOT, STABLE, Leg::Pending, epoch, scale))
 		.expect("pending sums row exists")
 }
 
@@ -813,8 +814,8 @@ pub fn seed_deposit(who: AccountId, amount: Balance) {
 
 /// Mints `balance` for `who`, then deposits `amount` behind the configured entry delay.
 pub fn seed_deposit_from_balance(who: AccountId, balance: Balance, amount: Balance) {
-	mint_stable(PUSD, who, balance);
-	assert_ok!(deposit(who, DOT, PUSD, amount));
+	mint_stable(STABLE, who, balance);
+	assert_ok!(deposit(who, DOT, STABLE, amount));
 }
 
 /// Deposits through the configured entry delay, then moves the clock to that deposit's deadline.
@@ -846,8 +847,8 @@ pub fn seed_matured_deposit(who: AccountId, amount: Balance) {
 
 /// Mints `balance` for `who`, deposits `amount`, then moves the clock to its cohort deadline.
 pub fn seed_matured_deposit_from_balance(who: AccountId, balance: Balance, amount: Balance) {
-	mint_stable(PUSD, who, balance);
-	assert_ok!(deposit_and_mature(who, DOT, PUSD, amount));
+	mint_stable(STABLE, who, balance);
+	assert_ok!(deposit_and_mature(who, DOT, STABLE, amount));
 }
 
 /// Gives an existing default-pool row backed claimable balances without exercising their source.
@@ -855,20 +856,20 @@ pub fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Bal
 	seed_claimables_in(DOT, who, collateral_gain, yield_gain);
 }
 
-/// [`seed_claimables`] in the `collateral`/pUSD market.
+/// [`seed_claimables`] in the `collateral`/[`STABLE`] market.
 pub fn seed_claimables_in(
 	collateral: AssetId,
 	who: AccountId,
 	collateral_gain: Balance,
 	yield_gain: Balance,
 ) {
-	let pool = Stability::pool_account(&collateral, &PUSD);
-	crate::Deposits::<Test>::mutate((collateral.clone(), PUSD, who), |row| {
+	let pool = Stability::pool_account(&collateral, &STABLE);
+	crate::Deposits::<Test>::mutate((collateral.clone(), STABLE, who), |row| {
 		let row = row.as_mut().expect("deposit row exists");
 		row.claimable_collateral += collateral_gain;
 		row.claimable_yield += yield_gain;
 	});
-	mutate_pool_state(collateral.clone(), PUSD, |state| {
+	mutate_pool_state(collateral.clone(), STABLE, |state| {
 		state.total_collateral_gains_unclaimed += collateral_gain;
 		state.total_yield_unclaimed += yield_gain;
 	});
@@ -876,7 +877,7 @@ pub fn seed_claimables_in(
 		mint_collateral(collateral, pool, collateral_gain);
 	}
 	if yield_gain > 0 {
-		mint_stable(PUSD, pool, yield_gain);
+		mint_stable(STABLE, pool, yield_gain);
 	}
 }
 
@@ -887,7 +888,7 @@ macro_rules! market_event {
 	($variant:ident { $($fields:tt)* }) => {
 		$crate::mock::RuntimeEvent::from($crate::Event::<$crate::mock::Test>::$variant {
 			collateral_id: $crate::mock::DOT,
-			stable_id: $crate::mock::PUSD,
+			stable_id: $crate::mock::STABLE,
 			$($fields)*
 		})
 	};
@@ -916,19 +917,19 @@ pub fn pending_deadline(collateral: AssetId, stable: StableId, who: AccountId) -
 /// The single-depositor fixture: account 1 has 400 ready to activate in the default market, and
 /// 600 in its wallet.
 pub fn seed_pool_with_matured_deposit() {
-	register_branch(DOT, PUSD, default_branch_config());
-	mint_stable(PUSD, 1, 1_000);
-	assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
+	register_branch(DOT, STABLE, default_branch_config());
+	mint_stable(STABLE, 1, 1_000);
+	assert_ok!(deposit_and_mature(1, DOT, STABLE, 400));
 }
 
 /// [`seed_pool_with_matured_deposit`] with real market debt behind it: one vault at a TCR of 250%,
 /// which leaves the market in Normal Mode and lets a test drive it into Safety Mode.
 pub fn seed_branch_with_debt() {
-	register_branch(DOT, PUSD, default_branch_config());
+	register_branch(DOT, STABLE, default_branch_config());
 	mint_collateral(DOT, 5, 2_000);
-	assert_ok!(open_vault(5, DOT, PUSD, 1_000, 500));
-	mint_stable(PUSD, 1, 1_000);
-	assert_ok!(deposit_and_mature(1, DOT, PUSD, 400));
+	assert_ok!(open_vault(5, DOT, STABLE, 1_000, 500));
+	mint_stable(STABLE, 1, 1_000);
+	assert_ok!(deposit_and_mature(1, DOT, STABLE, 400));
 }
 
 /// Drops the price until the TCR reaches 120%, which is under the Safety threshold and over the
@@ -944,7 +945,7 @@ pub fn exit_safety_mode() {
 
 /// Replaces the parameters of the default pool, through governance.
 pub fn set_pool_config(config: StabilityPoolConfig<Balance>) {
-	assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, PUSD, config));
+	assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, STABLE, config));
 }
 
 /// Sets the post-offset floor of the default pool, through governance.
@@ -977,7 +978,7 @@ pub fn distribute_yield_leftover(
 
 /// Offers `amount` of yield to the default market, which must take all of it.
 pub fn distribute_all_yield(amount: Balance) {
-	assert_eq!(distribute_yield_leftover(DOT, PUSD, amount), 0, "the pool takes the whole yield");
+	assert_eq!(distribute_yield_leftover(DOT, STABLE, amount), 0, "the pool takes the whole yield");
 }
 
 /// Issues stablecoin the way the vault engine mints interest.
@@ -1073,7 +1074,8 @@ pub fn offset_with(
 pub fn pro_rata_floor(amount: Balance, numerator: Balance, denominator: Balance) -> Balance {
 	assert!(numerator <= denominator);
 	assert!(denominator > 0);
-	pusd_primitives::mul_div_floor(amount, numerator, denominator).expect("share of amount fits")
+	stablecoin_primitives::mul_div_floor(amount, numerator, denominator)
+		.expect("share of amount fits")
 }
 
 /// The legs one [`simulate_offset`] call settled.

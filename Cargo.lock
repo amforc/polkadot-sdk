@@ -14848,8 +14848,8 @@ dependencies = [
  "pallet-vaults",
  "parity-scale-codec",
  "polkadot-sdk-frame",
- "pusd-primitives",
  "scale-info",
+ "stablecoin-primitives",
 ]
 
 [[package]]
