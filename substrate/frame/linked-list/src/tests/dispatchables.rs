@@ -15,15 +15,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, Error, Event, ListError, Position, PriorityProvider, SortedListInterface};
+use crate::{mock::*, Error, Event, ListError, Position, SortedListInterface};
 use frame::testing_prelude::{
 	assert_err_ignore_postinfo, assert_noop, assert_ok, assert_storage_noop,
 };
 
-/// Pin the authoritative priority via the same trait entry point the
-/// benchmarks use.
+/// Drift the authoritative priority of `item` away from its stored one, so `reprioritize` has
+/// something to correct.
 fn set_real_priority(list_id: ListId, item: ItemId, priority: Priority) {
-	StaticPriorityProvider::set_priority(&list_id, &item, priority);
+	StaticPriorityProvider::pin_priority(list_id, item, priority);
 }
 
 #[test]

@@ -53,6 +53,7 @@ pub use linked_list_interface::{
 pub use list::Node;
 pub use pallet::*;
 pub use types::ListMeta;
+pub use weights::WeightInfo;
 
 mod dispatchables;
 mod list;
@@ -91,7 +92,6 @@ mod benchmarking;
 #[frame::pallet]
 pub mod pallet {
 	use super::*;
-	use crate::weights::WeightInfo;
 
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
@@ -151,7 +151,7 @@ pub mod pallet {
 	/// Priority backing for benchmarks only. Production runtimes read the priority
 	/// from external state (e.g. stake) via their own [`PriorityProvider`]; this
 	/// storage lets the pallet be benchmarked alone, paired with
-	/// [`crate::BenchPriorityProvider`].
+	/// [`crate::BenchPriorityProvider`] or [`crate::BenchPriorityProviderWithPrimary`].
 	#[cfg(feature = "runtime-benchmarks")]
 	#[pallet::storage]
 	pub type BenchAuthoritativePriority<T: Config> = StorageDoubleMap<
@@ -270,8 +270,7 @@ pub mod pallet {
 			hint: Position<T::ItemId>,
 		) -> DispatchResultWithPostInfo {
 			ensure_signed(origin)?;
-			let actual_weight = Self::do_reprioritize(list_id, item, hint)?;
-			Ok(Some(actual_weight).into())
+			Self::do_reprioritize(list_id, item, hint)
 		}
 	}
 }
@@ -290,5 +289,31 @@ impl<T: Config> PriorityProvider<T::ListId, T::ItemId> for BenchPriorityProvider
 
 	fn set_priority(list_id: &T::ListId, item: &T::ItemId, priority: T::Priority) {
 		pallet::BenchAuthoritativePriority::<T>::insert(list_id, item, priority);
+	}
+}
+
+/// Benchmark provider that preserves production reads through `Primary`.
+///
+/// List benchmarks cannot seed the external state `Primary` needs. The fallback supplies
+/// priorities at the cost of one extra read, conservatively overcharging the benchmark.
+#[cfg(feature = "runtime-benchmarks")]
+pub struct BenchPriorityProviderWithPrimary<T, Primary>(core::marker::PhantomData<(T, Primary)>);
+
+#[cfg(feature = "runtime-benchmarks")]
+impl<T, Primary> PriorityProvider<T::ListId, T::ItemId>
+	for BenchPriorityProviderWithPrimary<T, Primary>
+where
+	T: Config,
+	Primary: PriorityProvider<T::ListId, T::ItemId, Priority = T::Priority>,
+{
+	type Priority = T::Priority;
+
+	fn priority(list_id: &T::ListId, item: &T::ItemId) -> Option<T::Priority> {
+		Primary::priority(list_id, item)
+			.or_else(|| BenchPriorityProvider::<T>::priority(list_id, item))
+	}
+
+	fn set_priority(list_id: &T::ListId, item: &T::ItemId, priority: T::Priority) {
+		BenchPriorityProvider::<T>::set_priority(list_id, item, priority);
 	}
 }
