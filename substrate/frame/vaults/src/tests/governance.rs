@@ -8,16 +8,16 @@ fn market_exists(collateral: AssetId, stable: StableId) -> bool {
 	branch_state(collateral, stable).is_some()
 }
 
-/// Repay `owner`'s full `(DOT, PUSD)` debt and close the vault, emptying the
-/// market. Mints a pUSD buffer first so any accrued interest beyond the borrowed
+/// Repay `owner`'s full `(DOT, STABLE)` debt and close the vault, emptying the
+/// market. Mints a stablecoin buffer first so any accrued interest beyond the borrowed
 /// principal is covered. Repay-to-zero leaves a Dormant husk that still holds the
 /// collateral, so an explicit `close_vault` is needed to empty the market.
 fn repay_to_close(owner: AccountId) {
-	let total = vault(DOT, PUSD, owner).debt.total();
-	mint_stable(PUSD, owner, total);
-	assert_ok!(repay(owner, DOT, PUSD, owner, None));
-	assert_ok!(close_vault(owner, DOT, PUSD, None));
-	assert!(!vault_exists(DOT, PUSD, owner), "close removed the vault");
+	let total = vault(DOT, STABLE, owner).debt.total();
+	mint_stable(STABLE, owner, total);
+	assert_ok!(repay(owner, DOT, STABLE, owner, None));
+	assert_ok!(close_vault(owner, DOT, STABLE, None));
+	assert!(!vault_exists(DOT, STABLE, owner), "close removed the vault");
 }
 
 // A signed asset-owner create locks the refundable deposit; removing the empty
@@ -26,22 +26,22 @@ fn repay_to_close(owner: AccountId) {
 fn signed_create_takes_deposit_and_remove_refunds() {
 	build_and_execute(|| {
 		set_price(DOT, DEFAULT_PRICE);
-		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0);
 
 		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::signed(PUSD_OWNER),
+			RuntimeOrigin::signed(STABLECOIN_OWNER),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
 			(),
 		));
-		assert_eq!(creation_deposit_held(PUSD_OWNER), MarketDepositBase::get());
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), MarketDepositBase::get());
 
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
-		assert_eq!(creation_deposit_held(PUSD_OWNER), 0, "deposit refunded on removal");
-		assert!(!market_exists(DOT, PUSD));
-		assert_event(crate::Event::BranchRemoved { collateral_id: DOT, stable_id: PUSD });
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0, "deposit refunded on removal");
+		assert!(!market_exists(DOT, STABLE));
+		assert_event(crate::Event::BranchRemoved { collateral_id: DOT, stable_id: STABLE });
 	});
 }
 
@@ -59,14 +59,14 @@ fn create_rejects_a_creator_that_cannot_pay_the_custody_seed() {
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				TOKEN_X,
-				PUSD,
+				STABLE,
 				branch_admins(PENNILESS_ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
 				(),
 			),
 			Error::<Test>::CustodySeedUnavailable
 		);
-		assert!(!market_exists(TOKEN_X, PUSD));
+		assert!(!market_exists(TOKEN_X, STABLE));
 	});
 }
 
@@ -76,14 +76,14 @@ fn create_rejects_a_creator_that_cannot_pay_the_custody_seed() {
 #[test]
 fn insufficient_collateral_custody_needs_the_provider_reference() {
 	build_and_execute(|| {
-		let custody = Pallet::<Test>::redistribution_account(&INSUFFICIENT, &PUSD);
+		let custody = Pallet::<Test>::redistribution_account(&INSUFFICIENT, &STABLE);
 		assert_eq!(System::providers(&custody), 0);
 		set_price(INSUFFICIENT, DEFAULT_PRICE);
 
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			INSUFFICIENT,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
 			(),
@@ -91,7 +91,11 @@ fn insufficient_collateral_custody_needs_the_provider_reference() {
 		assert_eq!(collateral_balance(INSUFFICIENT, custody), min_collateral_balance(INSUFFICIENT));
 		assert_eq!(System::consumers(&custody), 1, "the asset account holds a consumer reference");
 
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), INSUFFICIENT, PUSD));
+		assert_ok!(Pallet::<Test>::remove_branch(
+			RuntimeOrigin::signed(ADMIN),
+			INSUFFICIENT,
+			STABLE
+		));
 		assert_eq!(System::consumers(&custody), 0);
 		assert_eq!(System::providers(&custody), 0);
 	});
@@ -106,14 +110,14 @@ fn root_create_takes_no_deposit() {
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
 			(),
 		));
-		assert_eq!(creation_deposit_held(PUSD_OWNER), 0);
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0);
 		assert_eq!(creation_deposit_held(ADMIN), 0);
-		assert!(market_exists(DOT, PUSD));
+		assert!(market_exists(DOT, STABLE));
 	});
 }
 
@@ -131,7 +135,7 @@ fn create_branch_rejects_config_outside_envelope() {
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				DOT,
-				PUSD,
+				STABLE,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				config,
 				(),
@@ -140,7 +144,7 @@ fn create_branch_rejects_config_outside_envelope() {
 				BoundViolation::MinimumCollateralizationRatioTooLow
 			)
 		);
-		assert!(!market_exists(DOT, PUSD));
+		assert!(!market_exists(DOT, STABLE));
 	});
 }
 
@@ -156,7 +160,7 @@ fn zero_vault_floors_are_rejected_on_every_write() {
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				DOT,
-				PUSD,
+				STABLE,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				config,
 				(),
@@ -171,9 +175,9 @@ fn zero_vault_floors_are_rejected_on_every_write() {
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumCollateral)
 		);
 
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		let set_param =
-			|update| Pallet::<Test>::set_param(RuntimeOrigin::signed(ADMIN), DOT, PUSD, update);
+			|update| Pallet::<Test>::set_param(RuntimeOrigin::signed(ADMIN), DOT, STABLE, update);
 		assert_noop!(
 			set_param(BranchConfigUpdate::MinimumDebt(0)),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumDebt)
@@ -202,7 +206,7 @@ fn inverted_borrow_rate_band_is_rejected_on_every_write() {
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				DOT,
-				PUSD,
+				STABLE,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				inverted,
 				(),
@@ -210,12 +214,12 @@ fn inverted_borrow_rate_band_is_rejected_on_every_write() {
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumBorrowRateAboveMaximum)
 		);
 
-		register_market(DOT, PUSD); // Band is 0.1%..400%.
+		register_market(DOT, STABLE); // Band is 0.1%..400%.
 		let narrow = |min, max| {
 			Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
-				PUSD,
+				STABLE,
 				BranchConfigUpdate::BorrowRateBounds { min, max },
 			)
 		};
@@ -225,7 +229,7 @@ fn inverted_borrow_rate_band_is_rejected_on_every_write() {
 		);
 		// A narrowing that leaves the ends in order still applies.
 		assert_ok!(narrow(percent(200), percent(300)));
-		let config = market_config(DOT, PUSD);
+		let config = market_config(DOT, STABLE);
 		assert_eq!(config.minimum_borrow_rate, percent(200));
 		assert_eq!(config.maximum_borrow_rate, percent(300));
 	});
@@ -242,12 +246,12 @@ fn create_branch_accepts_any_debt_ceiling() {
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			config,
 			(),
 		));
-		assert_eq!(market_config(DOT, PUSD).debt_ceiling, u128::MAX);
+		assert_eq!(market_config(DOT, STABLE).debt_ceiling, u128::MAX);
 	});
 }
 
@@ -260,7 +264,7 @@ fn create_branch_rejects_unpriced_collateral() {
 			Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
 				DOT,
-				PUSD,
+				STABLE,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
 				default_branch_config(),
 				(),
@@ -275,7 +279,7 @@ fn create_branch_rejects_unpriced_collateral() {
 #[test]
 fn full_admin_loosens_within_envelope_but_not_past_floor() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		// Successful updates preserve the complete config and emit the field and value.
 		let raised_mcr = BranchConfig {
 			minimum_collateralization_ratio: percent(115),
@@ -286,28 +290,33 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 			(BranchConfigUpdate::MinimumCollateralizationRatio(percent(115)), raised_mcr),
 			(BranchConfigUpdate::DebtCeiling(50_000_000), lowered_ceiling),
 		] {
-			assert_ok!(Pallet::<Test>::set_param(RuntimeOrigin::signed(ADMIN), DOT, PUSD, update,));
+			assert_ok!(Pallet::<Test>::set_param(
+				RuntimeOrigin::signed(ADMIN),
+				DOT,
+				STABLE,
+				update,
+			));
 			crate::tests::assert_event(crate::Event::ParameterUpdated {
 				collateral_id: DOT,
-				stable_id: PUSD,
+				stable_id: STABLE,
 				update,
 			});
-			assert_eq!(branch_config(DOT, PUSD), Some(expected));
+			assert_eq!(branch_config(DOT, STABLE), Some(expected));
 		}
 		// 115% -> 106% is a loosening the full admin may apply (floor is 105%).
 		assert_ok!(Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD,
+			STABLE,
 			BranchConfigUpdate::MinimumCollateralizationRatio(percent(106))
 		));
-		assert_eq!(market_config(DOT, PUSD).minimum_collateralization_ratio, percent(106));
+		assert_eq!(market_config(DOT, STABLE).minimum_collateralization_ratio, percent(106));
 		// 104% is below the envelope floor — even the full admin cannot go there.
 		assert_noop!(
 			Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(ADMIN),
 				DOT,
-				PUSD,
+				STABLE,
 				BranchConfigUpdate::MinimumCollateralizationRatio(percent(104))
 			),
 			Error::<Test>::ConfigOutsideEnvelope(
@@ -324,17 +333,17 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 fn remove_branch_requires_empty_market() {
 	for origin in [RuntimeOrigin::signed(ADMIN), RuntimeOrigin::root()] {
 		build_and_execute(|| {
-			register_market(DOT, PUSD);
-			assert_ok!(open(PUSD_OWNER, DOT, PUSD, 1_000, 500, percent(5)));
+			register_market(DOT, STABLE);
+			assert_ok!(open(STABLECOIN_OWNER, DOT, STABLE, 1_000, 500, percent(5)));
 			assert_noop!(
-				Pallet::<Test>::remove_branch(origin.clone(), DOT, PUSD),
+				Pallet::<Test>::remove_branch(origin.clone(), DOT, STABLE),
 				Error::<Test>::BranchNotEmpty
 			);
 
 			// Once the sole vault is repaid to zero, the now-empty market is removable.
-			repay_to_close(PUSD_OWNER);
-			assert_ok!(Pallet::<Test>::remove_branch(origin.clone(), DOT, PUSD));
-			assert!(!market_exists(DOT, PUSD));
+			repay_to_close(STABLECOIN_OWNER);
+			assert_ok!(Pallet::<Test>::remove_branch(origin.clone(), DOT, STABLE));
+			assert!(!market_exists(DOT, STABLE));
 		});
 	}
 }
@@ -344,13 +353,13 @@ fn remove_branch_requires_empty_market() {
 #[test]
 fn set_branch_admins_reassigns_authority() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		// The emergency admin cannot reassign.
 		assert_noop!(
 			Pallet::<Test>::set_branch_admins(
 				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
-				PUSD,
+				STABLE,
 				branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
 			),
 			Error::<Test>::NotBranchAdmin
@@ -359,31 +368,31 @@ fn set_branch_admins_reassigns_authority() {
 		assert_ok!(Pallet::<Test>::set_branch_admins(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
 		));
-		let info = crate::pallet::Branches::<Test>::get(DOT, PUSD).expect("admins stored");
+		let info = crate::pallet::Branches::<Test>::get(DOT, STABLE).expect("admins stored");
 		assert_eq!(info.admins.full_admin, NEW_FULL_ADMIN);
 		assert_eq!(info.admins.emergency_admin, NEW_EMERGENCY_ADMIN);
 		assert_event(crate::Event::BranchAdminsChanged {
 			collateral_id: DOT,
-			stable_id: PUSD,
+			stable_id: STABLE,
 			full_admin: NEW_FULL_ADMIN,
 			emergency_admin: NEW_EMERGENCY_ADMIN,
 		});
 
 		// The old full admin can no longer act; the new one can.
 		assert_noop!(
-			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, PUSD, true),
+			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, STABLE, true),
 			Error::<Test>::NotBranchAdmin
 		);
 		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(NEW_FULL_ADMIN),
 			DOT,
-			PUSD,
+			STABLE,
 			true
 		));
-		assert!(market_state(DOT, PUSD).is_frozen());
+		assert!(market_state(DOT, STABLE).is_frozen());
 	});
 }
 
@@ -392,21 +401,21 @@ fn set_branch_admins_reassigns_authority() {
 #[test]
 fn force_origin_can_reassign_branch_admins() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		assert_ok!(Pallet::<Test>::set_branch_admins(
 			RuntimeOrigin::root(),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
 		));
 
-		let info = crate::pallet::Branches::<Test>::get(DOT, PUSD).expect("admins stored");
+		let info = crate::pallet::Branches::<Test>::get(DOT, STABLE).expect("admins stored");
 		assert_eq!(info.admins.full_admin, NEW_FULL_ADMIN);
 		assert_eq!(info.admins.emergency_admin, NEW_EMERGENCY_ADMIN);
 		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(NEW_FULL_ADMIN),
 			DOT,
-			PUSD,
+			STABLE,
 			true,
 		));
 	});
@@ -416,14 +425,14 @@ fn force_origin_can_reassign_branch_admins() {
 #[test]
 fn emergency_admin_can_freeze() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::signed(EMERGENCY_ADMIN),
 			DOT,
-			PUSD,
+			STABLE,
 			true
 		));
-		assert!(market_state(DOT, PUSD).is_frozen());
+		assert!(market_state(DOT, STABLE).is_frozen());
 	});
 }
 
@@ -432,19 +441,19 @@ fn emergency_admin_can_freeze() {
 #[test]
 fn force_origin_acts_as_full_branch_admin() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		assert_ok!(Pallet::<Test>::set_param(
 			RuntimeOrigin::root(),
 			DOT,
-			PUSD,
+			STABLE,
 			BranchConfigUpdate::MinimumDebt(250)
 		));
-		assert_eq!(market_config(DOT, PUSD).minimum_debt, 250);
+		assert_eq!(market_config(DOT, STABLE).minimum_debt, 250);
 		assert_noop!(
 			Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(9),
 				DOT,
-				PUSD,
+				STABLE,
 				BranchConfigUpdate::MinimumDebt(300)
 			),
 			Error::<Test>::NotBranchAdmin
@@ -453,7 +462,7 @@ fn force_origin_acts_as_full_branch_admin() {
 			Pallet::<Test>::set_param(
 				RuntimeOrigin::root(),
 				DOT,
-				PUSD,
+				STABLE,
 				BranchConfigUpdate::BorrowRateBounds {
 					min: FixedU128::from_rational(1u128, 1_000u128),
 					max: FixedU128::from_rational(500u128, 100u128),
@@ -463,10 +472,15 @@ fn force_origin_acts_as_full_branch_admin() {
 		);
 
 		// Root is not a branch admin, yet the kill switch passes both ways.
-		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, true));
-		assert!(market_state(DOT, PUSD).is_frozen());
-		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, PUSD, false));
-		assert!(!market_state(DOT, PUSD).is_frozen());
+		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, STABLE, true));
+		assert!(market_state(DOT, STABLE).is_frozen());
+		assert_ok!(Pallet::<Test>::set_governance_frozen(
+			RuntimeOrigin::root(),
+			DOT,
+			STABLE,
+			false
+		));
+		assert!(!market_state(DOT, STABLE).is_frozen());
 	});
 }
 
@@ -476,10 +490,10 @@ fn force_origin_acts_as_full_branch_admin() {
 #[test]
 fn redistribution_account_provider_reference_is_paired() {
 	build_and_execute(|| {
-		let account = Pallet::<Test>::redistribution_account(&DOT, &PUSD);
-		register_market(DOT, PUSD);
+		let account = Pallet::<Test>::redistribution_account(&DOT, &STABLE);
+		register_market(DOT, STABLE);
 		assert_eq!(System::providers(&account), 2);
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
 		assert_eq!(System::providers(&account), 0);
 
 		// A third party provided for the address before the market existed.
@@ -487,13 +501,13 @@ fn redistribution_account_provider_reference_is_paired() {
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
 			(),
 		));
 		assert_eq!(System::providers(&account), 3);
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
 		assert_eq!(System::providers(&account), 1);
 	});
 }
@@ -505,12 +519,12 @@ fn redistribution_account_provider_reference_is_paired() {
 #[test]
 fn issued_collateral_removal_refunds_the_custody_seed() {
 	build_and_execute(|| {
-		let account = Pallet::<Test>::redistribution_account(&TOKEN_X, &PUSD);
+		let account = Pallet::<Test>::redistribution_account(&TOKEN_X, &STABLE);
 		let funder_before = collateral_balance(TOKEN_X, ADMIN);
-		register_market(TOKEN_X, PUSD);
+		register_market(TOKEN_X, STABLE);
 		assert_eq!(collateral_balance(TOKEN_X, account), min_collateral_balance(TOKEN_X));
 
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, PUSD));
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, STABLE));
 		assert_eq!(System::providers(&account), 0);
 		assert_eq!(collateral_balance(TOKEN_X, ADMIN), funder_before);
 	});
@@ -521,14 +535,14 @@ fn issued_collateral_removal_refunds_the_custody_seed() {
 #[test]
 fn freeze_and_remove_reject_unauthorized_signers() {
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
+		register_market(DOT, STABLE);
 		const NOBODY: AccountId = 999;
 		assert_noop!(
-			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::signed(NOBODY), DOT, PUSD, true),
+			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::signed(NOBODY), DOT, STABLE, true),
 			Error::<Test>::NotBranchAdmin
 		);
 		assert_noop!(
-			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(NOBODY), DOT, PUSD),
+			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(NOBODY), DOT, STABLE),
 			Error::<Test>::NotBranchAdmin
 		);
 	});
@@ -544,12 +558,12 @@ fn registry_has_no_global_cap() {
 		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 10);
 
 		// Removing a market and re-creating the same pair round-trips.
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, PUSD));
+		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
 		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 9);
 		assert_ok!(Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			DOT,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			default_branch_config(),
 			(),
@@ -561,9 +575,9 @@ fn registry_has_no_global_cap() {
 #[test]
 fn create_branch_rejects_unknown_assets_and_role_collision() {
 	let cases = [
-		(AssetId::WithId(999_999), PUSD, Error::<Test>::UnknownCollateral),
+		(AssetId::WithId(999_999), STABLE, Error::<Test>::UnknownCollateral),
 		(DOT, 9_999, Error::<Test>::UnknownStable),
-		(AssetId::WithId(PUSD), PUSD, Error::<Test>::StableCollateralCollision),
+		(AssetId::WithId(STABLE), STABLE, Error::<Test>::StableCollateralCollision),
 	];
 	for (collateral, stable, error) in cases {
 		build_and_execute(|| {
@@ -589,8 +603,8 @@ fn ensure_branch_full_admin_authorizes_only_the_full_admin() {
 	use frame::traits::EnsureOriginWithArg;
 
 	build_and_execute(|| {
-		register_market(DOT, PUSD);
-		let market = (DOT, PUSD);
+		register_market(DOT, STABLE);
+		let market = (DOT, STABLE);
 		assert_ok!(EnsureBranchFullAdmin::<Test>::try_origin(
 			RuntimeOrigin::signed(ADMIN),
 			&market
@@ -608,7 +622,7 @@ fn ensure_branch_full_admin_authorizes_only_the_full_admin() {
 		// An unregistered market has no admin, so even the admin account fails.
 		assert!(EnsureBranchFullAdmin::<Test>::try_origin(
 			RuntimeOrigin::signed(ADMIN),
-			&(ETH, PUSD)
+			&(ETH, STABLE)
 		)
 		.is_err());
 	});

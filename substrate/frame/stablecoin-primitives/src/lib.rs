@@ -1,6 +1,6 @@
-//! # pUSD Primitives
+//! # Stablecoin Primitives
 //!
-//! Types and traits shared by the pUSD pallets (vaults, redemptions, stability pool).
+//! Types and traits shared by the stablecoin pallets (vaults, redemptions, stability pool).
 //! Everything is generic over the runtime's `AccountId`, `AssetId`, `Balance` and imbalances.
 
 #![cfg_attr(not(feature = "std"), no_std)]

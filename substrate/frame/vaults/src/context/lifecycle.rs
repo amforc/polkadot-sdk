@@ -8,7 +8,7 @@ use crate::{
 };
 use frame::{prelude::*, traits::DefensiveOption};
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
-use pusd_primitives::RedemptionStepSnapshot;
+use stablecoin_primitives::RedemptionStepSnapshot;
 
 impl<T: Config> VaultOp<T> {
 	/// Returns validated liquidation inputs.

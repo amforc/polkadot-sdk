@@ -48,7 +48,7 @@ pub mod mock;
 mod tests;
 
 pub use pallet::*;
-pub use pusd_primitives;
+pub use stablecoin_primitives;
 pub use types::{
 	AssetMinimums, BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate,
 	BranchDebt, BranchMode, BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState,
@@ -94,7 +94,7 @@ pub mod pallet {
 		},
 	};
 	use linked_list_interface::{Position, PriorityProvider, SortedListInterface};
-	use pusd_primitives::{
+	use stablecoin_primitives::{
 		collateralization_ratio, CollateralRatio, OnBranchLifecycle, OnBranchYield, ProvidePrice,
 	};
 
@@ -114,7 +114,7 @@ pub mod pallet {
 	pub type AccountIdLookupOf<T> = <<T as frame_system::Config>::Lookup as StaticLookup>::Source;
 
 	/// UNIX time in milliseconds.
-	pub use pusd_primitives::Millis;
+	pub use stablecoin_primitives::Millis;
 
 	/// Lifecycle registration payload forwarded to [`Config::OnBranchLifecycle`].
 	pub type RegistrationConfigOf<T> = <<T as Config>::OnBranchLifecycle as OnBranchLifecycle<
@@ -1307,7 +1307,7 @@ pub mod pallet {
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 		) -> T::AccountId {
-			pusd_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
+			stablecoin_primitives::market_sub_account(T::PalletId::get(), collateral_id, stable_id)
 		}
 	}
 }

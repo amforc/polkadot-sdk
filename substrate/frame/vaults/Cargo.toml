@@ -18,8 +18,8 @@ targets = ["x86_64-unknown-linux-gnu"]
 codec = { workspace = true, features = ["derive"] }
 frame = { workspace = true, features = ["runtime"] }
 linked-list-interface = { workspace = true }
-pusd-primitives = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
+stablecoin-primitives = { workspace = true }
 
 [dev-dependencies]
 pallet-assets = { workspace = true, features = ["std"] }
@@ -39,8 +39,8 @@ std = [
 	"pallet-balances/std",
 	"pallet-linked-list/std",
 	"pallet-timestamp/std",
-	"pusd-primitives/std",
 	"scale-info/std",
+	"stablecoin-primitives/std",
 ]
 runtime-benchmarks = [
 	"frame/runtime-benchmarks",
@@ -50,7 +50,7 @@ runtime-benchmarks = [
 	"pallet-balances/runtime-benchmarks",
 	"pallet-linked-list/runtime-benchmarks",
 	"pallet-timestamp/runtime-benchmarks",
-	"pusd-primitives/runtime-benchmarks",
+	"stablecoin-primitives/runtime-benchmarks",
 ]
 try-runtime = [
 	"frame/try-runtime",
@@ -60,5 +60,5 @@ try-runtime = [
 	"pallet-balances/try-runtime",
 	"pallet-linked-list/try-runtime",
 	"pallet-timestamp/try-runtime",
-	"pusd-primitives/try-runtime",
+	"stablecoin-primitives/try-runtime",
 ]

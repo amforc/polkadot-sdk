@@ -21,7 +21,7 @@ use frame::{
 		AccountTouch,
 	},
 };
-use pusd_primitives::CollateralRatio;
+use stablecoin_primitives::CollateralRatio;
 
 fn xbt_vault(owner: AccountId) -> crate::types::Vault<Balance> {
 	crate::mock::vault(XBT, USDX, owner)
@@ -63,11 +63,11 @@ fn fee_account_pays_its_own_asset_account_deposit() {
 				Fortitude::Polite,
 			)
 		};
-		let creator_spendable = spendable(PUSD_OWNER);
+		let creator_spendable = spendable(STABLECOIN_OWNER);
 		let fee_spendable = spendable(FEE_DEST);
 
 		assert_ok!(crate::Pallet::<Test>::create_branch(
-			RuntimeOrigin::signed(PUSD_OWNER),
+			RuntimeOrigin::signed(STABLECOIN_OWNER),
 			TOKEN_X,
 			USDX,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
@@ -76,7 +76,7 @@ fn fee_account_pays_its_own_asset_account_deposit() {
 		));
 
 		assert_eq!(
-			spendable(PUSD_OWNER),
+			spendable(STABLECOIN_OWNER),
 			creator_spendable -
 				MarketDepositBase::get() -
 				<Balances as FungibleInspect<AccountId>>::minimum_balance(),
@@ -132,7 +132,7 @@ fn lifecycle_exact_at_realistic_scale() {
 // The debt floor has to clear the stablecoin's minimum balance, or the smallest
 // vault the market admits could never be paid what it borrows. The floor is
 // judged against the coin, not against a number: the same 9_999 that is dust to
-// six-decimal USDX is a fine floor for PUSD, whose minimum balance is one unit.
+// six-decimal USDX is a fine floor for STABLE, whose minimum balance is one unit.
 #[test]
 fn create_branch_rejects_debt_floor_below_stable_minimum() {
 	build_and_execute(|| {
@@ -153,7 +153,7 @@ fn create_branch_rejects_debt_floor_below_stable_minimum() {
 		assert_ok!(crate::Pallet::<Test>::create_branch(
 			RuntimeOrigin::root(),
 			TOKEN_X,
-			PUSD,
+			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
 			config,
 			(),

@@ -26,7 +26,7 @@ use frame::{
 };
 use frame_system::RawOrigin;
 use linked_list_interface::{Position, SortedListInterface};
-use pusd_primitives::{
+use stablecoin_primitives::{
 	OnBranchLifecycle, RedemptionSettlement, RedemptionStepSnapshot, VaultInterface,
 };
 
@@ -488,7 +488,7 @@ mod benchmarks {
 		)?;
 		let caller: T::AccountId = whitelisted_caller();
 		T::StableAssets::mint_into(stable::<T>(), &caller, balance::<T>(SEED_DEBT * 100))
-			.expect("mint pUSD to repay caller");
+			.expect("mint stablecoin to repay caller");
 		let amount = balance::<T>(SEED_DEBT);
 		T::BenchmarkHelper::advance_time(ONE_HOUR_MS);
 
