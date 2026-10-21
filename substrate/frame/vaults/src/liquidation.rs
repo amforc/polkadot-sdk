@@ -34,7 +34,7 @@ use frame::{
 		DefensiveOption,
 	},
 };
-use pusd_primitives::{
+use stablecoin_primitives::{
 	math::collateral_for_value_ceil, mul_div_floor, reducible_debit, BranchSnapshot, OffsetLegs,
 	StabilityPoolInspect, StabilityPoolOffset,
 };
