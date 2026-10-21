@@ -15,15 +15,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, Error, Event, ListError, Position, PriorityProvider, SortedListInterface};
+use crate::{mock::*, Error, Event, ListError, Position, SortedListInterface};
 use frame::testing_prelude::{
 	assert_err_ignore_postinfo, assert_noop, assert_ok, assert_storage_noop,
 };
 
-/// Pin the authoritative priority via the same trait entry point the
-/// benchmarks use.
+/// Drift the authoritative priority of `item` away from its stored one, so `reprioritize` has
+/// something to correct.
 fn set_real_priority(list_id: ListId, item: ItemId, priority: Priority) {
-	StaticPriorityProvider::set_priority(&list_id, &item, priority);
+	StaticPriorityProvider::pin_priority(list_id, item, priority);
 }
 
 #[test]
@@ -172,9 +172,7 @@ fn re_insert_steps_needed_is_read_only() {
 		insert(1, 1, 100);
 		insert(1, 2, 90);
 		insert(1, 3, 80);
-		assert_storage_noop!({
-			let _ = LinkedList::re_insert_steps_needed(&1, &2, 5, Position::at_head(1));
-		});
+		assert_storage_noop!(LinkedList::re_insert_steps_needed(&1, &2, 5, Position::at_head(1)));
 	});
 }
 
@@ -183,13 +181,9 @@ fn reprioritize_with_hint_beyond_budget_errors() {
 	build_and_execute(|| {
 		// Build a chain longer than `MaxHintRepairSteps` so that a wrong-end
 		// hint cannot reach the correct position.
-		let chain_len = MaxHintRepairSteps::get() + 4;
-		for i in 1..=chain_len {
-			insert(1, u64::from(i), 100u32 - 10 * i + 10);
-		}
+		let tail = u64::from(build_long_chain());
 		// Tail item drifts up to 200; correct position is the head, but the
 		// supplied hint is at the tail and the budget cannot bridge that gap.
-		let tail = u64::from(chain_len);
 		set_real_priority(1, tail, 200);
 		assert_noop!(
 			LinkedList::reprioritize(

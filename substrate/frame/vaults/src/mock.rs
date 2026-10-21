@@ -22,7 +22,10 @@ pub use frame::{
 	testing_prelude::{assert_err, assert_noop, assert_ok, assert_storage_noop, hypothetically},
 };
 use frame::{
-	deps::sp_runtime::traits::{Convert as ConvertTrait, ConvertInto},
+	deps::{
+		frame_support::transactional,
+		sp_runtime::traits::{Convert as ConvertTrait, ConvertInto},
+	},
 	testing_prelude::*,
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
@@ -53,6 +56,9 @@ pub type VaultList = VaultListId<AssetId, StableId>;
 
 /// Default full market administrator.
 pub const ADMIN: AccountId = 100;
+
+/// Oracle price every market is created at unless a test says otherwise.
+pub const DEFAULT_PRICE: FixedU128 = FixedU128::from_u32(10);
 /// Default emergency market administrator.
 pub const EMERGENCY_ADMIN: AccountId = 101;
 /// Account that receives the protocol fee remainder.
@@ -255,9 +261,16 @@ impl pusd_primitives::OnBranchYield<AssetId, Credit<AccountId, VaultStableAssets
 	}
 }
 
+/// The lifecycle hook a [`LifecycleLog`] entry records.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lifecycle {
+	Registered,
+	Deregistered,
+}
+
 parameter_types! {
-	/// Recorded market lifecycle calls.
-	pub static LifecycleLog: Vec<(AssetId, StableId, bool, u32)> = Vec::new();
+	/// Recorded market lifecycle calls, with the stablecoin market count the hook was given.
+	pub static LifecycleLog: Vec<(AssetId, StableId, Lifecycle, u32)> = Vec::new();
 	/// Makes market registration fail in the lifecycle hook.
 	pub static FailOnRegistered: bool = false;
 	/// Makes market removal fail in the lifecycle hook.
@@ -277,7 +290,7 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for Record
 		_funder: &AccountId,
 	) -> DispatchResult {
 		LifecycleLog::mutate(|l| {
-			l.push((collateral_id.clone(), *stable_id, true, stablecoin_markets))
+			l.push((collateral_id.clone(), *stable_id, Lifecycle::Registered, stablecoin_markets))
 		});
 		if FailOnRegistered::get() {
 			return Err(DispatchError::Other("on_registered failure"));
@@ -291,7 +304,12 @@ impl pusd_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for Record
 		_funder: &AccountId,
 	) -> DispatchResult {
 		LifecycleLog::mutate(|l| {
-			l.push((collateral_id.clone(), *stable_id, false, remaining_stablecoin_markets))
+			l.push((
+				collateral_id.clone(),
+				*stable_id,
+				Lifecycle::Deregistered,
+				remaining_stablecoin_markets,
+			))
 		});
 		if FailOnDeregistered::get() {
 			return Err(DispatchError::Other("on_deregistered failure"));
@@ -449,7 +467,19 @@ pub fn new_test_ext() -> TestState {
 				(INSUFFICIENT_ID, 1, false, 1),
 			],
 			metadata: vec![],
-			accounts: vec![],
+			// Native collateral is funded below; these are the issued collaterals. Only the market
+			// creator holds the insufficient asset: an account of one takes a consumer reference,
+			// which changes what that account may spend down to.
+			accounts: (1u64..=10)
+				.chain([ADMIN])
+				.flat_map(|who| {
+					[TOKEN_X_ID, ETH_ID, COLL_C_ID, COLL_D_ID]
+						.map(|asset| (asset, who, 1_000_000_000_000))
+						.into_iter()
+						.chain([(XBT_ID, who, 100_000_000 * XBT_UNIT)])
+				})
+				.chain([(INSUFFICIENT_ID, ADMIN, 1_000_000_000_000)])
+				.collect(),
 			next_asset_id: None,
 			reserves: vec![],
 		},
@@ -470,31 +500,6 @@ pub fn new_test_ext() -> TestState {
 	ext.execute_with(|| {
 		System::set_block_number(1);
 		Timestamp::set_timestamp(1_000);
-		// Native collateral is already funded. Mint the issued assets now.
-		for who in (1u64..=10).chain([ADMIN]) {
-			for asset in [TOKEN_X_ID, ETH_ID, COLL_C_ID, COLL_D_ID] {
-				<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
-					asset,
-					&who,
-					1_000_000_000_000,
-				)
-				.expect("mint issued collateral in test setup");
-			}
-			<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
-				XBT_ID,
-				&who,
-				100_000_000 * XBT_UNIT,
-			)
-			.expect("mint realistic collateral in test setup");
-		}
-		// Only the market creator holds the insufficient asset: an account of one takes a consumer
-		// reference, which changes what that account may spend down to.
-		<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
-			INSUFFICIENT_ID,
-			&ADMIN,
-			1_000_000_000_000,
-		)
-		.expect("mint insufficient collateral in test setup");
 		MockPrices::set(BTreeMap::new());
 		MockOracleAvailable::set(true);
 		LifecycleLog::set(Vec::new());
@@ -556,9 +561,8 @@ pub fn check_stable_supply() {
 		let debt = Branches::<Test>::iter()
 			.filter(|(_, branch_stable, _)| *branch_stable == stable)
 			.map(|(_, _, branch)| signed(branch.state.debt.outstanding()))
-			.fold(0i128, |sum, outstanding| {
-				sum.checked_add(outstanding).expect("debt sum overflow")
-			});
+			.try_fold(0i128, i128::checked_add)
+			.expect("debt sum overflow");
 		let expected = debt
 			.checked_add(external.get(&stable).copied().unwrap_or_default())
 			.expect("expected supply overflow");
@@ -637,26 +641,16 @@ pub fn register_market_with(
 		.expect("set global debt ceiling");
 }
 
-/// Creates a market with default settings and a price of 10.
+/// Creates a market with default settings and [`DEFAULT_PRICE`].
 pub fn register_market(collateral: AssetId, stable: StableId) {
-	register_market_with(
-		collateral,
-		stable,
-		FixedU128::from_rational(10u128, 1u128),
-		default_branch_config(),
-	);
+	register_market_with(collateral, stable, DEFAULT_PRICE, default_branch_config());
 }
 
 /// Creates all ten mock markets without global debt limits.
 pub fn register_ten_markets() {
 	for collateral in [DOT, TOKEN_X, ETH, COLL_C, COLL_D] {
 		for stable in [PUSD, EUSD] {
-			create_market(
-				collateral.clone(),
-				stable,
-				FixedU128::from_rational(10u128, 1u128),
-				default_branch_config(),
-			);
+			create_market(collateral.clone(), stable, DEFAULT_PRICE, default_branch_config());
 		}
 	}
 }
@@ -974,6 +968,7 @@ pub fn redeem_from(
 ///
 /// The credit is issued and consumed inside one transaction layer, so a
 /// rejected settlement rolls the issuance back with the step.
+#[transactional]
 pub fn redeem_step(
 	collateral: AssetId,
 	stable: StableId,
@@ -982,20 +977,13 @@ pub fn redeem_step(
 	debt_to_cancel: Balance,
 	collateral_to_recipient: Balance,
 ) -> DispatchResult {
-	use frame::deps::frame_support::storage::{with_transaction, TransactionOutcome};
-	with_transaction(|| {
-		let result = <Vaults as VaultInterface>::redeem_step(
-			&collateral,
-			&stable,
-			&owner,
-			&recipient,
-			settlement(stable, debt_to_cancel, collateral_to_recipient),
-		);
-		match result {
-			Ok(()) => TransactionOutcome::Commit(Ok(())),
-			Err(error) => TransactionOutcome::Rollback(Err(error)),
-		}
-	})
+	<Vaults as VaultInterface>::redeem_step(
+		&collateral,
+		&stable,
+		&owner,
+		&recipient,
+		settlement(stable, debt_to_cancel, collateral_to_recipient),
+	)
 }
 
 /// Builds a redemption settlement with newly issued stable assets.
@@ -1022,6 +1010,18 @@ pub fn branch_state(
 /// Returns a market's settings, or `None` if it is not registered.
 pub fn branch_config(collateral: AssetId, stable: StableId) -> Option<BranchConfig<Balance>> {
 	Branches::<Test>::get(collateral, stable).map(|branch| branch.config)
+}
+
+/// Returns a registered market's accounting state, failing the calling test if it is absent.
+#[track_caller]
+pub fn market_state(collateral: AssetId, stable: StableId) -> BranchState<AccountId, Balance> {
+	branch_state(collateral, stable).expect("market is registered")
+}
+
+/// Returns a registered market's settings, failing the calling test if it is absent.
+#[track_caller]
+pub fn market_config(collateral: AssetId, stable: StableId) -> BranchConfig<Balance> {
+	branch_config(collateral, stable).expect("market is registered")
 }
 
 /// Updates market state through the pallet's commit path.

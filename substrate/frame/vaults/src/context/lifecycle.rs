@@ -6,7 +6,7 @@ use crate::{
 	recovery,
 	types::{DebtCollateral, LiquidationSnapshot, Vault, VaultStatus},
 };
-use frame::prelude::*;
+use frame::{prelude::*, traits::DefensiveOption};
 use linked_list_interface::{Position as ListPosition, SortedListInterface};
 use pusd_primitives::RedemptionStepSnapshot;
 
@@ -159,15 +159,14 @@ impl<T: Config> VaultOp<T> {
 			.state
 			.vault_count
 			.checked_sub(1)
-			.ok_or(DispatchError::Corruption)?;
+			.defensive_ok_or(DispatchError::Corruption)?;
 		self.ctx.branch.state.release_dormant_target(&self.owner);
-		self.ctx.branch.state.total_collateral = self
-			.ctx
+		self.ctx
 			.branch
 			.state
 			.total_collateral
-			.checked_sub(&collateral_out)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+			.ensure_sub_assign(collateral_out)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		Ok(())
 	}
 
@@ -220,8 +219,11 @@ impl<T: Config> VaultOp<T> {
 		let branch_empties = self.ctx.branch.state.is_empty_of_liability();
 		if branch_empties {
 			ensure!(
-				self.ctx.branch.state.debt.minted_interest.is_zero() &&
-					self.ctx.branch.state.debt.interest_ledger_settled(),
+				self.ctx.branch.state.debt.minted_interest.is_zero(),
+				DispatchError::Corruption
+			);
+			ensure!(
+				self.ctx.branch.state.debt.interest_ledger_settled(),
 				DispatchError::Corruption
 			);
 			// Neither the aggregate remainder nor interest charged ahead of it has a liability

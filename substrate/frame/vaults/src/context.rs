@@ -8,7 +8,7 @@ mod lifecycle;
 use crate::{
 	pallet::{
 		BalanceOf, BranchOf, CollateralIdOf, Config, Error, Event, HoldReason, Millis, Pallet,
-		StableCreditOf, StableIdOf, Vaults,
+		StableCreditOf, StableIdOf, VaultListIdOf, Vaults,
 	},
 	types::{DebtBreakdown, DebtCollateral, Vault, VaultListId, VaultRecord, VaultStatus},
 	utility_impls::{BranchContribution, Issuance},
@@ -110,7 +110,7 @@ impl<T: Config> Context<T> {
 	}
 
 	/// Returns the rate-list ID for this market.
-	fn rate_list(&self) -> VaultListId<CollateralIdOf<T>, StableIdOf<T>> {
+	fn rate_list(&self) -> VaultListIdOf<T> {
 		VaultListId::Rate(self.collateral_id.clone(), self.stable_id.clone())
 	}
 
@@ -221,9 +221,7 @@ impl<T: Config> Context<T> {
 		let price = self.price()?;
 		let pre_tcr = collateralization_ratio(&self.tcr_baseline, price)?;
 		let post_tcr = self.post_tcr()?;
-		if self.branch.state.is_frozen() {
-			return Err(Error::<T>::BranchFrozen.into());
-		}
+		self.ensure_not_frozen()?;
 		if pre_tcr < self.branch.config.safety_collateralization_ratio {
 			ensure!(post_tcr >= pre_tcr, Error::<T>::SafetyModeTcrWorsening);
 		} else {
@@ -274,13 +272,11 @@ impl<T: Config> Context<T> {
 			self.now,
 		);
 		let upfront_fee = self.apply_checked_borrow(&mut vault, initial_debt, annual_rate)?;
-		let total_collateral = self
-			.branch
+		self.branch
 			.state
 			.total_collateral
-			.checked_add(&initial_collateral)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
-		self.branch.state.total_collateral = total_collateral;
+			.ensure_add_assign(initial_collateral)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		// The vault is announced before its fee, so a reader of the events never sees a charge
 		// against a vault it does not know yet.
 		Pallet::<T>::deposit_event(Event::VaultOpened {
@@ -343,7 +339,7 @@ impl<T: Config> Context<T> {
 			return;
 		}
 		debug_assert!(self.pending_fee.is_zero(), "one upfront fee per dispatch");
-		self.pending_fee = self.pending_fee.saturating_add(amount);
+		self.pending_fee.saturating_accrue(amount);
 		Pallet::<T>::deposit_event(Event::UpfrontFeeCharged {
 			collateral_id: self.collateral_id.clone(),
 			stable_id: self.stable_id.clone(),
@@ -360,10 +356,9 @@ impl<T: Config> Context<T> {
 		let status = Pallet::<T>::vault_status_of(&self.collateral_id, &self.stable_id, owner);
 		let (pending, interest_to_mint) =
 			Pallet::<T>::apply_vault_touch(&mut self.branch.state, &mut vault, status, self.now)?;
-		self.pending_interest_mint = self
-			.pending_interest_mint
-			.checked_add(&interest_to_mint)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		self.pending_interest_mint
+			.ensure_add_assign(interest_to_mint)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		// Rounding the vault's interest up can add a unit the aggregate did not project. That unit
 		// is the protocol's, so the baseline takes it and the operation answers only for its own
 		// change.
@@ -401,12 +396,11 @@ impl<T: Config> Context<T> {
 		vault: Vault<BalanceOf<T>>,
 		deposit: T::VaultConsideration,
 	) -> Result<VaultOp<T>, DispatchError> {
-		self.branch.state.vault_count = self
-			.branch
+		self.branch
 			.state
 			.vault_count
-			.checked_add(1)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+			.ensure_add_assign(1)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		let mut op = VaultOp {
 			ctx: self,
 			owner: owner.clone(),
@@ -522,7 +516,7 @@ impl<T: Config> VaultOp<T> {
 		Ok(false)
 	}
 
-	fn rate_list(&self) -> VaultListId<CollateralIdOf<T>, StableIdOf<T>> {
+	fn rate_list(&self) -> VaultListIdOf<T> {
 		self.ctx.rate_list()
 	}
 
@@ -546,15 +540,15 @@ impl<T: Config> VaultOp<T> {
 		let vault_collateral = self
 			.vault
 			.collateral
-			.checked_add(&amount)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+			.ensure_add(amount)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		let branch_collateral = self
 			.ctx
 			.branch
 			.state
 			.total_collateral
-			.checked_add(&amount)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+			.ensure_add(amount)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		self.vault.collateral = vault_collateral;
 		self.ctx.branch.state.total_collateral = branch_collateral;
 		self.sync_stake_from(before)?;
@@ -567,15 +561,15 @@ impl<T: Config> VaultOp<T> {
 		let vault_collateral = self
 			.vault
 			.collateral
-			.checked_sub(&amount)
-			.ok_or(Error::<T>::InsufficientCollateral)?;
+			.ensure_sub(amount)
+			.map_err(|_| Error::<T>::InsufficientCollateral)?;
 		let branch_collateral = self
 			.ctx
 			.branch
 			.state
 			.total_collateral
-			.checked_sub(&amount)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
+			.ensure_sub(amount)
+			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		self.vault.collateral = vault_collateral;
 		self.ctx.branch.state.total_collateral = branch_collateral;
 		self.sync_stake_from(before)?;
