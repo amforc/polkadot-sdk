@@ -9,9 +9,9 @@ use crate::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Pallet, Pools, StabilityPoolOf,
 		StableCreditOf, StableIdOf,
 	},
-	types::{Leg, LegCoords},
+	types::Leg,
 };
-use frame::{prelude::*, traits::tokens::Preservation};
+use frame::prelude::*;
 use pusd_primitives::{
 	BranchMode, BranchSnapshot, OffsetLegs, OnBranchYield, StabilityPoolInspect,
 	StabilityPoolOffset,
@@ -42,18 +42,19 @@ impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T
 		if let Err(leftover) = remainder.subsume(leftover) {
 			// Both halves came from one credit, so they cannot disagree. Burning the leftover
 			// keeps issuance on the conservative side.
-			debug_assert!(false, "yield credit halves diverged");
+			defensive!("yield credit halves diverged");
 			drop(leftover);
 		}
 		remainder
 	}
 }
 
-/// Exact debt amount of one offset leg and its validated asset-preservation rule.
+/// Exact debt amount of one offset leg, validated against the pool custody.
+///
+/// Every reservation withdraws under `Preservation::Preserve`; see [`PoolCustody`].
 #[derive(Clone, Copy)]
 pub(crate) struct OffsetReservation<Balance> {
 	pub(crate) debt: Balance,
-	pub(crate) preservation: Preservation,
 }
 
 impl<T: Config> Pallet<T> {
@@ -66,9 +67,10 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		mode: BranchMode,
 	) -> Option<StabilityPoolOf<T>> {
-		match mode {
-			BranchMode::Normal | BranchMode::Safety => Pools::<T>::get(collateral_id, stable_id),
-			BranchMode::Frozen => None,
+		if mode.is_frozen() {
+			None
+		} else {
+			Pools::<T>::get(collateral_id, stable_id)
 		}
 	}
 
@@ -101,10 +103,10 @@ impl<T: Config> Pallet<T> {
 		if requested.is_zero() {
 			return Ok(None);
 		}
-		let (debt, preservation) = Self::size_offset(pool, custody, leg, requested, reserved)
+		let debt = Self::size_offset(pool, custody, leg, requested, reserved)
 			.ok_or(crate::Error::<T>::OffsetSettlementFailed)?;
 		ensure!(debt == requested, crate::Error::<T>::OffsetSettlementFailed);
-		Ok(Some(OffsetReservation { debt, preservation }))
+		Ok(Some(OffsetReservation { debt }))
 	}
 }
 
@@ -131,7 +133,7 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 	fn quote_active(quote: &OffsetQuote<T>, max_debt: BalanceOf<T>) -> BalanceOf<T> {
 		let reserved = BalanceOf::<T>::zero();
 		Self::size_offset(&quote.pool, &quote.custody, Leg::Active, max_debt, reserved)
-			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+			.unwrap_or_default()
 	}
 
 	fn quote_pending(
@@ -140,7 +142,7 @@ impl<T: Config> StabilityPoolInspect<CollateralIdOf<T>, StableIdOf<T>, BalanceOf
 		active_debt: BalanceOf<T>,
 	) -> BalanceOf<T> {
 		Self::size_offset(&quote.pool, &quote.custody, Leg::Pending, max_debt, active_debt)
-			.map_or_else(BalanceOf::<T>::zero, |(debt, _)| debt)
+			.unwrap_or_default()
 	}
 }
 
@@ -190,7 +192,7 @@ impl<T: Config>
 
 		// Each leg records its own accounting, then the value moves once for both: one stablecoin
 		// withdrawal of the summed debt and one collateral deposit of the merged credits. The
-		// pending `Preservation` was sized behind the active debt, so it already covers the sum.
+		// pending leg was sized behind the active debt, so the one custody read covers the sum.
 		let active = Self::record_offset(
 			collateral_id,
 			stable_id,
@@ -207,10 +209,7 @@ impl<T: Config>
 			pending,
 			collateral.pending,
 		)?;
-		let leg_coords = |taken: bool, leg| {
-			let coords = pool.state.coords(leg);
-			taken.then_some(LegCoords { epoch: coords.epoch, scale: coords.scale })
-		};
+		let leg_coords = |taken: bool, leg| taken.then_some(pool.state.coords(leg).position());
 		Self::deposit_event(crate::Event::OffsetApplied {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),

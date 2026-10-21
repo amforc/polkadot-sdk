@@ -152,27 +152,23 @@ pub mod pallet {
 	use pusd_primitives::{BranchInterface, Millis, OnBranchLifecycle, RecoveryOffsetInterface};
 
 	/// Balance type shared by the stablecoin and collateral asset systems.
-	pub type BalanceOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
-		<T as frame_system::Config>::AccountId,
-	>>::Balance;
+	pub type BalanceOf<T> =
+		<<T as Config>::StableAssets as fungibles::Inspect<AccountIdFor<T>>>::Balance;
 
 	/// Collateral identifier from [`Config::CollateralAssets`].
-	pub type CollateralIdOf<T> = <<T as Config>::CollateralAssets as fungibles::Inspect<
-		<T as frame_system::Config>::AccountId,
-	>>::AssetId;
+	pub type CollateralIdOf<T> =
+		<<T as Config>::CollateralAssets as fungibles::Inspect<AccountIdFor<T>>>::AssetId;
 
 	/// Stablecoin identifier from [`Config::StableAssets`].
-	pub type StableIdOf<T> = <<T as Config>::StableAssets as fungibles::Inspect<
-		<T as frame_system::Config>::AccountId,
-	>>::AssetId;
+	pub type StableIdOf<T> =
+		<<T as Config>::StableAssets as fungibles::Inspect<AccountIdFor<T>>>::AssetId;
 
 	/// Stablecoin credit that the pallet must resolve or burn.
-	pub type StableCreditOf<T> =
-		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::StableAssets>;
+	pub type StableCreditOf<T> = fungibles::Credit<AccountIdFor<T>, <T as Config>::StableAssets>;
 
 	/// Collateral credit that the pallet must resolve or burn.
 	pub type CollateralCreditOf<T> =
-		fungibles::Credit<<T as frame_system::Config>::AccountId, <T as Config>::CollateralAssets>;
+		fungibles::Credit<AccountIdFor<T>, <T as Config>::CollateralAssets>;
 
 	/// Deposit position of one account in one market.
 	pub type DepositOf<T> = Deposit<BalanceOf<T>>;
@@ -292,7 +288,7 @@ pub mod pallet {
 			NMapKey<Twox64Concat, u32>,
 		),
 		PoolSums,
-		ValueQuery,
+		OptionQuery,
 	>;
 
 	/// Activation boundary of each completed maturity cohort.
@@ -675,7 +671,7 @@ pub mod pallet {
 			stable_id: StableIdOf<T>,
 			max_stable_in: BalanceOf<T>,
 		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			Self::do_offset_recovery(collateral_id, stable_id, max_stable_in)
 		}
 
@@ -723,7 +719,7 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+			ensure_signed(origin)?;
 			Self::do_settle_deposit(owner, collateral_id, stable_id)
 		}
 
@@ -882,8 +878,11 @@ pub mod pallet {
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			ensure!(
-				T::StableAssets::balance(stable_id.clone(), &pool_account).is_zero() &&
-					T::CollateralAssets::balance(collateral_id.clone(), &pool_account).is_zero(),
+				T::StableAssets::balance(stable_id.clone(), &pool_account).is_zero(),
+				Error::<T>::PoolAccountNotEmpty
+			);
+			ensure!(
+				T::CollateralAssets::balance(collateral_id.clone(), &pool_account).is_zero(),
 				Error::<T>::PoolAccountNotEmpty
 			);
 
@@ -928,8 +927,7 @@ pub mod pallet {
 				Error::<T>::PoolNotEmpty
 			);
 
-			let pool =
-				Pools::<T>::get(collateral_id, stable_id).ok_or(Error::<T>::PoolNotRegistered)?;
+			let pool = Self::load_pool(collateral_id, stable_id)?;
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			let (stable_amount, collateral_amount) =
 				Self::release_custody(collateral_id, stable_id, &pool_account, &pool, funder)?;
@@ -962,7 +960,9 @@ pub mod pallet {
 				// The release emptied the market's own assets, but a third party may have parked
 				// another token here and left a consumer reference behind. The account then stays,
 				// which does no harm.
-				let _ = frame_system::Pallet::<T>::dec_providers(&pool_account);
+				if frame_system::Pallet::<T>::can_dec_provider(&pool_account) {
+					frame_system::Pallet::<T>::dec_providers(&pool_account)?;
+				}
 			}
 			Ok(())
 		}
