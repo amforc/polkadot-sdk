@@ -16,7 +16,7 @@ fn distribute_to_empty_pool_returns_the_credit() {
 		// A registered pool with nothing active has no denominator to share over, so nothing
 		// is written. `yield_distribution_routes_by_the_credits_own_asset` owns the
 		// unregistered market.
-		assert_yield_declined(DOT, PUSD, 100);
+		assert_yield_declined(DOT, STABLE, 100);
 	});
 }
 
@@ -25,19 +25,19 @@ fn distribute_updates_g_exactly() {
 	build_with_default_market(|| {
 		seed_matured_deposit_from_balance(1, 10_000, 1_000);
 
-		assert_eq!(distribute_yield_leftover(DOT, PUSD, 100), 0);
+		assert_eq!(distribute_yield_leftover(DOT, STABLE, 100), 0);
 
 		// delta_G = floor(100 * P / A) = floor(100 * 1e18 / 1000) = 1e17.
 		let sums = active_sums(0, 0);
 		assert_eq!(sums.g_yield, FixedU128::from_rational(1, 10));
 
-		let state = pool_state(DOT, PUSD);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.total_yield_unclaimed, 100);
 		// Pool holds the 1000 active plus the 100 undistributed yield.
-		assert_eq!(pool_stable_held(DOT, PUSD), 1_100);
+		assert_eq!(pool_stable_held(DOT, STABLE), 1_100);
 
 		System::assert_last_event(
-			crate::Event::YieldDistributed { collateral_id: DOT, stable_id: PUSD, amount: 100 }
+			crate::Event::YieldDistributed { collateral_id: DOT, stable_id: STABLE, amount: 100 }
 				.into(),
 		);
 	});
@@ -58,14 +58,14 @@ fn flooring_dust_accumulates_until_teardown() {
 		assert_claim_yield(2, 79);
 		// 100 - 19 - 79 = 2 units of flooring dust stay pool-owned, keeping
 		// the balance identity exact.
-		assert_eq!(pool_state(DOT, PUSD).total_yield_unclaimed, 2);
+		assert_eq!(pool_state(DOT, STABLE).total_yield_unclaimed, 2);
 
 		// Live-market interactions do not redistribute the residue: no flow
 		// reads it back, so later distributions add their own remainder.
 		distribute_all_yield(100);
-		assert_ok!(claim_yield(1, DOT, PUSD, 1));
-		assert_ok!(claim_yield(2, DOT, PUSD, 2));
-		assert_eq!(pool_state(DOT, PUSD).total_yield_unclaimed, 4);
+		assert_ok!(claim_yield(1, DOT, STABLE, 1));
+		assert_ok!(claim_yield(2, DOT, STABLE, 2));
+		assert_eq!(pool_state(DOT, STABLE).total_yield_unclaimed, 4);
 		// It backs the pool-balance identity until all depositor rows are gone
 		// and branch teardown sweeps it through `StableDustHandler`. The node
 		// runtime routes that terminal residue to Treasury; governance.rs pins
@@ -93,7 +93,7 @@ fn late_depositor_earns_only_after_their_snapshot() {
 		// the second). User 2: floor(400 * (0.2 - 0.1)) = 40.
 		assert_claim_yield(1, 120);
 		assert_claim_yield(2, 40);
-		assert_eq!(pool_state(DOT, PUSD).total_yield_unclaimed, 0);
+		assert_eq!(pool_state(DOT, STABLE).total_yield_unclaimed, 0);
 	});
 }
 
@@ -104,16 +104,16 @@ fn compound_moves_yield_into_active_and_it_earns() {
 		distribute_all_yield(60);
 
 		// Asking for more than the 60 claimable compounds exactly the 60.
-		assert_ok!(compound(1, DOT, PUSD, 1_000));
+		assert_ok!(compound(1, DOT, STABLE, 1_000));
 
-		let row = deposit_row(DOT, PUSD, 1).expect("row exists");
+		let row = deposit_row(DOT, STABLE, 1).expect("row exists");
 		assert_eq!(row.active_deposit, 660);
 		assert_eq!(row.claimable_yield, 0);
-		let state = pool_state(DOT, PUSD);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.total_active_deposits, 660);
 		assert_eq!(state.total_yield_unclaimed, 0);
 		// Pure accounting: the pool balance did not move.
-		assert_eq!(pool_stable_held(DOT, PUSD), 660);
+		assert_eq!(pool_stable_held(DOT, STABLE), 660);
 		System::assert_last_event(market_event!(YieldCompounded { depositor: 1, amount: 60 }));
 
 		// The compounded amount earns from here on: G moves by 66/660 = 0.1
@@ -128,10 +128,10 @@ fn compound_with_nothing_claimable_reverts() {
 	build_with_default_market(|| {
 		seed_matured_deposit_from_balance(1, 10_000, 600);
 
-		assert_noop!(compound(1, DOT, PUSD, 60), Error::<Test>::NoYieldToCompound);
+		assert_noop!(compound(1, DOT, STABLE, 60), Error::<Test>::NoYieldToCompound);
 		// A zero request is equally nothing to compound.
 		distribute_all_yield(60);
-		assert_noop!(compound(1, DOT, PUSD, 0), Error::<Test>::NoYieldToCompound);
+		assert_noop!(compound(1, DOT, STABLE, 0), Error::<Test>::NoYieldToCompound);
 	});
 }
 
@@ -144,31 +144,31 @@ fn vault_interest_flows_to_pool_through_the_hook() {
 		// upfront fee; the fee's 75% share floors to zero, so the whole
 		// unit routes to the fee destination).
 		mint_collateral(DOT, 5, 2_000);
-		assert_ok!(open_vault(5, DOT, PUSD, 1_000, 499));
-		assert_eq!(vault_debt(DOT, PUSD, 5), 500);
-		assert_eq!(stable_balance(PUSD, FEE_DEST), 1);
+		assert_ok!(open_vault(5, DOT, STABLE, 1_000, 499));
+		assert_eq!(vault_debt(DOT, STABLE, 5), 500);
+		assert_eq!(stable_balance(STABLE, FEE_DEST), 1);
 
 		// One exact year of interest, minted on the next branch touch
 		// (opening a second vault, whose own upfront fee is another unit
 		// for the fee destination). Interest accrues on the 499 principal
 		// at the floor-derived weighted rate — weighted sum
 		// floor(499 * 0.05) = 24 — so exactly 24 mints.
-		advance_time(pusd_primitives::MILLIS_PER_YEAR);
+		advance_time(stablecoin_primitives::MILLIS_PER_YEAR);
 		mint_collateral(DOT, 6, 2_000);
-		assert_ok!(open_vault(6, DOT, PUSD, 1_000, 499));
+		assert_ok!(open_vault(6, DOT, STABLE, 1_000, 499));
 
 		// The hook split the 24: floor(75% * 24) = 18 to the pool; the
 		// 6 remainder plus the two upfront fees (1 + 1) go to the fee
 		// destination.
-		let state = pool_state(DOT, PUSD);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.total_yield_unclaimed, 18);
 		let sums = active_sums(0, 0);
 		// delta_G = floor(18 * 1e18 / 400) = 4.5e16.
 		assert_eq!(sums.g_yield, FixedU128::from_rational(45, 1_000));
-		assert_eq!(pool_stable_held(DOT, PUSD), 418);
-		assert_eq!(stable_balance(PUSD, FEE_DEST), 8);
+		assert_eq!(pool_stable_held(DOT, STABLE), 418);
+		assert_eq!(stable_balance(STABLE, FEE_DEST), 8);
 		System::assert_has_event(
-			crate::Event::YieldDistributed { collateral_id: DOT, stable_id: PUSD, amount: 18 }
+			crate::Event::YieldDistributed { collateral_id: DOT, stable_id: STABLE, amount: 18 }
 				.into(),
 		);
 
@@ -188,7 +188,7 @@ fn pending_deposits_earn_no_yield() {
 
 		// The whole distribution went to the 600 active: G = 0.1. User 2 remains pending and has
 		// no yield to claim.
-		assert_noop!(claim_yield(2, DOT, PUSD, 2), Error::<Test>::NoClaimableYield);
+		assert_noop!(claim_yield(2, DOT, STABLE, 2), Error::<Test>::NoClaimableYield);
 
 		assert_claim_yield(1, 60);
 	});
@@ -201,25 +201,29 @@ fn pending_deposits_earn_no_yield() {
 #[test]
 fn capital_changing_calls_issue_pending_branch_interest_first() {
 	let calls: [fn() -> DispatchResult; 5] = [
-		|| deposit(2, DOT, PUSD, 400),
-		|| withdraw(1, DOT, PUSD, 400, 1),
-		|| request_withdraw(1, DOT, PUSD, 400),
-		|| claim_yield(1, DOT, PUSD, 1),
-		|| compound(1, DOT, PUSD, 100),
+		|| deposit(2, DOT, STABLE, 400),
+		|| withdraw(1, DOT, STABLE, 400, 1),
+		|| request_withdraw(1, DOT, STABLE, 400),
+		|| claim_yield(1, DOT, STABLE, 1),
+		|| compound(1, DOT, STABLE, 100),
 	];
 	for call in calls {
 		build_with_default_market(|| {
 			seed_matured_deposit_from_balance(1, 10_000, 400);
-			mint_stable(PUSD, 2, 10_000);
+			mint_stable(STABLE, 2, 10_000);
 			mint_collateral(DOT, 5, 2_000);
-			assert_ok!(open_vault(5, DOT, PUSD, 1_000, 499));
-			advance_time(pusd_primitives::MILLIS_PER_YEAR);
+			assert_ok!(open_vault(5, DOT, STABLE, 1_000, 499));
+			advance_time(stablecoin_primitives::MILLIS_PER_YEAR);
 
 			assert_ok!(call());
 
 			System::assert_has_event(
-				crate::Event::YieldDistributed { collateral_id: DOT, stable_id: PUSD, amount: 18 }
-					.into(),
+				crate::Event::YieldDistributed {
+					collateral_id: DOT,
+					stable_id: STABLE,
+					amount: 18,
+				}
+				.into(),
 			);
 			// delta_G = floor(18 * 1e18 / 400): spread over the 400 active before the call.
 			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(45, 1_000));

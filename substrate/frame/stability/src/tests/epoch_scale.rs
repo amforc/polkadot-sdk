@@ -7,7 +7,7 @@
 //! `total_supply / 1e18` is enough.
 
 use crate::mock::*;
-use pusd_primitives::StabilityPoolInspect;
+use stablecoin_primitives::StabilityPoolInspect;
 
 #[test]
 fn full_depletion_pays_old_epoch_and_starts_fresh() {
@@ -17,15 +17,15 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		// Yield before the depletion: G(0,0) = 100/1000 = 0.1.
 		distribute_all_yield(100);
 
-		assert_eq!(simulate_offset(DOT, PUSD, 1_000, 800).debt(), 1_000);
+		assert_eq!(simulate_offset(DOT, STABLE, 1_000, 800).debt(), 1_000);
 
-		let state = pool_state(DOT, PUSD);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.coords, Accumulators { p: FixedU128::one(), epoch: 1, scale: 0 });
 		assert_eq!(state.total_active_deposits, 0);
 		// The old epoch's sums row keeps the gains, delta_S = 800 * (1/1000) = 0.8, and the new
 		// epoch's row is seeded empty.
 		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(8, 10));
-		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 1u32, 0u32)));
+		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, STABLE, Leg::Active, 1u32, 0u32)));
 		assert_eq!(active_sums(1, 0), PoolSums::default());
 
 		// Old-epoch depositors realize to zero active but keep their epoch's gains — normalized
@@ -36,8 +36,8 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		assert_claim_yield(1, 60);
 		assert_claim_yield(2, 40);
 		// The emptied rows are gone.
-		assert!(deposit_row(DOT, PUSD, 1).is_none());
-		assert!(deposit_row(DOT, PUSD, 2).is_none());
+		assert!(deposit_row(DOT, STABLE, 1).is_none());
+		assert!(deposit_row(DOT, STABLE, 2).is_none());
 
 		// A fresh epoch-1 depositor is untouched by epoch-0 history. Yield on epoch 1:
 		// G(1,0) = 50/500 = 0.1. The 250 debt seizes 250 / 1.25 = 200 collateral at the
@@ -45,13 +45,13 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		// delta_S(1,0) = 200 * (1/500) = 0.4.
 		seed_matured_deposit(3, 500);
 		distribute_all_yield(50);
-		assert_eq!(simulate_offset(DOT, PUSD, 250, 200).debt(), 250);
+		assert_eq!(simulate_offset(DOT, STABLE, 250, 200).debt(), 250);
 		// gain = (500/1) * 0.4 = 200; yield = floor(500 * 0.1) = 50; compounded = (500/1) * 0.5
 		// = 250.
 		assert_claim_collateral(3, 200);
 		assert_claim_yield(3, 50);
-		assert_ok!(withdraw(3, DOT, PUSD, 1_000, 3));
-		assert_eq!(stable_balance(PUSD, 3), 300);
+		assert_ok!(withdraw(3, DOT, STABLE, 1_000, 3));
+		assert_eq!(stable_balance(STABLE, 3), 300);
 
 		// Collateral 480 + 320 + 200 = 1000 and yield 60 + 40 + 50 = 150: nothing stranded across
 		// the epoch boundary.
@@ -71,21 +71,21 @@ fn full_depletion_at_a_compounded_p_closes_the_epoch() {
 		seed_matured_deposit(1, 1_000);
 
 		// 1_000 → 600 gives P = 0.6, then 600 → 420 gives P = 0.6 * 0.7 = 0.42.
-		assert_eq!(simulate_offset(DOT, PUSD, 400, 0).debt(), 400);
-		assert_eq!(simulate_offset(DOT, PUSD, 180, 0).debt(), 180);
-		assert_eq!(pool_state(DOT, PUSD).coords.p, FixedU128::from_rational(42, 100));
+		assert_eq!(simulate_offset(DOT, STABLE, 400, 0).debt(), 400);
+		assert_eq!(simulate_offset(DOT, STABLE, 180, 0).debt(), 180);
+		assert_eq!(pool_state(DOT, STABLE).coords.p, FixedU128::from_rational(42, 100));
 
 		// The depositor this follows joins at P = 0.42 with 600, and a third tops the pool up to
 		// 1_500.
 		seed_matured_deposit(2, 600);
 		seed_matured_deposit(3, 480);
-		assert_eq!(Stability::quote_active(&market_quote(&DOT, &PUSD), 1_500), 1_500);
-		let epoch_before = pool_state(DOT, PUSD).coords.epoch;
+		assert_eq!(Stability::quote_active(&market_quote(&DOT, &STABLE), 1_500), 1_500);
+		let epoch_before = pool_state(DOT, STABLE).coords.epoch;
 
 		// Deplete: S rises by 900 * 0.42 / 1_500 = 0.252 on the closing epoch, which is where
 		// the gains stay claimable from, and the new epoch starts from zeroed sums.
-		assert_eq!(simulate_offset(DOT, PUSD, 1_500, 900).debt(), 1_500);
-		let state = pool_state(DOT, PUSD);
+		assert_eq!(simulate_offset(DOT, STABLE, 1_500, 900).debt(), 1_500);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(
 			state.coords,
@@ -111,15 +111,15 @@ fn scale_crossing_preserves_older_deposits() {
 		// Offset all but 100: the survival ratio 1e-11 pushes P below p_min
 		// once, so it crosses one scale:
 		// P = floor(1e18 * 1e9 * 100 / 1e13) = 1e16 (0.01), scale 1.
-		let offset = simulate_offset(DOT, PUSD, unit - 100, 5_000_000_000_000);
+		let offset = simulate_offset(DOT, STABLE, unit - 100, 5_000_000_000_000);
 		assert_eq!(offset.debt(), unit - 100);
-		let state = pool_state(DOT, PUSD);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(
 			state.coords,
 			Accumulators { p: FixedU128::from_rational(1, 100), epoch: 0, scale: 1 }
 		);
 		assert_eq!(state.total_active_deposits, 100);
-		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, PUSD, Leg::Active, 0u32, 1u32)));
+		assert!(crate::PoolSumsStore::<Test>::contains_key((DOT, STABLE, Leg::Active, 0u32, 1u32)));
 		System::assert_has_event(market_event!(OffsetApplied {
 			active: Some(crate::types::LegCoords { epoch: 0, scale: 1 }),
 			pending: None,
@@ -128,7 +128,7 @@ fn scale_crossing_preserves_older_deposits() {
 		// A second offset on the new scale leaves 50 of the 100:
 		// delta_S(0,1) = 40 * (0.01/100) = 4e-3 (inner 4e15),
 		// P = floor(1e16 * 50 / 100) = 5e15.
-		assert_eq!(simulate_offset(DOT, PUSD, 50, 40).debt(), 50);
+		assert_eq!(simulate_offset(DOT, STABLE, 50, 40).debt(), 50);
 
 		// The scale-0 deposit realizes one scale behind: each scale
 		// crossed adds a `scale_factor` divisor, so
@@ -136,12 +136,12 @@ fn scale_crossing_preserves_older_deposits() {
 		// gain = (D0/P0) * (delta_S(0,0) + delta_S(0,1) / sf)
 		//      = 1e13 * (0.5 + 4e-3/1e9) = 5_000_000_000_000 + 40.
 		assert_claim_collateral(1, 5_000_000_000_040);
-		assert_eq!(pool_state(DOT, PUSD).total_collateral_gains_unclaimed, 0);
+		assert_eq!(pool_state(DOT, STABLE).total_collateral_gains_unclaimed, 0);
 		// Nearly the whole 1e13 deposit has been offset away by now; only the
 		// compounded 50 remains to withdraw.
-		assert_ok!(withdraw(1, DOT, PUSD, unit, 1));
-		assert_eq!(stable_balance(PUSD, 1), 50);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
+		assert_ok!(withdraw(1, DOT, STABLE, unit, 1));
+		assert_eq!(stable_balance(STABLE, 1), 50);
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 0);
 	});
 }
 
@@ -154,9 +154,9 @@ fn deposit_two_scales_behind_realizes_through_the_squared_divisor() {
 
 		// Leaving 5 of 1e19 is a survival ratio of 5e-19 < 1e-18: two
 		// crossings in one offset, P = floor(1e36 * 5 / 1e19) = 5e17 (0.5).
-		let offset = simulate_offset(DOT, PUSD, unit - 5, 8_000_000_000_000_000_000);
+		let offset = simulate_offset(DOT, STABLE, unit - 5, 8_000_000_000_000_000_000);
 		assert_eq!(offset.debt(), unit - 5);
-		let state = pool_state(DOT, PUSD);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(
 			state.coords,
 			Accumulators { p: FixedU128::from_rational(1, 2), epoch: 0, scale: 2 }
@@ -169,11 +169,11 @@ fn deposit_two_scales_behind_realizes_through_the_squared_divisor() {
 		// stranded. The window gains survive alongside:
 		// gain = (D0/P0) * delta_S(0,0) = 1e19 * 0.8 = 8e18.
 		assert_claim_collateral(1, 8_000_000_000_000_000_000);
-		assert_ok!(withdraw(1, DOT, PUSD, unit, 1));
-		assert_eq!(stable_balance(PUSD, 1), 5);
+		assert_ok!(withdraw(1, DOT, STABLE, unit, 1));
+		assert_eq!(stable_balance(STABLE, 1), 5);
 		// The emptied row is gone and the aggregate holds no dust.
-		assert!(deposit_row(DOT, PUSD, 1).is_none());
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
+		assert!(deposit_row(DOT, STABLE, 1).is_none());
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 0);
 	});
 }
 
@@ -188,7 +188,7 @@ fn offset_beyond_supported_precision_steps_aside_untouched() {
 		// floor(1e36 * 1 / 1e28) = 1e8 < p_min even at the cap. Sizing already accounts for
 		// the precision limit, so the quote is zero and no caller allocates collateral to a burn
 		// the pool could not record.
-		let quote = market_quote(&DOT, &PUSD);
+		let quote = market_quote(&DOT, &STABLE);
 		assert_eq!(Stability::quote_active(&quote, unit - 1), 0);
 		// Precision is the only limit in the way: the full depletion one unit further resets
 		// `P` instead of shrinking it, and quotes whole.
@@ -197,7 +197,7 @@ fn offset_beyond_supported_precision_steps_aside_untouched() {
 		// The caller steps aside on the zero quote before any value moves, so there is nothing
 		// to roll back.
 		assert_storage_noop!(assert_eq!(
-			simulate_offset(DOT, PUSD, unit - 1, unit),
+			simulate_offset(DOT, STABLE, unit - 1, unit),
 			SimulatedOffset { active: 0, pending: 0, leftover: unit }
 		));
 	});

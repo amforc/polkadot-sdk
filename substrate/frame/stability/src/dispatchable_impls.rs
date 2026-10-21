@@ -30,7 +30,7 @@ use frame::{
 		Defensive, DefensiveOption, DefensiveSaturating, Time,
 	},
 };
-use pusd_primitives::{
+use stablecoin_primitives::{
 	debit_preservation, BranchInterface, BranchMode, BranchSnapshot, Millis,
 	RecoveryOffsetInterface, RecoveryOffsetResult,
 };

@@ -2,7 +2,7 @@
 //! how `P` shrinks, and why none of it disturbs the yield already recorded in `G`.
 
 use crate::{mock::*, Error};
-use pusd_primitives::{
+use stablecoin_primitives::{
 	BranchMode, BranchSnapshot, OffsetLegs, StabilityPoolInspect, StabilityPoolOffset,
 };
 
@@ -14,11 +14,11 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 
 		// 500 debt seizes 500 / 1.25 = 400 collateral at the registration
 		// price.
-		let offset = simulate_offset(DOT, PUSD, 500, 400);
+		let offset = simulate_offset(DOT, STABLE, 500, 400);
 		assert_eq!(offset.debt(), 500);
 		assert_eq!(offset.leftover, 0);
 
-		let state = pool_state(DOT, PUSD);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.total_active_deposits, 500);
 		// P = 1 * (1000 - 500) / 1000 = 0.5.
 		assert_eq!(state.coords.p, FixedU128::from_rational(1, 2));
@@ -28,8 +28,8 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 		assert_eq!(sums.s_collateral, FixedU128::from_rational(4, 10));
 
 		// 500 of the pool's 1000 stablecoin was burned.
-		assert_eq!(pool_stable_held(DOT, PUSD), 500);
-		assert_eq!(pool_collateral_held(DOT, PUSD), 400);
+		assert_eq!(pool_stable_held(DOT, STABLE), 500);
+		assert_eq!(pool_collateral_held(DOT, STABLE), 400);
 
 		System::assert_has_event(market_event!(OffsetApplied {
 			active: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
@@ -40,10 +40,10 @@ fn offset_burns_debt_and_distributes_gains_proportionally() {
 		// Gains: floor(600 * 0.4) = 240; floor(400 * 0.4) = 160.
 		assert_claim_collateral(1, 240);
 		assert_claim_collateral(2, 160);
-		assert_ok!(withdraw(1, DOT, PUSD, 1_000, 1));
-		assert_eq!(stable_balance(PUSD, 1), 300);
-		assert_ok!(withdraw(2, DOT, PUSD, 1_000, 2));
-		assert_eq!(stable_balance(PUSD, 2), 200);
+		assert_ok!(withdraw(1, DOT, STABLE, 1_000, 1));
+		assert_eq!(stable_balance(STABLE, 1), 300);
+		assert_ok!(withdraw(2, DOT, STABLE, 1_000, 2));
+		assert_eq!(stable_balance(STABLE, 2), 200);
 	});
 }
 
@@ -54,41 +54,41 @@ fn offset_clamps_at_the_floor_then_only_depletion_passes() {
 
 		// A first offset moves P off one, so the later equations exercise
 		// P0 != 1: P = 800/1000 = 0.8, delta_S = 160 * (1/1000) = 0.16.
-		assert_eq!(simulate_offset(DOT, PUSD, 200, 160).debt(), 200);
-		assert_eq!(pool_state(DOT, PUSD).coords.p, FixedU128::from_rational(4, 5));
+		assert_eq!(simulate_offset(DOT, STABLE, 200, 160).debt(), 200);
+		assert_eq!(pool_state(DOT, STABLE).coords.p, FixedU128::from_rational(4, 5));
 
 		// 750 of the remaining 800 would leave 50 < 100 (the floor): clamped
 		// to 700, and the collateral share scales down with it:
 		// floor(600 * 700 / 750) = 560, returning the unconsumed 40 with the
 		// credit. P = 0.8 * (100/800) = 0.1,
 		// delta_S = 560 * (0.8/800) = 0.56, so S = 0.72.
-		let offset = simulate_offset(DOT, PUSD, 750, 600);
+		let offset = simulate_offset(DOT, STABLE, 750, 600);
 		assert_eq!(offset.debt(), 700);
 		assert_eq!(offset.leftover, 40);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 100);
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 100);
 
 		// A = 100 = floor: any partial offset clamps to zero (no-op)...
-		let offset = simulate_offset(DOT, PUSD, 50, 40);
+		let offset = simulate_offset(DOT, STABLE, 50, 40);
 		assert_eq!(offset.debt(), 0);
 		assert_eq!(offset.leftover, 40);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 100);
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 100);
 
 		// ...while full depletion passes and starts epoch 1:
 		// delta_S = 80 * (0.1/100) = 0.08, so S = 0.8.
-		let offset = simulate_offset(DOT, PUSD, 100, 80);
+		let offset = simulate_offset(DOT, STABLE, 100, 80);
 		assert_eq!(offset.debt(), 100);
-		let state = pool_state(DOT, PUSD);
+		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.total_active_deposits, 0);
 		assert_eq!(state.coords, Accumulators { p: FixedU128::one(), epoch: 1, scale: 0 });
 
 		// Fully depleted: nothing left to withdraw (the row still exists,
 		// carrying the unclaimed gains).
-		assert_noop!(withdraw(1, DOT, PUSD, 1, 1), Error::<Test>::NoActiveDeposit);
+		assert_noop!(withdraw(1, DOT, STABLE, 1, 1), Error::<Test>::NoActiveDeposit);
 		// The depositor absorbed all three offsets:
 		// gain = (D0/P0) * S = (1000/1) * 0.8 = 800 = 160 + 560 + 80.
 		assert_claim_collateral(1, 800);
 		// The final claim emptied the row entirely.
-		assert!(deposit_row(DOT, PUSD, 1).is_none());
+		assert!(deposit_row(DOT, STABLE, 1).is_none());
 	});
 }
 
@@ -102,7 +102,7 @@ fn offset_without_capacity_quotes_nothing_and_refuses_settlement() {
 	build_and_execute(|| {
 		let offset_active = |branch: BranchSnapshot, debt: Balance, collateral: Balance| {
 			hypothetically!(offset_with(
-				(DOT, PUSD),
+				(DOT, STABLE),
 				branch,
 				OffsetLegs { active: debt, pending: 0 },
 				OffsetLegs { active: (DOT, collateral), pending: (DOT, 0) }
@@ -112,25 +112,25 @@ fn offset_without_capacity_quotes_nothing_and_refuses_settlement() {
 		// Unregistered market: no pool row exists, so even a healthy mode has nothing to quote
 		// and nothing to settle against.
 		let healthy = BranchSnapshot { mode: BranchMode::Normal, now: Timestamp::get() };
-		assert!(Stability::quote(&DOT, &PUSD, healthy).is_none());
+		assert!(Stability::quote(&DOT, &STABLE, healthy).is_none());
 		assert_err!(offset_active(healthy, 100, 50), Error::<Test>::OffsetSettlementFailed);
 
 		// Registered but empty pool: the market quotes, for nothing, and a caller that settles
 		// past its quote is refused.
-		register_branch(DOT, PUSD, default_branch_config());
-		assert_eq!(Stability::quote_active(&market_quote(&DOT, &PUSD), 100), 0);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_eq!(Stability::quote_active(&market_quote(&DOT, &STABLE), 100), 0);
 		assert_err!(
-			offset_active(branch_snapshot(&DOT, &PUSD), 100, 50),
+			offset_active(branch_snapshot(&DOT, &STABLE), 100, 50),
 			Error::<Test>::OffsetSettlementFailed
 		);
 
 		// A funded pool whose cohort is due and not yet advanced in storage. The quote counts
 		// the matured 1_000 as active, so capacity is not what refuses the calls below.
 		seed_matured_deposit(1, 1_000);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 0);
-		let branch = branch_snapshot(&DOT, &PUSD);
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 0);
+		let branch = branch_snapshot(&DOT, &STABLE);
 		assert_eq!(branch.mode, BranchMode::Normal);
-		let quote = market_quote(&DOT, &PUSD);
+		let quote = market_quote(&DOT, &STABLE);
 		assert_eq!(Stability::quote_active(&quote, 100), 100);
 
 		// A zero request quotes nothing. An offset with no debt on either leg settles nothing
@@ -141,7 +141,7 @@ fn offset_without_capacity_quotes_nothing_and_refuses_settlement() {
 		let burned = storage_noop(|| {
 			Stability::offset(
 				&DOT,
-				&PUSD,
+				&STABLE,
 				branch,
 				OffsetLegs { active: 0, pending: 0 },
 				no_collateral,
@@ -155,7 +155,7 @@ fn offset_without_capacity_quotes_nothing_and_refuses_settlement() {
 
 		// A frozen market has no capacity, however well funded its pool is.
 		let frozen = BranchSnapshot { mode: BranchMode::Frozen, now: branch.now };
-		assert!(Stability::quote(&DOT, &PUSD, frozen).is_none());
+		assert!(Stability::quote(&DOT, &STABLE, frozen).is_none());
 		assert_err!(offset_active(frozen, 100, 50), Error::<Test>::OffsetSettlementFailed);
 	});
 }
@@ -230,15 +230,15 @@ fn offset_refuses_stale_sizing_reads() {
 		// 950 would strand 50 below the 100 minimum: the read clamps to 900,
 		// and demanding the unclamped 950 anyway fails exactly. The probe
 		// credit is issued inside the rolled-back hypothetical.
-		let quote = market_quote(&DOT, &PUSD);
+		let quote = market_quote(&DOT, &STABLE);
 		assert_eq!(Stability::quote_active(&quote, 950), 900);
 		// Everything is activated: the pending leg sizes to zero even behind the active
 		// reservation.
 		assert_eq!(Stability::quote_pending(&quote, 100, 900), 0);
 		assert_err!(
 			hypothetically!(offset_with(
-				(DOT, PUSD),
-				branch_snapshot(&DOT, &PUSD),
+				(DOT, STABLE),
+				branch_snapshot(&DOT, &STABLE),
 				OffsetLegs { active: 950, pending: 0 },
 				OffsetLegs { active: (DOT, 400), pending: (DOT, 0) }
 			)),
@@ -248,12 +248,12 @@ fn offset_refuses_stale_sizing_reads() {
 		// The clamped amount itself executes exactly.
 		hypothetically!({
 			assert_ok!(offset_with(
-				(DOT, PUSD),
-				branch_snapshot(&DOT, &PUSD),
+				(DOT, STABLE),
+				branch_snapshot(&DOT, &STABLE),
 				OffsetLegs { active: 900, pending: 0 },
 				OffsetLegs { active: (DOT, 400), pending: (DOT, 0) }
 			));
-			assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 100);
+			assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 100);
 		});
 	});
 }
@@ -264,17 +264,17 @@ fn compounded_yield_absorbs_offsets() {
 		set_min_active_pool(20);
 		seed_matured_deposit(1, 600);
 		distribute_all_yield(60);
-		assert_ok!(compound(1, DOT, PUSD, 60));
+		assert_ok!(compound(1, DOT, STABLE, 60));
 
 		// The compounded 60 is offsettable: A = 660, and the 601 offset
 		// exceeds the original 600 deposit — only possible because the
 		// compounded yield absorbs too. The survival ratio 59/660 is
 		// 0.089393..., so the 18-decimal P floors and the withdrawal pays
 		// floor(660 * P) = 58; the odd unit strands as pool-owned dust.
-		assert_eq!(simulate_offset(DOT, PUSD, 601, 0).debt(), 601);
-		assert_ok!(withdraw(1, DOT, PUSD, 1_000, 1));
-		assert_eq!(stable_balance(PUSD, 1), 58);
-		assert_eq!(pool_state(DOT, PUSD).total_active_deposits, 1);
+		assert_eq!(simulate_offset(DOT, STABLE, 601, 0).debt(), 601);
+		assert_ok!(withdraw(1, DOT, STABLE, 1_000, 1));
+		assert_eq!(stable_balance(STABLE, 1), 58);
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 1);
 	});
 }
 
