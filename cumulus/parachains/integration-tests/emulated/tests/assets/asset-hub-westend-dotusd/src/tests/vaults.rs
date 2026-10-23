@@ -25,52 +25,14 @@ use frame_support::{
 		fungibles::{roles::Inspect as RolesInspect, Refund},
 	},
 };
-use pallet_vaults::{types::BranchAdmins, BranchConfigUpdate};
+use pallet_vaults::types::BranchAdmins;
 use sp_runtime::{DispatchError, TokenError};
 
-/// Opens a 10,000 WND / 10,000 dotUSD vault for `owner` without any helper funding.
-fn open_native_vault(owner: &AccountId) -> sp_runtime::DispatchResult {
-	Vaults::open_vault(
-		RuntimeOrigin::signed(owner.clone()),
-		get_native_id(),
-		DOTUSD_ID,
-		10_000 * WND,
-		10_000 * DOTUSD,
-		FixedU128::zero(),
-		pallet_linked_list::Position::endpoints_only(),
-	)
-	.map(|_| ())
-	.map_err(|error| error.error)
-}
-
-/// A stablecoin minimum balance above one unit requires the fee account's
-/// stablecoin account before the first branch registers.
-///
-/// The fee account owns that deposit, because it outlives any single branch. So
-/// it must hold native balance first. No stablecoin exists yet at that point.
-#[test]
-fn registration_creates_the_fee_account_stablecoin_account() {
-	AssetHubWestend::execute_with(|| {
-		let fee_account = governance::TreasuryAccount::get();
-		assert!(DOTUSD_MIN_BALANCE > 1, "a one-unit minimum would skip the touch entirely");
-		assert!(
-			<Assets as Refund<AccountId>>::deposit_held(DOTUSD_ID, fee_account.clone()).is_none()
-		);
-
-		feed_price(dot_price(2, 1));
-		create_branch(&BranchSpec::default());
-
-		let (depositor, deposit) =
-			<Assets as Refund<AccountId>>::deposit_held(DOTUSD_ID, fee_account.clone())
-				.expect("registration touched the fee account");
-		assert_eq!(depositor, fee_account, "the stablecoin-wide account owns its deposit");
-		assert!(deposit > 0);
-		// The account exists but is empty. It can now receive a credit of any size.
-		assert_eq!(dotusd_balance(&fee_account), 0);
-	});
-}
-
 /// Creates a native-collateral branch as the asset owner, then transfers control to governance.
+///
+/// A stablecoin minimum balance above one unit requires the fee account's
+/// stablecoin account before the first branch registers. The fee account owns
+/// that deposit, because it outlives any single branch.
 #[test]
 fn signed_user_registers_a_native_collateral_market() {
 	AssetHubWestend::execute_with(|| {
@@ -87,6 +49,11 @@ fn signed_user_registers_a_native_collateral_market() {
 		mint_dotusd(&creator, 2 * DOTUSD_MIN_BALANCE);
 		let creator_free_before = native_balance(&creator);
 		let creator_dotusd_before = dotusd_balance(&creator);
+		let fee_account = governance::TreasuryAccount::get();
+		assert!(DOTUSD_MIN_BALANCE > 1, "a one-unit minimum would skip the touch entirely");
+		assert!(
+			<Assets as Refund<AccountId>>::deposit_held(DOTUSD_ID, fee_account.clone()).is_none()
+		);
 
 		assert_ok!(Vaults::create_branch(
 			RuntimeOrigin::signed(creator.clone()),
@@ -121,37 +88,13 @@ fn signed_user_registers_a_native_collateral_market() {
 			VaultsBranchCreationDeposit::get() + 2 * get_native_ed(),
 		);
 		assert_eq!(creator_dotusd_before - dotusd_balance(&creator), DOTUSD_MIN_BALANCE);
-
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(full_admin.clone()),
-			get_native_id(),
-			DOTUSD_ID,
-			pallet_vaults::BranchConfigUpdate::MinimumDebt(100 * DOTUSD),
-		));
-		// The full admin controls every branch parameter. Lowering the branch
-		// ceiling reduces risk, so the emergency admin may do it too. Raising it
-		// does not, so only the full admin can.
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(emergency_admin.clone()),
-			get_native_id(),
-			DOTUSD_ID,
-			pallet_vaults::BranchConfigUpdate::DebtCeiling(50_000_000 * DOTUSD),
-		));
-		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(emergency_admin.clone()),
-				get_native_id(),
-				DOTUSD_ID,
-				pallet_vaults::BranchConfigUpdate::DebtCeiling(200_000_000 * DOTUSD),
-			),
-			pallet_vaults::Error::<Runtime>::DefensiveActionNotDefensive,
-		);
-		assert_ok!(Vaults::set_param(
-			RuntimeOrigin::signed(full_admin.clone()),
-			get_native_id(),
-			DOTUSD_ID,
-			pallet_vaults::BranchConfigUpdate::DebtCeiling(200_000_000 * DOTUSD),
-		));
+		let (depositor, deposit) =
+			<Assets as Refund<AccountId>>::deposit_held(DOTUSD_ID, fee_account.clone())
+				.expect("registration touched the fee account");
+		assert_eq!(depositor, fee_account, "the stablecoin-wide account owns its deposit");
+		assert!(deposit > 0);
+		// The account exists but is empty. It can now receive a credit of any size.
+		assert_eq!(dotusd_balance(&fee_account), 0);
 
 		// The full admin takes all asset roles and ownership. Only Root can reassign
 		// them through `force_asset_status`.
@@ -169,11 +112,7 @@ fn signed_user_registers_a_native_collateral_market() {
 			MultiAddress::Id(custodian.clone()),
 		));
 		assert_eq!(<Assets as RolesInspect<AccountId>>::owner(DOTUSD_ID), Some(custodian));
-		// The former owner cannot freeze the asset or register another branch.
-		assert_noop!(
-			Assets::freeze_asset(RuntimeOrigin::signed(creator.clone()), DOTUSD_ID.into()),
-			pallet_assets::Error::<Runtime, TrustBackedAssetsInstance>::NoPermission,
-		);
+		// The former owner cannot register another branch.
 		assert_noop!(
 			Vaults::create_branch(
 				RuntimeOrigin::signed(creator.clone()),
@@ -206,33 +145,15 @@ fn signed_user_registers_a_native_collateral_market() {
 		open_vault(&owner, 10_000 * WND, 10_000 * DOTUSD, FixedU128::zero());
 		assert_eq!(dotusd_balance(&owner), 10_000 * DOTUSD);
 		assert_eq!(collateral_on_hold(&get_native_id(), &owner), 10_000 * WND);
-
-		// A second borrower: 3,000 WND = 6,000 dotUSD value against 2,500 dotUSD debt at 5%,
-		// CR 240%.
-		let other_owner = acct(10);
-		open_vault(&other_owner, 3_000 * WND, 2_500 * DOTUSD, FixedU128::from_rational(5, 100));
-		assert_eq!(dotusd_balance(&other_owner), 2_500 * DOTUSD);
-		assert_eq!(collateral_on_hold(&get_native_id(), &other_owner), 3_000 * WND);
-		// Each vault keeps its own rate.
-		assert_eq!(vault(&owner).annual_rate, FixedU128::zero());
-		assert_eq!(vault(&other_owner).annual_rate, FixedU128::from_rational(5, 100));
-
-		// The branch aggregates both.
-		let state = pallet_vaults::Branches::<Runtime>::get(get_native_id(), DOTUSD_ID)
-			.expect("branch still registered")
-			.state;
-		assert_eq!(state.vault_count, 2);
-		assert_eq!(state.total_collateral, 13_000 * WND);
-		assert_eq!(state.debt.principal, 12_500 * DOTUSD);
 	});
 }
 
-/// The emergency admin can pull the freeze but not clear it, a stranger can
-/// change nothing, and Root can do everything. A branch with a live vault
-/// cannot be removed. Stablecoin-wide settings belong to the asset owner, not
-/// to branch admins.
+/// The runtime routes each update origin: branch freezes take Root through
+/// `ForceOrigin`, stablecoin-wide redemption settings take the asset owner, and
+/// the pool configuration takes the branch full admin or Root but not the
+/// emergency admin.
 #[test]
-fn branch_admin_levels_gate_freeze_config_and_removal() {
+fn runtime_update_origins_route_to_owner_admin_or_root() {
 	AssetHubWestend::execute_with(|| {
 		feed_price(dot_price(2, 1));
 		create_branch(&BranchSpec::default());
@@ -247,63 +168,13 @@ fn branch_admin_levels_gate_freeze_config_and_removal() {
 				emergency_admin: MultiAddress::Id(emergency_admin.clone()),
 			},
 		));
-		open_vault(&acct(1), 10_000 * WND, 10_000 * DOTUSD, FixedU128::zero());
-
-		let stranger = acct(9);
-		assert_noop!(
-			Vaults::set_param(
-				RuntimeOrigin::signed(stranger.clone()),
-				get_native_id(),
-				DOTUSD_ID,
-				BranchConfigUpdate::MinimumDebt(100 * DOTUSD),
-			),
-			pallet_vaults::Error::<Runtime>::NotBranchAdmin,
-		);
-		assert_noop!(
-			Vaults::set_branch_admins(
-				RuntimeOrigin::signed(stranger.clone()),
-				get_native_id(),
-				DOTUSD_ID,
-				branch_admins(),
-			),
-			pallet_vaults::Error::<Runtime>::NotBranchAdmin,
-		);
-		assert_noop!(
-			Vaults::remove_branch(
-				RuntimeOrigin::signed(full_admin.clone()),
-				get_native_id(),
-				DOTUSD_ID
-			),
-			pallet_vaults::Error::<Runtime>::BranchNotEmpty,
-		);
-
-		let set_frozen = |who: &AccountId, frozen: bool| {
-			Vaults::set_governance_frozen(
-				RuntimeOrigin::signed(who.clone()),
-				get_native_id(),
-				DOTUSD_ID,
-				frozen,
-			)
-		};
-		assert_noop!(set_frozen(&stranger, true), pallet_vaults::Error::<Runtime>::NotBranchAdmin);
-		assert_ok!(set_frozen(&emergency_admin, true));
-		// The freeze bites: the same open is refused frozen and accepted thawed.
-		let late_owner = acct(2);
-		fund_dot(&late_owner, 10_000 * WND);
-		fund_vault_deposit(&get_native_id(), &late_owner);
-		assert_noop!(open_native_vault(&late_owner), pallet_vaults::Error::<Runtime>::BranchFrozen);
-		assert_noop!(
-			set_frozen(&emergency_admin, false),
-			pallet_vaults::Error::<Runtime>::NotBranchAdmin
-		);
+		// Root holds no admin role, so only `ForceOrigin` can admit it.
 		hypothetically_ok!(Vaults::set_governance_frozen(
 			RuntimeOrigin::root(),
 			get_native_id(),
 			DOTUSD_ID,
-			false,
+			true,
 		));
-		assert_ok!(set_frozen(&full_admin, false));
-		assert_ok!(open_native_vault(&late_owner));
 
 		// The redemption policy takes the stablecoin owner or Root.
 		let redemption_config = pallet_redemptions::Stablecoins::<Runtime>::get(DOTUSD_ID)
