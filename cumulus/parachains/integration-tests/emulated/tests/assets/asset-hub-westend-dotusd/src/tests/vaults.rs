@@ -44,9 +44,9 @@ fn open_native_vault(owner: &AccountId) -> sp_runtime::DispatchResult {
 }
 
 /// A stablecoin minimum balance above one unit requires the fee account's
-/// stablecoin account before the first market registers.
+/// stablecoin account before the first branch registers.
 ///
-/// The fee account owns that deposit, because it outlives any single market. So
+/// The fee account owns that deposit, because it outlives any single branch. So
 /// it must hold native balance first. No stablecoin exists yet at that point.
 #[test]
 fn registration_creates_the_fee_account_stablecoin_account() {
@@ -70,14 +70,14 @@ fn registration_creates_the_fee_account_stablecoin_account() {
 	});
 }
 
-/// Creates a native-collateral market as the asset owner, then transfers control to governance.
+/// Creates a native-collateral branch as the asset owner, then transfers control to governance.
 #[test]
 fn signed_user_registers_a_native_collateral_market() {
 	AssetHubWestend::execute_with(|| {
 		create_dotusd();
 		feed_price(dot_price(2, 1));
 
-		// Asset ownership authorizes market creation and redemption configuration.
+		// Asset ownership authorizes branch creation and redemption configuration.
 		// The vault system uses fungibles traits to mint and burn.
 		let creator = admin();
 		// The administrators take no part in the creation.
@@ -101,7 +101,7 @@ fn signed_user_registers_a_native_collateral_market() {
 		));
 
 		let branch = pallet_vaults::Branches::<Runtime>::get(get_native_id(), DOTUSD_ID)
-			.expect("the signed creation registered the market");
+			.expect("the signed creation registered the branch");
 		// The deposit is held from the creator, so a removal refunds the creator.
 		assert_eq!(branch.deposit.map(|(who, _)| who), Some(creator.clone()));
 		assert_eq!(
@@ -128,7 +128,7 @@ fn signed_user_registers_a_native_collateral_market() {
 			DOTUSD_ID,
 			pallet_vaults::BranchConfigUpdate::MinimumDebt(100 * DOTUSD),
 		));
-		// The full admin controls every market parameter. Lowering the branch
+		// The full admin controls every branch parameter. Lowering the branch
 		// ceiling reduces risk, so the emergency admin may do it too. Raising it
 		// does not, so only the full admin can.
 		assert_ok!(Vaults::set_param(
@@ -169,7 +169,7 @@ fn signed_user_registers_a_native_collateral_market() {
 			MultiAddress::Id(custodian.clone()),
 		));
 		assert_eq!(<Assets as RolesInspect<AccountId>>::owner(DOTUSD_ID), Some(custodian));
-		// The former owner cannot freeze the asset or register another market.
+		// The former owner cannot freeze the asset or register another branch.
 		assert_noop!(
 			Assets::freeze_asset(RuntimeOrigin::signed(creator.clone()), DOTUSD_ID.into()),
 			pallet_assets::Error::<Runtime, TrustBackedAssetsInstance>::NoPermission,
@@ -217,9 +217,9 @@ fn signed_user_registers_a_native_collateral_market() {
 		assert_eq!(vault(&owner).annual_rate, FixedU128::zero());
 		assert_eq!(vault(&other_owner).annual_rate, FixedU128::from_rational(5, 100));
 
-		// The market aggregates both.
+		// The branch aggregates both.
 		let state = pallet_vaults::Branches::<Runtime>::get(get_native_id(), DOTUSD_ID)
-			.expect("market still registered")
+			.expect("branch still registered")
 			.state;
 		assert_eq!(state.vault_count, 2);
 		assert_eq!(state.total_collateral, 13_000 * WND);
@@ -228,7 +228,7 @@ fn signed_user_registers_a_native_collateral_market() {
 }
 
 /// The emergency admin can pull the freeze but not clear it, a stranger can
-/// change nothing, and Root can do everything. A market with a live vault
+/// change nothing, and Root can do everything. A branch with a live vault
 /// cannot be removed. Stablecoin-wide settings belong to the asset owner, not
 /// to branch admins.
 #[test]
@@ -306,8 +306,9 @@ fn branch_admin_levels_gate_freeze_config_and_removal() {
 		assert_ok!(open_native_vault(&late_owner));
 
 		// The redemption policy takes the stablecoin owner or Root.
-		let redemption_config = pallet_redemptions::RedemptionConfigs::<Runtime>::get(DOTUSD_ID)
-			.expect("registration stored the redemption policy");
+		let redemption_config = pallet_redemptions::Stablecoins::<Runtime>::get(DOTUSD_ID)
+			.expect("registration stored the redemption policy")
+			.config;
 		assert_noop!(
 			Redemptions::set_redemption_config(
 				RuntimeOrigin::signed(full_admin.clone()),

@@ -136,9 +136,9 @@ parameter_types! {
 	/// costs 100 / 1024. Keys and rows are priced alike, with no per-item component.
 	pub const VaultsVaultDepositBase: Balance = 0;
 	pub const VaultsVaultDepositPerByte: Balance = 100 * UNITS / 1024;
-	/// Governance envelope every permissionlessly-created market config must sit
+	/// Governance envelope every permissionlessly-created branch config must sit
 	/// inside: floors on the collateralization ratios and a cap on the borrow
-	/// rate. Amounts are denominated in the market's own assets, so the creator
+	/// rate. Amounts are denominated in the branch's own assets, so the creator
 	/// picks those.
 	pub VaultsBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
 		pallet_vaults::types::BranchConfigBounds {
@@ -163,19 +163,19 @@ impl stablecoin_primitives::ProvidePrice for VaultsOracleAdapter {
 }
 
 /// Names each stablecoin in the collateral namespace, so the vault pallet can
-/// reject a market that would make an asset its own collateral.
+/// reject a branch that would make an asset its own collateral.
 pub struct VaultsStableToCollateralId;
 impl Convert<VaultsStableId, VaultsCollateralId> for VaultsStableToCollateralId {
 	fn convert(stable_id: VaultsStableId) -> VaultsCollateralId {
 		// Prefixing a trust-backed id with the assets pallet location only fails on
 		// the junction limit, which two junctions cannot hit. `Here` is the safe
-		// fallback: no market names it, so a failure blocks rather than allows.
+		// fallback: no branch names it, so a failure blocks rather than allows.
 		TrustBackedAssetLocation::convert_back(&stable_id)
 			.unwrap_or_else(|| xcm::v5::Location::here())
 	}
 }
 
-/// `CreateOrigin` for permissionless market creation. Root creates deposit-free
+/// `CreateOrigin` for permissionless branch creation. Root creates deposit-free
 /// (`None`); the stablecoin asset's owner creates with a refundable deposit
 /// (`Some(who)`); every other origin is rejected.
 pub type VaultsCreateOrigin = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;

@@ -50,7 +50,7 @@ fn eth_price(dotusd_per_eth: u128) -> FixedU128 {
 	FixedU128::from_rational(dotusd_per_eth * DOTUSD, ETH)
 }
 
-/// One stablecoin, three markets: native WND, trust-backed USDT, bridged ETH.
+/// One stablecoin, three branches: native WND, trust-backed USDT, bridged ETH.
 ///
 /// Each vault pledges 20,000 dotUSD of value against 10,000 dotUSD of debt. The
 /// three differ only in the collateral pallet and the decimals.
@@ -105,9 +105,9 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 			);
 		}
 
-		// A branch ceiling binds one market only. Lowered to the native market's
+		// A branch ceiling binds one branch only. Lowered to the native branch's
 		// 10,000 dotUSD of debt, it refuses the next native vault while the USDT
-		// market keeps lending.
+		// branch keeps lending.
 		assert_ok!(Vaults::set_param(
 			RuntimeOrigin::signed(admin()),
 			get_native_id(),
@@ -139,7 +139,7 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 	});
 }
 
-/// Ether is a sufficient asset, so its accounts need no deposit. A market for it
+/// Ether is a sufficient asset, so its accounts need no deposit. A branch for it
 /// still needs one.
 ///
 /// The stability pool must accept an offset gain below the collateral's minimum
