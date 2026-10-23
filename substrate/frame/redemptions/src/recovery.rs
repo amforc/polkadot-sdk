@@ -2,17 +2,18 @@
 
 use crate::{
 	pallet::{
-		BalanceOf, CollateralIdOf, Config, Error, Pallet, RedemptionConfigOf, RedemptionConfigs,
-		SnapshotOf, StableCreditOf, StableIdOf,
+		BalanceOf, CollateralIdOf, Config, Error, Pallet, RedemptionConfigOf, SnapshotOf,
+		StableCreditOf, StableIdOf, Stablecoins,
 	},
 	types::RecoveryRegime,
 };
 use frame::{
 	deps::sp_runtime::{
-		traits::{Convert, Saturating, Zero},
+		traits::{Convert, Zero},
 		FixedU128,
 	},
 	prelude::*,
+	traits::DefensiveSaturating,
 };
 use stablecoin_primitives::{
 	debit_preservation, recovery_pricing, reducible_debit, CollateralRatio,
@@ -84,7 +85,10 @@ impl<T: Config> Pallet<T> {
 		budget: BalanceOf<T>,
 		config: &RedemptionConfigOf<T>,
 	) -> Result<RecoveryPlan<BalanceOf<T>>, Error<T>> {
-		ensure!(snapshot.status.is_final_recovery(), Error::<T>::NoRedeemableVault);
+		ensure!(
+			snapshot.status.is_final_recovery(),
+			Self::unexpected("both callers price only a head looked up as FinalRecovery")
+		);
 
 		let ratio =
 			match stablecoin_primitives::collateralization_ratio(&snapshot.position(), price) {
@@ -134,7 +138,7 @@ impl<T: Config> Pallet<T> {
 		// and the redeemer never pays less than the collateral is worth. It stays within the
 		// below-par split: the regime check floors, so `floor(C) < debt` and `ceil(C) <= debt`.
 		let collateral_value = recovery_pricing::collateral_value_ceil(snapshot.collateral, price)?;
-		let shortfall = snapshot.debt.saturating_sub(collateral_value);
+		let shortfall = snapshot.debt.defensive_saturating_sub(collateral_value);
 		let cover = Self::insurance_fund_cover(stable_id, shortfall);
 		let split = recovery_pricing::insurance_adjusted(snapshot.debt, collateral_value, cover)?;
 		if budget >= split.market_cancel_debt {
@@ -201,8 +205,9 @@ impl<T: Config> Pallet<T> {
 		let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
 			return Ok(OffsetDecision::NoTarget);
 		};
-		let config =
-			RedemptionConfigs::<T>::get(stable_id).ok_or(Error::<T>::StablecoinNotRegistered)?;
+		let config = Stablecoins::<T>::get(stable_id)
+			.ok_or(Error::<T>::StablecoinNotRegistered)?
+			.config;
 		let price = Self::collateral_price(collateral_id)?;
 		let snapshot = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?;
 		let plan = Self::price_recovery(stable_id, &snapshot, price, max_debt_to_cancel, &config);
@@ -232,7 +237,7 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 		mut payment: StableCreditOf<T>,
 		collateral_recipient: &T::AccountId,
 	) -> Result<(RecoveryOffsetResult<BalanceOf<T>>, StableCreditOf<T>), DispatchError> {
-		// The payment's own asset names the market: a coin mismatch is
+		// The payment's own asset names the branch: a coin mismatch is
 		// unrepresentable rather than an error. The decision is a pure read,
 		// so non-applied outcomes return the payment without touching storage.
 		let stable_id = payment.asset();
