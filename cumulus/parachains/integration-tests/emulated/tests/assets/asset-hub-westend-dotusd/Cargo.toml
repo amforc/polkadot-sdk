@@ -24,6 +24,7 @@ pallet-psm = { workspace = true, default-features = true }
 pallet-redemptions = { workspace = true, default-features = true }
 pallet-stability = { workspace = true, default-features = true }
 pallet-timestamp = { workspace = true, default-features = true }
+pallet-utility = { workspace = true, default-features = true }
 pallet-vaults = { workspace = true, default-features = true }
 sp-consensus-slots = { workspace = true, default-features = true }
 sp-runtime = { workspace = true, default-features = true }

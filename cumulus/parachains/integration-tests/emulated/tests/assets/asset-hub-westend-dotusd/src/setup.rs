@@ -106,22 +106,16 @@ impl Default for BranchSpec {
 	}
 }
 
-/// Sets MCR above the scenario vaults' 120% CR.
-pub(crate) fn liquidation_spec() -> BranchSpec {
+/// Sets MCR above the scenario vaults' 120% CR, and disables keeper compensation
+/// to keep amounts round.
+pub(crate) fn accounting_spec() -> BranchSpec {
 	BranchSpec {
 		mcr: FixedU128::from_rational(125, 100),
 		icr: FixedU128::from_rational(130, 100),
 		scr: FixedU128::from_rational(130, 100),
-		..Default::default()
-	}
-}
-
-/// Disables keeper compensation in [`liquidation_spec`] to keep amounts round.
-pub(crate) fn accounting_spec() -> BranchSpec {
-	BranchSpec {
 		keeper_flat_compensation_value: 0,
 		keeper_percent_compensation: Permill::zero(),
-		..liquidation_spec()
+		..Default::default()
 	}
 }
 

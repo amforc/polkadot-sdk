@@ -1840,6 +1840,7 @@ dependencies = [
  "pallet-redemptions",
  "pallet-stability",
  "pallet-timestamp",
+ "pallet-utility",
  "pallet-vaults",
  "parachains-common",
  "parity-scale-codec",
