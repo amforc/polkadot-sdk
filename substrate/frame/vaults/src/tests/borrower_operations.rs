@@ -7,9 +7,9 @@ use crate::{
 // `DebtOutstanding`.
 #[test]
 fn close_with_outstanding_debt_reverts() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+
 		assert_noop!(close_vault(1, DOT, STABLE, None), crate::Error::<Test>::DebtOutstanding);
 	});
 }
@@ -18,10 +18,10 @@ fn close_with_outstanding_debt_reverts() {
 // strictly between zero and `MinimumDebt`. (Full repayment to zero is allowed.)
 #[test]
 fn repay_into_dust_window_reverts() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		// borrow=1000, min_debt=200. Repay 850 would leave 150 < 200.
 		assert_ok!(open(1, DOT, STABLE, 1_000, 1_000, percent(5)));
+
 		assert_noop!(
 			repay(1, DOT, STABLE, 1, Some(850)),
 			crate::Error::<Test>::DebtWouldBecomeDust
@@ -33,9 +33,9 @@ fn repay_into_dust_window_reverts() {
 // (the held-balance check fires before the CR check).
 #[test]
 fn withdraw_more_than_held_reverts() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+
 		assert_noop!(
 			withdraw_collateral(1, DOT, STABLE, 2_000, None),
 			crate::Error::<Test>::InsufficientCollateral
@@ -45,9 +45,9 @@ fn withdraw_more_than_held_reverts() {
 
 #[test]
 fn withdraw_breaking_cr_reverts() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+
 		// 1000 DOT @ 10 STABLE backs 500 STABLE — withdrawing 950 leaves
 		// 50 DOT × 10 = 500 STABLE, CR == 100% < ICR 120%.
 		assert_noop!(
@@ -68,8 +68,7 @@ fn zero_amounts_are_rejected_without_touching_the_vault() {
 		|| borrow(1, DOT, STABLE, 0, Some(percent(10))),
 	];
 	for call in calls {
-		build_and_execute(|| {
-			register_market(DOT, STABLE);
+		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 			assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(50)));
 			advance_time(ONE_DAY_MS);
 			MockOracleAvailable::set(false);
@@ -86,14 +85,15 @@ fn zero_amounts_are_rejected_without_touching_the_vault() {
 // would release collateral and could worsen TCR).
 #[test]
 fn repay_for_allowed_in_safety_mode() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(5)));
 		// Drop price into Safety (TCR ≈ 126%, between ICR 120% and Safety 130%).
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		let tcr_before = crate::Pallet::<Test>::branch_tcr(DOT, STABLE).expect("tcr");
 		assert!(tcr_before < percent(130), "setup must leave the branch in Safety mode");
+
 		assert_ok!(repay(1, DOT, STABLE, 1, Some(2_000)));
+
 		let tcr_after = crate::Pallet::<Test>::branch_tcr(DOT, STABLE).expect("tcr");
 		assert!(tcr_after > tcr_before, "repay improves branch TCR even in Safety mode");
 	});
@@ -105,19 +105,20 @@ fn repay_for_allowed_in_safety_mode() {
 // *rate*, not on the whole storage row.
 #[test]
 fn change_rate_to_same_rate_is_no_op() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 5_000, 10_000, percent(5)));
 		let pre = vault(DOT, STABLE, 1);
 		advance_time(ONE_DAY_MS); // one day of pending interest
 		let now = Timestamp::get();
 		assert_eq!(
 			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 0, Some(percent(5)))
-				.expect("registered market and vault"),
+				.expect("registered branch and vault"),
 			0,
 			"the quote must reflect that an unchanged rate is a no-op"
 		);
+
 		assert_ok!(change_rate(1, DOT, STABLE, percent(5)));
+
 		let post = vault(DOT, STABLE, 1);
 		// Rate, principal and cooldown clock are untouched (no real rate change).
 		assert_eq!(post.annual_rate, pre.annual_rate);

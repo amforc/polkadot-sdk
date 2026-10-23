@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{percent, rate_pct, vault_status},
+	tests::{percent, vault_status},
 };
 use frame::traits::fungible::Mutate as FungibleMutate;
 
@@ -11,7 +11,14 @@ fn fund_account(who: AccountId) {
 fn seed_long_rate_index() {
 	for who in 1u64..=20 {
 		fund_account(who);
-		assert_ok!(open(who, DOT, STABLE, 2_000, 500, rate_pct(20 + u128::from(who), 100)));
+		assert_ok!(open(
+			who,
+			DOT,
+			STABLE,
+			2_000,
+			500,
+			FixedU128::from_rational(20 + u128::from(who), 100)
+		));
 	}
 }
 
@@ -19,8 +26,7 @@ fn seed_long_rate_index() {
 // the whole operation back: the vault stays in the FIFO and storage is unchanged.
 #[test]
 fn exit_final_recovery_invalid_hint_rolls_back() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		// Account 21 alone enters FinalRecovery after a price crash.
 		fund_account(21);
 		assert_ok!(open(21, DOT, STABLE, 1_000, 500, percent(1)));
@@ -36,6 +42,7 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 			exit_final_recovery(99, DOT, STABLE, 21),
 			crate::Error::<Test>::InvalidPositionHints
 		);
+
 		assert!(vault_status(DOT, STABLE, 21).is_final_recovery());
 		assert_eq!(
 			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, STABLE), 10),
@@ -46,8 +53,7 @@ fn exit_final_recovery_invalid_hint_rolls_back() {
 
 #[test]
 fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		seed_long_rate_index();
 		fund_account(21);
 
@@ -58,7 +64,7 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 				STABLE,
 				1_000,
 				500,
-				rate_pct(1, 100),
+				percent(1),
 				Position::endpoints_only()
 			),
 			crate::Error::<Test>::InvalidPositionHints
@@ -71,8 +77,7 @@ fn open_vault_invalid_hint_rolls_back_hold_mint_and_storage() {
 
 #[test]
 fn change_rate_invalid_hint_rolls_back_rate_fee_and_index() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		seed_long_rate_index();
 
 		assert_noop!(
