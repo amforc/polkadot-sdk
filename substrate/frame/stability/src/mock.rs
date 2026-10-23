@@ -25,6 +25,7 @@ pub use frame::{
 };
 use frame::{
 	deps::sp_runtime::traits::{ConvertInto, ConvertToValue},
+	prelude::DispatchResultWithPostInfo,
 	testing_prelude::*,
 	traits::{
 		fungible::{NativeFromLeft, NativeOrWithId},
@@ -240,34 +241,37 @@ impl pallet_vaults::Config for Test {
 	type BenchmarkHelper = VaultsBenchHelper;
 }
 
+/// Stages the vault benchmarks against this mock: native collateral, [`MockOracle`] prices and
+/// the mock clock.
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchHelper;
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for VaultsBenchHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
-	}
-
-	fn stable_asset_id() -> StableId {
-		STABLE
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
 	}
 
-	fn clear_oracle_price(collateral_id: AssetId) {
-		let mut prices = MockPrices::get();
-		prices.remove(&collateral_id);
-		MockPrices::set(&prices);
-	}
-
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
 
-	// The genesis config already creates every stable asset.
-	fn ensure_stable_asset(_: StableId) {}
+	// The benchmark collateral is native, which exists without being created.
+	fn ensure_collateral_asset(collateral_id: AssetId) {
+		assert_eq!(collateral_id, DOT);
+	}
+
+	// `StoredCeiling` reads only the ceiling row the benchmarks write themselves.
+	fn stage_debt_ceiling(_: StableId) {}
+
+	fn fund_native(who: &AccountId) {
+		use frame::traits::fungible::Mutate as FungibleMutate;
+		<Balances as FungibleMutate<AccountId>>::mint_into(who, 1_000_000_000_000)
+			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
+	}
 }
 
 /// Root as the governance override, or the stored full admin of the branch. A production runtime
@@ -321,29 +325,6 @@ impl pallet_redemptions::Config for Test {
 	type UpdateOrigin = EnsureAssetOwner;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
-	#[cfg(feature = "runtime-benchmarks")]
-	type BenchmarkHelper = RedemptionsBenchHelper;
-}
-
-#[cfg(feature = "runtime-benchmarks")]
-pub struct RedemptionsBenchHelper;
-#[cfg(feature = "runtime-benchmarks")]
-impl pallet_redemptions::BenchmarkHelper<AssetId, StableId, AccountId, Balance>
-	for RedemptionsBenchHelper
-{
-	fn setup_redeemable_branch(vaults: u32) -> (AssetId, StableId, AccountId, Balance) {
-		register_branch(DOT, STABLE, default_branch_config());
-		let debt: Balance = 300;
-		for i in 0..vaults {
-			let who = 1_000 + AccountId::from(i);
-			mint_collateral(DOT, who, 10_000_000_000);
-			open_vault(who, DOT, STABLE, 1_000_000, debt).expect("open benchmark vault");
-		}
-		let redeemer: AccountId = 1;
-		let budget = debt.saturating_mul(Balance::from(vaults).saturating_add(2)).saturating_mul(2);
-		mint_stable(STABLE, redeemer, budget.saturating_mul(2));
-		(DOT, STABLE, redeemer, budget)
-	}
 }
 
 impl pallet_stability::Config for Test {
@@ -746,7 +727,7 @@ pub fn open_vault(
 	use frame::traits::fungible::Mutate as FungibleMutate;
 	// A fresh account needs its existential deposit before anything else.
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&who, 1));
-	Vaults::open_vault(
+	without_post_info(Vaults::open_vault(
 		RuntimeOrigin::signed(who),
 		collateral,
 		stable,
@@ -754,7 +735,12 @@ pub fn open_vault(
 		debt,
 		FixedU128::from_rational(5u128, 100u128),
 		pallet_linked_list::Position::endpoints_only(),
-	)
+	))
+}
+
+/// The result of a dispatch whose post-dispatch info these suites never read.
+fn without_post_info(result: DispatchResultWithPostInfo) -> DispatchResult {
+	result.map(|_post_info| ()).map_err(|error| error.error)
 }
 
 /// Mints `amount` of the stablecoin to `who`.
@@ -856,7 +842,7 @@ pub fn deposit(
 	stable: StableId,
 	amount: Balance,
 ) -> DispatchResult {
-	Stability::deposit(RuntimeOrigin::signed(who), collateral, stable, amount)
+	without_post_info(Stability::deposit(RuntimeOrigin::signed(who), collateral, stable, amount))
 }
 
 /// Requests a withdrawal, signed by `who`.
@@ -866,7 +852,12 @@ pub fn request_withdraw(
 	stable: StableId,
 	amount: Balance,
 ) -> DispatchResult {
-	Stability::request_withdraw(RuntimeOrigin::signed(who), collateral, stable, amount)
+	without_post_info(Stability::request_withdraw(
+		RuntimeOrigin::signed(who),
+		collateral,
+		stable,
+		amount,
+	))
 }
 
 /// Withdraws to a named recipient, signed by `who`.
@@ -877,7 +868,13 @@ pub fn withdraw(
 	amount: Balance,
 	recipient: AccountId,
 ) -> DispatchResult {
-	Stability::withdraw(RuntimeOrigin::signed(who), collateral, stable, amount, Some(recipient))
+	without_post_info(Stability::withdraw(
+		RuntimeOrigin::signed(who),
+		collateral,
+		stable,
+		amount,
+		Some(recipient),
+	))
 }
 
 /// Claims collateral to a named recipient, signed by `who`.
