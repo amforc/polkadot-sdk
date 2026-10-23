@@ -6,10 +6,39 @@
 
 use crate::{mock::*, Error};
 
+/// Gives an existing default-pool row backed claimable balances without exercising their source.
+fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Balance) {
+	seed_claimables_in(DOT, who, collateral_gain, yield_gain);
+}
+
+/// [`seed_claimables`] in the `collateral`/[`STABLE`] branch.
+fn seed_claimables_in(
+	collateral: AssetId,
+	who: AccountId,
+	collateral_gain: Balance,
+	yield_gain: Balance,
+) {
+	let pool = Stability::pool_account(&collateral, &STABLE);
+	crate::Deposits::<Test>::mutate((collateral.clone(), STABLE, who), |row| {
+		let row = row.as_mut().expect("deposit row exists");
+		row.claimable_collateral += collateral_gain;
+		row.claimable_yield += yield_gain;
+	});
+	mutate_pool_state(collateral.clone(), STABLE, |state| {
+		state.total_collateral_gains_unclaimed += collateral_gain;
+		state.total_yield_unclaimed += yield_gain;
+	});
+	if collateral_gain > 0 {
+		mint_collateral(collateral, pool, collateral_gain);
+	}
+	if yield_gain > 0 {
+		mint_stable(STABLE, pool, yield_gain);
+	}
+}
+
 #[test]
 fn claims_pay_out_clear_and_default_to_the_caller() {
-	build_and_execute(|| {
-		seed_pool_with_matured_deposit();
+	ExtBuilder::single_depositor().build_and_execute(|| {
 		// A fresh immature tranche on top of the 400 active, which no claim may touch.
 		assert_ok!(deposit(1, DOT, STABLE, 300));
 		seed_claimables(1, 70, 55);
@@ -44,13 +73,15 @@ fn claims_pay_out_clear_and_default_to_the_caller() {
 		assert_noop!(claim_collateral(1, DOT, STABLE, 1), Error::<Test>::NoClaimableCollateral);
 		assert_noop!(claim_yield(1, DOT, STABLE, 9), Error::<Test>::NoClaimableYield);
 
-		// A `None` recipient pays the caller on both claim sides.
 		seed_claimables(1, 70, 55);
 		let coll_before = collateral_balance(DOT, 1);
-		assert_ok!(Stability::claim_collateral(RuntimeOrigin::signed(1), DOT, STABLE, None));
-		assert_eq!(collateral_balance(DOT, 1) - coll_before, 70);
 		let stable_before = stable_balance(STABLE, 1);
+
+		// A `None` recipient pays the caller on both claim sides.
+		assert_ok!(Stability::claim_collateral(RuntimeOrigin::signed(1), DOT, STABLE, None));
 		assert_ok!(Stability::claim_yield(RuntimeOrigin::signed(1), DOT, STABLE, None));
+
+		assert_eq!(collateral_balance(DOT, 1) - coll_before, 70);
 		assert_eq!(stable_balance(STABLE, 1) - stable_before, 55);
 	});
 }
@@ -60,9 +91,7 @@ fn claims_pay_out_clear_and_default_to_the_caller() {
 // account up. The float is what every exact payout leaves behind instead.
 #[test]
 fn claims_leaving_a_sub_minimum_remainder_still_pay_out() {
-	build_and_execute(|| {
-		create_high_min_collateral();
-		register_branch(HIGH_MIN, STABLE, branch_config_for(HIGH_MIN, STABLE));
+	ExtBuilder::default().branch(HIGH_MIN, STABLE).build_and_execute(|| {
 		let pool = Stability::pool_account(&HIGH_MIN, &STABLE);
 		for who in [1, 2] {
 			mint_stable(STABLE, who, 100);
@@ -76,13 +105,15 @@ fn claims_leaving_a_sub_minimum_remainder_still_pay_out() {
 			mint_collateral(HIGH_MIN, recipient, 1_000);
 		}
 
-		// 400 of tracked gains stay behind, below the 1_000 minimum; the float sits beneath them.
+		// 400 of tracked gains stay behind, below the 1_000 minimum; the float sits beneath
+		// them.
 		assert_ok!(claim_collateral(1, HIGH_MIN, STABLE, 8));
 		assert_eq!(collateral_balance(HIGH_MIN, 8), 1_600);
 		assert_eq!(pool_collateral_held(HIGH_MIN, STABLE), 400);
 
 		// The last claim empties the tracked gains and leaves exactly the float.
 		assert_ok!(claim_collateral(2, HIGH_MIN, STABLE, 9));
+
 		assert_eq!(collateral_balance(HIGH_MIN, 9), 1_400);
 		assert_eq!(pool_collateral_held(HIGH_MIN, STABLE), 0);
 		assert_eq!(collateral_balance(HIGH_MIN, pool), 1_000);

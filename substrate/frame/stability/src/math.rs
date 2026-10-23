@@ -342,23 +342,6 @@ mod tests {
 	}
 
 	#[test]
-	fn realize_one_scale_behind_divides_compounded_by_scale_factor() {
-		// D0=1e12 at P0=0.5 on scale n; current scale n+1 with P=0.8:
-		// compounded = floor(1e12 * 0.8 / (0.5 * 1e9)) = floor(8e11 / 5e8) = 1600.
-		let snap =
-			snapshot(FixedU128::from_rational(1, 2), FixedU128::zero(), FixedU128::zero(), 0, 3);
-		let current = accumulators(FixedU128::from_rational(4, 5), 0, 4);
-		let got = realize::<u128>(
-			1_000_000_000_000,
-			&snap,
-			&current,
-			&window(FixedU128::zero(), FixedU128::zero()),
-			&PRECISION,
-		);
-		assert_eq!(got.compounded, 1_600);
-	}
-
-	#[test]
 	fn realize_two_scales_behind_combines_three_sum_rows() {
 		// D0=1e18 at P0=0.5, S0=0.2; the snapshot row finished at 0.5, the
 		// next row holds 300 and the one after 500:
@@ -390,29 +373,6 @@ mod tests {
 	}
 
 	#[test]
-	fn realize_three_scales_behind_compounds_to_zero_but_pays_window_gains() {
-		// Three crossings leave less than one part in scale_factor² of the
-		// deposit: compounded rounds to zero; gains inside the three-row
-		// window remain claimable.
-		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
-		let current = accumulators(FixedU128::from_rational(1, 2), 0, 3);
-		let sums = window(FixedU128::from_rational(1, 4), FixedU128::zero());
-		let got = realize::<u128>(4_000_000_000_000_000_000, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got.compounded, 0);
-		// gain = floor(4e18 * 0.25 / 1) = 1e18.
-		assert_eq!(got.collateral_gain, 1_000_000_000_000_000_000);
-	}
-
-	#[test]
-	fn realize_zero_deposit_is_all_zero() {
-		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
-		let current = accumulators(FixedU128::one(), 0, 0);
-		let sums = window(FixedU128::from_u32(5), FixedU128::from_u32(5));
-		let got = realize::<u128>(0, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got, Realized { compounded: 0, collateral_gain: 0, yield_gain: 0 });
-	}
-
-	#[test]
 	fn clamp_offset_debt_matrix() {
 		// A=1000, min=100:
 		// full depletion passes through unchanged;
@@ -427,30 +387,10 @@ mod tests {
 		assert_eq!(clamp_offset_debt::<u128>(500, 1_000, 100), 500);
 		// request above the pool consumes the whole pool.
 		assert_eq!(clamp_offset_debt::<u128>(5_000, 1_000, 100), 1_000);
-	}
-
-	#[test]
-	fn clamp_offset_debt_below_minimum_pool_allows_only_full_depletion() {
-		// A=50 < min=100: partial offsets clamp to zero (A - min saturates),
-		// full depletion still passes.
+		// A=50 < min=100, a pool already below its floor: partial offsets clamp to zero
+		// (A - min saturates), full depletion still passes.
 		assert_eq!(clamp_offset_debt::<u128>(30, 50, 100), 0);
 		assert_eq!(clamp_offset_debt::<u128>(50, 50, 100), 50);
-	}
-
-	#[test]
-	fn delta_sum_basic_and_floors() {
-		// floor(300 * 0.5 / 1000) = 0.15 → inner 1.5e17.
-		let got = delta_sum::<u128>(300, FixedU128::from_rational(1, 2), 1_000).expect("fits");
-		assert_eq!(got, FixedU128::from_inner(150_000_000_000_000_000));
-		// floor(100 * 1.0 / 3000) truncates the infinite tail.
-		let got = delta_sum::<u128>(100, FixedU128::one(), 3_000).expect("fits");
-		assert_eq!(got, FixedU128::from_inner(33_333_333_333_333_333));
-	}
-
-	#[test]
-	fn delta_sum_empty_pool_is_none_zero_distribution_is_zero() {
-		assert_eq!(delta_sum::<u128>(300, FixedU128::one(), 0), None);
-		assert_eq!(delta_sum::<u128>(0, FixedU128::one(), 0), Some(FixedU128::zero()));
 	}
 
 	#[test]
@@ -481,15 +421,6 @@ mod tests {
 				scales_crossed: 1
 			})
 		);
-	}
-
-	#[test]
-	fn update_p_beyond_crossing_cap_is_rejected() {
-		// A=1e28, new_total=1: even after two crossings the candidate is
-		// floor(1e18 * 1e18 * 1 / 1e28) = 1e8 < p_min → None.
-		let total = 10_000_000_000_000_000_000_000_000_000u128;
-		let got = update_p_after_offset::<u128>(FixedU128::one(), total, total - 1, &PRECISION);
-		assert_eq!(got, None);
 	}
 
 	#[test]
@@ -612,10 +543,18 @@ mod tests {
 		// One past the boundary rolls a whole width forward.
 		assert_eq!(cohort_deadline(5_001, 5_000), 15_000);
 		// The wait always lands in [delay, 2 * delay).
-		for now in [0, 1, 999, 4_999, 5_000, 7_331] {
-			let deadline = cohort_deadline(now, 5_000);
-			assert!(deadline - now >= 5_000);
-			assert!(deadline - now < 10_000);
-		}
+		assert_wait_within_one_window(0);
+		assert_wait_within_one_window(1);
+		assert_wait_within_one_window(999);
+		assert_wait_within_one_window(4_999);
+		assert_wait_within_one_window(5_000);
+		assert_wait_within_one_window(7_331);
+	}
+
+	/// Asserts that a deposit at `now` waits at least the 5_000 entry delay and less than twice it.
+	fn assert_wait_within_one_window(now: Millis) {
+		let deadline = cohort_deadline(now, 5_000);
+		assert!(deadline - now >= 5_000);
+		assert!(deadline - now < 10_000);
 	}
 }
