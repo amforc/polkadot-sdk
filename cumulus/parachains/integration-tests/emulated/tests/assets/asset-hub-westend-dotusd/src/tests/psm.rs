@@ -101,7 +101,7 @@ fn create_dotusd_psm() -> (Location, Location) {
 	(internal, external)
 }
 
-/// Steps 1 and 2 of the referendum on top of a vault market, so vault and PSM
+/// Steps 1 and 2 of the referendum on top of a vault branch, so vault and PSM
 /// share the stablecoin. `create_branch` already plays step 1.
 fn launch_dotusd_psm() -> (Location, Location) {
 	feed_price(dot_price(2, 1));
@@ -110,7 +110,7 @@ fn launch_dotusd_psm() -> (Location, Location) {
 	create_dotusd_psm()
 }
 
-/// Calls `Vaults::borrow` for `owner` on the native market. Post-dispatch info
+/// Calls `Vaults::borrow` for `owner` on the native branch. Post-dispatch info
 /// is dropped so callers can assert against plain pallet errors.
 fn borrow(owner: &AccountId, amount: Balance) -> DispatchResult {
 	Vaults::borrow(

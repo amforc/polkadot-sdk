@@ -72,7 +72,8 @@ fn final_recovery_redemption_below_par_with_full_insurance_cover() {
 			stable_id: DOTUSD_ID,
 			owner: parked_owner.clone(),
 			recipient: settler.clone(),
-			debt_cancelled: 7_000 * DOTUSD,
+			// The vault borrowed at a zero rate, so its debt carries no interest.
+			debt_cancelled: pallet_vaults::DebtBreakdown { principal: 7_000 * DOTUSD, interest: 0 },
 			collateral_to_recipient: 2_500 * WND,
 			vault_annual_rate: FixedU128::zero(),
 		}));

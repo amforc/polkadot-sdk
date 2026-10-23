@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared setup for a six-decimal stablecoin, runtime asset markets, and a Root-fed oracle.
+//! Shared setup for a six-decimal stablecoin, runtime asset branches, and a Root-fed oracle.
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
@@ -125,7 +125,7 @@ pub(crate) fn accounting_spec() -> BranchSpec {
 	}
 }
 
-/// Creates the stablecoin and a native-WND market for it, and lifts the global
+/// Creates the stablecoin and a native-WND branch for it, and lifts the global
 /// debt ceiling.
 pub(crate) fn create_branch(spec: &BranchSpec) {
 	create_dotusd();
@@ -152,7 +152,7 @@ pub(crate) fn create_branch(spec: &BranchSpec) {
 /// Creates the stablecoin asset, owned by [`admin`]. It is sufficient, so holders
 /// need no native provider reference, and it has a real minimum balance.
 ///
-/// With a minimum balance above one unit, the first market registration must
+/// With a minimum balance above one unit, the first branch registration must
 /// create the fee account's stablecoin account. That account owns its deposit,
 /// so it needs native balance. A live treasury holds some. The emulated genesis
 /// does not, so the helper funds it.
@@ -179,7 +179,7 @@ pub(crate) fn create_dotusd() {
 	));
 }
 
-/// Creates a market from the stablecoin owner instead of Root, and lifts the
+/// Creates a branch from the stablecoin owner instead of Root, and lifts the
 /// global debt ceiling. The creator then pays every refundable registration
 /// cost, not the full admin.
 pub(crate) fn create_market_signed(collateral_id: VaultsCollateralId, spec: &BranchSpec) {
@@ -203,15 +203,14 @@ pub(crate) fn create_market_signed(collateral_id: VaultsCollateralId, spec: &Bra
 	lift_global_ceiling(SCENARIO_GLOBAL_CEILING);
 }
 
-/// Registration payload `(redemptions, stability)` for a dotUSD market. The
-/// redemption policy is stablecoin-wide, so only the first market carries it.
+/// Registration payload `(redemptions, stability)` for a dotUSD branch. The
+/// redemption policy is stablecoin-wide, so only the first branch carries it.
 pub(crate) fn registration_config() -> (
 	Option<pallet_redemptions::RedemptionConfig<Balance>>,
 	pallet_stability::types::StabilityPoolConfig<Balance>,
 ) {
-	let redemption_config =
-		(!pallet_redemptions::RedemptionConfigs::<Runtime>::contains_key(DOTUSD_ID))
-			.then(test_redemption_config);
+	let redemption_config = (!pallet_redemptions::Stablecoins::<Runtime>::contains_key(DOTUSD_ID))
+		.then(test_redemption_config);
 	(redemption_config, test_stability_config())
 }
 
@@ -242,7 +241,7 @@ fn test_stability_config() -> pallet_stability::types::StabilityPoolConfig<Balan
 	}
 }
 
-/// One call covers every market of the coin, because the ceiling is
+/// One call covers every branch of the coin, because the ceiling is
 /// stablecoin-wide. `amount` is in stablecoin units.
 pub(crate) fn lift_global_ceiling(amount: Balance) {
 	assert_ok!(Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), DOTUSD_ID, amount));
@@ -449,7 +448,7 @@ pub(crate) fn liquidate_on(collateral_id: VaultsCollateralId, owner: &AccountId)
 }
 
 /// Funds a fresh `redeemer` with `terms.max_stable_to_spend` plus the stablecoin
-/// minimum balance, redeems on the native market, and returns the collateral
+/// minimum balance, redeems on the native branch, and returns the collateral
 /// received.
 ///
 /// Every scenario redemption is budgeted to the unit, so the helper asserts
@@ -476,7 +475,7 @@ pub(crate) fn dotusd_balance(who: &AccountId) -> Balance {
 	<Assets as Inspect<AccountId>>::balance(DOTUSD_ID, who)
 }
 
-/// Market-level accounting for the native-WND market.
+/// Branch-level accounting for the native-WND branch.
 pub(crate) fn branch_state() -> pallet_vaults::types::BranchState<AccountId, Balance> {
 	pallet_vaults::Branches::<Runtime>::get(get_native_id(), DOTUSD_ID)
 		.expect("branch registered")
