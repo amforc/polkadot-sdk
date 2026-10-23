@@ -42,61 +42,64 @@ mod tests {
 		testing_prelude::hypothetically,
 	};
 
-	/// Each corruption that no write path can produce must trip its own check.
-	#[test]
-	fn detects_each_corrupted_redemption_row() {
-		// One corruption per check, with the message that check reports.
-		let corruptions: [(fn(), &str); 4] = [
-			// A row for a coin no branch issues.
-			(
-				|| {
-					Stablecoins::<Test>::insert(
-						USDX,
-						RedemptionInfo {
-							config: default_redemption_config(),
-							fee_state: Default::default(),
-						},
-					)
-				},
-				"redemption row for a stablecoin with no live branch",
-			),
-			// An issued coin without its row.
-			(
-				|| Stablecoins::<Test>::remove(STABLE),
-				"redemption rows diverge from the vault engine's issued stablecoins",
-			),
-			// A stored config that `set_redemption_config` would have refused.
-			(
-				|| {
-					Stablecoins::<Test>::mutate(STABLE, |info| {
-						info.as_mut().expect("STABLE is registered").config.dynamic_fee_ceiling =
-							FixedU128::zero();
-						info.as_mut().expect("STABLE is registered").config.dynamic_fee_floor =
-							FixedU128::from_rational(1, 100);
-					})
-				},
-				"stored redemption config fails `is_valid`",
-			),
-			// A fee operation stamped after the current time.
-			(
-				|| {
-					Stablecoins::<Test>::mutate(STABLE, |info| {
-						info.as_mut().expect("STABLE is registered").fee_state.last_fee_operation =
-							Timestamp::get() + 1;
-					})
-				},
-				"`last_fee_operation` is ahead of now",
-			),
-		];
+	// Each corruption that no write path can produce must trip its own check, with the message
+	// that check reports.
+
+	/// Corrupts a sound default branch and asserts that `try_state` reports `message`.
+	///
+	/// The corruption is rolled back so the post-test invariant check still passes.
+	fn assert_detects(message: &'static str, corrupt: impl FnOnce()) {
 		ExtBuilder::default().default_branch().build_and_execute(|| {
 			assert_eq!(do_try_state::<Test>(), Ok(()));
-			for (corrupt, message) in corruptions {
-				hypothetically!({
-					corrupt();
+			hypothetically!({
+				corrupt();
 
-					assert_eq!(do_try_state::<Test>(), Err(DispatchError::Other(message)));
-				});
-			}
+				assert_eq!(do_try_state::<Test>(), Err(DispatchError::Other(message)));
+			});
+		});
+	}
+
+	#[test]
+	fn detects_a_row_for_a_coin_no_branch_issues() {
+		assert_detects("redemption row for a stablecoin with no live branch", || {
+			Stablecoins::<Test>::insert(
+				USDX,
+				RedemptionInfo {
+					config: default_redemption_config(),
+					fee_state: Default::default(),
+				},
+			)
+		});
+	}
+
+	#[test]
+	fn detects_an_issued_coin_without_its_row() {
+		assert_detects(
+			"redemption rows diverge from the vault engine's issued stablecoins",
+			|| Stablecoins::<Test>::remove(STABLE),
+		);
+	}
+
+	/// A stored config that `set_redemption_config` would have refused.
+	#[test]
+	fn detects_a_stored_invalid_config() {
+		assert_detects("stored redemption config fails `is_valid`", || {
+			Stablecoins::<Test>::mutate(STABLE, |info| {
+				info.as_mut().expect("STABLE is registered").config.dynamic_fee_ceiling =
+					FixedU128::zero();
+				info.as_mut().expect("STABLE is registered").config.dynamic_fee_floor =
+					FixedU128::from_rational(1, 100);
+			})
+		});
+	}
+
+	#[test]
+	fn detects_a_fee_operation_stamped_after_now() {
+		assert_detects("`last_fee_operation` is ahead of now", || {
+			Stablecoins::<Test>::mutate(STABLE, |info| {
+				info.as_mut().expect("STABLE is registered").fee_state.last_fee_operation =
+					Timestamp::get() + 1;
+			})
 		});
 	}
 }
