@@ -110,29 +110,36 @@ mod tests {
 		// A 5% penalty cap and a 1% buffer below which no excess is paid out.
 		let penalty = Permill::from_percent(5);
 		let buffer = Permill::from_percent(1);
-		// (CR, expected bonus).
-		let cases = [
-			// CR = 130% → excess = 30% - 1% = 29%, capped at 5%.
-			(FixedU128::from_rational(130, 100), FixedU128::from_rational(5, 100)),
-			// CR = 102% → excess = 2% - 1% = 1% < 5% cap.
-			(FixedU128::from_rational(102, 100), FixedU128::from_rational(1, 100)),
-			// CR = 101% sits exactly at 100% + buffer: the excess is zero, so the
-			// buffer guarantees the bonus never reaches into CR − 100% itself.
-			(FixedU128::from_rational(101, 100), FixedU128::zero()),
-			// CR = 100.5% sits inside the buffer band: the raw excess
-			// CR − 100% − buffer would be −0.5%, and the saturating max(0, ·)
-			// clamp yields zero — never a negative bonus.
-			(FixedU128::from_rational(1_005, 1_000), FixedU128::zero()),
-			// CR = 100% → excess saturates to 0.
-			(FixedU128::one(), FixedU128::zero()),
-			// CR below 100% (an underwater vault) → still 0, no underflow.
-			(FixedU128::from_rational(99, 100), FixedU128::zero()),
-		];
-		for (cr, expected) in cases {
-			let bonus = recovery_bonus(cr, buffer, penalty);
-
-			assert_eq!(bonus, expected, "CR = {cr:?}");
-		}
+		// CR = 130% → excess = 30% - 1% = 29%, capped at 5%.
+		assert_eq!(
+			recovery_bonus(FixedU128::from_rational(130, 100), buffer, penalty),
+			FixedU128::from_rational(5, 100)
+		);
+		// CR = 102% → excess = 2% - 1% = 1% < 5% cap.
+		assert_eq!(
+			recovery_bonus(FixedU128::from_rational(102, 100), buffer, penalty),
+			FixedU128::from_rational(1, 100)
+		);
+		// CR = 101% sits exactly at 100% + buffer: the excess is zero, so the
+		// buffer guarantees the bonus never reaches into CR − 100% itself.
+		assert_eq!(
+			recovery_bonus(FixedU128::from_rational(101, 100), buffer, penalty),
+			FixedU128::zero()
+		);
+		// CR = 100.5% sits inside the buffer band: the raw excess
+		// CR − 100% − buffer would be −0.5%, and the saturating max(0, ·)
+		// clamp yields zero — never a negative bonus.
+		assert_eq!(
+			recovery_bonus(FixedU128::from_rational(1_005, 1_000), buffer, penalty),
+			FixedU128::zero()
+		);
+		// CR = 100% → excess saturates to 0.
+		assert_eq!(recovery_bonus(FixedU128::one(), buffer, penalty), FixedU128::zero());
+		// CR below 100% (an underwater vault) → still 0, no underflow.
+		assert_eq!(
+			recovery_bonus(FixedU128::from_rational(99, 100), buffer, penalty),
+			FixedU128::zero()
+		);
 
 		// No buffer and a 100% penalty.
 		let cr = FixedU128::from_rational(105, 100);
@@ -180,28 +187,31 @@ mod tests {
 		// An unchecked split would price the payout above par.
 		assert_eq!(above_par, None);
 
-		// (D, C, IF, effective_cover, market_cancel_debt)
-		let cases: [(u128, u128, u128, u128, u128); 5] = [
-			// The boundary C == D stays in range, with the whole debt on the market side.
-			(1000, 1000, 0, 0, 1000),
-			// A partial cover gives an effective rate of 800/950 ≈ 0.8421.
-			(1000, 800, 50, 50, 950),
-			// An empty fund puts the whole debt on the market, at an effective rate of C/D.
-			(1000, 800, 0, 0, 1000),
-			// A fund beyond the shortfall covers only the shortfall: the market cancels C, at par.
-			(1000, 800, 500, 200, 800),
-			// Worthless collateral and a fund of at least D leave nothing on the market side.
-			(1000, 0, 1000, 1000, 0),
-		];
-		for (debt, value, fund, cover, market) in cases {
-			let split = insurance_adjusted(debt, value, fund);
-
-			assert_eq!(
-				split,
-				Some(InsuranceAdjusted { market_cancel_debt: market, effective_cover: cover }),
-				"D = {debt}, C = {value}, IF = {fund}"
-			);
-		}
+		// The boundary C == D stays in range, with the whole debt on the market side.
+		assert_eq!(
+			insurance_adjusted::<u128>(1000, 1000, 0),
+			Some(InsuranceAdjusted { market_cancel_debt: 1000, effective_cover: 0 }),
+		);
+		// A partial cover gives an effective rate of 800/950 ≈ 0.8421.
+		assert_eq!(
+			insurance_adjusted::<u128>(1000, 800, 50),
+			Some(InsuranceAdjusted { market_cancel_debt: 950, effective_cover: 50 }),
+		);
+		// An empty fund puts the whole debt on the market, at an effective rate of C/D.
+		assert_eq!(
+			insurance_adjusted::<u128>(1000, 800, 0),
+			Some(InsuranceAdjusted { market_cancel_debt: 1000, effective_cover: 0 }),
+		);
+		// A fund beyond the shortfall covers only the shortfall: the market cancels C, at par.
+		assert_eq!(
+			insurance_adjusted::<u128>(1000, 800, 500),
+			Some(InsuranceAdjusted { market_cancel_debt: 800, effective_cover: 200 }),
+		);
+		// Worthless collateral and a fund of at least D leave nothing on the market side.
+		assert_eq!(
+			insurance_adjusted::<u128>(1000, 0, 1000),
+			Some(InsuranceAdjusted { market_cancel_debt: 0, effective_cover: 1000 }),
+		);
 	}
 
 	#[test]
