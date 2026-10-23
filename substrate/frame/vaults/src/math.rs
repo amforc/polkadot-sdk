@@ -165,8 +165,10 @@ mod tests {
 	use super::*;
 	use frame::arithmetic::Saturating;
 
+	// Interest is charged in whole units rounded up, and the excess is carried as prepaid so that
+	// repeated touches charge the rounded-up total once instead of compounding the rounding.
 	#[test]
-	fn charged_interest_never_falls_below_the_exact_amount() {
+	fn charge_interest_rounds_up_once_and_carries_prepaid() {
 		let unit = INTEREST_DENOMINATOR;
 
 		// A third of a unit rounds up to one and prepays two thirds.
@@ -183,11 +185,9 @@ mod tests {
 		// An exact multiple leaves no excess.
 		assert_eq!(charge_interest::<u128>(U256::from(unit * 5), 0), Some((5, 0)));
 		assert_eq!(charge_interest::<u64>(U256::from(u128::MAX) * U256::from(unit), 0), None);
-	}
 
-	#[test]
-	fn repeated_touches_charge_the_rounded_up_total_once() {
-		let step = INTEREST_DENOMINATOR / 7;
+		// Seventy touches of a seventh each charge ceil(sum), not the sum of the ceilings.
+		let step = unit / 7;
 		let mut total = 0u128;
 		let mut prepaid = 0;
 
@@ -198,7 +198,7 @@ mod tests {
 		}
 
 		let exact = U256::from(step) * U256::from(70u32);
-		let ceil = exact.div_mod(U256::from(INTEREST_DENOMINATOR));
+		let ceil = exact.div_mod(U256::from(unit));
 		let expected = ceil.0.low_u128() + u128::from(!ceil.1.is_zero());
 		assert_eq!(total, expected);
 	}
@@ -216,29 +216,18 @@ mod tests {
 	fn simple_interest_ceil_is_exact_or_rounds_up() {
 		let one = FixedU128::one();
 		let ten_percent = FixedU128::saturating_from_rational(10u32, 100u32);
-		// Each case is `(principal, rate, elapsed milliseconds, interest)`.
-		let cases: [(u128, FixedU128, u64, u128); 5] = [
-			// Any zero input yields no interest.
-			(0, one, 1_000, 0),
-			(1_000, FixedU128::zero(), 1_000, 0),
-			(1_000, one, 0, 0),
-			// An exact year has no rounding.
-			(1_000_000, ten_percent, MILLIS_PER_YEAR, 100_000),
-			// A positive fraction rounds up to one.
-			(3, one, 1, 1),
-		];
-
-		for (principal, rate, elapsed, interest) in cases {
-			assert_eq!(
-				simple_interest_ceil::<u128>(principal, rate, elapsed),
-				interest,
-				"{principal} at {rate:?} over {elapsed} ms"
-			);
-		}
+		// Any zero input yields no interest.
+		assert_eq!(simple_interest_ceil::<u128>(0, one, 1_000), 0);
+		assert_eq!(simple_interest_ceil::<u128>(1_000, FixedU128::zero(), 1_000), 0);
+		assert_eq!(simple_interest_ceil::<u128>(1_000, one, 0), 0);
+		// An exact year has no rounding.
+		assert_eq!(simple_interest_ceil::<u128>(1_000_000, ten_percent, MILLIS_PER_YEAR), 100_000);
+		// A positive fraction rounds up to one.
+		assert_eq!(simple_interest_ceil::<u128>(3, one, 1), 1);
 	}
 
 	#[test]
-	fn average_branch_rate_ceils_in_protocol_favor() {
+	fn average_branch_rate_ceils_and_defaults_to_one() {
 		// An exact 7% rate does not need rounding.
 		let avg = average_branch_rate::<u128>(700, 10_000);
 		assert_eq!(avg, FixedU128::from_rational(7u128, 100u128));
@@ -250,13 +239,8 @@ mod tests {
 		assert!(
 			avg.saturating_sub(FixedU128::from_rational(1u128, 3u128)) <= FixedU128::from_inner(1)
 		);
-	}
 
-	#[test]
-	fn average_branch_rate_zero_debt_returns_one() {
 		// An empty branch uses 1.0 for its first fee calculation.
-		let avg = average_branch_rate::<u128>(0, 0);
-
-		assert_eq!(avg, FixedU128::one());
+		assert_eq!(average_branch_rate::<u128>(0, 0), FixedU128::one());
 	}
 }

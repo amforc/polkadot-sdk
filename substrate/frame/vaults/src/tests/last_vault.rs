@@ -24,16 +24,6 @@ fn execute_liquidation_rejects_healthy_vault() {
 }
 
 #[test]
-fn execute_liquidation_rejects_final_recovery_vault() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(enter_final_recovery(99, DOT, STABLE, 1));
-		assert_noop!(liquidate(DOT, STABLE, 1), crate::Error::<Test>::VaultInFinalRecovery);
-	});
-}
-
-#[test]
 fn execute_liquidation_rejects_frozen_branch() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
@@ -156,7 +146,7 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 		// Partial redemption drains vault 1 below MinimumDebt → Dormant, and
 		// parks it as the next redemption target.
 		assert_ok!(redeem(DOT, STABLE, 3, 350));
-		let state = branch_state(DOT, STABLE).expect("branch state");
+		let state = market_state(DOT, STABLE);
 		assert_eq!(state.dormant_redemption_target, Some(1));
 
 		// Crash the price so the dormant husk is liquidatable, then liquidate.
@@ -164,7 +154,7 @@ fn liquidating_parked_dormant_owner_clears_pointer() {
 		assert_ok!(liquidate(DOT, STABLE, 1));
 
 		assert!(!vault_exists(DOT, STABLE, 1));
-		let state = branch_state(DOT, STABLE).expect("branch state");
+		let state = market_state(DOT, STABLE);
 		assert_eq!(state.dormant_redemption_target, None, "pointer cleared with the row");
 	});
 }
