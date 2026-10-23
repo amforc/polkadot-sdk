@@ -3,7 +3,7 @@
 #![cfg(feature = "runtime-benchmarks")]
 
 use crate::{
-	pallet::{BalanceOf, Call, Config, Pallet, RedemptionConfigOf},
+	pallet::{BalanceOf, Call, Config, Event, Pallet, RedemptionConfigOf, Stablecoins},
 	types::{RedemptionConfig, RedemptionTerms},
 	BenchmarkHelper as _,
 };
@@ -61,15 +61,30 @@ mod benchmarks {
 	#[benchmark]
 	fn set_redemption_config() -> Result<(), BenchmarkError> {
 		let (_, stable_id, _, _) = T::BenchmarkHelper::setup_redeemable_branch(1);
-		let config = registration_config::<T>();
+		let config =
+			RedemptionConfig { base_fee: Permill::from_percent(1), ..registration_config::<T>() };
+		let old_config = Stablecoins::<T>::get(&stable_id)
+			.map(|info| info.config)
+			.ok_or(BenchmarkError::Stop("registration seeded no redemption config"))?;
+		assert!(old_config != config);
+		// A stablecoin owner's signed origin, where the runtime admits one, reads the owner too.
 		let origin = T::UpdateOrigin::try_successful_origin(&stable_id)
 			.map_err(|_| BenchmarkError::Weightless)?;
 
 		#[extrinsic_call]
-		_(origin as T::RuntimeOrigin, stable_id, config);
+		_(origin as T::RuntimeOrigin, stable_id.clone(), config.clone());
 
+		assert_eq!(Stablecoins::<T>::get(&stable_id).map(|info| info.config), Some(config.clone()));
+		frame_system::Pallet::<T>::assert_last_event(
+			Event::<T>::RedemptionConfigUpdated { stable_id, old_config, new_config: config }
+				.into(),
+		);
 		Ok(())
 	}
 
-	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);
+	impl_benchmark_test_suite!(
+		Pallet,
+		crate::mock::ExtBuilder::default().build(),
+		crate::mock::Test
+	);
 }
