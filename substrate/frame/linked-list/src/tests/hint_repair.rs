@@ -24,76 +24,73 @@ fn build_chain(priorities: &[(ItemId, Priority)]) {
 	}
 }
 
-#[test]
-fn stale_hint_within_budget_repairs_succeeds() {
-	build_and_execute(|| {
-		// MaxHintRepairSteps = 4 (set in mock).
-		// 5 items; correct insert pos for priority=15 is between 4 (priority 20) and 5 (priority
-		// 10).
-		build_chain(&[(1, 100), (2, 80), (3, 50), (4, 20), (5, 10)]);
+/// Dry-run `hint` through `repair_steps_needed`, then insert item 99 with it:
+/// the view must predict exactly the repair steps the insert spends.
+fn assert_view_matches_insert(priority: Priority, hint: Position<ItemId>) -> u32 {
+	let steps = LinkedList::repair_steps_needed(&1, priority, hint.clone());
+	assert_eq!(LinkedList::insert(1, 99, priority, hint), Ok(steps));
+	steps
+}
 
-		// Stale hint: caller thinks pos is between 1 and 2 (head region).
-		// Real pos is between 4 and 5: 3 nodes away, within the 4-step budget.
-		let steps = LinkedList::insert(1, 100, 15, Position::between(1, 2))
-			.expect("repair walks within budget");
-		assert!(steps > 0 && steps <= MaxHintRepairSteps::get());
-		assert_eq!(dump(1), vec![(1, 100), (2, 80), (3, 50), (4, 20), (100, 15), (5, 10)]);
+/// A short chain whose gaps leave room for item 99 at any position.
+fn build_short_chain() {
+	build_chain(&[(1, 90), (2, 70), (3, 50)]);
+}
+
+#[test]
+fn repair_steps_needed_is_zero_for_valid_hint() {
+	build_and_execute(|| {
+		build_short_chain();
+		assert_eq!(assert_view_matches_insert(80, Position::between(1, 2)), 0);
 	});
 }
 
 #[test]
-fn stale_hint_beyond_budget_returns_invalid_hints() {
+fn repair_steps_needed_counts_stale_hint() {
 	build_and_execute(|| {
-		// Long chain so that priority=5 (correct pos = tail) is unreachable from a
-		// head-region hint within `MaxHintRepairSteps`.
+		build_short_chain();
+		assert!(assert_view_matches_insert(60, Position::at_head(1)) > 0);
+	});
+}
+
+/// `Some(999)` is dangling. Even though priority 80 is positionally between
+/// (1, 2), `walk_repair` must spend at least one step clamping the invalid
+/// `next`; a head-positional approximation of the cost once missed this.
+#[test]
+fn repair_steps_needed_counts_clamping_dangling_next() {
+	build_and_execute(|| {
+		build_short_chain();
+		assert!(assert_view_matches_insert(80, Position::between(1, 999)) > 0);
+	});
+}
+
+/// MaxHintRepairSteps = 4 (set in mock). The caller thinks priority 15 goes
+/// between 1 and 2 (head region); the real position is between 4 and 5,
+/// 3 nodes away, within budget.
+#[test]
+fn repair_steps_needed_matches_insert_within_budget() {
+	build_and_execute(|| {
+		build_chain(&[(1, 100), (2, 80), (3, 50), (4, 20), (5, 10)]);
+		let steps = assert_view_matches_insert(15, Position::between(1, 2));
+		assert!(steps > 0);
+		assert!(steps <= MaxHintRepairSteps::get());
+		assert_eq!(dump(1), vec![(1, 100), (2, 80), (3, 50), (4, 20), (99, 15), (5, 10)]);
+	});
+}
+
+/// Past the budget the view reports an infeasible step count and the insert
+/// fails without touching storage: priority 5 belongs at the tail of a chain
+/// longer than `MaxHintRepairSteps`, but the hint claims the head.
+#[test]
+fn repair_steps_needed_exceeds_budget_and_insert_fails() {
+	build_and_execute(|| {
 		build_long_chain();
+		let steps = LinkedList::repair_steps_needed(&1, 5, Position::at_head(1));
+		assert!(steps > MaxHintRepairSteps::get());
 		assert_noop!(
 			LinkedList::insert(1, 99, 5, Position::at_head(1)),
 			ListError::InvalidPositionHints
 		);
-	});
-}
-
-#[test]
-fn repair_steps_needed_zero_for_valid_hint() {
-	build_and_execute(|| {
-		build_chain(&[(1, 90), (2, 70), (3, 50)]);
-		assert_eq!(LinkedList::repair_steps_needed(&1, 80, Position::between(1, 2),), 0);
-	});
-}
-
-#[test]
-fn repair_steps_needed_positive_for_stale_hint() {
-	build_and_execute(|| {
-		build_chain(&[(1, 90), (2, 70), (3, 50)]);
-		let n = LinkedList::repair_steps_needed(&1, 60, Position::at_head(1));
-		assert!(n > 0);
-	});
-}
-
-/// `repair_steps_needed` now reflects the *actual* `walk_repair` cost,
-/// including dangling-hint clamps that a head-positional approximation
-/// missed. A hint pointing at a deleted item should report a non-zero step
-/// count.
-#[test]
-fn repair_steps_needed_counts_dangling_hint_clamp() {
-	build_and_execute(|| {
-		build_chain(&[(1, 90), (2, 70), (3, 50)]);
-		// `Some(999)` is dangling. Even though priority 80 is positionally between
-		// (1, 2), `walk_repair` must spend at least one step clamping the
-		// invalid `next` before it can land on the correct position.
-		let n = LinkedList::repair_steps_needed(&1, 80, Position::between(1, 999));
-		assert!(n > 0);
-	});
-}
-
-#[test]
-fn repair_steps_needed_exceeds_budget_signals_infeasible() {
-	build_and_execute(|| {
-		build_long_chain();
-		// priority=5 is tail; hint claims head. Distance > `MaxHintRepairSteps`.
-		let n = LinkedList::repair_steps_needed(&1, 5, Position::at_head(1));
-		assert!(n > MaxHintRepairSteps::get());
 	});
 }
 
@@ -121,7 +118,7 @@ fn strict_mode_zero_budget_accepts_valid_hint_rejects_invalid() {
 #[test]
 #[cfg_attr(debug_assertions, should_panic = "repair step made no progress")]
 fn walk_repair_asymmetric_links_is_defensive() {
-	build_and_execute_defensive(|| {
+	build_and_execute_no_post_check(|| {
 		build_chain(&[(1, 90), (2, 70), (3, 50)]);
 		// Break the back-link: 2.next still names 3, but 3.prev now names 1.
 		corrupt_node(1, 3, |n| n.prev = Some(1));

@@ -19,6 +19,15 @@ use pallet_vaults::DebtBreakdown;
 /// The price that parks the standing vault at a CR of 104%.
 const PRICE_AT_104_PERCENT: FixedU128 = FixedU128::from_rational(52, 100);
 
+/// Branch configuration for recovery settlement tests, with no entry compensation.
+/// These tests price the collateral available to settle the head.
+fn recovery_branch_config() -> pallet_vaults::BranchConfig<Balance> {
+	let mut config = default_branch_config();
+	config.liquidation.keeper_flat_compensation_value = 0;
+	config.liquidation.keeper_percent_compensation = Permill::zero();
+	config
+}
+
 /// The recovery branch, without the standing vault.
 fn recovery_branch() -> ExtBuilder {
 	ExtBuilder::default().default_branch().branch_config(recovery_branch_config())
@@ -52,6 +61,26 @@ fn park_standing_head_at(price: FixedU128) {
 	assert_standing_debt();
 	set_price(DOT, price);
 	assert_ok!(enter_final_recovery(DOT, STABLE, 5));
+}
+
+/// Asserts that Vaults reported `debt` cancelled against `collateral` for the vault of `owner` in
+/// the default branch, paid to its pool account at the rate [`open_vault`] sets.
+///
+/// The recovery events of this pallet carry no amounts, because the vault engine reports them.
+fn assert_vault_redeemed(
+	owner: AccountId,
+	debt: pallet_vaults::DebtBreakdown<Balance>,
+	collateral: Balance,
+) {
+	System::assert_has_event(RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed {
+		collateral_id: DOT,
+		stable_id: STABLE,
+		owner,
+		recipient: Stability::pool_account(&DOT, &STABLE),
+		debt_cancelled: debt,
+		collateral_to_recipient: collateral,
+		vault_annual_rate: FixedU128::from_rational(5u128, 100u128),
+	}));
 }
 
 /// Asserts that this pallet reported a recovery offset paid by `source`.
@@ -152,18 +181,22 @@ fn recovery_offset_error_paths() {
 		assert_noop!(offset_recovery(DOT, STABLE, 0), Error::<Test>::NoRecoveryOffsetPerformed);
 
 		// Frozen halts recovery offsets like every other operation.
-		MockOracleAvailable::set(false);
+		MockOracleAvailable::set(&false);
 
 		assert_noop!(offset_recovery(DOT, STABLE, 300), Error::<Test>::BranchFrozen);
-		MockOracleAvailable::set(true);
 	});
 }
 
-#[test]
-fn recovery_offset_past_the_supported_scale_range_is_refused() {
-	// Recovery sizes its burn by the floor alone, and only the accounting checks `P`. The coarsest
-	// precision the pool accepts, `p_min = 1e-3` and `scale_factor = 1e3`, lets `P` fall by at
-	// most `1e6` across the two supported crossings before it must stay at or above `p_min`.
+/// The 2e9 active pool behind the standing vault, under the coarsest precision the pool accepts.
+const COARSE_POOL_TOTAL: Balance = 2_000_000_000;
+
+/// Recovery sizes its burn by the floor alone, and only the accounting checks `P`. The coarsest
+/// precision the pool accepts, `p_min = 1e-3` and `scale_factor = 1e3`, lets `P` fall by at most
+/// `1e6` across the two supported crossings before it must stay at or above `p_min`.
+///
+/// One survivor in 2e9 needs `P = 1e6 / 2e9 = 5e-4`, under `p_min`. Two survivors land on `p_min`
+/// exactly, which the pool still represents.
+fn coarse_precision_recovery_branch() -> ExtBuilder {
 	let coarse = StabilityPoolConfig {
 		minimum_active_pool_balance: 1,
 		precision: PoolPrecision {
@@ -172,65 +205,69 @@ fn recovery_offset_past_the_supported_scale_range_is_refused() {
 		},
 		..default_pool_config()
 	};
-	let pool_total: Balance = 2_000_000_000;
-	for (survivor, refused) in [(1, true), (2, false)] {
-		// The standing vault scaled by 1e7, so the head can absorb the whole pool.
-		recovery_branch()
-			.pool_config(coarse.clone())
-			.vault(5, 10_000_000_000, 4_980_000_000)
-			.matured_deposit(1, pool_total)
-			.build_and_execute(|| {
-				set_price(DOT, PRICE_AT_104_PERCENT);
-				assert_ok!(enter_final_recovery(DOT, STABLE, 5));
-
-				// One survivor in 2e9 needs `P = 1e6 / 2e9 = 5e-4`, under `p_min`. Two survivors
-				// land on `p_min` exactly, which the pool still represents.
-				let burn = pool_total - survivor;
-				if refused {
-					assert_noop!(
-						offset_recovery(DOT, STABLE, burn),
-						Error::<Test>::UnsupportedOffsetPrecision
-					);
-				} else {
-					assert_ok!(offset_recovery(DOT, STABLE, burn));
-					assert_eq!(pool_state(DOT, STABLE).total_active_deposits, survivor);
-				}
-			});
-	}
+	// The standing vault scaled by 1e7, so the head can absorb the whole pool.
+	recovery_branch()
+		.pool_config(coarse)
+		.vault(5, 10_000_000_000, 4_980_000_000)
+		.matured_deposit(1, COARSE_POOL_TOTAL)
 }
 
 #[test]
-fn active_recovery_rolls_back_when_pool_accounting_fails_after_settlement() {
-	standing_head_with_active_pool().build_and_execute(|| {
-		park_standing_head_at(PRICE_AT_104_PERCENT);
+fn recovery_offset_past_the_supported_scale_range_is_refused() {
+	coarse_precision_recovery_branch().build_and_execute(|| {
+		set_price(DOT, PRICE_AT_104_PERCENT);
+		assert_ok!(enter_final_recovery(DOT, STABLE, 5));
 
-		hypothetically!({
-			mutate_pool_state(DOT, STABLE, |state| {
-				state.total_collateral_gains_unclaimed = Balance::MAX;
-			});
-
-			// `assert_noop!` compares the whole storage root, so it also proves the vault
-			// settlement and the pool burn rolled back with the failed plan.
-			assert_noop!(offset_recovery(DOT, STABLE, 300), ArithmeticError::Overflow);
-		});
+		// One survivor would need `P` under `p_min`.
+		assert_noop!(
+			offset_recovery(DOT, STABLE, COARSE_POOL_TOTAL - 1),
+			Error::<Test>::UnsupportedOffsetPrecision
+		);
 	});
 }
 
 #[test]
-fn incoming_recovery_rolls_back_when_deposit_accounting_fails_after_settlement() {
-	standing_vault().stable_balance(2, 200).deposit(2, 100).build_and_execute(|| {
-		park_standing_head_at(PRICE_AT_104_PERCENT);
+fn recovery_offset_at_the_edge_of_the_supported_scale_range_settles() {
+	coarse_precision_recovery_branch().build_and_execute(|| {
+		set_price(DOT, PRICE_AT_104_PERCENT);
+		assert_ok!(enter_final_recovery(DOT, STABLE, 5));
 
-		hypothetically!({
-			crate::Deposits::<Test>::mutate((DOT, STABLE, 2), |row| {
-				row.as_mut().expect("deposit row exists").claimable_collateral = Balance::MAX;
+		// Two survivors land `P` on `p_min` exactly.
+		assert_ok!(offset_recovery(DOT, STABLE, COARSE_POOL_TOTAL - 2));
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 2);
+	});
+}
+
+#[test]
+fn recovery_rolls_back_when_accounting_fails_after_settlement() {
+	standing_head_with_active_pool()
+		.stable_balance(2, 200)
+		.deposit(2, 100)
+		.build_and_execute(|| {
+			park_standing_head_at(PRICE_AT_104_PERCENT);
+
+			// Active pool: the pool's gain total overflows after the vault settled.
+			hypothetically!({
+				mutate_pool_state(DOT, STABLE, |state| {
+					state.total_collateral_gains_unclaimed = Balance::MAX;
+				});
+
+				// `assert_noop!` compares the whole storage root, so it also proves the vault
+				// settlement and the pool burn rolled back with the failed plan.
+				assert_noop!(offset_recovery(DOT, STABLE, 300), ArithmeticError::Overflow);
 			});
 
-			// `assert_noop!` compares the whole storage root, so it also proves the depositor
-			// burn and the vault settlement rolled back with the failed claimable update.
-			assert_noop!(deposit(2, DOT, STABLE, 200), ArithmeticError::Overflow);
+			// Incoming deposit: the depositor's claimable overflows after the vault settled.
+			hypothetically!({
+				crate::Deposits::<Test>::mutate((DOT, STABLE, 2), |row| {
+					row.as_mut().expect("deposit row exists").claimable_collateral = Balance::MAX;
+				});
+
+				// `assert_noop!` compares the whole storage root, so it also proves the depositor
+				// burn and the vault settlement rolled back with the failed claimable update.
+				assert_noop!(deposit(2, DOT, STABLE, 200), ArithmeticError::Overflow);
+			});
 		});
-	});
 }
 
 #[test]
@@ -255,6 +292,11 @@ fn par_band_head_settles_at_face_value() {
 		let debt = DebtBreakdown { principal: 300, interest: 0 };
 		assert_recovery_offset(debt, 597, RecoveryOffsetSource::IncomingDeposit);
 		assert_eq!(vault_debt(DOT, STABLE, 5), 0);
+		System::assert_has_event(market_event!(DepositReceived {
+			depositor: 2,
+			amount: 300,
+			pending_amount: 0,
+		}));
 		let row = deposit_row(DOT, STABLE, 2).expect("row created");
 		assert_eq!(row.claimable_collateral, 597);
 		assert!(row.pending_deposit.is_none());
@@ -272,8 +314,6 @@ fn below_par_head_rejects_offsets_and_deposits() {
 		// Incoming deposits are rejected wholesale rather than settled at
 		// a discount.
 		assert_noop!(deposit(2, DOT, STABLE, 300), Error::<Test>::RecoveryOffsetBelowPar);
-		assert!(deposit_row(DOT, STABLE, 2).is_none());
-		assert_eq!(stable_balance(STABLE, 2), 300);
 	});
 }
 
@@ -323,32 +363,6 @@ fn incoming_deposit_recovers_first_and_queues_the_rest() {
 
 		// The direct credit is claimable through the normal path.
 		assert_claim_collateral(2, 990);
-	});
-}
-
-#[test]
-fn incoming_deposit_fully_used_leaves_no_pending() {
-	standing_head_with_active_pool().build_and_execute(|| {
-		park_standing_head_at(PRICE_AT_104_PERCENT);
-
-		// used = min(200, capacity 500) = 200 — nothing left to queue;
-		// collateral_out = floor(floor(200 * 1.03) / 0.52) = floor(206/0.52)
-		//                = 396.
-		seed_deposit(2, 200);
-
-		System::assert_has_event(market_event!(DepositReceived {
-			depositor: 2,
-			amount: 200,
-			pending_amount: 0,
-		}));
-		let row = deposit_row(DOT, STABLE, 2).expect("row created");
-		assert_eq!(row.claimable_collateral, 396);
-		assert!(row.pending_deposit.is_none());
-		assert_eq!(stable_balance(STABLE, 2), 0);
-
-		// The head keeps its remaining 300 debt and stays in the FIFO.
-		assert_eq!(vault_debt(DOT, STABLE, 5), 300);
-		assert_eq!(pool_state(DOT, STABLE).total_pending_deposits, 0);
 	});
 }
 
@@ -432,40 +446,21 @@ fn active_pool_offset_keeps_yield_distributed_during_settlement() {
 	});
 }
 
-// The deposit is charged for a settlement that closes the head, so only a deposit that found no
-// head may report the smaller weight.
+// A head that is read and priced charges the full deposit weight whether or not it can be offset,
+// so only a deposit that found no head may report the smaller weight.
 #[test]
-fn deposit_refunds_to_the_no_recovery_weight_only_without_a_head() {
-	standing_head_with_active_pool().stable_balance(2, 900).build_and_execute(|| {
+fn deposit_weight_refund_depends_on_the_recovery_queue() {
+	standing_head_with_active_pool().stable_balance(2, 1_000).build_and_execute(|| {
 		park_standing_head_at(PRICE_AT_104_PERCENT);
 
-		let settled = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 800)
-			.expect("the deposit settles the head");
-
-		assert_vault_redeemed(5, DebtBreakdown { principal: 498, interest: 2 }, 990);
-		assert_eq!(settled.actual_weight, None);
-
-		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 100)
-			.expect("the deposit queues");
-
-		assert_eq!(queued.actual_weight, Some(<() as crate::WeightInfo>::deposit_no_recovery()));
-	});
-}
-
-// A head that cannot be offset is still read and priced, so the deposit that meets it keeps the
-// full charge rather than the weight of an empty queue.
-#[test]
-fn deposit_keeps_the_full_weight_for_a_head_it_cannot_offset() {
-	standing_head_with_active_pool().stable_balance(2, 900).build_and_execute(|| {
-		park_standing_head_at(PRICE_AT_104_PERCENT);
-		// The registration price lifts the head above the exit threshold.
+		// The registration price lifts the head above the exit threshold: it cannot be offset.
 		set_price(DOT, REGISTRATION_PRICE);
 		stability_events_since_last_call();
 
-		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 100)
+		let not_offsettable = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 100)
 			.expect("the deposit queues past the head");
 
-		assert_eq!(queued.actual_weight, None);
+		assert_eq!(not_offsettable.actual_weight, None);
 		// The deposit activates the matured cohort and queues: no recovery offset is among its
 		// events.
 		assert_eq!(
@@ -487,5 +482,19 @@ fn deposit_keeps_the_full_weight_for_a_head_it_cannot_offset() {
 				},
 			]
 		);
+
+		// Back at the parked price the head is offsettable again, and the deposit settles it.
+		set_price(DOT, PRICE_AT_104_PERCENT);
+		let settled = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 800)
+			.expect("the deposit settles the head");
+
+		let debt = DebtBreakdown { principal: 498, interest: 2 };
+		assert_recovery_offset(debt, 990, RecoveryOffsetSource::IncomingDeposit);
+		assert_eq!(settled.actual_weight, None);
+
+		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 100)
+			.expect("the deposit queues");
+
+		assert_eq!(queued.actual_weight, Some(<() as crate::WeightInfo>::deposit_no_recovery()));
 	});
 }

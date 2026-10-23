@@ -6,6 +6,36 @@
 
 use crate::{mock::*, Error};
 
+/// Gives an existing default-pool row backed claimable balances without exercising their source.
+fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Balance) {
+	seed_claimables_in(DOT, who, collateral_gain, yield_gain);
+}
+
+/// [`seed_claimables`] in the `collateral`/[`STABLE`] branch.
+fn seed_claimables_in(
+	collateral: AssetId,
+	who: AccountId,
+	collateral_gain: Balance,
+	yield_gain: Balance,
+) {
+	let pool = Stability::pool_account(&collateral, &STABLE);
+	crate::Deposits::<Test>::mutate((collateral.clone(), STABLE, who), |row| {
+		let row = row.as_mut().expect("deposit row exists");
+		row.claimable_collateral += collateral_gain;
+		row.claimable_yield += yield_gain;
+	});
+	mutate_pool_state(collateral.clone(), STABLE, |state| {
+		state.total_collateral_gains_unclaimed += collateral_gain;
+		state.total_yield_unclaimed += yield_gain;
+	});
+	if collateral_gain > 0 {
+		mint_collateral(collateral, pool, collateral_gain);
+	}
+	if yield_gain > 0 {
+		mint_stable(STABLE, pool, yield_gain);
+	}
+}
+
 #[test]
 fn claims_pay_out_clear_and_default_to_the_caller() {
 	ExtBuilder::single_depositor().build_and_execute(|| {
@@ -61,38 +91,35 @@ fn claims_pay_out_clear_and_default_to_the_caller() {
 // account up. The float is what every exact payout leaves behind instead.
 #[test]
 fn claims_leaving_a_sub_minimum_remainder_still_pay_out() {
-	ExtBuilder::default()
-		.high_min_collateral()
-		.branch(HIGH_MIN, STABLE)
-		.build_and_execute(|| {
-			let pool = Stability::pool_account(&HIGH_MIN, &STABLE);
-			for who in [1, 2] {
-				mint_stable(STABLE, who, 100);
-				assert_ok!(deposit(who, HIGH_MIN, STABLE, 100));
-			}
-			seed_claimables_in(HIGH_MIN, 1, 600, 0);
-			seed_claimables_in(HIGH_MIN, 2, 400, 0);
-			assert_eq!(collateral_balance(HIGH_MIN, pool), 2_000);
-			// Both payouts are below the asset minimum, so the recipients need accounts first.
-			for recipient in [8, 9] {
-				mint_collateral(HIGH_MIN, recipient, 1_000);
-			}
+	ExtBuilder::default().branch(HIGH_MIN, STABLE).build_and_execute(|| {
+		let pool = Stability::pool_account(&HIGH_MIN, &STABLE);
+		for who in [1, 2] {
+			mint_stable(STABLE, who, 100);
+			assert_ok!(deposit(who, HIGH_MIN, STABLE, 100));
+		}
+		seed_claimables_in(HIGH_MIN, 1, 600, 0);
+		seed_claimables_in(HIGH_MIN, 2, 400, 0);
+		assert_eq!(collateral_balance(HIGH_MIN, pool), 2_000);
+		// Both payouts are below the asset minimum, so the recipients need accounts first.
+		for recipient in [8, 9] {
+			mint_collateral(HIGH_MIN, recipient, 1_000);
+		}
 
-			// 400 of tracked gains stay behind, below the 1_000 minimum; the float sits beneath
-			// them.
-			assert_ok!(claim_collateral(1, HIGH_MIN, STABLE, 8));
-			assert_eq!(collateral_balance(HIGH_MIN, 8), 1_600);
-			assert_eq!(pool_collateral_held(HIGH_MIN, STABLE), 400);
+		// 400 of tracked gains stay behind, below the 1_000 minimum; the float sits beneath
+		// them.
+		assert_ok!(claim_collateral(1, HIGH_MIN, STABLE, 8));
+		assert_eq!(collateral_balance(HIGH_MIN, 8), 1_600);
+		assert_eq!(pool_collateral_held(HIGH_MIN, STABLE), 400);
 
-			// The last claim empties the tracked gains and leaves exactly the float.
-			assert_ok!(claim_collateral(2, HIGH_MIN, STABLE, 9));
+		// The last claim empties the tracked gains and leaves exactly the float.
+		assert_ok!(claim_collateral(2, HIGH_MIN, STABLE, 9));
 
-			assert_eq!(collateral_balance(HIGH_MIN, 9), 1_400);
-			assert_eq!(pool_collateral_held(HIGH_MIN, STABLE), 0);
-			assert_eq!(collateral_balance(HIGH_MIN, pool), 1_000);
-			assert_noop!(
-				claim_collateral(2, HIGH_MIN, STABLE, 2),
-				Error::<Test>::NoClaimableCollateral
-			);
-		});
+		assert_eq!(collateral_balance(HIGH_MIN, 9), 1_400);
+		assert_eq!(pool_collateral_held(HIGH_MIN, STABLE), 0);
+		assert_eq!(collateral_balance(HIGH_MIN, pool), 1_000);
+		assert_noop!(
+			claim_collateral(2, HIGH_MIN, STABLE, 2),
+			Error::<Test>::NoClaimableCollateral
+		);
+	});
 }

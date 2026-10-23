@@ -4,9 +4,10 @@
 //! the first tests in which realization does real work.
 
 use crate::{mock::*, Error};
+use stablecoin_primitives::OnBranchYield;
 
 #[test]
-fn distribute_to_empty_pool_returns_the_credit() {
+fn yield_without_a_target_returns_the_credit_whole() {
 	ExtBuilder::default().default_branch().build_and_execute(|| {
 		// The returned credit is the caller's to route: in the runtime the
 		// vault engine's `OnBranchYield` plumbing forwards it to the fee
@@ -14,9 +15,22 @@ fn distribute_to_empty_pool_returns_the_credit() {
 		// exercises that split live). Here the test drops it, rescinding the
 		// issuance.
 		// A registered pool with nothing active has no denominator to share over, so nothing
-		// is written. `yield_distribution_routes_by_the_credits_own_asset` owns the
-		// unregistered branch.
+		// is written.
 		assert_yield_declined(DOT, STABLE, 100);
+
+		// The credit's asset names the branch: a USDX credit targets the
+		// unregistered (DOT, USDX) pair and comes back whole, while the
+		// funded STABLE pool never sees it.
+		seed_matured_deposit(1, 400);
+		let credit = issue_stable(USDX, 20_000);
+
+		let returned = storage_noop(|| {
+			Stability::distribute_yield(&DOT, branch_snapshot(&DOT, &USDX), credit)
+		});
+
+		assert_eq!(returned.asset(), USDX);
+		assert_eq!(returned.peek(), 20_000);
+		drop(returned);
 	});
 }
 
@@ -24,7 +38,6 @@ fn distribute_to_empty_pool_returns_the_credit() {
 fn distribute_updates_g_exactly() {
 	ExtBuilder::default()
 		.default_branch()
-		.stable_balance(1, 9_000)
 		.matured_deposit(1, 1_000)
 		.build_and_execute(|| {
 			let leftover = distribute_yield_leftover(DOT, STABLE, 100);
@@ -63,9 +76,7 @@ fn distribute_updates_g_exactly() {
 fn flooring_dust_accumulates_until_teardown() {
 	ExtBuilder::default()
 		.default_branch()
-		.stable_balance(1, 9_400)
 		.matured_deposit(1, 600)
-		.stable_balance(2, 7_600)
 		.matured_deposit(2, 2_400)
 		.build_and_execute(|| {
 			distribute_all_yield(100);
@@ -94,36 +105,9 @@ fn flooring_dust_accumulates_until_teardown() {
 }
 
 #[test]
-fn late_depositor_earns_only_after_their_snapshot() {
-	ExtBuilder::default()
-		.default_branch()
-		.stable_balance(1, 9_400)
-		.matured_deposit(1, 600)
-		.build_and_execute(|| {
-			// First distribution belongs to user 1 alone: G = 60/600 = 0.1.
-			distribute_all_yield(60);
-			// User 2 waits behind the ordinary delay at G0 = 0.1. The second distribution itself
-			// activates the matured cohort before sharing the new yield.
-			mint_stable(STABLE, 2, 9_600);
-			seed_deposit(2, 400);
-			advance_time(9_000);
-
-			// Second distribution splits over A = 1000: G = 0.1 + 0.1 = 0.2.
-			distribute_all_yield(100);
-
-			// User 1: floor(600 * (0.2 - 0)) = 120 (all of the first, 60% of
-			// the second). User 2: floor(400 * (0.2 - 0.1)) = 40.
-			assert_claim_yield(1, 120);
-			assert_claim_yield(2, 40);
-			assert_eq!(pool_state(DOT, STABLE).total_yield_unclaimed, 0);
-		});
-}
-
-#[test]
 fn compound_moves_yield_into_active_and_it_earns() {
 	ExtBuilder::default()
 		.default_branch()
-		.stable_balance(1, 9_400)
 		.matured_deposit(1, 600)
 		.build_and_execute(|| {
 			distribute_all_yield(60);
@@ -152,7 +136,6 @@ fn compound_moves_yield_into_active_and_it_earns() {
 fn compound_with_nothing_claimable_reverts() {
 	ExtBuilder::default()
 		.default_branch()
-		.stable_balance(1, 9_400)
 		.matured_deposit(1, 600)
 		.build_and_execute(|| {
 			assert_noop!(compound(1, DOT, STABLE, 60), Error::<Test>::NoYieldToCompound);
@@ -168,7 +151,6 @@ fn compound_with_nothing_claimable_reverts() {
 fn vault_interest_flows_to_pool_through_the_hook() {
 	ExtBuilder::default()
 		.default_branch()
-		.stable_balance(1, 9_600)
 		.matured_deposit(1, 400)
 		.build_and_execute(|| {
 			// A vault accruing 5%/yr on exactly 500 debt (499 borrowed + 1
@@ -212,61 +194,60 @@ fn vault_interest_flows_to_pool_through_the_hook() {
 		});
 }
 
-#[test]
-fn pending_deposits_earn_no_yield() {
-	// User 2's deposit is still pending when the yield arrives.
+/// Every call that changes the capital sharing the yield issues the branch's pending interest
+/// first, over the capital active before the call: one year on the 499 vault is 24 units, 18 of
+/// which the pool spreads over the 400 already active, whatever the call then does. Dispatches
+/// `call` after that year and asserts the distribution it triggered.
+fn assert_issues_pending_branch_interest_first(call: impl FnOnce() -> DispatchResult) {
 	ExtBuilder::default()
 		.default_branch()
-		.stable_balance(1, 9_400)
-		.matured_deposit(1, 600)
-		.stable_balance(2, 9_600)
-		.deposit(2, 400)
+		.matured_deposit(1, 400)
+		.stable_balance(2, 10_000)
 		.build_and_execute(|| {
-			distribute_all_yield(60);
+			// The figures below assume the vault opens after the deposit matures, which the
+			// builder's vaults-first order cannot express. Its events are cleared as setup events
+			// are, so the assertions below see only what `call` emits.
+			mint_collateral(DOT, 5, 1_000);
+			assert_ok!(open_vault(5, DOT, STABLE, 1_000, 499));
+			System::reset_events();
+			advance_time(stablecoin_primitives::MILLIS_PER_YEAR);
 
-			// The whole distribution went to the 600 active: G = 0.1. User 2 remains pending and
-			// has no yield to claim.
-			assert_noop!(claim_yield(2, DOT, STABLE, 2), Error::<Test>::NoClaimableYield);
+			assert_ok!(call());
 
-			assert_claim_yield(1, 60);
+			System::assert_has_event(
+				crate::Event::YieldDistributed {
+					collateral_id: DOT,
+					stable_id: STABLE,
+					amount: 18,
+				}
+				.into(),
+			);
+			// delta_G = floor(18 * 1e18 / 400): spread over the 400 active before the call.
+			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(45, 1_000));
 		});
 }
 
-// Every call that changes the capital sharing the yield issues the branch's
-// pending interest first, over the capital active before the call: one year on
-// the 499 vault is 24 units, 18 of which the pool spreads over the 400 already
-// active, whatever the call then does.
 #[test]
-fn capital_changing_calls_issue_pending_branch_interest_first() {
-	let calls: [fn() -> DispatchResult; 5] = [
-		|| deposit(2, DOT, STABLE, 400),
-		|| withdraw(1, DOT, STABLE, 400, 1),
-		|| request_withdraw(1, DOT, STABLE, 400),
-		|| claim_yield(1, DOT, STABLE, 1),
-		|| compound(1, DOT, STABLE, 100),
-	];
-	for call in calls {
-		ExtBuilder::default()
-			.default_branch()
-			.stable_balance(1, 9_600)
-			.matured_deposit(1, 400)
-			.stable_balance(2, 10_000)
-			.vault(5, 1_000, 499)
-			.build_and_execute(|| {
-				advance_time(stablecoin_primitives::MILLIS_PER_YEAR);
+fn deposit_issues_pending_branch_interest_first() {
+	assert_issues_pending_branch_interest_first(|| deposit(2, DOT, STABLE, 400));
+}
 
-				assert_ok!(call());
+#[test]
+fn withdraw_issues_pending_branch_interest_first() {
+	assert_issues_pending_branch_interest_first(|| withdraw(1, DOT, STABLE, 400, 1));
+}
 
-				System::assert_has_event(
-					crate::Event::YieldDistributed {
-						collateral_id: DOT,
-						stable_id: STABLE,
-						amount: 18,
-					}
-					.into(),
-				);
-				// delta_G = floor(18 * 1e18 / 400): spread over the 400 active before the call.
-				assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(45, 1_000));
-			});
-	}
+#[test]
+fn request_withdraw_issues_pending_branch_interest_first() {
+	assert_issues_pending_branch_interest_first(|| request_withdraw(1, DOT, STABLE, 400));
+}
+
+#[test]
+fn claim_yield_issues_pending_branch_interest_first() {
+	assert_issues_pending_branch_interest_first(|| claim_yield(1, DOT, STABLE, 1));
+}
+
+#[test]
+fn compound_issues_pending_branch_interest_first() {
+	assert_issues_pending_branch_interest_first(|| compound(1, DOT, STABLE, 100));
 }

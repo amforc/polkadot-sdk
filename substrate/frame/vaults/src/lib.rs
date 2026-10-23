@@ -46,7 +46,7 @@ mod benchmarking;
 mod try_state;
 
 #[cfg(test)]
-pub mod mock;
+mod mock;
 
 #[cfg(test)]
 mod tests;

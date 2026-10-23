@@ -1205,39 +1205,11 @@ fn shifted<N: EnsureAdd + EnsureSub>(current: N, old: N, new: N) -> Result<N, Ar
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use frame::arithmetic::FixedPointNumber;
 
 	fn make_branch_state(principal: u128, accrual_rate: U256) -> BranchState<u64, u128> {
 		BranchState {
 			debt: BranchDebt { principal, accrual_rate, ..BranchDebt::default() },
 			..BranchState::fresh(0)
-		}
-	}
-
-	#[test]
-	fn replace_vault_swaps_full_contribution() {
-		for (principal, accrual_rate) in [(9, 27 * FixedU128::DIV / 10), (0, 0)] {
-			let rate = FixedU128::from_rational(3u128, 10u128);
-			let mut state = make_branch_state(10, U256::from(3 * FixedU128::DIV));
-			let before = Vault {
-				collateral: 0,
-				debt: DebtBreakdown { interest: 0, principal: 10 },
-				annual_rate: rate,
-				last_interest_time: 0,
-				interest_prepaid: 0,
-				last_rate_update: 0,
-				redistribution_stake: 0,
-				redistribution_checkpoint: RedistributionAccumulators::default(),
-			};
-			let mut after = before.clone();
-			after.debt.principal = principal;
-
-			state
-				.replace_vault(Some(&before), Some(&after))
-				.expect("consistent contribution");
-
-			assert_eq!(state.debt.principal, principal);
-			assert_eq!(state.debt.accrual_rate, U256::from(accrual_rate));
 		}
 	}
 

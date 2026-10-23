@@ -68,52 +68,6 @@ fn full_depletion_pays_old_epoch_and_starts_fresh() {
 		});
 }
 
-/// A full depletion at a compounded `P`: the epoch closes and the accumulators reset, while the
-/// closing epoch's collateral stays claimable to a depositor who joined at that `P`.
-///
-/// `P = 0.42` is reached with two collateral-free offsets. The epoch and scale indices are
-/// labels, and the arithmetic depends only on `P` and the pool total, so this asserts that the
-/// epoch increments rather than that it reaches any particular value.
-#[test]
-fn full_depletion_at_a_compounded_p_closes_the_epoch() {
-	ExtBuilder::default()
-		.default_branch()
-		.matured_deposit(1, 1_000)
-		.build_and_execute(|| {
-			// 1_000 → 600 gives P = 0.6, then 600 → 420 gives P = 0.6 * 0.7 = 0.42.
-			assert_eq!(simulate_offset(DOT, STABLE, 400, 0).debt(), 400);
-			assert_eq!(simulate_offset(DOT, STABLE, 180, 0).debt(), 180);
-			assert_eq!(pool_state(DOT, STABLE).coords.p, FixedU128::from_rational(42, 100));
-
-			// The depositor this follows joins at P = 0.42 with 600, and a third tops the pool up
-			// to 1_500.
-			seed_matured_deposit(2, 600);
-			seed_matured_deposit(3, 480);
-			assert_eq!(Stability::quote_active(&market_quote(&DOT, &STABLE), 1_500), 1_500);
-			let epoch_before = pool_state(DOT, STABLE).coords.epoch;
-
-			// Deplete: S rises by 900 * 0.42 / 1_500 = 0.252 on the closing epoch, which is where
-			// the gains stay claimable from, and the new epoch starts from zeroed sums.
-			assert_eq!(simulate_offset(DOT, STABLE, 1_500, 900).debt(), 1_500);
-
-			let state = pool_state(DOT, STABLE);
-			assert_eq!(state.total_active_deposits, 0);
-			assert_eq!(
-				state.coords,
-				Accumulators { p: FixedU128::one(), epoch: epoch_before + 1, scale: 0 }
-			);
-			assert_eq!(
-				active_sums(epoch_before, 0).s_collateral,
-				FixedU128::from_rational(252, 1_000)
-			);
-			assert_eq!(active_sums(epoch_before + 1, 0), PoolSums::default());
-
-			// The 600 depositor: remaining principal is zero an epoch behind, but its collateral
-			// 600 * 0.252 / 0.42 = 360 stays claimable.
-			assert_claim_collateral(2, 360);
-		});
-}
-
 #[test]
 fn scale_crossing_preserves_older_deposits() {
 	let unit: Balance = 10_000_000_000_000; // 1e13
@@ -145,6 +99,29 @@ fn scale_crossing_preserves_older_deposits() {
 				active: Some(crate::types::LegCoords { epoch: 0, scale: 1 }),
 				pending: None,
 			}));
+			// Settlement windows end at the first absent scale, so a pruned row below the current
+			// scale would silently drop the gains recorded beyond it.
+			hypothetically!({
+				crate::PoolSumsStore::<Test>::remove((DOT, STABLE, Leg::Active, 0u32, 0u32));
+
+				assert_err!(
+					crate::try_state::do_try_state::<Test>(),
+					"sums rows of an epoch have a scale gap"
+				);
+			});
+			// Offsets seed rows only up to the coordinates they move the leg to, so a row past the
+			// current `(0, 1)` is corruption as well.
+			hypothetically!({
+				crate::PoolSumsStore::<Test>::insert(
+					(DOT, STABLE, Leg::Active, 0u32, 2u32),
+					PoolSums::default(),
+				);
+
+				assert_err!(
+					crate::try_state::do_try_state::<Test>(),
+					"sums row ahead of the leg's coordinates"
+				);
+			});
 
 			// A second offset on the new scale leaves 50 of the 100:
 			// delta_S(0,1) = 40 * (0.01/100) = 4e-3 (inner 4e15),

@@ -7,39 +7,55 @@
 
 use crate::{mock::*, types::WithdrawalRequest, Error};
 
-#[test]
-fn withdraw_pays_at_most_the_active_deposit_and_prunes_the_row() {
-	// The depositor holds 400 active and 600 in its wallet. The exact amount goes back to the
-	// depositor. The over-ask goes to an empty-handed recipient, so the clamped amount is visible
-	// on its own rather than blending into the original mint.
-	let cases: [(Balance, AccountId, Balance, Balance); 2] =
-		[(400, 1, 1_000, 1_000), (1_000, 2, 600, 400)];
-	for (requested, recipient, depositor_balance, recipient_balance) in cases {
-		ExtBuilder::single_depositor().build_and_execute(|| {
-			assert_ok!(withdraw(1, DOT, STABLE, requested, recipient));
+/// Withdraws `requested` from the single depositor's 400 active to `recipient`, then asserts that
+/// exactly the 400 left the pool and that the emptied row was pruned.
+fn withdraw_and_assert_the_active_deposit_is_paid_out(requested: Balance, recipient: AccountId) {
+	assert_ok!(withdraw(1, DOT, STABLE, requested, recipient));
 
-			assert_eq!(stable_balance(STABLE, 1), depositor_balance);
-			assert_eq!(stable_balance(STABLE, recipient), recipient_balance);
-			assert_eq!(pool_stable_held(DOT, STABLE), 0);
-			assert!(deposit_row(DOT, STABLE, 1).is_none());
-			let state = pool_state(DOT, STABLE);
-			assert_eq!(state.total_active_deposits, 0);
-			assert_eq!(state.total_pending_deposits, 0);
+	assert_eq!(pool_stable_held(DOT, STABLE), 0);
+	assert!(deposit_row(DOT, STABLE, 1).is_none());
+	let state = pool_state(DOT, STABLE);
+	assert_eq!(state.total_active_deposits, 0);
+	assert_eq!(state.total_pending_deposits, 0);
 
-			System::assert_last_event(market_event!(WithdrawalExecuted {
-				depositor: 1,
-				recipient,
-				amount: 400,
-			}));
-		});
-	}
+	System::assert_last_event(market_event!(WithdrawalExecuted {
+		depositor: 1,
+		recipient,
+		amount: 400,
+	}));
 }
 
 #[test]
-fn withdraw_with_nothing_active_reverts() {
-	// Still pending (immature): nothing withdrawable.
-	ExtBuilder::default().default_branch().deposit(1, 400).build_and_execute(|| {
-		assert_noop!(withdraw(1, DOT, STABLE, 400, 1), Error::<Test>::NoActiveDeposit);
+fn withdraw_of_the_whole_active_deposit_pays_it_and_prunes_the_row() {
+	ExtBuilder::single_depositor().build_and_execute(|| {
+		withdraw_and_assert_the_active_deposit_is_paid_out(400, 1);
+
+		// The depositor's 600 in its wallet plus the 400 it held active.
+		assert_eq!(stable_balance(STABLE, 1), 1_000);
+
+		// Storing the emptied row instead of pruning it is what the invariant check rejects.
+		hypothetically!({
+			let snapshot =
+				DepositSnapshot { coords: pool_state(DOT, STABLE).coords, sums: active_sums(0, 0) };
+			crate::Deposits::<Test>::insert((DOT, STABLE, 1), Deposit::fresh(snapshot));
+
+			assert_err!(
+				crate::try_state::do_try_state::<Test>(),
+				"empty deposit row was not removed"
+			);
+		});
+	});
+}
+
+#[test]
+fn withdraw_over_the_active_deposit_pays_at_most_the_active_deposit() {
+	ExtBuilder::single_depositor().build_and_execute(|| {
+		withdraw_and_assert_the_active_deposit_is_paid_out(1_000, 2);
+
+		// The over-ask goes to an empty-handed recipient, so the clamped amount is visible on its
+		// own rather than blending into the depositor's original mint.
+		assert_eq!(stable_balance(STABLE, 1), 600);
+		assert_eq!(stable_balance(STABLE, 2), 400);
 	});
 }
 
@@ -105,11 +121,15 @@ fn request_is_recorded_replaced_by_a_new_one_and_survives_deposits() {
 }
 
 #[test]
-fn zero_amount_requests_and_withdrawals_revert() {
-	ExtBuilder::branch_with_debt().build_and_execute(|| {
+fn withdraw_and_request_reject_zero_and_pending_only() {
+	ExtBuilder::branch_with_debt().stable_balance(2, 400).build_and_execute(|| {
 		assert_noop!(withdraw(1, DOT, STABLE, 0, 1), Error::<Test>::ZeroAmount);
 		// The request rejects the zero before deciding whether to forward.
 		assert_noop!(request_withdraw(1, DOT, STABLE, 0), Error::<Test>::ZeroAmount);
+
+		// Still pending (immature): nothing withdrawable, so the entry delay cannot be bypassed.
+		assert_ok!(deposit(2, DOT, STABLE, 400));
+		assert_noop!(withdraw(2, DOT, STABLE, 400, 2), Error::<Test>::NoActiveDeposit);
 
 		enter_safety_mode();
 

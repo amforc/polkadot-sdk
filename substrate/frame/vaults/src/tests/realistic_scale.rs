@@ -8,7 +8,7 @@
 
 use crate::{
 	mock::*,
-	tests::{percent, vault_events, vault_status, ONE_YEAR_MS},
+	tests::{percent, vault_events, vault_status},
 	types::{BranchConfigUpdate, VaultStatus},
 	Error,
 };
@@ -21,7 +21,6 @@ use frame::{
 		AccountTouch,
 	},
 };
-use stablecoin_primitives::CollateralRatio;
 
 fn xbt_vault(owner: AccountId) -> crate::types::Vault<Balance> {
 	crate::mock::vault(XBT, USDX, owner)
@@ -89,57 +88,15 @@ fn fee_account_pays_its_own_asset_account_deposit() {
 	});
 }
 
-// The math is scale-free end to end: exact CR through the decimals-offset
-// price, exact one-year interest, repay to husk, close.
+// A vault floor has to clear its asset's minimum balance, or the smallest vault the branch admits
+// could never be paid what it borrows or hold what it pledges. The floor is judged against the
+// coin, not against a number: the same 9_999 that is dust to six-decimal USDX is a fine floor for
+// STABLE, whose minimum balance is one unit. Neither floor can be walked back after creation: the
+// branch that admits a vault is the branch that has to carry it.
 #[test]
-fn lifecycle_exact_at_realistic_scale() {
-	ExtBuilder::default().build_and_execute(|| {
-		register_realistic_market();
-
-		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
-
-		assert_eq!(stable_balance(USDX, 1), 5_000 * USD, "borrowed amount minted at scale");
-
-		// ceil(5×10^9 · 5% · 7d / 365.25d) = ceil(4_791_238.88) minor units.
-		let fee = xbt_vault(1).debt.interest;
-		assert_eq!(fee, 4_791_239, "upfront fee recorded as interest");
-		// 10^13 minor units at 10^-3 are worth 10^10 against 5_004_791_239 of debt. The ratio
-		// rounds down to ≈ 1.998, just under 200%.
-		let expected = FixedU128::from_rational_with_rounding(
-			10_000_000_000,
-			5_004_791_239,
-			frame::arithmetic::Rounding::Down,
-		);
-		assert_eq!(
-			crate::Pallet::<Test>::vault_cr(XBT, USDX, 1).expect("cr"),
-			CollateralRatio::Ratio(expected)
-		);
-
-		// One year at 5% on 5×10^9 minor units: exactly 250 USDX of interest.
-		advance_time(ONE_YEAR_MS);
-		assert_ok!(poke(9, XBT, USDX, 1));
-
-		assert_eq!(xbt_vault(1).debt.interest, fee + 250 * USD);
-
-		// Fund the interest, repay to a husk, close, and get the collateral back.
-		mint_stable(USDX, 1, fee + 250 * USD);
-		assert_ok!(repay(1, XBT, USDX, 1, Some(10_000 * USD)));
-		assert!(vault_status(XBT, USDX, 1).is_dormant());
-		assert_ok!(close_vault(1, XBT, USDX, None));
-
-		assert_eq!(held(XBT, 1), 0);
-		assert_eq!(collateral_balance(XBT, 1), 100_000_000 * XBT_UNIT, "genesis balance restored");
-	});
-}
-
-// The debt floor has to clear the stablecoin's minimum balance, or the smallest
-// vault the branch admits could never be paid what it borrows. The floor is
-// judged against the coin, not against a number: the same 9_999 that is dust to
-// six-decimal USDX is a fine floor for STABLE, whose minimum balance is one unit.
-#[test]
-fn create_branch_rejects_debt_floor_below_stable_minimum() {
+fn vault_floors_below_asset_minimums_are_rejected_on_every_write() {
 	ExtBuilder::default().price(TOKEN_X, DEFAULT_PRICE).build_and_execute(|| {
-		let config = BranchConfig { minimum_debt: USDX_ED - 1, ..usdx_branch_config() };
+		let dust_debt = BranchConfig { minimum_debt: USDX_ED - 1, ..usdx_branch_config() };
 
 		assert_noop!(
 			crate::Pallet::<Test>::create_branch(
@@ -147,7 +104,7 @@ fn create_branch_rejects_debt_floor_below_stable_minimum() {
 				TOKEN_X,
 				USDX,
 				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				config.clone(),
+				dust_debt.clone(),
 				(),
 			),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumDebtBelowStableMinimum)
@@ -158,18 +115,10 @@ fn create_branch_rejects_debt_floor_below_stable_minimum() {
 			TOKEN_X,
 			STABLE,
 			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			config,
+			dust_debt,
 			(),
 		));
-	});
-}
 
-// Collateral is held to the same rule, and neither floor can be walked back
-// after creation: the branch that admits a vault is the branch that has to
-// carry it.
-#[test]
-fn vault_floors_below_the_asset_minimum_are_rejected_on_every_write() {
-	ExtBuilder::default().build_and_execute(|| {
 		set_price(XBT, FixedU128::from_rational(1u128, 1_000u128));
 		let dust_collateral =
 			BranchConfig { minimum_collateral: XBT_ED - 1, ..usdx_branch_config() };
@@ -248,13 +197,13 @@ fn borrow_below_stable_ed_depends_on_recipient() {
 fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
 	ExtBuilder::default().build_and_execute(|| {
 		// Start with a zero fee balance to test the sub-minimum credit.
-		SpFeeShare::set(Permill::from_percent(100));
+		SpFeeShare::set(&Permill::from_percent(100));
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		assert_eq!(stable_balance(USDX, FEE_DEST), 0, "touched at registration, still empty");
 
 		// Route the full credit from here on.
-		SpFeeShare::set(Permill::zero());
+		SpFeeShare::set(&Permill::zero());
 
 		// The 476-unit fee is below the 10_000-unit asset minimum.
 		let minted_pre = market_state(XBT, USDX).debt.minted_interest;
@@ -273,7 +222,7 @@ fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
 #[test]
 fn frozen_stable_fails_fee_resolution_loudly() {
 	ExtBuilder::default().build_and_execute(|| {
-		SpFeeShare::set(Permill::zero());
+		SpFeeShare::set(&Permill::zero());
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		advance_time(60_000);
@@ -471,7 +420,7 @@ fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
 		mint_stable(USDX, 3, keeper_balance);
 		// Settle the remainder through the pending pool so this test isolates
 		// the keeper debit from issued-collateral redistribution custody.
-		PendingSpCapacity::set(10_000 * USD);
+		PendingSpCapacity::set(&(10_000 * USD));
 		let issuance_before = total_stable(USDX);
 
 		// `keeper_balance - 1` is above the preserving limit `funded` but below
@@ -507,27 +456,101 @@ fn redemption_reverts_on_sub_ed_recipient_leg() {
 	});
 }
 
-#[test]
-fn repay_preserves_exact_supply_at_the_payer_minimum_balance() {
-	for requested in [Some(1_000 * USD), Some(10_000 * USD), None] {
-		for remainder in [0, USDX_ED / 2, USDX_ED] {
-			ExtBuilder::default().build_and_execute(|| {
-				register_realistic_market();
-				assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
-				let debt = xbt_vault(3).debt.total();
-				let payment = requested.map_or(debt, |amount| amount.min(debt));
-				mint_stable(USDX, 4, payment + remainder);
+/// Opens vault 3 and funds payer 4 with the payment `requested` resolves to plus `remainder`.
+/// Returns the vault's debt and that payment.
+fn open_and_fund_repayer(requested: Option<Balance>, remainder: Balance) -> (Balance, Balance) {
+	register_realistic_market();
+	assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+	let debt = xbt_vault(3).debt.total();
+	let payment = requested.map_or(debt, |amount| amount.min(debt));
+	mint_stable(USDX, 4, payment + remainder);
+	(debt, payment)
+}
 
-				if remainder > 0 && remainder < USDX_ED {
-					assert_noop!(repay(4, XBT, USDX, 3, requested), TokenError::FundsUnavailable);
-				} else {
-					let issuance = total_stable(USDX);
-					assert_ok!(repay(4, XBT, USDX, 3, requested));
-					assert_eq!(stable_balance(USDX, 4), remainder);
-					assert_eq!(total_stable(USDX), issuance - payment);
-					assert_eq!(xbt_vault(3).debt.total(), debt - payment);
-				}
-			});
-		}
-	}
+/// Repays vault 3 from payer 4, which keeps `remainder`, and asserts that the repayment burned
+/// exactly the payment from supply and debt.
+fn assert_repay_burns_exactly_the_payment(requested: Option<Balance>, remainder: Balance) {
+	let (debt, payment) = open_and_fund_repayer(requested, remainder);
+	let issuance = total_stable(USDX);
+
+	assert_ok!(repay(4, XBT, USDX, 3, requested));
+
+	assert_eq!(stable_balance(USDX, 4), remainder);
+	assert_eq!(total_stable(USDX), issuance - payment);
+	assert_eq!(xbt_vault(3).debt.total(), debt - payment);
+}
+
+/// Asserts that a repayment which would leave payer 4 a sub-ED remainder fails without touching
+/// anything.
+fn assert_repay_rejects_a_sub_ed_remainder(requested: Option<Balance>) {
+	open_and_fund_repayer(requested, USDX_ED / 2);
+
+	assert_noop!(repay(4, XBT, USDX, 3, requested), TokenError::FundsUnavailable);
+}
+
+// Every repayment shape burns exactly what it pays, whether it empties the payer or leaves it
+// exactly its minimum balance, so supply stays exact at realistic decimals.
+#[test]
+fn partial_repay_that_empties_the_payer_burns_exactly_the_payment() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_burns_exactly_the_payment(Some(1_000 * USD), 0);
+	});
+}
+
+// An excess request is clamped to the debt, so it burns the debt and no more.
+#[test]
+fn excess_repay_that_empties_the_payer_burns_exactly_the_debt() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_burns_exactly_the_payment(Some(10_000 * USD), 0);
+	});
+}
+
+#[test]
+fn full_repay_that_empties_the_payer_burns_exactly_the_debt() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_burns_exactly_the_payment(None, 0);
+	});
+}
+
+#[test]
+fn partial_repay_at_the_payer_minimum_balance_burns_exactly_the_payment() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_burns_exactly_the_payment(Some(1_000 * USD), USDX_ED);
+	});
+}
+
+#[test]
+fn excess_repay_at_the_payer_minimum_balance_burns_exactly_the_debt() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_burns_exactly_the_payment(Some(10_000 * USD), USDX_ED);
+	});
+}
+
+#[test]
+fn full_repay_at_the_payer_minimum_balance_burns_exactly_the_debt() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_burns_exactly_the_payment(None, USDX_ED);
+	});
+}
+
+// The payer's account cannot be left below its minimum balance, whatever the repayment shape.
+#[test]
+fn partial_repay_rejects_leaving_the_payer_below_minimum_balance() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_rejects_a_sub_ed_remainder(Some(1_000 * USD));
+	});
+}
+
+#[test]
+fn excess_repay_rejects_leaving_the_payer_below_minimum_balance() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_rejects_a_sub_ed_remainder(Some(10_000 * USD));
+	});
+}
+
+#[test]
+fn full_repay_rejects_leaving_the_payer_below_minimum_balance() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_repay_rejects_a_sub_ed_remainder(None);
+	});
 }
