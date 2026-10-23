@@ -120,13 +120,13 @@ fn full_redistribution() -> LiquidationOutcome<Balance> {
 // the keeper's stablecoin is untouched.
 #[test]
 fn jit_skipped_falls_back_to_full_redistribution() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 
 		let cases = [
 			(0, 0, 0, "no allowance"),
 			// A 50-unit allowance sits below the 100-unit `minimum_jit_contribution`.
-			(500, 50, 0, "allowance below the market minimum"),
+			(500, 50, 0, "allowance below the branch minimum"),
 			// The allowance clears the minimum, but the keeper's funding clamps it below.
 			(50, 1_000, 0, "funding clamps the contribution below the minimum"),
 			// An allowance does not reserve stablecoin, so an unfunded keeper resolves to no JIT
@@ -153,7 +153,7 @@ fn jit_skipped_falls_back_to_full_redistribution() {
 // Equal penalties must produce the same borrower loss for offset and redistributed debt.
 #[test]
 fn full_redistribution_with_surplus() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_branch(DOT, STABLE, default_branch_config());
 		assert_ok!(open(1, DOT, STABLE, 600, 500, FixedU128::from_rational(1, 1_000)));
 		assert_ok!(open(2, DOT, STABLE, 2_000, 500, FixedU128::from_rational(2, 1_000)));
@@ -174,7 +174,7 @@ fn full_redistribution_with_surplus() {
 // protocol — absorb the shortfall.
 #[test]
 fn redistribution_with_collateral_below_debt() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 		// 600 * 0.7 = 420 of value against 500 of debt: CR 0.84.
 		set_price(DOT, FixedU128::from_rational(7, 10));
@@ -189,6 +189,7 @@ fn redistribution_with_collateral_below_debt() {
 
 		// The recipient must own the complete redistributed shortfall after its touch.
 		assert_ok!(poke(KEEPER, DOT, STABLE, 2));
+
 		let vault = vault(DOT, STABLE, 2);
 		assert_eq!(vault.debt.total(), 501 + 500);
 		assert_eq!(vault.collateral, 2_585);
@@ -199,11 +200,12 @@ fn redistribution_with_collateral_below_debt() {
 // Liquidation must settle current debt so accrued interest cannot escape the waterfall.
 #[test]
 fn debt_includes_accrued_interest() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 		advance_time(10 * ONE_YEAR_MS);
 		let before = ledger();
 
+		System::reset_events();
 		assert_ok!(liquidate(KEEPER, DOT, STABLE, 1, 0, 0));
 
 		// Ten years at 0.1% accrue floor(500 * 0.001 * 10) = 5, so 505 of debt
@@ -213,8 +215,21 @@ fn debt_includes_accrued_interest() {
 		let mut expected = outcome([0, 0, 0, 505], [0, 0, 0, 588], 12, 0);
 		// The accrued interest rides on the liquidation event instead of its own.
 		expected.touch.interest = 5;
+		// The branch issues the touch's 5 together with ten years of the other vaults' interest.
+		assert_eq!(
+			vault_events(),
+			vec![
+				Event::InterestIssued { collateral_id: DOT, stable_id: STABLE, amount: 15 },
+				Event::VaultLiquidated {
+					collateral_id: DOT,
+					stable_id: STABLE,
+					owner: 1,
+					keeper: KEEPER,
+					outcome: expected.clone(),
+				},
+			]
+		);
 		assert_settled(&before, expected);
-		assert!(!vault_events().iter().any(|e| matches!(e, Event::InterestAccrued { .. })));
 	});
 }
 
@@ -222,7 +237,7 @@ fn debt_includes_accrued_interest() {
 // the supply falls by exactly the difference.
 #[test]
 fn liquidation_supply_nets_burned_debt_against_issued_interest() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		// The mock hook burns the pool's share; route all yield to the fee account instead, so
 		// the only burn is the liquidation's.
 		SpFeeShare::set(Permill::zero());
@@ -251,7 +266,7 @@ fn liquidation_supply_nets_burned_debt_against_issued_interest() {
 
 #[test]
 fn rounded_interest_enters_the_waterfall_before_redistribution() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 		advance_time(1);
 		let before = ledger();
@@ -270,9 +285,8 @@ fn rounded_interest_enters_the_waterfall_before_redistribution() {
 // JIT burn.
 #[test]
 fn active_pool_precedes_jit() {
-	build_and_execute(|| {
+	ExtBuilder::default().active_sp_capacity(1_000).build_and_execute(|| {
 		setup_underwater_vault();
-		ActiveSpCapacity::set(1_000);
 		mint_stable(STABLE, KEEPER, 1_000);
 		let before = ledger();
 
@@ -295,7 +309,7 @@ fn active_pool_precedes_jit() {
 // An offset cannot create borrower surplus when penalized debt exceeds the held collateral.
 #[test]
 fn full_offset_without_surplus() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 		// Deeper underwater than the standard 0.9: at 0.8 the 525 of offset
 		// value asks for ceil(525/0.8) = 657, more than the 600 held.
@@ -315,9 +329,8 @@ fn full_offset_without_surplus() {
 // JIT must cover only the debt left by the active pool to preserve waterfall priority.
 #[test]
 fn jit_burns_after_active_pool() {
-	build_and_execute(|| {
+	ExtBuilder::default().active_sp_capacity(300).build_and_execute(|| {
 		setup_underwater_vault();
-		ActiveSpCapacity::set(300);
 		mint_stable(STABLE, KEEPER, 500);
 		let issuance_before = total_stable(STABLE);
 		let before = ledger();
@@ -340,7 +353,7 @@ fn jit_burns_after_active_pool() {
 // stablecoin.
 #[test]
 fn jit_clamped_by_keeper_balance() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(STABLE, KEEPER, 150);
 		let before = ledger();
@@ -360,7 +373,7 @@ fn jit_clamped_by_keeper_balance() {
 // Pending deposits must absorb debt before redistribution to preserve the specified waterfall.
 #[test]
 fn pending_precedes_redistribution() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 		PendingSpCapacity::set(150);
 		let before = ledger();
@@ -381,9 +394,8 @@ fn pending_precedes_redistribution() {
 // no debt goes to redistribution.
 #[test]
 fn remainder_follows_last_offset() {
-	build_and_execute(|| {
+	ExtBuilder::default().active_sp_capacity(300).build_and_execute(|| {
 		setup_underwater_vault();
-		ActiveSpCapacity::set(300);
 		PendingSpCapacity::set(200);
 		let before = ledger();
 
@@ -396,10 +408,10 @@ fn remainder_follows_last_offset() {
 	});
 }
 
-// The market minimum is inclusive, so exactly funded JIT must remain available.
+// The branch minimum is inclusive, so exactly funded JIT must remain available.
 #[test]
 fn jit_executes_at_minimum_funding() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(STABLE, KEEPER, 100);
 		let before = ledger();
@@ -415,17 +427,16 @@ fn jit_executes_at_minimum_funding() {
 	});
 }
 
-// A system ask below the market minimum must still execute: the keeper's allowance and funding
+// A system ask below the branch minimum must still execute: the keeper's allowance and funding
 // clear the minimum, and the small residual is the waterfall's choice, not the keeper's.
 #[test]
 fn jit_executes_below_minimum_ask() {
-	build_and_execute(|| {
+	ExtBuilder::default().active_sp_capacity(450).build_and_execute(|| {
 		setup_underwater_vault();
-		ActiveSpCapacity::set(450);
 		mint_stable(STABLE, KEEPER, 500);
 		let before = ledger();
 
-		// The active pool leaves only 50 debt, below the market's 100-unit
+		// The active pool leaves only 50 debt, below the branch's 100-unit
 		// minimum JIT contribution — the JIT burns it anyway.
 		assert_ok!(liquidate(KEEPER, DOT, STABLE, 1, 500, 0));
 
@@ -439,12 +450,11 @@ fn jit_executes_below_minimum_ask() {
 	});
 }
 
-// The system must use JIT when residual debt equals the inclusive market minimum.
+// The system must use JIT when residual debt equals the inclusive branch minimum.
 #[test]
 fn jit_executes_at_minimum_ask() {
-	build_and_execute(|| {
+	ExtBuilder::default().active_sp_capacity(400).build_and_execute(|| {
 		setup_underwater_vault();
-		ActiveSpCapacity::set(400);
 		mint_stable(STABLE, KEEPER, 500);
 		let before = ledger();
 
@@ -465,7 +475,7 @@ fn jit_executes_at_minimum_ask() {
 // drops the trade while the waterfall proceeds without it.
 #[test]
 fn slippage_floor_binds_at_the_jit_share() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		setup_underwater_vault();
 		mint_stable(STABLE, KEEPER, 200);
 
@@ -487,9 +497,8 @@ fn slippage_floor_binds_at_the_jit_share() {
 // out of the plan, and its debt moves down the waterfall.
 #[test]
 fn slippage_skip_preserves_pool_settlement() {
-	build_and_execute(|| {
+	ExtBuilder::default().active_sp_capacity(300).build_and_execute(|| {
 		setup_underwater_vault();
-		ActiveSpCapacity::set(300);
 		mint_stable(STABLE, KEEPER, 500);
 		let before = ledger();
 
@@ -511,7 +520,7 @@ fn slippage_skip_preserves_pool_settlement() {
 // The exact MCR boundary protects healthy debt and permits liquidation below the boundary.
 #[test]
 fn liquidatable_only_below_mcr() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_branch(DOT, STABLE, liquidation_branch_config());
 		assert_ok!(open(1, DOT, STABLE, 550, 500, FixedU128::from_rational(1, 1_000)));
 		assert_ok!(open(2, DOT, STABLE, 2_000, 500, FixedU128::from_rational(2, 1_000)));
@@ -531,7 +540,7 @@ fn liquidatable_only_below_mcr() {
 // Safety mode must preserve ordinary liquidation so unsafe vaults can improve branch health.
 #[test]
 fn safety_mode_allows_liquidation() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_branch(DOT, STABLE, liquidation_branch_config());
 		assert_ok!(open(1, DOT, STABLE, 600, 500, FixedU128::from_rational(1, 1_000)));
 		assert_ok!(open(2, DOT, STABLE, 800, 500, FixedU128::from_rational(2, 1_000)));
@@ -542,6 +551,7 @@ fn safety_mode_allows_liquidation() {
 		// below the 1.30 safety threshold, while staying healthy itself at
 		// CR 1.44.
 		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Safety));
+
 		assert_ok!(liquidate(KEEPER, DOT, STABLE, 1, 0, 0));
 
 		assert_settled(&before, full_redistribution());
@@ -552,7 +562,7 @@ fn safety_mode_allows_liquidation() {
 // works when the recipients are themselves below par.
 #[test]
 fn branch_below_par_still_liquidates() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_branch(DOT, STABLE, liquidation_branch_config());
 		assert_ok!(open(1, DOT, STABLE, 600, 500, FixedU128::from_rational(1, 1_000)));
 		assert_ok!(open(2, DOT, STABLE, 600, 500, FixedU128::from_rational(2, 1_000)));
@@ -569,6 +579,7 @@ fn branch_below_par_still_liquidates() {
 
 		// The sole recipient must receive the complete redistributed debt and collateral.
 		assert_ok!(poke(KEEPER, DOT, STABLE, 2));
+
 		let vault = vault(DOT, STABLE, 2);
 		assert_eq!(vault.debt.total(), 501 + 500);
 		assert_eq!(vault.collateral, 600 + 587);
@@ -583,31 +594,59 @@ fn branch_below_par_still_liquidates() {
 	});
 }
 
-// Liquidation must reject an unknown market, a missing vault, and an unavailable oracle before it
+// Liquidation must reject an unknown branch, a missing vault, and an unavailable oracle before it
 // can change protocol state.
 #[test]
 fn preconditions_rejected_without_side_effects() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		assert_noop!(liquidate(KEEPER, DOT, STABLE, 1, 0, 0), Error::<Test>::BranchNotFound);
 
-		// The market exists but account 1 never opened a vault on it.
+		// The branch exists but account 1 never opened a vault on it.
 		register_branch(DOT, STABLE, liquidation_branch_config());
+
 		assert_noop!(liquidate(KEEPER, DOT, STABLE, 1, 0, 0), Error::<Test>::VaultNotFound);
 
 		assert_ok!(open(1, DOT, STABLE, 600, 500, FixedU128::from_rational(1, 1_000)));
 		assert_ok!(open(2, DOT, STABLE, 2_000, 500, FixedU128::from_rational(2, 1_000)));
 		set_price(DOT, FixedU128::from_rational(9, 10));
 		MockOracleAvailable::set(false);
+
 		// The pallet propagates the oracle's own error.
 		assert_noop!(liquidate(KEEPER, DOT, STABLE, 1, 0, 0), DispatchError::Unavailable);
 	});
 }
 
+// Redistribution posts debt per unit of the remaining stake. A huge vault liquidated onto a
+// one-unit stake needs a per-stake increment beyond `FixedU128`, and the liquidation must fail
+// whole rather than post a truncated share that would orphan debt.
+#[test]
+fn redistribution_beyond_the_per_stake_range_is_rejected() {
+	ExtBuilder::default().build_and_execute(|| {
+		const DEBT: Balance = 400_000_000_000_000_000_000;
+		const COLLATERAL: Balance = 600_000_000_000_000;
+		let config = BranchConfig { debt_ceiling: Balance::MAX, ..liquidation_branch_config() };
+		register_market_with(DOT, STABLE, FixedU128::from_u32(1_000_000), config);
+		assert_ok!(Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), STABLE, Balance::MAX));
+		mint_collateral(DOT, 1, COLLATERAL);
+		// One unit of collateral is the whole stake left once vault 1 is detached.
+		assert_ok!(open(2, DOT, STABLE, 1, 200, FixedU128::from_rational(1, 1_000)));
+		assert_ok!(open(1, DOT, STABLE, COLLATERAL, DEBT, FixedU128::from_rational(1, 1_000)));
+		// Vault 1 drops to a 105% ratio; vault 2 stays far above every threshold.
+		set_price(DOT, FixedU128::from_u32(700_000));
+		assert!(DEBT > Balance::MAX / FixedU128::DIV, "the per-stake increment must overflow");
+
+		assert_noop!(
+			liquidate(KEEPER, DOT, STABLE, 1, 0, 0),
+			Error::<Test>::RedistributionWouldOverflow
+		);
+	});
+}
+
 // Liquidation policy is branch governance state: only that branch's administrator may change it,
-// and authority on one market must not create policy for an unregistered one.
+// and authority on one branch must not create policy for an unregistered one.
 #[test]
 fn config_update_requires_the_branch_admin() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_branch(DOT, STABLE, liquidation_branch_config());
 		let update = BranchConfigUpdate::OffsetPenalty(Permill::from_percent(10));
 
@@ -618,6 +657,7 @@ fn config_update_requires_the_branch_admin() {
 		);
 
 		assert_ok!(set_liquidation_param(ADMIN, update));
+
 		assert_eq!(
 			liquidation_config(),
 			LiquidationConfig {
@@ -633,10 +673,11 @@ fn config_update_requires_the_branch_admin() {
 // does not.
 #[test]
 fn penalty_order_enforced_on_create_and_update() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		let mut config = liquidation_branch_config();
 		config.liquidation.redistribution_penalty = Permill::from_percent(4);
 		set_price(DOT, FixedU128::from_rational(5, 4));
+
 		assert_noop!(
 			Vaults::create_branch(
 				RuntimeOrigin::root(),
@@ -652,6 +693,7 @@ fn penalty_order_enforced_on_create_and_update() {
 		);
 
 		register_branch(DOT, STABLE, liquidation_branch_config());
+
 		assert_noop!(
 			set_liquidation_param(
 				ADMIN,
@@ -670,6 +712,7 @@ fn penalty_order_enforced_on_create_and_update() {
 				BranchConfigDefect::OffsetPenaltyAboveRedistribution
 			)
 		);
+
 		assert_ok!(set_liquidation_param(
 			ADMIN,
 			BranchConfigUpdate::OffsetPenalty(Permill::from_percent(10))
@@ -679,11 +722,11 @@ fn penalty_order_enforced_on_create_and_update() {
 
 // The keeper is paid out of the offset penalty, so the compensation a liquidation can actually
 // hand over may not outgrow what that penalty funds — otherwise an offset burns pool stablecoin
-// the seizure no longer covers, with the market's own administrator naming who collects the
+// the seizure no longer covers, with the branch's own administrator naming who collects the
 // difference.
 #[test]
 fn keeper_compensation_above_the_penalty_rejected() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		// The mock's smallest vault owes 200 at a 5% offset penalty, so a liquidation seizes
 		// 210 and leaves exactly 10 spare.
 		register_branch(DOT, STABLE, liquidation_branch_config());
@@ -710,6 +753,7 @@ fn keeper_compensation_above_the_penalty_rejected() {
 			ADMIN,
 			BranchConfigUpdate::KeeperFlatCompensationValue(11)
 		));
+
 		// The cap is the amount that gets paid, so it must fit the penalty itself.
 		assert_noop!(
 			set_liquidation_param(ADMIN, BranchConfigUpdate::KeeperCompensationCapValue(11)),
@@ -719,11 +763,11 @@ fn keeper_compensation_above_the_penalty_rejected() {
 }
 
 // The keeper's percentage is charged on the whole seizure while only the penalty inside it pays
-// for the keeper, so the two rates — not any one vault's amounts — decide whether the market
+// for the keeper, so the two rates — not any one vault's amounts — decide whether the branch
 // works. `min_debt` is 200 here, small enough that rounding hides a rate that leaks at scale.
 #[test]
 fn keeper_percentage_above_the_penalty_rate_rejected() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_branch(DOT, STABLE, liquidation_branch_config());
 		let percent = |numerator: u32| {
 			BranchConfigUpdate::KeeperPercentCompensation(Permill::from_rational(
@@ -745,7 +789,7 @@ fn keeper_percentage_above_the_penalty_rate_rejected() {
 		assert_noop!(set_liquidation_param(ADMIN, percent(47_620)), exceeds_penalty());
 
 		// 5% of a seizure is past the 5% penalty inside it: on a 2_000 debt the keeper would
-		// take 105 against a 100 penalty. On the 200 the market floors at, the same rate takes
+		// take 105 against a 100 penalty. On the 200 the branch floors at, the same rate takes
 		// floor(10.5) = 10 out of a 10 penalty and looks payable.
 		assert_noop!(set_liquidation_param(ADMIN, percent(50_000)), exceeds_penalty());
 	});
@@ -755,9 +799,8 @@ fn keeper_percentage_above_the_penalty_rate_rejected() {
 // debt.
 #[test]
 fn redistribution_outpays_offsets() {
-	build_and_execute(|| {
+	ExtBuilder::default().active_sp_capacity(200).build_and_execute(|| {
 		setup_underwater_vault();
-		ActiveSpCapacity::set(200);
 		let before = ledger();
 
 		assert_ok!(liquidate(KEEPER, DOT, STABLE, 1, 0, 0));
@@ -820,7 +863,7 @@ fn setup_token_scale_vault(
 // compensation is zero.
 #[test]
 fn four_way_split() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		let liquidation = LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			keeper_flat_compensation_value: 0,
@@ -860,7 +903,7 @@ fn four_way_split() {
 // distortion.
 #[test]
 fn full_offset_with_keeper_compensation() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		let liquidation = LiquidationConfig {
 			offset_penalty: Permill::from_percent(5),
 			keeper_flat_compensation_value: 2 * UNIT,
@@ -894,7 +937,7 @@ fn full_offset_with_keeper_compensation() {
 // the share into the seized lot.
 #[test]
 fn pending_share_settles_in_custody_without_an_owner_round_trip() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_branch(DOT, STABLE, liquidation_branch_config());
 		assert_ok!(open(1, DOT, STABLE, 600, 500, FixedU128::from_rational(1, 1_000)));
 		assert_ok!(open(2, DOT, STABLE, 2_000, 500, FixedU128::from_rational(2, 1_000)));
@@ -905,6 +948,7 @@ fn pending_share_settles_in_custody_without_an_owner_round_trip() {
 		let vault_events_len = vault_events().len();
 
 		assert_ok!(liquidate(KEEPER, DOT, STABLE, 1, 0, 0));
+
 		assert_eq!(held(DOT, custody), 588);
 
 		// Vault 2's share is on hold in custody, and larger than the top-up its own liquidation
@@ -915,7 +959,9 @@ fn pending_share_settles_in_custody_without_an_owner_round_trip() {
 		assert!(share_2 > 0);
 		let owner_held_2 = held(DOT, 2);
 		assert_eq!(owner_held_2 + share_2, touched_2.collateral);
+
 		assert_ok!(liquidate(KEEPER, DOT, STABLE, 2, 0, 0));
+
 		let leg_2 = vault_events()
 			.into_iter()
 			.skip(vault_events_len)
@@ -938,7 +984,9 @@ fn pending_share_settles_in_custody_without_an_owner_round_trip() {
 		assert!(share_3 > 0);
 		let custody_before = held(DOT, custody);
 		let pool_before = collateral_balance(DOT, SP_ACCOUNT);
+
 		assert_ok!(liquidate(KEEPER, DOT, STABLE, 3, 0, 0));
+
 		let outcome_3 = vault_events()
 			.into_iter()
 			.skip(vault_events_len)

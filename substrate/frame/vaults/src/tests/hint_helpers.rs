@@ -86,12 +86,11 @@ fn open_vault_refunds_unused_hint_repair_steps() {
 	use linked_list_interface::SortedListInterface;
 
 	for steps in 0..=MaxHintRepairSteps::get() {
-		build_and_execute(|| {
-			register_market(DOT, STABLE);
+		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 			seed_long_rate_index();
 			fund_account(21);
 			let hint = Position::between(20 - u64::from(steps), 19 - u64::from(steps));
-			let rate = rate_pct(395, 1000);
+			let rate = FixedU128::from_rational(395, 1000);
 			let call = crate::Call::<Test>::open_vault {
 				collateral_id: DOT,
 				stable_id: STABLE,
@@ -104,6 +103,7 @@ fn open_vault_refunds_unused_hint_repair_steps() {
 				call.get_dispatch_info().call_weight,
 				<() as WeightInfo>::open_vault(MaxHintRepairSteps::get()),
 			);
+
 			let post = crate::Pallet::<Test>::open_vault(
 				RuntimeOrigin::signed(21),
 				DOT,
@@ -114,12 +114,13 @@ fn open_vault_refunds_unused_hint_repair_steps() {
 				hint,
 			)
 			.expect("valid hint within the repair budget");
+
 			assert_eq!(post.actual_weight, Some(<() as WeightInfo>::open_vault(steps)));
 			assert_eq!(
 				LinkedList::neighbors(&VaultList::Rate(DOT, STABLE), &21),
 				Some(Position::between(20, 19)),
 			);
-			crate::tests::assert_invariants();
+			crate::mock::check_invariants();
 		});
 	}
 }
