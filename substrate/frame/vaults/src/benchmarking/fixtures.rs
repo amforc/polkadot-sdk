@@ -762,6 +762,9 @@ pub(crate) fn seed_redemption_targets<T: BenchmarkConfig>(
 			owner,
 		)?;
 		assert_eq!(snapshot.status, VaultStatus::Active);
+		// The worst case settles a redistribution share the stored row has not applied yet.
+		let stored = Pallet::<T>::vault_of(&collateral::<T>(), &stable::<T>(), owner)?;
+		assert!(snapshot.debt > stored.debt.total());
 		total_debt = total_debt.saturating_add(snapshot.debt);
 	}
 	Ok(RedemptionTargetsSeed { owners, total_debt })
