@@ -251,7 +251,8 @@ impl<T: Config>
 			collateral_id.clone(),
 			stable_id.clone(),
 			amount,
-		)?;
+		)
+		.map_err(|error| error.error)?;
 
 		let cohort = crate::pallet::Deposits::<T>::get((collateral_id, stable_id, &who))
 			.and_then(|deposit| deposit.pending_deposit)
