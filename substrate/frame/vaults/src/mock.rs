@@ -393,29 +393,31 @@ impl pallet_vaults::Config for Test {
 pub struct MockBenchmarkHelper;
 
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for MockBenchmarkHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for MockBenchmarkHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
-	}
-
-	fn stable_asset_id() -> StableId {
-		STABLE
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
 	}
 
-	fn clear_oracle_price(collateral_id: AssetId) {
-		clear_price(collateral_id);
-	}
-
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
 
-	// The genesis config already creates every stable asset.
-	fn ensure_stable_asset(_: StableId) {}
+	// The benchmark collateral is native, which exists without being created.
+	fn ensure_collateral_asset(collateral_id: AssetId) {
+		assert_eq!(collateral_id, DOT);
+	}
+
+	// `StoredCeiling` reads only the ceiling row the benchmarks write themselves.
+	fn stage_debt_ceiling(_: StableId) {}
+
+	fn fund_native(who: &AccountId) {
+		<Balances as fungible::Mutate<AccountId>>::mint_into(who, 1_000_000_000_000)
+			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
+	}
 }
 
 /// Builds the test externalities: genesis balances, the oracle and pool knobs, and the branches a
@@ -685,6 +687,8 @@ pub fn open(
 		rate,
 		Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// Liquidation amounts used by the test helpers.
@@ -798,6 +802,8 @@ pub fn borrow(
 		None,
 		Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// Calls the `change_rate` dispatchable with endpoint hints.
@@ -814,6 +820,8 @@ pub fn change_rate(
 		new_rate,
 		Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// Calls the `close_vault` dispatchable; `None` returns collateral to the owner.

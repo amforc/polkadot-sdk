@@ -7,7 +7,7 @@ use crate::{
 	types::{DebtCollateral, LiquidationSnapshot, Vault, VaultStatus},
 };
 use frame::{prelude::*, traits::DefensiveOption};
-use linked_list_interface::{Position as ListPosition, SortedListInterface};
+use linked_list_interface::{Outcome, Position as ListPosition, SortedListInterface};
 use stablecoin_primitives::RedemptionStepSnapshot;
 
 impl<T: Config> VaultOp<T> {
@@ -55,16 +55,19 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	/// Moves an active vault to its new rate-list position.
-	pub(super) fn reindex(&self, hint: ListPosition<T::AccountId>) -> DispatchResult {
+	pub(super) fn reindex(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
-		T::VaultLists::re_insert(
+		let outcome = T::VaultLists::re_insert(
 			self.ctx.rate_list(),
 			self.owner.clone(),
 			self.vault.annual_rate,
 			hint,
 		)
-		.map(|_| ())
-		.map_err(|e| Pallet::<T>::map_error(e).into())
+		.map_err(Pallet::<T>::map_error)?;
+		if let Outcome::Relocated { steps } = outcome {
+			self.hint_repair_steps.saturating_accrue(steps);
+		}
+		Ok(())
 	}
 
 	/// Moves an unsafe last eligible vault into final recovery.

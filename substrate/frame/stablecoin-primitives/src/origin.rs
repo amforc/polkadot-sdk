@@ -10,7 +10,9 @@ use frame::{
 ///
 /// `Root` yields `None` (no deposit); the owner, as reported by `Assets` through
 /// [`fungibles::roles::Inspect`](frame::traits::fungibles::roles::Inspect), yields `Some(owner)`
-/// (refundable deposit). Other origins are returned unchanged. The benchmark origin is `Root`.
+/// (refundable deposit). Other origins are returned unchanged. The benchmark origin is the owner's
+/// signed origin, which takes the deposit path and reads the owner, or `Root` for a stablecoin
+/// without an owner.
 ///
 /// ```ignore
 /// type CreateOrigin = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
@@ -45,7 +47,7 @@ where
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]
-	fn try_successful_origin(_stable_id: &Assets::AssetId) -> Result<OuterOrigin, ()> {
-		Ok(OuterOrigin::root())
+	fn try_successful_origin(stable_id: &Assets::AssetId) -> Result<OuterOrigin, ()> {
+		Ok(Assets::owner(stable_id.clone()).map_or_else(OuterOrigin::root, OuterOrigin::signed))
 	}
 }

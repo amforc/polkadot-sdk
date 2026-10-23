@@ -3458,22 +3458,15 @@ impl pallet_vaults::Config for Runtime {
 	type BenchmarkHelper = VaultsBenchmarkHelper;
 }
 
-/// Trust-backed asset id the vault benchmarks mint their stablecoin under. The
-/// benchmarks create the asset themselves, so any free id works.
-#[cfg(feature = "runtime-benchmarks")]
-const BENCHMARK_STABLE_ASSET_ID: VaultsStableId = 50_000_342;
-
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchmarkHelper;
 
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for VaultsBenchmarkHelper {
+impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountId>
+	for VaultsBenchmarkHelper
+{
 	fn collateral_asset_id() -> VaultsCollateralId {
 		VaultsCollateralId::Native
-	}
-
-	fn stable_asset_id() -> VaultsStableId {
-		BENCHMARK_STABLE_ASSET_ID
 	}
 
 	fn set_oracle_price(asset_id: VaultsCollateralId, price: FixedU128) {
@@ -3484,24 +3477,23 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId> for Vaul
 		);
 	}
 
-	fn clear_oracle_price(asset_id: VaultsCollateralId) {
-		pallet_oracle::Values::<Runtime>::remove(vaults_oracle_key(&asset_id));
-	}
-
+	// Bypass Babe's timestamp hook: benchmarks never initialize its slot, so advancing would panic.
 	fn advance_time(ms: u64) {
-		let now = <pallet_timestamp::Pallet<Runtime>>::get();
-		<pallet_timestamp::Pallet<Runtime>>::set_timestamp(now + ms);
+		pallet_timestamp::Now::<Runtime>::mutate(|now| *now = now.saturating_add(ms));
 	}
 
-	// The benchmark genesis does not create the stablecoin asset, so opening vaults
-	// (which mints stablecoin debt) would fail without it.
-	fn ensure_stable_asset(stable_id: VaultsStableId) {
-		use frame_support::traits::fungibles::{Create, Inspect as FungiblesInspect};
-		if !<Assets as FungiblesInspect<AccountId>>::asset_exists(stable_id) {
-			let asset_owner: AccountId = frame_benchmarking::account("stablecoin_owner", 0, 0);
-			<Assets as Create<AccountId>>::create(stable_id, asset_owner, true, 1)
-				.expect("create stablecoin asset for benchmark");
-		}
+	// The benchmarks use native collateral, which exists without being created.
+	fn ensure_collateral_asset(collateral_id: VaultsCollateralId) {
+		assert_eq!(collateral_id, VaultsCollateralId::Native);
+	}
+
+	// `StoredCeiling` reads only the ceiling row the benchmarks write themselves.
+	fn stage_debt_ceiling(_stable_id: VaultsStableId) {}
+
+	fn fund_native(who: &AccountId) {
+		use frame_support::traits::fungible::Mutate as FungibleMutate;
+		<Balances as FungibleMutate<AccountId>>::mint_into(who, 1_000 * DOLLARS)
+			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
 	}
 }
 
