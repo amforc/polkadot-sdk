@@ -813,6 +813,10 @@ pub use pallet_uniques;
 #[cfg(feature = "pallet-utility")]
 pub use pallet_utility;
 
+/// FRAME vaults pallet.
+#[cfg(feature = "pallet-vaults")]
+pub use pallet_vaults;
+
 /// FRAME verify signature pallet.
 #[cfg(feature = "pallet-verify-signature")]
 pub use pallet_verify_signature;
@@ -1545,6 +1549,10 @@ pub use sp_wasm_interface;
 /// Types and traits for interfacing between the host and the wasm runtime.
 #[cfg(feature = "sp-weights")]
 pub use sp_weights;
+
+/// Shared primitive types and traits for the stablecoin protocol pallets.
+#[cfg(feature = "stablecoin-primitives")]
+pub use stablecoin_primitives;
 
 /// Utility for building chain-specification files for Substrate-based runtimes based on
 /// `sp-genesis-builder`.

@@ -31,7 +31,7 @@ static_assertions = { workspace = true, default-features = true }
 # pallet-asset-conversion: turn on "num-traits" feature
 primitive-types = { features = ["codec", "num-traits", "scale-info"], workspace = true }
 
-polkadot-sdk = { features = ["runtime-full", "tuples-96"], workspace = true }
+polkadot-sdk = { features = ["runtime-full", "tuples-128"], workspace = true }
 
 # shared code between runtime and node
 node-primitives = { workspace = true }
