@@ -57,6 +57,7 @@ use core::marker::PhantomData;
 /// Weight functions needed for `pallet_redemptions`.
 pub trait WeightInfo {
 	fn redeem(s: u32, ) -> Weight;
+	fn redeem_recovery() -> Weight;
 	fn set_redemption_config() -> Weight;
 }
 
@@ -105,6 +106,11 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().writes(6_u64))
 			.saturating_add(T::DbWeight::get().writes((4_u64).saturating_mul(s.into())))
 			.saturating_add(Weight::from_parts(0, 3028).saturating_mul(s.into()))
+	}
+	// PLACEHOLDER: copies `redeem(1)` until the `redeem_recovery` benchmark is run; it must be
+	// regenerated.
+	fn redeem_recovery() -> Weight {
+		Self::redeem(1)
 	}
 	/// Storage: `Vaults::BranchStates` (r:1 w:0)
 	/// Proof: `Vaults::BranchStates` (`max_values`: Some(16), `max_size`: Some(369), added: 864, mode: `MaxEncodedLen`)
@@ -171,6 +177,11 @@ impl WeightInfo for () {
 			.saturating_add(RocksDbWeight::get().writes(6_u64))
 			.saturating_add(RocksDbWeight::get().writes((4_u64).saturating_mul(s.into())))
 			.saturating_add(Weight::from_parts(0, 3028).saturating_mul(s.into()))
+	}
+	// PLACEHOLDER: copies `redeem(1)` until the `redeem_recovery` benchmark is run; it must be
+	// regenerated.
+	fn redeem_recovery() -> Weight {
+		Self::redeem(1)
 	}
 	/// Storage: `Vaults::BranchStates` (r:1 w:0)
 	/// Proof: `Vaults::BranchStates` (`max_values`: Some(16), `max_size`: Some(369), added: 864, mode: `MaxEncodedLen`)

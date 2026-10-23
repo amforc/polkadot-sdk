@@ -1731,3 +1731,39 @@ fn recovery_bonus_capped_by_penalty() {
 			assert_eq!(held(DOT, 1), 4_900 * UNIT);
 		});
 }
+
+fn redeem_actual_weight(max_stable_to_spend: Balance, max_steps: u32) -> frame::prelude::Weight {
+	Redemptions::redeem(
+		RuntimeOrigin::signed(REDEEMER),
+		DOT,
+		STABLE,
+		crate::RedemptionTerms { max_stable_to_spend, min_collateral_out: 0 },
+		RECIPIENT,
+		max_steps,
+	)
+	.expect("the redemption succeeds")
+	.actual_weight
+	.expect("a redemption reports its actual weight")
+}
+
+// A walk that runs out of targets still paid for the lookup that found none, so it is weighed one
+// step above the vaults it visited; a walk that stops at its cap does no such lookup.
+#[test]
+fn ordinary_walk_weighs_a_trailing_lookup_as_a_step() {
+	use crate::WeightInfo;
+	ExtBuilder::default()
+		.default_branch()
+		.stable_balance(STABLE, REDEEMER, 1_000_000)
+		.build_and_execute(|| {
+			assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+			assert_ok!(open(2, DOT, STABLE, 10_000, 500, percent(2)));
+
+			let capped = hypothetically!(redeem_actual_weight(100_000, 1));
+			assert_eq!(capped, <() as WeightInfo>::redeem(1));
+
+			let exhausted = redeem_actual_weight(100_000, 0);
+			assert_eq!(exhausted, <() as WeightInfo>::redeem(3));
+			assert!(vault_status(DOT, STABLE, 1).is_none_or(|status| status.is_dormant()));
+			assert!(vault_status(DOT, STABLE, 2).is_none_or(|status| status.is_dormant()));
+		});
+}
