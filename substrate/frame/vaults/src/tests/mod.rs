@@ -30,10 +30,6 @@ use crate::mock::{
 pub const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
 pub const ONE_YEAR_MS: Moment = stablecoin_primitives::MILLIS_PER_YEAR;
 
-pub fn rate_pct(num: u128, denom: u128) -> FixedU128 {
-	FixedU128::from_rational(num, denom)
-}
-
 /// `n` percent, exactly.
 pub const fn percent(n: u128) -> FixedU128 {
 	FixedU128::from_inner(n * (<FixedU128 as frame::arithmetic::FixedPointNumber>::DIV / 100))
@@ -70,17 +66,11 @@ pub fn liquidation_outcome() -> crate::types::LiquidationOutcome<Balance> {
 		.expect("liquidation event")
 }
 
-/// Checks accounting at the current checkpoint, including all stablecoin aggregates and supply.
-#[track_caller]
-pub fn assert_invariants() {
-	crate::mock::check_invariants();
-}
-
 /// Asserts success and checks accounting before any subsequent operation can repair it.
 #[track_caller]
 pub fn assert_ok_and_invariants<R: core::fmt::Debug>(
 	result: Result<R, frame::prelude::DispatchError>,
 ) {
 	frame::testing_prelude::assert_ok!(result);
-	assert_invariants();
+	crate::mock::check_invariants();
 }

@@ -147,7 +147,7 @@ fn offset_without_capacity_quotes_nothing_and_refuses_settlement() {
 				no_collateral,
 			)
 		});
-		assert!(matches!(burned, Ok(None)));
+		assert!(matches!(burned, Ok(ref credit) if credit.peek() == 0));
 
 		// A leg that cancels no debt may carry no collateral: the pool would receive it for
 		// free.

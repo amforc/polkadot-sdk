@@ -128,10 +128,9 @@ impl<T: Config> Pallet<T> {
 		ensure!(expected.next().is_none(), "reverse walk length != forward walk length");
 
 		// Catch unreachable nodes: total rows must equal chain length.
-		let total_nodes =
-			u32::try_from(ListNodes::<T>::iter_key_prefix(list_id).count()).unwrap_or(u32::MAX);
+		let total_nodes = ListNodes::<T>::iter_key_prefix(list_id).count();
 		ensure!(
-			total_nodes == stored_size,
+			total_nodes == forward.len(),
 			"orphan ListNodes rows: total count differs from chain length"
 		);
 

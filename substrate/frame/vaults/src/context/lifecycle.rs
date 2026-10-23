@@ -74,7 +74,7 @@ impl<T: Config> VaultOp<T> {
 	pub(super) fn reindex(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
 		let outcome = T::VaultLists::re_insert(
-			self.rate_list(),
+			self.ctx.rate_list(),
 			self.owner.clone(),
 			self.vault.annual_rate,
 			hint,
@@ -260,6 +260,10 @@ impl<T: Config> VaultOp<T> {
 			.ok_or(Error::<T>::InvalidLiquidationPlan)?;
 		self.detach(collateral_out)?;
 		if !redistribution.is_zero() {
+			// The liquidation gate refuses the only stake bearer, so another stake is left to
+			// absorb the residual. A zero total here is corruption, not an overflow.
+			let has_recipients = !self.ctx.branch.state.stakes.total.is_zero();
+			has_recipients.then_some(()).defensive_ok_or(DispatchError::Corruption)?;
 			self.ctx
 				.branch
 				.state
@@ -301,7 +305,7 @@ impl<T: Config> VaultOp<T> {
 				DispatchError::Corruption
 			);
 			// Neither the aggregate remainder nor interest charged ahead of it has a liability
-			// owner once the market is empty.
+			// owner once the branch is empty.
 			self.ctx.branch.state.debt.aggregate_interest_remainder = 0;
 			self.ctx.branch.state.debt.interest_minted_ahead = Zero::zero();
 		}

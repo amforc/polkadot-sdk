@@ -161,7 +161,7 @@ impl<T: Config>
 		branch: BranchSnapshot,
 		debt: OffsetLegs<BalanceOf<T>>,
 		collateral: OffsetLegs<CollateralCreditOf<T>>,
-	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
+	) -> Result<StableCreditOf<T>, DispatchError> {
 		// A leg that cancels no debt must carry no collateral. Anything else would give the pool
 		// collateral for free and break the link between the two sides.
 		if debt.active.is_zero() {
@@ -170,7 +170,7 @@ impl<T: Config>
 		if debt.pending.is_zero() {
 			ensure!(collateral.pending.peek().is_zero(), crate::Error::<T>::OffsetSettlementFailed);
 			if debt.active.is_zero() {
-				return Ok(None);
+				return Ok(StableCreditOf::<T>::zero(stable_id.clone()));
 			}
 		}
 		let mut pool = Self::offset_pool(collateral_id, stable_id, branch.mode)
@@ -220,7 +220,7 @@ impl<T: Config>
 		let burned =
 			Self::settle_reservation_exact(stable_id, custody.account(), reservation, collateral)?;
 		Pools::<T>::insert(collateral_id, stable_id, pool);
-		Ok(Some(burned))
+		Ok(burned)
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]

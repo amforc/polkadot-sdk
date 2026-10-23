@@ -20,7 +20,7 @@ use frame::{
 	traits::{
 		fungibles::{Balanced as FungiblesBalanced, Inspect as FungiblesInspect, InspectHold as _},
 		tokens::{Fortitude, Precision, Preservation, Provenance},
-		AccountTouch, AssetFootprint, DefensiveOption, Footprint, Time,
+		AccountTouch, AssetFootprint, DefensiveOption, DefensiveSaturating, Footprint, Time,
 	},
 };
 use linked_list_interface::{ListError, SortedListInterface};
@@ -57,18 +57,22 @@ pub(crate) struct BranchContribution<Balance> {
 }
 
 impl<T: Config> Pallet<T> {
-	/// Translate a rate-index insert/re-insert failure. A stale user-supplied
+	/// Translate a rate-index insert, re-insert, or removal failure. A stale user-supplied
 	/// hint surfaces as [`Error::InvalidPositionHints`]; every other kind —
 	/// index/vault disagreement or the list's internal transactional limit
-	/// ([`ListError::Internal`]).
-	pub(crate) const fn map_error(e: ListError) -> Error<T> {
+	/// ([`ListError::Internal`]) — as [`Error::RateIndexInvariantBroken`].
+	///
+	/// Index/vault disagreement is storage corruption, so it is also reported defensively.
+	pub(crate) fn map_error(e: ListError) -> Error<T> {
 		match e {
 			ListError::InvalidPositionHints => Error::<T>::InvalidPositionHints,
-			ListError::ItemNotFound |
-			ListError::ItemAlreadyExists |
-			ListError::ListTooLong |
-			ListError::CorruptList |
-			ListError::Internal => Error::<T>::RateIndexInvariantBroken,
+			ListError::ItemNotFound | ListError::ItemAlreadyExists | ListError::CorruptList => {
+				defensive!("rate index disagrees with the vault records", e);
+				Error::<T>::RateIndexInvariantBroken
+			},
+			// Neither is corruption: the length counter cannot realistically fill, and the
+			// transactional limit is environmental.
+			ListError::ListTooLong | ListError::Internal => Error::<T>::RateIndexInvariantBroken,
 		}
 	}
 
@@ -194,7 +198,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Advance the stablecoin-wide debt projection to `now`, then replace one
-	/// market's realized debt, pending interest, and active accrual rate.
+	/// branch's realized debt, pending interest, and active accrual rate.
 	fn updated_stablecoin_debt(
 		mut total: StablecoinDebtState<BalanceOf<T>>,
 		before: &BranchContribution<BalanceOf<T>>,
@@ -224,10 +228,10 @@ impl<T: Config> Pallet<T> {
 		Ok(total)
 	}
 
-	/// Fully accrued stablecoin debt if one market were replaced by `after_state`.
+	/// Fully accrued stablecoin debt if one branch were replaced by `after_state`.
 	///
-	/// This is the exact state [`Self::commit_branch`] would derive from `before`, the market's
-	/// stored contribution, including sibling-market interest and the current market's own
+	/// This is the exact state [`Self::commit_branch`] would derive from `before`, the branch's
+	/// stored contribution, including sibling-branch interest and the current branch's own
 	/// rounding, without writing it.
 	pub(crate) fn projected_stablecoin_debt(
 		stable_id: &StableIdOf<T>,
@@ -262,7 +266,7 @@ impl<T: Config> Pallet<T> {
 		})
 	}
 
-	/// Returns the market's unminted interest, over [`math::INTEREST_DENOMINATOR`].
+	/// Returns the branch's unminted interest, over [`math::INTEREST_DENOMINATOR`].
 	pub(crate) fn branch_pending_interest(
 		state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
@@ -276,9 +280,9 @@ impl<T: Config> Pallet<T> {
 			.ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
 	}
 
-	/// Fully accrued debt across every market issuing `stable_id`.
+	/// Fully accrued debt across every branch issuing `stable_id`.
 	///
-	/// The projection rounds the markets' combined unminted interest up once and does not net
+	/// The projection rounds the branches' combined unminted interest up once and does not net
 	/// interest vaults were charged ahead, so it bounds the debt from above by a few units.
 	pub(crate) fn accrued_stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {
 		let debt = StablecoinDebt::<T>::get(stable_id);
@@ -292,7 +296,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Move an aggregate from `before` to `after`. Underflow means the aggregate
-	/// had drifted from the markets it sums, so it is corruption rather than a
+	/// had drifted from the branches it sums, so it is corruption rather than a
 	/// user-reachable error.
 	fn shifted_total(
 		total: BalanceOf<T>,
@@ -307,7 +311,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Returns a vault, or `VaultNotFound` if it does not exist.
-	pub fn vault_of(
+	pub(crate) fn vault_of(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		owner: &T::AccountId,
@@ -445,7 +449,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Authorizes [`Config::ForceOrigin`] as a full administrator.
 	///
-	/// This authority lets governance recover a market when its administrators are unavailable.
+	/// This authority lets governance recover a branch when its administrators are unavailable.
 	pub(crate) fn ensure_force_or_branch_admin(
 		origin: OriginFor<T>,
 		collateral_id: &CollateralIdOf<T>,
@@ -457,7 +461,7 @@ impl<T: Config> Pallet<T> {
 		Self::ensure_branch_admin(&who, collateral_id, stable_id, required)
 	}
 
-	/// Authorize a per-market admin account, returning its [`AdminLevel`].
+	/// Authorize a per-branch admin account, returning its [`AdminLevel`].
 	/// `full_admin` satisfies any `required`; `emergency_admin` satisfies only
 	/// `Emergency`.
 	pub(crate) fn ensure_branch_admin(
@@ -467,13 +471,16 @@ impl<T: Config> Pallet<T> {
 		required: AdminLevel,
 	) -> Result<AdminLevel, DispatchError> {
 		let admins = Self::branch_of(collateral_id, stable_id)?.admins;
-		if who == &admins.full_admin {
-			return Ok(AdminLevel::Full);
-		}
-		if required == AdminLevel::Emergency && who == &admins.emergency_admin {
-			return Ok(AdminLevel::Emergency);
-		}
-		Err(Error::<T>::NotBranchAdmin.into())
+		// One account holding both roles acts as the full administrator.
+		let level = if who == &admins.full_admin {
+			AdminLevel::Full
+		} else if who == &admins.emergency_admin {
+			AdminLevel::Emergency
+		} else {
+			return Err(Error::<T>::NotBranchAdmin.into());
+		};
+		ensure!(level.satisfies(required), Error::<T>::NotBranchAdmin);
+		Ok(level)
 	}
 
 	/// Fully-accrued total branch debt (the TCR numerator): principal + minted
@@ -530,9 +537,9 @@ impl<T: Config> Pallet<T> {
 		Ok(new_interest)
 	}
 
-	/// Issues market yield and routes the remainder from `T::YieldHook` to `T::FeeAccount`.
+	/// Issues branch yield and routes the remainder from `T::YieldHook` to `T::FeeAccount`.
 	///
-	/// `branch` is the market as stored at this point: the caller derives it from the state it
+	/// `branch` is the branch as stored at this point: the caller derives it from the state it
 	/// just committed, so the hook does not load the branch again.
 	pub(crate) fn mint_and_route_yield(
 		collateral_id: &CollateralIdOf<T>,
@@ -545,7 +552,7 @@ impl<T: Config> Pallet<T> {
 		Self::resolve_fee_credit(stable_id, credit)
 	}
 
-	/// Issues aggregate interest as market yield and reports it.
+	/// Issues aggregate interest as branch yield and reports it.
 	pub(crate) fn issue_interest(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -564,9 +571,9 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Persists the market's pending aggregate interest and issues it as yield.
+	/// Persists the branch's pending aggregate interest and issues it as yield.
 	///
-	/// A frozen market has no elapsed interest time, so it issues nothing.
+	/// A frozen branch has no elapsed interest time, so it issues nothing.
 	pub(crate) fn accrue_branch_interest(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -583,7 +590,7 @@ impl<T: Config> Pallet<T> {
 					Self::mode_of(state, config, collateral_id, now).unwrap_or(BranchMode::Frozen);
 				Ok((minted, Some(BranchSnapshot { mode, now })))
 			})?;
-		// Mint only after storing the updated market.
+		// Mint only after storing the updated branch.
 		if let Some(branch) = branch {
 			Self::issue_interest(collateral_id, stable_id, branch, minted)?;
 		}
@@ -592,36 +599,32 @@ impl<T: Config> Pallet<T> {
 
 	/// Makes the fee account able to receive a one-unit credit for `stable_id`.
 	///
-	/// The fee account pays its deposit because it can outlive one market.
+	/// The fee account pays its deposit because it can outlive one branch.
 	pub(crate) fn ensure_fee_account_receivable(stable_id: &StableIdOf<T>) -> DispatchResult {
 		let fee_account = T::FeeAccount::convert(stable_id.clone());
-		let can_receive_unit = || {
-			<T::StableAssets as FungiblesInspect<T::AccountId>>::can_deposit(
-				stable_id.clone(),
-				&fee_account,
-				BalanceOf::<T>::one(),
-				Provenance::Extant,
-			)
-			.into_result()
-			.is_ok()
-		};
-		if can_receive_unit() {
+		let can_receive_unit = <T::StableAssets as FungiblesInspect<T::AccountId>>::can_deposit(
+			stable_id.clone(),
+			&fee_account,
+			BalanceOf::<T>::one(),
+			Provenance::Extant,
+		)
+		.into_result()
+		.is_ok();
+		if can_receive_unit {
 			return Ok(());
 		}
 		<T::StableAssets as AccountTouch<_, _>>::touch(
 			stable_id.clone(),
 			&fee_account,
 			&fee_account,
-		)?;
-		ensure!(can_receive_unit(), Error::<T>::FeeAccountNotReceivable);
-		Ok(())
+		)
 	}
 
-	/// Returns the account that pays and is refunded a market's custody seed.
+	/// Returns the account that pays and is refunded a branch's custody seed.
 	///
-	/// A market that charged a creation deposit charges the same account. A privileged creation
-	/// has no depositor, so the market's own full administrator funds it. Removal recomputes this
-	/// from the stored record: rotating that admin of a privileged market therefore refunds the
+	/// A branch that charged a creation deposit charges the same account. A privileged creation
+	/// has no depositor, so the branch's own full administrator funds it. Removal recomputes this
+	/// from the stored record: rotating that admin of a privileged branch therefore refunds the
 	/// new one.
 	pub(crate) fn custody_funder(
 		depositor: Option<&T::AccountId>,
@@ -630,10 +633,10 @@ impl<T: Config> Pallet<T> {
 		depositor.unwrap_or(&admins.full_admin).clone()
 	}
 
-	/// Parks one minimum balance of collateral in the market's redistribution account.
+	/// Parks one minimum balance of collateral in the branch's redistribution account.
 	///
 	/// A hold must leave the asset's minimum balance free, so custody carries that float for as
-	/// long as the market exists. The provider reference alone does not cover this: `pallet-assets`
+	/// long as the branch exists. The provider reference alone does not cover this: `pallet-assets`
 	/// keeps the minimum balance untouchable whatever the account's existence reason, while
 	/// `pallet-balances` waives it for an account another provider keeps alive. Seeding both makes
 	/// every later seizure hold exactly what it deposited.
@@ -666,10 +669,10 @@ impl<T: Config> Pallet<T> {
 
 	/// Returns the custody float to the account that funded it.
 	///
-	/// Removal happens on an empty market, so nothing is on hold and the whole free balance is
+	/// Removal happens on an empty branch, so nothing is on hold and the whole free balance is
 	/// swept: the seed, plus anything donated to the address, which the funder keeps. Emptying the
 	/// account also lets it die, releasing the consumer references that would otherwise block the
-	/// market's provider reference.
+	/// branch's provider reference.
 	pub(crate) fn refund_redistribution_custody(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -683,7 +686,7 @@ impl<T: Config> Pallet<T> {
 				&custody,
 			)
 			.is_zero(),
-			"custody still holds collateral at market removal"
+			"custody still holds collateral at branch removal"
 		);
 		let seed = <T::CollateralAssets as FungiblesInspect<T::AccountId>>::reducible_balance(
 			collateral_id.clone(),
@@ -762,10 +765,13 @@ impl<T: Config> Pallet<T> {
 			});
 		}
 
-		let delta_principal =
-			redistribution.principal_per_stake.saturating_sub(snap.principal_per_stake);
-		let delta_collateral =
-			redistribution.collateral_per_stake.saturating_sub(snap.collateral_per_stake);
+		// A checkpoint never runs ahead of the branch accumulators, so an underflow is corruption.
+		let delta_principal = redistribution
+			.principal_per_stake
+			.defensive_saturating_sub(snap.principal_per_stake);
+		let delta_collateral = redistribution
+			.collateral_per_stake
+			.defensive_saturating_sub(snap.collateral_per_stake);
 		let principal = if only_recipient {
 			state.debt.pending_redistribution_principal
 		} else {

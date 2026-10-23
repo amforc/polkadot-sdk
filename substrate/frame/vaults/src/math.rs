@@ -1,7 +1,7 @@
 //! Storage-free math helpers for vault accounting.
 //!
 //! Every rounding favors the protocol. A vault's debt never falls below its exact accrued interest.
-//! Aggregates stay exact, as wide integers, so markets issue their yield without vault touches.
+//! Aggregates stay exact, as wide integers, so branches issue their yield without vault touches.
 //!
 //! Overflow triggers a debug failure and saturates in release.
 
@@ -126,7 +126,7 @@ pub fn scale_wide(value: U256, factor: U256, direction: Direction) -> Option<U25
 
 /// Returns simple interest rounded up.
 ///
-/// Used for market interest and upfront fees.
+/// Used for branch interest and upfront fees.
 ///
 /// Uses `ceil(principal * rate * delta_millis / MILLIS_PER_YEAR)` to preserve precision.
 pub fn simple_interest_ceil<Balance: FixedPointOperand>(
@@ -143,7 +143,7 @@ pub fn simple_interest_ceil<Balance: FixedPointOperand>(
 		.defensive_unwrap_or_else(Balance::max_value)
 }
 
-/// Returns the market's average rate, rounded up.
+/// Returns the branch's average rate, rounded up.
 ///
 /// `accrual_rate` is the sum of each debt multiplied by its rate, in whole units. Zero debt
 /// returns `1.0`, which keeps the first vault's fee calculation safe.
@@ -168,15 +168,18 @@ mod tests {
 	#[test]
 	fn charged_interest_never_falls_below_the_exact_amount() {
 		let unit = INTEREST_DENOMINATOR;
+
 		// A third of a unit rounds up to one and prepays two thirds.
 		let (charged, prepaid) = charge_interest::<u128>(U256::from(unit / 3), 0).unwrap();
 		assert_eq!(charged, 1);
 		assert_eq!(prepaid, unit - unit / 3);
+
 		// Touching again inside the prepaid excess charges nothing.
 		let (charged, prepaid_after) =
 			charge_interest::<u128>(U256::from(unit / 3), prepaid).unwrap();
 		assert_eq!(charged, 0);
 		assert_eq!(prepaid_after, prepaid - unit / 3);
+
 		// An exact multiple leaves no excess.
 		assert_eq!(charge_interest::<u128>(U256::from(unit * 5), 0), Some((5, 0)));
 		assert_eq!(charge_interest::<u64>(U256::from(u128::MAX) * U256::from(unit), 0), None);
@@ -187,11 +190,13 @@ mod tests {
 		let step = INTEREST_DENOMINATOR / 7;
 		let mut total = 0u128;
 		let mut prepaid = 0;
+
 		for _ in 0..70 {
 			let (charged, next) = charge_interest::<u128>(U256::from(step), prepaid).unwrap();
 			total += charged;
 			prepaid = next;
 		}
+
 		let exact = U256::from(step) * U256::from(70u32);
 		let ceil = exact.div_mod(U256::from(INTEREST_DENOMINATOR));
 		let expected = ceil.0.low_u128() + u128::from(!ceil.1.is_zero());
@@ -201,6 +206,7 @@ mod tests {
 	#[test]
 	fn scale_wide_rounds_the_fraction_only() {
 		let div = U256::from(FixedU128::DIV);
+
 		assert_eq!(scale_wide(div * 3, U256::from(5u32), Direction::Down), Some(U256::from(15u32)));
 		assert_eq!(scale_wide(U256::one(), U256::one(), Direction::Down), Some(U256::zero()));
 		assert_eq!(scale_wide(U256::one(), U256::one(), Direction::Up), Some(U256::one()));
@@ -221,6 +227,7 @@ mod tests {
 			// A positive fraction rounds up to one.
 			(3, one, 1, 1),
 		];
+
 		for (principal, rate, elapsed, interest) in cases {
 			assert_eq!(
 				simple_interest_ceil::<u128>(principal, rate, elapsed),
@@ -247,8 +254,9 @@ mod tests {
 
 	#[test]
 	fn average_branch_rate_zero_debt_returns_one() {
-		// An empty market uses 1.0 for its first fee calculation.
+		// An empty branch uses 1.0 for its first fee calculation.
 		let avg = average_branch_rate::<u128>(0, 0);
+
 		assert_eq!(avg, FixedU128::one());
 	}
 }

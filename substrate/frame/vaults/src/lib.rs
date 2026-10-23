@@ -1,6 +1,6 @@
 //! # Vaults Pallet
 //!
-//! Creates collateral-backed stablecoin markets.
+//! Creates collateral-backed stablecoin branches.
 //!
 //! ## Pallet API
 //!
@@ -8,19 +8,21 @@
 //!
 //! ## Overview
 //!
-//! A market pairs one collateral asset with one stable asset. Each market has its own risk limits
+//! A branch pairs one collateral asset with one stable asset. Each branch has its own risk limits
 //! and administrators.
 //!
 //! A user opens a vault by locking collateral and borrowing the stable asset. Each vault has an
-//! annual interest rate chosen by its owner. Interest is added when the market or vault is updated.
+//! annual interest rate chosen by its owner. Interest is simple, not compounding: it accrues
+//! linearly on the vault's principal only, never on interest already charged. It is added when the
+//! branch or vault is updated.
 //! Opening also takes a refundable storage deposit, settled
 //! according to the runtime policy.
 //!
 //! Vaults are ordered by rate for redemptions. Lower-rate vaults are redeemed first. A final
-//! recovery queue is served before the rate list when a market has only one eligible vault left.
+//! recovery queue is served before the rate list when a branch has only one eligible vault left.
 //! Moving a vault into recovery may pay a keeper reward; see [`Call::enter_final_recovery`].
 //!
-//! A market may enter safety mode when its total collateral ratio is low. It may also be frozen by
+//! A branch may enter safety mode when its total collateral ratio is low. It may also be frozen by
 //! an administrator or when its oracle price is unavailable.
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -52,9 +54,9 @@ mod tests;
 pub use pallet::*;
 pub use stablecoin_primitives;
 pub use types::{
-	AssetMinimums, BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate,
-	BranchDebt, BranchMode, BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState,
-	JitTerms, LiquidationConfig, LiquidationOutcome, LiquidationTouch, RedistributionAccumulators,
+	BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate, BranchDebt, BranchMode,
+	BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState, JitTerms,
+	LiquidationConfig, LiquidationOutcome, LiquidationTouch, RedistributionAccumulators,
 	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
 };
 pub use weights::WeightInfo;
@@ -74,7 +76,8 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId> {
 	/// A runtime hook supports native and holder-backed assets that lack `fungibles::Create`.
 	fn ensure_collateral_asset(collateral_id: CollateralId);
 	/// Stages the costliest global debt-ceiling lookup after stablecoin creation.
-	/// The runtime owns external inputs, such as PSM debt rows; local-only ceilings need no setup.
+	/// The runtime owns external inputs, such as debt from other issuers of the stablecoin;
+	/// local-only ceilings need no setup.
 	fn stage_debt_ceiling(stable_id: StableId);
 	/// Funds native asset-account and storage deposits; `Config` exposes no native currency.
 	fn fund_native(who: &AccountId);
@@ -155,10 +158,10 @@ pub mod pallet {
 	pub type CollateralCreditOf<T> =
 		fungibles::Credit<AccountIdFor<T>, <T as Config>::CollateralAssets>;
 
-	/// List identifier for one of this pallet's per-market lists.
+	/// List identifier for one of this pallet's per-branch lists.
 	pub type VaultListIdOf<T> = VaultListId<CollateralIdOf<T>, StableIdOf<T>>;
 
-	/// Market record used by the runtime.
+	/// Branch record used by the runtime.
 	pub type BranchOf<T> =
 		crate::types::Branch<AccountIdFor<T>, BalanceOf<T>, <T as Config>::BranchConsideration>;
 
@@ -166,6 +169,7 @@ pub mod pallet {
 	pub type VaultRecordOf<T> =
 		crate::types::VaultRecord<BalanceOf<T>, <T as Config>::VaultConsideration>;
 
+	/// The in-code storage version.
 	pub const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
 	#[pallet::pallet]
@@ -206,7 +210,7 @@ pub mod pallet {
 		/// This account receives stable-asset fees that remain after [`Config::YieldHook`]. Fee
 		/// resolution must be exact because each fee credit backs a recorded liability.
 		///
-		/// The account must fund its asset-account deposit before registration of the first market
+		/// The account must fund its asset-account deposit before registration of the first branch
 		/// for that stablecoin.
 		type FeeAccount: Convert<StableIdOf<Self>, Self::AccountId>;
 
@@ -215,14 +219,14 @@ pub mod pallet {
 		/// The pallet resolves the remaining credit to [`Config::FeeAccount`].
 		type YieldHook: OnBranchYield<CollateralIdOf<Self>, StableCreditOf<Self>>;
 
-		/// Notifies other pallets when a market is created or removed.
+		/// Notifies other pallets when a branch is created or removed.
 		type OnBranchLifecycle: OnBranchLifecycle<
 			CollateralIdOf<Self>,
 			StableIdOf<Self>,
 			Self::AccountId,
 		>;
 
-		/// Sizes and settles liquidation offsets against the Stability Pool:
+		/// Sizes and settles liquidation offsets against an external provider of stable capital:
 		/// limit-aware capacity reads plus one exact settlement call.
 		type StabilityPool: StabilityPoolOffset<
 			CollateralIdOf<Self>,
@@ -235,9 +239,9 @@ pub mod pallet {
 		/// Provides UNIX time in milliseconds.
 		type TimeProvider: Time<Moment = Millis>;
 
-		/// Origin allowed to create a market for a stable asset.
+		/// Origin allowed to create a branch for a stable asset.
 		///
-		/// `Some(account)` charges that account the market deposit. `None` creates the market
+		/// `Some(account)` charges that account the branch deposit. `None` creates the branch
 		/// without a deposit.
 		type CreateOrigin: EnsureOriginWithArg<
 			Self::RuntimeOrigin,
@@ -245,7 +249,7 @@ pub mod pallet {
 			Success = Option<Self::AccountId>,
 		>;
 
-		/// Refundable deposit charged for creating a market.
+		/// Refundable deposit charged for creating a branch.
 		type BranchConsideration: Consideration<Self::AccountId, Footprint>;
 
 		/// Refundable deposit charged for opening a vault.
@@ -254,11 +258,11 @@ pub mod pallet {
 			AssetFootprint<CollateralIdOf<Self>>,
 		>;
 
-		/// Runtime-owned, scale-independent limits for every market.
+		/// Runtime-owned, scale-independent limits for every branch.
 		#[pallet::constant]
 		type BranchConfigBounds: Get<BranchConfigBounds>;
 
-		/// Origin allowed to override market administrators.
+		/// Origin allowed to override branch administrators.
 		type ForceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
 		/// Effective stablecoin-wide limit for new borrowing, in stable units.
@@ -271,7 +275,7 @@ pub mod pallet {
 			Priority = FixedU128,
 		>;
 
-		/// Pallet ID used to derive each market's redistribution account.
+		/// Pallet ID used to derive each branch's redistribution account.
 		#[pallet::constant]
 		type PalletId: Get<PalletId>;
 
@@ -292,7 +296,7 @@ pub mod pallet {
 	pub enum HoldReason {
 		/// Collateral held for an open vault.
 		VaultCollateral,
-		/// Refundable deposit held while a market exists.
+		/// Refundable deposit held while a branch exists.
 		BranchCreationDeposit,
 		/// Refundable deposit held while a vault exists.
 		VaultCreationDeposit,
@@ -311,9 +315,9 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Authoritative market state keyed by collateral and stable asset.
+	/// Authoritative branch state keyed by collateral and stable asset.
 	///
-	/// Each record contains the market state, configuration, administrators, and creation deposit.
+	/// Each record contains the branch state, configuration, administrators, and creation deposit.
 	#[pallet::storage]
 	pub type Branches<T: Config> = StorageDoubleMap<
 		_,
@@ -325,8 +329,8 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Number of live markets issuing each stablecoin, keyed by the stablecoin's name in the
-	/// collateral namespace. The entry is removed with its last market.
+	/// Number of live branches issuing each stablecoin, keyed by the stablecoin's name in the
+	/// collateral namespace. The entry is removed with its last branch.
 	///
 	/// This is the stable half of the role-exclusivity index: registration reads it to reject a
 	/// stablecoin proposed as collateral, a second-key question [`Branches`] cannot answer with a
@@ -336,22 +340,22 @@ pub mod pallet {
 	pub type StablecoinMarkets<T: Config> =
 		StorageMap<_, Blake2_128Concat, CollateralIdOf<T>, u32, OptionQuery>;
 
-	/// Governance debt limit across every market issuing one stable asset.
+	/// Governance debt limit across every branch issuing one stable asset.
 	///
 	/// The limit uses that stablecoin's own units. A zero limit blocks new debt and is not stored.
 	#[pallet::storage]
 	pub type GlobalDebtCeilings<T: Config> =
 		StorageMap<_, Blake2_128Concat, StableIdOf<T>, BalanceOf<T>, ValueQuery>;
 
-	/// Fully accrued debt state across every market issuing one stable asset.
+	/// Fully accrued debt state across every branch issuing one stable asset.
 	///
-	/// Redemptions reads it as the denominator of the redeemed fraction, which
-	/// prices the stablecoin's dynamic fee across all of its collateral markets at once. A zero
+	/// A redemption consumer can read it as the denominator of the redeemed fraction, which
+	/// prices the stablecoin's dynamic fee across all of its collateral branches at once. A zero
 	/// record is not stored.
 	///
 	/// The record combines realized debt with the aggregate projection of
 	/// unminted interest, keeping the fully accrued denominator available in
-	/// O(1) without walking the uncapped market registry.
+	/// O(1) without walking the uncapped branch registry.
 	#[pallet::storage]
 	pub type StablecoinDebt<T: Config> = StorageMap<
 		_,
@@ -484,8 +488,8 @@ pub mod pallet {
 			owner: T::AccountId,
 			/// Account that paid the stable assets.
 			from: T::AccountId,
-			/// Debt repaid.
-			amount: BalanceOf<T>,
+			/// Debt repaid, split into the interest and principal it removed.
+			amount: DebtBreakdown<BalanceOf<T>>,
 		},
 		/// A vault was closed and its collateral was returned.
 		VaultClosed {
@@ -535,7 +539,7 @@ pub mod pallet {
 			/// Rate after the change.
 			new_rate: FixedU128,
 		},
-		/// A market changed mode.
+		/// A branch changed mode.
 		ModeChanged {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
@@ -546,16 +550,18 @@ pub mod pallet {
 			/// Mode after the change.
 			new_mode: BranchMode,
 		},
-		/// A market parameter changed.
+		/// A branch parameter changed.
 		ParameterUpdated {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
+			/// Parameter and the value it replaced.
+			old_value: BranchConfigUpdate<BalanceOf<T>>,
 			/// Parameter and new value.
-			update: BranchConfigUpdate<BalanceOf<T>>,
+			new_value: BranchConfigUpdate<BalanceOf<T>>,
 		},
-		/// A market was created.
+		/// A branch was created.
 		BranchRegistered {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
@@ -566,26 +572,28 @@ pub mod pallet {
 		GlobalDebtCeilingSet {
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
+			/// Stored global debt limit before the change. Zero when none was stored.
+			old_ceiling: BalanceOf<T>,
 			/// New global debt limit.
-			ceiling: BalanceOf<T>,
+			new_ceiling: BalanceOf<T>,
 		},
-		/// An empty market was removed.
+		/// An empty branch was removed.
 		BranchRemoved {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
 		},
-		/// A market's administrators changed.
+		/// A branch's administrators changed.
 		BranchAdminsChanged {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
 			/// Stable asset ID.
 			stable_id: StableIdOf<T>,
-			/// New full administrator.
-			full_admin: T::AccountId,
-			/// New emergency administrator.
-			emergency_admin: T::AccountId,
+			/// Administrators before the change.
+			old_admins: BranchAdmins<T::AccountId>,
+			/// Administrators after the change.
+			new_admins: BranchAdmins<T::AccountId>,
 		},
 		/// A redemption exchanged stable debt for collateral.
 		VaultRedeemed {
@@ -597,8 +605,8 @@ pub mod pallet {
 			owner: T::AccountId,
 			/// Account that received the collateral.
 			recipient: T::AccountId,
-			/// Debt removed from the vault.
-			debt_cancelled: BalanceOf<T>,
+			/// Debt removed from the vault, split into interest and principal.
+			debt_cancelled: DebtBreakdown<BalanceOf<T>>,
 			/// Collateral sent to the recipient.
 			collateral_to_recipient: BalanceOf<T>,
 			/// Vault rate used for the redemption fee.
@@ -645,7 +653,7 @@ pub mod pallet {
 		/// A vault update realized the vault's share of earlier liquidations.
 		///
 		/// [`Event::VaultLiquidated`] reports the amounts a liquidation redistributes across the
-		/// market. This is the part one vault absorbs, which its stake decides.
+		/// branch. This is the part one vault absorbs, which its stake decides.
 		RedistributionApplied {
 			/// Collateral asset ID.
 			collateral_id: CollateralIdOf<T>,
@@ -658,9 +666,9 @@ pub mod pallet {
 			/// Collateral moved from the redistribution account into the vault.
 			collateral: BalanceOf<T>,
 		},
-		/// Aggregate interest accrued since the market's last update was issued as yield.
+		/// Aggregate interest accrued since the branch's last update was issued as yield.
 		///
-		/// Every write to a market issues the interest accrued since the previous one, so this
+		/// Every write to a branch issues the interest accrued since the previous one, so this
 		/// reports each increase of the stablecoin supply from interest.
 		/// [`Event::InterestAccrued`] later adds one vault's share of issued interest to its
 		/// debt row, and mints nothing.
@@ -678,7 +686,7 @@ pub mod pallet {
 	pub enum Error<T> {
 		/// The requested vault does not exist.
 		VaultNotFound,
-		/// The owner already has a vault in this market.
+		/// The owner already has a vault in this branch.
 		VaultAlreadyExists,
 		/// The vault is not in a valid state for this operation.
 		InvalidVaultStatus,
@@ -694,41 +702,39 @@ pub mod pallet {
 		StableCollateralCollision,
 		/// This collateral and stable asset pair is already registered.
 		BranchAlreadyRegistered,
-		/// The fee account cannot be made able to receive the stable asset.
-		FeeAccountNotReceivable,
-		/// The market creator cannot pay one minimum balance of the collateral asset.
+		/// The branch creator cannot pay one minimum balance of the collateral asset.
 		CustodySeedUnavailable,
 		/// A fee credit backing a recorded liability failed to resolve.
 		FeeResolutionFailed,
-		/// The resulting debt is below the market minimum.
+		/// The resulting debt is below the branch minimum.
 		DebtBelowMinimum,
-		/// The repayment would leave debt below the market minimum.
+		/// The repayment would leave debt below the branch minimum.
 		///
 		/// Repay less or repay the full debt.
 		DebtWouldBecomeDust,
-		/// The borrow would exceed the market debt limit.
+		/// The borrow would exceed the branch debt limit.
 		DebtCeilingExceeded,
 		/// The borrow would exceed the global debt limit for this stablecoin.
 		GlobalDebtCeilingExceeded,
-		/// The caller does not have the required market role.
+		/// The caller does not have the required branch role.
 		NotBranchAdmin,
 		/// The branch still has vaults, collateral, or debt.
 		BranchNotEmpty,
-		/// The market configuration contradicts itself.
+		/// The branch configuration contradicts itself.
 		InvalidBranchConfig(crate::types::BranchConfigDefect),
-		/// The market configuration is outside the runtime's limits.
+		/// The branch configuration is outside the runtime's limits.
 		ConfigOutsideEnvelope(crate::types::BoundViolation),
-		/// The annual interest rate is outside the market limits.
+		/// The annual interest rate is outside the branch limits.
 		RateOutOfBounds,
 		/// The operation would leave the vault below its required collateral ratio.
 		UnsafeCollateralizationRatio,
 		/// The vault is too well collateralized to enter final recovery.
 		CollateralizationRatioTooHealthy,
-		/// The operation would lower the market collateral ratio in safety mode.
+		/// The operation would lower the branch collateral ratio in safety mode.
 		SafetyModeTcrWorsening,
-		/// The operation would move the market into safety mode.
+		/// The operation would move the branch into safety mode.
 		WouldEnterSafetyMode,
-		/// The market is frozen.
+		/// The branch is frozen.
 		BranchFrozen,
 		/// The oracle has no valid price for this collateral asset.
 		OraclePriceNotAvailable,
@@ -743,7 +749,7 @@ pub mod pallet {
 		RateIndexInvariantBroken,
 		/// The final recovery queue does not match the vault records. This is storage corruption.
 		FinalRecoveryInvariantBroken,
-		/// The vault is not the market's last eligible vault.
+		/// The vault is not the branch's last eligible vault.
 		NotLastEligibleVault,
 		/// The vault does not have enough collateral.
 		InsufficientCollateral,
@@ -775,12 +781,41 @@ pub mod pallet {
 		NoDebt,
 		/// The vault is below the ratio required to leave final recovery.
 		CollateralizationRatioTooLow,
-		/// Nomination requires non-zero debt below the market minimum.
+		/// Nomination requires non-zero debt below the branch minimum.
 		DebtNotDust,
 	}
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		fn integrity_test() {
+			let bounds = T::BranchConfigBounds::get();
+			let par = FixedU128::from_u32(1);
+			// A liquidation floor under par admits branches whose vaults may owe more than their
+			// collateral is worth before anyone can liquidate them.
+			assert!(
+				bounds.min_minimum_collateralization_ratio >= par,
+				"`BranchConfigBounds::min_minimum_collateralization_ratio` must be at least 100%"
+			);
+			// Every branch keeps its liquidation ratio at or below its borrow and safety ratios,
+			// so a liquidation floor above either floor silently replaces it.
+			assert!(
+				bounds.min_minimum_collateralization_ratio <=
+					bounds.min_initial_collateralization_ratio,
+				"`BranchConfigBounds` liquidation floor exceeds the borrow floor"
+			);
+			assert!(
+				bounds.min_minimum_collateralization_ratio <=
+					bounds.min_safety_collateralization_ratio,
+				"`BranchConfigBounds` liquidation floor exceeds the safety floor"
+			);
+			// A zero cap forces every branch to lend interest-free, which is a misconfiguration
+			// rather than a policy: borrowing would pay no yield and no upfront fee.
+			assert!(
+				!bounds.max_borrow_rate.is_zero(),
+				"`BranchConfigBounds::max_borrow_rate` must be non-zero"
+			);
+		}
+
 		#[cfg(feature = "try-runtime")]
 		fn try_state(_: BlockNumberFor<T>) -> Result<(), frame::try_runtime::TryRuntimeError> {
 			crate::try_state::do_try_state::<T>()
@@ -803,10 +838,10 @@ pub mod pallet {
 			Ok(collateralization_ratio(&draft.vault.position(), price)?)
 		}
 
-		/// Returns the market's total collateral ratio after pending interest.
+		/// Returns the branch's total collateral ratio after pending interest.
 		///
-		/// Missing markets, oracle failure, and arithmetic failure are reported
-		/// explicitly. A debt-free market reports [`CollateralRatio::DebtFree`].
+		/// Missing branches, oracle failure, and arithmetic failure are reported
+		/// explicitly. A debt-free branch reports [`CollateralRatio::DebtFree`].
 		pub fn branch_tcr(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -831,7 +866,7 @@ pub mod pallet {
 			Ok((draft.vault, draft.status))
 		}
 
-		/// Returns the market state with aggregate interest accrued to now.
+		/// Returns the branch state with aggregate interest accrued to now.
 		///
 		/// Nothing is persisted and no interest is issued. The carried interest fraction stays
 		/// in the remainder here, while [`Self::branch_tcr`] rounds it up to one debt unit.
@@ -841,6 +876,15 @@ pub mod pallet {
 		) -> Result<BranchState<T::AccountId, BalanceOf<T>>, DispatchError> {
 			let (_, state, _) = Self::accrued_branch_view(&collateral_id, &stable_id)?;
 			Ok(state)
+		}
+
+		/// Returns a stablecoin's fully accrued debt across all of its branches, and the global
+		/// limit new borrowing is checked against.
+		pub fn stablecoin_debt_and_ceiling(
+			stable_id: StableIdOf<T>,
+		) -> (BalanceOf<T>, BalanceOf<T>) {
+			let debt = Self::accrued_stablecoin_debt(&stable_id);
+			(debt, T::GlobalDebtCeiling::convert(stable_id))
 		}
 
 		/// Returns up to `n` owners in redemption order.
@@ -955,8 +999,8 @@ pub mod pallet {
 		///
 		/// Must be signed by the vault owner.
 		///
-		/// The market must not be frozen. The collateral, debt, annual rate, and list hint must
-		/// satisfy the market limits. The collateral is held from the owner, and the stable asset
+		/// The branch must not be frozen. The collateral, debt, annual rate, and list hint must
+		/// satisfy the branch limits. The collateral is held from the owner, and the stable asset
 		/// is minted to the owner. Unused hint-repair steps are refunded after a successful open.
 		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::open_vault(T::VaultLists::repair_budget()))]
@@ -988,8 +1032,11 @@ pub mod pallet {
 		/// Must be signed by the account providing the collateral.
 		///
 		/// Any account may add collateral for a vault owner. The amount must be non-zero. Deposits
-		/// are allowed during final recovery and while the market is frozen, because they need no
+		/// are allowed during final recovery and while the branch is frozen, because they need no
 		/// price and only lower risk.
+		///
+		/// Dormant vaults cannot receive deposits: the owner must first borrow back above the
+		/// branch's minimum debt.
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::deposit_collateral_for())]
 		pub fn deposit_collateral_for(
@@ -1082,7 +1129,7 @@ pub mod pallet {
 		///
 		/// Must be signed by the vault owner.
 		///
-		/// The new rate must be within the market limits. A change during the cooldown may charge
+		/// The new rate must be within the branch limits. A change during the cooldown may charge
 		/// an upfront fee. The hint gives the new place in the rate list.
 		#[pallet::call_index(5)]
 		#[pallet::weight(T::WeightInfo::change_rate()
@@ -1140,7 +1187,7 @@ pub mod pallet {
 		///
 		/// May be called by any signed account.
 		///
-		/// The vault must be the market's last eligible vault and must be below the minimum
+		/// The vault must be the branch's last eligible vault and must be below the minimum
 		/// collateral ratio. Pays the liquidation reward unless the cooldown is active.
 		#[pallet::call_index(8)]
 		#[pallet::weight(T::WeightInfo::enter_final_recovery())]
@@ -1160,8 +1207,8 @@ pub mod pallet {
 		///
 		/// May be called by any signed account.
 		///
-		/// The vault must meet the market's minimum collateral ratio. It returns to the rate list
-		/// if its debt is at least the market minimum.
+		/// The vault must meet the branch's minimum collateral ratio. It returns to the rate list
+		/// if its debt is at least the branch minimum.
 		#[pallet::call_index(9)]
 		#[pallet::weight(T::WeightInfo::exit_final_recovery())]
 		pub fn exit_final_recovery(
@@ -1175,7 +1222,7 @@ pub mod pallet {
 			Self::do_exit_final_recovery(owner, collateral_id, stable_id, hint)
 		}
 
-		/// Creates a market for a collateral and stable asset pair.
+		/// Creates a branch for a collateral and stable asset pair.
 		///
 		/// ## Dispatch Origin
 		///
@@ -1190,7 +1237,7 @@ pub mod pallet {
 		/// rolls the complete registration back.
 		///
 		/// Registration also charges one minimum balance of the collateral asset, which the
-		/// market's redistribution account carries until removal refunds it. A deposit-paying
+		/// branch's redistribution account carries until removal refunds it. A deposit-paying
 		/// creator funds it. A privileged creation charges the named full administrator: that
 		/// account never signed, so an unfunded admin fails with [`Error::CustodySeedUnavailable`].
 		#[pallet::call_index(10)]
@@ -1215,11 +1262,11 @@ pub mod pallet {
 			)
 		}
 
-		/// Changes one market parameter.
+		/// Changes one branch parameter.
 		///
 		/// ## Dispatch Origin
 		///
-		/// Requires [`Config::ForceOrigin`] or a market administrator with the required role.
+		/// Requires [`Config::ForceOrigin`] or a branch administrator with the required role.
 		///
 		/// Emergency administrators may only reduce risk. The full configuration must remain
 		/// structurally valid and within [`Config::BranchConfigBounds`] for every origin.
@@ -1240,12 +1287,12 @@ pub mod pallet {
 			Self::do_set_param(collateral_id, stable_id, update, level)
 		}
 
-		/// Freezes or unfreezes a market for an administrative reason.
+		/// Freezes or unfreezes a branch for an administrative reason.
 		///
 		/// ## Dispatch Origin
 		///
-		/// Freezing requires [`Config::ForceOrigin`] or a market administrator. Unfreezing requires
-		/// [`Config::ForceOrigin`] or the market's full administrator.
+		/// Freezing requires [`Config::ForceOrigin`] or a branch administrator. Unfreezing requires
+		/// [`Config::ForceOrigin`] or the branch's full administrator.
 		///
 		/// The call does nothing if the requested administrative state is already satisfied. Oracle
 		/// freezes are managed by [`Pallet::refresh_branch`].
@@ -1263,15 +1310,15 @@ pub mod pallet {
 			Self::do_set_governance_frozen(&collateral_id, &stable_id, frozen)
 		}
 
-		/// Brings a market up to date.
+		/// Brings a branch up to date.
 		///
 		/// ## Dispatch Origin
 		///
 		/// May be called by any signed account.
 		///
-		/// The market is frozen when its price is unavailable and unfrozen when the price returns.
-		/// Administrative freezes are unchanged. An unfrozen market applies its pending aggregate
-		/// interest and issues it as yield; a frozen market accrues nothing.
+		/// The branch is frozen when its price is unavailable and unfrozen when the price returns.
+		/// Administrative freezes are unchanged. An unfrozen branch applies its pending aggregate
+		/// interest and issues it as yield; a frozen branch accrues nothing.
 		#[pallet::call_index(13)]
 		#[pallet::weight(T::WeightInfo::refresh_branch())]
 		pub fn refresh_branch(
@@ -1283,15 +1330,15 @@ pub mod pallet {
 			Self::do_refresh_branch(&collateral_id, &stable_id)
 		}
 
-		/// Removes an empty market.
+		/// Removes an empty branch.
 		///
 		/// ## Dispatch Origin
 		///
-		/// Requires [`Config::ForceOrigin`] or the market's full administrator.
+		/// Requires [`Config::ForceOrigin`] or the branch's full administrator.
 		///
-		/// The market must have no vaults, collateral, or debt. Its creation deposit is refunded,
+		/// The branch must have no vaults, collateral, or debt. Its creation deposit is refunded,
 		/// and the redistribution custody seed returns to the original depositor, or to the current
-		/// full administrator of a privileged market. Rotating that admin therefore redirects the
+		/// full administrator of a privileged branch. Rotating that admin therefore redirects the
 		/// seed.
 		#[pallet::call_index(14)]
 		#[pallet::weight(T::WeightInfo::remove_branch())]
@@ -1309,11 +1356,11 @@ pub mod pallet {
 			Self::do_remove_branch(collateral_id, stable_id)
 		}
 
-		/// Replaces a market's administrators.
+		/// Replaces a branch's administrators.
 		///
 		/// ## Dispatch Origin
 		///
-		/// Requires [`Config::ForceOrigin`] or the market's full administrator.
+		/// Requires [`Config::ForceOrigin`] or the branch's full administrator.
 		#[pallet::call_index(15)]
 		#[pallet::weight(T::WeightInfo::set_branch_admins())]
 		pub fn set_branch_admins(
@@ -1338,7 +1385,7 @@ pub mod pallet {
 		///
 		/// May be called by any signed account.
 		///
-		/// The vault's debt after pending updates must meet the market minimum. A successful call
+		/// The vault's debt after pending updates must meet the branch minimum. A successful call
 		/// pays no transaction fee.
 		#[pallet::call_index(16)]
 		#[pallet::weight(T::WeightInfo::activate_dormant())]
@@ -1359,11 +1406,13 @@ pub mod pallet {
 		/// ## Dispatch Origin
 		///
 		/// Requires [`Config::CreateOrigin`] for `stable_id`: the authority that can open
-		/// markets for a stablecoin also bounds its total issuance. The depositor the origin
+		/// branches for a stablecoin also bounds its total issuance. The depositor the origin
 		/// resolves has no meaning here and is discarded.
 		///
 		/// The limit is measured in the stable asset's units and spans all of its collateral
-		/// markets. A limit of zero blocks new debt.
+		/// branches. A limit of zero blocks new debt. A non-zero limit needs an existing stable
+		/// asset, which need not have a branch yet. A zero limit is accepted for any key, so the
+		/// record of a destroyed asset can still be cleared.
 		#[pallet::call_index(17)]
 		#[pallet::weight(T::WeightInfo::set_global_debt_ceiling())]
 		pub fn set_global_debt_ceiling(
@@ -1372,8 +1421,7 @@ pub mod pallet {
 			ceiling: BalanceOf<T>,
 		) -> DispatchResult {
 			T::CreateOrigin::ensure_origin(origin, &stable_id)?;
-			Self::do_set_global_debt_ceiling(stable_id, ceiling);
-			Ok(())
+			Self::do_set_global_debt_ceiling(stable_id, ceiling)
 		}
 
 		/// Liquidates an unsafe vault.
@@ -1382,12 +1430,12 @@ pub mod pallet {
 		///
 		/// Must be signed by the keeper executing the liquidation.
 		///
-		/// The vault must be below the market's minimum collateralization ratio and must not be
-		/// the market's last eligible vault. That vault enters final recovery through
+		/// The vault must be below the branch's minimum collateralization ratio and must not be
+		/// the branch's last eligible vault. That vault enters final recovery through
 		/// [`Call::enter_final_recovery`] instead.
 		///
-		/// Active Stability Pool capital is used first, followed by the
-		/// keeper's optional direct contribution, pending pool capital, and
+		/// Active capital from [`Config::StabilityPool`] is used first, followed by the
+		/// keeper's optional direct contribution, that provider's pending capital, and
 		/// finally redistribution.
 		///
 		/// The caller's collateral legs — compensation and the JIT share — are paid only when the
@@ -1401,7 +1449,7 @@ pub mod pallet {
 		///
 		/// - `jit.max_stable`: Maximum stable assets the keeper allows the call to burn for a
 		///   direct contribution. Zero disables the contribution; a non-zero allowance below the
-		///   market's minimum JIT contribution skips JIT without blocking liquidation.
+		///   branch's minimum JIT contribution skips JIT without blocking liquidation.
 		/// - `jit.min_collateral_out`: Minimum collateral allocated to an executed JIT slice,
 		///   excluding the keeper reward. This absolute floor is not scaled down for a partial JIT
 		///   execution, so it should reflect the smallest execution the keeper would accept. A
@@ -1421,14 +1469,14 @@ pub mod pallet {
 			Self::do_liquidate(keeper, collateral_id, stable_id, owner, jit)
 		}
 
-		/// Nominates a dormant vault's dust as the market's redemption target.
+		/// Nominates a dormant vault's dust as the branch's redemption target.
 		///
 		/// ## Dispatch Origin
 		///
 		/// May be called by any signed account.
 		///
 		/// After pending redistribution and interest, the vault must have non-zero debt below
-		/// the market minimum and a collateral ratio of at least 100%. The market must be
+		/// the branch minimum and a collateral ratio of at least 100%. The branch must be
 		/// unfrozen with a live price. The single Dormant slot must be empty or already held by
 		/// this vault; final recovery retains priority.
 		#[pallet::call_index(20)]
