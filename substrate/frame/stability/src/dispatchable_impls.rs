@@ -222,10 +222,29 @@ impl<'a, T: Config> DepositOp<'a, T> {
 	}
 }
 
-/// Frozen-market check of [`Pallet::open_op`].
+/// Operating mode of a branch that admits value movement.
+///
+/// [`Pallet::ensure_not_frozen`] returns it, so code past that check matches only the modes it can
+/// meet.
+#[derive(Clone, Copy)]
+pub(crate) enum UnfrozenMode {
+	Normal,
+	Safety,
+}
+
+impl From<UnfrozenMode> for BranchMode {
+	fn from(mode: UnfrozenMode) -> Self {
+		match mode {
+			UnfrozenMode::Normal => Self::Normal,
+			UnfrozenMode::Safety => Self::Safety,
+		}
+	}
+}
+
+/// Frozen-branch check of [`Pallet::open_op`].
 #[derive(Clone, Copy)]
 enum FrozenCheck {
-	/// Rejects a frozen market before the row loads.
+	/// Rejects a frozen branch before the row loads.
 	Reject,
 	/// Settles the row in any mode.
 	Skip,
@@ -237,10 +256,6 @@ pub(crate) struct CohortRoll<Balance> {
 	deadline: Millis,
 	/// Capital moved from the pending total to the active total.
 	survived: Balance,
-	/// Unclamped cohort value recorded in the checkpoint.
-	///
-	/// This value is not less than the sum of the downward-rounded member claims.
-	activated: Balance,
 	members: u32,
 }
 
@@ -248,7 +263,7 @@ pub(crate) struct CohortRoll<Balance> {
 pub(crate) type CohortRolls<Balance> = BoundedVec<CohortRoll<Balance>, MaxOpenCohorts>;
 
 impl<T: Config> Pallet<T> {
-	/// Returns the registered pool of a market.
+	/// Returns the registered pool of a branch.
 	pub(crate) fn load_pool(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
@@ -268,23 +283,25 @@ impl<T: Config> Pallet<T> {
 		let sf_int = pool.config.precision.scale_factor();
 		let state = &mut pool.state;
 		let mut rolls = CohortRolls::default();
+		// Pending offsets keep every reserve funded, and try-state checks the same property.
+		if !state.cohorts_covered(&state.pending_coords, sf_int, state.total_pending_deposits) {
+			defensive!("open cohort reserves exceed the pending total");
+			return Err(DispatchError::Corruption);
+		}
 		// Deadlines are ordered, so the due cohorts are a prefix of the open set.
 		while let Some(cohort) = state.open_cohorts.first() {
 			if cohort.deadline > now {
 				break;
 			}
-			// The revaluation ceilings can overstate the aggregate by a sliver; the clamp keeps
-			// the moved capital inside what the pending total actually tracks. The roll keeps
-			// the unclamped resolution for the checkpoint: it stays at or above the floored
-			// member claims even in the corner where the clamp bites.
-			let resolved = math::compound_ceil::<BalanceOf<T>>(
+			// Pending offsets keep the sum of these reserves inside the pending total, so
+			// moving one cohort leaves the other cohort's claims fully funded.
+			let survived = math::compound_ceil::<BalanceOf<T>>(
 				cohort.amount,
 				&cohort.coords,
 				&state.pending_coords,
 				sf_int,
 			);
 			let cohort = state.open_cohorts.remove(0);
-			let survived = resolved.min(state.total_pending_deposits);
 			state.total_pending_deposits.ensure_sub_assign(survived)?;
 			state.total_active_deposits.ensure_add_assign(survived)?;
 			rolls
@@ -292,7 +309,6 @@ impl<T: Config> Pallet<T> {
 					id: cohort.id,
 					deadline: cohort.deadline,
 					survived,
-					activated: resolved,
 					members: cohort.members,
 				})
 				.map_err(|_| DispatchError::Corruption)
@@ -339,7 +355,7 @@ impl<T: Config> Pallet<T> {
 					CohortCheckpoint {
 						pending_end,
 						active_start,
-						activated: roll.activated,
+						activated: roll.survived,
 						members: roll.members,
 					},
 				);
@@ -386,8 +402,12 @@ impl<T: Config> Pallet<T> {
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
 		// The settlement runs before the row loads: settling the head re-enters this pallet
 		// through the vault's yield hook, and a row loaded earlier would commit over that yield.
-		let (result, change) =
-			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
+		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
+			&collateral_id,
+			payment,
+			amount,
+			&pool_account,
+		)?;
 		let (queue_empty, collateral_out) = match result {
 			RecoveryOffsetResult::NoTarget => {
 				debug_assert_eq!(change.peek(), amount);
@@ -414,7 +434,7 @@ impl<T: Config> Pallet<T> {
 		let now = T::TimeProvider::now();
 		let pool = Self::load_pool(&collateral_id, &stable_id)?;
 		let mut op = DepositOp::<T>::load_or_fresh(&collateral_id, &stable_id, &who, pool)?;
-		op.refresh(BranchSnapshot { mode, now })?;
+		op.refresh(BranchSnapshot { mode: mode.into(), now })?;
 		op.credit_recovery_collateral(collateral_out)?;
 		// The settlement can only spend value the credit carried, so the rest is still to queue.
 		let pending_amount = change.peek();
@@ -486,7 +506,7 @@ impl<T: Config> Pallet<T> {
 		// Matured capital must stand in the active total before the offset is sized against it.
 		// The activation is stored as a transition of its own, because the settlement below
 		// re-enters this pallet through the vault's yield hook and reads the stored row.
-		let branch = BranchSnapshot { mode, now: T::TimeProvider::now() };
+		let branch = BranchSnapshot { mode: mode.into(), now: T::TimeProvider::now() };
 		if Self::advance_cohorts(&collateral_id, &stable_id, &mut pool, branch)? {
 			Pools::<T>::insert(&collateral_id, &stable_id, &pool);
 		}
@@ -506,8 +526,16 @@ impl<T: Config> Pallet<T> {
 			Preservation::Preserve,
 			Fortitude::Polite,
 		)?;
-		let (result, change) =
-			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
+		let max_partial_debt = pool
+			.state
+			.total_active_deposits
+			.saturating_sub(pool.config.minimum_active_pool_balance);
+		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
+			&collateral_id,
+			payment,
+			max_partial_debt,
+			&pool_account,
+		)?;
 		let collateral_out = match result {
 			// The dropped change unwinds with the failing extrinsic.
 			RecoveryOffsetResult::NoTarget | RecoveryOffsetResult::NotOffsettable => {
@@ -520,17 +548,24 @@ impl<T: Config> Pallet<T> {
 		};
 		// The settlement can only spend value the credit carried, so the difference is what it
 		// spent.
-		let debt_cancelled = funded.saturating_sub(change.peek());
+		let debt_cancelled = funded.defensive_saturating_sub(change.peek());
 		ensure!(!debt_cancelled.is_zero(), Error::<T>::NoRecoveryOffsetPerformed);
-		// Put the unspent slice back. This can only fail after a full drain whose head took less
-		// than everything and left a change below the minimum balance. Failing here asks the
-		// caller to size `max_stable_in` from the preview, which is better than stranding the pool
-		// account.
+		// Return unspent credit above the pool's custody float.
 		Self::resolve_into_pool(&stable_id, &pool_account, change)?;
 
 		// The recovery interface already moved the value, so only the accounting remains. It
 		// applies to the stored row, which now carries any yield the settlement routed here.
 		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
+		// Funding the whole pool does not imply depletion: the head can return change. Apply
+		// the floor to the actual burn, rolling back the settlement if it would leave dust.
+		ensure!(
+			math::clamp_offset_debt(
+				debt_cancelled,
+				pool.state.total_active_deposits,
+				pool.config.minimum_active_pool_balance,
+			) == debt_cancelled,
+			Error::<T>::NoRecoveryOffsetPerformed
+		);
 		Self::apply_offset(
 			&collateral_id,
 			&stable_id,
@@ -562,7 +597,7 @@ impl<T: Config> Pallet<T> {
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 		match mode {
-			BranchMode::Normal => {
+			UnfrozenMode::Normal => {
 				return Self::do_withdraw(who.clone(), collateral_id, stable_id, amount, who)
 					.map(|_| Some(T::WeightInfo::request_withdraw()).into())
 					.map_err(|mut error| {
@@ -573,13 +608,12 @@ impl<T: Config> Pallet<T> {
 						error
 					});
 			},
-			BranchMode::Safety => {},
-			BranchMode::Frozen => return Err(Error::<T>::BranchFrozen.into()),
+			UnfrozenMode::Safety => {},
 		}
 		let mut op = DepositOp::<T>::load(&collateral_id, &stable_id, &who, pool)?;
 
 		let now = T::TimeProvider::now();
-		op.refresh(BranchSnapshot { mode, now })?;
+		op.refresh(BranchSnapshot { mode: mode.into(), now })?;
 
 		let executable_at = now.saturating_add(op.pool.config.safety_withdrawal_delay);
 		op.deposit.withdrawal_request = Some(WithdrawalRequest { amount, executable_at });
@@ -609,7 +643,7 @@ impl<T: Config> Pallet<T> {
 
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let now = T::TimeProvider::now();
-		op.refresh(BranchSnapshot { mode, now })?;
+		op.refresh(BranchSnapshot { mode: mode.into(), now })?;
 
 		let take = Self::resolve_withdrawal(mode, now, amount, &mut op.deposit)?;
 		ensure!(
@@ -712,14 +746,55 @@ impl<T: Config> Pallet<T> {
 		reserved: BalanceOf<T>,
 	) -> Option<BalanceOf<T>> {
 		let debt = Self::fund_offset(pool, custody, leg, max_debt, reserved)?;
+		Self::offset_p_update(pool, leg, debt)?;
+		Some(debt)
+	}
+
+	/// Reserves enough pending capital for each cohort's upward-rounded aggregate.
+	///
+	/// With two cohorts, their ceilings can exceed the surviving total by one unit. Only in
+	/// that case, `P` uses a survivor numerator one unit smaller; the actual burn stays unchanged.
+	/// If the old reserves sum to at most the leg total, their new ceilings sum to at most the
+	/// surviving total (leg total minus `debt`) when `P` scales by
+	/// `(surviving total - 1) / leg total`. Quoting and execution use this same precision check.
+	fn offset_p_update(pool: &StabilityPoolOf<T>, leg: Leg, debt: BalanceOf<T>) -> Option<PUpdate> {
 		let state = &pool.state;
-		math::update_p_after_offset(
-			state.coords(leg).p,
-			state.total(leg),
-			debt,
+		let coords = *state.coords(leg);
+		let total = state.total(leg);
+		let update = math::update_p_after_offset(coords.p, total, debt, &pool.config.precision)?;
+		if !leg.holds_cohorts() {
+			return Some(update);
+		}
+		match update {
+			PUpdate::Depleted => return Some(update),
+			PUpdate::Updated { .. } => {},
+		}
+		let sf_int = pool.config.precision.scale_factor();
+		if !state.cohorts_covered(&coords, sf_int, total) {
+			return None;
+		}
+		let covered = |update: &PUpdate| match update {
+			PUpdate::Depleted => false,
+			PUpdate::Updated { new_p, scales_crossed } => {
+				let scale = match coords.scale.checked_add(*scales_crossed) {
+					Some(scale) => scale,
+					None => return false,
+				};
+				let live = Accumulators { p: *new_p, epoch: coords.epoch, scale };
+				state.cohorts_covered(&live, sf_int, total.saturating_sub(debt))
+			},
+		};
+		if covered(&update) {
+			return Some(update);
+		}
+		let conservative_debt = debt.checked_add(&One::one())?;
+		let update = math::update_p_after_offset(
+			coords.p,
+			total,
+			conservative_debt,
 			&pool.config.precision,
 		)?;
-		Some(debt)
+		covered(&update).then_some(update)
 	}
 
 	/// Returns the nonzero debt that `leg` can fund from the pool's `custody`.
@@ -728,8 +803,8 @@ impl<T: Config> Pallet<T> {
 	///
 	/// - The capital available in the leg.
 	/// - The required balance after a partial offset.
-	/// - The reducible pool-account balance, which equals the tracked totals while custody is
-	///   intact. A shortfall rounds the debt down to what custody can pay.
+	/// - The reducible pool-account balance. Donations can add surplus, but the leg's tracked
+	///   capital still caps the debit. A shortfall rounds it down to what custody can pay.
 	///
 	/// `reserved` is debt that another leg will burn from the same account first. This input keeps
 	/// both reservations valid against one custody balance.
@@ -740,11 +815,19 @@ impl<T: Config> Pallet<T> {
 		max_debt: BalanceOf<T>,
 		reserved: BalanceOf<T>,
 	) -> Option<BalanceOf<T>> {
-		let accounting_cap = math::clamp_offset_debt(
-			max_debt,
-			pool.state.total(leg),
-			pool.config.minimum_active_pool_balance,
-		);
+		let mut minimum = pool.config.minimum_active_pool_balance;
+		if leg.holds_cohorts() {
+			// Every nonzero cohort needs at least one unit for its rounded-up reserve.
+			let cohorts: BalanceOf<T> = pool
+				.state
+				.open_cohorts
+				.iter()
+				.filter(|cohort| !cohort.amount.is_zero())
+				.count()
+				.saturated_into();
+			minimum = minimum.max(cohorts);
+		}
+		let accounting_cap = math::clamp_offset_debt(max_debt, pool.state.total(leg), minimum);
 		if accounting_cap.is_zero() {
 			return None;
 		}
@@ -859,12 +942,14 @@ impl<T: Config> Pallet<T> {
 			(None, Some(pending)) => Ok(pending),
 			(Some((active, mut active_collateral)), Some((pending, pending_collateral))) => {
 				let debt = active.debt.ensure_add(pending.debt)?;
-				// Both credits passed the asset check in `record_offset`, so the merge cannot
-				// fail; a refusal still aborts rather than losing a credit.
-				active_collateral.subsume(pending_collateral).map_err(|pending_collateral| {
-					drop(pending_collateral);
-					DispatchError::Corruption
-				})?;
+				// A refusal still aborts rather than losing a credit.
+				active_collateral
+					.subsume(pending_collateral)
+					.map_err(|pending_collateral| {
+						drop(pending_collateral);
+						DispatchError::Corruption
+					})
+					.defensive_proof("both credits passed the asset check in `record_offset`")?;
 				Ok((OffsetReservation { debt }, active_collateral))
 			},
 			(None, None) => {
@@ -920,6 +1005,8 @@ impl<T: Config> Pallet<T> {
 		debt: BalanceOf<T>,
 		collateral: BalanceOf<T>,
 	) -> DispatchResult {
+		let update =
+			Self::offset_p_update(pool, leg, debt).ok_or(Error::<T>::UnsupportedOffsetPrecision)?;
 		let state = &mut pool.state;
 		let coords = *state.coords(leg);
 		let total = state.total(leg);
@@ -932,8 +1019,6 @@ impl<T: Config> Pallet<T> {
 		sums.s_collateral.ensure_add_assign(delta_s)?;
 		let new_unclaimed = state.total_collateral_gains_unclaimed.ensure_add(collateral)?;
 
-		let update = math::update_p_after_offset(coords.p, total, debt, &pool.config.precision)
-			.ok_or(Error::<T>::UnsupportedOffsetPrecision)?;
 		let (new_coords, new_total) = match update {
 			PUpdate::Depleted => (
 				Accumulators { p: FixedU128::one(), epoch: coords.epoch.ensure_add(1)?, scale: 0 },
@@ -965,6 +1050,13 @@ impl<T: Config> Pallet<T> {
 		*state.coords_mut(leg) = new_coords;
 		*state.total_mut(leg) = new_total;
 		state.total_collateral_gains_unclaimed = new_unclaimed;
+		if leg.holds_cohorts() {
+			// All cohort reserves share the live coordinates. Row touches and later joins
+			// therefore cannot accumulate additional ceiling rounding between offsets.
+			for cohort in &mut state.open_cohorts {
+				cohort.revalue(&new_coords, pool.config.precision.scale_factor());
+			}
+		}
 		Ok(())
 	}
 
@@ -984,7 +1076,7 @@ impl<T: Config> Pallet<T> {
 		if credit.peek().is_zero() {
 			return credit;
 		}
-		// A frozen market takes no yield.
+		// A frozen branch takes no yield.
 		if branch.mode.is_frozen() {
 			return credit;
 		}
@@ -1094,7 +1186,7 @@ impl<T: Config> Pallet<T> {
 
 	/// Settles the position of another account against the current pool state.
 	///
-	/// The function moves no value. A frozen market prevents new activation because activation
+	/// The function moves no value. A frozen branch prevents new activation because activation
 	/// changes risk. Settlement of prior losses and gains remains available.
 	pub(crate) fn do_settle_deposit(
 		owner: T::AccountId,
@@ -1118,7 +1210,7 @@ impl<T: Config> Pallet<T> {
 	) -> Result<DepositOp<'a, T>, DispatchError> {
 		let pool = Self::load_pool(collateral_id, stable_id)?;
 		let mode = match frozen {
-			FrozenCheck::Reject => Self::ensure_not_frozen(collateral_id, stable_id)?,
+			FrozenCheck::Reject => Self::ensure_not_frozen(collateral_id, stable_id)?.into(),
 			FrozenCheck::Skip => Self::branch_mode_or_frozen(collateral_id, stable_id),
 		};
 		let mut op = DepositOp::<T>::load(collateral_id, stable_id, owner, pool)?;
@@ -1162,16 +1254,15 @@ impl<T: Config> Pallet<T> {
 	///
 	/// - `Normal` permits up to the active deposit and ignores a prior Safety-mode request.
 	/// - `Safety` requires a request at or after `executable_at` and reduces its authorized amount.
-	/// - `Frozen` rejects the withdrawal.
 	fn resolve_withdrawal(
-		mode: BranchMode,
+		mode: UnfrozenMode,
 		now: Millis,
 		amount: BalanceOf<T>,
 		deposit: &mut DepositOf<T>,
 	) -> Result<BalanceOf<T>, DispatchError> {
 		match mode {
-			BranchMode::Normal => Ok(amount.min(deposit.active_deposit)),
-			BranchMode::Safety => {
+			UnfrozenMode::Normal => Ok(amount.min(deposit.active_deposit)),
+			UnfrozenMode::Safety => {
 				let request = deposit
 					.withdrawal_request
 					.as_mut()
@@ -1184,11 +1275,10 @@ impl<T: Config> Pallet<T> {
 				}
 				Ok(take)
 			},
-			BranchMode::Frozen => Err(Error::<T>::BranchFrozen.into()),
 		}
 	}
 
-	/// Returns the current mode, counting a market whose mode cannot be read as frozen.
+	/// Returns the current mode, counting a branch whose mode cannot be read as frozen.
 	///
 	/// Paths that must not fail on an unavailable mode use this: unknown risk stops activation and
 	/// offsets, as a freeze does.
@@ -1199,17 +1289,19 @@ impl<T: Config> Pallet<T> {
 		T::BranchInterface::branch_mode(collateral_id, stable_id).unwrap_or(BranchMode::Frozen)
 	}
 
-	/// Returns the current mode or rejects a frozen market.
+	/// Returns the current mode or rejects a frozen branch.
 	///
 	/// An unavailable mode also causes rejection. This behavior prevents value movement without
 	/// current market-risk information.
 	pub(crate) fn ensure_not_frozen(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
-	) -> Result<BranchMode, DispatchError> {
-		let mode = T::BranchInterface::branch_mode(collateral_id, stable_id)?;
-		ensure!(mode != BranchMode::Frozen, Error::<T>::BranchFrozen);
-		Ok(mode)
+	) -> Result<UnfrozenMode, DispatchError> {
+		match T::BranchInterface::branch_mode(collateral_id, stable_id)? {
+			BranchMode::Normal => Ok(UnfrozenMode::Normal),
+			BranchMode::Safety => Ok(UnfrozenMode::Safety),
+			BranchMode::Frozen => Err(Error::<T>::BranchFrozen.into()),
+		}
 	}
 
 	/// Settles active principal and gains, then resets the active snapshot.
@@ -1232,7 +1324,7 @@ impl<T: Config> Pallet<T> {
 			deposit.active_deposit,
 			&deposit.snapshot,
 		)?;
-		deposit.active_deposit = realized.compounded;
+		deposit.active_deposit = realized.remaining_principal;
 		deposit.claimable_collateral.ensure_add_assign(realized.collateral_gain)?;
 		deposit.claimable_yield.ensure_add_assign(realized.yield_gain)?;
 		deposit.snapshot = snapshot;
@@ -1294,18 +1386,18 @@ impl<T: Config> Pallet<T> {
 			&pool.config.precision,
 		)?;
 		debug_assert!(phase_one.yield_gain.is_zero());
-		debug_assert!(phase_one.compounded <= checkpoint.activated);
+		debug_assert!(phase_one.remaining_principal <= checkpoint.activated);
 
 		let (phase_two, live) = Self::realize_leg(
 			collateral_id,
 			stable_id,
 			Leg::Active,
 			pool,
-			phase_one.compounded,
+			phase_one.remaining_principal,
 			&checkpoint.active_start,
 		)?;
 		debug_assert!(deposit.snapshot.coords.p == live.coords.p);
-		deposit.active_deposit.ensure_add_assign(phase_two.compounded)?;
+		deposit.active_deposit.ensure_add_assign(phase_two.remaining_principal)?;
 		let gains = phase_one.collateral_gain.ensure_add(phase_two.collateral_gain)?;
 		deposit.claimable_collateral.ensure_add_assign(gains)?;
 		deposit.claimable_yield.ensure_add_assign(phase_two.yield_gain)?;
@@ -1315,7 +1407,7 @@ impl<T: Config> Pallet<T> {
 			collateral_id: collateral_id.clone(),
 			stable_id: stable_id.clone(),
 			depositor: who.clone(),
-			amount: phase_one.compounded,
+			amount: phase_one.remaining_principal,
 		});
 		Ok(())
 	}
@@ -1354,11 +1446,11 @@ impl<T: Config> Pallet<T> {
 
 		let sf_int = pool.config.precision.scale_factor();
 		pool.state.revalued_cohort(pending.cohort, &live, sf_int)?;
-		if realized.compounded.is_zero() {
+		if realized.remaining_principal.is_zero() {
 			pool.state.drop_member(pending.cohort);
 			return Ok(None);
 		}
-		pending.amount = realized.compounded;
+		pending.amount = realized.remaining_principal;
 		pending.snapshot = snapshot;
 		Ok(Some(pending))
 	}
@@ -1413,7 +1505,7 @@ impl<T: Config> Pallet<T> {
 	) -> Result<Realized<BalanceOf<T>>, DispatchError> {
 		let window = Self::window_until(collateral_id, stable_id, leg, snapshot, end)?;
 		let realized = math::realize(amount, snapshot, &end.coords, &window, precision);
-		debug_assert!(realized.compounded <= amount);
+		debug_assert!(realized.remaining_principal <= amount);
 		Ok(realized)
 	}
 
@@ -1462,12 +1554,27 @@ impl<T: Config> Pallet<T> {
 		stable_id: StableIdOf<T>,
 		config: StabilityPoolConfigOf<T>,
 	) -> DispatchResult {
-		let mut pool = Self::load_pool(&collateral_id, &stable_id)?;
-		ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
-		ensure!(config.precision == pool.config.precision, Error::<T>::AccumulatorParamsImmutable);
-		pool.config = config;
-		Pools::<T>::insert(&collateral_id, &stable_id, pool);
-		Self::deposit_event(Event::StabilityPoolConfigUpdated { collateral_id, stable_id });
+		let old = Pools::<T>::try_mutate(
+			&collateral_id,
+			&stable_id,
+			|maybe_pool| -> Result<_, Error<T>> {
+				let pool = maybe_pool.as_mut().ok_or(Error::<T>::PoolNotRegistered)?;
+				ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
+				ensure!(
+					config.precision == pool.config.precision,
+					Error::<T>::AccumulatorParamsImmutable
+				);
+				let old = pool.config.clone();
+				pool.config = config.clone();
+				Ok(old)
+			},
+		)?;
+		Self::deposit_event(Event::StabilityPoolConfigUpdated {
+			collateral_id,
+			stable_id,
+			old,
+			new: config,
+		});
 		Ok(())
 	}
 
@@ -1494,7 +1601,7 @@ impl<T: Config> Pallet<T> {
 		scale: u32,
 	) -> Result<PoolSums, DispatchError> {
 		PoolSumsStore::<T>::get((collateral_id, stable_id, leg, epoch, scale))
-			.ok_or_else(|| Error::<T>::AccumulatorRowMissing.into())
+			.defensive_ok_or(Error::<T>::AccumulatorRowMissing.into())
 	}
 
 	/// Returns the bounded sums window required to settle a snapshot.

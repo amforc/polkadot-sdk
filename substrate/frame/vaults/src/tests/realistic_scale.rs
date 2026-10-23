@@ -1,4 +1,4 @@
-//! Realistic-scale market: 10-decimals collateral (`XBT`, ED 0.01 token)
+//! Realistic-scale branch: 10-decimals collateral (`XBT`, ED 0.01 token)
 //! against a 6-decimals stable (`USDX`, ED $0.01). The rest of the suite runs
 //! unitless with min_balance 1, so it never exercises the ED interactions or
 //! the decimals-offset price convention documented on `ProvidePrice` — this
@@ -9,7 +9,7 @@
 use crate::{
 	mock::*,
 	tests::{percent, vault_events, vault_status, ONE_YEAR_MS},
-	types::BranchConfigUpdate,
+	types::{BranchConfigUpdate, VaultStatus},
 	Error,
 };
 use frame::{
@@ -33,7 +33,7 @@ fn usdx_branch_config() -> BranchConfig<Balance> {
 	BranchConfig { minimum_debt: 200 * USD, ..default_branch_config() }
 }
 
-/// Register the realistic-scale `(XBT, USDX)` market: 10-decimals collateral
+/// Register the realistic-scale `(XBT, USDX)` branch: 10-decimals collateral
 /// against a 6-decimals stable, both with a 0.01 minimum balance.
 ///
 /// The price follows `ProvidePrice`'s unit contract: human $10/token scaled by
@@ -53,8 +53,7 @@ fn register_realistic_market() {
 
 #[test]
 fn fee_account_pays_its_own_asset_account_deposit() {
-	build_and_execute(|| {
-		set_price(TOKEN_X, DEFAULT_PRICE);
+	ExtBuilder::default().price(TOKEN_X, DEFAULT_PRICE).build_and_execute(|| {
 		let deposit = <Assets as AccountTouch<StableId, AccountId>>::deposit_required(USDX);
 		let spendable = |who| {
 			<Balances as FungibleInspect<AccountId>>::reducible_balance(
@@ -80,7 +79,7 @@ fn fee_account_pays_its_own_asset_account_deposit() {
 			creator_spendable -
 				MarketDepositBase::get() -
 				<Balances as FungibleInspect<AccountId>>::minimum_balance(),
-			"the creator pays only the market's own refundable deposit",
+			"the creator pays only the branch's own refundable deposit",
 		);
 		assert_eq!(
 			spendable(FEE_DEST),
@@ -94,9 +93,11 @@ fn fee_account_pays_its_own_asset_account_deposit() {
 // price, exact one-year interest, repay to husk, close.
 #[test]
 fn lifecycle_exact_at_realistic_scale() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
+
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+
 		assert_eq!(stable_balance(USDX, 1), 5_000 * USD, "borrowed amount minted at scale");
 
 		// ceil(5×10^9 · 5% · 7d / 365.25d) = ceil(4_791_238.88) minor units.
@@ -117,6 +118,7 @@ fn lifecycle_exact_at_realistic_scale() {
 		// One year at 5% on 5×10^9 minor units: exactly 250 USDX of interest.
 		advance_time(ONE_YEAR_MS);
 		assert_ok!(poke(9, XBT, USDX, 1));
+
 		assert_eq!(xbt_vault(1).debt.interest, fee + 250 * USD);
 
 		// Fund the interest, repay to a husk, close, and get the collateral back.
@@ -124,20 +126,21 @@ fn lifecycle_exact_at_realistic_scale() {
 		assert_ok!(repay(1, XBT, USDX, 1, Some(10_000 * USD)));
 		assert!(vault_status(XBT, USDX, 1).is_dormant());
 		assert_ok!(close_vault(1, XBT, USDX, None));
+
 		assert_eq!(held(XBT, 1), 0);
 		assert_eq!(collateral_balance(XBT, 1), 100_000_000 * XBT_UNIT, "genesis balance restored");
 	});
 }
 
 // The debt floor has to clear the stablecoin's minimum balance, or the smallest
-// vault the market admits could never be paid what it borrows. The floor is
+// vault the branch admits could never be paid what it borrows. The floor is
 // judged against the coin, not against a number: the same 9_999 that is dust to
 // six-decimal USDX is a fine floor for STABLE, whose minimum balance is one unit.
 #[test]
 fn create_branch_rejects_debt_floor_below_stable_minimum() {
-	build_and_execute(|| {
-		set_price(TOKEN_X, DEFAULT_PRICE);
+	ExtBuilder::default().price(TOKEN_X, DEFAULT_PRICE).build_and_execute(|| {
 		let config = BranchConfig { minimum_debt: USDX_ED - 1, ..usdx_branch_config() };
+
 		assert_noop!(
 			crate::Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
@@ -162,14 +165,15 @@ fn create_branch_rejects_debt_floor_below_stable_minimum() {
 }
 
 // Collateral is held to the same rule, and neither floor can be walked back
-// after creation: the market that admits a vault is the market that has to
+// after creation: the branch that admits a vault is the branch that has to
 // carry it.
 #[test]
 fn vault_floors_below_the_asset_minimum_are_rejected_on_every_write() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		set_price(XBT, FixedU128::from_rational(1u128, 1_000u128));
 		let dust_collateral =
 			BranchConfig { minimum_collateral: XBT_ED - 1, ..usdx_branch_config() };
+
 		assert_noop!(
 			crate::Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
@@ -185,6 +189,7 @@ fn vault_floors_below_the_asset_minimum_are_rejected_on_every_write() {
 		);
 
 		register_realistic_market();
+
 		assert_noop!(
 			crate::Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(ADMIN),
@@ -212,7 +217,7 @@ fn vault_floors_below_the_asset_minimum_are_rejected_on_every_write() {
 // it cannot create a fresh account but lands fine on an existing one.
 #[test]
 fn borrow_below_stable_ed_depends_on_recipient() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 
@@ -227,6 +232,7 @@ fn borrow_below_stable_ed_depends_on_recipient() {
 				Position::endpoints_only(),
 			)
 		};
+
 		assert_eq!(stable_balance(USDX, 999), 0, "recipient is fresh");
 		assert_noop!(borrow_to(999), TokenError::BelowMinimum);
 
@@ -240,7 +246,7 @@ fn borrow_below_stable_ed_depends_on_recipient() {
 // A fee below the stablecoin minimum must reach a fee account with no balance.
 #[test]
 fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		// Start with a zero fee balance to test the sub-minimum credit.
 		SpFeeShare::set(Permill::from_percent(100));
 		register_realistic_market();
@@ -255,6 +261,7 @@ fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
 		let issuance_pre = total_stable(USDX);
 		advance_time(60_000);
 		assert_ok!(poke(9, XBT, USDX, 1));
+
 		let minted_delta = market_state(XBT, USDX).debt.minted_interest - minted_pre;
 		assert_eq!(minted_delta, 476);
 		assert_eq!(stable_balance(USDX, FEE_DEST), 476, "sub-ED credit landed");
@@ -265,17 +272,18 @@ fn sub_ed_fee_residual_lands_on_the_registration_touched_account() {
 // Interest accrual must roll back when the fee account cannot receive its credit.
 #[test]
 fn frozen_stable_fails_fee_resolution_loudly() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		SpFeeShare::set(Permill::zero());
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		advance_time(60_000);
 		assert_ok!(Assets::freeze_asset(RuntimeOrigin::signed(1), USDX));
+
 		assert_noop!(poke(9, XBT, USDX, 1), Error::<Test>::FeeResolutionFailed);
 	});
 }
 
-/// Prices the market so a 1_000 XBT vault is far under water — 10^13 × 10^-5 = 10^8 stable
+/// Prices the branch so a 1_000 XBT vault is far under water — 10^13 × 10^-5 = 10^8 stable
 /// minor units against ~5_000 USDX of debt — and sizes keeper compensation as one flat value:
 /// at this price a value of `v` buys `v × 10^5` collateral minor units, so 500 is half the ED
 /// and 2_000 is twice it.
@@ -288,12 +296,12 @@ fn crash_price_with_flat_keeper_value(value: Balance) {
 }
 
 // A keeper leg below the collateral's ED to a fresh keeper is planned out rather than failing
-// the liquidation: an unsafe vault left in the market is worse than an unpaid keeper, and
+// the liquidation: an unsafe vault left in the branch is worse than an unpaid keeper, and
 // holding an account that can receive collateral is the keeper's own responsibility. The freed
 // reward falls through to the waterfall exactly as a skipped JIT leg does.
 #[test]
 fn liquidation_plans_out_a_sub_ed_keeper_leg() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
@@ -302,7 +310,9 @@ fn liquidation_plans_out_a_sub_ed_keeper_leg() {
 		let custody_before = held(XBT, custody);
 
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+
 		assert_ok!(liquidate(998, XBT, USDX, 1, 0, 0));
+
 		assert!(!crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)), "vault liquidated");
 		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper stayed unpaid");
 		// The vault is far under water, so its whole collateral is seized; with the reward
@@ -315,19 +325,30 @@ fn liquidation_plans_out_a_sub_ed_keeper_leg() {
 // out, the vault still enters recovery, and it keeps the collateral for its settlement.
 #[test]
 fn final_recovery_entry_plans_out_a_sub_ed_keeper_reward() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		crash_price_with_flat_keeper_value(500);
 
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+
+		System::reset_events();
 		assert_ok!(enter_final_recovery(998, XBT, USDX, 1));
+
 		assert!(vault_status(XBT, USDX, 1).is_final_recovery());
 		assert_eq!(collateral_balance(XBT, 998), 0, "the keeper stayed unpaid");
 		assert_eq!(xbt_vault(1).collateral, 1_000 * XBT_UNIT, "the vault kept its collateral");
-		assert!(!vault_events()
-			.iter()
-			.any(|event| matches!(event, Event::FinalRecoveryRewardPaid { .. })));
+		// No `FinalRecoveryRewardPaid`: the reward was planned out.
+		assert_eq!(
+			vault_events(),
+			vec![Event::VaultStatusChanged {
+				collateral_id: XBT,
+				stable_id: USDX,
+				owner: 1,
+				old_status: VaultStatus::Active,
+				new_status: VaultStatus::FinalRecovery,
+			}]
+		);
 	});
 }
 
@@ -337,7 +358,7 @@ fn final_recovery_entry_plans_out_a_sub_ed_keeper_reward() {
 // minor units here, far below the 10^8 ED.
 #[test]
 fn liquidation_drops_a_jit_share_the_keeper_cannot_receive() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
@@ -347,7 +368,9 @@ fn liquidation_drops_a_jit_share_the_keeper_cannot_receive() {
 		let custody_before = held(XBT, custody);
 
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+
 		assert_ok!(liquidate(998, XBT, USDX, 1, 100, 0));
+
 		assert!(!crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 1)), "vault liquidated");
 		assert_eq!(
 			stable_balance(USDX, 998),
@@ -364,7 +387,7 @@ fn liquidation_drops_a_jit_share_the_keeper_cannot_receive() {
 // intake, not each leg alone.
 #[test]
 fn reward_above_ed_carries_a_sub_ed_jit_share() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		assert_ok!(open(2, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
@@ -374,7 +397,9 @@ fn reward_above_ed_carries_a_sub_ed_jit_share() {
 		let custody_before = held(XBT, custody);
 
 		assert_eq!(collateral_balance(XBT, 998), 0, "keeper is fresh");
+
 		assert_ok!(liquidate(998, XBT, USDX, 1, 100, 0));
+
 		assert_eq!(stable_balance(USDX, 998), USD - 100, "the JIT trade executed");
 		let reward = 2 * XBT_ED;
 		let jit_share = collateral_balance(XBT, 998) - reward;
@@ -395,7 +420,7 @@ fn reward_above_ed_carries_a_sub_ed_jit_share() {
 // hides this.
 #[test]
 fn redistribution_custody_holds_issued_collateral() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
 		let custody = Vaults::redistribution_account(&XBT, &USDX);
 		assert_eq!(collateral_balance(XBT, custody), XBT_ED, "registration seeded custody");
@@ -409,6 +434,7 @@ fn redistribution_custody_holds_issued_collateral() {
 
 		// No Stability capital, so the whole seizure lands in custody.
 		assert_ok!(liquidate(9, XBT, USDX, 1, 0, 0));
+
 		let first = held(XBT, custody);
 		assert!(first > 0, "seizure reached custody");
 		assert_eq!(first, market_state(XBT, USDX).pending_redistribution_collateral);
@@ -416,11 +442,13 @@ fn redistribution_custody_holds_issued_collateral() {
 
 		// The seed is a float, not a consumable: the next seizure holds too.
 		assert_ok!(liquidate(9, XBT, USDX, 2, 0, 0));
+
 		assert!(held(XBT, custody) > first, "second seizure added to custody");
 		assert_eq!(collateral_balance(XBT, custody), XBT_ED);
 
 		// Materializing drains the hold and leaves the seed behind.
 		assert_ok!(poke(9, XBT, USDX, 3));
+
 		assert_eq!(held(XBT, custody), 0);
 		assert_eq!(collateral_balance(XBT, custody), XBT_ED);
 	});
@@ -431,7 +459,7 @@ fn redistribution_custody_holds_issued_collateral() {
 // stable account alive at exactly the ED.
 #[test]
 fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 		assert_ok!(open(2, XBT, USDX, 2_000 * XBT_UNIT, 5_000 * USD, percent(5)));
@@ -464,7 +492,7 @@ fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
 // recipient cannot receive (sub-ED to a fresh account) reverts the step; an ED-sized leg passes.
 #[test]
 fn redemption_reverts_on_sub_ed_recipient_leg() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		register_realistic_market();
 		assert_ok!(open(1, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
 
@@ -479,25 +507,27 @@ fn redemption_reverts_on_sub_ed_recipient_leg() {
 	});
 }
 
-// Repaying with `Preservation::Expendable` reaps a payer left below the
-// stable's ED: the sub-ED remainder is burned out of the supply.
 #[test]
-fn repay_dusts_sub_ed_payer_remainder() {
-	build_and_execute(|| {
-		register_realistic_market();
-		assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+fn repay_preserves_exact_supply_at_the_payer_minimum_balance() {
+	for requested in [Some(1_000 * USD), Some(10_000 * USD), None] {
+		for remainder in [0, USDX_ED / 2, USDX_ED] {
+			ExtBuilder::default().build_and_execute(|| {
+				register_realistic_market();
+				assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+				let debt = xbt_vault(3).debt.total();
+				let payment = requested.map_or(debt, |amount| amount.min(debt));
+				mint_stable(USDX, 4, payment + remainder);
 
-		// Top the owner up to debt + a sub-ED remainder of 5_000 minor units.
-		let debt = xbt_vault(3).debt.total();
-		let top_up = debt - 5_000 * USD + 5_000;
-		mint_stable(USDX, 3, top_up);
-		assert_eq!(stable_balance(USDX, 3), debt + 5_000);
-
-		let issuance_pre = total_stable(USDX);
-		assert_ok!(repay(3, XBT, USDX, 3, Some(10_000 * USD)));
-		assert_eq!(stable_balance(USDX, 3), 0, "payer reaped, sub-ED remainder gone");
-		assert_eq!(total_stable(USDX), issuance_pre - debt - 5_000, "remainder burned from supply");
-		// The asset pallet, not the market, burned the dust.
-		record_external_issuance(USDX, -5_000);
-	});
+				if remainder > 0 && remainder < USDX_ED {
+					assert_noop!(repay(4, XBT, USDX, 3, requested), TokenError::FundsUnavailable);
+				} else {
+					let issuance = total_stable(USDX);
+					assert_ok!(repay(4, XBT, USDX, 3, requested));
+					assert_eq!(stable_balance(USDX, 4), remainder);
+					assert_eq!(total_stable(USDX), issuance - payment);
+					assert_eq!(xbt_vault(3).debt.total(), debt - payment);
+				}
+			});
+		}
+	}
 }

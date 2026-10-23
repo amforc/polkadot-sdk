@@ -27,7 +27,7 @@ impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T
 		branch: BranchSnapshot,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
-		// The asset of the credit names the market; an unregistered pair has no pool row, and the
+		// The asset of the credit names the branch; an unregistered pair has no pool row, and the
 		// credit comes back whole.
 		let stable_id = &credit.asset();
 		let Some(pool) = Pools::<T>::get(collateral_id, stable_id) else {
@@ -60,7 +60,7 @@ pub(crate) struct OffsetReservation<Balance> {
 impl<T: Config> Pallet<T> {
 	/// Returns the pool available for an offset.
 	///
-	/// A missing or frozen market returns `None`. This result gives zero capacity and prevents
+	/// A missing or frozen branch returns `None`. This result gives zero capacity and prevents
 	/// settlement.
 	fn offset_pool(
 		collateral_id: &CollateralIdOf<T>,
@@ -110,7 +110,7 @@ impl<T: Config> Pallet<T> {
 	}
 }
 
-/// One market as its offset quotes read it: the pool with due cohorts activated in memory and its
+/// One branch as its offset quotes read it: the pool with due cohorts activated in memory and its
 /// stablecoin custody.
 pub struct OffsetQuote<T: Config> {
 	pool: StabilityPoolOf<T>,
@@ -161,7 +161,7 @@ impl<T: Config>
 		branch: BranchSnapshot,
 		debt: OffsetLegs<BalanceOf<T>>,
 		collateral: OffsetLegs<CollateralCreditOf<T>>,
-	) -> Result<Option<StableCreditOf<T>>, DispatchError> {
+	) -> Result<StableCreditOf<T>, DispatchError> {
 		// A leg that cancels no debt must carry no collateral. Anything else would give the pool
 		// collateral for free and break the link between the two sides.
 		if debt.active.is_zero() {
@@ -170,7 +170,7 @@ impl<T: Config>
 		if debt.pending.is_zero() {
 			ensure!(collateral.pending.peek().is_zero(), crate::Error::<T>::OffsetSettlementFailed);
 			if debt.active.is_zero() {
-				return Ok(None);
+				return Ok(StableCreditOf::<T>::zero(stable_id.clone()));
 			}
 		}
 		let mut pool = Self::offset_pool(collateral_id, stable_id, branch.mode)
@@ -220,7 +220,7 @@ impl<T: Config>
 		let burned =
 			Self::settle_reservation_exact(stable_id, custody.account(), reservation, collateral)?;
 		Pools::<T>::insert(collateral_id, stable_id, pool);
-		Ok(Some(burned))
+		Ok(burned)
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]

@@ -119,28 +119,44 @@ mod tests {
 
 	#[test]
 	fn wrappers_preserve_zero_and_output_precision_rules() {
+		// A zero numerator, rate or denominator.
+
+		// A zero denominator or zero price fails, but `mul_div_rate_floor`
+		// returns zero for a zero value or rate before dividing, and zero times any rate is zero.
 		assert_eq!(mul_div_floor(0u64, 1, 0), None);
 		assert_eq!(mul_div_rate_floor(0u64, FixedU128::one(), 0), Some(FixedU128::zero()));
 		assert_eq!(mul_div_rate_floor(1u64, FixedU128::zero(), 0), Some(FixedU128::zero()));
 		assert_eq!(mul_div_rate_floor(1u64, FixedU128::one(), 0), None);
 		assert_eq!(collateral_for_value_floor(0u64, FixedU128::zero()), None);
 		assert_eq!(collateral_for_value_ceil(0u64, FixedU128::zero()), None);
-		// A fixed-point result may exceed the input Balance's representation.
+		assert_eq!(mul_rate_ceil(0u64, FixedU128::from_inner(u128::MAX)), Some(0));
+
+		// Values at the edge of the input Balance's representation.
+
+		// A fixed-point result may exceed the input Balance's representation,
+		// while a Balance result may not.
 		assert_eq!(
 			mul_div_rate_floor(u64::MAX, FixedU128::one(), 1),
 			Some(FixedU128::from_inner(u128::from(u64::MAX) * FixedU128::DIV)),
 		);
-		assert_eq!(mul_rate_ceil(3u64, FixedU128::from_rational(1, 2)), Some(2));
 		assert_eq!(mul_rate_ceil(u64::MAX, FixedU128::from_u32(2)), None);
-		assert_eq!(mul_rate_ceil(0u64, FixedU128::from_inner(u128::MAX)), Some(0));
+
+		// A product with a fractional part.
+
+		// 3 · 0.5 = 1.5 rounds up.
+		assert_eq!(mul_rate_ceil(3u64, FixedU128::from_rational(1, 2)), Some(2));
 	}
 
 	#[test]
 	fn mul_div_rate_floor_overflow_returns_none() {
-		let got = mul_div_rate_floor(u128::MAX / 2, FixedU128::one(), 1);
+		let overflowing = u128::MAX / 2;
+		let fitting = u128::MAX / (FixedU128::DIV * 2);
+
+		let got = mul_div_rate_floor(overflowing, FixedU128::one(), 1);
+		let safe = mul_div_rate_floor(fitting, FixedU128::one(), 1);
+
+		// The function rejects only values past the overflow limit.
 		assert!(got.is_none());
-		// Confirm that the function does not reject values below the overflow limit.
-		let safe = mul_div_rate_floor(u128::MAX / (FixedU128::DIV * 2), FixedU128::one(), 1);
 		assert!(safe.is_some());
 	}
 
@@ -148,72 +164,80 @@ mod tests {
 	/// would pay out more than came in.
 	#[test]
 	fn mul_div_rate_floor_is_exact_or_rounds_down() {
-		// 100 · 1 / 1_000 = 0.1.
-		assert_eq!(
-			mul_div_rate_floor::<u128>(100, FixedU128::one(), 1_000),
-			Some(FixedU128::from_inner(100_000_000_000_000_000))
-		);
-		// 10_000 · 5% / 100 = 5.
-		assert_eq!(
-			mul_div_rate_floor::<u128>(10_000, FixedU128::from_rational(5u128, 100u128), 100),
-			Some(FixedU128::from_u32(5))
-		);
-		// 1/3 and 2/3 have no exact value. The nearest value to 2/3 ends in 7.
-		assert_eq!(
-			mul_div_rate_floor::<u128>(1, FixedU128::one(), 3),
-			Some(FixedU128::from_inner(333_333_333_333_333_333))
-		);
-		assert_eq!(
-			mul_div_rate_floor::<u128>(2, FixedU128::one(), 3),
-			Some(FixedU128::from_inner(666_666_666_666_666_666))
-		);
+		// (value, rate, denominator, expected).
+		let cases = [
+			// 100 · 1 / 1_000 = 0.1.
+			(100, FixedU128::one(), 1_000, FixedU128::from_inner(100_000_000_000_000_000)),
+			// 10_000 · 5% / 100 = 5.
+			(10_000, FixedU128::from_rational(5u128, 100u128), 100, FixedU128::from_u32(5)),
+			// 1/3 and 2/3 have no exact value. The nearest value to 2/3 ends in 7.
+			(1, FixedU128::one(), 3, FixedU128::from_inner(333_333_333_333_333_333)),
+			(2, FixedU128::one(), 3, FixedU128::from_inner(666_666_666_666_666_666)),
+		];
+		for (value, rate, denominator, expected) in cases {
+			let got = mul_div_rate_floor::<u128>(value, rate, denominator);
+
+			assert_eq!(got, Some(expected), "{value} · {rate:?} / {denominator}");
+		}
 	}
 
 	#[test]
 	fn mul_div_rate_floor_avoids_two_step_overflow() {
-		// The complete formula fits although `value / denominator` does not fit in `FixedU128`.
+		// The complete formula fits although `value / denominator` does not fit in
+		// `FixedU128`.
 		let rate = FixedU128::from_inner(1);
+
 		let got = mul_div_rate_floor(u128::MAX / 4, rate, 1);
+
 		assert_eq!(got, Some(FixedU128::from_inner(u128::MAX / 4)));
 	}
 
 	#[test]
 	fn collateral_for_value_floors() {
-		// 100 stablecoin at price 10 → 10 collateral.
-		let price = FixedU128::from_rational(10, 1);
-		assert_eq!(collateral_for_value_floor::<u128>(100, price), Some(10));
-		// 105 stablecoin at price 10 → floor(10.5) = 10.
-		assert_eq!(collateral_for_value_floor::<u128>(105, price), Some(10));
-		// Sub-1.0 price scales up.
-		assert_eq!(
-			collateral_for_value_floor::<u128>(100, FixedU128::from_rational(1, 2)),
-			Some(200)
-		);
-		assert_eq!(collateral_for_value_floor::<u128>(0, FixedU128::one()), Some(0));
+		// (value, price, expected).
+		let cases = [
+			// 100 stablecoin at price 10 → 10 collateral.
+			(100, FixedU128::from_rational(10, 1), 10),
+			// 105 stablecoin at price 10 → floor(10.5) = 10.
+			(105, FixedU128::from_rational(10, 1), 10),
+			// Sub-1.0 price scales up.
+			(100, FixedU128::from_rational(1, 2), 200),
+			(0, FixedU128::one(), 0),
+		];
+		for (value, price, expected) in cases {
+			let collateral = collateral_for_value_floor::<u128>(value, price);
+
+			assert_eq!(collateral, Some(expected), "value = {value}, price = {price:?}");
+		}
 	}
 
 	#[test]
 	fn collateral_for_value_ceils() {
-		// 100 stablecoin at price 10 → exactly 10 collateral.
-		let price = FixedU128::from_rational(10, 1);
-		assert_eq!(collateral_for_value_ceil::<u128>(100, price), Some(10));
-		// 105 stablecoin at price 10 → ceil(10.5) = 11 (the floor variant gives 10).
-		assert_eq!(collateral_for_value_ceil::<u128>(105, price), Some(11));
-		// Sub-1.0 price scales up: 100 / 0.9 = 111.1… → 112.
-		assert_eq!(
-			collateral_for_value_ceil::<u128>(100, FixedU128::from_rational(9, 10)),
-			Some(112)
-		);
-		assert_eq!(collateral_for_value_ceil::<u128>(0, FixedU128::one()), Some(0));
+		// (value, price, expected).
+		let cases = [
+			// 100 stablecoin at price 10 → exactly 10 collateral.
+			(100, FixedU128::from_rational(10, 1), 10),
+			// 105 stablecoin at price 10 → ceil(10.5) = 11 (the floor variant gives 10).
+			(105, FixedU128::from_rational(10, 1), 11),
+			// Sub-1.0 price scales up: 100 / 0.9 = 111.1… → 112.
+			(100, FixedU128::from_rational(9, 10), 112),
+			(0, FixedU128::one(), 0),
+		];
+		for (value, price, expected) in cases {
+			let collateral = collateral_for_value_ceil::<u128>(value, price);
+
+			assert_eq!(collateral, Some(expected), "value = {value}, price = {price:?}");
+		}
 	}
 
 	#[test]
 	fn collateral_for_value_fails_loudly() {
+		let half = FixedU128::from_rational(1, 2);
+
 		// A zero price cannot size anything, in either rounding direction.
 		assert_eq!(collateral_for_value_floor::<u128>(100, FixedU128::zero()), None);
 		assert_eq!(collateral_for_value_ceil::<u128>(100, FixedU128::zero()), None);
 		// A sub-1.0 price doubles the value past u128::MAX.
-		let half = FixedU128::from_rational(1, 2);
 		assert_eq!(collateral_for_value_floor::<u128>(u128::MAX, half), None);
 		// The result fits u128 but not the caller's narrower Balance.
 		assert_eq!(collateral_for_value_floor::<u64>(u64::MAX, half), None);

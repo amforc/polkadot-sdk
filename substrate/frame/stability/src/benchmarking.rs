@@ -218,7 +218,7 @@ impl<T: Config> Market<T> {
 }
 
 impl<T: BenchmarkConfig> Market<T> {
-	/// Registers the benchmark market and gives its pool a non-zero entry delay.
+	/// Registers the benchmark branch and gives its pool a non-zero entry delay.
 	fn register() -> Result<Self, BenchmarkError> {
 		let (collateral_id, stable_id) = Seeder::<T>::register_market()?;
 		Pools::<T>::try_mutate(&collateral_id, &stable_id, |pool| {
@@ -280,7 +280,7 @@ impl<T: BenchmarkConfig> Market<T> {
 			OffsetLegs { active, pending },
 			collateral,
 		)?;
-		assert_eq!(burned.map(|credit| credit.peek()), Some(active.saturating_add(pending)));
+		assert_eq!(burned.peek(), active.saturating_add(pending));
 		Ok(())
 	}
 
@@ -511,7 +511,7 @@ mod benchmarks {
 	fn deposit() -> Result<(), BenchmarkError> {
 		let seed = stage_refresh::<T>(false, Principal::None)?;
 		let market = &seed.market;
-		// Staging the head prices the market last, so it also carries the clock to the cohorts.
+		// Staging the head prices the branch last, so it also carries the clock to the cohorts.
 		let elapsed = seed.due.saturating_sub(T::TimeProvider::now()).max(RECOVERY_ACCRUAL_MS);
 		let head = Seeder::<T>::stage_recovery_head(elapsed)?;
 		assert!(T::TimeProvider::now() >= seed.due);
@@ -855,7 +855,7 @@ mod benchmarks {
 		Ok(())
 	}
 
-	/// Signed by the market's full administrator, whose check reads the market, where the
+	/// Signed by the branch's full administrator, whose check reads the branch, where the
 	/// runtime's `UpdateOrigin` admits one.
 	#[benchmark]
 	fn set_stability_pool_config() -> Result<(), BenchmarkError> {
@@ -877,5 +877,9 @@ mod benchmarks {
 		Ok(())
 	}
 
-	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);
+	impl_benchmark_test_suite!(
+		Pallet,
+		crate::mock::ExtBuilder::default().build(),
+		crate::mock::Test
+	);
 }

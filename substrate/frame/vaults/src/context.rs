@@ -76,7 +76,7 @@ pub struct VaultOp<T: Config> {
 }
 
 impl<T: Config> Context<T> {
-	/// Loads a market and applies its pending interest in memory.
+	/// Loads a branch and applies its pending interest in memory.
 	fn load(
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
@@ -127,7 +127,7 @@ impl<T: Config> Context<T> {
 		Ok(())
 	}
 
-	/// Returns the rate-list ID for this market.
+	/// Returns the rate-list ID for this branch.
 	fn rate_list(&self) -> VaultListIdOf<T> {
 		VaultListId::Rate(self.collateral_id.clone(), self.stable_id.clone())
 	}
@@ -145,12 +145,12 @@ impl<T: Config> Context<T> {
 		self.price.defensive_ok_or(DispatchError::Corruption)
 	}
 
-	/// The market as this operation hands it to the Stability Pool.
+	/// The branch as this operation hands it to the Stability Pool.
 	///
 	/// The mode comes from the loaded state and the cached price, so the pool needs no branch,
 	/// oracle, or clock read of its own. An operation that loaded no price reads the oracle once
 	/// here. A price the oracle cannot give, or a ratio that does not compute, reports `Frozen`:
-	/// the pool then declines, which is what it does for a market it cannot classify.
+	/// the pool then declines, which is what it does for a branch it cannot classify.
 	fn branch_snapshot(&self) -> BranchSnapshot {
 		let mode = if self.branch.state.is_frozen() {
 			BranchMode::Frozen
@@ -180,7 +180,7 @@ impl<T: Config> Context<T> {
 		Ok(collateralization_ratio(position, self.price()?)?)
 	}
 
-	/// Ensures a vault's collateralization ratio is at or above this market's ICR.
+	/// Ensures a vault's collateralization ratio is at or above this branch's ICR.
 	fn ensure_above_icr(&self, position: &DebtCollateral<BalanceOf<T>>) -> DispatchResult {
 		let cr = self.collateralization_ratio(position)?;
 		ensure!(
@@ -190,7 +190,7 @@ impl<T: Config> Context<T> {
 		Ok(())
 	}
 
-	/// Ensures a vault's collateralization ratio is strictly below this market's MCR.
+	/// Ensures a vault's collateralization ratio is strictly below this branch's MCR.
 	fn ensure_below_mcr(&self, position: &DebtCollateral<BalanceOf<T>>) -> DispatchResult {
 		let cr = self.collateralization_ratio(position)?;
 		ensure!(
@@ -200,7 +200,7 @@ impl<T: Config> Context<T> {
 		Ok(())
 	}
 
-	/// Ensures a vault's collateralization ratio is at or above this market's MCR.
+	/// Ensures a vault's collateralization ratio is at or above this branch's MCR.
 	fn ensure_at_or_above_mcr(&self, position: &DebtCollateral<BalanceOf<T>>) -> DispatchResult {
 		let cr = self.collateralization_ratio(position)?;
 		ensure!(
@@ -266,7 +266,7 @@ impl<T: Config> Context<T> {
 		Ok(())
 	}
 
-	/// Prepares a new vault and updates the market state in memory.
+	/// Prepares a new vault and updates the branch state in memory.
 	fn create_vault(
 		mut self,
 		owner: &T::AccountId,
@@ -624,10 +624,6 @@ impl<T: Config> VaultOp<T> {
 		Ok(false)
 	}
 
-	fn rate_list(&self) -> VaultListIdOf<T> {
-		self.ctx.rate_list()
-	}
-
 	/// Returns the loaded vault status.
 	pub(crate) const fn status(&self) -> VaultStatus {
 		self.status
@@ -641,7 +637,7 @@ impl<T: Config> VaultOp<T> {
 	/// Places the vault in the rate index at its current rate.
 	pub(super) fn index_insert(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
 		let steps = T::VaultLists::insert(
-			self.rate_list(),
+			self.ctx.rate_list(),
 			self.owner.clone(),
 			self.vault.annual_rate,
 			hint,
@@ -653,11 +649,11 @@ impl<T: Config> VaultOp<T> {
 
 	/// Removes the vault from the rate index, where it must be present.
 	pub(super) fn index_remove(&self) -> DispatchResult {
-		T::VaultLists::remove(&self.rate_list(), &self.owner)
-			.map_err(|_| Error::<T>::RateIndexInvariantBroken.into())
+		T::VaultLists::remove(&self.ctx.rate_list(), &self.owner)
+			.map_err(|e| Pallet::<T>::map_error(e).into())
 	}
 
-	/// Adds collateral to the vault and market totals.
+	/// Adds collateral to the vault and branch totals.
 	pub(crate) fn add_collateral(&mut self, amount: BalanceOf<T>) -> DispatchResult {
 		ensure!(!self.status.is_dormant(), Error::<T>::InvalidVaultStatus);
 		let before = self.vault.clone();
@@ -679,7 +675,7 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
-	/// Removes collateral from the vault and market totals.
+	/// Removes collateral from the vault and branch totals.
 	pub(crate) fn remove_collateral(&mut self, amount: BalanceOf<T>) -> DispatchResult {
 		let before = self.vault.clone();
 		let vault_collateral = self
@@ -702,7 +698,7 @@ impl<T: Config> VaultOp<T> {
 
 	/// Transfers held vault collateral from the owner to `to`, released from the hold.
 	///
-	/// Moves funds only; the caller adjusts vault and market accounting.
+	/// Moves funds only; the caller adjusts vault and branch accounting.
 	pub(crate) fn release_collateral(
 		&self,
 		to: &T::AccountId,
@@ -826,7 +822,7 @@ impl<T: Config> VaultOp<T> {
 		Ok(payment)
 	}
 
-	/// The market as this operation hands it to the Stability Pool.
+	/// The branch as this operation hands it to the Stability Pool.
 	pub(crate) fn branch_snapshot(&self) -> BranchSnapshot {
 		self.ctx.branch_snapshot()
 	}
@@ -840,7 +836,7 @@ impl<T: Config> VaultOp<T> {
 		self.persist(false)
 	}
 
-	/// Writes the vault and the market, then issues what the operation owes.
+	/// Writes the vault and the branch, then issues what the operation owes.
 	fn persist(self, remove: bool) -> DispatchResult {
 		let VaultOp { ctx, owner, vault, deposit, .. } = self;
 		let collateral_id = ctx.collateral_id.clone();
@@ -855,7 +851,7 @@ impl<T: Config> VaultOp<T> {
 			Vaults::<T>::insert(key, &VaultRecord { vault, deposit });
 		}
 		// Taken before the state moves into storage; the stored row equals it once committed, so
-		// the yield route sees the market the engine just wrote. A commit that mints nothing
+		// the yield route sees the branch the engine just wrote. A commit that mints nothing
 		// takes none, so it reads no oracle.
 		let yield_due = !ctx.pending_interest_mint.is_zero() || !ctx.pending_fee.is_zero();
 		let branch = if yield_due { Some(ctx.branch_snapshot()) } else { None };

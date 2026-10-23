@@ -11,15 +11,16 @@ use stablecoin_primitives::{
 type Seeder = Pallet<Test>;
 
 fn register() -> (AssetId, StableId) {
-	let market = Seeder::register_market().expect("benchmark market registers");
+	let market = Seeder::register_market().expect("benchmark branch registers");
 	assert_eq!(Seeder::register_market(), Ok(market.clone()), "registration is idempotent");
 	market
 }
 
 #[test]
 fn redemption_targets_are_walked_in_seed_order_with_pending_shares() {
-	new_test_ext().execute_with(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		let (collateral, stable) = register();
+
 		let seed = Seeder::seed_redemption_targets(3, 3_600_000).expect("targets seed");
 
 		assert_eq!(seed.owners.len(), 3);
@@ -52,8 +53,9 @@ fn redemption_targets_are_walked_in_seed_order_with_pending_shares() {
 
 #[test]
 fn recovery_head_settles_in_full_and_closes() {
-	new_test_ext().execute_with(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		let (collateral, stable) = register();
+
 		let head = Seeder::stage_recovery_head(3_600_000).expect("head stages");
 
 		let target = Seeder::next_redemption_target(&collateral, &stable, None);
@@ -66,6 +68,7 @@ fn recovery_head_settles_in_full_and_closes() {
 			stablecoin_primitives::collateralization_ratio(&snapshot.position(), head.price),
 			Ok(CollateralRatio::Ratio(FixedU128::one()))
 		);
+
 		let payment = <VaultStableAssets as Balanced<AccountId>>::issue(stable, head.debt);
 		assert_ok!(Seeder::redeem_step(
 			&collateral,
@@ -77,6 +80,7 @@ fn recovery_head_settles_in_full_and_closes() {
 				collateral_to_recipient: head.collateral
 			},
 		));
+
 		assert!(!Vaults::<Test>::contains_key((&collateral, stable, head.owner)));
 	});
 }

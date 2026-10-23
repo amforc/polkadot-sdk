@@ -1,16 +1,16 @@
 //! # Stability Pool
 //!
-//! Provides market-specific stablecoin pools that cancel vault debt and allocate collateral and
+//! Provides branch-specific stablecoin pools that cancel vault debt and allocate collateral and
 //! yield to depositors.
 //!
 //! ## Overview
 //!
-//! Each pool belongs to one `(collateral_id, stable_id)` market. The market lifecycle creates and
-//! removes its pool, which prevents pool state without a registered market.
+//! Each pool belongs to one `(collateral_id, stable_id)` branch. The branch lifecycle creates and
+//! removes its pool, which prevents pool state without a registered branch.
 //!
 //! Depositors supply stablecoin that the liquidation system can burn to cancel vault debt. The pool
 //! allocates the associated collateral to those depositors. Active deposits also receive the
-//! configured share of market yield.
+//! configured share of branch yield.
 //!
 //! Participation has risk. Debt cancellation reduces the stablecoin deposit, and the value of the
 //! received collateral can change. The operating mode can also delay withdrawals.
@@ -30,14 +30,14 @@
 //!
 //! ### Gains
 //!
-//! Liquidation offsets reduce deposit principal and add claimable collateral. Market yield adds
+//! Liquidation offsets reduce deposit principal and add claimable collateral. Branch yield adds
 //! claimable stablecoin. A depositor collects these balances with [`Pallet::claim_collateral`] and
 //! [`Pallet::claim_yield`].
 //!
 //! Claimable yield does not absorb debt or earn more yield. Only the depositor can use
 //! [`Pallet::compound_yield`] to expose it to pool risk again.
 //!
-//! Market interest accrues lazily and is shared out when it is issued. Before a deposit,
+//! Branch interest accrues lazily and is shared out when it is issued. Before a deposit,
 //! withdrawal request, withdrawal, yield claim, or compounding changes the active capital, the
 //! pallet asks
 //! [`Config::BranchInterface`] to issue the interest accrued so far, so it reaches the capital
@@ -45,13 +45,13 @@
 //!
 //! ### Operating modes
 //!
-//! [`Config::BranchInterface`] reports the operating mode of a market:
+//! [`Config::BranchInterface`] reports the operating mode of a branch:
 //!
 //! - `Normal` permits immediate withdrawals.
 //! - `Safety` requires [`Pallet::request_withdraw`] and a `safety_withdrawal_delay`. The delay
-//!   keeps capital available while the market is under stress.
+//!   keeps capital available while the branch is under stress.
 //! - `Frozen` blocks value movement and cohort activation. Local settlement remains available so
-//!   committed losses and gains do not depend on market recovery.
+//!   committed losses and gains do not depend on branch recovery.
 //!
 //! The pallet applies `Frozen` rules when market risk information is unavailable. This rule
 //! prevents value movement without current risk information.
@@ -79,7 +79,7 @@
 //! ### Scalable accounting
 //!
 //! Liquidation cost must not increase with the depositor count. The pallet therefore updates
-//! market accumulators and settles each deposit when an operation uses its row.
+//! branch accumulators and settles each deposit when an operation uses its row.
 //!
 //! `P` tracks the deposit fraction that remains. `S` tracks collateral per deposit unit, and `G`
 //! tracks yield per active deposit unit. Active and pending capital have separate loss accumulators
@@ -96,8 +96,8 @@
 //!
 //! User payouts round down. Remainders stay in pool custody, which prevents the pool from owing
 //! more than its account holds. The pool account also carries a custody float of one minimum
-//! balance per asset, paid by the market creator at registration, so that every exact payout can
-//! leave the asset minimum behind; see [`types::StabilityPool`]. Market removal refunds the float
+//! balance per asset, paid by the branch creator at registration, so that every exact payout can
+//! leave the asset minimum behind; see [`types::StabilityPool`]. Branch removal refunds the float
 //! and sends unowned remainders to [`Config::StableDustHandler`] and
 //! [`Config::CollateralDustHandler`].
 
@@ -143,7 +143,6 @@ pub mod pallet {
 			storage::StorageNMap as _,
 			traits::{
 				fungibles,
-				fungibles::Inspect as _,
 				tokens::{Fortitude, Precision, Preservation},
 				EnsureOriginWithArg, OnUnbalanced, Time,
 			},
@@ -174,7 +173,7 @@ pub mod pallet {
 	pub type CollateralCreditOf<T> =
 		fungibles::Credit<AccountIdFor<T>, <T as Config>::CollateralAssets>;
 
-	/// Deposit position of one account in one market.
+	/// Deposit position of one account in one branch.
 	pub type DepositOf<T> = Deposit<BalanceOf<T>>;
 
 	/// Activation checkpoint for one maturity cohort.
@@ -214,9 +213,13 @@ pub mod pallet {
 			> + fungibles::Balanced<Self::AccountId>;
 
 		/// Clock for the entry delay and the Safety-mode withdrawal delay.
+		///
+		/// It must be a clock that block authors cannot move, such as the relay-chain timestamp
+		/// on a parachain. A parachain's own `pallet_timestamp` is set by its collator, which
+		/// could then shorten both delays.
 		type TimeProvider: Time<Moment = Millis>;
 
-		/// The vault engine: authority for the operating mode of each market, and issuer of its
+		/// The branch engine: authority for the operating mode of each branch, and issuer of its
 		/// pending interest.
 		type BranchInterface: BranchInterface<CollateralIdOf<Self>, StableIdOf<Self>>;
 
@@ -228,21 +231,21 @@ pub mod pallet {
 			Credit = StableCreditOf<Self>,
 		>;
 
-		/// Destination for unowned stablecoin after market removal.
+		/// Destination for unowned stablecoin after branch removal.
 		type StableDustHandler: OnUnbalanced<StableCreditOf<Self>>;
 
-		/// Destination for unowned collateral after market removal. See
+		/// Destination for unowned collateral after branch removal. See
 		/// [`Config::StableDustHandler`].
 		type CollateralDustHandler: OnUnbalanced<CollateralCreditOf<Self>>;
 
-		/// Origin that can update the configuration of the specified market.
+		/// Origin that can update the configuration of the specified branch.
 		type UpdateOrigin: EnsureOriginWithArg<
 			Self::RuntimeOrigin,
 			(CollateralIdOf<Self>, StableIdOf<Self>),
 			Success = (),
 		>;
 
-		/// Seed for the pool account of each market. See [`Pallet::pool_account`].
+		/// Seed for the pool account of each branch. See [`Pallet::pool_account`].
 		#[pallet::constant]
 		type PalletId: Get<PalletId>;
 
@@ -250,7 +253,7 @@ pub mod pallet {
 		type WeightInfo: WeightInfo;
 	}
 
-	/// Deposit position of each account in each market.
+	/// Deposit position of each account in each branch.
 	#[pallet::storage]
 	pub type Deposits<T: Config> = StorageNMap<
 		_,
@@ -263,10 +266,10 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Configuration and accounting state of each registered market.
+	/// Configuration and accounting state of each registered branch.
 	///
 	/// One row contains both parts so configuration cannot exist without its accounting state. The
-	/// row also proves that the market is registered.
+	/// row also proves that the branch is registered.
 	#[pallet::storage]
 	pub type Pools<T: Config> = StorageDoubleMap<
 		_,
@@ -373,7 +376,7 @@ pub mod pallet {
 			recipient: T::AccountId,
 			amount: BalanceOf<T>,
 		},
-		/// Market yield was shared out to the active depositors.
+		/// Branch yield was shared out to the active depositors.
 		YieldDistributed {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -402,30 +405,47 @@ pub mod pallet {
 		/// Stablecoin settled the head of the `FinalRecovery` queue. `source` identifies the
 		/// capital that paid and therefore the owner of the collateral gain.
 		///
-		/// The vault engine reports the settled vault, the debt burned, and the collateral gained.
+		/// The branch engine reports the settled vault, the debt burned, and the collateral
+		/// gained.
 		RecoveryOffsetApplied {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			source: RecoveryOffsetSource,
 		},
-		/// An authorized origin replaced the pool parameters of a market.
-		StabilityPoolConfigUpdated { collateral_id: CollateralIdOf<T>, stable_id: StableIdOf<T> },
-		/// Market removal sent unowned pool balances to the dust handlers.
-		DustSwept {
+		/// An authorized origin replaced the pool parameters of a branch.
+		StabilityPoolConfigUpdated {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
-			stable_amount: BalanceOf<T>,
-			collateral_amount: BalanceOf<T>,
+			old: StabilityPoolConfigOf<T>,
+			new: StabilityPoolConfigOf<T>,
+		},
+		/// Branch registration created the pool and moved its custody float from the branch
+		/// creator into the pool account. A zero float means the asset has no minimum balance.
+		PoolRegistered {
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			custody_stable: BalanceOf<T>,
+			custody_collateral: BalanceOf<T>,
+		},
+		/// Branch removal emptied the pool account. The `*_refund` amounts returned the custody
+		/// float to the branch creator, and the `*_dust` amounts went to the dust handlers.
+		PoolRemoved {
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			stable_refund: BalanceOf<T>,
+			collateral_refund: BalanceOf<T>,
+			stable_dust: BalanceOf<T>,
+			collateral_dust: BalanceOf<T>,
 		},
 	}
 
 	#[pallet::error]
 	pub enum Error<T> {
-		/// The market has no stability pool. Register the market before this call.
+		/// The branch has no stability pool. Register the branch before this call.
 		PoolNotRegistered,
-		/// The deposit is less than the market's `minimum_deposit`. Increase the deposit amount.
+		/// The deposit is less than the branch's `minimum_deposit`. Increase the deposit amount.
 		DepositTooSmall,
-		/// The caller holds no deposit in this market.
+		/// The caller holds no deposit in this branch.
 		DepositNotFound,
 		/// The requested amount is zero.
 		ZeroAmount,
@@ -436,7 +456,7 @@ pub mod pallet {
 		WithdrawalRequestMissing,
 		/// The withdrawal request has not completed its `safety_withdrawal_delay`.
 		SafetyWithdrawalDelayActive,
-		/// The market is frozen, and this call can move value or change pool risk.
+		/// The branch is frozen, and this call can move value or change pool risk.
 		BranchFrozen,
 		/// The caller has no claimable collateral.
 		NoClaimableCollateral,
@@ -450,7 +470,7 @@ pub mod pallet {
 		/// The pool cannot burn the exact quoted debt. Obtain new reducible amounts, and then
 		/// retry.
 		OffsetSettlementFailed,
-		/// This market has no vault in `FinalRecovery`.
+		/// This branch has no vault in `FinalRecovery`.
 		RecoveryVaultNotFound,
 		/// The head of the `FinalRecovery` queue is below par, so the pool rejects deposits and
 		/// offers no recovery offset. Settlement at a discount stays exclusive to the redemption
@@ -465,18 +485,15 @@ pub mod pallet {
 		/// The pool account cannot receive its custody float. The pool would have to refuse
 		/// value it owes to depositors.
 		PoolAccountNotReceivable,
-		/// The market creator cannot pay one minimum balance of each asset as the pool's custody
+		/// The branch creator cannot pay one minimum balance of each asset as the pool's custody
 		/// float.
 		CustodySeedUnavailable,
-		/// The market creator cannot receive the custody float back at market removal.
+		/// The branch creator cannot receive the custody float back at branch removal.
 		CustodyRefundFailed,
-		/// The pool account already holds a balance, sent before the market was registered. It
-		/// belongs to no depositor, so registration refuses to start from it.
-		PoolAccountNotEmpty,
 		/// The `precision` parameters differ from their registered values. Stored snapshots depend
 		/// on those values and would produce incorrect amounts after a change.
 		AccumulatorParamsImmutable,
-		/// The pool still has deposit rows. Remove all user positions before market removal.
+		/// The pool still has deposit rows. Remove all user positions before branch removal.
 		PoolNotEmpty,
 		/// A sums row required by the pool's accumulator coordinates is absent.
 		AccumulatorRowMissing,
@@ -512,7 +529,7 @@ pub mod pallet {
 		///
 		/// Activation needs no action from a depositor, so the stored totals can still count
 		/// capital as pending after its deadline. This view reports the classification an offset
-		/// or a settlement would use now. A frozen market activates nothing.
+		/// or a settlement would use now. A frozen branch activates nothing.
 		pub fn pool_after_activation(
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
@@ -523,7 +540,7 @@ pub mod pallet {
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// Supply stablecoin to the stability pool of a market.
+		/// Supply stablecoin to the stability pool of a branch.
 		///
 		/// ## Dispatch Origin
 		///
@@ -672,9 +689,7 @@ pub mod pallet {
 		/// The call reduces recovery debt and gives the collateral to active depositors through
 		/// `S`.
 		#[pallet::call_index(5)]
-		#[pallet::weight(
-			T::WeightInfo::offset_recovery().saturating_add(T::DbWeight::get().writes(1))
-		)]
+		#[pallet::weight(Pallet::<T>::offset_recovery_weight())]
 		pub fn offset_recovery(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
@@ -719,7 +734,7 @@ pub mod pallet {
 		/// The call moves no value and does not control activation. Permissionless settlement
 		/// removes unused rows and checkpoint references when an owner becomes inactive.
 		///
-		/// This action lets checkpoint cleanup and market removal continue when accounts are
+		/// This action lets checkpoint cleanup and branch removal continue when accounts are
 		/// inactive.
 		#[pallet::call_index(7)]
 		#[pallet::weight(T::WeightInfo::settle_deposit())]
@@ -733,11 +748,11 @@ pub mod pallet {
 			Self::do_settle_deposit(owner, collateral_id, stable_id)
 		}
 
-		/// Replace the pool parameters of a market.
+		/// Replace the pool parameters of a branch.
 		///
 		/// ## Dispatch Origin
 		///
-		/// The dispatch origin of this call must satisfy [`Config::UpdateOrigin`] for the market.
+		/// The dispatch origin of this call must satisfy [`Config::UpdateOrigin`] for the branch.
 		///
 		/// ## Details
 		///
@@ -757,7 +772,7 @@ pub mod pallet {
 	}
 
 	impl<T: Config> Pallet<T> {
-		/// Returns the custody account of a market's pool.
+		/// Returns the custody account of a branch's pool.
 		///
 		/// The account backs active deposits, pending deposits, claimable yield, and unclaimed
 		/// collateral.
@@ -802,39 +817,23 @@ pub mod pallet {
 			Ok(seed)
 		}
 
-		/// Empties the pool account: the custody float goes back to `funder`, the rest to the
-		/// dust handlers. Returns the stablecoin and collateral dust.
+		/// Weight of [`Pallet::offset_recovery`].
 		///
-		/// Market removal requires no deposit rows, so beyond the float only rounding remainders
-		/// or unrelated transfers remain, not user claims. Emptying the account also keeps a later
-		/// registration of the same market from inheriting those balances.
-		fn release_custody(
-			collateral_id: &CollateralIdOf<T>,
-			stable_id: &StableIdOf<T>,
-			pool_account: &T::AccountId,
-			pool: &StabilityPoolOf<T>,
-			funder: &T::AccountId,
-		) -> Result<(BalanceOf<T>, BalanceOf<T>), DispatchError> {
-			let stable_dust = Self::release_custody_asset::<T::StableAssets, T::StableDustHandler>(
-				stable_id.clone(),
-				pool_account,
-				pool.custody_stable,
-				funder,
-			)?;
-			let collateral_dust =
-				Self::release_custody_asset::<T::CollateralAssets, T::CollateralDustHandler>(
-					collateral_id.clone(),
-					pool_account,
-					pool.custody_collateral,
-					funder,
-				)?;
-			debug_assert!(T::StableAssets::balance(stable_id.clone(), pool_account).is_zero());
-			debug_assert!(
-				T::CollateralAssets::balance(collateral_id.clone(), pool_account).is_zero()
-			);
-			Ok((stable_dust, collateral_dust))
+		/// An activation persists the pool before the settlement re-enters this pallet, and the
+		/// accounting rewrites the same row afterwards. The benchmark counts each written key once,
+		/// so it misses the second `Pools` write.
+		fn offset_recovery_weight() -> Weight {
+			let activation_write = T::DbWeight::get().writes(1);
+			T::WeightInfo::offset_recovery().saturating_add(activation_write)
 		}
 
+		/// Empties the pool account of one asset: up to the custody float `seed` goes back to
+		/// `funder`, the rest to the dust handler. Returns the refund and the dust.
+		///
+		/// Branch removal requires no deposit rows, so beyond the float only rounding remainders
+		/// or unrelated transfers remain, not user claims. Emptying the account also keeps a later
+		/// registration of the same branch from inheriting those balances.
+		///
 		/// One withdrawal takes the whole balance, so a sub-minimum remainder cannot be left
 		/// behind by the refund and then be stuck.
 		fn release_custody_asset<Assets, DustHandler>(
@@ -842,17 +841,17 @@ pub mod pallet {
 			pool_account: &T::AccountId,
 			seed: BalanceOf<T>,
 			funder: &T::AccountId,
-		) -> Result<BalanceOf<T>, DispatchError>
+		) -> Result<(BalanceOf<T>, BalanceOf<T>), DispatchError>
 		where
 			Assets: fungibles::Balanced<T::AccountId, Balance = BalanceOf<T>>,
 			DustHandler: OnUnbalanced<fungibles::Credit<T::AccountId, Assets>>,
 		{
 			let held = Assets::balance(asset_id.clone(), pool_account);
 			if held.is_zero() {
-				return Ok(held);
+				return Ok((held, held));
 			}
 			let credit = Assets::withdraw(
-				asset_id,
+				asset_id.clone(),
 				pool_account,
 				held,
 				Precision::Exact,
@@ -860,7 +859,8 @@ pub mod pallet {
 				Fortitude::Polite,
 			)?;
 			let (refund, dust) = credit.split(seed.min(held));
-			if refund.peek().is_zero() {
+			let refund_amount = refund.peek();
+			if refund_amount.is_zero() {
 				drop(refund);
 			} else {
 				Assets::resolve(funder, refund).map_err(|credit| {
@@ -870,12 +870,13 @@ pub mod pallet {
 			}
 			let dust_amount = dust.peek();
 			DustHandler::on_unbalanced(dust);
-			Ok(dust_amount)
+			debug_assert!(Assets::balance(asset_id, pool_account).is_zero());
+			Ok((refund_amount, dust_amount))
 		}
 	}
 
 	impl<T: Config> OnBranchLifecycle<CollateralIdOf<T>, StableIdOf<T>, T::AccountId> for Pallet<T> {
-		/// Pool parameters required when the market is registered.
+		/// Pool parameters required when the branch is registered.
 		type RegistrationConfig = StabilityPoolConfigOf<T>;
 
 		fn on_registered(
@@ -887,20 +888,10 @@ pub mod pallet {
 		) -> DispatchResult {
 			ensure!(config.is_valid(), Error::<T>::InvalidStabilityPoolConfig);
 			let pool_account = Self::pool_account(collateral_id, stable_id);
-			ensure!(
-				T::StableAssets::balance(stable_id.clone(), &pool_account).is_zero(),
-				Error::<T>::PoolAccountNotEmpty
-			);
-			ensure!(
-				T::CollateralAssets::balance(collateral_id.clone(), &pool_account).is_zero(),
-				Error::<T>::PoolAccountNotEmpty
-			);
 
 			// The provider reference lets a non-sufficient asset open its account here, and keeps
 			// the account through a zero-minimum asset's full drain.
-			if frame_system::Pallet::<T>::providers(&pool_account) == 0 {
-				frame_system::Pallet::<T>::inc_providers(&pool_account);
-			}
+			frame_system::Pallet::<T>::inc_providers(&pool_account);
 			let custody_stable =
 				Self::seed_custody::<T::StableAssets>(stable_id.clone(), &pool_account, funder)?;
 			let custody_collateral = Self::seed_custody::<T::CollateralAssets>(
@@ -912,7 +903,12 @@ pub mod pallet {
 			Pools::<T>::insert(
 				collateral_id,
 				stable_id,
-				StabilityPoolOf::<T>::fresh(config, custody_stable, custody_collateral),
+				StabilityPool {
+					config,
+					state: PoolState::fresh(),
+					custody_stable,
+					custody_collateral,
+				},
 			);
 			for leg in Leg::ALL {
 				PoolSumsStore::<T>::insert(
@@ -920,6 +916,12 @@ pub mod pallet {
 					PoolSums::default(),
 				);
 			}
+			Self::deposit_event(Event::PoolRegistered {
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
+				custody_stable,
+				custody_collateral,
+			});
 			Ok(())
 		}
 
@@ -930,8 +932,8 @@ pub mod pallet {
 			funder: &T::AccountId,
 		) -> DispatchResult {
 			// Deposit rows are what guards user funds: active, pending and claimable value all
-			// live on them. Vaults rolls the whole `remove_branch` back on this error, so a market
-			// admin cannot strand depositor funds.
+			// live on them. The branch lifecycle owner rolls the whole branch removal back on this
+			// error, so a branch admin cannot strand depositor funds.
 			ensure!(
 				!Deposits::<T>::contains_prefix((collateral_id.clone(), stable_id.clone())),
 				Error::<T>::PoolNotEmpty
@@ -939,16 +941,20 @@ pub mod pallet {
 
 			let pool = Self::load_pool(collateral_id, stable_id)?;
 			let pool_account = Self::pool_account(collateral_id, stable_id);
-			let (stable_amount, collateral_amount) =
-				Self::release_custody(collateral_id, stable_id, &pool_account, &pool, funder)?;
-			if !stable_amount.is_zero() || !collateral_amount.is_zero() {
-				Self::deposit_event(Event::DustSwept {
-					collateral_id: collateral_id.clone(),
-					stable_id: stable_id.clone(),
-					stable_amount,
-					collateral_amount,
-				});
-			}
+			let (stable_refund, stable_dust) =
+				Self::release_custody_asset::<T::StableAssets, T::StableDustHandler>(
+					stable_id.clone(),
+					&pool_account,
+					pool.custody_stable,
+					funder,
+				)?;
+			let (collateral_refund, collateral_dust) =
+				Self::release_custody_asset::<T::CollateralAssets, T::CollateralDustHandler>(
+					collateral_id.clone(),
+					&pool_account,
+					pool.custody_collateral,
+					funder,
+				)?;
 
 			Pools::<T>::remove(collateral_id, stable_id);
 			// Safe to clear in full: with no deposit rows, no snapshot on either leg can still
@@ -967,13 +973,21 @@ pub mod pallet {
 			debug_assert!(removal.maybe_cursor.is_none());
 
 			if frame_system::Pallet::<T>::providers(&pool_account) > 0 {
-				// The release emptied the market's own assets, but a third party may have parked
+				// The release emptied the branch's own assets, but a third party may have parked
 				// another token here and left a consumer reference behind. The account then stays,
 				// which does no harm.
 				if frame_system::Pallet::<T>::can_dec_provider(&pool_account) {
 					frame_system::Pallet::<T>::dec_providers(&pool_account)?;
 				}
 			}
+			Self::deposit_event(Event::PoolRemoved {
+				collateral_id: collateral_id.clone(),
+				stable_id: stable_id.clone(),
+				stable_refund,
+				collateral_refund,
+				stable_dust,
+				collateral_dust,
+			});
 			Ok(())
 		}
 
@@ -1002,7 +1016,7 @@ pub mod pallet {
 			collateral_id: &CollateralIdOf<T>,
 			stable_id: &StableIdOf<T>,
 		) -> DispatchResult {
-			use frame::traits::fungibles::Mutate as _;
+			use frame::traits::fungibles::{Inspect as _, Mutate as _};
 			let pool_account = Self::pool_account(collateral_id, stable_id);
 			let one = BalanceOf::<T>::one();
 			let stable_dust = T::StableAssets::minimum_balance(stable_id.clone()).max(one);

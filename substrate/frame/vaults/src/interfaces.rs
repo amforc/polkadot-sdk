@@ -2,7 +2,10 @@
 
 use crate::{
 	context::{Commit, VaultOp},
-	pallet::{BalanceOf, CollateralIdOf, Config, Error, Event, Pallet, StableCreditOf, StableIdOf},
+	pallet::{
+		BalanceOf, CollateralIdOf, Config, Error, Event, Pallet, StableCreditOf, StableIdOf,
+		StablecoinMarkets,
+	},
 	types::VaultStatus,
 };
 use frame::prelude::*;
@@ -95,7 +98,7 @@ impl<T: Config> VaultInterface for Pallet<T> {
 			stable_id: op.stable_id().clone(),
 			owner: op.owner().clone(),
 			recipient: recipient.clone(),
-			debt_cancelled: debt_to_cancel,
+			debt_cancelled: payment,
 			collateral_to_recipient,
 			vault_annual_rate: op.vault().annual_rate,
 		});
@@ -110,5 +113,25 @@ impl<T: Config> VaultInterface for Pallet<T> {
 
 	fn stablecoin_debt(stable_id: &StableIdOf<T>) -> BalanceOf<T> {
 		Self::accrued_stablecoin_debt(stable_id)
+	}
+
+	fn stablecoin_markets(stable_id: &StableIdOf<T>) -> u32 {
+		// The index is keyed by the stablecoin's name in the collateral namespace, the same key
+		// registration counts under.
+		let stable_key = T::StableToCollateralId::convert(stable_id.clone());
+		match StablecoinMarkets::<T>::get(&stable_key) {
+			Some(branches) => {
+				// The entry is removed with its last branch.
+				debug_assert!(branches > 0);
+				branches
+			},
+			None => 0,
+		}
+	}
+
+	fn issued_stablecoin_count() -> usize {
+		// Every stored entry counts at least one branch, so entries and issued stablecoins
+		// coincide.
+		StablecoinMarkets::<T>::iter_keys().count()
 	}
 }

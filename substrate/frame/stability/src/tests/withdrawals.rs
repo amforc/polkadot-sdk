@@ -15,9 +15,7 @@ fn withdraw_pays_at_most_the_active_deposit_and_prunes_the_row() {
 	let cases: [(Balance, AccountId, Balance, Balance); 2] =
 		[(400, 1, 1_000, 1_000), (1_000, 2, 600, 400)];
 	for (requested, recipient, depositor_balance, recipient_balance) in cases {
-		build_and_execute(|| {
-			seed_pool_with_matured_deposit();
-
+		ExtBuilder::single_depositor().build_and_execute(|| {
 			assert_ok!(withdraw(1, DOT, STABLE, requested, recipient));
 
 			assert_eq!(stable_balance(STABLE, 1), depositor_balance);
@@ -39,18 +37,15 @@ fn withdraw_pays_at_most_the_active_deposit_and_prunes_the_row() {
 
 #[test]
 fn withdraw_with_nothing_active_reverts() {
-	build_with_default_market(|| {
-		mint_stable(STABLE, 1, 1_000);
-		// Still pending (immature): nothing withdrawable.
-		assert_ok!(deposit(1, DOT, STABLE, 400));
+	// Still pending (immature): nothing withdrawable.
+	ExtBuilder::default().default_branch().deposit(1, 400).build_and_execute(|| {
 		assert_noop!(withdraw(1, DOT, STABLE, 400, 1), Error::<Test>::NoActiveDeposit);
 	});
 }
 
 #[test]
 fn withdraw_leaves_pending_untouched() {
-	build_and_execute(|| {
-		seed_pool_with_matured_deposit();
+	ExtBuilder::single_depositor().build_and_execute(|| {
 		// A fresh pending amount on top of the 400 active.
 		assert_ok!(deposit(1, DOT, STABLE, 300));
 
@@ -67,14 +62,14 @@ fn withdraw_leaves_pending_untouched() {
 
 #[test]
 fn request_is_recorded_replaced_by_a_new_one_and_survives_deposits() {
-	build_and_execute(|| {
+	ExtBuilder::branch_with_debt().build_and_execute(|| {
 		// Requests only record in Safety Mode: real branch debt plus the 0.6
 		// price puts the TCR at 120%, under the 130% Safety threshold.
-		seed_branch_with_debt();
 		enter_safety_mode();
-
 		let requested_at = Timestamp::get();
+
 		assert_ok!(request_withdraw(1, DOT, STABLE, 250));
+
 		let executable_at = requested_at + 600_000;
 		let request = deposit_row(DOT, STABLE, 1)
 			.expect("row exists")
@@ -91,6 +86,7 @@ fn request_is_recorded_replaced_by_a_new_one_and_survives_deposits() {
 		advance_time(4_000);
 		let requested_at = Timestamp::get();
 		assert_ok!(request_withdraw(1, DOT, STABLE, 100));
+
 		let expected = WithdrawalRequest { amount: 100, executable_at: requested_at + 600_000 };
 		assert_eq!(
 			deposit_row(DOT, STABLE, 1).expect("row exists").withdrawal_request,
@@ -100,6 +96,7 @@ fn request_is_recorded_replaced_by_a_new_one_and_survives_deposits() {
 		// A deposit leaves the request as it was.
 		advance_time(1_000);
 		assert_ok!(deposit(1, DOT, STABLE, 300));
+
 		assert_eq!(
 			deposit_row(DOT, STABLE, 1).expect("row exists").withdrawal_request,
 			Some(expected)
@@ -109,28 +106,29 @@ fn request_is_recorded_replaced_by_a_new_one_and_survives_deposits() {
 
 #[test]
 fn zero_amount_requests_and_withdrawals_revert() {
-	build_and_execute(|| {
-		seed_branch_with_debt();
+	ExtBuilder::branch_with_debt().build_and_execute(|| {
 		assert_noop!(withdraw(1, DOT, STABLE, 0, 1), Error::<Test>::ZeroAmount);
 		// The request rejects the zero before deciding whether to forward.
 		assert_noop!(request_withdraw(1, DOT, STABLE, 0), Error::<Test>::ZeroAmount);
+
 		enter_safety_mode();
+
 		assert_noop!(request_withdraw(1, DOT, STABLE, 0), Error::<Test>::ZeroAmount);
 	});
 }
 
 #[test]
 fn normal_withdraw_ignores_request_and_prunes_it_with_the_row() {
-	build_and_execute(|| {
+	ExtBuilder::branch_with_debt().build_and_execute(|| {
 		// A request recorded in Safety Mode lingers if the branch recovers
 		// before execution.
-		seed_branch_with_debt();
 		enter_safety_mode();
 		assert_ok!(request_withdraw(1, DOT, STABLE, 100));
 		exit_safety_mode();
 
 		// Normal Mode is not bounded by the 100-unit request.
 		assert_ok!(withdraw(1, DOT, STABLE, 400, 1));
+
 		assert_eq!(stable_balance(STABLE, 1), 1_000);
 		// The emptied row takes the leftover request with it.
 		assert!(deposit_row(DOT, STABLE, 1).is_none());

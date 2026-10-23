@@ -1,6 +1,6 @@
 //! Lets the Stability Pool cancel debt against the `FinalRecovery` FIFO head at the same pricing
-//! as recovery redemptions. The redemptions pallet owns that pricing and implements this, so the
-//! two paths cannot diverge.
+//! as recovery redemptions. The implementer is the owner of that pricing, so the two paths cannot
+//! diverge.
 
 use frame::deps::sp_runtime::DispatchError;
 
@@ -23,23 +23,31 @@ pub enum RecoveryOffsetResult<Balance> {
 /// Like redemptions, each call stops after one head, so it never crosses into another recovery
 /// price.
 pub trait RecoveryOffsetInterface {
+	/// Collateral asset identifier; with the payment's asset it names the branch.
 	type CollateralId;
+	/// Account type of the collateral recipient.
 	type AccountId;
+	/// Amount type; [`RecoveryOffsetResult::Applied`] reports collateral planck in it.
 	type Balance;
+	/// Branch stablecoin credit that pays for the offset.
 	type Credit;
 
-	/// Cancels head debt in the market of `collateral_id` and the payment's asset, spending up to
+	/// Cancels head debt in the branch of `collateral_id` and the payment's asset, spending up to
 	/// the payment, and sends the priced collateral to `collateral_recipient`. No redemption fee.
 	///
 	/// Returns the outcome and the unspent change; `NoTarget`, `NotOffsettable` and `BelowPar`
 	/// return the whole payment. The implementation can only burn what the credit carries, so
 	/// callers derive the cancelled debt as `payment - change`.
 	///
+	/// If the head cannot consume the whole payment, the burn is capped at `max_partial_debt`.
+	/// This lets a pool preserve its minimum balance without preventing full depletion.
+	///
 	/// An `Err` consumes the payment and storage unwinds only with the caller's transaction, so
 	/// callers must abort the extrinsic.
 	fn execute_recovery_offset(
 		collateral_id: &Self::CollateralId,
 		payment: Self::Credit,
+		max_partial_debt: Self::Balance,
 		collateral_recipient: &Self::AccountId,
 	) -> Result<(RecoveryOffsetResult<Self::Balance>, Self::Credit), DispatchError>;
 }

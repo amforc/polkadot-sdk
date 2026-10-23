@@ -56,10 +56,15 @@ impl<Balance: Copy + Ord> RedemptionStepSnapshot<Balance> {
 ///
 /// [`Self::redeem_step`] revalidates against a fresh projection; a mismatch fails the step.
 pub trait VaultInterface {
+	/// Collateral asset identifier.
 	type CollateralId;
+	/// Stablecoin asset identifier.
 	type StableId;
+	/// Vault owner and recipient account type.
 	type AccountId;
+	/// Amount type for both assets: debt in stablecoin planck, collateral in collateral planck.
 	type Balance;
+	/// Branch stablecoin credit, burned to cancel debt.
 	type StableCredit;
 
 	/// Returns the highest-priority redemption target and its status: the `FinalRecovery` FIFO
@@ -81,7 +86,7 @@ pub trait VaultInterface {
 
 	/// Applies one atomic redemption to `owner`'s vault.
 	///
-	/// The payment must be in the market stablecoin and at most the debt; the collateral at most
+	/// The payment must be in the branch stablecoin and at most the debt; the collateral at most
 	/// the vault's. A full payment clears the debt. The caller charges the redemption fee.
 	///
 	/// An error consumes `settlement.debt_payment` and writes roll back only with the caller's
@@ -94,10 +99,16 @@ pub trait VaultInterface {
 		settlement: RedemptionSettlement<Self::StableCredit, Self::Balance>,
 	) -> DispatchResult;
 
-	/// Returns the total debt of `stable_id` across its markets, including interest accrued since
-	/// each market's last touch.
+	/// Returns the total debt of `stable_id` across its branches, including interest accrued since
+	/// each branch's last touch.
 	///
 	/// The denominator of the dynamic redemption fee, which is stablecoin-wide because it targets
 	/// how much of the coin is redeemed, whatever backs it.
 	fn stablecoin_debt(stable_id: &Self::StableId) -> Self::Balance;
+
+	/// Returns the number of live branches issuing `stable_id`.
+	fn stablecoin_markets(stable_id: &Self::StableId) -> u32;
+
+	/// Returns how many distinct stablecoins have at least one live branch.
+	fn issued_stablecoin_count() -> usize;
 }

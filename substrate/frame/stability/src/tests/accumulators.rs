@@ -11,37 +11,41 @@ use crate::mock::*;
 
 #[test]
 fn offsets_move_p_and_s_yield_moves_g() {
-	build_with_default_market(|| {
-		seed_matured_deposit(1, 1_000);
+	ExtBuilder::default()
+		.default_branch()
+		.matured_deposit(1, 1_000)
+		.build_and_execute(|| {
+			// Offset 1: P = 800/1000 = 0.8, delta_S = 160 * (1/1000) = 0.16;
+			// G is untouched.
+			assert_eq!(simulate_offset(DOT, STABLE, 200, 160).debt(), 200);
 
-		// Offset 1: P = 800/1000 = 0.8, delta_S = 160 * (1/1000) = 0.16;
-		// G is untouched.
-		assert_eq!(simulate_offset(DOT, STABLE, 200, 160).debt(), 200);
-		let state = pool_state(DOT, STABLE);
-		assert_eq!(state.coords.p, FixedU128::from_rational(4, 5));
-		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(16, 100));
-		assert_eq!(active_sums(0, 0).g_yield, FixedU128::zero());
+			let state = pool_state(DOT, STABLE);
+			assert_eq!(state.coords.p, FixedU128::from_rational(4, 5));
+			assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(16, 100));
+			assert_eq!(active_sums(0, 0).g_yield, FixedU128::zero());
 
-		// Yield: delta_G = 80 * (0.8/800) = 0.08; P and S are untouched.
-		distribute_all_yield(80);
-		let state = pool_state(DOT, STABLE);
-		assert_eq!(state.coords.p, FixedU128::from_rational(4, 5));
-		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(16, 100));
-		assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(8, 100));
+			// Yield: delta_G = 80 * (0.8/800) = 0.08; P and S are untouched.
+			distribute_all_yield(80);
 
-		// Offset 2 compounds P multiplicatively and adds to S:
-		// P = 0.8 * (400/800) = 0.4, delta_S = 320 * (0.8/800) = 0.32,
-		// so S = 0.48; G is untouched again.
-		assert_eq!(simulate_offset(DOT, STABLE, 400, 320).debt(), 400);
-		let state = pool_state(DOT, STABLE);
-		// Coordinates never moved: everything above stayed on (0, 0).
-		assert_eq!(
-			state.coords,
-			Accumulators { p: FixedU128::from_rational(2, 5), epoch: 0, scale: 0 }
-		);
-		assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(48, 100));
-		assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(8, 100));
-	});
+			let state = pool_state(DOT, STABLE);
+			assert_eq!(state.coords.p, FixedU128::from_rational(4, 5));
+			assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(16, 100));
+			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(8, 100));
+
+			// Offset 2 compounds P multiplicatively and adds to S:
+			// P = 0.8 * (400/800) = 0.4, delta_S = 320 * (0.8/800) = 0.32,
+			// so S = 0.48; G is untouched again.
+			assert_eq!(simulate_offset(DOT, STABLE, 400, 320).debt(), 400);
+
+			let state = pool_state(DOT, STABLE);
+			// Coordinates never moved: everything above stayed on (0, 0).
+			assert_eq!(
+				state.coords,
+				Accumulators { p: FixedU128::from_rational(2, 5), epoch: 0, scale: 0 }
+			);
+			assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(48, 100));
+			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(8, 100));
+		});
 }
 
 /// The pending pair resets only when an offset empties the pending stock. Emptying it any other
@@ -49,12 +53,11 @@ fn offsets_move_p_and_s_yield_moves_g() {
 /// the snapshot of a later deposit mean anything.
 #[test]
 fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
-	build_with_default_market(|| {
-		seed_deposit(1, 200);
-
+	ExtBuilder::default().default_branch().deposit(1, 200).build_and_execute(|| {
 		// Burn 100 of the 200 pending: P_pending = 100/200 = 0.5 and
 		// delta_S = 50 * (1/200) = 0.25.
 		assert_eq!(simulate_offset(DOT, STABLE, 100, 50).debt(), 100);
+
 		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.pending_coords.p, FixedU128::from_rational(1, 2));
 		assert_eq!(pending_sums(0, 0).s_collateral, FixedU128::from_rational(1, 4));
@@ -65,6 +68,7 @@ fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
 		// that would move the accumulators under examination.
 		advance_time(10_000);
 		assert_ok!(settle(7, 1, DOT, STABLE));
+
 		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.total_active_deposits, 100);
@@ -78,6 +82,7 @@ fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
 		// where the accumulators stand rather than from `P = 1`: untouched,
 		// it realizes its full 400.
 		seed_deposit(2, 400);
+
 		assert_eq!(pending_after_settlement(DOT, STABLE, 2), 400);
 
 		// Depletion is what resets the pair: a new epoch at `P = 1`, scale 0,
@@ -87,6 +92,7 @@ fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
 			simulate_offset(DOT, STABLE, 500, 100),
 			SimulatedOffset { active: 100, pending: 400, leftover: 0 }
 		);
+
 		let state = pool_state(DOT, STABLE);
 		assert_eq!(state.total_pending_deposits, 0);
 		assert_eq!(state.pending_coords, Accumulators { p: FixedU128::one(), epoch: 1, scale: 0 });

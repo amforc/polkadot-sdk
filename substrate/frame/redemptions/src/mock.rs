@@ -170,12 +170,12 @@ parameter_types! {
 }
 
 /// Genesis owner of every test stablecoin, so [`EnsureAssetOwner`] admits it. It administers no
-/// market.
+/// branch.
 pub const STABLECOIN_OWNER: AccountId = 1;
 
-/// Full admin of every market a test helper registers.
+/// Full admin of every branch a test helper registers.
 pub const ADMIN: AccountId = 100;
-/// Emergency (tighten-only) admin of every market a test helper registers.
+/// Emergency (tighten-only) admin of every branch a test helper registers.
 pub const EMERGENCY_ADMIN: AccountId = 101;
 
 /// The `create_branch` admin bundle: `full` administers, `emergency` tightens.
@@ -216,7 +216,7 @@ impl pallet_vaults::Config for Test {
 	type Oracle = MockOracle;
 	type FeeAccount = FeeAccounts;
 	type YieldHook = ();
-	// Registering a market seeds this pallet's redemption config via `on_registered`.
+	// Registering a branch seeds this pallet's redemption config via `on_registered`.
 	type OnBranchLifecycle = Redemptions;
 	type StabilityPool = BenchmarkSeedablePool;
 	type TimeProvider = Timestamp;
@@ -301,13 +301,13 @@ impl stablecoin_primitives::StabilityPoolInspect<AssetId, StableId, Balance>
 	}
 }
 
-impl<CollateralCredit: frame::deps::frame_support::traits::TryDrop, StableCredit>
+impl<CollateralCredit: frame::deps::frame_support::traits::TryDrop>
 	stablecoin_primitives::StabilityPoolOffset<
 		AssetId,
 		StableId,
 		Balance,
 		CollateralCredit,
-		StableCredit,
+		pallet_vaults::StableCreditOf<Test>,
 	> for BenchmarkSeedablePool
 {
 	fn offset(
@@ -316,7 +316,7 @@ impl<CollateralCredit: frame::deps::frame_support::traits::TryDrop, StableCredit
 		branch: stablecoin_primitives::BranchSnapshot,
 		debt: stablecoin_primitives::OffsetLegs<Balance>,
 		collateral: stablecoin_primitives::OffsetLegs<CollateralCredit>,
-	) -> Result<Option<StableCredit>, DispatchError> {
+	) -> Result<pallet_vaults::StableCreditOf<Test>, DispatchError> {
 		<() as stablecoin_primitives::StabilityPoolOffset<_, _, _, _, _>>::offset(
 			collateral_id,
 			stable_id,
@@ -377,11 +377,11 @@ parameter_types! {
 	pub const FeeDestAccount: AccountId = FEE_DEST;
 }
 
-/// The redemption config spans every market on a coin, so the coin's owner or Root sets it, not
-/// a market admin.
+/// The redemption config spans every branch on a coin, so the coin's owner or Root sets it, not
+/// a branch admin.
 pub type RedemptionsUpdateOrigin = EnsureAssetOwner;
 
-/// The redemption config that [`register_branch`] seeds on a stablecoin's first market.
+/// The redemption config that [`register_branch`] seeds on a stablecoin's first branch.
 pub fn default_redemption_config() -> RedemptionConfig<Balance> {
 	RedemptionConfig {
 		minimum_redemption_amount: 100,
@@ -427,8 +427,171 @@ pub const USDX_MIN_BALANCE: Balance = USDX_UNIT / 100;
 /// Stablecoin-wide debt ceiling that [`register_branch`] sets, high enough never to bind.
 pub const GLOBAL_CEILING: Balance = 1_000_000_000_000_000;
 
-pub fn new_test_ext() -> TestState {
-	let t = RuntimeGenesisConfig {
+/// The `(collateral, stable)` branch and terms of a vault an [`ExtBuilder`] opens.
+struct VaultSetup {
+	owner: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	collateral_amount: Balance,
+	debt: Balance,
+	rate: FixedU128,
+}
+
+/// One step of the initial state an [`ExtBuilder`] lays down, in the order it was added.
+///
+/// Order is part of the state: a vault opens in the branch added before it, and a price holds
+/// until the next step that moves it.
+enum SetupStep {
+	/// Registers a branch through [`register_branch`].
+	Branch { collateral: AssetId, stable: StableId, config: pallet_vaults::BranchConfig<Balance> },
+	/// Sets the oracle price of a collateral.
+	Price { collateral: AssetId, price: FixedU128 },
+	/// Opens an ordinary vault.
+	Vault(VaultSetup),
+	/// Opens a vault at [`DEFAULT_PRICE`], then parks it in `FinalRecovery` at `price`.
+	FinalRecoveryVault { vault: VaultSetup, price: FixedU128 },
+}
+
+/// Builds the test externalities: genesis first, then the initial state each builder method
+/// adds, applied in order through the real dispatchables.
+///
+/// The events the setup emits are cleared, so a test observes only its own.
+pub struct ExtBuilder {
+	/// `pallet-assets` balances that genesis mints: `(asset, who, amount)`.
+	asset_balances: Vec<(AssetIdForAssets, AccountId, Balance)>,
+	steps: Vec<SetupStep>,
+}
+
+impl Default for ExtBuilder {
+	fn default() -> Self {
+		Self {
+			// A Root-created branch takes its custody seed from its full admin, so a TOKEN_X
+			// branch needs [`ADMIN`] to hold some.
+			asset_balances: vec![(TOKEN_X_ID, ADMIN, 1_000_000_000_000)],
+			steps: Vec::new(),
+		}
+	}
+}
+
+impl ExtBuilder {
+	/// Registers the `(DOT, STABLE)` branch with [`default_branch_config`].
+	pub fn default_branch(self) -> Self {
+		self.branch(DOT, STABLE, default_branch_config())
+	}
+
+	/// Registers the `(collateral, stable)` branch with `config`, as [`register_branch`] does.
+	pub fn branch(
+		mut self,
+		collateral: AssetId,
+		stable: StableId,
+		config: pallet_vaults::BranchConfig<Balance>,
+	) -> Self {
+		self.steps.push(SetupStep::Branch { collateral, stable, config });
+		self
+	}
+
+	/// Sets the oracle price of `collateral` for every step after this one.
+	pub fn price(mut self, collateral: AssetId, price: FixedU128) -> Self {
+		self.steps.push(SetupStep::Price { collateral, price });
+		self
+	}
+
+	/// Opens `owner`'s vault in the most recently added branch.
+	pub fn vault(
+		mut self,
+		owner: AccountId,
+		collateral_amount: Balance,
+		debt: Balance,
+		rate: FixedU128,
+	) -> Self {
+		let vault = self.vault_setup(owner, collateral_amount, debt, rate);
+		self.steps.push(SetupStep::Vault(vault));
+		self
+	}
+
+	/// Opens `owner`'s vault in the most recently added branch at [`DEFAULT_PRICE`] and a 5%
+	/// rate, then parks it in `FinalRecovery` at `price`, which holds after the step.
+	///
+	/// The vault must be its branch's last eligible vault and below the MCR at `price`.
+	pub fn final_recovery_vault(
+		mut self,
+		owner: AccountId,
+		collateral_amount: Balance,
+		debt: Balance,
+		price: FixedU128,
+	) -> Self {
+		let rate = FixedU128::from_rational(5, 100);
+		let vault = self.vault_setup(owner, collateral_amount, debt, rate);
+		self.steps.push(SetupStep::FinalRecoveryVault { vault, price });
+		self
+	}
+
+	/// Mints `amount` of `stable` to `who` at genesis.
+	pub fn stable_balance(mut self, stable: StableId, who: AccountId, amount: Balance) -> Self {
+		self.asset_balances.push((stable, who, amount));
+		self
+	}
+
+	/// Mints `amount` of the [`TOKEN_X`] collateral to `who` at genesis.
+	pub fn token_x_balance(mut self, who: AccountId, amount: Balance) -> Self {
+		self.asset_balances.push((TOKEN_X_ID, who, amount));
+		self
+	}
+
+	/// Builds the genesis, then applies every setup step in order.
+	pub fn build(self) -> TestState {
+		let mut ext = genesis_ext(self.asset_balances);
+		ext.execute_with(|| {
+			System::set_block_number(1);
+			Timestamp::set_timestamp(1_000);
+			for step in self.steps {
+				apply_setup_step(step);
+			}
+			System::reset_events();
+		});
+		ext
+	}
+
+	/// Builds, runs `test`, then checks the pallet's `try_state` invariants against the state it
+	/// left behind.
+	pub fn build_and_execute(self, test: impl FnOnce()) {
+		self.build().execute_with(|| {
+			test();
+			crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
+			// The tests also drive Vaults, whose invariants are reachable from here only through
+			// its try-runtime hook.
+			#[cfg(feature = "try-runtime")]
+			<Vaults as frame::deps::frame_support::traits::Hooks<_>>::try_state(
+				System::block_number(),
+			)
+			.expect("post-test vaults invariants hold");
+		});
+	}
+
+	fn vault_setup(
+		&self,
+		owner: AccountId,
+		collateral_amount: Balance,
+		debt: Balance,
+		rate: FixedU128,
+	) -> VaultSetup {
+		let (collateral, stable) = self
+			.steps
+			.iter()
+			.rev()
+			.find_map(|step| match step {
+				SetupStep::Branch { collateral, stable, .. } => Some((collateral.clone(), *stable)),
+				SetupStep::Price { .. } |
+				SetupStep::Vault(_) |
+				SetupStep::FinalRecoveryVault { .. } => None,
+			})
+			.expect("a branch is added before a vault opens in it");
+		VaultSetup { owner, collateral, stable, collateral_amount, debt, rate }
+	}
+}
+
+fn genesis_ext(asset_balances: Vec<(AssetIdForAssets, AccountId, Balance)>) -> TestState {
+	RuntimeGenesisConfig {
 		assets: pallet_assets::GenesisConfig {
 			assets: vec![
 				(TOKEN_X_ID, 1, true, 1),
@@ -436,14 +599,14 @@ pub fn new_test_ext() -> TestState {
 				(USDX, STABLECOIN_OWNER, true, USDX_MIN_BALANCE),
 			],
 			metadata: vec![(USDX, b"USDX".to_vec(), b"USDX".to_vec(), 6)],
-			accounts: vec![],
+			accounts: asset_balances,
 			next_asset_id: None,
 			reserves: vec![],
 		},
 		system: Default::default(),
 		balances: pallet_balances::GenesisConfig {
 			// The fee and insurance accounts pay native asset-account deposits, and a
-			// Root-created market takes its custody seed from its full admin.
+			// Root-created branch takes its custody seed from its full admin.
 			balances: (1u64..=10u64)
 				.chain([insurance_account(STABLE), FEE_DEST, VAULT_FEE_DEST, ADMIN])
 				.map(|i| (i, 1_000_000_000_000))
@@ -452,29 +615,35 @@ pub fn new_test_ext() -> TestState {
 		},
 	}
 	.build_storage()
-	.unwrap();
-	let mut ext: TestState = t.into();
-	ext.execute_with(|| {
-		System::set_block_number(1);
-		Timestamp::set_timestamp(1_000);
-		MockPrices::set(alloc::collections::BTreeMap::new());
-		// The custody seed of a TOKEN_X market.
-		mint_collateral(TOKEN_X_ID, ADMIN, 1_000_000_000_000);
-	});
-	ext
+	.expect("the test genesis config is valid; qed")
+	.into()
 }
 
-/// Runs `test` and then checks its final storage against the pallet's `try_state` invariants.
-pub fn build_and_execute(test: impl FnOnce()) {
-	new_test_ext().execute_with(|| {
-		test();
-		crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
-		// The tests also drive Vaults, whose invariants are reachable from here only through its
-		// try-runtime hook.
-		#[cfg(feature = "try-runtime")]
-		<Vaults as frame::deps::frame_support::traits::Hooks<_>>::try_state(System::block_number())
-			.expect("post-test vaults invariants hold");
-	});
+fn apply_setup_step(step: SetupStep) {
+	match step {
+		SetupStep::Branch { collateral, stable, config } => {
+			register_branch(collateral, stable, config)
+		},
+		SetupStep::Price { collateral, price } => set_price(collateral, price),
+		SetupStep::Vault(vault) => open_setup_vault(vault),
+		SetupStep::FinalRecoveryVault { vault, price } => {
+			let (collateral, stable, owner) = (vault.collateral.clone(), vault.stable, vault.owner);
+			// An earlier `FinalRecovery` vault may have left the price depressed.
+			set_price(collateral.clone(), DEFAULT_PRICE);
+			open_setup_vault(vault);
+			set_price(collateral.clone(), price);
+			enter_final_recovery(collateral.clone(), stable, owner)
+				.expect("the vault enters recovery");
+			let (_, status) = Vaults::vault_after_touch(collateral, stable, owner)
+				.expect("the parked vault exists");
+			assert!(status.is_final_recovery(), "the vault is parked in FinalRecovery");
+		},
+	}
+}
+
+fn open_setup_vault(vault: VaultSetup) {
+	let VaultSetup { owner, collateral, stable, collateral_amount, debt, rate } = vault;
+	open(owner, collateral, stable, collateral_amount, debt, rate).expect("the vault opens");
 }
 
 /// The branch config that most tests register.
@@ -515,11 +684,11 @@ pub fn usdx_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	}
 }
 
-/// The collateral price that [`register_branch`] opens every market at: 1 unit = 1.25 STABLE.
+/// The collateral price that [`register_branch`] opens every branch at: 1 unit = 1.25 STABLE.
 pub const DEFAULT_PRICE: FixedU128 = FixedU128::from_rational(5, 4);
 
-/// Registers the `(collateral, stable)` market at [`DEFAULT_PRICE`] under [`GLOBAL_CEILING`],
-/// seeding [`default_redemption_config`] when it is the coin's first market.
+/// Registers the `(collateral, stable)` branch at [`DEFAULT_PRICE`] under [`GLOBAL_CEILING`],
+/// seeding [`default_redemption_config`] when it is the coin's first branch.
 pub fn register_branch(
 	collateral: AssetId,
 	stable: StableId,
@@ -528,7 +697,7 @@ pub fn register_branch(
 	// `create_branch` requires a live price, so set it before creating.
 	set_price(collateral.clone(), DEFAULT_PRICE);
 	let redemption_config =
-		(!crate::RedemptionConfigs::<Test>::contains_key(stable)).then(default_redemption_config);
+		(!crate::Stablecoins::<Test>::contains_key(stable)).then(default_redemption_config);
 	Vaults::create_branch(
 		RuntimeOrigin::root(),
 		collateral.clone(),
@@ -542,7 +711,7 @@ pub fn register_branch(
 		.expect("set global debt ceiling");
 }
 
-/// Opens `who`'s vault on the `(collateral, stable)` market without rate-index hints.
+/// Opens `who`'s vault on the `(collateral, stable)` branch without rate-index hints.
 pub fn open(
 	who: AccountId,
 	collateral: AssetId,
@@ -567,7 +736,7 @@ pub fn open(
 /// The `max_steps` that defers to [`crate::Config::MaxRedemptionSteps`].
 pub const MAX_STEPS_CONFIGURED: u32 = 0;
 
-/// The parties, market, and terms of one [`redeem`] call.
+/// The parties, branch, and terms of one [`redeem`] call.
 pub struct RedeemOptions {
 	pub who: AccountId,
 	pub collateral: AssetId,
@@ -624,7 +793,7 @@ pub fn redeem(options: RedeemOptions) -> Result<Settlement, DispatchError> {
 	Ok(call.read_settlement())
 }
 
-/// The parties and market that one `redeem` call's events must report.
+/// The parties and branch that one `redeem` call's events must report.
 struct RedeemCall {
 	who: AccountId,
 	collateral: AssetId,
@@ -641,8 +810,16 @@ pub struct Settlement {
 	pub insurance_cover: Balance,
 	pub fee: Balance,
 	pub collateral_out: Balance,
-	/// Number of steps in an ordinary settlement, `None` for a recovery settlement.
-	pub ordinary_steps: Option<u32>,
+	pub kind: SettlementKind,
+}
+
+/// What the settlement event of a redemption reports beyond its amounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlementKind {
+	/// An ordinary walk that visited `steps` vaults.
+	Ordinary { steps: u32 },
+	/// A `FinalRecovery` head settled under `regime`.
+	Recovery { regime: crate::types::RecoveryRegime },
 }
 
 impl Settlement {
@@ -672,7 +849,7 @@ impl RedeemCall {
 					assert_eq!(collateral_id, self.collateral);
 					assert_eq!(stable_id, self.stable);
 					assert_eq!(recipient, self.recipient, "the vaults pay the named recipient");
-					vault_debt_cancelled += debt_cancelled;
+					vault_debt_cancelled += debt_cancelled.total();
 					vault_collateral_out += collateral_to_recipient;
 					continue;
 				},
@@ -695,7 +872,7 @@ impl RedeemCall {
 						insurance_cover: 0,
 						fee,
 						collateral_out,
-						ordinary_steps: Some(steps),
+						kind: SettlementKind::Ordinary { steps },
 					},
 				),
 				RuntimeEvent::Redemptions(
@@ -706,7 +883,7 @@ impl RedeemCall {
 						stable_burned,
 						insurance_cover,
 						collateral_out,
-						..
+						regime,
 					},
 				) => (
 					collateral_id,
@@ -717,7 +894,7 @@ impl RedeemCall {
 						insurance_cover,
 						fee: 0,
 						collateral_out,
-						ordinary_steps: None,
+						kind: SettlementKind::Recovery { regime },
 					},
 				),
 				_ => continue,
@@ -742,7 +919,7 @@ impl RedeemCall {
 }
 
 /// Parks `owner`'s vault in `FinalRecovery`. Any account may sign the call; the caller sets up
-/// its preconditions: the market's last eligible vault, below the MCR.
+/// its preconditions: the branch's last eligible vault, below the MCR.
 pub fn enter_final_recovery(
 	collateral: AssetId,
 	stable: StableId,
@@ -757,27 +934,27 @@ pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
 	<Assets as FungiblesMutate<AccountId>>::mint_into(stable, &who, amount).expect("mint stable");
 }
 
-/// Funds `who` with a `pallet-assets` collateral. Genesis funds only [`DOT`].
-pub fn mint_collateral(collateral: AssetIdForAssets, who: AccountId, amount: Balance) {
-	<Assets as FungiblesMutate<AccountId>>::mint_into(collateral, &who, amount)
-		.expect("mint collateral");
+parameter_types! {
+	/// How many of this pallet's events [`redemption_events_since_last_call`] has returned. It
+	/// lives in storage so that `hypothetically!` rolls it back with the events it counts.
+	storage ObservedRedemptionEvents: u32 = 0;
+}
+
+/// This pallet's events deposited since the previous call, in order.
+pub fn redemption_events_since_last_call() -> Vec<crate::Event<Test>> {
+	let events = System::read_events_for_pallet::<crate::Event<Test>>();
+	let observed = usize::try_from(ObservedRedemptionEvents::get())
+		.expect("a u32 count fits usize on every supported target; qed");
+	assert!(observed <= events.len(), "events are only cleared by the setup");
+	ObservedRedemptionEvents::set(
+		&u32::try_from(events.len()).expect("a test deposits fewer than u32::MAX events; qed"),
+	);
+	events.into_iter().skip(observed).collect()
 }
 
 /// Advances the timestamp by `ms` without advancing the block number.
 pub fn advance_time(ms: Moment) {
 	Timestamp::set_timestamp(Timestamp::get() + ms);
-}
-
-/// Overwrites the stablecoin's fee state, stamped now so the next redemption starts from exactly
-/// `rate`.
-pub fn set_dynamic_fee(stable: StableId, rate: FixedU128) {
-	pallet_redemptions::RedemptionStates::<Test>::insert(
-		stable,
-		pallet_redemptions::RedemptionState {
-			dynamic_fee: rate,
-			last_fee_operation: Timestamp::get(),
-		},
-	);
 }
 
 /// Total `collateral` balance of `who`, held or free.
@@ -801,7 +978,7 @@ pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Bala
 		.unwrap_or_default()
 }
 
-/// Debt across every market on `stable`: the denominator of the dynamic-fee increase.
+/// Debt across every branch on `stable`: the denominator of the dynamic-fee increase.
 pub fn stablecoin_debt(stable: StableId) -> Balance {
 	pallet_vaults::Pallet::<Test>::stablecoin_debt(&stable)
 }

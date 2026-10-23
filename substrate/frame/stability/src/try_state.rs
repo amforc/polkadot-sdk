@@ -3,7 +3,7 @@
 //! These checks protect four contracts:
 //!
 //! - Accumulators stay within the configured precision limits.
-//! - Pool custody equals the recorded stablecoin and collateral totals.
+//! - Pool custody covers the recorded stablecoin and collateral totals.
 //! - The sum of user positions does not exceed each pool total.
 //! - Cohort aggregates and checkpoints cover all member rows that reference them.
 
@@ -18,7 +18,7 @@ use frame::{
 	prelude::ensure,
 };
 
-/// Member counts and claims derived from the deposit rows of one market.
+/// Member counts and claims derived from the deposit rows of one branch.
 ///
 /// The checks compare these values with cohort aggregates and checkpoints.
 #[derive(Default)]
@@ -61,10 +61,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			ensure!(sums.g_yield.is_zero(), "pending sums row carries a nonzero `G`");
 		}
 
-		// This holds as an equality, not as an inequality: every stablecoin that enters or leaves
-		// the pool account moves exactly one total with it, and a rounding remainder stays inside
-		// those totals rather than outside them. The custody float sits on top and only moves at
-		// removal.
+		// Direct transfers can add unowned surplus at any time. Obligations and the refundable
+		// custody float must remain fully backed; donations leave through the removal sweep.
 		let pool_account = Pallet::<T>::pool_account(&collateral_id, &stable_id);
 		let stable_held = T::StableAssets::balance(stable_id.clone(), &pool_account);
 		let stable_owed = state
@@ -72,14 +70,11 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			.saturating_add(state.total_pending_deposits)
 			.saturating_add(state.total_yield_unclaimed)
 			.saturating_add(pool.custody_stable);
-		ensure!(stable_held == stable_owed, "pool stablecoin balance diverges from tracked totals");
+		ensure!(stable_held >= stable_owed, "pool stablecoin balance below tracked totals");
 		let collateral_held = T::CollateralAssets::balance(collateral_id.clone(), &pool_account);
 		let collateral_owed =
 			state.total_collateral_gains_unclaimed.saturating_add(pool.custody_collateral);
-		ensure!(
-			collateral_held == collateral_owed,
-			"pool collateral balance diverges from tracked totals"
-		);
+		ensure!(collateral_held >= collateral_owed, "pool collateral balance below tracked totals");
 		// The float is what lets every claim leave the minimum balance behind. A minimum raised
 		// after registration is the one case the float does not cover, and it must be visible.
 		ensure!(
@@ -113,9 +108,15 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		// every realized value at or below the total, and the difference belongs to nobody; it
 		// leaves with an epoch reset or with the teardown sweep.
 		let mut pending_sum = BalanceOf::<T>::zero();
-		let mut compounded_sum = BalanceOf::<T>::zero();
+		let mut remaining_principal_sum = BalanceOf::<T>::zero();
+		// A claim subtracts the stored claimable balance plus every gain the next settlement
+		// realizes, so both count against the unclaimed totals.
+		let mut collateral_sum = BalanceOf::<T>::zero();
+		let mut yield_sum = BalanceOf::<T>::zero();
 		let mut tallies = CohortTallies::<BalanceOf<T>>::default();
 		for (_, deposit) in Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone())) {
+			collateral_sum.saturating_accrue(deposit.claimable_collateral);
+			yield_sum.saturating_accrue(deposit.claimable_yield);
 			if let Some(pending) = &deposit.pending_deposit {
 				let open = state.cohort(pending.cohort);
 				let checkpoint =
@@ -145,12 +146,13 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							realized.yield_gain.is_zero(),
 							"pending deposit realized a yield gain"
 						);
-						pending_sum.saturating_accrue(realized.compounded);
+						pending_sum.saturating_accrue(realized.remaining_principal);
+						collateral_sum.saturating_accrue(realized.collateral_gain);
 						tallies
 							.claims
 							.entry(pending.cohort)
 							.or_default()
-							.saturating_accrue(realized.compounded);
+							.saturating_accrue(realized.remaining_principal);
 					},
 					(None, Some(checkpoint)) => {
 						let phase_one = Pallet::<T>::realize_between(
@@ -168,7 +170,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							"checkpointed tranche realized a yield gain"
 						);
 						let claims = tallies.claims.entry(pending.cohort).or_default();
-						claims.saturating_accrue(phase_one.compounded);
+						claims.saturating_accrue(phase_one.remaining_principal);
 						ensure!(
 							*claims <= checkpoint.activated,
 							"member claims exceed the activated cohort capital"
@@ -180,11 +182,14 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							&stable_id,
 							Leg::Active,
 							&pool,
-							phase_one.compounded,
+							phase_one.remaining_principal,
 							&checkpoint.active_start,
 						)
 						.map_err(|_| "checkpoint active start has no sums row")?;
-						compounded_sum.saturating_accrue(phase_two.compounded);
+						remaining_principal_sum.saturating_accrue(phase_two.remaining_principal);
+						collateral_sum.saturating_accrue(phase_one.collateral_gain);
+						collateral_sum.saturating_accrue(phase_two.collateral_gain);
+						yield_sum.saturating_accrue(phase_two.yield_gain);
 					},
 				}
 				*tallies.members.entry(pending.cohort).or_default() += 1;
@@ -199,20 +204,38 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				&deposit.snapshot,
 			)
 			.map_err(|_| "deposit snapshot has no sums row")?;
-			compounded_sum.saturating_accrue(realized.compounded);
+			remaining_principal_sum.saturating_accrue(realized.remaining_principal);
+			collateral_sum.saturating_accrue(realized.collateral_gain);
+			yield_sum.saturating_accrue(realized.yield_gain);
 		}
 		ensure!(
 			pending_sum <= state.total_pending_deposits,
 			"realized pending deposits exceed `total_pending_deposits`"
 		);
 		ensure!(
-			compounded_sum <= state.total_active_deposits,
+			remaining_principal_sum <= state.total_active_deposits,
 			"realized deposits exceed `total_active_deposits`"
+		);
+		ensure!(
+			collateral_sum <= state.total_collateral_gains_unclaimed,
+			"claimable collateral exceeds `total_collateral_gains_unclaimed`"
+		);
+		ensure!(
+			yield_sum <= state.total_yield_unclaimed,
+			"claimable yield exceeds `total_yield_unclaimed`"
 		);
 
 		// The cohort bookkeeping must cover the rows that reference it: member counts move in
 		// step with the rows, and the ceiling-compounded aggregate never falls below the floored
 		// member claims it will have to pay at advancement.
+		ensure!(
+			state.cohorts_covered(
+				&state.pending_coords,
+				config.precision.scale_factor(),
+				state.total_pending_deposits,
+			),
+			"cohort reserves exceed total pending deposits"
+		);
 		for cohort in &state.open_cohorts {
 			ensure!(
 				tallies.members.get(&cohort.id).copied().unwrap_or(0) == cohort.members,
@@ -246,7 +269,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		}
 	}
 
-	// A pool row is what makes a market registered, so nothing may outlive one.
+	// A pool row is what makes a branch registered, so nothing may outlive one.
 	for ((collateral_id, stable_id, _who), deposit) in Deposits::<T>::iter() {
 		let state = Pools::<T>::get(&collateral_id, &stable_id)
 			.ok_or("deposit row without a pool row")?
@@ -287,7 +310,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		);
 	}
 
-	// Market removal clears every sums row: no row may outlive its pool.
+	// Branch removal clears every sums row: no row may outlive its pool.
 	for (collateral_id, stable_id, _leg, _epoch, _scale) in PoolSumsStore::<T>::iter_keys() {
 		ensure!(
 			Pools::<T>::contains_key(&collateral_id, &stable_id),
@@ -296,7 +319,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 	}
 
 	// No checkpoint may outlive the rows that reference it: every stored checkpoint belongs to a
-	// registered market, and the per-market loop above already matched member counts.
+	// registered branch, and the per-branch loop above already matched member counts.
 	for (collateral_id, stable_id, _id) in CohortCheckpoints::<T>::iter_keys() {
 		ensure!(
 			Pools::<T>::contains_key(&collateral_id, &stable_id),

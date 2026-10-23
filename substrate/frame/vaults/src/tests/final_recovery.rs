@@ -44,9 +44,7 @@ fn reward_events() -> Vec<(AccountId, AccountId, Balance)> {
 
 #[test]
 fn final_recovery_queue_is_fifo_across_multiple_vaults() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(1));
 		enter_recovery(2, percent(2));
 		enter_recovery(3, percent(3));
@@ -60,7 +58,7 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 				.map(|(owner, _status)| owner),
 			Some(1)
 		);
-		// The timestamp and cooldown apply to the market. Thus, only the first entry pays.
+		// The timestamp and cooldown apply to the branch. Thus, only the first entry pays.
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
 		assert_eq!(market_state(DOT, STABLE).last_final_recovery_entry, Some(Timestamp::get()));
 	});
@@ -68,8 +66,7 @@ fn final_recovery_queue_is_fifo_across_multiple_vaults() {
 
 #[test]
 fn enter_final_recovery_is_an_idempotent_noop() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		advance_time(ONE_YEAR_MS);
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
@@ -80,6 +77,7 @@ fn enter_final_recovery_is_an_idempotent_noop() {
 		assert_storage_noop!(
 			post_info = enter_final_recovery(KEEPER, DOT, STABLE, 1).expect("a no-op succeeds")
 		);
+
 		assert_eq!(post_info.pays_fee, Pays::Yes);
 	});
 }
@@ -88,8 +86,7 @@ fn enter_final_recovery_is_an_idempotent_noop() {
 // keeper the liquidation reward out of the vault, and the vault keeps only the rest.
 #[test]
 fn final_recovery_entry_pays_the_keeper_from_the_vault() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_eq!(collateral_balance(DOT, KEEPER), 0, "keeper is fresh");
 
 		enter_recovery(1, percent(5));
@@ -119,8 +116,7 @@ fn final_recovery_entry_pays_the_keeper_from_the_vault() {
 // resolutions of identical vaults pay identical rewards.
 #[test]
 fn final_recovery_entry_pays_what_liquidation_pays() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 		// The pool covers the first liquidation whole, so nothing redistributes onto vault 2.
@@ -143,12 +139,11 @@ fn final_recovery_entry_pays_what_liquidation_pays() {
 }
 
 // Exit is permissionless and unpaid. Without a cooldown, a caller can repeatedly move a vault
-// across the MCR and collect rewards. Only a paid entry resets the market cooldown: an unpaid one
+// across the MCR and collect rewards. Only a paid entry resets the branch cooldown: an unpaid one
 // must not push the next honest keeper's reward further out.
 #[test]
 fn final_recovery_reward_cooldown_blocks_flipping() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD);
 		let first_entry = market_state(DOT, STABLE).last_final_recovery_entry.expect("stamped");
@@ -164,6 +159,7 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 		// the timestamp where the paid entry put it.
 		advance_time(cooldown / 2);
 		let post_info = flip(KEEPER);
+
 		assert_eq!(post_info.pays_fee, Pays::No);
 		assert!(vault_status(DOT, STABLE, 1).is_final_recovery());
 		assert_eq!(reward_events(), vec![(1, KEEPER, ENTRY_REWARD)]);
@@ -176,6 +172,7 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 		// which rounds to nothing. This paid entry moves the timestamp.
 		advance_time(cooldown / 2);
 		flip(KEEPER);
+
 		assert_eq!(reward_events(), vec![(1, KEEPER, ENTRY_REWARD), (1, KEEPER, 100)]);
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD + 100);
 		assert_eq!(held(DOT, 1), 1_000 - ENTRY_REWARD - 100);
@@ -184,7 +181,7 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 			Some(first_entry + cooldown)
 		);
 
-		// A market may switch the protection off, after which every entry pays.
+		// A branch may switch the protection off, after which every entry pays.
 		assert_ok!(crate::Pallet::<Test>::set_param(
 			RuntimeOrigin::signed(ADMIN),
 			DOT,
@@ -192,13 +189,14 @@ fn final_recovery_reward_cooldown_blocks_flipping() {
 			crate::types::BranchConfigUpdate::FinalRecoveryRewardCooldown(0)
 		));
 		flip(KEEPER);
+
 		assert_eq!(collateral_balance(DOT, KEEPER), ENTRY_REWARD + 100 + 100);
 	});
 }
 
 #[test]
 fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
 		register_market_with(DOT, STABLE, DEFAULT_PRICE, config);
 		assert_ok!(open(1, DOT, STABLE, 1_040, 500, percent(5)));
@@ -218,6 +216,7 @@ fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
 			liquidate(KEEPER, DOT, STABLE, 1, 0, 0),
 			crate::Error::<Test>::LastVaultCannotBeLiquidated
 		);
+
 		assert_ok!(enter_final_recovery(KEEPER, DOT, STABLE, 1));
 
 		assert!(vault_status(DOT, STABLE, 1).is_final_recovery());
@@ -225,7 +224,7 @@ fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
 		assert_eq!(vault(DOT, STABLE, 1).redistribution_stake, 0);
 		assert_eq!(market_state(DOT, STABLE).stakes.total, 0);
 		assert_eq!(market_state(DOT, STABLE).dormant_redemption_target, None);
-		assert_eq!(LinkedList::node(rate_list(DOT, STABLE), 1), None);
+		assert_eq!(LinkedList::node(VaultList::Rate(DOT, STABLE), 1), None);
 		assert_eq!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, STABLE), 10), vec![1]);
 		assert_event(crate::Event::VaultStatusChanged {
 			collateral_id: DOT,
@@ -239,7 +238,7 @@ fn last_unsafe_dormant_enters_recovery_and_releases_its_slot() {
 
 #[test]
 fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
 		register_market_with(DOT, STABLE, DEFAULT_PRICE, config);
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
@@ -255,7 +254,9 @@ fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 			enter_final_recovery(KEEPER, DOT, STABLE, 1),
 			crate::Error::<Test>::NotLastEligibleVault
 		);
+
 		assert_ok!(liquidate(KEEPER, DOT, STABLE, 1, 0, 0));
+
 		assert!(!vault_exists(DOT, STABLE, 1));
 		assert_eq!(market_state(DOT, STABLE).dormant_redemption_target, None);
 		assert!(LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, STABLE), 10).is_empty());
@@ -266,7 +267,7 @@ fn unsafe_dormant_with_another_stake_bearer_uses_liquidation() {
 // keeps its collateral, pays no fee, and leaves the reward cooldown untouched.
 #[test]
 fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
-	build_and_execute(|| {
+	ExtBuilder::default().build_and_execute(|| {
 		let config = crate::BranchConfig { upfront_fee_period: 0, ..default_branch_config() };
 		register_market_with(DOT, STABLE, DEFAULT_PRICE, config.clone());
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
@@ -284,6 +285,7 @@ fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
 
 		let post_info =
 			enter_final_recovery(KEEPER, DOT, STABLE, 1).expect("recovery still enters");
+
 		assert_eq!(post_info.pays_fee, Pays::No);
 		assert_eq!(reward_events(), vec![]);
 		assert_eq!(collateral_balance(DOT, KEEPER), 0);
@@ -302,8 +304,7 @@ fn exhausting_recovery_reward_is_skipped_and_the_vault_still_enters() {
 
 #[test]
 fn enter_final_recovery_rejects_non_last_eligible_vault() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 		set_price(DOT, low_recovery_price());
@@ -319,8 +320,7 @@ fn enter_final_recovery_rejects_non_last_eligible_vault() {
 // last eligible recipient and cannot enter final recovery.
 #[test]
 fn debt_free_husk_keeps_the_branch_out_of_final_recovery() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		// The lower rate makes account 1 the first redemption target.
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
@@ -354,8 +354,7 @@ fn debt_free_husk_keeps_the_branch_out_of_final_recovery() {
 
 #[test]
 fn enter_final_recovery_rejects_vault_above_mcr() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		// Price 10 → CR = 1000·10/500 = 2000% ≫ MCR 110%, far too healthy for FR.
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 
@@ -368,9 +367,7 @@ fn enter_final_recovery_rejects_vault_above_mcr() {
 
 #[test]
 fn final_recovery_middle_exit_splices_queue() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(1));
 		enter_recovery(2, percent(2));
 		enter_recovery(3, percent(3));
@@ -388,10 +385,10 @@ fn final_recovery_middle_exit_splices_queue() {
 
 #[test]
 fn exit_final_recovery_rejects_non_final_recovery_vault() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		// A plain Active vault is not in the FIFO, so exiting it is invalid.
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+
 		assert_noop!(
 			exit_final_recovery(99, DOT, STABLE, 1),
 			crate::Error::<Test>::InvalidVaultStatus
@@ -401,10 +398,10 @@ fn exit_final_recovery_rejects_non_final_recovery_vault() {
 
 #[test]
 fn frozen_branch_rejects_enter_final_recovery() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
+
 		// The frozen check precedes the CR / last-eligible checks.
 		assert_noop!(enter_final_recovery(99, DOT, STABLE, 1), crate::Error::<Test>::BranchFrozen);
 	});
@@ -412,10 +409,10 @@ fn frozen_branch_rejects_enter_final_recovery() {
 
 #[test]
 fn frozen_branch_rejects_exit_final_recovery() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
+
 		assert_noop!(exit_final_recovery(99, DOT, STABLE, 1), crate::Error::<Test>::BranchFrozen);
 		assert!(vault_status(DOT, STABLE, 1).is_final_recovery());
 	});
@@ -425,8 +422,7 @@ fn frozen_branch_rejects_exit_final_recovery() {
 // that leaves residual collateral keeps the owner's claim on it as a Dormant vault.
 #[test]
 fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		// Restore the price so the recipient's collateral payout is affordable.
 		set_price(DOT, DEFAULT_PRICE);
@@ -462,8 +458,7 @@ fn redemption_zeroing_final_recovery_vault_makes_it_dormant() {
 
 #[test]
 fn final_recovery_blocks_borrow_withdraw_and_change_rate() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 
 		assert_noop!(borrow(1, DOT, STABLE, 100, None), crate::Error::<Test>::VaultInFinalRecovery);
@@ -482,8 +477,7 @@ fn final_recovery_blocks_borrow_withdraw_and_change_rate() {
 // in Safety Mode. A partial payoff leaves the vault queued and outside stake accounting.
 #[test]
 fn final_recovery_accepts_partial_repayment_and_stays_queued() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		let debt_before = vault(DOT, STABLE, 1).debt.total();
 
@@ -500,8 +494,7 @@ fn final_recovery_accepts_partial_repayment_and_stays_queued() {
 // The minimum-debt floor applies to a recovery vault as to any other: a payoff cannot leave dust.
 #[test]
 fn final_recovery_repayment_cannot_leave_dust() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		let debt = vault(DOT, STABLE, 1).debt.total();
 
@@ -516,9 +509,9 @@ fn final_recovery_repayment_cannot_leave_dust() {
 // the rate index with its stake restored.
 #[test]
 fn final_recovery_repayment_then_exit_rejoins_rate_index() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
+
 		// The 899 of collateral left after the entry reward is worth 449 at 0.5 against 501 of
 		// debt: still below the 110% MCR.
 		set_price(DOT, FixedU128::from_rational(1u128, 2u128));
@@ -541,8 +534,7 @@ fn final_recovery_repayment_then_exit_rejoins_rate_index() {
 // debt-free Dormant husk that keeps its collateral and rejoins stake accounting.
 #[test]
 fn final_recovery_full_repayment_leaves_dormant_husk() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		// Cover the upfront fee that the borrowed principal does not include.
 		mint_stable(STABLE, 1, 10);
@@ -576,8 +568,7 @@ fn final_recovery_full_repayment_leaves_dormant_husk() {
 // A freeze must not lock owners out of the one action that can still rescue a recovery vault.
 #[test]
 fn frozen_branch_accepts_deposit_into_final_recovery_vault() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
 
@@ -591,8 +582,7 @@ fn frozen_branch_accepts_deposit_into_final_recovery_vault() {
 
 #[test]
 fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		enter_recovery(2, percent(5));
 		// Restore price so CR sits comfortably above MCR after partial redemption.
@@ -603,6 +593,7 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 		let v = vault(DOT, STABLE, 1);
 		assert!(v.debt.total() > 0);
 		assert!(v.debt.total() < 200);
+
 		// The Dormant-exit branch never re-inserts into the rate index, so the
 		// hint is ignored. Pass a deliberately invalid one to prove it.
 		assert_ok!(crate::Pallet::<Test>::exit_final_recovery(
@@ -612,6 +603,7 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 			1,
 			Position::between(999, 998)
 		));
+
 		// Vault is no longer in FR FIFO and not in the rate index — it's Dormant.
 		assert!(vault_status(DOT, STABLE, 1).is_dormant());
 		assert_eq!(
@@ -628,8 +620,7 @@ fn exit_final_recovery_to_dormant_when_debt_below_minimum() {
 // rejected and the vault stays in FinalRecovery.
 #[test]
 fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		enter_recovery(2, percent(5));
 		set_price(DOT, DEFAULT_PRICE);
@@ -639,6 +630,7 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 
 		// First exit parks vault 1 in the (empty) dormant slot.
 		assert_ok!(exit_final_recovery(99, DOT, STABLE, 1));
+
 		assert!(vault_status(DOT, STABLE, 1).is_dormant());
 		assert_eq!(market_state(DOT, STABLE).dormant_redemption_target, Some(1));
 
@@ -655,8 +647,7 @@ fn exit_final_recovery_rejected_when_dormant_slot_occupied() {
 
 #[test]
 fn final_recovery_rescue_deposit_then_exit() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 
 		// At the crash price the vault is deep underwater; top up enough
@@ -676,15 +667,16 @@ fn final_recovery_rescue_deposit_then_exit() {
 // so a recovered price alone must not move the vault out on a touch.
 #[test]
 fn poke_does_not_exit_final_recovery() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		set_price(DOT, DEFAULT_PRICE);
 
 		assert_ok!(poke(99, DOT, STABLE, 1));
+
 		assert!(vault_status(DOT, STABLE, 1).is_final_recovery());
 
 		assert_ok!(exit_final_recovery(99, DOT, STABLE, 1));
+
 		assert!(vault_status(DOT, STABLE, 1).is_active());
 	});
 }
@@ -693,9 +685,7 @@ fn poke_does_not_exit_final_recovery() {
 // Dormant target through the FIFO to preserve the normal lifecycle.
 #[test]
 fn redemption_queue_gates_on_final_recovery() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(1));
 		enter_recovery(2, percent(2));
 		enter_recovery(3, percent(3));
@@ -715,8 +705,7 @@ fn redemption_queue_gates_on_final_recovery() {
 
 #[test]
 fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(1));
 		enter_recovery(2, percent(2));
 
@@ -726,6 +715,7 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 		assert_ok!(exit_final_recovery(42, DOT, STABLE, 1));
 		set_price(DOT, low_recovery_price());
 		assert_ok!(enter_final_recovery(KEEPER, DOT, STABLE, 1));
+
 		assert_eq!(
 			LinkedList::iter_from_tail(VaultList::FinalRecovery(DOT, STABLE), 10),
 			alloc::vec![2, 1]
@@ -749,8 +739,7 @@ fn final_recovery_re_entry_queues_behind_with_strict_priorities() {
 // recovery settlement usually runs in.
 #[test]
 fn full_settlement_of_a_final_recovery_vault_closes_it() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_recovery(1, percent(5));
 		assert!(vault_deposit_held(DOT, 1) > 0);
 
