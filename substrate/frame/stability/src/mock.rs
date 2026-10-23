@@ -1059,7 +1059,7 @@ pub fn offset_with(
 	branch: BranchSnapshot,
 	debt: OffsetLegs<Balance>,
 	collateral: OffsetLegs<(AssetId, Balance)>,
-) -> Result<Option<crate::pallet::StableCreditOf<Test>>, DispatchError> {
+) -> Result<crate::pallet::StableCreditOf<Test>, DispatchError> {
 	let (collateral_id, stable_id) = market;
 	let credits = OffsetLegs {
 		active: issue_collateral(collateral.active.0, collateral.active.1),
@@ -1143,7 +1143,7 @@ pub fn simulate_offset(
 		OffsetLegs { active: active_collateral, pending: pending_collateral },
 	)
 	.expect("quoted legs settle");
-	let given_up = burned.as_ref().map_or(0, |credit| credit.peek());
+	let given_up = burned.peek();
 	assert_eq!(given_up, active + pending, "the pool gives up exactly the debt it cancels");
 	SimulatedOffset { active, pending, leftover: credit.peek() }
 }
@@ -1199,10 +1199,10 @@ pub fn assert_vault_redeemed(owner: AccountId, debt: Balance, collateral: Balanc
 			record.event,
 			RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed {
 				owner: redeemed,
-				debt_cancelled,
+				ref debt_cancelled,
 				collateral_to_recipient,
 				..
-			}) if redeemed == owner && debt_cancelled == debt && collateral_to_recipient == collateral
+			}) if redeemed == owner && debt_cancelled.total() == debt && collateral_to_recipient == collateral
 		)
 	});
 	assert!(reported, "no `VaultRedeemed` for vault {owner}: debt {debt}, collateral {collateral}");
