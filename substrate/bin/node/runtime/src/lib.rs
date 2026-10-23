@@ -3378,7 +3378,7 @@ parameter_types! {
 		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::VaultCreationDeposit);
 	pub const VaultsVaultDepositBase: Balance = 0;
 	pub const VaultsVaultDepositPerByte: Balance = 100 * DOLLARS / 1024;
-	/// Governance envelope every permissionlessly-created market config must sit
+	/// Governance envelope every permissionlessly-created branch config must sit
 	/// inside.
 	pub VaultsBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
 		pallet_vaults::types::BranchConfigBounds {
@@ -3434,7 +3434,7 @@ impl stablecoin_primitives::ProvidePrice for VaultsOracleAdapter {
 	}
 }
 
-/// `CreateOrigin` for permissionless market creation. Root creates deposit-free
+/// `CreateOrigin` for permissionless branch creation. Root creates deposit-free
 /// (`None`); the stablecoin asset's owner creates with a refundable deposit
 /// (`Some(who)`); every other origin is rejected.
 pub type VaultsCreateOrigin = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
