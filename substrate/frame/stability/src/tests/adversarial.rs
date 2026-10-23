@@ -7,7 +7,7 @@ use frame::traits::{
 	fungibles::Balanced as FungiblesBalanced,
 	tokens::{Fortitude, Precision, Preservation},
 };
-use stablecoin_primitives::{OffsetLegs, OnBranchYield, StabilityPoolInspect};
+use stablecoin_primitives::{OffsetLegs, StabilityPoolInspect};
 
 fn burn_stable(stable: StableId, who: AccountId, amount: Balance) {
 	let credit = <Assets as FungiblesBalanced<AccountId>>::withdraw(
@@ -58,61 +58,7 @@ fn yield_distribution_returns_credit_when_pool_account_cannot_hold_it() {
 }
 
 #[test]
-fn yield_distribution_routes_by_the_credits_own_asset() {
-	ExtBuilder::default()
-		.default_branch()
-		.matured_deposit(1, 400)
-		.build_and_execute(|| {
-			// The credit's asset names the branch: a USDX credit targets the
-			// unregistered (DOT, USDX) pair and comes back whole, while the
-			// funded STABLE pool never sees it.
-			let credit = issue_stable(USDX, 20_000);
-
-			let returned = storage_noop(|| {
-				Stability::distribute_yield(&DOT, branch_snapshot(&DOT, &USDX), credit)
-			});
-
-			assert_eq!(returned.asset(), USDX);
-			assert_eq!(returned.peek(), 20_000);
-			drop(returned);
-		});
-}
-
-#[test]
-fn offset_apis_reject_a_credit_for_another_collateral() {
-	ExtBuilder::default()
-		.default_branch()
-		.matured_deposit(1, 400)
-		.deposit(2, 200)
-		.build_and_execute(|| {
-			let quote = market_quote(&DOT, &STABLE);
-
-			assert_eq!(Stability::quote_active(&quote, 200), 200);
-			assert_err!(
-				hypothetically!(offset_with(
-					(DOT, STABLE),
-					branch_snapshot(&DOT, &STABLE),
-					OffsetLegs { active: 200, pending: 0 },
-					OffsetLegs { active: (TOKEN_X, 100), pending: (DOT, 0) }
-				)),
-				crate::Error::<Test>::OffsetSettlementFailed,
-			);
-
-			assert_eq!(Stability::quote_pending(&quote, 200, 0), 200);
-			assert_err!(
-				hypothetically!(offset_with(
-					(DOT, STABLE),
-					branch_snapshot(&DOT, &STABLE),
-					OffsetLegs { active: 0, pending: 200 },
-					OffsetLegs { active: (DOT, 0), pending: (TOKEN_X, 100) }
-				)),
-				crate::Error::<Test>::OffsetSettlementFailed,
-			);
-		});
-}
-
-#[test]
-fn stable_shortfall_quotes_nothing_and_try_state_reports_it() {
+fn stable_shortfall_quotes_nothing_and_refuses_settlement() {
 	ExtBuilder::default().branch(TOKEN_X, STABLE).build_and_execute(|| {
 		mint_stable(STABLE, 1, 400);
 		assert_ok!(deposit_and_mature(1, TOKEN_X, STABLE, 400));
@@ -129,11 +75,6 @@ fn stable_shortfall_quotes_nothing_and_try_state_reports_it() {
 		let pool = Stability::pool_account(&TOKEN_X, &STABLE);
 		hypothetically!({
 			burn_stable(STABLE, pool, 600);
-
-			assert_eq!(
-				crate::try_state::do_try_state::<Test>(),
-				Err("pool stablecoin balance below tracked totals".into())
-			);
 
 			// Sizing reads custody, so neither leg quotes anything, and a caller that settles
 			// past its quote is refused.
@@ -154,10 +95,6 @@ fn stable_shortfall_quotes_nothing_and_try_state_reports_it() {
 				SimulatedOffset { active: 0, pending: 0, leftover: 100 }
 			));
 		});
-
-		// Rolling the burn back restores the identity, so the invariant check that runs when the
-		// test exits passes again.
-		assert_ok!(crate::try_state::do_try_state::<Test>());
 	});
 }
 

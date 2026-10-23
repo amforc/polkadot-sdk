@@ -22,8 +22,8 @@ use stablecoin_primitives::{
 
 /// One authoritative price for a `FinalRecovery` head.
 ///
-/// Redemption execution, quotes, and Stability Pool offsets all consume this
-/// plan. Re-price with a smaller budget when the payer cannot fund it in full.
+/// Redemption execution and Stability Pool offsets both consume this plan. Re-price with a
+/// smaller budget when the payer cannot fund it in full.
 pub(crate) enum RecoveryPlan<Balance> {
 	AbovePar {
 		debt: Balance,
@@ -70,7 +70,7 @@ impl<Balance: Copy + Zero> RecoveryPlan<Balance> {
 	}
 }
 
-pub(crate) enum OffsetDecision<AccountId, Balance> {
+enum OffsetDecision<AccountId, Balance> {
 	NoTarget,
 	/// A head is queued but offers nothing to offset.
 	NotOffsettable,
@@ -203,7 +203,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Locate and price the recovery head for an offset, as a pure read.
-	pub(crate) fn offset_decision(
+	fn offset_decision(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		max_debt_to_cancel: BalanceOf<T>,

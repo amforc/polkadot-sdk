@@ -10,113 +10,105 @@ use stablecoin_primitives::StabilityPoolInspect;
 
 #[test]
 fn yield_distribution_activates_matured_capital_without_a_touch() {
-	ExtBuilder::default()
-		.default_branch()
-		.stable_balance(1, 600)
-		.deposit(1, 400)
-		.build_and_execute(|| {
-			// Before the deadline the capital is pending: the pool takes no yield for it.
-			assert_eq!(distribute_yield_leftover(DOT, STABLE, 40), 40);
+	ExtBuilder::default().default_branch().deposit(1, 400).build_and_execute(|| {
+		// Before the deadline the capital is pending: the pool takes no yield for it.
+		assert_yield_declined(DOT, STABLE, 40);
 
-			// Past the deadline, the distribution itself advances the cohort first: the 400 enters
-			// the denominator without anyone touching the row.
-			advance_time(9_000);
-			assert_eq!(distribute_yield_leftover(DOT, STABLE, 40), 0);
+		// Past the deadline, the distribution itself advances the cohort first: the 400 enters
+		// the denominator without anyone touching the row.
+		advance_time(9_000);
+		assert_eq!(distribute_yield_leftover(DOT, STABLE, 40), 0);
 
-			let state = pool_state(DOT, STABLE);
-			assert_eq!(state.total_active_deposits, 400);
-			assert_eq!(state.total_pending_deposits, 0);
-			assert!(state.open_cohorts.is_empty());
-			System::assert_has_event(market_event!(CohortActivated {
-				cohort: CohortId(0),
-				deadline: 10_000,
-				amount: 400,
-			}));
+		let state = pool_state(DOT, STABLE);
+		assert_eq!(state.total_active_deposits, 400);
+		assert_eq!(state.total_pending_deposits, 0);
+		assert!(state.open_cohorts.is_empty());
+		System::assert_has_event(market_event!(CohortActivated {
+			cohort: CohortId(0),
+			deadline: 10_000,
+			amount: 400,
+		}));
 
-			// The row itself is untouched; it still shows the tranche as pending.
-			let row = deposit_row(DOT, STABLE, 1).expect("row exists");
-			assert_eq!(row.active_deposit, 0);
-			assert_eq!(row.pending_deposit.expect("not yet settled").amount, 400);
+		// The row itself is untouched; it still shows the tranche as pending.
+		let row = deposit_row(DOT, STABLE, 1).expect("row exists");
+		assert_eq!(row.active_deposit, 0);
+		assert_eq!(row.pending_deposit.expect("not yet settled").amount, 400);
 
-			// The claim settles the row through the checkpoint and pays the yield earned since
-			// activation: delta_G = 40 / 400 = 0.1, so floor(400 * 0.1) = 40.
-			assert_claim_yield(1, 40);
-			let row = deposit_row(DOT, STABLE, 1).expect("row exists");
-			assert_eq!(row.active_deposit, 400);
-			assert!(row.pending_deposit.is_none());
-		});
+		// The claim settles the row through the checkpoint and pays the yield earned since
+		// activation: delta_G = 40 / 400 = 0.1, so floor(400 * 0.1) = 40.
+		assert_claim_yield(1, 40);
+		let row = deposit_row(DOT, STABLE, 1).expect("row exists");
+		assert_eq!(row.active_deposit, 400);
+		assert!(row.pending_deposit.is_none());
+	});
 }
 
 #[test]
 fn offsets_size_against_matured_capital_without_a_touch() {
-	ExtBuilder::default()
-		.default_branch()
-		.stable_balance(1, 600)
-		.deposit(1, 400)
-		.build_and_execute(|| {
-			// Deposited at t = 1_000: the cohort boundary lands at 10_000, and t = 9_999 is one
-			// millisecond short. The read-only sizing simulates the advancement and still finds
-			// no active capital, so an offset reaches the 400 only through the pending leg.
-			advance_time(8_999);
+	ExtBuilder::default().default_branch().deposit(1, 400).build_and_execute(|| {
+		// Deposited at t = 1_000: the cohort boundary lands at 10_000, and t = 9_999 is one
+		// millisecond short. The read-only sizing simulates the advancement and still finds
+		// no active capital, so an offset reaches the 400 only through the pending leg.
+		advance_time(8_999);
 
-			assert_storage_noop!({
-				let quote = market_quote(&DOT, &STABLE);
-				assert_eq!(Stability::quote_active(&quote, 400), 0);
-				assert_eq!(Stability::quote_pending(&quote, 100, 0), 100);
-			});
-			// The activation view agrees: one millisecond short, the 400 is still pending.
-			let view = Stability::pool_after_activation(DOT, STABLE).expect("pool registered");
-			assert_eq!((view.total_active_deposits, view.total_pending_deposits), (0, 400));
-			assert_eq!(view.open_cohorts.len(), 1);
-
-			// Exactly at t = 10_000 the same call sees the 400 as active, with the row and the pool
-			// untouched.
-			advance_time(1);
-
-			assert_storage_noop!({
-				let quote = market_quote(&DOT, &STABLE);
-				assert_eq!(Stability::quote_active(&quote, 400), 400);
-				assert_eq!(Stability::quote_pending(&quote, 400, 400), 0);
-			});
-			// The view reports the classification the quote used, while the stored totals still
-			// count the capital as pending until an operation commits the activation.
-			let view = storage_noop(|| Stability::pool_after_activation(DOT, STABLE))
-				.expect("pool registered");
-			assert_eq!((view.total_active_deposits, view.total_pending_deposits), (400, 0));
-			assert!(view.open_cohorts.is_empty());
-			let stored = pool_state(DOT, STABLE);
-			assert_eq!((stored.total_active_deposits, stored.total_pending_deposits), (0, 400));
-
-			// The transactional offset commits the same advancement and settles against it:
-			// P = 300/400 = 0.75, delta_S = 80 * (1/400) = 0.2.
-			let offset = simulate_offset(DOT, STABLE, 100, 80);
-
-			assert_eq!(offset, SimulatedOffset { active: 100, pending: 0, leftover: 0 });
-			let state = pool_state(DOT, STABLE);
-			assert_eq!(state.total_active_deposits, 300);
-			assert_eq!(state.total_pending_deposits, 0);
-			System::assert_has_event(market_event!(CohortActivated {
-				cohort: CohortId(0),
-				deadline: 10_000,
-				amount: 400,
-			}));
-			// Aggregate activation did not touch the depositor row.
-			let row = deposit_row(DOT, STABLE, 1).expect("row exists");
-			assert_eq!(row.active_deposit, 0);
-			assert_eq!(row.pending_deposit.expect("not yet settled").amount, 400);
-
-			// The row settles lazily: phase one carries the full 400 across the checkpoint, phase
-			// two prices the offset it lived through as active capital.
-			assert_ok!(settle(7, 1, DOT, STABLE));
-
-			let row = deposit_row(DOT, STABLE, 1).expect("row exists");
-			assert_eq!(row.active_deposit, 300);
-			assert_eq!(row.claimable_collateral, 80);
-			System::assert_has_event(market_event!(PendingDepositActivated {
-				depositor: 1,
-				amount: 400,
-			}));
+		assert_storage_noop!({
+			let quote = market_quote(&DOT, &STABLE);
+			assert_eq!(Stability::quote_active(&quote, 400), 0);
+			assert_eq!(Stability::quote_pending(&quote, 100, 0), 100);
 		});
+		// The activation view agrees: one millisecond short, the 400 is still pending.
+		let view = Stability::pool_after_activation(DOT, STABLE).expect("pool registered");
+		assert_eq!((view.total_active_deposits, view.total_pending_deposits), (0, 400));
+		assert_eq!(view.open_cohorts.len(), 1);
+
+		// Exactly at t = 10_000 the same call sees the 400 as active, with the row and the pool
+		// untouched.
+		advance_time(1);
+
+		assert_storage_noop!({
+			let quote = market_quote(&DOT, &STABLE);
+			assert_eq!(Stability::quote_active(&quote, 400), 400);
+			assert_eq!(Stability::quote_pending(&quote, 400, 400), 0);
+		});
+		// The view reports the classification the quote used, while the stored totals still
+		// count the capital as pending until an operation commits the activation.
+		let view = storage_noop(|| Stability::pool_after_activation(DOT, STABLE))
+			.expect("pool registered");
+		assert_eq!((view.total_active_deposits, view.total_pending_deposits), (400, 0));
+		assert!(view.open_cohorts.is_empty());
+		let stored = pool_state(DOT, STABLE);
+		assert_eq!((stored.total_active_deposits, stored.total_pending_deposits), (0, 400));
+
+		// The transactional offset commits the same advancement and settles against it:
+		// P = 300/400 = 0.75, delta_S = 80 * (1/400) = 0.2.
+		let offset = simulate_offset(DOT, STABLE, 100, 80);
+
+		assert_eq!(offset, SimulatedOffset { active: 100, pending: 0, leftover: 0 });
+		let state = pool_state(DOT, STABLE);
+		assert_eq!(state.total_active_deposits, 300);
+		assert_eq!(state.total_pending_deposits, 0);
+		System::assert_has_event(market_event!(CohortActivated {
+			cohort: CohortId(0),
+			deadline: 10_000,
+			amount: 400,
+		}));
+		// Aggregate activation did not touch the depositor row.
+		let row = deposit_row(DOT, STABLE, 1).expect("row exists");
+		assert_eq!(row.active_deposit, 0);
+		assert_eq!(row.pending_deposit.expect("not yet settled").amount, 400);
+
+		// The row settles lazily: phase one carries the full 400 across the checkpoint, phase
+		// two prices the offset it lived through as active capital.
+		assert_ok!(settle(7, 1, DOT, STABLE));
+
+		let row = deposit_row(DOT, STABLE, 1).expect("row exists");
+		assert_eq!(row.active_deposit, 300);
+		assert_eq!(row.claimable_collateral, 80);
+		System::assert_has_event(market_event!(PendingDepositActivated {
+			depositor: 1,
+			amount: 400,
+		}));
+	});
 }
 
 #[test]
@@ -341,7 +333,7 @@ fn freeze_halts_advancement_but_settles_committed_checkpoints() {
 
 		// A frozen branch cannot advance cohorts, but settling a row through a checkpoint that
 		// was committed before the freeze is pure bookkeeping and stays available.
-		MockOracleAvailable::set(false);
+		MockOracleAvailable::set(&false);
 		advance_time(10_000);
 		assert_ok!(settle(7, 2, DOT, STABLE));
 
@@ -356,7 +348,7 @@ fn freeze_halts_advancement_but_settles_committed_checkpoints() {
 		assert_eq!(row.claimable_yield, 30);
 		// Paying it out stays frozen.
 		assert_noop!(claim_yield(2, DOT, STABLE, 2), Error::<Test>::BranchFrozen);
-		MockOracleAvailable::set(true);
+		MockOracleAvailable::set(&true);
 		assert_ok!(claim_yield(2, DOT, STABLE, 2));
 
 		// The thaw lets the first operation activate the overdue cohort.

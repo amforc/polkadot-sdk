@@ -388,37 +388,6 @@ fn update_meta_for_insert<T: Config>(
 	Ok(list_created)
 }
 
-/// Insert `item` at `position` in `list_id`, fetching the neighbor and meta
-/// rows from storage. The caller is responsible for ensuring the position is
-/// valid; errors if `item` is already in the list.
-///
-/// Thin wrapper over [`insert_at_inner`] for callers that did not just run
-/// [`walk_repair`] (which already holds the fetched rows). All production
-/// paths go through `walk_repair`, so only tests drive this entry point
-/// directly (to exercise the defensive guards in isolation).
-///
-/// Returns `true` if this insert created the list (it was previously empty).
-#[cfg(test)]
-pub fn insert_at<T: Config>(
-	list_id: &T::ListId,
-	item: &T::ItemId,
-	priority: T::Priority,
-	position: Position<T::ItemId>,
-) -> Result<bool, ListError> {
-	ensure!(!ListNodes::<T>::contains_key(list_id, item), ListError::ItemAlreadyExists);
-
-	// Anti-cycle guard: a node must never be linked against itself. Checked
-	// before the fetches so a self-naming hint surfaces as the cycle it is
-	// rather than as a missing-neighbor row.
-	ensure!(!links_to(&position, item), corrupt("insert_at: item linked against itself"));
-
-	// A dangling side surfaces as `insert_at_inner`'s side/node disagreement.
-	let (prev_node, next_node) = neighbor_nodes::<T>(list_id, &position);
-	let meta = ListMetas::<T>::get(list_id);
-	let valid = ValidPosition { position, steps: 0, prev_node, next_node, meta };
-	insert_at_inner::<T>(list_id, item, priority, valid)
-}
-
 /// Splice `item` in at `valid.position`, whose rows the caller has already
 /// fetched: `prev_node`/`next_node` must be the stored nodes for
 /// `position.prev`/`position.next` (`None` on endpoint sides) and `meta` the
@@ -438,7 +407,7 @@ pub fn insert_at_inner<T: Config>(
 	// never yields such a position, so reaching it is internal corruption.
 	ensure!(!links_to(&position, item), corrupt("insert_at: item linked against itself"));
 	// Each `Some` side must come with its stored node; a dangling side here is
-	// corruption (the wrapper and `walk_repair` both guarantee agreement).
+	// corruption (`walk_repair` guarantees agreement).
 	ensure!(
 		position.prev.is_some() == prev_node.is_some(),
 		corrupt("insert_at: prev side and prev node disagree")

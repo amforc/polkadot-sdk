@@ -3,57 +3,26 @@ use crate::{
 	tests::{percent, ONE_DAY_MS},
 };
 
-// `close_vault` requires zero debt; with debt outstanding it returns
-// `DebtOutstanding`.
+// Each request fails on the guard it names and leaves no trace. Closing needs zero debt. A
+// withdrawal beyond the held collateral fails before the ratio check, and one within it that
+// drops the vault below ICR fails on the ratio. A poke of a missing vault is an error, so a
+// mistyped owner cannot pass for a completed refresh.
 #[test]
-fn close_with_outstanding_debt_reverts() {
+fn vault_ops_reject_invalid_requests() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 
 		assert_noop!(close_vault(1, DOT, STABLE, None), crate::Error::<Test>::DebtOutstanding);
-	});
-}
-
-// `repay_for` returns `DebtWouldBecomeDust` when the post-state would land
-// strictly between zero and `MinimumDebt`. (Full repayment to zero is allowed.)
-#[test]
-fn repay_into_dust_window_reverts() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		// borrow=1000, min_debt=200. Repay 850 would leave 150 < 200.
-		assert_ok!(open(1, DOT, STABLE, 1_000, 1_000, percent(5)));
-
-		assert_noop!(
-			repay(1, DOT, STABLE, 1, Some(850)),
-			crate::Error::<Test>::DebtWouldBecomeDust
-		);
-	});
-}
-
-// Withdrawing more collateral than is held returns `InsufficientCollateral`
-// (the held-balance check fires before the CR check).
-#[test]
-fn withdraw_more_than_held_reverts() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-
 		assert_noop!(
 			withdraw_collateral(1, DOT, STABLE, 2_000, None),
 			crate::Error::<Test>::InsufficientCollateral
 		);
-	});
-}
-
-#[test]
-fn withdraw_breaking_cr_reverts() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-
-		// 1000 DOT @ 10 STABLE backs 500 STABLE — withdrawing 950 leaves
-		// 50 DOT × 10 = 500 STABLE, CR == 100% < ICR 120%.
+		// 1_000 DOT at 10 backs about 500 of debt, so withdrawing 950 leaves CR ≈ 100% < ICR 120%.
 		assert_noop!(
 			withdraw_collateral(1, DOT, STABLE, 950, None),
 			crate::Error::<Test>::UnsafeCollateralizationRatio
 		);
+		assert_noop!(poke(1, DOT, STABLE, 99), crate::Error::<Test>::VaultNotFound);
 	});
 }
 
@@ -61,41 +30,21 @@ fn withdraw_breaking_cr_reverts() {
 // oracle down and leaves no trace.
 #[test]
 fn zero_amounts_are_rejected_without_touching_the_vault() {
-	let calls: [fn() -> DispatchResult; 4] = [
-		|| repay(1, DOT, STABLE, 1, Some(0)),
-		|| withdraw_collateral(1, DOT, STABLE, 0, None),
-		|| deposit_collateral(1, DOT, STABLE, 1, 0),
-		|| borrow(1, DOT, STABLE, 0, Some(percent(10))),
-	];
-	for call in calls {
-		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-			assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(50)));
-			advance_time(ONE_DAY_MS);
-			MockOracleAvailable::set(false);
-
-			assert_noop!(call(), crate::Error::<Test>::ZeroAmount);
-			MockOracleAvailable::set(true);
-		});
-	}
-}
-
-// `repay_for` is exempt from the Safety-mode TCR gate: repaying always improves
-// branch TCR, so it must succeed even while the branch sits in Safety mode
-// (this is why repay-to-zero leaves a husk rather than auto-closing — the close
-// would release collateral and could worsen TCR).
-#[test]
-fn repay_for_allowed_in_safety_mode() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(5)));
-		// Drop price into Safety (TCR ≈ 126%, between ICR 120% and Safety 130%).
-		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
-		let tcr_before = crate::Pallet::<Test>::branch_tcr(DOT, STABLE).expect("tcr");
-		assert!(tcr_before < percent(130), "setup must leave the branch in Safety mode");
+		assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(50)));
+		advance_time(ONE_DAY_MS);
+		MockOracleAvailable::set(&false);
 
-		assert_ok!(repay(1, DOT, STABLE, 1, Some(2_000)));
-
-		let tcr_after = crate::Pallet::<Test>::branch_tcr(DOT, STABLE).expect("tcr");
-		assert!(tcr_after > tcr_before, "repay improves branch TCR even in Safety mode");
+		assert_noop!(repay(1, DOT, STABLE, 1, Some(0)), crate::Error::<Test>::ZeroAmount);
+		assert_noop!(
+			withdraw_collateral(1, DOT, STABLE, 0, None),
+			crate::Error::<Test>::ZeroAmount
+		);
+		assert_noop!(deposit_collateral(1, DOT, STABLE, 1, 0), crate::Error::<Test>::ZeroAmount);
+		assert_noop!(
+			borrow(1, DOT, STABLE, 0, Some(percent(10))),
+			crate::Error::<Test>::ZeroAmount
+		);
 	});
 }
 

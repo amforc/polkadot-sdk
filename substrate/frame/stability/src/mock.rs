@@ -8,6 +8,8 @@
 //! while `AssetId::WithId` routes to `AssetsHolder`. Stablecoin [`STABLE`] holds to a unit, and
 //! [`USDX`] has six decimals, which the scale tests need.
 
+use alloc::collections::BTreeMap;
+
 use crate as pallet_stability;
 use crate::types::PoolPrecision;
 pub use crate::types::{
@@ -22,13 +24,14 @@ pub use frame::{
 	},
 };
 use frame::{
-	deps::sp_runtime::traits::ConvertInto,
+	deps::sp_runtime::traits::{ConvertInto, ConvertToValue},
+	prelude::DispatchResultWithPostInfo,
 	testing_prelude::*,
 	traits::{
-		fungible::{HoldConsideration, NativeFromLeft, NativeOrWithId},
+		fungible::{NativeFromLeft, NativeOrWithId},
 		fungibles::Balanced as FungiblesBalanced,
 		tokens::{fungible, imbalance::ResolveAssetTo},
-		AsEnsureOriginWithArg, Convert, IdentityLookup, LinearStoragePrice,
+		AsEnsureOriginWithArg, Convert, IdentityLookup,
 	},
 };
 use stablecoin_primitives::{
@@ -99,6 +102,7 @@ impl frame_system::Config for Test {
 	type Block = Block;
 	type AccountId = AccountId;
 	type AccountData = pallet_balances::AccountData<Balance>;
+	// The preset's lookup is pinned to its own `u64` account id.
 	type Lookup = IdentityLookup<Self::AccountId>;
 }
 
@@ -106,20 +110,13 @@ impl frame_system::Config for Test {
 impl pallet_balances::Config for Test {
 	type AccountStore = System;
 	type Balance = Balance;
-	type ExistentialDeposit = ConstU128<1>;
-	type RuntimeHoldReason = RuntimeHoldReason;
 }
 
-impl pallet_timestamp::Config for Test {
-	type Moment = Moment;
-	type OnTimestampSet = ();
-	type MinimumPeriod = ConstU64<1>;
-	type WeightInfo = ();
-}
+#[derive_impl(pallet_timestamp::config_preludes::TestDefaultConfig)]
+impl pallet_timestamp::Config for Test {}
 
 #[derive_impl(pallet_assets::config_preludes::TestDefaultConfig as pallet_assets::DefaultConfig)]
 impl pallet_assets::Config for Test {
-	type AssetId = AssetIdForAssets;
 	type CreateOrigin = AsEnsureOriginWithArg<frame_system::EnsureSigned<AccountId>>;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type Currency = Balances;
@@ -133,7 +130,6 @@ impl pallet_assets_holder::Config for Test {
 }
 
 parameter_types! {
-	pub const MaxHintRepairSteps: u32 = 16;
 	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
 	pub const StabilityPalletId: PalletId = PalletId(*b"py/stabl");
 }
@@ -143,7 +139,7 @@ impl pallet_linked_list::Config for Test {
 	type ListId = VaultList;
 	type ItemId = AccountId;
 	type Priority = FixedU128;
-	type MaxHintRepairSteps = MaxHintRepairSteps;
+	type MaxHintRepairSteps = ConstU32<16>;
 	type PriorityProvider = pallet_vaults::Pallet<Test>;
 }
 
@@ -166,36 +162,28 @@ pub type PoolCollateralAssets =
 pub struct MockOracle;
 parameter_types! {
 	/// The price [`MockOracle`] reports per collateral; a collateral with no entry has no price.
-	pub static MockPrices: alloc::collections::BTreeMap<AssetId, FixedU128> =
-		alloc::collections::BTreeMap::new();
+	pub storage MockPrices: BTreeMap<AssetId, FixedU128> = BTreeMap::new();
 	/// When `false`, [`MockOracle`] fails every query, modelling an oracle outage.
-	pub static MockOracleAvailable: bool = true;
+	pub storage MockOracleAvailable: bool = true;
 }
 impl ProvidePrice for MockOracle {
 	type AssetId = AssetId;
 
 	fn provide_price(collateral_id: &AssetId) -> Result<FixedU128, DispatchError> {
+		// Production adapters report a missing price as `Unavailable`. The pallet propagates the
+		// oracle's error, so a pallet error here would let tests assert what no runtime returns.
 		if !MockOracleAvailable::get() {
-			return Err(DispatchError::Other("oracle unavailable"));
+			return Err(DispatchError::Unavailable);
 		}
-		MockPrices::get()
-			.get(collateral_id)
-			.copied()
-			.ok_or(DispatchError::Other("no price"))
+		MockPrices::get().get(collateral_id).copied().ok_or(DispatchError::Unavailable)
 	}
 }
 
 /// Sets the price [`MockOracle`] reports for `collateral`.
 pub fn set_price(collateral: AssetId, price: FixedU128) {
-	MockPrices::mutate(|m| {
-		m.insert(collateral, price);
-	});
-}
-
-parameter_types! {
-	pub const MarketDepositReason: RuntimeHoldReason =
-		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
-	pub const MarketDepositBase: Balance = 1_000;
+	let mut prices = MockPrices::get();
+	prices.insert(collateral, price);
+	MockPrices::set(&prices);
 }
 
 /// Full admin of every branch a test helper registers.
@@ -215,14 +203,6 @@ pub fn branch_admins(
 /// anyone else is refused.
 pub type EnsureAssetOwner = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
-/// A flat, refundable 1_000-unit registration deposit, held in native balance.
-pub type VaultsConsideration = HoldConsideration<
-	AccountId,
-	Balances,
-	MarketDepositReason,
-	LinearStoragePrice<MarketDepositBase, ConstU128<0>, Balance>,
->;
-
 parameter_types! {
 	/// Bounds wide enough that the default branch config never touches them.
 	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
@@ -239,7 +219,7 @@ impl pallet_vaults::Config for Test {
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
-	type FeeAccount = FeeAccounts;
+	type FeeAccount = ConvertToValue<ConstU128<FEE_DEST>>;
 	// The pool takes its `yield_share` of every minted credit, and the fee destination
 	// receives the rest.
 	type YieldHook = Stability;
@@ -249,8 +229,8 @@ impl pallet_vaults::Config for Test {
 	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
-	type BranchConsideration = VaultsConsideration;
-	// These suites assert raw balances; vault deposits are the vaults suite's concern.
+	// These suites assert raw balances; branch and vault deposits are the vaults suite's concern.
+	type BranchConsideration = ();
 	type VaultConsideration = ();
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
@@ -305,17 +285,13 @@ pub type StabilityUpdateOrigin = EitherOf<
 	AsEnsureOriginWithArg<frame_system::EnsureRoot<AccountId>>,
 >;
 
-/// Where redemption fees go. Recovery offsets charge no fee, so only ordinary redemptions pay
-/// into it.
+/// Where the vault fees of every test stablecoin and the redemption fees go. Recovery offsets
+/// charge no fee, so only ordinary redemptions pay redemption fees into it.
 pub const FEE_DEST: AccountId = 888;
 
 /// Where branch teardown sends what is left in a pool account. It stands in for a treasury, and
 /// it is separate from [`FEE_DEST`] so that tests can tell the two streams apart.
 pub const DUST_DEST: AccountId = 889;
-
-parameter_types! {
-	pub const DustDestAccount: AccountId = DUST_DEST;
-}
 
 /// One insurance account per stablecoin. All are empty here, so every below-par head prices as
 /// `BelowPar`.
@@ -324,18 +300,6 @@ impl Convert<StableId, AccountId> for InsuranceFundAccounts {
 	fn convert(stable: StableId) -> AccountId {
 		700_000 + AccountId::from(stable)
 	}
-}
-
-/// Sends the vault fees of every test stablecoin to [`FEE_DEST`].
-pub struct FeeAccounts;
-impl Convert<StableId, AccountId> for FeeAccounts {
-	fn convert(_stable: StableId) -> AccountId {
-		FEE_DEST
-	}
-}
-
-parameter_types! {
-	pub const FeeDestAccount: AccountId = FEE_DEST;
 }
 
 /// The redemption parameters the first branch of a stablecoin registers with.
@@ -357,7 +321,7 @@ impl pallet_redemptions::Config for Test {
 	type Oracle = MockOracle;
 	type Vaults = Vaults;
 	type InsuranceFundAccount = InsuranceFundAccounts;
-	type FeeHandler = ResolveAssetTo<FeeDestAccount, Assets>;
+	type FeeHandler = ResolveAssetTo<ConstU128<FEE_DEST>, Assets>;
 	type TimeProvider = Timestamp;
 	type UpdateOrigin = EnsureAssetOwner;
 	type MaxRedemptionSteps = ConstU32<20>;
@@ -369,8 +333,8 @@ impl pallet_stability::Config for Test {
 	type CollateralAssets = PoolCollateralAssets;
 	type BranchInterface = Vaults;
 	type RecoveryOffsets = Redemptions;
-	type StableDustHandler = ResolveAssetTo<DustDestAccount, Assets>;
-	type CollateralDustHandler = ResolveAssetTo<DustDestAccount, PoolCollateralAssets>;
+	type StableDustHandler = ResolveAssetTo<ConstU128<DUST_DEST>, Assets>;
+	type CollateralDustHandler = ResolveAssetTo<ConstU128<DUST_DEST>, PoolCollateralAssets>;
 	type TimeProvider = Timestamp;
 	type UpdateOrigin = StabilityUpdateOrigin;
 	type PalletId = StabilityPalletId;
@@ -386,7 +350,7 @@ pub const TOKEN_X_ID: AssetIdForAssets = 1;
 pub const TOKEN_X: AssetId = AssetId::WithId(TOKEN_X_ID);
 
 /// An issued collateral whose minimum balance of 1_000 sits far above every other asset's, for
-/// the custody-float tests. [`create_high_min_collateral`] creates it.
+/// the custody-float tests.
 pub const HIGH_MIN_ID: AssetIdForAssets = 77;
 /// [`HIGH_MIN_ID`] as a collateral identifier.
 pub const HIGH_MIN: AssetId = AssetId::WithId(HIGH_MIN_ID);
@@ -405,42 +369,30 @@ pub const USDX_UNIT: Balance = 1_000_000;
 /// The minimum balance of [`USDX`]: one hundredth of a coin.
 pub const USDX_MIN_BALANCE: Balance = USDX_UNIT / 100;
 
-/// One step of the initial state an [`ExtBuilder`] lays down, in the order it was added.
-///
-/// Order is part of the state: each deposit joins the cohort its timestamp selects, and a
-/// matured deposit moves the clock for every step after it.
-enum SetupStep {
-	/// Creates the [`HIGH_MIN`] collateral asset.
-	HighMinCollateral,
-	/// Registers a branch through the vault engine.
-	Branch(BranchSetup),
-	/// Mints stablecoin [`STABLE`] to an account.
-	StableBalance { who: AccountId, amount: Balance },
-	/// Opens a vault in the default branch.
-	Vault { owner: AccountId, collateral: Balance, debt: Balance },
-	/// Deposits into the default pool behind the entry delay.
-	Deposit { who: AccountId, amount: Balance },
-	/// Deposits into the default pool and moves the clock to the deposit's deadline.
-	MaturedDeposit { who: AccountId, amount: Balance },
+/// A deposit an [`ExtBuilder`] makes into the default pool.
+struct SetupDeposit {
+	who: AccountId,
+	amount: Balance,
+	/// Whether the clock then moves to the deposit's cohort deadline.
+	matured: bool,
 }
 
-/// A branch an [`ExtBuilder`] registers.
-struct BranchSetup {
-	collateral_id: AssetId,
-	stable_id: StableId,
+/// Builds the test externalities: genesis with the stablecoin balances, then the branch, the
+/// vaults and the deposits, applied in that order through the real dispatchables.
+///
+/// Deposits keep the order they were added in: each joins the cohort its timestamp selects, and a
+/// matured deposit moves the clock for every deposit after it. The events the setup emits are
+/// cleared, so a test observes only its own.
+#[derive(Default)]
+pub struct ExtBuilder {
+	branch: Option<(AssetId, StableId)>,
 	/// `None` registers with [`branch_config_for`] the pair, which reads the asset minimums and
 	/// so can only be resolved inside the externalities.
 	branch_config: Option<pallet_vaults::BranchConfig<Balance>>,
-	pool_config: StabilityPoolConfig<Balance>,
-}
-
-/// Builds the test externalities: genesis first, then the initial state each builder method
-/// adds, applied in order through the real dispatchables.
-///
-/// The events the setup emits are cleared, so a test observes only its own.
-#[derive(Default)]
-pub struct ExtBuilder {
-	steps: Vec<SetupStep>,
+	pool_config: Option<StabilityPoolConfig<Balance>>,
+	stable_balances: Vec<(AccountId, Balance)>,
+	vaults: Vec<(AccountId, Balance, Balance)>,
+	deposits: Vec<SetupDeposit>,
 }
 
 impl ExtBuilder {
@@ -460,21 +412,11 @@ impl ExtBuilder {
 			.matured_deposit(1, 400)
 	}
 
-	/// Creates the [`HIGH_MIN`] collateral asset, which a branch on it needs first.
-	pub fn high_min_collateral(mut self) -> Self {
-		self.steps.push(SetupStep::HighMinCollateral);
-		self
-	}
-
 	/// Registers the `collateral`/`stable` branch with [`branch_config_for`] the pair and
 	/// [`default_pool_config`].
 	pub fn branch(mut self, collateral_id: AssetId, stable_id: StableId) -> Self {
-		self.steps.push(SetupStep::Branch(BranchSetup {
-			collateral_id,
-			stable_id,
-			branch_config: None,
-			pool_config: default_pool_config(),
-		}));
+		assert!(self.branch.is_none(), "the builder registers one branch");
+		self.branch = Some((collateral_id, stable_id));
 		self
 	}
 
@@ -483,19 +425,21 @@ impl ExtBuilder {
 		self.branch(DOT, STABLE)
 	}
 
-	/// Registers the most recently added branch with `config` instead.
+	/// Registers the branch with `config` instead.
 	pub fn branch_config(mut self, config: pallet_vaults::BranchConfig<Balance>) -> Self {
-		self.last_branch().branch_config = Some(config);
+		assert!(self.branch.is_some(), "a branch is added before it is configured");
+		self.branch_config = Some(config);
 		self
 	}
 
-	/// Registers the pool of the most recently added branch with `config` instead.
+	/// Registers the pool of the branch with `config` instead.
 	pub fn pool_config(mut self, config: StabilityPoolConfig<Balance>) -> Self {
-		self.last_branch().pool_config = config;
+		assert!(self.branch.is_some(), "a branch is added before it is configured");
+		self.pool_config = Some(config);
 		self
 	}
 
-	/// Registers the pool of the most recently added branch with the post-offset floor `min`.
+	/// Registers the pool of the branch with the post-offset floor `min`.
 	pub fn min_active_pool(self, min: Balance) -> Self {
 		self.pool_config(StabilityPoolConfig {
 			minimum_active_pool_balance: min,
@@ -503,39 +447,61 @@ impl ExtBuilder {
 		})
 	}
 
-	/// Mints `amount` of [`STABLE`] to `who`, on top of whatever its deposits mint.
+	/// Gives `who` `amount` of [`STABLE`] at genesis, on top of whatever its deposits mint.
 	pub fn stable_balance(mut self, who: AccountId, amount: Balance) -> Self {
-		self.steps.push(SetupStep::StableBalance { who, amount });
+		self.stable_balances.push((who, amount));
 		self
 	}
 
 	/// Opens a vault of `owner` in the default branch, minting the collateral it locks.
 	pub fn vault(mut self, owner: AccountId, collateral: Balance, debt: Balance) -> Self {
-		self.steps.push(SetupStep::Vault { owner, collateral, debt });
+		self.vaults.push((owner, collateral, debt));
 		self
 	}
 
 	/// Mints `amount` for `who` and deposits it into the default pool, where it starts pending.
 	pub fn deposit(mut self, who: AccountId, amount: Balance) -> Self {
-		self.steps.push(SetupStep::Deposit { who, amount });
+		self.deposits.push(SetupDeposit { who, amount, matured: false });
 		self
 	}
 
 	/// [`Self::deposit`], then moves the clock to the deposit's cohort deadline.
 	pub fn matured_deposit(mut self, who: AccountId, amount: Balance) -> Self {
-		self.steps.push(SetupStep::MaturedDeposit { who, amount });
+		self.deposits.push(SetupDeposit { who, amount, matured: true });
 		self
 	}
 
-	/// Builds the genesis, then applies every setup step in order.
+	/// Builds the genesis, then registers the branch, opens the vaults and makes the deposits.
 	pub fn build(self) -> TestState {
-		let mut ext = genesis_ext();
+		let seeds_default_branch = !self.vaults.is_empty() || !self.deposits.is_empty();
+		if seeds_default_branch {
+			assert_eq!(
+				self.branch,
+				Some((DOT, STABLE)),
+				"vaults and deposits use the default branch"
+			);
+		}
+		let mut ext = genesis_ext(&self.stable_balances);
 		ext.execute_with(|| {
-			for step in self.steps {
-				apply_setup_step(step);
+			if let Some((collateral, stable)) = self.branch {
+				let config = self
+					.branch_config
+					.unwrap_or_else(|| branch_config_for(collateral.clone(), stable));
+				let pool_config = self.pool_config.unwrap_or_else(default_pool_config);
+				register_branch_with_pool(collateral, stable, config, pool_config);
+			}
+			for (owner, collateral, debt) in self.vaults {
+				mint_collateral(DOT, owner, collateral);
+				assert_ok!(open_vault(owner, DOT, STABLE, collateral, debt));
+			}
+			for SetupDeposit { who, amount, matured } in self.deposits {
+				if matured {
+					seed_matured_deposit(who, amount);
+				} else {
+					seed_deposit(who, amount);
+				}
 			}
 			System::reset_events();
-			ObservedStabilityEvents::set(0);
 		});
 		ext
 	}
@@ -557,58 +523,21 @@ impl ExtBuilder {
 			crate::try_state::do_try_state::<Test>().expect("post-test invariants hold");
 		});
 	}
-
-	fn last_branch(&mut self) -> &mut BranchSetup {
-		self.steps
-			.iter_mut()
-			.rev()
-			.find_map(|step| match step {
-				SetupStep::Branch(branch) => Some(branch),
-				SetupStep::HighMinCollateral |
-				SetupStep::StableBalance { .. } |
-				SetupStep::Vault { .. } |
-				SetupStep::Deposit { .. } |
-				SetupStep::MaturedDeposit { .. } => None,
-			})
-			.expect("a branch is added before it is configured")
-	}
 }
 
-fn apply_setup_step(step: SetupStep) {
-	match step {
-		SetupStep::HighMinCollateral => create_high_min_collateral(),
-		SetupStep::Branch(branch) => {
-			let config = branch.branch_config.unwrap_or_else(|| {
-				branch_config_for(branch.collateral_id.clone(), branch.stable_id)
-			});
-			register_branch_with_pool(
-				branch.collateral_id,
-				branch.stable_id,
-				config,
-				branch.pool_config,
-			);
-		},
-		SetupStep::StableBalance { who, amount } => mint_stable(STABLE, who, amount),
-		SetupStep::Vault { owner, collateral, debt } => {
-			mint_collateral(DOT, owner, collateral);
-			assert_ok!(open_vault(owner, DOT, STABLE, collateral, debt));
-		},
-		SetupStep::Deposit { who, amount } => seed_deposit(who, amount),
-		SetupStep::MaturedDeposit { who, amount } => seed_matured_deposit(who, amount),
-	}
-}
-
-/// The genesis state, with the test assets created and the default accounts funded.
-fn genesis_ext() -> TestState {
+/// The genesis state, with the test assets created, the default accounts funded and each
+/// `(who, amount)` of `stable_balances` holding that much [`STABLE`].
+fn genesis_ext(stable_balances: &[(AccountId, Balance)]) -> TestState {
 	let t = RuntimeGenesisConfig {
 		assets: pallet_assets::GenesisConfig {
 			assets: vec![
 				(TOKEN_X_ID, 1, true, 1),
+				(HIGH_MIN_ID, 1, true, 1_000),
 				(STABLE, 1, true, 1),
 				(USDX, 1, true, USDX_MIN_BALANCE),
 			],
 			metadata: vec![(USDX, b"USDX".to_vec(), b"USDX".to_vec(), 6)],
-			accounts: vec![],
+			accounts: stable_balances.iter().map(|&(who, amount)| (STABLE, who, amount)).collect(),
 			next_asset_id: None,
 			reserves: vec![],
 		},
@@ -629,29 +558,26 @@ fn genesis_ext() -> TestState {
 	ext.execute_with(|| {
 		System::set_block_number(1);
 		Timestamp::set_timestamp(1_000);
-		MockPrices::set(alloc::collections::BTreeMap::new());
-		MockOracleAvailable::set(true);
 	});
 	ext
 }
 
 parameter_types! {
-	/// How many pallet events [`stability_events_since_last_call`] has already returned.
-	pub static ObservedStabilityEvents: usize = 0;
+	/// How many of this pallet's events [`stability_events_since_last_call`] has returned. It
+	/// lives in storage so that `hypothetically!` rolls it back with the events it counts.
+	storage ObservedStabilityEvents: u32 = 0;
 }
 
-/// The events of this pallet recorded since the previous call, or since setup on the first.
+/// This pallet's events deposited since the previous call, or since setup on the first.
 pub fn stability_events_since_last_call() -> Vec<crate::Event<Test>> {
-	let events: Vec<_> = System::events()
-		.into_iter()
-		.filter_map(|record| match record.event {
-			RuntimeEvent::Stability(event) => Some(event),
-			_ => None,
-		})
-		.collect();
-	let already_seen = ObservedStabilityEvents::get();
-	ObservedStabilityEvents::set(events.len());
-	events.into_iter().skip(already_seen).collect()
+	let events = System::read_events_for_pallet::<crate::Event<Test>>();
+	let observed = usize::try_from(ObservedStabilityEvents::get())
+		.expect("a u32 count fits usize on every supported target; qed");
+	assert!(observed <= events.len(), "events are only cleared by the setup");
+	ObservedStabilityEvents::set(
+		&u32::try_from(events.len()).expect("a test deposits fewer than u32::MAX events; qed"),
+	);
+	events.into_iter().skip(observed).collect()
 }
 
 /// The pool parameters every registered branch starts with: a 5 second entry delay and a
@@ -721,32 +647,6 @@ pub fn branch_config_for(
 	}
 }
 
-/// The registration payload of a branch on `stable`.
-///
-/// Redemption policy is set per stablecoin, so only its first branch carries one. A pool is per
-/// branch, so every branch carries one.
-pub fn registration_config(
-	stable: StableId,
-) -> (Option<pallet_redemptions::types::RedemptionConfig<Balance>>, StabilityPoolConfig<Balance>) {
-	let redemption_config = (!pallet_redemptions::Stablecoins::<Test>::contains_key(stable))
-		.then(default_redemption_config);
-	(redemption_config, default_pool_config())
-}
-
-/// Branch configuration for recovery settlement tests, with no entry compensation.
-/// These tests price the collateral available to settle the head.
-pub fn recovery_branch_config() -> pallet_vaults::BranchConfig<Balance> {
-	let mut config = default_branch_config();
-	config.liquidation.keeper_flat_compensation_value = 0;
-	config.liquidation.keeper_percent_compensation = Permill::zero();
-	config
-}
-
-/// Creates the [`HIGH_MIN`] collateral asset.
-pub fn create_high_min_collateral() {
-	assert_ok!(Assets::force_create(RuntimeOrigin::root(), HIGH_MIN_ID, 1, true, 1_000));
-}
-
 /// Keeper terms that make no just-in-time contribution.
 pub const NO_JIT: pallet_vaults::JitTerms<Balance> =
 	pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 };
@@ -760,13 +660,30 @@ pub fn liquidate(keeper: AccountId, collateral: AssetId, owner: AccountId) -> Di
 /// Creates the `collateral`/[`STABLE`] branch as `origin`, with the default admins, branch
 /// parameters and registration.
 pub fn create_branch_as(origin: RuntimeOrigin, collateral: AssetId) -> DispatchResult {
+	let config = branch_config_for(collateral.clone(), STABLE);
+	create_branch_with(origin, collateral, STABLE, config, default_pool_config())
+}
+
+/// Creates a branch as `origin` with the default admins.
+///
+/// Redemption policy is set per stablecoin, so only the first branch of `stable` carries one. A
+/// pool is per branch, so every branch carries one.
+fn create_branch_with(
+	origin: RuntimeOrigin,
+	collateral: AssetId,
+	stable: StableId,
+	config: pallet_vaults::BranchConfig<Balance>,
+	pool_config: StabilityPoolConfig<Balance>,
+) -> DispatchResult {
+	let redemption_config = (!pallet_redemptions::Stablecoins::<Test>::contains_key(stable))
+		.then(default_redemption_config);
 	Vaults::create_branch(
 		origin,
-		collateral.clone(),
-		STABLE,
+		collateral,
+		stable,
 		branch_admins(ADMIN, EMERGENCY_ADMIN),
-		branch_config_for(collateral, STABLE),
-		registration_config(STABLE),
+		config,
+		(redemption_config, pool_config),
 	)
 }
 
@@ -783,58 +700,41 @@ pub fn register_branch(
 
 /// [`register_branch`] with the pool registered under `pool_config`, for the parameters that
 /// only registration can set.
-pub fn register_branch_with_pool(
+fn register_branch_with_pool(
 	collateral: AssetId,
 	stable: StableId,
 	config: pallet_vaults::BranchConfig<Balance>,
 	pool_config: StabilityPoolConfig<Balance>,
 ) {
+	use frame::traits::{
+		fungibles::{Inspect as FungiblesInspect, Mutate as FungiblesMutate},
+		tokens::{Fortitude, Precision, Preservation},
+	};
 	// A branch cannot be registered without a live price.
 	set_price(collateral.clone(), REGISTRATION_PRICE);
 	// Account 1 owns every test stablecoin. As the depositor it pays the redistribution custody
 	// seed of Vaults and the pool custody float of Stability, one collateral minimum each,
 	// withdrawn under `Preserve`. The stablecoin float is one stablecoin minimum, also preserved.
-	mint_collateral(
-		collateral.clone(),
-		1,
-		3 * <VaultCollateralAssets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(
-			collateral.clone(),
-		),
-	);
-	mint_stable(
-		stable,
-		1,
-		2 * <Assets as frame::traits::fungibles::Inspect<AccountId>>::minimum_balance(stable),
-	);
-	Vaults::create_branch(
-		RuntimeOrigin::signed(1),
-		collateral.clone(),
-		stable,
-		branch_admins(ADMIN, EMERGENCY_ADMIN),
-		config,
-		(registration_config(stable).0, pool_config),
-	)
-	.expect("create_branch ok");
+	let collateral_minimum =
+		<VaultCollateralAssets as FungiblesInspect<AccountId>>::minimum_balance(collateral.clone());
+	let stable_minimum = <Assets as FungiblesInspect<AccountId>>::minimum_balance(stable);
+	mint_collateral(collateral.clone(), 1, 3 * collateral_minimum);
+	mint_stable(stable, 1, 2 * stable_minimum);
+	create_branch_with(RuntimeOrigin::signed(1), collateral, stable, config, pool_config)
+		.expect("create_branch ok");
 	Vaults::set_global_debt_ceiling(RuntimeOrigin::root(), stable, 1_000_000_000_000_000)
 		.expect("set global debt ceiling");
 	// The preserved remainder of the stablecoin float would skew every balance a test reads on
 	// account 1, so registration leaves its stablecoin exactly where it found it.
-	{
-		use frame::traits::{
-			fungibles::{Inspect as FungiblesInspect, Mutate as FungiblesMutate},
-			tokens::{Fortitude, Precision, Preservation},
-		};
-		let remainder = <Assets as FungiblesInspect<AccountId>>::minimum_balance(stable);
-		<Assets as FungiblesMutate<AccountId>>::burn_from(
-			stable,
-			&1,
-			remainder,
-			Preservation::Expendable,
-			Precision::Exact,
-			Fortitude::Force,
-		)
-		.expect("burn the preserved float remainder");
-	}
+	<Assets as FungiblesMutate<AccountId>>::burn_from(
+		stable,
+		&1,
+		stable_minimum,
+		Preservation::Expendable,
+		Precision::Exact,
+		Fortitude::Force,
+	)
+	.expect("burn the preserved float remainder");
 }
 
 /// Opens a vault, so that a test can create real branch debt and move the TCR.
@@ -848,7 +748,7 @@ pub fn open_vault(
 	use frame::traits::fungible::Mutate as FungibleMutate;
 	// A fresh account needs its existential deposit before anything else.
 	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&who, 1));
-	Vaults::open_vault(
+	without_post_info(Vaults::open_vault(
 		RuntimeOrigin::signed(who),
 		collateral,
 		stable,
@@ -856,19 +756,12 @@ pub fn open_vault(
 		debt,
 		FixedU128::from_rational(5u128, 100u128),
 		pallet_linked_list::Position::endpoints_only(),
-	)
-	.map(|_| ())
-	.map_err(|error| error.error)
+	))
 }
 
-/// The collateral `who` holds under the vault engine's collateral hold.
-pub fn vault_collateral_on_hold(collateral: AssetId, who: AccountId) -> Balance {
-	use frame::traits::fungibles::InspectHold;
-	<VaultCollateralAssets as InspectHold<AccountId>>::balance_on_hold(
-		collateral,
-		&pallet_vaults::HoldReason::VaultCollateral.into(),
-		&who,
-	)
+/// The result of a dispatch whose post-dispatch info these suites never read.
+fn without_post_info(result: DispatchResultWithPostInfo) -> DispatchResult {
+	result.map(|_post_info| ()).map_err(|error| error.error)
 }
 
 /// Mints `amount` of the stablecoin to `who`.
@@ -970,9 +863,7 @@ pub fn deposit(
 	stable: StableId,
 	amount: Balance,
 ) -> DispatchResult {
-	Stability::deposit(RuntimeOrigin::signed(who), collateral, stable, amount)
-		.map(|_| ())
-		.map_err(|error| error.error)
+	without_post_info(Stability::deposit(RuntimeOrigin::signed(who), collateral, stable, amount))
 }
 
 /// Requests a withdrawal, signed by `who`.
@@ -982,9 +873,12 @@ pub fn request_withdraw(
 	stable: StableId,
 	amount: Balance,
 ) -> DispatchResult {
-	Stability::request_withdraw(RuntimeOrigin::signed(who), collateral, stable, amount)
-		.map(|_| ())
-		.map_err(|error| error.error)
+	without_post_info(Stability::request_withdraw(
+		RuntimeOrigin::signed(who),
+		collateral,
+		stable,
+		amount,
+	))
 }
 
 /// Withdraws to a named recipient, signed by `who`.
@@ -995,9 +889,13 @@ pub fn withdraw(
 	amount: Balance,
 	recipient: AccountId,
 ) -> DispatchResult {
-	Stability::withdraw(RuntimeOrigin::signed(who), collateral, stable, amount, Some(recipient))
-		.map(|_| ())
-		.map_err(|error| error.error)
+	without_post_info(Stability::withdraw(
+		RuntimeOrigin::signed(who),
+		collateral,
+		stable,
+		amount,
+		Some(recipient),
+	))
 }
 
 /// Claims collateral to a named recipient, signed by `who`.
@@ -1057,52 +955,17 @@ pub fn deposit_and_mature(
 	stable: StableId,
 	amount: Balance,
 ) -> DispatchResult {
-	let result = deposit(who, collateral.clone(), stable, amount);
-	if result.is_ok() {
-		if let Some(deadline) = pending_deadline(collateral, stable, who) {
-			let now = Timestamp::get();
-			if deadline > now {
-				advance_time(deadline - now);
-			}
-		}
+	deposit(who, collateral.clone(), stable, amount)?;
+	if let Some(deadline) = pending_deadline(collateral, stable, who) {
+		advance_time(deadline.saturating_sub(Timestamp::get()));
 	}
-	result
+	Ok(())
 }
 
 /// Mints and deposits a position whose entry delay has elapsed in the default pool.
 pub fn seed_matured_deposit(who: AccountId, amount: Balance) {
 	mint_stable(STABLE, who, amount);
 	assert_ok!(deposit_and_mature(who, DOT, STABLE, amount));
-}
-
-/// Gives an existing default-pool row backed claimable balances without exercising their source.
-pub fn seed_claimables(who: AccountId, collateral_gain: Balance, yield_gain: Balance) {
-	seed_claimables_in(DOT, who, collateral_gain, yield_gain);
-}
-
-/// [`seed_claimables`] in the `collateral`/[`STABLE`] branch.
-pub fn seed_claimables_in(
-	collateral: AssetId,
-	who: AccountId,
-	collateral_gain: Balance,
-	yield_gain: Balance,
-) {
-	let pool = Stability::pool_account(&collateral, &STABLE);
-	crate::Deposits::<Test>::mutate((collateral.clone(), STABLE, who), |row| {
-		let row = row.as_mut().expect("deposit row exists");
-		row.claimable_collateral += collateral_gain;
-		row.claimable_yield += yield_gain;
-	});
-	mutate_pool_state(collateral.clone(), STABLE, |state| {
-		state.total_collateral_gains_unclaimed += collateral_gain;
-		state.total_yield_unclaimed += yield_gain;
-	});
-	if collateral_gain > 0 {
-		mint_collateral(collateral, pool, collateral_gain);
-	}
-	if yield_gain > 0 {
-		mint_stable(STABLE, pool, yield_gain);
-	}
 }
 
 /// The pallet event `$variant` of the default branch, as a `RuntimeEvent`. The fields name
@@ -1154,24 +1017,14 @@ pub fn set_pool_config(config: StabilityPoolConfig<Balance>) {
 	assert_ok!(Stability::set_stability_pool_config(RuntimeOrigin::root(), DOT, STABLE, config));
 }
 
-/// Mints stablecoin as the vault engine does and offers it to the pool, returning what the pool
-/// could not take.
-pub fn distribute_yield(
-	collateral: AssetId,
-	stable: StableId,
-	amount: Balance,
-) -> crate::pallet::StableCreditOf<Test> {
-	let credit = issue_stable(stable, amount);
-	offer_yield(collateral, stable, credit)
-}
-
-/// Offers `amount` of yield through [`distribute_yield`] and returns what the pool handed back.
+/// Mints `amount` of stablecoin as the vault engine does, offers it to the pool and returns what
+/// the pool handed back.
 pub fn distribute_yield_leftover(
 	collateral: AssetId,
 	stable: StableId,
 	amount: Balance,
 ) -> Balance {
-	distribute_yield(collateral, stable, amount).peek()
+	offer_yield(collateral, stable, issue_stable(stable, amount)).peek()
 }
 
 /// Offers `amount` of yield to the default branch, which must take all of it.
@@ -1188,7 +1041,7 @@ pub fn issue_stable(stable: StableId, amount: Balance) -> crate::pallet::StableC
 ///
 /// This calls the engine directly rather than through `OnBranchYield`, so the whole credit
 /// reaches the pool and no `yield_share` cut is taken.
-pub fn offer_yield(
+fn offer_yield(
 	collateral: AssetId,
 	stable: StableId,
 	credit: crate::pallet::StableCreditOf<Test>,
@@ -1266,16 +1119,6 @@ pub fn offset_with(
 	Stability::offset(&collateral_id, &stable_id, branch, debt, credits)
 }
 
-/// The proportional share of `amount`: `floor(amount * numerator / denominator)`.
-///
-/// The offset simulation uses it to slice collateral pro rata to the debt each leg burns.
-pub fn pro_rata_floor(amount: Balance, numerator: Balance, denominator: Balance) -> Balance {
-	assert!(numerator <= denominator);
-	assert!(denominator > 0);
-	stablecoin_primitives::mul_div_floor(amount, numerator, denominator)
-		.expect("share of amount fits")
-}
-
 /// The legs one [`simulate_offset`] call settled.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SimulatedOffset {
@@ -1330,9 +1173,14 @@ pub fn simulate_offset(
 	if active.is_zero() && pending.is_zero() {
 		return SimulatedOffset { active, pending, leftover: collateral_total };
 	}
+	// Each leg's debt is at most `max_debt`, so its share never exceeds `collateral_total`.
+	let share = |debt: Balance| {
+		stablecoin_primitives::mul_div_floor(collateral_total, debt, max_debt)
+			.expect("a share of at most `collateral_total` fits; qed")
+	};
 	let mut credit = issue_collateral(collateral.clone(), collateral_total);
-	let active_collateral = credit.extract(pro_rata_floor(collateral_total, active, max_debt));
-	let pending_collateral = credit.extract(pro_rata_floor(collateral_total, pending, max_debt));
+	let active_collateral = credit.extract(share(active));
+	let pending_collateral = credit.extract(share(pending));
 	let burned = Stability::offset(
 		&collateral,
 		&stable,
@@ -1377,9 +1225,12 @@ pub fn enter_final_recovery(
 	stable: StableId,
 	owner: AccountId,
 ) -> DispatchResult {
-	Vaults::enter_final_recovery(RuntimeOrigin::signed(99), collateral, stable, owner)
-		.map(|_post_info| ())
-		.map_err(|error| error.error)
+	without_post_info(Vaults::enter_final_recovery(
+		RuntimeOrigin::signed(99),
+		collateral,
+		stable,
+		owner,
+	))
 }
 
 /// The stored debt of a vault, principal and settled interest together. Zero if it is absent.
@@ -1387,26 +1238,6 @@ pub fn vault_debt(collateral: AssetId, stable: StableId, who: AccountId) -> Bala
 	pallet_vaults::Vaults::<Test>::get((collateral, stable, who))
 		.map(|record| record.vault.debt.principal + record.vault.debt.interest)
 		.unwrap_or_default()
-}
-
-/// Asserts that Vaults reported `debt` cancelled against `collateral` for the vault of `owner` in
-/// the default branch, paid to its pool account at the rate [`open_vault`] sets.
-///
-/// The recovery events of this pallet carry no amounts, because the vault engine reports them.
-pub fn assert_vault_redeemed(
-	owner: AccountId,
-	debt: pallet_vaults::DebtBreakdown<Balance>,
-	collateral: Balance,
-) {
-	System::assert_has_event(RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed {
-		collateral_id: DOT,
-		stable_id: STABLE,
-		owner,
-		recipient: Stability::pool_account(&DOT, &STABLE),
-		debt_cancelled: debt,
-		collateral_to_recipient: collateral,
-		vault_annual_rate: FixedU128::from_rational(5u128, 100u128),
-	}));
 }
 
 /// Runs an active-pool recovery offset, signed by an arbitrary account.

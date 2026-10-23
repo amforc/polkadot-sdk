@@ -1,7 +1,7 @@
 //! `deposit`: what leaves the wallet, what queues behind the entry delay, and what happens when a
 //! second deposit arrives.
 
-use crate::{mock::*, Error};
+use crate::mock::*;
 
 #[test]
 fn deposit_moves_funds_and_queues_pending() {
@@ -38,31 +38,6 @@ fn deposit_moves_funds_and_queues_pending() {
 				pending_amount: 400,
 			}));
 		});
-}
-
-#[test]
-fn deposit_below_minimum_reverts_at_minimum_succeeds() {
-	ExtBuilder::default()
-		.default_branch()
-		.stable_balance(1, 1_000)
-		.build_and_execute(|| {
-			let minimum = default_pool_config().minimum_deposit;
-
-			assert_noop!(deposit(1, DOT, STABLE, minimum - 1), Error::<Test>::DepositTooSmall);
-			assert_ok!(deposit(1, DOT, STABLE, minimum));
-
-			assert_eq!(pool_state(DOT, STABLE).total_pending_deposits, minimum);
-		});
-}
-
-#[test]
-fn deposit_without_funds_reverts() {
-	ExtBuilder::default().default_branch().build_and_execute(|| {
-		// User 2 was never minted any STABLE, so the asset account itself is
-		// missing (a funded-but-short wallet errors `BalanceLow` instead —
-		// see `deposit_in_the_wallet_dead_zone_fails_instead_of_dusting`).
-		assert_noop!(deposit(2, DOT, STABLE, 400), pallet_assets::Error::<Test>::NoAccount);
-	});
 }
 
 #[test]

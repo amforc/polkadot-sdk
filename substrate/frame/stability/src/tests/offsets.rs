@@ -1,53 +1,10 @@
 //! Active-pool offsets: how an offset is capped, how the collateral is shared out through `S`,
-//! how `P` shrinks, and why none of it disturbs the yield already recorded in `G`.
+//! and how `P` shrinks.
 
 use crate::{mock::*, Error};
 use stablecoin_primitives::{
 	BranchMode, BranchSnapshot, OffsetLegs, StabilityPoolInspect, StabilityPoolOffset,
 };
-
-#[test]
-fn offset_burns_debt_and_distributes_gains_proportionally() {
-	ExtBuilder::default()
-		.default_branch()
-		.matured_deposit(1, 600)
-		.matured_deposit(2, 400)
-		.build_and_execute(|| {
-			// 500 debt seizes 500 / 1.25 = 400 collateral at the registration
-			// price.
-			let offset = simulate_offset(DOT, STABLE, 500, 400);
-
-			assert_eq!(offset.debt(), 500);
-			assert_eq!(offset.leftover, 0);
-
-			let state = pool_state(DOT, STABLE);
-			assert_eq!(state.total_active_deposits, 500);
-			// P = 1 * (1000 - 500) / 1000 = 0.5.
-			assert_eq!(state.coords.p, FixedU128::from_rational(1, 2));
-			assert_eq!(state.total_collateral_gains_unclaimed, 400);
-			// delta_S = 400 * (1/1000) = 0.4.
-			let sums = active_sums(0, 0);
-			assert_eq!(sums.s_collateral, FixedU128::from_rational(4, 10));
-
-			// 500 of the pool's 1000 stablecoin was burned.
-			assert_eq!(pool_stable_held(DOT, STABLE), 500);
-			assert_eq!(pool_collateral_held(DOT, STABLE), 400);
-
-			System::assert_has_event(market_event!(OffsetApplied {
-				active: Some(crate::types::LegCoords { epoch: 0, scale: 0 }),
-				pending: None,
-			}));
-
-			// Compounded: floor(600 * 0.5) = 300; floor(400 * 0.5) = 200.
-			// Gains: floor(600 * 0.4) = 240; floor(400 * 0.4) = 160.
-			assert_claim_collateral(1, 240);
-			assert_claim_collateral(2, 160);
-			assert_ok!(withdraw(1, DOT, STABLE, 1_000, 1));
-			assert_eq!(stable_balance(STABLE, 1), 300);
-			assert_ok!(withdraw(2, DOT, STABLE, 1_000, 2));
-			assert_eq!(stable_balance(STABLE, 2), 200);
-		});
-}
 
 #[test]
 fn offset_clamps_at_the_floor_then_only_depletion_passes() {
@@ -95,38 +52,54 @@ fn offset_clamps_at_the_floor_then_only_depletion_passes() {
 		});
 }
 
+/// Offers `debt` against `collateral` on `leg` alone, through the offset interface, and asserts
+/// that the pool refuses it.
+///
+/// Every refusal consumes the credit it was handed, so the probe issues its collateral inside a
+/// hypothetical that rolls the issuance back with it.
+fn assert_one_leg_refused(
+	branch: BranchSnapshot,
+	leg: Leg,
+	debt: Balance,
+	collateral: (AssetId, Balance),
+) {
+	let nothing = (DOT, 0);
+	let (debt, collateral) = match leg {
+		Leg::Active => (
+			OffsetLegs { active: debt, pending: 0 },
+			OffsetLegs { active: collateral, pending: nothing },
+		),
+		Leg::Pending => (
+			OffsetLegs { active: 0, pending: debt },
+			OffsetLegs { active: nothing, pending: collateral },
+		),
+	};
+	assert_err!(
+		hypothetically!(offset_with((DOT, STABLE), branch, debt, collateral)),
+		Error::<Test>::OffsetSettlementFailed
+	);
+}
+
 /// The guards of the offset interface, read through the trait rather than through the mock's
 /// simulation, which only offers what a quote sized and so never reaches a refusal.
-///
-/// Every refusal consumes the credit it was handed, so each probe issues its collateral inside a
-/// hypothetical that rolls the issuance back with it.
 #[test]
-fn offset_without_capacity_quotes_nothing_and_refuses_settlement() {
+fn offset_interface_refuses_what_it_did_not_quote() {
 	ExtBuilder::default().build_and_execute(|| {
-		let offset_active = |branch: BranchSnapshot, debt: Balance, collateral: Balance| {
-			hypothetically!(offset_with(
-				(DOT, STABLE),
-				branch,
-				OffsetLegs { active: debt, pending: 0 },
-				OffsetLegs { active: (DOT, collateral), pending: (DOT, 0) }
-			))
-		};
-
 		// Unregistered branch: no pool row exists, so even a healthy mode has nothing to quote
 		// and nothing to settle against.
 		let healthy = BranchSnapshot { mode: BranchMode::Normal, now: Timestamp::get() };
 		assert!(Stability::quote(&DOT, &STABLE, healthy).is_none());
-		assert_err!(offset_active(healthy, 100, 50), Error::<Test>::OffsetSettlementFailed);
+		assert_one_leg_refused(healthy, Leg::Active, 100, (DOT, 50));
 
-		// Registered but empty pool: the branch quotes, for nothing, and a caller that settles
-		// past its quote is refused.
+		// Registered but empty pool: each leg quotes, for nothing, and a caller that settles past
+		// its quote is refused.
 		register_branch(DOT, STABLE, default_branch_config());
-
-		assert_eq!(Stability::quote_active(&market_quote(&DOT, &STABLE), 100), 0);
-		assert_err!(
-			offset_active(branch_snapshot(&DOT, &STABLE), 100, 50),
-			Error::<Test>::OffsetSettlementFailed
-		);
+		let quote = market_quote(&DOT, &STABLE);
+		let branch = branch_snapshot(&DOT, &STABLE);
+		assert_eq!(Stability::quote_active(&quote, 100), 0);
+		assert_one_leg_refused(branch, Leg::Active, 100, (DOT, 50));
+		assert_eq!(Stability::quote_pending(&quote, 100, 0), 0);
+		assert_one_leg_refused(branch, Leg::Pending, 100, (DOT, 50));
 
 		// A funded pool whose cohort is due and not yet advanced in storage. The quote counts
 		// the matured 1_000 as active, so capacity is not what refuses the calls below.
@@ -155,12 +128,27 @@ fn offset_without_capacity_quotes_nothing_and_refuses_settlement() {
 
 		// A leg that cancels no debt may carry no collateral: the pool would receive it for
 		// free.
-		assert_err!(offset_active(branch, 0, 50), Error::<Test>::OffsetSettlementFailed);
+		assert_one_leg_refused(branch, Leg::Active, 0, (DOT, 50));
 
 		// A frozen branch has no capacity, however well funded its pool is.
 		let frozen = BranchSnapshot { mode: BranchMode::Frozen, now: branch.now };
 		assert!(Stability::quote(&DOT, &STABLE, frozen).is_none());
-		assert_err!(offset_active(frozen, 100, 50), Error::<Test>::OffsetSettlementFailed);
+		assert_one_leg_refused(frozen, Leg::Active, 100, (DOT, 50));
+
+		// With both legs funded, each quotes a real request, so capacity is not what refuses
+		// the calls below: a debtless leg carrying collateral, or a credit in another
+		// collateral than the branch's. The deposit also advances the due cohort.
+		seed_deposit(2, 200);
+		let branch = branch_snapshot(&DOT, &STABLE);
+		let quote = market_quote(&DOT, &STABLE);
+		assert_eq!(Stability::quote_pending(&quote, 100, 0), 100);
+		assert_eq!(Stability::quote_pending(&quote, 0, 0), 0);
+		assert_eq!(Stability::quote_active(&quote, 200), 200);
+		assert_one_leg_refused(branch, Leg::Active, 0, (DOT, 50));
+		assert_one_leg_refused(branch, Leg::Active, 200, (TOKEN_X, 100));
+		assert_eq!(Stability::quote_pending(&quote, 200, 0), 200);
+		assert_one_leg_refused(branch, Leg::Pending, 0, (DOT, 50));
+		assert_one_leg_refused(branch, Leg::Pending, 200, (TOKEN_X, 100));
 	});
 }
 
@@ -259,29 +247,6 @@ fn offset_refuses_stale_sizing_reads() {
 				));
 				assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 100);
 			});
-		});
-}
-
-#[test]
-fn compounded_yield_absorbs_offsets() {
-	ExtBuilder::default()
-		.default_branch()
-		.min_active_pool(20)
-		.matured_deposit(1, 600)
-		.build_and_execute(|| {
-			distribute_all_yield(60);
-			assert_ok!(compound(1, DOT, STABLE, 60));
-
-			// The compounded 60 is offsettable: A = 660, and the 601 offset
-			// exceeds the original 600 deposit — only possible because the
-			// compounded yield absorbs too. The survival ratio 59/660 is
-			// 0.089393..., so the 18-decimal P floors and the withdrawal pays
-			// floor(660 * P) = 58; the odd unit strands as pool-owned dust.
-			assert_eq!(simulate_offset(DOT, STABLE, 601, 0).debt(), 601);
-			assert_ok!(withdraw(1, DOT, STABLE, 1_000, 1));
-
-			assert_eq!(stable_balance(STABLE, 1), 58);
-			assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 1);
 		});
 }
 

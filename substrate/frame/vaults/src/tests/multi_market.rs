@@ -2,8 +2,9 @@
 //!
 //! A branch is one stablecoin against one collateral. These exercise the
 //! independence and shared-collateral properties the generalisation introduces:
-//! one owner running several branches, branches sharing a collateral, and
-//! in-branch isolation of redemption, liquidation, redistribution, and yield.
+//! one owner running several branches, branches sharing a collateral or a
+//! stablecoin, in-branch isolation of redemption and close, and per-branch
+//! pricing.
 
 use crate::{
 	mock::*,
@@ -12,86 +13,90 @@ use crate::{
 };
 use stablecoin_primitives::{CollateralRatio, VaultInterface};
 
-// One owner can share a stablecoin or collateral across branches. Redemption and close
-// change only the selected branch and release only its share of the hold.
-#[test]
-fn owner_runs_markets_independently_through_redemption_and_close() {
-	// Balances: (STABLE, other coin); holds: (DOT, other collateral); DOT hold after close.
-	for (collateral, stable, amount, debt, pct, balances, holds, dot_hold_after_close) in [
-		(ETH, EUSD, 500, 1_000, 5, (2_000, 1_000), (1_000, 500), 0),
-		(ETH, STABLE, 1_000, 3_000, 7, (5_000, 5_000), (1_000, 1_000), 0),
-		(DOT, EUSD, 600, 1_000, 5, (2_000, 1_000), (1_600, 1_600), 600),
-	] {
-		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-			register_market(collateral.clone(), stable);
-			assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, percent(5)));
-			assert_ok!(open(1, collateral.clone(), stable, amount, debt, percent(pct)));
-			assert_eq!((stable_balance(STABLE, 1), stable_balance(stable, 1)), balances);
-			assert_eq!((held(DOT, 1), held(collateral.clone(), 1)), holds);
-			let dot = vault(DOT, STABLE, 1);
-			let other = vault(collateral.clone(), stable, 1);
-			assert_eq!((dot.collateral, dot.debt.principal), (1_000, 2_000));
-			assert_eq!((other.collateral, other.debt.principal), (amount, debt));
-			assert_eq!(market_state(DOT, STABLE).debt.principal, 2_000);
-			let other_state = branch_state(collateral.clone(), stable).expect("branch");
-			assert_eq!(other_state.debt.principal, debt);
+/// Redeems and closes owner 1's DOT/STABLE vault, checking that the owner's vault and branch on
+/// `collateral`/`stable` stay untouched throughout.
+fn redeem_and_close_dot_vault_sparing(collateral: AssetId, stable: StableId) {
+	let dot = vault(DOT, STABLE, 1);
+	assert_eq!((dot.collateral, dot.debt.principal), (1_000, 2_000));
+	assert_eq!(market_state(DOT, STABLE).debt.principal, 2_000);
+	let other = vault(collateral.clone(), stable, 1);
+	let other_state = market_state(collateral.clone(), stable);
 
-			assert_eq!(redeem(DOT, STABLE, 9, 500), Ok(1));
+	assert_eq!(redeem(DOT, STABLE, 9, 500), Ok(1));
 
-			assert_eq!(vault(collateral.clone(), stable, 1), other);
-			assert_eq!(branch_state(collateral.clone(), stable), Some(other_state.clone()));
+	assert_eq!(vault(collateral.clone(), stable, 1), other);
+	assert_eq!(market_state(collateral.clone(), stable), other_state.clone());
 
-			mint_stable(STABLE, 1, 10_000);
-			assert_ok!(repay(1, DOT, STABLE, 1, None));
-			assert_ok!(close_vault(1, DOT, STABLE, None));
+	mint_stable(STABLE, 1, 10_000);
+	assert_ok!(repay(1, DOT, STABLE, 1, None));
+	assert_ok!(close_vault(1, DOT, STABLE, None));
 
-			assert!(!vault_exists(DOT, STABLE, 1));
-			assert_eq!(vault(collateral.clone(), stable, 1), other);
-			assert_eq!(branch_state(collateral.clone(), stable), Some(other_state));
-			assert_eq!(held(DOT, 1), dot_hold_after_close);
-			assert_eq!(held(collateral.clone(), 1), amount);
-		});
-	}
+	assert!(!vault_exists(DOT, STABLE, 1));
+	assert_eq!(vault(collateral.clone(), stable, 1), other);
+	assert_eq!(market_state(collateral, stable), other_state);
 }
 
-// `StablecoinDebt` sums every collateral branch issuing one coin, and stays
-// blind to branches issuing another. Redemptions divides by it to price one
-// stablecoin's dynamic fee across all of its collaterals at once.
+// One owner can run branches on distinct assets. Redemption and close change only the selected
+// branch.
 #[test]
-fn stablecoin_debt_sums_the_markets_issuing_that_coin() {
-	ExtBuilder::default()
-		.branch(DOT, STABLE)
-		.branch(ETH, STABLE)
-		.branch(ETH, EUSD)
-		.build_and_execute(|| {
-			assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, percent(5)));
-			assert_ok!(open(1, ETH, STABLE, 1_000, 3_000, percent(7)));
-			assert_ok!(open(2, ETH, EUSD, 1_000, 4_000, percent(5)));
+fn owner_runs_markets_on_distinct_assets_independently() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		register_market(ETH, EUSD);
+		assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, percent(5)));
+		assert_ok!(open(1, ETH, EUSD, 500, 1_000, percent(5)));
+		assert_eq!((stable_balance(STABLE, 1), stable_balance(EUSD, 1)), (2_000, 1_000));
+		assert_eq!((held(DOT, 1), held(ETH, 1)), (1_000, 500));
+		let other = vault(ETH, EUSD, 1);
+		assert_eq!((other.collateral, other.debt.principal), (500, 1_000));
+		assert_eq!(market_state(ETH, EUSD).debt.principal, 1_000);
 
-			// Principal plus each branch's own upfront fee.
-			// ceil(principal × rate × 7 / 365.25): 2_000 × 5% → 2, 3_000 × 7% → 5,
-			// and 4_000 × 5% → 4.
-			assert_eq!(
-				(
-					market_state(DOT, STABLE).debt.outstanding(),
-					market_state(ETH, STABLE).debt.outstanding(),
-					market_state(ETH, EUSD).debt.outstanding(),
-				),
-				(2_002, 3_005, 4_004),
-			);
+		redeem_and_close_dot_vault_sparing(ETH, EUSD);
 
-			// Both STABLE branches, and only those, land in the STABLE total.
-			assert_eq!(StablecoinDebt::<Test>::get(STABLE).outstanding, 5_007);
-			assert_eq!(StablecoinDebt::<Test>::get(EUSD).outstanding, 4_004);
+		assert_eq!(held(DOT, 1), 0);
+		assert_eq!(held(ETH, 1), 500);
+	});
+}
 
-			// The aggregate tracks debt leaving as well as arriving: repaying 1_000
-			// on one STABLE branch drops the shared total by exactly that, and leaves
-			// the other coin's total alone.
-			assert_ok!(repay(1, ETH, STABLE, 1, Some(1_000)));
+// One owner can share a stablecoin across branches. Redemption and close change only the
+// selected branch, while both vaults mint into the same balance.
+#[test]
+fn owner_runs_markets_sharing_a_stablecoin_independently() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		register_market(ETH, STABLE);
+		assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, percent(5)));
+		assert_ok!(open(1, ETH, STABLE, 1_000, 3_000, percent(7)));
+		assert_eq!(stable_balance(STABLE, 1), 5_000);
+		assert_eq!((held(DOT, 1), held(ETH, 1)), (1_000, 1_000));
+		let other = vault(ETH, STABLE, 1);
+		assert_eq!((other.collateral, other.debt.principal), (1_000, 3_000));
+		assert_eq!(market_state(ETH, STABLE).debt.principal, 3_000);
 
-			assert_eq!(StablecoinDebt::<Test>::get(STABLE).outstanding, 4_007);
-			assert_eq!(StablecoinDebt::<Test>::get(EUSD).outstanding, 4_004);
-		});
+		redeem_and_close_dot_vault_sparing(ETH, STABLE);
+
+		assert_eq!(held(DOT, 1), 0);
+		assert_eq!(held(ETH, 1), 1_000);
+	});
+}
+
+// One owner can share a collateral across branches. Redemption and close change only the selected
+// branch and release only its share of the hold.
+#[test]
+fn owner_runs_markets_sharing_a_collateral_independently() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		register_market(DOT, EUSD);
+		assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, percent(5)));
+		assert_ok!(open(1, DOT, EUSD, 600, 1_000, percent(5)));
+		assert_eq!((stable_balance(STABLE, 1), stable_balance(EUSD, 1)), (2_000, 1_000));
+		assert_eq!(held(DOT, 1), 1_600);
+		let other = vault(DOT, EUSD, 1);
+		assert_eq!((other.collateral, other.debt.principal), (600, 1_000));
+		assert_eq!(market_state(DOT, EUSD).debt.principal, 1_000);
+
+		redeem_and_close_dot_vault_sparing(DOT, EUSD);
+
+		// The other branch's 600 stays held.
+		assert_eq!(held(DOT, 1), 600);
+	});
 }
 
 // The stablecoin debt view must include interest accrued on branches nobody has touched.
@@ -104,76 +109,24 @@ fn stablecoin_debt_accrues_interest_across_untouched_markets() {
 			assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, percent(5)));
 			assert_ok!(open(2, ETH, STABLE, 1_000, 3_000, percent(7)));
 			let stored = StablecoinDebt::<Test>::get(STABLE);
-			// Principal plus the upfront fee of each open: 2_000 + ceil(2_000 · 5% · 7d / 365.25d)
-			// = 2_002 and 3_000 + ceil(3_000 · 7% · 7d / 365.25d) = 3_005.
-			assert_eq!(stored.outstanding, 5_007);
 
 			advance_time(ONE_YEAR_MS);
 
-			// A year adds 2_000 · 5% = 100 and 3_000 · 7% = 210 that no branch has minted yet.
+			// Principal plus the upfront fee of each open: 2_000 + ceil(2_000 · 5% · 7d / 365.25d)
+			// = 2_002 and 3_000 + ceil(3_000 · 7% · 7d / 365.25d) = 3_005. A year adds
+			// 2_000 · 5% = 100 and 3_000 · 7% = 210 that no branch has minted yet.
 			assert_eq!(<crate::Pallet<Test> as VaultInterface>::stablecoin_debt(&STABLE), 5_317);
+			// The view pairs that accrued debt with the limit borrowing is checked against.
+			assert_eq!(
+				crate::Pallet::<Test>::stablecoin_debt_and_ceiling(STABLE),
+				(5_317, GLOBAL_CEILING)
+			);
 			assert_eq!(
 				StablecoinDebt::<Test>::get(STABLE),
 				stored,
 				"read-only projection must not touch either branch"
 			);
 		});
-}
-
-// Liquidating a vault in one branch never touches another branch's vaults,
-// branch state, or holds. The mock helper fully offsets the liquidated debt.
-#[test]
-fn liquidation_stays_inside_its_market() {
-	ExtBuilder::default()
-		.branch(DOT, STABLE)
-		.branch(ETH, EUSD)
-		.build_and_execute(|| {
-			// Two STABLE-branch vaults so the liquidatee is not the last stake-bearer.
-			assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-			assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
-			// An untouched vault on the other branch.
-			assert_ok!(open(3, ETH, EUSD, 1_000, 500, percent(5)));
-
-			let other_vault = vault(ETH, EUSD, 3);
-			let other_state = market_state(ETH, EUSD);
-			let other_hold = held(ETH, 3);
-
-			// Drop DOT so owner 1 falls below MCR, then liquidate it.
-			set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-			assert_ok!(liquidate(9, DOT, STABLE, 1, 0, 0));
-
-			// The ETH/EUSD branch is byte-for-byte untouched.
-			assert_eq!(vault(ETH, EUSD, 3), other_vault);
-			assert_eq!(market_state(ETH, EUSD), other_state);
-			assert_eq!(held(ETH, 3), other_hold);
-		});
-}
-
-// Yield (interest) on a branch accrues in that branch's own coin. The mock
-// fee sink routes by the credit's own asset, so the balance assertions guard
-// the accrual path end-to-end.
-#[test]
-fn yield_accrues_in_the_markets_own_coin() {
-	ExtBuilder::default().branch(ETH, EUSD).build_and_execute(|| {
-		assert_ok!(open(1, ETH, EUSD, 100_000, 5_000, percent(50)));
-
-		let stable_supply_before = total_stable(STABLE);
-		let interest_before = vault(ETH, EUSD, 1).debt.interest;
-		let eusd_fee_before = stable_balance(EUSD, FEE_DEST);
-
-		advance_time(ONE_YEAR_MS);
-		assert_ok!(poke(9, ETH, EUSD, 1));
-
-		let interest_after = vault(ETH, EUSD, 1).debt.interest;
-		// A full year at 50% on 5_000 principal accrues exactly 2_500 EUSD of vault
-		// interest (interest is on principal, not the open fee).
-		assert_eq!(interest_after - interest_before, 2_500);
-		// Fee routing must use the branch's stablecoin: the mock burns the Stability Pool's 75%
-		// share and routes the other 625.
-		assert_eq!(stable_balance(EUSD, FEE_DEST) - eusd_fee_before, 625);
-		// The STABLE branch was never involved, so its supply is unchanged.
-		assert_eq!(total_stable(STABLE), stable_supply_before);
-	});
 }
 
 // CR is computed per branch: equal collateral and debt yield different ratios

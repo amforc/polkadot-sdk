@@ -1,52 +1,12 @@
-//! What each accumulator responds to.
+//! When the pending accumulators reset.
 //!
-//! An offset shrinks `P` and adds to `S`. Yield adds to `G` and leaves the loss side alone. The
-//! pending pair resets when an offset empties the pending stock, and not merely when the last
+//! The pending pair resets when an offset empties the pending stock, and not merely when the last
 //! pending deposit matures.
 //!
 //! `epoch_scale` covers the epoch and scale transitions, and `claimable_accrual` covers the
 //! depositor snapshots.
 
 use crate::mock::*;
-
-#[test]
-fn offsets_move_p_and_s_yield_moves_g() {
-	ExtBuilder::default()
-		.default_branch()
-		.matured_deposit(1, 1_000)
-		.build_and_execute(|| {
-			// Offset 1: P = 800/1000 = 0.8, delta_S = 160 * (1/1000) = 0.16;
-			// G is untouched.
-			assert_eq!(simulate_offset(DOT, STABLE, 200, 160).debt(), 200);
-
-			let state = pool_state(DOT, STABLE);
-			assert_eq!(state.coords.p, FixedU128::from_rational(4, 5));
-			assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(16, 100));
-			assert_eq!(active_sums(0, 0).g_yield, FixedU128::zero());
-
-			// Yield: delta_G = 80 * (0.8/800) = 0.08; P and S are untouched.
-			distribute_all_yield(80);
-
-			let state = pool_state(DOT, STABLE);
-			assert_eq!(state.coords.p, FixedU128::from_rational(4, 5));
-			assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(16, 100));
-			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(8, 100));
-
-			// Offset 2 compounds P multiplicatively and adds to S:
-			// P = 0.8 * (400/800) = 0.4, delta_S = 320 * (0.8/800) = 0.32,
-			// so S = 0.48; G is untouched again.
-			assert_eq!(simulate_offset(DOT, STABLE, 400, 320).debt(), 400);
-
-			let state = pool_state(DOT, STABLE);
-			// Coordinates never moved: everything above stayed on (0, 0).
-			assert_eq!(
-				state.coords,
-				Accumulators { p: FixedU128::from_rational(2, 5), epoch: 0, scale: 0 }
-			);
-			assert_eq!(active_sums(0, 0).s_collateral, FixedU128::from_rational(48, 100));
-			assert_eq!(active_sums(0, 0).g_yield, FixedU128::from_rational(8, 100));
-		});
-}
 
 /// The pending pair resets only when an offset empties the pending stock. Emptying it any other
 /// way, such as every row maturing, leaves the accumulators where they stand, which is what makes

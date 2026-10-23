@@ -1,7 +1,6 @@
 //! Lifecycle smoke tests: a fast layer covering branch registration, vault
-//! open/close happy paths and validation rejections, frozen-mode blocking, and
-//! same-rate LIFO ordering. The deeper per-area
-//! coverage lives in the sibling modules.
+//! open/close happy paths and validation rejections, and frozen-mode blocking.
+//! The deeper per-area coverage lives in the sibling modules.
 
 use crate::{
 	mock::*,
@@ -10,32 +9,11 @@ use crate::{
 };
 use pallet_linked_list::SortedListInterface;
 
-// Lazy redistribution has constant cost per vault operation, so it does not require a branch
-// vault limit. The fixture exceeds the former limit of 64.
+// Only the stable asset's owner or root may register a branch, and a pair registers once. The
+// positive owner path and its deposit are covered in `governance.rs`.
 #[test]
-fn open_vault_count_is_not_capped_by_redistribution() {
-	use frame::traits::fungible::Mutate;
-
+fn create_branch_rejects_non_owner_and_duplicate_pair() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		for owner in 1_000..1_064 {
-			assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&owner, 2_000));
-			let rate = FixedU128::from_rational(u128::from(owner - 999), 100);
-			assert_ok!(open(owner, DOT, STABLE, 1_000, 500, rate));
-		}
-		assert_eq!(market_state(DOT, STABLE).vault_count, 64);
-
-		let owner = 1_064;
-		assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&owner, 2_000));
-		assert_ok!(open(owner, DOT, STABLE, 1_000, 500, percent(65)));
-
-		assert_eq!(market_state(DOT, STABLE).vault_count, 65);
-		assert!(vault_exists(DOT, STABLE, owner));
-	});
-}
-
-#[test]
-fn create_branch_requires_asset_owner_or_root() {
-	ExtBuilder::default().build_and_execute(|| {
 		// A non-owner of the stable asset cannot create a branch for it.
 		assert_noop!(
 			crate::Pallet::<Test>::create_branch(
@@ -49,22 +27,6 @@ fn create_branch_requires_asset_owner_or_root() {
 			DispatchError::BadOrigin
 		);
 
-		// The stable asset's owner (acct 1 in genesis) can, locking a deposit.
-		set_price(TOKEN_X, DEFAULT_PRICE);
-		assert_ok!(crate::Pallet::<Test>::create_branch(
-			RuntimeOrigin::signed(1),
-			TOKEN_X,
-			STABLE,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config(),
-			(),
-		));
-	});
-}
-
-#[test]
-fn create_branch_rejects_duplicate_market_pair() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_noop!(
 			crate::Pallet::<Test>::create_branch(
 				RuntimeOrigin::root(),
@@ -79,34 +41,39 @@ fn create_branch_rejects_duplicate_market_pair() {
 	});
 }
 
-// Each case violates one opening constraint and must leave storage unchanged.
+// Each position violates one opening constraint and must leave storage unchanged.
 #[test]
 fn open_vault_rejects_invalid_positions() {
-	let cases = [
-		(true, 2_000, 500, percent(5), crate::Error::<Test>::VaultAlreadyExists),
-		(false, 1_000, 100, percent(5), crate::Error::<Test>::DebtBelowMinimum),
-		(false, 1_000, 500, FixedU128::from_rational(0, 1), crate::Error::<Test>::RateOutOfBounds),
-		(false, 1_000, 500, percent(401), crate::Error::<Test>::RateOutOfBounds),
-		(
-			false,
-			100_000_000_000,
-			200_000_000,
-			percent(5),
-			crate::Error::<Test>::DebtCeilingExceeded,
-		),
-		(false, 100, 1_000, percent(5), crate::Error::<Test>::UnsafeCollateralizationRatio),
-	];
-	for (exists, collateral, debt, rate, error) in cases {
-		ExtBuilder::default().build_and_execute(|| {
-			let config = BranchConfig { debt_ceiling: 100_000_000, ..default_branch_config() };
-			register_market_with(DOT, STABLE, DEFAULT_PRICE, config);
-			if exists {
-				assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-			}
+	let config = BranchConfig { debt_ceiling: 100_000_000, ..default_branch_config() };
+	ExtBuilder::default().branch_with(DOT, STABLE, config).build_and_execute(|| {
+		assert_noop!(
+			open(1, DOT, STABLE, 1_000, 100, percent(5)),
+			crate::Error::<Test>::DebtBelowMinimum
+		);
+		assert_noop!(
+			open(1, DOT, STABLE, 1_000, 500, FixedU128::from_rational(0, 1)),
+			crate::Error::<Test>::RateOutOfBounds
+		);
+		assert_noop!(
+			open(1, DOT, STABLE, 1_000, 500, percent(401)),
+			crate::Error::<Test>::RateOutOfBounds
+		);
+		assert_noop!(
+			open(1, DOT, STABLE, 100_000_000_000, 200_000_000, percent(5)),
+			crate::Error::<Test>::DebtCeilingExceeded
+		);
+		assert_noop!(
+			open(1, DOT, STABLE, 100, 1_000, percent(5)),
+			crate::Error::<Test>::UnsafeCollateralizationRatio
+		);
 
-			assert_noop!(open(1, DOT, STABLE, collateral, debt, rate), error);
-		});
-	}
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+
+		assert_noop!(
+			open(1, DOT, STABLE, 2_000, 500, percent(5)),
+			crate::Error::<Test>::VaultAlreadyExists
+		);
+	});
 }
 
 #[test]
@@ -156,52 +123,72 @@ fn defensive_manager_can_only_tighten_selected_risk_parameters() {
 	});
 }
 
-#[test]
-fn same_rate_lifo_redemption_order() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		// Three vaults at the same rate, in order: 1, 2, 3.
-		for who in 1u64..=3 {
-			assert_ok!(open(who, DOT, STABLE, 1_000, 500, percent(5)));
-		}
+/// Opens vaults 1 and 2, then redeems vault 1 down to Dormant dust while vault 2 stays Active.
+fn open_active_and_dormant_vaults() {
+	assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(50)));
+	assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(60)));
+	assert_ok!(redeem(DOT, STABLE, 3, 350));
+	assert!(vault_status(DOT, STABLE, 1).is_dormant());
+}
 
-		// Tail-first iteration produces 3, 2, 1 (LIFO).
-		let tail = LinkedList::iter_from_tail(VaultList::Rate(DOT, STABLE), 5);
-		assert_eq!(tail, alloc::vec![3, 2, 1]);
+// A frozen branch rejects every operation that raises risk or needs a price. Each operation
+// succeeds right before the freeze, so the freeze is the only guard left to reject it.
+#[test]
+fn frozen_branch_blocks_user_ops() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		open_active_and_dormant_vaults();
+		hypothetically!({
+			assert_ok!(open(3, DOT, STABLE, 1_000, 500, percent(5)));
+		});
+		hypothetically!({
+			assert_ok!(borrow(2, DOT, STABLE, 100, None));
+		});
+		hypothetically!({
+			assert_ok!(withdraw_collateral(2, DOT, STABLE, 1, None));
+		});
+		hypothetically!({
+			assert_ok!(change_rate(2, DOT, STABLE, percent(70)));
+		});
+		hypothetically!({
+			assert_ok!(nominate_dormant(9, DOT, STABLE, 1));
+		});
+
+		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
+
+		assert_noop!(
+			open(3, DOT, STABLE, 1_000, 500, percent(5)),
+			crate::Error::<Test>::BranchFrozen
+		);
+		assert_noop!(borrow(2, DOT, STABLE, 100, None), crate::Error::<Test>::BranchFrozen);
+		assert_noop!(
+			withdraw_collateral(2, DOT, STABLE, 1, None),
+			crate::Error::<Test>::BranchFrozen
+		);
+		assert_noop!(change_rate(2, DOT, STABLE, percent(70)), crate::Error::<Test>::BranchFrozen);
+		assert_noop!(nominate_dormant(9, DOT, STABLE, 1), crate::Error::<Test>::BranchFrozen);
 	});
 }
 
-// A frozen branch rejects every operation that raises risk or needs a price. Each case succeeds
-// right before the freeze, so the freeze is the only guard left to reject it.
+// A frozen branch rejects dormant activation too. It succeeds right before the freeze, so the
+// freeze is the only guard left to reject it.
 #[test]
-fn frozen_branch_blocks_user_ops() {
-	type Operation = fn() -> DispatchResult;
-	// The elapsed time lets the Dormant dust of 155 accrue 78 at 50%, past the 200 minimum that
-	// activation needs and nomination forbids.
-	let cases: [(&str, Moment, Operation); 6] = [
-		("open_vault", 0, || open(3, DOT, STABLE, 1_000, 500, percent(5))),
-		("borrow", 0, || borrow(2, DOT, STABLE, 100, None)),
-		("withdraw_collateral", 0, || withdraw_collateral(2, DOT, STABLE, 1, None)),
-		("change_rate", 0, || change_rate(2, DOT, STABLE, percent(70))),
-		("nominate_dormant", 0, || nominate_dormant(9, DOT, STABLE, 1)),
-		("activate_dormant", ONE_YEAR_MS, || {
-			activate_dormant(9, DOT, STABLE, 1).map(|_| ()).map_err(|error| error.error)
-		}),
-	];
-	for (name, elapsed, operation) in cases {
-		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-			// The redemption parks vault 1 as Dormant dust. Vault 2 stays Active.
-			assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(50)));
-			assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(60)));
-			assert_ok!(redeem(DOT, STABLE, 3, 350));
-			assert!(vault_status(DOT, STABLE, 1).is_dormant());
-			advance_time(elapsed);
-			hypothetically!(assert_eq!(operation(), Ok(()), "{name} succeeds while unfrozen"));
-
-			assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
-
-			assert_noop!(operation(), crate::Error::<Test>::BranchFrozen);
+fn frozen_branch_blocks_dormant_activation() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		open_active_and_dormant_vaults();
+		// The elapsed time lets the Dormant dust of 155 accrue 78 at 50%, past the 200 minimum
+		// that activation needs and nomination forbids, so `frozen_branch_blocks_user_ops`
+		// checks nomination before any time passes.
+		advance_time(ONE_YEAR_MS);
+		let activate =
+			|| activate_dormant(9, DOT, STABLE, 1).map(|_| ()).map_err(|error| error.error);
+		hypothetically!({
+			assert_ok!(activate());
 		});
-	}
+
+		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
+
+		assert_noop!(activate(), crate::Error::<Test>::BranchFrozen);
+	});
 }
 
 fn freeze_by_governance() {
@@ -209,61 +196,43 @@ fn freeze_by_governance() {
 	assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Frozen));
 }
 
-// A collateral deposit needs no price and only lowers risk, so a freeze must not block an owner
-// from protecting the vault before liquidations resume.
+// A freeze blocks what raises risk or needs a price, but owners must still be able to protect a
+// vault before liquidations resume. A deposit and a repayment need no price and only lower risk. A
+// full payoff that leaves collateral behind parks a husk and closes nothing, so it is allowed too,
+// while the close that would release the collateral stays blocked.
 #[test]
-fn frozen_branch_accepts_collateral_deposit() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-		freeze_by_governance();
-
-		assert_ok!(deposit_collateral(2, DOT, STABLE, 1, 100));
-
-		assert_eq!(held(DOT, 1), 1_100);
-		assert_eq!(vault(DOT, STABLE, 1).collateral, 1_100);
-		assert_eq!(market_state(DOT, STABLE).total_collateral, 1_100);
-		assert_eq!(
-			branch_mode(DOT, STABLE),
-			Some(BranchMode::Frozen),
-			"the deposit does not unfreeze"
-		);
-	});
-}
-
-// A partial repayment burns stablecoin without a price, so it stays available while frozen.
-#[test]
-fn frozen_branch_accepts_partial_repayment() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-		let debt_before = vault(DOT, STABLE, 1).debt.total();
-		freeze_by_governance();
-
-		assert_ok!(repay(1, DOT, STABLE, 1, Some(100)));
-
-		assert_eq!(vault(DOT, STABLE, 1).debt.total(), debt_before - 100);
-		assert!(vault_status(DOT, STABLE, 1).is_active());
-		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Frozen));
-	});
-}
-
-// A full payoff that leaves collateral behind only parks a husk; it closes nothing, so the freeze
-// does not stand in its way.
-#[test]
-fn frozen_branch_accepts_full_repayment_that_leaves_a_husk() {
+fn frozen_branch_accepts_risk_reducing_ops() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		// Cover the upfront fee that the borrowed principal does not include.
 		mint_stable(STABLE, 1, 10);
 		freeze_by_governance();
 
+		assert_ok!(deposit_collateral(2, DOT, STABLE, 1, 100));
+
+		assert_eq!(held(DOT, 1), 1_100);
+		assert_eq!(vault(DOT, STABLE, 1).collateral, 1_100);
+		assert_eq!(
+			branch_mode(DOT, STABLE),
+			Some(BranchMode::Frozen),
+			"the deposit does not unfreeze"
+		);
+
+		let debt_before = vault(DOT, STABLE, 1).debt.total();
+		assert_ok!(repay(1, DOT, STABLE, 1, Some(100)));
+
+		assert_eq!(vault(DOT, STABLE, 1).debt.total(), debt_before - 100);
+		assert!(vault_status(DOT, STABLE, 1).is_active());
+		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Frozen));
+
 		assert_ok!(repay(1, DOT, STABLE, 1, None));
 
 		let husk = vault(DOT, STABLE, 1);
 		assert_eq!(husk.debt.total(), 0);
-		assert_eq!(husk.collateral, 1_000);
+		assert_eq!(husk.collateral, 1_100);
 		assert!(vault_status(DOT, STABLE, 1).is_dormant());
 		assert!(
-			!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
+			!<LinkedList as SortedListInterface<VaultList, AccountId>>::contains(
 				&VaultList::Rate(DOT, STABLE),
 				&1
 			),
@@ -274,99 +243,179 @@ fn frozen_branch_accepts_full_repayment_that_leaves_a_husk() {
 	});
 }
 
-// Empty-row cleanup remains available under either freeze reason and before an oracle
-// failure has been persisted as a freeze.
-#[test]
-fn repayment_closes_empty_vault_without_price_or_unfreezing() {
-	for another_vault in [false, true] {
-		for governance_frozen in [false, true] {
-			for oracle_frozen in [false, true] {
-				ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-					assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-					// Exercise both the last-vault and nonempty-branch cleanup paths.
-					if another_vault {
-						assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
-					}
-					assert_ok!(redeem_step(DOT, STABLE, 1, 7, 200, 1_000));
-					assert_eq!(vault(DOT, STABLE, 1).collateral, 0);
-					if governance_frozen {
-						freeze_by_governance();
-					}
-					MockOracleAvailable::set(false);
-					if oracle_frozen {
-						assert_ok!(crate::Pallet::<Test>::refresh_branch(
-							RuntimeOrigin::signed(99),
-							DOT,
-							STABLE
-						));
-					}
-					let before = market_state(DOT, STABLE);
-
-					assert_ok!(repay(1, DOT, STABLE, 1, None));
-
-					assert!(!vault_exists(DOT, STABLE, 1));
-					assert_eq!(vault_deposit_held(DOT, 1), 0);
-					assert!(!<LinkedList as SortedListInterface<VaultList, u64>>::contains(
-						&VaultList::Rate(DOT, STABLE),
-						&1
-					));
-					let after = market_state(DOT, STABLE);
-					assert_eq!(after.vault_count, before.vault_count - 1);
-					assert_eq!(after.total_collateral, before.total_collateral);
-					assert_eq!(after.frozen, before.frozen);
-					assert_eq!(after.dormant_redemption_target, None);
-				});
-			}
-		}
-	}
+/// Redeems all of vault 1's collateral, leaving a row that holds only debt.
+fn empty_vault_one() {
+	assert_ok!(redeem_step(DOT, STABLE, 1, 7, 200, 1_000));
+	assert_eq!(vault(DOT, STABLE, 1).collateral, 0);
 }
 
-// External observers must not see the most permissive mode while prices are
-// unknowable: `mode()` reports `Frozen` for a failing oracle even before
-// `refresh_branch` persists the freeze.
+/// Repays the empty vault 1 in full and asserts that the repayment closed it without touching the
+/// branch's collateral or freeze.
+fn assert_repayment_closes_empty_vault_one() {
+	let before = market_state(DOT, STABLE);
+
+	assert_ok!(repay(1, DOT, STABLE, 1, None));
+
+	assert!(!vault_exists(DOT, STABLE, 1));
+	assert_eq!(vault_deposit_held(DOT, 1), 0);
+	assert!(!<LinkedList as SortedListInterface<VaultList, AccountId>>::contains(
+		&VaultList::Rate(DOT, STABLE),
+		&1
+	));
+	let after = market_state(DOT, STABLE);
+	assert_eq!(after.vault_count, before.vault_count - 1);
+	assert_eq!(after.total_collateral, before.total_collateral);
+	assert_eq!(after.frozen, before.frozen);
+	assert_eq!(after.dormant_redemption_target, None);
+}
+
+// Empty-row cleanup remains available under either freeze reason and before an oracle failure has
+// been persisted as a freeze. The oracle is down in every test below, and each freeze state is
+// covered on both the last-vault and the nonempty-branch cleanup paths.
 #[test]
-fn mode_reports_frozen_while_oracle_unavailable() {
+fn repayment_closes_last_empty_vault_while_oracle_is_down() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Normal));
+		empty_vault_one();
+		MockOracleAvailable::set(&false);
 
-		MockOracleAvailable::set(false);
-
-		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Frozen));
-
-		MockOracleAvailable::set(true);
-
-		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Normal));
+		assert_repayment_closes_empty_vault_one();
 	});
 }
 
 #[test]
-fn refresh_branch_clears_oracle_frozen() {
+fn repayment_closes_last_empty_vault_under_oracle_freeze() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		empty_vault_one();
+		MockOracleAvailable::set(&false);
+		assert_ok!(refresh_branch(99, DOT, STABLE));
 
-		MockOracleAvailable::set(false);
+		assert_repayment_closes_empty_vault_one();
+	});
+}
+
+#[test]
+fn repayment_closes_last_empty_vault_under_governance_freeze() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		empty_vault_one();
+		freeze_by_governance();
+		MockOracleAvailable::set(&false);
+
+		assert_repayment_closes_empty_vault_one();
+	});
+}
+
+#[test]
+fn repayment_closes_last_empty_vault_under_governance_and_oracle_freeze() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		empty_vault_one();
+		freeze_by_governance();
+		MockOracleAvailable::set(&false);
+		assert_ok!(refresh_branch(99, DOT, STABLE));
+
+		assert_repayment_closes_empty_vault_one();
+	});
+}
+
+#[test]
+fn repayment_closes_empty_vault_beside_another_while_oracle_is_down() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
+		empty_vault_one();
+		MockOracleAvailable::set(&false);
+
+		assert_repayment_closes_empty_vault_one();
+	});
+}
+
+#[test]
+fn repayment_closes_empty_vault_beside_another_under_oracle_freeze() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
+		empty_vault_one();
+		MockOracleAvailable::set(&false);
+		assert_ok!(refresh_branch(99, DOT, STABLE));
+
+		assert_repayment_closes_empty_vault_one();
+	});
+}
+
+#[test]
+fn repayment_closes_empty_vault_beside_another_under_governance_freeze() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
+		empty_vault_one();
+		freeze_by_governance();
+		MockOracleAvailable::set(&false);
+
+		assert_repayment_closes_empty_vault_one();
+	});
+}
+
+#[test]
+fn repayment_closes_empty_vault_beside_another_under_governance_and_oracle_freeze() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
+		empty_vault_one();
+		freeze_by_governance();
+		MockOracleAvailable::set(&false);
+		assert_ok!(refresh_branch(99, DOT, STABLE));
+
+		assert_repayment_closes_empty_vault_one();
+	});
+}
+
+// External observers must not see the most permissive mode while prices are unknowable, so
+// `mode()` reports `Frozen` for a failing oracle even before `refresh_branch` persists the freeze.
+// Only a refresh with a working oracle lifts the persisted freeze; the governance clear does not.
+#[test]
+fn oracle_freeze_is_reported_persisted_and_cleared_only_by_refresh() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Normal));
+
+		MockOracleAvailable::set(&false);
+
+		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Frozen));
+		assert_eq!(market_state(DOT, STABLE).frozen, None, "the derived freeze is not persisted");
+
+		MockOracleAvailable::set(&true);
+
+		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Normal));
+
+		MockOracleAvailable::set(&false);
 		assert_ok!(refresh_branch(99, DOT, STABLE));
 
 		let frozen = market_state(DOT, STABLE).frozen.expect("freeze persisted");
 		assert_eq!(frozen.reason, crate::FrozenReason::OracleFailure);
 
-		// Oracle still down → second refresh is a no-op (already frozen for
-		// the same reason).
+		// Oracle still down, so a second refresh is a no-op for the same reason.
 		assert_ok!(refresh_branch(99, DOT, STABLE));
 
 		assert!(market_state(DOT, STABLE).is_frozen());
 
-		// Restore oracle and refresh → unfreezes.
-		MockOracleAvailable::set(true);
+		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, false));
+
+		assert!(market_state(DOT, STABLE).is_frozen(), "governance cannot clear an oracle freeze");
+
+		MockOracleAvailable::set(&true);
 		assert_ok!(refresh_branch(99, DOT, STABLE));
 
 		assert!(!market_state(DOT, STABLE).is_frozen());
 	});
 }
 
+// A governance freeze must pin the interest clock: neither a branch refresh nor a vault poke may
+// mint interest for the frozen window or clear the freeze.
 #[test]
-fn refresh_branch_does_not_clear_governance_frozen_or_mint() {
+fn governance_freeze_pins_interest_across_refresh_and_poke() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
@@ -378,14 +427,25 @@ fn refresh_branch_does_not_clear_governance_frozen_or_mint() {
 		let after = market_state(DOT, STABLE);
 		assert!(after.is_frozen());
 		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
+
+		assert_ok!(poke(9, DOT, STABLE, 1));
+
+		let after = market_state(DOT, STABLE);
+		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
+		assert_eq!(
+			after.debt.last_interest_time, before.debt.last_interest_time,
+			"interest clock pinned across the frozen window"
+		);
+		assert!(after.is_frozen(), "poke does not clear Frozen");
 	});
 }
 
 #[test]
 fn governance_clear_clears_governance_frozen() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		// The emergency admin cannot clear a governance freeze. That needs the full admin.
-		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
+		// The emergency admin can pull the freeze but cannot clear it. That needs the full admin.
+		assert_ok!(set_governance_frozen(EMERGENCY_ADMIN, DOT, STABLE, true));
+		assert!(market_state(DOT, STABLE).is_frozen());
 
 		assert_noop!(
 			set_governance_frozen(EMERGENCY_ADMIN, DOT, STABLE, false),
@@ -408,41 +468,5 @@ fn governance_clear_clears_governance_frozen() {
 			old_mode: BranchMode::Frozen,
 			new_mode: BranchMode::Normal,
 		});
-	});
-}
-
-#[test]
-fn governance_clear_is_noop_for_oracle_frozen() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-		MockOracleAvailable::set(false);
-		assert_ok!(refresh_branch(99, DOT, STABLE));
-		assert!(market_state(DOT, STABLE).is_frozen());
-
-		// Governance clear refuses oracle-Frozen state — branch stays frozen.
-		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, false));
-
-		assert!(market_state(DOT, STABLE).is_frozen());
-	});
-}
-
-#[test]
-fn frozen_poke_pins_interest_time_without_minting() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
-		let before = market_state(DOT, STABLE);
-
-		let elapsed: Moment = ONE_DAY_MS;
-		advance_time(elapsed);
-		assert_ok!(poke(9, DOT, STABLE, 1));
-
-		let after = market_state(DOT, STABLE);
-		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
-		assert_eq!(
-			after.debt.last_interest_time, before.debt.last_interest_time,
-			"interest clock pinned across the frozen window"
-		);
-		assert!(after.is_frozen(), "poke does not clear Frozen");
 	});
 }

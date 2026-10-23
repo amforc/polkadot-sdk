@@ -242,6 +242,8 @@ fn check_branch_identities<T: Config>(
 	let mut sum_claimable_accrual_rate = U256::zero();
 	let mut sum_eligible_collateral = BalanceOf::<T>::zero();
 	let mut vault_count: u32 = 0;
+	let mut rate_members: u32 = 0;
+	let mut recovery_members: u32 = 0;
 
 	for (owner, record) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
 		let vault = record.vault;
@@ -274,6 +276,13 @@ fn check_branch_identities<T: Config>(
 		let in_rate_index = T::VaultLists::contains(rate_list, &owner);
 		let in_recovery = T::VaultLists::contains(recovery_list, &owner);
 		ensure!(!(in_rate_index && in_recovery), "vault in both rate index and recovery FIFO");
+		if in_rate_index {
+			rate_members = rate_members.checked_add(1).ok_or("rate member count overflow")?;
+		}
+		if in_recovery {
+			recovery_members =
+				recovery_members.checked_add(1).ok_or("recovery member count overflow")?;
+		}
 		// The row carries this branch's share of the owner's hold; the cross-branch
 		// owner-hold invariant (`Σ_stablecoins vault.collateral == hold`) is
 		// accumulated here and checked once, globally, in `do_try_state`.
@@ -343,6 +352,16 @@ fn check_branch_identities<T: Config>(
 		}
 	}
 	ensure!(state.vault_count == vault_count, "branch vault_count != number of vault rows");
+	// Each member counted above is a distinct vault row, so equal counts leave no list node
+	// without a row: an orphan would be redeemed against, or recovered, with nothing behind it.
+	ensure!(
+		T::VaultLists::count(rate_list) == rate_members,
+		"rate index holds a node with no vault row"
+	);
+	ensure!(
+		T::VaultLists::count(recovery_list) == recovery_members,
+		"recovery FIFO holds a node with no vault row"
+	);
 
 	ensure!(
 		state.stakes.total == sum_stake,
