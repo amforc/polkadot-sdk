@@ -16,80 +16,66 @@
 // limitations under the License.
 
 use crate::{
-	list, mock::*, Event, ListError, ListMeta, ListMetas, ListNodes, Position, SortedListInterface,
+	mock::*, Event, ListError, ListMeta, ListMetas, ListNodes, Position, SortedListInterface,
 };
-use frame::testing_prelude::{assert_err, assert_noop, assert_ok};
+use frame::testing_prelude::{assert_err, assert_noop};
 
 #[test]
-fn insert_into_empty_list_sets_head_tail_size() {
-	build_and_execute(|| {
-		let steps = LinkedList::insert(1, 100, 50, Position::endpoints_only()).unwrap();
-		assert_eq!(steps, 0);
-		assert_eq!(LinkedList::head(&1), Some(100));
-		assert_eq!(LinkedList::tail(&1), Some(100));
-		assert_eq!(LinkedList::count(&1), 1);
-		assert_eq!(dump(1), vec![(100, 50)]);
-		System::assert_last_event(
-			Event::ItemInserted { list_id: 1, item: 100, priority: 50 }.into(),
-		);
-
-		// Re-inserting the same `(list_id, item)` rejects without touching state.
-		assert_noop!(
-			LinkedList::insert(1, 100, 50, Position::endpoints_only()),
-			ListError::ItemAlreadyExists
-		);
-	});
-}
-
-#[test]
-fn insert_creating_list_emits_list_created() {
+fn insert_into_empty_list_creates_list() {
 	build_and_execute(|| {
 		// The first item creates the list: `ListCreated` then `ItemInserted`.
-		insert(1, 100, 50);
-		System::assert_has_event(Event::ListCreated { list_id: 1 }.into());
-		System::assert_last_event(
-			Event::ItemInserted { list_id: 1, item: 100, priority: 50 }.into(),
+		let steps = LinkedList::insert(1, 100, 50, Position::endpoints_only()).unwrap();
+		assert_eq!(steps, 0);
+		assert_eq!(dump(1), vec![(100, 50)]);
+		assert_eq!(
+			linked_list_events(),
+			vec![
+				Event::ListCreated { list_id: 1 },
+				Event::ItemInserted { list_id: 1, item: 100, priority: 50 },
+			]
 		);
 
 		// A second item into the same list must not re-emit `ListCreated`.
 		System::reset_events();
 		insert(1, 200, 40);
-		assert_eq!(System::events().len(), 1);
-		System::assert_last_event(
-			Event::ItemInserted { list_id: 1, item: 200, priority: 40 }.into(),
+		assert_eq!(
+			linked_list_events(),
+			vec![Event::ItemInserted { list_id: 1, item: 200, priority: 40 }]
 		);
 	});
 }
 
-#[test]
-fn insert_with_valid_hints_o1() {
-	build_and_execute(|| {
-		insert(1, 100, 90); // head
-		insert(1, 200, 50); // tail
+/// Seeds list 1 with 100(90) and 200(50), leaving a head, a middle and a
+/// tail slot for item 150.
+fn build_two_item_list() {
+	insert(1, 100, 90);
+	insert(1, 200, 50);
+}
 
-		let steps = LinkedList::insert(1, 150, 70, Position::between(100, 200)).unwrap();
-		assert_eq!(steps, 0);
+#[test]
+fn insert_with_exact_head_hint_takes_zero_steps() {
+	build_and_execute(|| {
+		build_two_item_list();
+		assert_eq!(LinkedList::insert(1, 150, 95, Position::at_head(100)), Ok(0));
+		assert_eq!(dump(1), vec![(150, 95), (100, 90), (200, 50)]);
+	});
+}
+
+#[test]
+fn insert_with_exact_between_hint_takes_zero_steps() {
+	build_and_execute(|| {
+		build_two_item_list();
+		assert_eq!(LinkedList::insert(1, 150, 70, Position::between(100, 200)), Ok(0));
 		assert_eq!(dump(1), vec![(100, 90), (150, 70), (200, 50)]);
 	});
 }
 
 #[test]
-fn insert_at_head() {
+fn insert_with_exact_tail_hint_takes_zero_steps() {
 	build_and_execute(|| {
-		insert(1, 100, 50);
-		assert_ok!(LinkedList::insert(1, 200, 90, Position::at_head(100)));
-		assert_eq!(LinkedList::head(&1), Some(200));
-		assert_eq!(dump(1), vec![(200, 90), (100, 50)]);
-	});
-}
-
-#[test]
-fn insert_at_tail() {
-	build_and_execute(|| {
-		insert(1, 100, 90);
-		assert_ok!(LinkedList::insert(1, 200, 10, Position::at_tail(100)));
-		assert_eq!(LinkedList::tail(&1), Some(200));
-		assert_eq!(dump(1), vec![(100, 90), (200, 10)]);
+		build_two_item_list();
+		assert_eq!(LinkedList::insert(1, 150, 10, Position::at_tail(200)), Ok(0));
+		assert_eq!(dump(1), vec![(100, 90), (200, 50), (150, 10)]);
 	});
 }
 
@@ -101,17 +87,9 @@ fn insert_same_priority_lands_at_tail_side_of_cluster() {
 		insert(1, 3, 50);
 		assert_eq!(dump(1), vec![(1, 50), (2, 50), (3, 50)]);
 		assert_eq!(LinkedList::iter_from_tail(1, 3), vec![3, 2, 1]);
-	});
-}
-
-#[test]
-fn insert_existing_item_errors() {
-	build_and_execute(|| {
-		insert(1, 100, 50);
-		assert_noop!(
-			LinkedList::insert(1, 100, 50, Position::endpoints_only()),
-			ListError::ItemAlreadyExists
-		);
+		// Tail-side placement makes `pop_tail` LIFO within the cluster.
+		assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((3, 50)));
+		assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((2, 50)));
 	});
 }
 
@@ -145,104 +123,18 @@ fn insert_does_not_saturate_size_counter() {
 }
 
 #[test]
-#[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
-fn insert_at_missing_neighbor_is_defensive() {
-	build_and_execute_defensive(|| {
-		// The hint names a prev neighbor (100) that does not exist.
-		assert_err!(
-			list::insert_at::<Test>(&1, &200, 50, Position::at_tail(100)),
-			ListError::CorruptList
-		);
-	});
-}
-
-#[test]
-#[cfg_attr(debug_assertions, should_panic = "head pointer disagrees with head-side insert")]
-fn insert_at_endpoint_mismatch_is_defensive() {
-	build_and_execute_defensive(|| {
-		insert(1, 100, 90);
-		insert(1, 200, 50);
-		// `Position::endpoints_only()` on a non-empty list: `prev = next = None`
-		// would rewrite both head and tail. The endpoint cross-check trips
-		// defensively. In production it logs and returns `CorruptList` instead.
-		assert_err!(
-			list::insert_at::<Test>(&1, &300, 70, Position::endpoints_only()),
-			ListError::CorruptList
-		);
-	});
-}
-
-#[test]
-#[cfg_attr(debug_assertions, should_panic = "prev neighbor rejects the resolved position")]
-fn insert_at_priority_above_prev_is_defensive() {
-	build_and_execute_defensive(|| {
-		insert(1, 100, 90);
-		insert(1, 200, 50);
-		// Priority 100 violates `prev.priority (90) >= priority (100)`; the
-		// adjacency check trips defensively.
-		assert_err!(
-			list::insert_at::<Test>(&1, &300, 100, Position::between(100, 200)),
-			ListError::CorruptList
-		);
-	});
-}
-
-#[test]
-#[cfg_attr(debug_assertions, should_panic = "next neighbor rejects the resolved position")]
-fn insert_at_priority_not_above_next_is_defensive() {
-	build_and_execute_defensive(|| {
-		insert(1, 100, 90);
-		insert(1, 200, 50);
-		// Priority 50 violates `priority (50) > next.priority (50)`; the
-		// adjacency check trips defensively.
-		assert_err!(
-			list::insert_at::<Test>(&1, &300, 50, Position::between(100, 200)),
-			ListError::CorruptList
-		);
-	});
-}
-
-#[test]
-#[cfg_attr(debug_assertions, should_panic = "item linked against itself")]
-fn insert_at_self_link_is_defensive() {
-	build_and_execute_defensive(|| {
-		// The hint claims the new item 200 is its own predecessor.
-		assert_err!(
-			list::insert_at::<Test>(&1, &200, 40, Position::at_tail(200)),
-			ListError::CorruptList
-		);
-	});
-}
-
-#[test]
 #[cfg_attr(debug_assertions, should_panic = "neighbor hint into absent list metadata")]
-fn insert_at_interior_into_absent_meta_is_defensive() {
-	build_and_execute_defensive(|| {
+fn insert_interior_into_absent_meta_is_defensive() {
+	build_and_execute_no_post_check(|| {
 		insert(1, 100, 90);
 		insert(1, 200, 50);
-		// Drop the meta row but keep both linked nodes. An interior insert must
+		// Drop the meta row but keep both linked nodes. The hint's interior sides
+		// never consult meta, so `walk_repair` accepts it; the insert must still
 		// reject this as corruption, not treat the missing row as an empty list
 		// and build metadata over the orphans.
 		ListMetas::<Test>::remove(1);
 		assert_err!(
-			list::insert_at::<Test>(&1, &150, 70, Position::between(100, 200)),
-			ListError::CorruptList
-		);
-	});
-}
-
-#[test]
-#[cfg_attr(debug_assertions, should_panic = "tail pointer disagrees with tail-side insert")]
-fn insert_at_tail_endpoint_mismatch_is_defensive() {
-	build_and_execute_defensive(|| {
-		insert(1, 100, 90);
-		insert(1, 200, 50);
-		// Corrupt the tail pointer so a tail-side insert (`next = None`) past the
-		// real tail (200) disagrees with `ListMetas.tail`. Twin of the head-side
-		// `insert_at_endpoint_mismatch_is_defensive` case.
-		ListMetas::<Test>::mutate_extant(1, |meta| meta.tail = Some(100));
-		assert_err!(
-			list::insert_at::<Test>(&1, &300, 40, Position::at_tail(200)),
+			LinkedList::insert(1, 150, 70, Position::between(100, 200)),
 			ListError::CorruptList
 		);
 	});

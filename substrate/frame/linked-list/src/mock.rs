@@ -17,8 +17,6 @@
 
 //! Tests mock for `pallet-linked-list`.
 
-#![cfg(test)]
-
 use crate as pallet_linked_list;
 use alloc::collections::BTreeMap;
 use frame::testing_prelude::*;
@@ -99,27 +97,19 @@ pub(crate) fn build_and_execute(test: impl FnOnce()) {
 	});
 }
 
-/// Like [`build_and_execute`], but skips the post-test invariant check. Use
-/// only for tests that deliberately leave storage corrupt to exercise
-/// `do_try_state` directly. For `should_panic` tests of `defensive!` paths
-/// use [`build_and_execute_defensive`] instead.
+/// Like [`build_and_execute`], but skips the post-test invariant check, for tests that
+/// deliberately leave storage corrupt: `do_try_state` probes and `should_panic` tests of
+/// `defensive!` paths (in release `defensive!` does not panic, so the post-check would trip on
+/// the corruption).
 pub(crate) fn build_and_execute_no_post_check(test: impl FnOnce()) {
-	new_test_ext().execute_with(test);
+	sp_tracing::capture_test_logs!(sp_tracing::Level::ERROR, true, {
+		new_test_ext().execute_with(test);
+	});
 }
 
-/// Like [`build_and_execute_no_post_check`], for `should_panic` tests of
-/// `defensive!` paths: `defensive!` logs an ERROR before panicking, and the
-/// hidden `construct_runtime` integrity test installs a global stderr
-/// subscriber that leaks that log past libtest's capture even when the test
-/// passes. The capture below keeps it silent on pass, visible on failure.
-///
-/// NOTE: Fold back into `build_and_execute_no_post_check` once the generated
-/// integrity test uses `with_test_writer` instead of `try_init_simple`. We can
-/// get rid of this by updating `try_init_simple` in `#[frame_construct_runtime]`
-pub(crate) fn build_and_execute_defensive(test: impl FnOnce()) {
-	sp_tracing::capture_test_logs!(sp_tracing::Level::ERROR, true, {
-		build_and_execute_no_post_check(test);
-	});
+/// This pallet's events deposited so far in the current block, in order.
+pub(crate) fn linked_list_events() -> alloc::vec::Vec<pallet_linked_list::Event<Test>> {
+	System::read_events_for_pallet::<pallet_linked_list::Event<Test>>()
 }
 
 /// Convenience: insert via the `SortedListInterface` with the hint fetched
