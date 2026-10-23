@@ -374,6 +374,35 @@ impl pallet_example_tasks::Config for Runtime {
 
 impl pallet_example_mbm::Config for Runtime {}
 
+parameter_types! {
+	pub const LinkedListMaxHintRepairSteps: u32 = 16;
+}
+
+impl pallet_linked_list::Config for Runtime {
+	type WeightInfo = ();
+	type ListId = u32;
+	type ItemId = u32;
+	type Priority = u32;
+	type MaxHintRepairSteps = LinkedListMaxHintRepairSteps;
+	#[cfg(feature = "runtime-benchmarks")]
+	type PriorityProvider = pallet_linked_list::BenchPriorityProvider<Runtime>;
+	#[cfg(not(feature = "runtime-benchmarks"))]
+	type PriorityProvider = LinkedListDummyPriorityProvider;
+}
+
+/// Constant-priority `PriorityProvider` for non-benchmark builds.
+/// Real runtimes must (a) implement `PriorityProvider` against their
+/// authoritative state and (b) regenerate this pallet's weights with that
+/// provider wired for benchmarks — the committed weights account for exactly
+/// one storage read of the benchmark-only provider.
+pub struct LinkedListDummyPriorityProvider;
+impl pallet_linked_list::PriorityProvider<u32, u32> for LinkedListDummyPriorityProvider {
+	type Priority = u32;
+	fn priority(_list_id: &u32, _item: &u32) -> Option<u32> {
+		Some(1)
+	}
+}
+
 impl pallet_utility::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type RuntimeCall = RuntimeCall;
@@ -3074,6 +3103,9 @@ mod runtime {
 
 	#[runtime::pallet_index(97)]
 	pub type OnDemand = pallet_on_demand_para::Pallet<Runtime>;
+
+	#[runtime::pallet_index(98)]
+	pub type LinkedList = pallet_linked_list::Pallet<Runtime>;
 }
 
 /// The address format for describing accounts.
@@ -3453,6 +3485,7 @@ mod benches {
 		[pallet_verify_signature, VerifySignature]
 		[pallet_meta_tx, MetaTx]
 		[pallet_psm, Psm]
+		[pallet_linked_list, LinkedList]
 	);
 }
 
