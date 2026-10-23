@@ -55,6 +55,8 @@ pub struct VaultOp<T: Config> {
 	vault: Vault<BalanceOf<T>>,
 	deposit: T::VaultConsideration,
 	status: VaultStatus,
+	/// Hint-repair steps used by successful rate-index mutations in this operation.
+	hint_repair_steps: u32,
 }
 
 impl<T: Config> Context<T> {
@@ -294,7 +296,7 @@ impl<T: Config> Context<T> {
 			owner,
 			Pallet::<T>::vault_footprint(&self.collateral_id, &self.stable_id, owner),
 		)?;
-		let op = self.attach_new(owner, vault, deposit)?;
+		let mut op = self.attach_new(owner, vault, deposit)?;
 		op.index_insert(hint)?;
 		Ok(op)
 	}
@@ -384,7 +386,14 @@ impl<T: Config> Context<T> {
 				amount: pending.interest,
 			});
 		}
-		Ok(VaultOp { ctx: self, owner: owner.clone(), vault, deposit, status })
+		Ok(VaultOp {
+			ctx: self,
+			owner: owner.clone(),
+			vault,
+			deposit,
+			status,
+			hint_repair_steps: 0,
+		})
 	}
 
 	/// Attaches a new vault without touching an existing row.
@@ -407,6 +416,7 @@ impl<T: Config> Context<T> {
 			vault,
 			deposit,
 			status: VaultStatus::Active,
+			hint_repair_steps: 0,
 		};
 		op.sync_stake()?;
 		Ok(op)
@@ -517,15 +527,26 @@ impl<T: Config> VaultOp<T> {
 	}
 
 	/// Places the vault in the rate index at its current rate.
-	pub(super) fn index_insert(&self, hint: ListPosition<T::AccountId>) -> DispatchResult {
-		T::VaultLists::insert(
+	pub(super) fn index_insert(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
+		let steps = T::VaultLists::insert(
 			self.ctx.rate_list(),
 			self.owner.clone(),
 			self.vault.annual_rate,
 			hint,
 		)
-		.map(|_| ())
-		.map_err(|e| Pallet::<T>::map_error(e).into())
+		.map_err(Pallet::<T>::map_error)?;
+		self.hint_repair_steps.saturating_accrue(steps);
+		Ok(())
+	}
+
+	/// Returns the loaded vault status.
+	pub(crate) const fn status(&self) -> VaultStatus {
+		self.status
+	}
+
+	/// Returns the hint-repair steps used by this operation.
+	pub(crate) const fn hint_repair_steps(&self) -> u32 {
+		self.hint_repair_steps
 	}
 
 	/// Removes the vault from the rate index, where it must be present.
