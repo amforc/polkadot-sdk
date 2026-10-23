@@ -215,29 +215,31 @@ impl pallet_vaults::Config for Test {
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchHelper;
 #[cfg(feature = "runtime-benchmarks")]
-impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for VaultsBenchHelper {
+impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for VaultsBenchHelper {
 	fn collateral_asset_id() -> AssetId {
 		DOT
-	}
-
-	fn stable_asset_id() -> StableId {
-		STABLE
 	}
 
 	fn set_oracle_price(collateral_id: AssetId, price: FixedU128) {
 		set_price(collateral_id, price);
 	}
 
-	fn clear_oracle_price(collateral_id: AssetId) {
-		clear_price(collateral_id);
-	}
-
 	fn advance_time(ms: u64) {
 		advance_time(ms);
 	}
 
-	// The genesis config already creates every stable asset.
-	fn ensure_stable_asset(_: StableId) {}
+	// The benchmark collateral is native, which exists without being created.
+	fn ensure_collateral_asset(collateral_id: AssetId) {
+		assert_eq!(collateral_id, DOT);
+	}
+
+	// `StoredCeiling` reads only the ceiling row the benchmarks write themselves.
+	fn stage_debt_ceiling(_: StableId) {}
+
+	fn fund_native(who: &AccountId) {
+		<Balances as fungible::Mutate<AccountId>>::mint_into(who, 1_000_000_000_000)
+			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
+	}
 }
 
 /// Signs, and pays for, the redemptions a test runs.
@@ -298,32 +300,6 @@ impl pallet_redemptions::Config for Test {
 	type UpdateOrigin = EnsureAssetOwner;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
-	#[cfg(feature = "runtime-benchmarks")]
-	type BenchmarkHelper = RedemptionsBenchHelper;
-}
-#[cfg(feature = "runtime-benchmarks")]
-pub struct RedemptionsBenchHelper;
-#[cfg(feature = "runtime-benchmarks")]
-impl pallet_redemptions::BenchmarkHelper<AssetId, StableId, AccountId, Balance>
-	for RedemptionsBenchHelper
-{
-	fn setup_redeemable_branch(vaults: u32) -> (AssetId, StableId, AccountId, Balance) {
-		use frame::traits::fungible::Mutate as FungibleMutate;
-		register_branch(DOT, STABLE, default_branch_config());
-
-		let debt: Balance = 300;
-		for i in 0..vaults {
-			let who = 1_000 + u64::from(i);
-			let _ = <Balances as FungibleMutate<AccountId>>::mint_into(&who, 10_000_000_000);
-			let rate = FixedU128::from_rational(u128::from(i) + 1, 1_000u128);
-			open(who, DOT, STABLE, 1_000_000, debt, rate).expect("open benchmark vault");
-		}
-
-		let redeemer: AccountId = 1;
-		let budget = debt.saturating_mul(u128::from(vaults).saturating_add(2)).saturating_mul(2);
-		mint_stable(STABLE, redeemer, budget.saturating_mul(2));
-		(DOT, STABLE, redeemer, budget)
-	}
 }
 
 /// Native collateral.
@@ -625,6 +601,8 @@ pub fn open(
 		rate,
 		Position::endpoints_only(),
 	)
+	.map(|_| ())
+	.map_err(|error| error.error)
 }
 
 /// The `max_steps` that defers to [`crate::Config::MaxRedemptionSteps`].
