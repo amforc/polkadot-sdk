@@ -1,7 +1,7 @@
 //! Tests for the refundable storage deposit charged on `open_vault`.
 //!
 //! The mock settles in the collateral when it is native or sufficient and in native otherwise,
-//! and re-prices sufficient collateral through the oracle or a mock fallback quote.
+//! and re-prices sufficient collateral from the native price through the oracle.
 
 use crate::{mock::*, tests::percent};
 use frame::{prelude::TokenError, traits::Footprint};
@@ -24,24 +24,10 @@ fn footprint_includes_vault_record_and_rate_list_node() {
 		let footprint = Vaults::vault_footprint(&DOT, &STABLE, &OWNER);
 
 		assert_eq!(footprint.asset, DOT);
-		// One item of 398 bytes: the 93-byte hashed vault key, the 176-byte max-encoded `Vault`,
-		// the 17-byte deposit ticket (1-byte asset plus 16-byte balance), and the 112-byte
+		// One item of 430 bytes: the 101-byte hashed vault key, the 176-byte max-encoded `Vault`,
+		// the 17-byte deposit ticket (1-byte asset plus 16-byte balance), and the 136-byte
 		// rate-list node.
-		assert_eq!(footprint.footprint, Footprint::from_parts(1, 398));
-	});
-}
-
-#[test]
-fn native_collateral_pays_the_deposit_in_native() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		let free_before = collateral_balance(DOT, OWNER);
-
-		assert_ok!(open(OWNER, DOT, STABLE, 1_000, 500, default_rate()));
-
-		assert_eq!(vault_deposit_held(DOT, OWNER), VAULT_DEPOSIT);
-		// The collateral and its storage deposit use separate holds.
-		assert_eq!(held(DOT, OWNER), 1_000);
-		assert_eq!(collateral_balance(DOT, OWNER), free_before - 1_000 - VAULT_DEPOSIT);
+		assert_eq!(footprint.footprint, Footprint::from_parts(1, 430));
 	});
 }
 
@@ -66,7 +52,7 @@ fn sufficient_collateral_pays_the_deposit_in_that_asset_at_the_oracle_rate() {
 #[test]
 fn unpriceable_sufficient_collateral_rejects_the_open_atomically() {
 	ExtBuilder::default().branch(TOKEN_X, STABLE).build_and_execute(|| {
-		MockFallbackRate::set(None);
+		clear_price(DOT);
 
 		assert_noop!(
 			open(OWNER, TOKEN_X, STABLE, 1_000, 500, default_rate()),

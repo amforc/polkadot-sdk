@@ -6,7 +6,7 @@ use crate::{
 /// In the registered `(DOT, STABLE)` branch, open one vault, then drop the oracle price so the
 /// branch enters Safety mode (TCR ≈ 125.87% — between ICR 120% and Safety 130%).
 ///
-/// pre-state: state.total_collateral=1000 DOT, state.total_ib=5000 STABLE, price=6.30.
+/// pre-state: state.total_collateral=1000 DOT, state.debt.principal=5000 STABLE, price=6.30.
 /// Vault (acct 1) starts at CR=199.6% before the price drop and stays the
 /// only vault on the branch.
 fn enter_safety_mode_single_vault() {
@@ -23,37 +23,92 @@ fn enter_safety_mode_single_vault() {
 	);
 }
 
-// The vault pallet's
-// liquidation guards are: branch frozen, vault in FinalRecovery, last vault.
+/// Returns the live TCR of the `(DOT, STABLE)` branch.
+fn safety_branch_tcr() -> stablecoin_primitives::CollateralRatio {
+	crate::Pallet::<Test>::branch_tcr(DOT, STABLE).expect("tcr")
+}
 
 // All four positions clear ICR but worsen the already stressed branch's TCR.
 #[test]
 fn safety_mode_rejects_tcr_worsening_operations() {
-	let cases: [fn() -> DispatchResult; 4] = [
-		|| open(2, DOT, STABLE, 100, 510, percent(5)),
-		|| borrow(1, DOT, STABLE, 200, None),
-		|| withdraw_collateral(1, DOT, STABLE, 1, None),
-		|| change_rate(1, DOT, STABLE, percent(7)),
-	];
-	for operation in cases {
-		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-			enter_safety_mode_single_vault();
-
-			assert_noop!(operation(), crate::Error::<Test>::SafetyModeTcrWorsening);
-		});
-	}
-}
-
-// In Safety mode, opening a large healthy vault that drives TCR up is allowed
-// — even when it implicitly exits Safety mode. The Safety-branch rule is
-// "post_tcr ≥ pre_tcr" (non-worsening), with no upper bound.
-#[test]
-fn safety_mode_allows_new_vault_that_improves_tcr() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		enter_safety_mode_single_vault();
 
+		assert_noop!(
+			open(2, DOT, STABLE, 100, 510, percent(5)),
+			crate::Error::<Test>::SafetyModeTcrWorsening
+		);
+		assert_noop!(
+			borrow(1, DOT, STABLE, 200, None),
+			crate::Error::<Test>::SafetyModeTcrWorsening
+		);
+		assert_noop!(
+			withdraw_collateral(1, DOT, STABLE, 1, None),
+			crate::Error::<Test>::SafetyModeTcrWorsening
+		);
+		assert_noop!(
+			change_rate(1, DOT, STABLE, percent(7)),
+			crate::Error::<Test>::SafetyModeTcrWorsening
+		);
+	});
+}
+
+// The Safety-branch rule is "post_tcr ≥ pre_tcr" (non-worsening), with no upper bound, so it must
+// not over-block. Opening a large healthy vault that drives TCR up is allowed, even when it
+// implicitly exits Safety mode.
+#[test]
+fn safety_mode_allows_opening_a_vault_that_raises_tcr() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		enter_safety_mode_single_vault();
+		let tcr_before = safety_branch_tcr();
+
 		// New vault B with CR = 630% — improves TCR substantially.
 		assert_ok!(open(2, DOT, STABLE, 1_000, 1_000, percent(5)));
+
+		assert!(safety_branch_tcr() > tcr_before, "the operation strictly improves branch TCR");
+	});
+}
+
+// Repayment always raises TCR, so it needs no mode gate; this is also why repaying to zero leaves a
+// husk rather than closing it.
+#[test]
+fn safety_mode_allows_repayment() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		enter_safety_mode_single_vault();
+		let tcr_before = safety_branch_tcr();
+
+		assert_ok!(repay(1, DOT, STABLE, 1, Some(2_000)));
+
+		assert!(safety_branch_tcr() > tcr_before, "the operation strictly improves branch TCR");
+	});
+}
+
+// Redemption always raises TCR, so it needs no mode gate.
+#[test]
+fn safety_mode_allows_redemption() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		enter_safety_mode_single_vault();
+		let tcr_before = safety_branch_tcr();
+
+		let target = redeem(DOT, STABLE, 3, 1_000);
+
+		assert_eq!(target, Ok(1));
+		// The vault keeps enough debt to stay Active.
+		assert!(vault_status(DOT, STABLE, 1).is_active());
+		assert!(safety_branch_tcr() > tcr_before, "the operation strictly improves branch TCR");
+	});
+}
+
+// A rate change that carries no upfront fee leaves TCR unchanged, so the non-worsening rule allows
+// it.
+#[test]
+fn safety_mode_allows_a_fee_free_rate_change() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		enter_safety_mode_single_vault();
+		// Wait out the default one-day cooldown so the rate change carries no upfront fee.
+		advance_time(ONE_DAY_MS);
+
+		assert_ok!(change_rate(1, DOT, STABLE, percent(7)));
 	});
 }
 
@@ -78,53 +133,9 @@ fn normal_mode_blocks_premature_rate_change_pulling_into_safety() {
 	});
 }
 
-#[test]
-fn safety_mode_allows_post_cooldown_rate_change() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		enter_safety_mode_single_vault();
-		// Wait out the cooldown so the rate change carries no upfront fee.
-		// Default rate_adjustment_cooldown = 1 day.
-		advance_time(ONE_DAY_MS);
-
-		assert_ok!(change_rate(1, DOT, STABLE, percent(7)));
-	});
-}
-
-// Repaying to zero is always allowed (it improves TCR) and just leaves a husk;
-// the TCR gate is on the *collateral-releasing* `close_vault`. Closing a husk
-// that still holds collateral removes backing and, here, drops the branch into
-// Safety mode → the close reverts with `WouldEnterSafetyMode`.
-#[test]
-fn close_with_collateral_is_blocked_when_it_would_enter_safety_mode() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(5)));
-		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
-		// Top up acct 2's stablecoin so the repay can cover principal + upfront fee.
-		let v = vault(DOT, STABLE, 2);
-		let total = v.debt.principal + v.debt.interest;
-		assert_ok!(<Stable as frame::traits::fungible::Mutate<u64>>::transfer(
-			&1,
-			&2,
-			v.debt.interest,
-			frame::traits::tokens::Preservation::Expendable,
-		));
-		// Repay to zero at price 10 (Normal mode) — allowed, leaves a Dormant husk
-		// still holding its 1000 DOT.
-		assert_ok!(repay(2, DOT, STABLE, 2, Some(total)));
-		assert!(vault_status(DOT, STABLE, 2).is_dormant(), "husk survives the repay");
-		// Now drop the price: releasing the husk's collateral on close would push
-		// post-close TCR below the safety threshold, so the close must revert.
-		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
-
-		// The branch is still in Normal mode here (TCR ≈ 252%); it is *releasing* the
-		// husk's collateral on close that would drop TCR into Safety — hence the block.
-		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Normal),);
-		assert_noop!(close_vault(2, DOT, STABLE, None), crate::Error::<Test>::WouldEnterSafetyMode);
-	});
-}
-
-// Withdrawing the last collateral from a debt-free vault auto-closes it.
-// Because that withdraw releases collateral, it hits the same TCR gate as an explicit close.
+// Repaying to zero is always allowed (it improves TCR) and just leaves a husk; the TCR gate is on
+// releasing its collateral. Withdrawing the last collateral from a debt-free vault auto-closes it,
+// so that withdraw hits the same gate as an explicit close.
 #[test]
 fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
@@ -133,7 +144,7 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 		// Top up acct 2's stablecoin so the repay can cover principal + upfront fee.
 		let v = vault(DOT, STABLE, 2);
 		let total = v.debt.principal + v.debt.interest;
-		assert_ok!(<Stable as frame::traits::fungible::Mutate<u64>>::transfer(
+		assert_ok!(<Stable as frame::traits::fungible::Mutate<AccountId>>::transfer(
 			&1,
 			&2,
 			v.debt.interest,
@@ -143,10 +154,12 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 		assert_ok!(repay(2, DOT, STABLE, 2, Some(total)));
 		assert!(vault_status(DOT, STABLE, 2).is_dormant(), "husk survives the repay");
 
-		// At price 6.30 releasing the husk's 1000 DOT would push TCR into Safety, so
-		// the emptying withdraw is blocked exactly like the explicit close.
+		// The branch is still in Normal mode at price 6.30 (TCR ≈ 252%), but releasing the
+		// husk's 1000 DOT would push TCR into Safety, so the emptying withdraw is blocked exactly
+		// like the explicit close.
 		set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Normal),);
+		assert_noop!(close_vault(2, DOT, STABLE, None), crate::Error::<Test>::WouldEnterSafetyMode);
 		assert_noop!(
 			withdraw_collateral(2, DOT, STABLE, 1_000, None),
 			crate::Error::<Test>::WouldEnterSafetyMode
@@ -174,10 +187,10 @@ fn emptying_withdraw_is_tcr_gated_and_auto_closes() {
 	});
 }
 
-// The ICR gate protects each vault in both branch modes. A change to another vault can change the
-// branch mode, but it cannot make this vault safe.
+// The ICR gate protects each vault in both branch modes, against both a borrow and a withdraw. A
+// change to another vault can change the branch mode, but it cannot make this vault safe.
 #[test]
-fn borrow_below_icr_is_blocked_in_both_modes() {
+fn borrow_and_withdraw_below_icr_blocked_in_both_modes() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(5)));
 		assert_ok!(open(2, DOT, STABLE, 100, 200, percent(5)));
@@ -186,74 +199,19 @@ fn borrow_below_icr_is_blocked_in_both_modes() {
 		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Safety));
 
 		let borrow_one = || borrow(2, DOT, STABLE, 1, None);
+		let withdraw_one = || withdraw_collateral(2, DOT, STABLE, 1, None);
 		assert_noop!(borrow_one(), crate::Error::<Test>::UnsafeCollateralizationRatio);
+		assert_noop!(withdraw_one(), crate::Error::<Test>::UnsafeCollateralizationRatio);
 
 		// Improve only the branch ratio to isolate the per-vault gate.
 		assert_ok!(deposit_collateral(1, DOT, STABLE, 1, 99_000));
 		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Normal));
 		assert_noop!(borrow_one(), crate::Error::<Test>::UnsafeCollateralizationRatio);
+		assert_noop!(withdraw_one(), crate::Error::<Test>::UnsafeCollateralizationRatio);
 
-		// The same borrow succeeds after this vault clears ICR.
+		// The same calls succeed after this vault clears ICR.
 		assert_ok!(deposit_collateral(2, DOT, STABLE, 2, 100));
 		assert_ok!(borrow_one());
-	});
-}
-
-// The withdraw-side analogue of the borrow guard above: a vault below ICR
-// cannot make itself worse via `withdraw_collateral` (the per-call ICR guard
-// fires). Like the borrow gate, this is mode-independent — the Normal-mode case
-// is `borrower_operations::withdraw_breaking_cr_reverts`. Depositing enough
-// collateral to lift branch TCR back above the safety threshold lets a
-// subsequent withdraw pass the Normal-mode gate.
-#[test]
-fn safety_mode_blocks_withdraw_when_cr_below_icr() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(5)));
-		assert_ok!(open(2, DOT, STABLE, 100, 200, percent(5)));
-		set_price(DOT, FixedU128::from_rational(21u128, 10u128));
-		// The price drop puts the branch in Safety mode (TCR ≈ 44%, below 130%).
-		assert_eq!(branch_mode(DOT, STABLE), Some(BranchMode::Safety),);
-
-		// Withdrawing any collateral fails because post-CR < ICR (and so does
-		// pre-CR; the per-call gate uses the post-state).
-		assert_noop!(
-			withdraw_collateral(2, DOT, STABLE, 1, None),
-			crate::Error::<Test>::UnsafeCollateralizationRatio
-		);
-
-		// Top up enough collateral to lift the branch back out of Safety
-		// mode entirely (target TCR > 130%). state.total_debt ≈ 5206; we need
-		// total_coll * 2.10 / 5206 ≥ 1.30 → total_coll ≥ 3223 DOT, so a
-		// deposit of 3000 DOT puts us comfortably in Normal mode.
-		assert_ok!(deposit_collateral(2, DOT, STABLE, 2, 3_000));
-
-		// Withdraw 1 DOT now — vault 2 CR is huge, branch is in Normal mode
-		// well above Safety, so the per-call gate passes from both directions.
-		assert_ok!(withdraw_collateral(2, DOT, STABLE, 1, None));
-	});
-}
-
-// Redemptions are allowed in Safety mode because they always improve branch TCR
-// (they burn stablecoin debt and release collateral at par), not because they are
-// "protocol settlement operations". The gated ops (borrow / withdraw / close /
-// change_rate) can worsen TCR; a redemption of a vault with CR > 100% cannot, so
-// it needs no mode gate. The one exception is a FinalRecovery vault with CR <
-// 100%, where a redemption may worsen CR yet is still allowed via pro-rata
-// accounting including the IF's funds (see `final_recovery.rs`).
-#[test]
-fn redemption_improves_tcr_and_proceeds_in_safety_mode() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		enter_safety_mode_single_vault();
-		let tcr_before = crate::Pallet::<Test>::branch_tcr(DOT, STABLE).expect("tcr");
-		assert!(tcr_before < percent(130), "setup must leave the branch in Safety mode");
-
-		let target = redeem(DOT, STABLE, 3, 1_000).expect("redemption settles in Safety mode");
-
-		assert_eq!(target, 1);
-		// The vault kept enough debt to remain Active; the redemption went through
-		// despite Safety mode and strictly improved branch TCR.
-		assert_eq!(vault_status(DOT, STABLE, 1), crate::types::VaultStatus::Active);
-		let tcr_after = crate::Pallet::<Test>::branch_tcr(DOT, STABLE).expect("tcr");
-		assert!(tcr_after > tcr_before, "redemption strictly improves branch TCR");
+		assert_ok!(withdraw_one());
 	});
 }

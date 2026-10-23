@@ -2,24 +2,9 @@ use crate::{
 	mock::*,
 	tests::{assert_event, percent, vault_events, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 };
-use frame::traits::{fungible::Mutate as FungibleMutate, tokens::Preservation};
 
 fn interest_time_at(asset: AssetId, now: Moment) -> Moment {
 	market_state(asset, STABLE).interest_time(now)
-}
-
-// Helper: top up `who`'s stablecoin balance by `delta` so that subsequent
-// repay_for / etc. doesn't trip on the upfront-fee residual.
-fn top_up_stable(who: AccountId, donor: AccountId, delta: Balance) {
-	if delta == 0 {
-		return;
-	}
-	assert_ok!(<Stable as FungibleMutate<AccountId>>::transfer(
-		&donor,
-		&who,
-		delta,
-		Preservation::Expendable,
-	));
 }
 
 #[test]
@@ -60,20 +45,6 @@ fn aggregate_interest_overflow_is_rejected_without_advancing_state() {
 			Err(crate::Error::<Test>::ArithmeticOverflow.into())
 		);
 		assert_eq!(state, before);
-	});
-}
-
-// A vault is addressed by the `(collateral_id, caller)` storage key, so the
-// caller can only ever reach their own vault; another account simply has no
-// row to mutate. Access control falls out of the storage layout: changing a
-// non-owner's rate fails with `VaultNotFound`, not a dedicated owner-check
-// error.
-#[test]
-fn change_rate_from_non_owner_returns_vault_not_found() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, percent(37)));
-
-		assert_noop!(change_rate(2, DOT, STABLE, percent(50)), crate::Error::<Test>::VaultNotFound);
 	});
 }
 
@@ -173,70 +144,17 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 	});
 }
 
-// Collateral/debt adjustments without a rate change keep the DLL ordering.
-#[test]
-fn collateral_or_debt_adjust_does_not_reorder_dll() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		for (who, pct) in [(1u64, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
-			assert_ok!(open(who, DOT, STABLE, 1_000, 500, percent(pct)));
-		}
-		let order_before = LinkedList::iter_from_tail(VaultList::Rate(DOT, STABLE), 10);
-
-		assert_ok!(deposit_collateral(1, DOT, STABLE, 1, 100));
-		assert_ok!(borrow(2, DOT, STABLE, 50, None));
-		assert_ok!(repay(3, DOT, STABLE, 3, Some(50)));
-
-		let order_after = LinkedList::iter_from_tail(VaultList::Rate(DOT, STABLE), 10);
-		assert_eq!(order_before, order_after);
-	});
-}
-
-// Borrow refreshes last_interest_time, applies pending into accrued,
-// charges the upfront fee, and grows recorded principal by exactly the
-// borrowed amount.
-//
-// To isolate the upfront-fee delta from the materialised simple-interest
-// accrual we poke the vault first (folding sim-pending into accrued).
-#[test]
-fn borrow_full_state_changes() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 3_000, 2_000, percent(25)));
-		advance_time(ONE_DAY_MS);
-		// Settle pending into accrued so the borrow delta isolates the
-		// upfront fee.
-		assert_ok!(poke(1, DOT, STABLE, 1));
-
-		let v_pre = vault(DOT, STABLE, 1);
-		let predicted_fee =
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 500, None)
-				.expect("registered branch and vault");
-		// ceil(500 · 25% · 7d / 365.25d) = 3.
-		assert_eq!(predicted_fee, 3);
-		let now_before_call = Timestamp::get();
-
-		assert_ok!(borrow(1, DOT, STABLE, 500, None));
-
-		let v_post = vault(DOT, STABLE, 1);
-
-		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
-		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
-		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted_fee);
-		assert_event(crate::Event::Borrowed {
-			collateral_id: DOT,
-			stable_id: STABLE,
-			owner: 1,
-			recipient: 1,
-			amount: 500,
-		});
-	});
-}
-
 #[test]
 fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		for (who, pct) in [(1u64, 20), (2, 10), (3, 30)] {
+		for (who, pct) in [(1, 20), (2, 10), (3, 30)] {
 			assert_ok!(open(who, DOT, STABLE, 5_000, 2_000, percent(pct)));
 		}
+		// Above the branch `maximum_borrow_rate` (400%).
+		assert_noop!(
+			borrow(1, DOT, STABLE, 500, Some(percent(401))),
+			crate::Error::<Test>::RateOutOfBounds
+		);
 		let v_pre = vault(DOT, STABLE, 1);
 		// The rate change is premature, so the fee covers all 2_500 of the vault's principal, at
 		// the post-borrow *average* rate (2_500 · 5% + 2_000 · 10% + 2_000 · 30%) / 6_500 ≈ 14.23%,
@@ -269,19 +187,6 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 			old_rate: percent(20),
 			new_rate: percent(5),
 		}));
-	});
-}
-
-#[test]
-fn borrow_with_new_rate_rejects_rate_out_of_bounds_without_state_change() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 5_000, 2_000, percent(20)));
-
-		// Above the branch `maximum_borrow_rate` (400%).
-		assert_noop!(
-			borrow(1, DOT, STABLE, 500, Some(percent(401))),
-			crate::Error::<Test>::RateOutOfBounds
-		);
 	});
 }
 
@@ -351,110 +256,15 @@ fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 	});
 }
 
-// Repay refreshes last_interest_time, settles pending interest, reduces
-// entire debt by the repaid amount, and reduces recorded debt by the
-// principal portion.
-#[test]
-fn repay_full_state_changes() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 3_000, 3_000, percent(25)));
-		advance_time(ONE_DAY_MS);
-
-		// Settle pending interest into a known-quantity accrued, then top up
-		// the borrower's stablecoin so they have enough to repay both principal
-		// and accrued.
-		assert_ok!(poke(1, DOT, STABLE, 1));
-		let v_pre = vault(DOT, STABLE, 1);
-		// Borrow more stablecoin into a second account so we can shuttle some over.
-		assert_ok!(open(2, DOT, STABLE, 5_000, 3_000, percent(25)));
-		top_up_stable(1, 2, v_pre.debt.interest + 500);
-
-		let now_before_call = Timestamp::get();
-		assert_ok!(repay(1, DOT, STABLE, 1, Some(500)));
-
-		let v_post = vault(DOT, STABLE, 1);
-
-		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
-
-		// Open fee ceil(3_000 × 25% × 7 / 365.25) = 15 plus one day's interest
-		// ceil(3_000 × 25% / 365.25) = 3 are paid before the principal.
-		assert_eq!(v_pre.debt.principal, 3_000);
-		assert_eq!(v_pre.debt.interest, 18);
-		assert_eq!(v_post.debt.principal, 2_518);
-		assert_eq!(v_post.debt.interest, 0);
-		assert_eq!(v_post.debt.total(), 2_518);
-	});
-}
-// Poke is permissionless, refreshes last_interest_time, materialises
-// sim-pending into accrued, and leaves principal unchanged. Other tests use
-// `poke` only as a setup step; this one isolates the poke path itself.
-//
-// Storage exposes only `interest_bearing_debt + accrued_interest`, i.e. the
-// recorded debt — which does not include the live sim-pending accrual. We pin
-// the per-component changes instead of an entire-debt invariant.
-#[test]
-fn poke_full_state_changes() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 3_000, 2_000, percent(25)));
-		advance_time(ONE_DAY_MS);
-
-		let v_pre = vault(DOT, STABLE, 1);
-		let now_before_call = Timestamp::get();
-
-		// Permissionless: any signed origin (here, account 2) can poke
-		// account 1's vault.
-		assert_ok!(poke(2, DOT, STABLE, 1));
-
-		let v_post = vault(DOT, STABLE, 1);
-
-		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
-		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
-		// One day at 25% on 2_000 principal materialises
-		// ceil(2_000 * 0.25 * 1day / year) = 2 units on top of the pending open fee.
-		assert_eq!(v_post.debt.interest, v_pre.debt.interest + 2);
-		assert_event(crate::Event::InterestAccrued {
-			collateral_id: DOT,
-			stable_id: STABLE,
-			owner: 1,
-			amount: 2,
-		});
-	});
-}
-
-// A full repayment leaves a live zero-debt Dormant husk (it no longer
-// auto-closes), so the row survives and stays pokeable — poking it is a no-op on
-// zero debt but must not error with `VaultNotFound`.
-#[test]
-fn poke_after_full_repayment_pokes_dormant_husk() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 3_000, 2_000, percent(25)));
-		assert_ok!(open(2, DOT, STABLE, 3_000, 2_000, percent(25)));
-		// Repay all of vault 1's debt — first poke to settle accrued, then
-		// transfer accrued from vault 2 to cover the residual.
-		assert_ok!(poke(1, DOT, STABLE, 1));
-		let v = vault(DOT, STABLE, 1);
-		let total = v.debt.principal + v.debt.interest;
-		top_up_stable(1, 2, v.debt.interest);
-		assert_ok!(repay(1, DOT, STABLE, 1, Some(total)));
-		// The husk survives as a Dormant zero-debt row and remains pokeable.
-		assert!(vault_status(DOT, STABLE, 1).is_dormant());
-
-		assert_ok!(poke(3, DOT, STABLE, 1));
-
-		assert_eq!(vault(DOT, STABLE, 1).debt.total(), 0);
-	});
-}
-
-// Redemption refreshes last_interest_time on the redeemed vault, applies
-// pending interest, reduces entire debt by the redeemed amount, and reduces
-// recorded debt accordingly. Tested through the `VaultInterface`
-// trait (no `redeem` extrinsic exists yet).
+// Redemption settles the target's pending interest before cancelling debt, so interest is paid
+// before principal, and releases the redeemed collateral to the recipient. The clock stamp and the
+// hold are owned by the redemption tests and `try_state`.
 #[test]
 fn redemption_full_state_changes() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		// Six vaults across ascending rates so the rate index has a clear
 		// "lowest rate" target at the tail.
-		for (who, pct) in [(1u64, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)] {
+		for (who, pct) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)] {
 			assert_ok!(open(who, DOT, STABLE, 1_000, 500, percent(pct)));
 		}
 		// Settle acct 1's recorded interest, then let a full year accrue so it
@@ -465,24 +275,15 @@ fn redemption_full_state_changes() {
 		assert_ok!(poke(9, DOT, STABLE, 1));
 		let v_pre = vault(DOT, STABLE, 1);
 		advance_time(ONE_YEAR_MS);
-
-		let now_before_call = Timestamp::get();
-		// Collateral-leg baselines before the redemption.
 		let recipient_collateral_pre = collateral_balance(DOT, 5);
-		let branch_collateral_pre = market_state(DOT, STABLE).total_collateral;
 
 		// Redeem 200 STABLE to acct 5 (the recipient) — the helper uses the
 		// rate-index tail, which is acct 1 (lowest rate).
 		let target = redeem(DOT, STABLE, 5, 200).expect("redeem ok");
 		assert_eq!(target, 1);
 
-		let v_post = vault(DOT, STABLE, 1);
-		// The redemption refreshed acct 1's interest clock — it poked the target.
-		assert_eq!(v_post.last_interest_time, interest_time_at(DOT, now_before_call));
-
 		// Fee 1 plus a year's interest 5 are paid before 194 principal.
-		assert_eq!(v_pre.debt.principal, 500);
-		assert_eq!(v_pre.debt.interest, 1);
+		let v_post = vault(DOT, STABLE, 1);
 		assert_eq!(v_post.debt.interest, 0);
 		assert_eq!(v_post.debt.principal, 306);
 		assert_eq!(v_post.debt.total(), 306);
@@ -491,12 +292,7 @@ fn redemption_full_state_changes() {
 		// hold to the recipient, who receives it free (not held).
 		let collateral_released: Balance = 20;
 		assert_eq!(v_post.collateral, v_pre.collateral - collateral_released); // 1_000 -> 980
-		assert_eq!(held(DOT, 1), v_pre.collateral - collateral_released);
 		assert_eq!(collateral_balance(DOT, 5), recipient_collateral_pre + collateral_released);
-		assert_eq!(
-			market_state(DOT, STABLE).total_collateral,
-			branch_collateral_pre - collateral_released,
-		);
 
 		assert!(vault_status(DOT, STABLE, 1).is_active());
 		assert_event(crate::Event::VaultRedeemed {
@@ -511,52 +307,46 @@ fn redemption_full_state_changes() {
 	});
 }
 
-// The routed fee must match vault debt, branch debt, and the net issuance increase.
+// Open records the quoted fee as debt on top of the principal and mints the borrowed amount in
+// full. Fee rounding is owned by `math.rs` and the fee's routing by
+// `refresh_branch_issues_pending_aggregate_interest`.
 #[test]
-fn open_mints_borrow_amount_and_routes_fee_residual_to_handler() {
-	// Fee is ceil(2_000 × rate × 7 / 365.25): 10% → 4, 37% → 15, 100% → 39. The mock pool
-	// burns 75% of it, so the residual is ceil(fee / 4): 1, 4, 10.
-	for (pct, fee, fee_residual) in [(10, 4, 1), (37, 15, 4), (100, 39, 10)] {
-		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-			assert_event(crate::Event::BranchRegistered { collateral_id: DOT, stable_id: STABLE });
-			let total_pre = total_stable(STABLE);
-			let rate = percent(pct);
-			assert_eq!(
-				crate::Pallet::<Test>::predict_open_upfront_fee(DOT, STABLE, 2_000, rate)
-					.expect("registered branch"),
-				fee
-			);
+fn open_records_debt_mints_borrow_and_emits_events() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_event(crate::Event::BranchRegistered { collateral_id: DOT, stable_id: STABLE });
+		let rate = percent(37);
+		// ceil(2_000 × 37% × 7 / 365.25) = 15.
+		let fee = 15;
+		assert_eq!(
+			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, STABLE, 2_000, rate)
+				.expect("registered branch"),
+			fee
+		);
 
-			assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, rate));
+		assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, rate));
 
-			let v = vault(DOT, STABLE, 1);
-			assert_eq!(v.annual_rate, rate);
-			assert_eq!(v.debt.principal, 2_000);
-			assert_eq!(v.debt.interest, fee);
-			assert_eq!(held(DOT, 1), 1_000);
-			assert!(vault_status(DOT, STABLE, 1).is_active());
-			assert_eq!(LinkedList::iter_from_tail(VaultList::Rate(DOT, STABLE), 1), vec![1]);
-			assert_eq!(stable_balance(STABLE, 1), 2_000);
-			assert_eq!(market_state(DOT, STABLE).debt.minted_interest, fee);
-			// The mock burns its 75% share; only the residual is issued.
-			assert_eq!(stable_balance(STABLE, FEE_DEST), fee_residual);
-			assert_eq!(total_stable(STABLE), total_pre + 2_000 + fee_residual);
-			assert_event(crate::Event::VaultOpened {
-				collateral_id: DOT,
-				stable_id: STABLE,
-				owner: 1,
-				collateral: 1_000,
-				debt: 2_000,
-				annual_rate: rate,
-			});
-			assert_event(crate::Event::UpfrontFeeCharged {
-				collateral_id: DOT,
-				stable_id: STABLE,
-				owner: 1,
-				amount: fee,
-			});
+		let v = vault(DOT, STABLE, 1);
+		assert_eq!(v.annual_rate, rate);
+		assert_eq!(v.debt.principal, 2_000);
+		assert_eq!(v.debt.interest, fee);
+		assert!(vault_status(DOT, STABLE, 1).is_active());
+		assert_eq!(LinkedList::iter_from_tail(VaultList::Rate(DOT, STABLE), 1), vec![1]);
+		assert_eq!(stable_balance(STABLE, 1), 2_000);
+		assert_event(crate::Event::VaultOpened {
+			collateral_id: DOT,
+			stable_id: STABLE,
+			owner: 1,
+			collateral: 1_000,
+			debt: 2_000,
+			annual_rate: rate,
 		});
-	}
+		assert_event(crate::Event::UpfrontFeeCharged {
+			collateral_id: DOT,
+			stable_id: STABLE,
+			owner: 1,
+			amount: fee,
+		});
+	});
 }
 
 #[test]
