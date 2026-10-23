@@ -57,7 +57,7 @@ pub trait OnBranchLifecycle<CollateralId, StableId, AccountId> {
 	#[cfg(feature = "runtime-benchmarks")]
 	fn benchmark_registration_config(stablecoin_markets: u32) -> Self::RegistrationConfig;
 
-	/// Stages worst-case removal of an empty market, including custody dust and teardown rows.
+	/// Stages worst-case removal of an empty branch, including custody dust and teardown rows.
 	/// Defaults to no setup.
 	#[cfg(feature = "runtime-benchmarks")]
 	fn benchmark_stage_deregistration(

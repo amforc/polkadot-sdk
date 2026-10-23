@@ -39,11 +39,15 @@ pub trait RecoveryOffsetInterface {
 	/// return the whole payment. The implementation can only burn what the credit carries, so
 	/// callers derive the cancelled debt as `payment - change`.
 	///
+	/// If the head cannot consume the whole payment, the burn is capped at `max_partial_debt`.
+	/// This lets a pool preserve its minimum balance without preventing full depletion.
+	///
 	/// An `Err` consumes the payment and storage unwinds only with the caller's transaction, so
 	/// callers must abort the extrinsic.
 	fn execute_recovery_offset(
 		collateral_id: &Self::CollateralId,
 		payment: Self::Credit,
+		max_partial_debt: Self::Balance,
 		collateral_recipient: &Self::AccountId,
 	) -> Result<(RecoveryOffsetResult<Self::Balance>, Self::Credit), DispatchError>;
 }
