@@ -1,6 +1,8 @@
 //! `pallet-vaults` test suite.
 
 mod basic_ops;
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmark_seeding;
 mod borrower_operations;
 mod critical_threshold;
 mod debt_in_front;
