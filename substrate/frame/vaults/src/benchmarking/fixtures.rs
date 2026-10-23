@@ -10,7 +10,7 @@ use crate::{
 		AccountIdLookupOf, BalanceOf, BranchOf, Branches, CollateralIdOf, Config, Event, Pallet,
 		RegistrationConfigOf, StableIdOf, VaultListIdOf, Vaults,
 	},
-	types::{BranchAdmins, BranchConfig, LiquidationSettlement, VaultListId, VaultStatus},
+	types::{BranchAdmins, BranchConfig, JitTerms, VaultListId, VaultStatus},
 	BenchmarkConfig, BenchmarkHelper as _, HoldReason,
 };
 use alloc::vec::Vec;
@@ -31,8 +31,9 @@ use frame::{
 use frame_system::RawOrigin;
 use linked_list_interface::{Position, SortedListInterface};
 use stablecoin_primitives::{
-	BenchmarkVault, CollateralRatio, OnBranchLifecycle as _, ProvidePrice, RecoveryHeadSeed,
-	RedemptionSettlement, RedemptionTargetsSeed, VaultInterface,
+	BenchmarkVault, BranchSnapshot, CollateralRatio, OnBranchLifecycle as _, ProvidePrice,
+	RecoveryHeadSeed, RedemptionSettlement, RedemptionTargetsSeed, StabilityPoolOffset,
+	VaultInterface,
 };
 
 /// Avoids asset ids used by runtime genesis and test mocks.
@@ -54,6 +55,10 @@ pub(crate) const RECOVERY_TRIGGER_PRICE: u128 = 1;
 pub(crate) const RECOVERY_VAULT_COLL: u128 = 2_000;
 /// Enough to accrue non-zero interest at the default 5% rate.
 pub(crate) const ONE_HOUR_MS: u64 = 60 * 60 * 1_000;
+/// Shorter than the rate-adjustment cooldown, so changing rates after activation still pays a fee.
+pub(crate) const POOL_ENTRY_DELAY_MS: u64 = ONE_HOUR_MS;
+/// Stablecoin each cohort that [`queue_pool_cohorts`] queues deposits.
+pub(crate) const POOL_COHORT_DEPOSIT: u128 = 1_000_000;
 /// Debt of each redemption target. At [`ORACLE_PRICE`] a full step pays out 100 collateral
 /// units, above any account's minimum balance.
 pub(crate) const REDEMPTION_TARGET_DEBT: u128 = 1_000;
@@ -131,6 +136,12 @@ pub(crate) fn advance_time<T: BenchmarkConfig>(ms: u64) {
 	}
 }
 
+/// Moves the clock to `deadline`, if it is still ahead, and re-quotes the price.
+pub(crate) fn advance_to<T: BenchmarkConfig>(deadline: u64) {
+	advance_time::<T>(deadline.saturating_sub(T::TimeProvider::now()));
+	assert!(T::TimeProvider::now() >= deadline);
+}
+
 pub(crate) fn rate_list<T: BenchmarkConfig>() -> VaultListIdOf<T> {
 	VaultListId::Rate(collateral::<T>(), stable::<T>())
 }
@@ -158,7 +169,15 @@ pub(crate) fn default_branch_config<T: BenchmarkConfig>() -> BranchConfig<Balanc
 		maximum_borrow_rate: FixedU128::from_rational(100, 100),
 		upfront_fee_period: 7 * DAY_MS,
 		rate_adjustment_cooldown: DAY_MS,
-		redistribution_penalty: Permill::from_percent(5),
+		final_recovery_reward_cooldown: ONE_HOUR_MS,
+		liquidation: crate::LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			keeper_flat_compensation_value: balance::<T>(10),
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: balance::<T>(10_000),
+			minimum_jit_contribution: balance::<T>(100),
+			redistribution_penalty: Permill::from_percent(5),
+		},
 	}
 }
 
@@ -396,7 +415,7 @@ pub(crate) struct MidChainCaller<T: Config> {
 }
 
 /// Seeds the worst-case chain and opens the caller's vault in its middle. Leaves every vault a
-/// pending redistribution share an hour of interest behind, so no vault operation may follow.
+/// pending redistribution share and two due pool cohorts, so no vault operation may follow.
 pub(crate) fn seed_mid_chain_caller<T: BenchmarkConfig>() -> Result<MidChainCaller<T>, DispatchError>
 {
 	let asset = register_default_branch::<T>()?;
@@ -413,7 +432,7 @@ pub(crate) fn seed_mid_chain_caller<T: BenchmarkConfig>() -> Result<MidChainCall
 	assert!(neighbours.prev.is_some());
 	assert!(neighbours.next.is_some());
 	seed_pending_redistribution::<T>()?;
-	advance_time::<T>(ONE_HOUR_MS);
+	make_cohorts_due::<T>()?;
 	Ok(MidChainCaller { asset, caller, seeds, interior_rate: bounds.interior() })
 }
 
@@ -434,23 +453,24 @@ pub(crate) fn redeem_debt_only<T: BenchmarkConfig>(owner: &T::AccountId) -> Disp
 	Ok(())
 }
 
-/// Opens `vault` for `owner`, crashes the price to [`RECOVERY_TRIGGER_PRICE`] so `caller` can push
+/// Opens `vault` for `owner`, crashes the price to [`RECOVERY_TRIGGER_PRICE`] so `keeper` can push
 /// it into the FinalRecovery FIFO, and leaves the price crashed.
 ///
 /// The vault must be the branch's only stake bearer when it enters.
 fn enter_recovery<T: BenchmarkConfig>(
 	owner: &T::AccountId,
 	vault: BenchmarkVault<BalanceOf<T>>,
-	caller: T::AccountId,
+	keeper: T::AccountId,
 ) -> DispatchResult {
 	open_funded_vault::<T>(owner, vault)?;
 	set_unit_price::<T>(RECOVERY_TRIGGER_PRICE);
 	Pallet::<T>::enter_final_recovery(
-		RawOrigin::Signed(caller).into(),
+		RawOrigin::Signed(keeper).into(),
 		collateral::<T>(),
 		stable::<T>(),
 		owner.clone(),
-	)?;
+	)
+	.map_err(|error| error.error)?;
 	ensure!(
 		status_of::<T>(owner) == VaultStatus::FinalRecovery,
 		"vault did not enter final recovery"
@@ -477,7 +497,7 @@ pub(crate) fn recovery_cycle<T: BenchmarkConfig>(
 	Ok(owner)
 }
 
-/// A vault opened only to be liquidated with no offset, so its debt and collateral are
+/// A vault opened only to be liquidated into the empty pool, so its debt and collateral are
 /// redistributed over every other stake-bearing vault.
 pub(crate) struct Sacrifice<Balance> {
 	pub vault: BenchmarkVault<Balance>,
@@ -487,8 +507,8 @@ pub(crate) struct Sacrifice<Balance> {
 	pub restored_price: u128,
 }
 
-/// Opens `sacrifice` and liquidates it at its price through the engine, sending its whole debt and
-/// collateral to redistribution, then restores the price.
+/// Opens `sacrifice` and liquidates it at its price with no JIT, then restores the price. The
+/// pool must be empty, so redistribution takes the whole vault.
 pub(crate) fn redistribute<T: BenchmarkConfig>(
 	sacrifice: Sacrifice<BalanceOf<T>>,
 ) -> DispatchResult {
@@ -496,18 +516,14 @@ pub(crate) fn redistribute<T: BenchmarkConfig>(
 	open_funded_vault::<T>(&owner, sacrifice.vault)?;
 	let held = redistribution_held::<T>();
 	set_unit_price::<T>(sacrifice.liquidation_price);
-	Pallet::<T>::execute_liquidation(
-		&collateral::<T>(),
-		&stable::<T>(),
-		&owner,
-		|_, mut seized| {
-			let redistribution_collateral = seized.extract(seized.peek());
-			Ok(LiquidationSettlement {
-				debt_offset: Zero::zero(),
-				redistribution_collateral,
-				owner_surplus: seized,
-			})
-		},
+	// A keeper distinct from every benchmark caller, so no caller's accounts are touched.
+	let keeper: T::AccountId = account("sacrifice_keeper", 0, 0);
+	Pallet::<T>::liquidate(
+		RawOrigin::Signed(keeper).into(),
+		collateral::<T>(),
+		stable::<T>(),
+		owner.clone(),
+		JitTerms { max_stable: Zero::zero(), min_collateral_out: Zero::zero() },
 	)?;
 	set_unit_price::<T>(sacrifice.restored_price);
 	assert!(!Vaults::<T>::contains_key((collateral::<T>(), stable::<T>(), &owner)));
@@ -516,7 +532,7 @@ pub(crate) fn redistribute<T: BenchmarkConfig>(
 }
 
 /// Leaves every stake-bearing vault a pending redistribution share, which the next touch of each
-/// vault absorbs through a collateral transfer.
+/// vault absorbs through a collateral transfer. The pool must be empty.
 pub(crate) fn seed_pending_redistribution<T: BenchmarkConfig>() -> DispatchResult {
 	redistribute::<T>(Sacrifice {
 		vault: BenchmarkVault {
@@ -527,6 +543,68 @@ pub(crate) fn seed_pending_redistribution<T: BenchmarkConfig>() -> DispatchResul
 		liquidation_price: RECOVERY_TRIGGER_PRICE,
 		restored_price: ORACLE_PRICE,
 	})
+}
+
+/// Queues two pool deposits of `deposit` with `entry_delay`, the second just before the first is
+/// due, so they open two cohorts. Returns both deadlines; the clock is left one millisecond before
+/// the first.
+fn queue_two_cohorts<T: BenchmarkConfig>(
+	entry_delay: u64,
+	deposit: BalanceOf<T>,
+) -> Result<(u64, u64), DispatchError> {
+	let queue = |index| {
+		T::StabilityPool::benchmark_queue_deposit(
+			&collateral::<T>(),
+			&stable::<T>(),
+			index,
+			entry_delay,
+			deposit,
+		)
+	};
+	let start = T::TimeProvider::now();
+	let first = queue(0)?;
+	assert!(first > start);
+	advance_time::<T>(first.saturating_sub(start).saturating_sub(1));
+	let second = queue(1)?;
+	assert!(second > first);
+	assert!(T::TimeProvider::now() < first);
+	Ok((first, second))
+}
+
+/// Queues two pool cohorts, so the first yield distribution after they are due activates both
+/// and finds active capital to distribute to. Returns the time from which both are due; the clock
+/// is left one millisecond before the first deadline, so no operation before that rolls them.
+pub(crate) fn queue_pool_cohorts<T: BenchmarkConfig>() -> Result<u64, DispatchError> {
+	let deposit = balance::<T>(POOL_COHORT_DEPOSIT);
+	queue_two_cohorts::<T>(POOL_ENTRY_DELAY_MS, deposit).map(|(_, second)| second)
+}
+
+/// Queues two pool cohorts and moves the clock to where both are due. No vault operation may
+/// follow, since the first one would activate them. Precede any recovery head, which would route
+/// the deposits into a recovery offset.
+pub(crate) fn make_cohorts_due<T: BenchmarkConfig>() -> DispatchResult {
+	advance_to::<T>(queue_pool_cohorts::<T>()?);
+	Ok(())
+}
+
+/// Seed the Stability Pool so the next offset rolls a due cohort into the active leg and still
+/// finds pending capital behind it. Leaves the clock one millisecond before the pending deadline,
+/// a full entry delay after the last branch accrual.
+pub(crate) fn seed_liquidation_pool<T: BenchmarkConfig>(
+	entry_delay: u64,
+	deposit: BalanceOf<T>,
+) -> DispatchResult {
+	let (active_deadline, pending_deadline) = queue_two_cohorts::<T>(entry_delay, deposit)?;
+	advance_to::<T>(pending_deadline.saturating_sub(1));
+	assert!(active_deadline <= T::TimeProvider::now());
+	assert!(T::TimeProvider::now() < pending_deadline);
+	Ok(())
+}
+
+/// The branch as the engine hands it to the pool, read the way `liquidate` reads it.
+pub(crate) fn branch_snapshot<T: BenchmarkConfig>() -> Result<BranchSnapshot, DispatchError> {
+	let mode = Pallet::<T>::current_mode(&collateral::<T>(), &stable::<T>())?;
+	Ok(BranchSnapshot { mode, now: T::TimeProvider::now() })
 }
 
 pub(crate) fn redistribution_held<T: BenchmarkConfig>() -> BalanceOf<T> {
@@ -603,7 +681,19 @@ pub(crate) fn stage_recovery_head<T: BenchmarkConfig>(
 		debt: balance::<T>(RECOVERY_HEAD_DEBT),
 		..default_vault::<T>()
 	};
-	enter_recovery::<T>(&owner, vault, account("recovery_caller", 0, 0))?;
+	enter_recovery::<T>(&owner, vault, account("recovery_keeper", 0, 0))?;
+	// Top the keeper reward back up: the exact-par price below needs a round collateral amount.
+	let reward = collateral
+		.saturating_sub(Pallet::<T>::vault_of(&asset, &stable::<T>(), &owner)?.collateral);
+	if !reward.is_zero() {
+		Pallet::<T>::deposit_collateral_for(
+			RawOrigin::Signed(owner.clone()).into(),
+			asset.clone(),
+			stable::<T>(),
+			owner.clone(),
+			reward,
+		)?;
+	}
 	T::BenchmarkHelper::advance_time(elapsed);
 
 	let snapshot =
@@ -655,6 +745,7 @@ pub(crate) fn seed_redemption_targets<T: BenchmarkConfig>(
 		owners.push(owner);
 	}
 	seed_pending_redistribution::<T>()?;
+	make_cohorts_due::<T>()?;
 	advance_time::<T>(elapsed);
 
 	let first = <Pallet<T> as VaultInterface>::next_redemption_target(

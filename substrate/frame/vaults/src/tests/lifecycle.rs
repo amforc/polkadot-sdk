@@ -149,6 +149,9 @@ fn frozen_branch_blocks_user_ops() {
 		hypothetically!({
 			assert_ok!(change_rate(2, DOT, STABLE, percent(70)));
 		});
+		hypothetically!({
+			assert_ok!(nominate_dormant(9, DOT, STABLE, 1));
+		});
 
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
 
@@ -162,6 +165,7 @@ fn frozen_branch_blocks_user_ops() {
 			crate::Error::<Test>::BranchFrozen
 		);
 		assert_noop!(change_rate(2, DOT, STABLE, percent(70)), crate::Error::<Test>::BranchFrozen);
+		assert_noop!(nominate_dormant(9, DOT, STABLE, 1), crate::Error::<Test>::BranchFrozen);
 	});
 }
 
@@ -172,7 +176,8 @@ fn frozen_branch_blocks_dormant_activation() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		open_active_and_dormant_vaults();
 		// The elapsed time lets the Dormant dust of 155 accrue 78 at 50%, past the 200 minimum
-		// that activation needs.
+		// that activation needs and nomination forbids, so `frozen_branch_blocks_user_ops`
+		// checks nomination before any time passes.
 		advance_time(ONE_YEAR_MS);
 		let activate =
 			|| activate_dormant(9, DOT, STABLE, 1).map(|_| ()).map_err(|error| error.error);

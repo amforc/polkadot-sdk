@@ -723,7 +723,7 @@ fn raised_icr_keeps_open_vaults_but_blocks_their_borrow_and_withdrawal() {
 		assert_ok!(set_param(BranchConfigUpdate::InitialCollateralizationRatio(percent(130))));
 
 		assert!(vault_status(DOT, STABLE, 1).is_active());
-		assert_noop!(liquidate(DOT, STABLE, 1), Error::<Test>::VaultNotLiquidatable);
+		assert_noop!(liquidate(9, DOT, STABLE, 1, 0, 0), Error::<Test>::VaultNotLiquidatable);
 		assert_noop!(borrow(1, DOT, STABLE, 1, None), Error::<Test>::UnsafeCollateralizationRatio);
 		assert_noop!(
 			withdraw_collateral(1, DOT, STABLE, 1, None),
@@ -740,14 +740,14 @@ fn raised_icr_keeps_open_vaults_but_blocks_their_borrow_and_withdrawal() {
 fn raised_minimum_ratio_makes_open_vaults_under_it_liquidatable() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		open_vault_near_one_and_a_quarter();
-		assert_noop!(liquidate(DOT, STABLE, 1), Error::<Test>::VaultNotLiquidatable);
+		assert_noop!(liquidate(9, DOT, STABLE, 1, 0, 0), Error::<Test>::VaultNotLiquidatable);
 		// The liquidation ratio may not exceed ICR.
 		assert_ok!(set_param(BranchConfigUpdate::InitialCollateralizationRatio(percent(130))));
 
 		assert_ok!(set_param(BranchConfigUpdate::MinimumCollateralizationRatio(percent(130))));
 
 		assert!(vault_status(DOT, STABLE, 1).is_active());
-		assert_ok!(liquidate(DOT, STABLE, 1));
+		assert_ok!(liquidate(9, DOT, STABLE, 1, 0, 0));
 		assert!(!vault_exists(DOT, STABLE, 1));
 	});
 }

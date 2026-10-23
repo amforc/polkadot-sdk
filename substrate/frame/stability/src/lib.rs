@@ -555,7 +555,7 @@ pub mod pallet {
 		/// `[entry_delay, 2 * entry_delay)`, unless the delay is zero. A new deposit restarts the
 		/// wait for all pending capital of the depositor.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::deposit())]
+		#[pallet::weight(T::WeightInfo::deposit().max(T::WeightInfo::deposit_no_recovery()))]
 		pub fn deposit(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,

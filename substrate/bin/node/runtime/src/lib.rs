@@ -3378,7 +3378,7 @@ parameter_types! {
 		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::VaultCreationDeposit);
 	pub const VaultsVaultDepositBase: Balance = 0;
 	pub const VaultsVaultDepositPerByte: Balance = 100 * DOLLARS / 1024;
-	/// Governance envelope every permissionlessly-created market config must sit
+	/// Governance envelope every permissionlessly-created branch config must sit
 	/// inside.
 	pub VaultsBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
 		pallet_vaults::types::BranchConfigBounds {
@@ -3434,7 +3434,7 @@ impl stablecoin_primitives::ProvidePrice for VaultsOracleAdapter {
 	}
 }
 
-/// `CreateOrigin` for permissionless market creation. Root creates deposit-free
+/// `CreateOrigin` for permissionless branch creation. Root creates deposit-free
 /// (`None`); the stablecoin asset's owner creates with a refundable deposit
 /// (`Some(who)`); every other origin is rejected.
 pub type VaultsCreateOrigin = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
@@ -3468,6 +3468,7 @@ impl pallet_vaults::Config for Runtime {
 	type FeeAccount = VaultsFeeAccount;
 	type YieldHook = Stability;
 	type OnBranchLifecycle = (Redemptions, Stability);
+	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
 	type BranchConsideration = HoldConsideration<
@@ -3487,7 +3488,7 @@ impl pallet_vaults::Config for Runtime {
 	type GlobalDebtCeiling = pallet_vaults::StoredCeiling<Runtime>;
 	type PalletId = VaultsPalletId;
 	type VaultLists = LinkedList;
-	type WeightInfo = ();
+	type WeightInfo = pallet_vaults::weights::SubstrateWeight<Runtime>;
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = VaultsBenchmarkHelper;
 }
@@ -3531,27 +3532,6 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountI
 	}
 }
 
-#[cfg(feature = "runtime-benchmarks")]
-fn fund_vaults_benchmark_collateral(
-	asset_id: VaultsCollateralId,
-	who: &AccountId,
-	amount: Balance,
-) {
-	use frame_support::traits::{fungibles::Balanced as FungiblesBalanced, tokens::Precision};
-
-	if System::providers(who) == 0 {
-		System::inc_providers(who);
-	}
-	let debt = <VaultsCollateral as FungiblesBalanced<AccountId>>::deposit(
-		asset_id,
-		who,
-		amount,
-		Precision::Exact,
-	)
-	.expect("fund collateral for benchmark account");
-	drop(debt);
-}
-
 parameter_types! {
 	pub const InsurancePalletId: PalletId = PalletId(*b"py/insur");
 }
@@ -3593,11 +3573,11 @@ impl pallet_stability::Config for Runtime {
 	type StableDustHandler = ResolveAssetTo<TreasuryAccount, Assets>;
 	type CollateralDustHandler = ResolveAssetTo<TreasuryAccount, StabilityCollateral>;
 	type UpdateOrigin = EitherOf<
-		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
 		pallet_vaults::EnsureBranchFullAdmin<Runtime>,
+		AsEnsureOriginWithArg<EnsureRoot<AccountId>>,
 	>;
 	type PalletId = StabilityPalletId;
-	type WeightInfo = ();
+	type WeightInfo = pallet_stability::weights::SubstrateWeight<Runtime>;
 }
 
 /// MMR helper types.

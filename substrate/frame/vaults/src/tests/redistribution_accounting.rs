@@ -1,5 +1,8 @@
 //! Tests for the redistribution / aggregate-interest accounting identities.
 //!
+//! Liquidations run on a keeper-less branch with an empty Stability Pool, so each one
+//! redistributes the vault's whole debt and collateral.
+//!
 //! Conventions:
 //! - Eligible vaults use snapshot-corrected stake. Only `FinalRecovery` vaults have zero stake.
 //! - "Recipient rate" means the recipient vault's `annual_rate`, not the liquidated vault's rate.
@@ -9,14 +12,10 @@
 use crate::{
 	math::whole_units,
 	mock::*,
-	tests::{assert_ok_and_invariants, percent, ONE_YEAR_MS},
+	tests::{keeperless_branch, liquidation_outcome, percent, ONE_YEAR_MS},
+	DebtCollateral,
 };
 use stablecoin_primitives::CollateralRatio;
-
-/// `floor(x * rate)` for the recipient-rate assertions.
-fn accrual_rate(x: Balance, rate: FixedU128) -> Balance {
-	rate.saturating_mul_int(x)
-}
 
 // Touch order must not change mixed-rate allocation, pending residue, or any vault or branch
 // field, even when the liquidation lands at a non-zero interest time.
@@ -32,8 +31,8 @@ fn redistribution_is_touch_order_independent() {
 
 			advance_time(1_000);
 			set_price(DOT, FixedU128::from_u32(1));
-			let liquidated_debt =
-				redistribute_for_test(DOT, STABLE, 3, held(DOT, 3)).expect("liquidated");
+			assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
+			let liquidated_debt = liquidation_outcome().redistribution.debt;
 
 			assert_eq!(vault(DOT, STABLE, 1).debt.principal, before_1);
 			assert_eq!(vault(DOT, STABLE, 2).debt.principal, before_2);
@@ -59,54 +58,22 @@ fn redistribution_is_touch_order_independent() {
 	assert_eq!(run(1, 2), run(2, 1));
 }
 
-// Recipient touches must preserve the market's accrual rate projection.
-#[test]
-fn mixed_rate_recipients_materialize_at_their_own_rates() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5))); // A — recipient
-		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(50))); // B — recipient
-		assert_ok!(open(3, DOT, STABLE, 1_000, 500, percent(10))); // C — liquidated
-
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, STABLE, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
-
-		assert_ok!(poke(99, DOT, STABLE, 1));
-		assert_ok!(poke(99, DOT, STABLE, 2));
-
-		let state = market_state(DOT, STABLE);
-		let vault_a = vault(DOT, STABLE, 1);
-		let vault_b = vault(DOT, STABLE, 2);
-		let expected = accrual_rate(vault_a.debt.principal, percent(5))
-			.saturating_add(accrual_rate(vault_b.debt.principal, percent(50)));
-		let actual: Balance = whole_units(state.debt.accrual_rate);
-		// One ceil (`average_branch_rate`) against two per-recipient floors.
-		assert!(
-			actual.abs_diff(expected) <= 2,
-			"mixed-rate accrual rate drift too large: actual={}, expected={}",
-			actual,
-			expected,
-		);
-	});
-}
-
 // A rate change first materializes the assigned share. Past interest keeps the old rate, and the
 // new rate applies to all principal after the change.
 #[test]
 fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+	keeperless_branch().build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5))); // A - reprices
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(50))); // B - holds its share
 		assert_ok!(open(3, DOT, STABLE, 1_000, 500, percent(10))); // C - liquidated
 		let vault_a_pre = vault(DOT, STABLE, 1);
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		let redistributed =
-			redistribute_for_test(DOT, STABLE, 3, held(DOT, 3)).expect("liquidated");
+		let held_3 = held(DOT, 3);
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
+		let redistribution = liquidation_outcome().redistribution;
+		assert_eq!(redistribution.collateral, held_3);
+		let redistributed = redistribution.debt;
 
 		// Wait past the cooldown to isolate interest from the rate-change fee, and restore the
 		// price so the rate change passes the ratio checks.
@@ -129,83 +96,57 @@ fn recipient_rate_change_after_liquidation_reprices_the_absorbed_share() {
 		assert_eq!(state.debt.pending_redistribution_principal, redistributed - 251);
 		assert_eq!(state.pending_redistribution_collateral, 500);
 		let actual: Balance = whole_units(state.stakes.accrual_rate);
-		assert_eq!(actual, accrual_rate(1_000, percent(30)) + accrual_rate(1_000, percent(50)));
+		assert_eq!(
+			actual,
+			percent(30).saturating_mul_int(1_000) + percent(50).saturating_mul_int(1_000)
+		);
 
 		// Interest after the change uses the new rate for all principal.
 		advance_time(ONE_YEAR_MS);
 		assert_ok!(poke(9, DOT, STABLE, 1));
+
 		let vault_a_post = vault(DOT, STABLE, 1);
 		assert_eq!(vault_a_post.debt.interest, vault_a.debt.interest + 225);
 	});
 }
 
-// A follow-on `borrow` against a recipient must keep the branch accrual_rate
-// consistent with each vault's own-rate contribution: the borrow first touches
-// the vault to fold in its redistribution share, then updates the accrual-rate
-// bookkeeping so the aggregate still equals Σ (own ib_debt × own rate).
+// A follow-on `borrow` against a recipient first touches the vault to fold in its redistribution
+// share, then prices the fee at the branch's average rate, which still counts the share left
+// pending. The quote and the dispatch must agree on both. The exact aggregates are checked by
+// `try_state` when the test ends.
 #[test]
-fn borrow_after_redistribution_keeps_accrual_rate_consistent() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+fn borrow_after_redistribution_folds_the_share_and_charges_the_quoted_fee() {
+	keeperless_branch().build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5))); // A — recipient + borrower
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(50))); // B — recipient
 		assert_ok!(open(3, DOT, STABLE, 1_000, 500, percent(10))); // C — liquidated
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, STABLE, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
+		// C owes 500 plus an upfront fee of 3, priced at the 21.67% average of the three opens.
+		assert_eq!(
+			liquidation_outcome().redistribution,
+			DebtCollateral { debt: 503, collateral: coll_3 }
+		);
+		set_price(DOT, DEFAULT_PRICE);
 
 		let interest_before = vault(DOT, STABLE, 1).debt.interest;
+
+		// A holds half the stake, so the touch folds floor(503 / 2) = 251 into its principal and
+		// leaves 252 pending. After the borrow the branch accrues, per year,
+		//   A: 2_751 · 5% = 137.55, B: 500 · 50% = 250, B's pending share: 251.5 · 50% = 125.75,
+		// which is 513 in whole units over 2_751 + 500 + 252 = 3_503 of principal: 14.64%. The
+		// fee is ceil(2_000 · 14.64% · 7d / 365.25d) = ceil(5.61) = 6. A's own 5% would give 2.
 		let predicted_fee =
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 200, None)
+			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 2_000, None)
 				.expect("touch projection and fee calculation succeed");
-		assert_ok!(borrow(1, DOT, STABLE, 200, None));
-		assert_eq!(
-			vault(DOT, STABLE, 1).debt.interest,
-			interest_before + predicted_fee,
-			"the prediction and execution paths share the pending-touch kernel",
-		);
-		assert_ok!(poke(99, DOT, STABLE, 2));
+		assert_eq!(predicted_fee, 6);
+		assert_ok!(borrow(1, DOT, STABLE, 2_000, None));
 
-		let state = market_state(DOT, STABLE);
-		let vault_a = vault(DOT, STABLE, 1);
-		let vault_b = vault(DOT, STABLE, 2);
-		let expected = accrual_rate(vault_a.debt.principal, percent(5))
-			.saturating_add(accrual_rate(vault_b.debt.principal, percent(50)));
-		let actual: Balance = whole_units(state.debt.accrual_rate);
-		// Same ceil-vs-floor drift as above, plus the borrow's own reconciliation.
-		assert!(
-			actual.abs_diff(expected) <= 2,
-			"accrual_rate drift after borrow: actual={}, expected={}",
-			actual,
-			expected,
-		);
-	});
-}
-
-#[test]
-fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
-		assert_ok!(open(3, DOT, STABLE, 5_000, 500, percent(5)));
-
-		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-
-		for liquidatee in [1, 2] {
-			let collateral = held(DOT, liquidatee);
-			assert_ok_and_invariants(liquidate_with(DOT, STABLE, liquidatee, |_| {
-				LiquidationAllocation {
-					offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-					redistribution_collateral: collateral,
-					keeper: KeeperCompensation { recipient: liquidatee, collateral: 0 },
-				}
-			}));
-		}
+		let vault = vault(DOT, STABLE, 1);
+		assert_eq!(vault.debt.principal, 500 + 251 + 2_000);
+		assert_eq!(vault.debt.interest, interest_before + 6);
 	});
 }
 
@@ -213,7 +154,7 @@ fn back_to_back_near_empty_redistributions_preserve_accounting_identity() {
 // survives recipient changes and moves to a later sole recipient without loss.
 #[test]
 fn pending_residue_outlives_its_recipients_and_lands_on_a_later_vault() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+	keeperless_branch().build_and_execute(|| {
 		mint_collateral(DOT, 1, 2_000_000_000_000_000_000_000_000);
 		mint_collateral(DOT, 2, 3_000_000_000_000_000_000_000_000);
 		// Large stakes keep the allocation below accumulator resolution.
@@ -222,7 +163,7 @@ fn pending_residue_outlives_its_recipients_and_lands_on_a_later_vault() {
 		assert_ok!(open(3, DOT, STABLE, 1_000, 500, percent(5)));
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
-		assert_ok!(redistribute_for_test(DOT, STABLE, 3, held(DOT, 3)));
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
 		assert_ok!(poke(9, DOT, STABLE, 1));
 		assert_ok!(poke(9, DOT, STABLE, 2));
 		let seeded = market_state(DOT, STABLE);
@@ -261,13 +202,14 @@ fn pending_residue_outlives_its_recipients_and_lands_on_a_later_vault() {
 // A one-unit stake floor keeps a debt-bearing vault eligible for redistribution and liquidation.
 #[test]
 fn dust_ratio_stake_floors_to_one_unit_and_stays_liquidatable() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+	keeperless_branch().build_and_execute(|| {
 		// The fixture makes the corrected stake floor to zero before the minimum applies.
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(open(2, DOT, STABLE, 2_000_000, 500, percent(5)));
 		set_price(DOT, FixedU128::from_rational(1u128, 10_000u128));
 		let coll_2 = held(DOT, 2);
-		assert_ok!(redistribute_for_test(DOT, STABLE, 2, coll_2));
+		assert_ok!(liquidate(99, DOT, STABLE, 2, 0, 0));
+		assert_eq!(liquidation_outcome().redistribution.collateral, coll_2);
 
 		set_price(DOT, DEFAULT_PRICE);
 		assert_ok!(open(3, DOT, STABLE, 1_000, 500, percent(5)));
@@ -278,27 +220,25 @@ fn dust_ratio_stake_floors_to_one_unit_and_stays_liquidatable() {
 		assert_ok!(poke(9, DOT, STABLE, 3));
 
 		set_price(DOT, FixedU128::from_rational(50u128, 100u128));
-		assert_ok!(redistribute_for_test(DOT, STABLE, 3, held(DOT, 3)));
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
+
 		assert!(!vault_exists(DOT, STABLE, 3));
 	});
 }
 
 #[test]
 fn vault_cr_projects_lazy_redistribution_before_materialization() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+	keeperless_branch().build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(open(3, DOT, STABLE, 1_000, 500, percent(5)));
 
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, STABLE, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
+		assert_eq!(liquidation_outcome().redistribution.collateral, coll_3);
 		// Restore price so the view's CR is defined for vault 1.
-		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
+		set_price(DOT, DEFAULT_PRICE);
 
 		let view_pre = crate::Pallet::<Test>::vault_cr(DOT, STABLE, 1).expect("cr");
 		// Vault 3 owed 500 plus a fee of 1. Vault 1 holds half the stake, so its share is
@@ -324,7 +264,7 @@ fn vault_cr_projects_lazy_redistribution_before_materialization() {
 // `share · rate · (t2 - t1) / year` to within fixed-point flooring.
 #[test]
 fn redistributed_principal_accrues_interest_from_liquidation_moment() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+	keeperless_branch().build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(open(2, DOT, STABLE, 2_000, 800, percent(50)));
 
@@ -333,7 +273,8 @@ fn redistributed_principal_accrues_interest_from_liquidation_moment() {
 		advance_time(ONE_YEAR_MS);
 		set_price(DOT, FixedU128::from_rational(55u128, 100u128));
 		let v_pre = vault(DOT, STABLE, 2);
-		let redistributed = redistribute_for_test(DOT, STABLE, 1, 0).unwrap();
+		assert_ok!(liquidate(99, DOT, STABLE, 1, 0, 0));
+		let redistributed = liquidation_outcome().redistribution.debt;
 
 		// 500 principal + open fee 1 + one year at 5% = 25.
 		assert_eq!(redistributed, 526);
@@ -370,13 +311,14 @@ fn seed_redistributed_recipient() {
 	// Only vault 2 must be liquidatable in this fixture.
 	set_price(DOT, FixedU128::from_rational(50u128, 100u128));
 	let coll_2 = held(DOT, 2);
-	assert_ok!(redistribute_for_test(DOT, STABLE, 2, coll_2));
+	assert_ok!(liquidate(99, DOT, STABLE, 2, 0, 0));
+	assert_eq!(liquidation_outcome().redistribution.collateral, coll_2);
 }
 
 // A recipient touch moves pending interest to the vault and preserves projected branch debt.
 #[test]
 fn recipient_owned_redistribution_interest_stays_in_branch_projection() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+	keeperless_branch().build_and_execute(|| {
 		seed_redistributed_recipient();
 
 		let state = market_state(DOT, STABLE);
@@ -413,7 +355,7 @@ fn recipient_owned_redistribution_interest_stays_in_branch_projection() {
 #[test]
 fn branch_debt_projection_is_refresh_cadence_independent() {
 	let run = |refreshes: u64| {
-		ExtBuilder::default().branch(DOT, STABLE).build().execute_with(|| {
+		keeperless_branch().build().execute_with(|| {
 			seed_redistributed_recipient();
 			assert_ok!(open(9, DOT, STABLE, 1_000, 300, percent(5)));
 

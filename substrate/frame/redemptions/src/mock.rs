@@ -25,9 +25,13 @@ use frame::{
 	},
 };
 use pallet_linked_list::Position;
-use stablecoin_primitives::{ProvidePrice, VaultInterface};
+use pallet_vaults::{CollateralCreditOf, StableCreditOf};
+use stablecoin_primitives::{
+	BranchSnapshot, OffsetLegs, ProvidePrice, StabilityPoolInspect, StabilityPoolOffset,
+	VaultInterface,
+};
 
-pub type AccountId = u64;
+pub type AccountId = u128;
 pub type Balance = u128;
 pub type AssetIdForAssets = u32;
 /// Collateral asset id: native DOT or an issued asset.
@@ -82,6 +86,7 @@ impl frame_system::Config for Test {
 	type Block = Block;
 	type AccountId = AccountId;
 	type AccountData = pallet_balances::AccountData<Balance>;
+	// The preset's lookup is pinned to its own `u64` account id.
 	type Lookup = IdentityLookup<Self::AccountId>;
 }
 
@@ -197,6 +202,7 @@ impl pallet_vaults::Config for Test {
 	type YieldHook = ();
 	// Registering a branch seeds this pallet's redemption config via `on_registered`.
 	type OnBranchLifecycle = Redemptions;
+	type StabilityPool = BenchmarkSeedablePool;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	// Branch and vault deposits are the vaults suite's concern; these suites assert raw balances.
@@ -239,6 +245,61 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for VaultsBenc
 	fn fund_native(who: &AccountId) {
 		<Balances as fungible::Mutate<AccountId>>::mint_into(who, 1_000_000_000_000)
 			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
+	}
+}
+
+/// No Stability Pool: nothing absorbs a liquidation, so it redistributes, exactly as with `()`.
+///
+/// The benchmarks still queue pool cohorts, which a real pool needs for its yield route; this
+/// pool accepts them as deadlines only, so the same staging runs here and on a real runtime.
+pub struct BenchmarkSeedablePool;
+
+impl StabilityPoolInspect<AssetId, StableId, Balance> for BenchmarkSeedablePool {
+	type Quote = ();
+
+	fn quote(_: &AssetId, _: &StableId, _: BranchSnapshot) -> Option<()> {
+		None
+	}
+
+	fn quote_active(_: &(), _: Balance) -> Balance {
+		0
+	}
+
+	fn quote_pending(_: &(), _: Balance, _: Balance) -> Balance {
+		0
+	}
+}
+
+impl StabilityPoolOffset<AssetId, StableId, Balance, CollateralCreditOf<Test>, StableCreditOf<Test>>
+	for BenchmarkSeedablePool
+{
+	// Forwarded so that `()`'s defensive check on a nonzero leg still runs.
+	fn offset(
+		collateral_id: &AssetId,
+		stable_id: &StableId,
+		branch: BranchSnapshot,
+		debt: OffsetLegs<Balance>,
+		collateral: OffsetLegs<CollateralCreditOf<Test>>,
+	) -> Result<StableCreditOf<Test>, DispatchError> {
+		<() as StabilityPoolOffset<_, _, _, _, _>>::offset(
+			collateral_id,
+			stable_id,
+			branch,
+			debt,
+			collateral,
+		)
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_queue_deposit(
+		_: &AssetId,
+		_: &StableId,
+		_: u32,
+		entry_delay: u64,
+		_: Balance,
+	) -> Result<u64, DispatchError> {
+		assert!(entry_delay > 0);
+		Ok(Timestamp::get() + entry_delay)
 	}
 }
 
@@ -482,7 +543,7 @@ fn genesis_ext(asset_balances: Vec<(AssetIdForAssets, AccountId, Balance)>) -> T
 		balances: pallet_balances::GenesisConfig {
 			// The fee and insurance accounts pay native asset-account deposits, and a
 			// Root-created branch takes its custody seed from its full admin.
-			balances: (1u64..=10u64)
+			balances: (1..=10)
 				.chain([insurance_account(STABLE), FEE_DEST, VAULT_FEE_DEST, ADMIN])
 				.map(|i| (i, 1_000_000_000_000))
 				.collect(),
@@ -542,7 +603,18 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(100u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
-		redistribution_penalty: Permill::from_percent(5),
+		final_recovery_reward_cooldown: 3_600 * 1_000,
+		liquidation: pallet_vaults::LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			// Keeper compensation is off. These tests price settlements of a collateral they
+			// state up front, and final-recovery entry would otherwise pay part of it to the
+			// entering keeper. The vaults suite covers that schedule.
+			keeper_flat_compensation_value: 0,
+			keeper_percent_compensation: Permill::zero(),
+			keeper_compensation_cap_value: 10_000,
+			minimum_jit_contribution: 100,
+			redistribution_penalty: Permill::from_percent(5),
+		},
 	}
 }
 
@@ -771,6 +843,8 @@ pub fn enter_final_recovery(
 	owner: AccountId,
 ) -> DispatchResult {
 	Vaults::enter_final_recovery(RuntimeOrigin::signed(99), collateral, stable, owner)
+		.map(|_post_info| ())
+		.map_err(|error| error.error)
 }
 
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {

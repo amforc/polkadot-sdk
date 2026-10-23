@@ -19,9 +19,18 @@ use pallet_vaults::DebtBreakdown;
 /// The price that parks the standing vault at a CR of 104%.
 const PRICE_AT_104_PERCENT: FixedU128 = FixedU128::from_rational(52, 100);
 
+/// Branch configuration for recovery settlement tests, with no entry compensation.
+/// These tests price the collateral available to settle the head.
+fn recovery_branch_config() -> pallet_vaults::BranchConfig<Balance> {
+	let mut config = default_branch_config();
+	config.liquidation.keeper_flat_compensation_value = 0;
+	config.liquidation.keeper_percent_compensation = Permill::zero();
+	config
+}
+
 /// The recovery branch, without the standing vault.
 fn recovery_branch() -> ExtBuilder {
-	ExtBuilder::default().default_branch()
+	ExtBuilder::default().default_branch().branch_config(recovery_branch_config())
 }
 
 /// The recovery branch with the standing vault (owner 5) open.
@@ -434,5 +443,58 @@ fn active_pool_offset_keeps_yield_distributed_during_settlement() {
 			]
 		);
 		assert_eq!(pool_state(DOT, STABLE).total_yield_unclaimed, yield_before + 2);
+	});
+}
+
+// A head that is read and priced charges the full deposit weight whether or not it can be offset,
+// so only a deposit that found no head may report the smaller weight.
+#[test]
+fn deposit_weight_refund_depends_on_the_recovery_queue() {
+	standing_head_with_active_pool().stable_balance(2, 1_000).build_and_execute(|| {
+		park_standing_head_at(PRICE_AT_104_PERCENT);
+
+		// The registration price lifts the head above the exit threshold: it cannot be offset.
+		set_price(DOT, REGISTRATION_PRICE);
+		stability_events_since_last_call();
+
+		let not_offsettable = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 100)
+			.expect("the deposit queues past the head");
+
+		assert_eq!(not_offsettable.actual_weight, None);
+		// The deposit activates the matured cohort and queues: no recovery offset is among its
+		// events.
+		assert_eq!(
+			stability_events_since_last_call(),
+			vec![
+				crate::Event::CohortActivated {
+					collateral_id: DOT,
+					stable_id: STABLE,
+					cohort: CohortId(0),
+					deadline: 10_000,
+					amount: 400,
+				},
+				crate::Event::DepositReceived {
+					collateral_id: DOT,
+					stable_id: STABLE,
+					depositor: 2,
+					amount: 100,
+					pending_amount: 100,
+				},
+			]
+		);
+
+		// Back at the parked price the head is offsettable again, and the deposit settles it.
+		set_price(DOT, PRICE_AT_104_PERCENT);
+		let settled = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 800)
+			.expect("the deposit settles the head");
+
+		let debt = DebtBreakdown { principal: 498, interest: 2 };
+		assert_recovery_offset(debt, 990, RecoveryOffsetSource::IncomingDeposit);
+		assert_eq!(settled.actual_weight, None);
+
+		let queued = Stability::deposit(RuntimeOrigin::signed(2), DOT, STABLE, 100)
+			.expect("the deposit queues");
+
+		assert_eq!(queued.actual_weight, Some(<() as crate::WeightInfo>::deposit_no_recovery()));
 	});
 }

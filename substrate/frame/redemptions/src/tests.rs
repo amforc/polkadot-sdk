@@ -3,7 +3,6 @@ use crate::{
 	types::{RecoveryRegime, RedemptionConfig, RedemptionState},
 	Error, Event,
 };
-use pallet_vaults::LiquidationSettlement;
 use stablecoin_primitives::{
 	collateralization_ratio, reducible_debit, CollateralRatio, DebtCollateral,
 	RecoveryOffsetInterface, RecoveryOffsetResult, VaultInterface,
@@ -838,7 +837,7 @@ fn recovery_stops_above_icr() {
 				redeem(RedeemOptions::spend(200)),
 				Error::<Test>::FinalRecoveryExitRequired
 			);
-			assert_ok!(execute_offset(STABLE, 200), RecoveryOffsetResult::NoTarget);
+			assert_ok!(execute_offset(STABLE, 200), RecoveryOffsetResult::NotOffsettable);
 			assert_eq!(vault_debt(DOT, STABLE, 1), debt_before);
 
 			// CR = 619 · 0.56 / 301 ≈ 115.2%, above MCR but not ICR.
@@ -1331,14 +1330,13 @@ fn ordinary_accrues_interest_before_cancelling() {
 
 /// Liquidates `owner`'s DOT/STABLE vault entirely by redistribution.
 fn liquidate_redistribute_all(owner: AccountId) {
-	Vaults::execute_liquidation(&DOT, &STABLE, &owner, |_, mut collateral| {
-		let owner_surplus = collateral.extract(0);
-		Ok(LiquidationSettlement {
-			debt_offset: 0,
-			redistribution_collateral: collateral,
-			owner_surplus,
-		})
-	})
+	Vaults::liquidate(
+		RuntimeOrigin::signed(99),
+		DOT,
+		STABLE,
+		owner,
+		pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 },
+	)
 	.expect("liquidation succeeds");
 }
 
@@ -1400,7 +1398,7 @@ fn execute_offset_inner(
 		)?
 	};
 	let (result, change) = <Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
-		&DOT, payment, &RECIPIENT,
+		&DOT, payment, amount, &RECIPIENT,
 	)?;
 	if let Err(change) = change.drop_zero() {
 		<Assets as FungiblesBalanced<AccountId>>::resolve(&REDEEMER, change)
@@ -1432,7 +1430,7 @@ fn execute_recovery_offset_settles_only_an_offsettable_head() {
 			// A zero budget withdraws nothing, so it is a pure storage no-op even though a
 			// recovery bonus applies.
 			assert_storage_noop!({
-				assert_ok!(execute_offset(STABLE, 0), RecoveryOffsetResult::NoTarget);
+				assert_ok!(execute_offset(STABLE, 0), RecoveryOffsetResult::NotOffsettable);
 			});
 
 			let debt_before = vault_debt(DOT, STABLE, 1);
@@ -1708,7 +1706,11 @@ fn recovery_bonus_capped_by_penalty() {
 	config.minimum_collateralization_ratio = FixedU128::from_rational(130u128, 100u128);
 	config.initial_collateralization_ratio = FixedU128::from_rational(140u128, 100u128);
 	config.safety_collateralization_ratio = FixedU128::from_rational(150u128, 100u128);
-	config.redistribution_penalty = Permill::from_percent(10);
+	config.liquidation.redistribution_penalty = Permill::from_percent(10);
+	// Keeper terms stay on here, so the settlement below prices the collateral the entry reward
+	// left in the vault.
+	config.liquidation.keeper_flat_compensation_value = 10;
+	config.liquidation.keeper_percent_compensation = Permill::from_rational(1u32, 1_000u32);
 	// The vault opens above the 140% ICR, and then 1 DOT = 2 STABLE. At this
 	// price, 6_000 DOT has a value of 12_000 STABLE against 10_000 debt, which gives a 120% CR.
 	ExtBuilder::default()
@@ -1718,7 +1720,11 @@ fn recovery_bonus_capped_by_penalty() {
 		.price(DOT, FixedU128::from_rational(2, 1))
 		.stable_balance(STABLE, REDEEMER, 1_000_000 * UNIT)
 		.build_and_execute(|| {
+			// The keeper terms are in raw units, so the entry pays its keeper the cap: a 10_000
+			// value is 5_000 units, or 5 DOT, at 2. The 5-unit flat plus 0.1% of the
+			// 5_250_000-unit seizure would be more.
 			assert_ok!(enter_final_recovery(DOT, STABLE, 1));
+			assert_eq!(held(DOT, 1), 6_000 * UNIT - 5_000);
 
 			let settled = redeem(RedeemOptions::spend(2_000 * UNIT)).expect("redemption succeeds");
 
@@ -1728,7 +1734,7 @@ fn recovery_bonus_capped_by_penalty() {
 			assert_eq!(settled.figures(), (2_000 * UNIT, 0, 1_100 * UNIT));
 			assert_eq!(settled.kind, RECOVERY_BONUS);
 			assert_eq!(vault_debt(DOT, STABLE, 1), 8_000 * UNIT);
-			assert_eq!(held(DOT, 1), 4_900 * UNIT);
+			assert_eq!(held(DOT, 1), 4_900 * UNIT - 5_000);
 		});
 }
 
@@ -1747,23 +1753,77 @@ fn redeem_actual_weight(max_stable_to_spend: Balance, max_steps: u32) -> frame::
 }
 
 // A walk that runs out of targets still paid for the lookup that found none, so it is weighed one
-// step above the vaults it visited; a walk that stops at its cap does no such lookup.
+// step above the vaults it visited; a walk that stops at its cap does no such lookup. A cap above
+// `MaxRedemptionSteps`, or the `0` default, is clamped to it, and the declared weight covers the
+// clamped walk or a recovery settlement, whichever weighs more.
 #[test]
 fn ordinary_walk_weighs_a_trailing_lookup_as_a_step() {
-	use crate::WeightInfo;
+	use crate::{Config, WeightInfo};
+	use frame::{deps::frame_support::dispatch::GetDispatchInfo, traits::Get};
+	let cap = <Test as Config>::MaxRedemptionSteps::get();
+	// One vault more than a walk can reach.
+	let vault_count = cap + 1;
 	ExtBuilder::default()
 		.default_branch()
+		.vault(1, 1_000, 500, percent(1))
+		.vault(2, 10_000, 500, percent(2))
 		.stable_balance(STABLE, REDEEMER, 1_000_000)
 		.build_and_execute(|| {
-			assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
-			assert_ok!(open(2, DOT, STABLE, 10_000, 500, percent(2)));
+			// Rising rates queue the extra vaults behind vaults 1 and 2, the last opened last.
+			let extra_owners = 11..=AccountId::from(vault_count) + 8;
+			for (owner, rate) in extra_owners.clone().zip(30u128..) {
+				assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), owner, 1_000_000));
+				assert_ok!(open(
+					owner,
+					DOT,
+					STABLE,
+					1_000,
+					500,
+					FixedU128::from_rational(rate, 1_000)
+				));
+			}
+			let last = *extra_owners.end();
+			let last_debt = vault_debt(DOT, STABLE, last);
+
+			let declared = |max_steps: u32| {
+				crate::Call::<Test>::redeem {
+					collateral_id: DOT,
+					stable_id: STABLE,
+					terms: crate::RedemptionTerms {
+						max_stable_to_spend: 100_000,
+						min_collateral_out: 0,
+					},
+					recipient: RECIPIENT,
+					max_steps,
+				}
+				.get_dispatch_info()
+				.call_weight
+			};
+			let capped_weight =
+				<() as WeightInfo>::redeem(cap).max(<() as WeightInfo>::redeem_recovery());
+			assert_eq!(declared(u32::MAX), capped_weight);
+			assert_eq!(declared(0), capped_weight);
+			assert_eq!(
+				declared(1),
+				<() as WeightInfo>::redeem(1).max(<() as WeightInfo>::redeem_recovery())
+			);
 
 			let capped = hypothetically!(redeem_actual_weight(100_000, 1));
 			assert_eq!(capped, <() as WeightInfo>::redeem(1));
 
+			// A cap above the ceiling walks only `cap` vaults with budget to spare.
+			let clamped = hypothetically!(redeem(RedeemOptions {
+				max_steps: u32::MAX,
+				..RedeemOptions::spend(100_000)
+			}))
+			.expect("the walk is redeemable");
+			assert_eq!(clamped.kind, SettlementKind::Ordinary { steps: cap });
+			assert_eq!(redeem_actual_weight(100_000, u32::MAX), <() as WeightInfo>::redeem(cap));
+			assert_eq!(vault_debt(DOT, STABLE, last), last_debt);
+
+			// The one vault left is a step, and the lookup past it another.
 			let exhausted = redeem_actual_weight(100_000, 0);
-			assert_eq!(exhausted, <() as WeightInfo>::redeem(3));
-			assert!(vault_status(DOT, STABLE, 1).is_none_or(|status| status.is_dormant()));
-			assert!(vault_status(DOT, STABLE, 2).is_none_or(|status| status.is_dormant()));
+			assert_eq!(exhausted, <() as WeightInfo>::redeem(2));
+			assert!(vault_status(DOT, STABLE, last).is_none_or(|status| status.is_dormant()));
 		});
 }

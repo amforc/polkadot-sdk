@@ -9,11 +9,11 @@ use crate as pallet_vaults;
 use crate::{
 	pallet::{Branches, CollateralCreditOf, StableCreditOf},
 	types::{BranchConfigBounds, Vault},
-	BranchState, HoldReason, LiquidationSettlement, VaultListId,
+	BranchState, HoldReason, LiquidationConfig, VaultListId,
 };
 pub use crate::{
 	types::BranchAdmins, BoundViolation, BranchConfig, BranchConfigDefect, BranchMode, Error,
-	Pallet,
+	Event, Pallet,
 };
 pub use frame::{
 	arithmetic::{FixedPointNumber, FixedU128, Permill},
@@ -40,7 +40,8 @@ use frame::{
 };
 pub use pallet_linked_list::Position;
 use stablecoin_primitives::{
-	BranchSnapshot, OraclePriceConversion, RedemptionSettlement, VaultInterface,
+	BranchSnapshot, OffsetLegs, OraclePriceConversion, RedemptionSettlement, StabilityPoolInspect,
+	StabilityPoolOffset, VaultInterface,
 };
 
 pub type AccountId = u128;
@@ -65,6 +66,8 @@ pub const EMERGENCY_ADMIN: AccountId = 101;
 pub const FEE_DEST: AccountId = 200;
 /// Owner allowed to create a STABLE branch with a deposit.
 pub const STABLECOIN_OWNER: AccountId = 1;
+/// Account that receives collateral consumed by the mocked Stability Pool.
+pub const SP_ACCOUNT: AccountId = 777;
 
 /// Native collateral used by most tests.
 pub const DOT: AssetId = AssetId::Native;
@@ -358,6 +361,12 @@ pub type VaultDepositConsideration = FungiblesHoldConsideration<
 >;
 
 parameter_types! {
+	/// Debt the mocked Stability Pool can absorb from its active deposits.
+	pub storage ActiveSpCapacity: Balance = 0;
+	/// Debt the mocked Stability Pool can absorb from deposits not yet active.
+	pub storage PendingSpCapacity: Balance = 0;
+	/// Benchmark-queued pending deposits as `(activation deadline, amount)`.
+	pub storage PendingSpCohorts: Vec<(u64, Balance)> = Vec::new();
 	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
 	pub TestBranchConfigBounds: BranchConfigBounds = BranchConfigBounds {
 		min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
@@ -365,6 +374,113 @@ parameter_types! {
 		min_safety_collateralization_ratio: FixedU128::from_rational(120u128, 100u128),
 		max_borrow_rate: FixedU128::from_rational(400u128, 100u128),
 	};
+}
+
+pub struct MockStabilityPool;
+
+impl MockStabilityPool {
+	/// Settles one leg against its capacity knob and returns the capacity left, mirroring the
+	/// real pallet's exact semantics: a zero leg carries no collateral, and a non-zero one must
+	/// still fit the capacity a sizing read reported, or the whole offset fails.
+	fn settle_leg(
+		debt: Balance,
+		collateral: CollateralCreditOf<Test>,
+		capacity: Balance,
+	) -> Result<Balance, DispatchError> {
+		if debt.is_zero() {
+			ensure!(collateral.peek().is_zero(), Error::<Test>::InvalidLiquidationPlan);
+			return Ok(capacity);
+		}
+		ensure!(debt <= capacity, Error::<Test>::InvalidLiquidationPlan);
+		let resolved = <VaultCollateralAssets as FungiblesBalanced<AccountId>>::resolve(
+			&SP_ACCOUNT,
+			collateral,
+		);
+		ensure!(resolved.is_ok(), Error::<Test>::CollateralPayoutFailed);
+		Ok(capacity - debt)
+	}
+
+	/// Moves every due benchmark cohort from the pending to the active capacity knob, as the
+	/// real pool activates cohorts at the deadline the engine's clock has reached.
+	fn activate_due_cohorts(branch: BranchSnapshot) {
+		assert_eq!(branch.now, Timestamp::get(), "the engine passes its own clock");
+		let (due, open): (Vec<_>, Vec<_>) = PendingSpCohorts::get()
+			.into_iter()
+			.partition(|(deadline, _)| *deadline <= branch.now);
+		// Writing nothing when nothing is due keeps the storage root of a no-op call unchanged.
+		if due.is_empty() {
+			return;
+		}
+		let amount: Balance = due.iter().map(|(_, amount)| amount).sum();
+		PendingSpCapacity::set(&(PendingSpCapacity::get() - amount));
+		ActiveSpCapacity::set(&(ActiveSpCapacity::get() + amount));
+		PendingSpCohorts::set(&open);
+	}
+}
+
+impl StabilityPoolInspect<AssetId, StableId, Balance> for MockStabilityPool {
+	type Quote = ();
+
+	fn quote(_: &AssetId, _: &StableId, branch: BranchSnapshot) -> Option<()> {
+		Self::activate_due_cohorts(branch);
+		Some(())
+	}
+
+	fn quote_active(_: &(), max_debt: Balance) -> Balance {
+		max_debt.min(ActiveSpCapacity::get())
+	}
+
+	fn quote_pending(_: &(), max_debt: Balance, _: Balance) -> Balance {
+		max_debt.min(PendingSpCapacity::get())
+	}
+}
+
+impl
+	StabilityPoolOffset<
+		AssetId,
+		StableId,
+		Balance,
+		CollateralCreditOf<Test>,
+		pallet_vaults::StableCreditOf<Test>,
+	> for MockStabilityPool
+{
+	fn offset(
+		_: &AssetId,
+		stable_id: &StableId,
+		branch: BranchSnapshot,
+		debt: OffsetLegs<Balance>,
+		collateral: OffsetLegs<CollateralCreditOf<Test>>,
+	) -> Result<StableCreditOf<Test>, DispatchError> {
+		Self::activate_due_cohorts(branch);
+		let active = Self::settle_leg(debt.active, collateral.active, ActiveSpCapacity::get())?;
+		let pending = Self::settle_leg(debt.pending, collateral.pending, PendingSpCapacity::get())?;
+		ActiveSpCapacity::set(&active);
+		PendingSpCapacity::set(&pending);
+		// The knobs stand in for pool custody, so the stablecoin the pool gives up is issued here;
+		// the engine burns it again, leaving the supply as a real pool's burn would.
+		let given_up = debt.active + debt.pending;
+		if given_up.is_zero() {
+			return Ok(StableCreditOf::<Test>::zero(*stable_id));
+		}
+		Ok(issue_external(*stable_id, given_up))
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn benchmark_queue_deposit(
+		_: &AssetId,
+		_: &StableId,
+		_: u32,
+		entry_delay: u64,
+		amount: Balance,
+	) -> Result<u64, DispatchError> {
+		assert!(entry_delay > 0);
+		let deadline = Timestamp::get() + entry_delay;
+		PendingSpCapacity::set(&(PendingSpCapacity::get() + amount));
+		let mut cohorts = PendingSpCohorts::get();
+		cohorts.push((deadline, amount));
+		PendingSpCohorts::set(&cohorts);
+		Ok(deadline)
+	}
 }
 
 impl pallet_vaults::Config for Test {
@@ -375,6 +491,7 @@ impl pallet_vaults::Config for Test {
 	type FeeAccount = ConvertToValue<FeeDestAccount>;
 	type YieldHook = MockYieldHook;
 	type OnBranchLifecycle = RecordingLifecycle;
+	type StabilityPool = MockStabilityPool;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	type BranchConsideration = VaultsConsideration;
@@ -426,6 +543,7 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for MockBenchm
 pub struct ExtBuilder {
 	prices: BTreeMap<AssetId, FixedU128>,
 	branches: Vec<(AssetId, StableId, BranchConfig<Balance>)>,
+	active_sp_capacity: Balance,
 }
 
 impl ExtBuilder {
@@ -452,6 +570,12 @@ impl ExtBuilder {
 		self
 	}
 
+	/// Sets the debt the mocked Stability Pool can absorb from its active deposits.
+	pub fn active_sp_capacity(mut self, capacity: Balance) -> Self {
+		self.active_sp_capacity = capacity;
+		self
+	}
+
 	/// Builds fresh storage with the configured branches registered at block 1.
 	///
 	/// The native price defaults to [`DEFAULT_PRICE`]: vault deposits on non-native collateral
@@ -463,6 +587,7 @@ impl ExtBuilder {
 			System::set_block_number(1);
 			Timestamp::set_timestamp(1_000);
 			MockPrices::set(&self.prices);
+			ActiveSpCapacity::set(&self.active_sp_capacity);
 			for (collateral, stable, config) in self.branches {
 				let price = self.prices.get(&collateral).copied().unwrap_or(DEFAULT_PRICE);
 				register_market_with(collateral, stable, price, config);
@@ -514,7 +639,10 @@ fn genesis_storage() -> frame::deps::sp_runtime::Storage {
 		balances: pallet_balances::GenesisConfig {
 			// The fee account needs native funds to pay its asset-account deposit.
 			// The full admin funds the custody seed of every Root-created branch.
-			balances: (1..=10).chain([FEE_DEST, ADMIN]).map(|i| (i, 1_000_000_000_000)).collect(),
+			balances: (1..=10)
+				.chain([SP_ACCOUNT, FEE_DEST, ADMIN])
+				.map(|i| (i, 1_000_000_000_000))
+				.collect(),
 			..Default::default()
 		},
 	}
@@ -623,7 +751,17 @@ pub fn default_branch_config() -> BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(400u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
-		redistribution_penalty: Permill::from_percent(5),
+		final_recovery_reward_cooldown: 3_600 * 1_000,
+		liquidation: LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			// The keeper is paid out of the offset penalty, which on the smallest
+			// vault here is 5% of a 200 debt.
+			keeper_flat_compensation_value: 10,
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: 10_000,
+			minimum_jit_contribution: 100,
+			redistribution_penalty: Permill::from_percent(5),
+		},
 	}
 }
 
@@ -691,72 +829,22 @@ pub fn open(
 	.map_err(|error| error.error)
 }
 
-/// Liquidation amounts used by the test helpers.
-///
-/// The real interface uses collateral credits instead.
-pub struct OffsetAllocation<AccountId, Balance> {
-	pub collateral_recipient: AccountId,
-	pub debt: Balance,
-	pub collateral: Balance,
-}
-
-pub struct KeeperCompensation<AccountId, Balance> {
-	pub recipient: AccountId,
-	pub collateral: Balance,
-}
-
-pub struct LiquidationAllocation<AccountId, Balance> {
-	pub offset: OffsetAllocation<AccountId, Balance>,
-	pub redistribution_collateral: Balance,
-	pub keeper: KeeperCompensation<AccountId, Balance>,
-}
-
-/// Liquidates a vault by fully offsetting its current debt.
-pub fn liquidate(collateral: AssetId, stable: StableId, owner: AccountId) -> DispatchResult {
-	liquidate_with(collateral, stable, owner, |post_touch| LiquidationAllocation {
-		offset: OffsetAllocation { collateral_recipient: owner, debt: post_touch, collateral: 0 },
-		redistribution_collateral: 0,
-		keeper: KeeperCompensation { recipient: owner, collateral: 0 },
-	})
-}
-
-/// Liquidates a vault with a caller-built allocation.
-pub fn liquidate_with(
+/// Calls the production liquidation dispatchable.
+pub fn liquidate(
+	keeper: AccountId,
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
-	build: impl FnOnce(Balance) -> LiquidationAllocation<AccountId, Balance>,
+	max_jit_stable: Balance,
+	min_jit_collateral_out: Balance,
 ) -> DispatchResult {
-	Vaults::execute_liquidation(&collateral, &stable, &owner, |snapshot, mut collateral_credit| {
-		let allocation = build(snapshot.debt);
-		let total = allocation
-			.offset
-			.collateral
-			.saturating_add(allocation.redistribution_collateral)
-			.saturating_add(allocation.keeper.collateral);
-		ensure!(total <= collateral_credit.peek(), Error::<Test>::InvalidLiquidationSettlement);
-
-		resolve_test_collateral(
-			&mut collateral_credit,
-			allocation.offset.collateral,
-			&allocation.offset.collateral_recipient,
-		)?;
-		resolve_test_collateral(
-			&mut collateral_credit,
-			allocation.keeper.collateral,
-			&allocation.keeper.recipient,
-		)?;
-		let redistribution_collateral =
-			collateral_credit.extract(allocation.redistribution_collateral);
-		// No Stability Pool burns the offset here, so its stablecoin stays in circulation without
-		// market debt behind it. The transactional liquidation rolls this back with the step.
-		record_external_issuance(stable, signed(allocation.offset.debt));
-		Ok(LiquidationSettlement {
-			debt_offset: allocation.offset.debt,
-			redistribution_collateral,
-			owner_surplus: collateral_credit,
-		})
-	})
+	Vaults::liquidate(
+		RuntimeOrigin::signed(keeper),
+		collateral,
+		stable,
+		owner,
+		crate::JitTerms { max_stable: max_jit_stable, min_collateral_out: min_jit_collateral_out },
+	)
 }
 
 /// Calls the `poke` dispatchable as `who` against `owner`'s vault.
@@ -872,7 +960,7 @@ pub fn enter_final_recovery(
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
-) -> DispatchResult {
+) -> DispatchResultWithPostInfo {
 	Vaults::enter_final_recovery(RuntimeOrigin::signed(keeper), collateral, stable, owner)
 }
 
@@ -908,44 +996,14 @@ pub fn activate_dormant(
 	)
 }
 
-/// Removes a vault and records its whole debt as redistribution.
-///
-/// This bypasses liquidation pricing only for tests concerned with the
-/// redistribution ledger. Economic and custody tests use [`liquidate_with`].
-pub fn redistribute_for_test(
+/// Calls the permissionless `nominate_dormant` dispatchable.
+pub fn nominate_dormant(
+	who: AccountId,
 	collateral: AssetId,
 	stable: StableId,
 	owner: AccountId,
-	redistribution_collateral: Balance,
-) -> Result<Balance, DispatchError> {
-	let mut redistributed: Balance = 0;
-	liquidate_with(collateral, stable, owner, |post_touch| {
-		redistributed = post_touch;
-		LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral,
-			keeper: KeeperCompensation { recipient: 0, collateral: 0 },
-		}
-	})?;
-	Ok(redistributed)
-}
-
-fn resolve_test_collateral(
-	collateral: &mut CollateralCreditOf<Test>,
-	amount: Balance,
-	recipient: &AccountId,
 ) -> DispatchResult {
-	if amount.is_zero() {
-		return Ok(());
-	}
-	let credit = collateral.extract(amount);
-	debug_assert_eq!(credit.peek(), amount);
-	<VaultCollateralAssets as FungiblesBalanced<AccountId>>::resolve(recipient, credit).map_err(
-		|credit| {
-			drop(credit);
-			TokenError::CannotCreate.into()
-		},
-	)
+	Vaults::nominate_dormant(RuntimeOrigin::signed(who), collateral, stable, owner)
 }
 
 /// Redeems from the next branch target at the oracle price.

@@ -2,7 +2,10 @@
 
 use crate::{
 	mock::*,
-	tests::{assert_event, assert_ok_and_invariants, percent, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{
+		assert_event, assert_ok_and_invariants, liquidation_outcome, percent, ONE_DAY_MS,
+		ONE_YEAR_MS,
+	},
 };
 
 // The global ceiling binds per stablecoin: branches issuing one coin share it across collaterals,
@@ -92,10 +95,10 @@ fn projected_ceiling_counts_accrued_aggregate_interest() {
 }
 
 // Check after every write, before later operations can reconcile a broken aggregate. The
-// liquidation splits into an offset and a redistribution, so the writes include the later
-// touches, repay and overpaying close of a vault holding a redistributed share, and a redemption
-// from a vault whose share is still pending. The second coin is backed by the same collateral on
-// a branch of its own.
+// liquidation takes the production three-way path, so the writes include a redistribution, the
+// later touches, repay and overpaying close of a vault holding a redistributed share, and a
+// redemption from a vault whose share is still pending. The second coin is backed by the same
+// collateral on a branch of its own.
 #[test]
 fn stablecoin_debt_aggregate_tracks_every_write() {
 	ExtBuilder::default()
@@ -115,13 +118,25 @@ fn stablecoin_debt_aggregate_tracks_every_write() {
 			assert_ok_and_invariants(open(3, DOT, STABLE, 40, 300, percent(5)));
 			assert_ok_and_invariants(open(4, DOT, STABLE, 1_000, 500, percent(25)));
 
-			// Part offset, the rest redistributed to vaults 1 and 4.
+			// Active Stability Pool, keeper JIT, then redistribution to vaults 1 and 4.
 			set_price(DOT, FixedU128::from_u32(8));
-			assert_ok_and_invariants(liquidate_with(DOT, STABLE, 3, |_| LiquidationAllocation {
-				offset: OffsetAllocation { collateral_recipient: 8, debt: 100, collateral: 13 },
-				redistribution_collateral: 27,
-				keeper: KeeperCompensation { recipient: 8, collateral: 0 },
-			}));
+			let keeper_pre = collateral_balance(DOT, 8);
+			let pool_pre = collateral_balance(DOT, SP_ACCOUNT);
+			ActiveSpCapacity::set(&100);
+			mint_stable(STABLE, 8, 100);
+			assert_ok_and_invariants(liquidate(8, DOT, STABLE, 3, 100, 0));
+			let outcome = liquidation_outcome();
+			assert_ne!(outcome.active_pool.debt, 0);
+			assert_ne!(outcome.keeper_jit.debt, 0);
+			assert_ne!(outcome.redistribution.debt, 0);
+			assert_eq!(
+				collateral_balance(DOT, SP_ACCOUNT) - pool_pre,
+				outcome.active_pool.collateral
+			);
+			assert_eq!(
+				collateral_balance(DOT, 8) - keeper_pre,
+				outcome.keeper_reward + outcome.keeper_jit.collateral
+			);
 
 			// The recipient accrues from the redistribution time, and a partial repay swaps its
 			// full-contribution accrual rate.

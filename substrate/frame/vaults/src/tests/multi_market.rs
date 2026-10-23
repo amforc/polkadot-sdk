@@ -124,7 +124,7 @@ fn stablecoin_debt_accrues_interest_across_untouched_markets() {
 			assert_eq!(
 				StablecoinDebt::<Test>::get(STABLE),
 				stored,
-				"read-only projection must not touch either market"
+				"read-only projection must not touch either branch"
 			);
 		});
 }

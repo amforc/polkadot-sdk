@@ -1,6 +1,6 @@
 use crate::{
 	mock::*,
-	tests::{percent, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
+	tests::{keeperless_branch, percent, vault_status, ONE_DAY_MS, ONE_YEAR_MS},
 	VaultStatus,
 };
 use pallet_linked_list::SortedListInterface;
@@ -267,30 +267,27 @@ fn activate_dormant_requires_dormant_vault_at_minimum_debt() {
 #[test]
 fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		// Distinct rates so the rate-index tail is deterministic — acct 1 at
-		// the lower rate sits at the tail, where the redemption helper picks
-		// it first.
+		// Distinct rates make account 1 the first redemption target.
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
 		assert_ok!(open(3, DOT, STABLE, 200, 200, percent(5)));
 		assert_ok!(redeem(DOT, STABLE, 4, 350)); // leaves acct 1 Dormant with debt
 
 		let vault_dormant_pre = vault(DOT, STABLE, 1);
+
 		// At 1.0 vault 3 (200 collateral, ~200 debt) sits under MCR while 1 and 2 stay above it.
-		set_price(DOT, FixedU128::from_rational(1u128, 1u128));
-		// Redistribute vault 3's whole debt across the recipients (no offset).
-		let coll_3 = held(DOT, 3);
-		assert_ok!(liquidate_with(DOT, STABLE, 3, |_| LiquidationAllocation {
-			offset: OffsetAllocation { collateral_recipient: 0, debt: 0, collateral: 0 },
-			redistribution_collateral: coll_3,
-			keeper: KeeperCompensation { recipient: 3, collateral: 0 },
-		}));
+		set_price(DOT, FixedU128::from_u32(1));
+		// An empty pool sends the residual to both eligible vaults.
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
+
 		assert_eq!(
 			vault(DOT, STABLE, 1).debt.principal,
 			vault_dormant_pre.debt.principal,
 			"the allocation stays lazy until this vault is touched",
 		);
+
 		assert_ok!(poke(99, DOT, STABLE, 1));
+
 		let vault_dormant_post = vault(DOT, STABLE, 1);
 		// Dormant debt must not remove a vault from redistribution.
 		let gained = vault_dormant_post.debt.principal - vault_dormant_pre.debt.principal;
@@ -303,7 +300,7 @@ fn debt_bearing_dormant_vault_receives_redistribution_on_touch() {
 // redemption slot. Redistribution can make it debt-bearing again.
 #[test]
 fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+	keeperless_branch().build_and_execute(|| {
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
 		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
 		assert_ok!(open(3, DOT, STABLE, 200, 200, percent(5)));
@@ -316,7 +313,7 @@ fn debt_free_dormant_husk_is_made_debt_bearing_by_redistribution() {
 		assert_eq!(market_state(DOT, STABLE).dormant_redemption_target, None);
 
 		set_price(DOT, FixedU128::from_u32(1));
-		assert_ok!(redistribute_for_test(DOT, STABLE, 3, held(DOT, 3)));
+		assert_ok!(liquidate(99, DOT, STABLE, 3, 0, 0));
 		assert_ok!(poke(2, DOT, STABLE, 1));
 
 		// The liquidated vault leaves the recipient set before allocation.
@@ -382,6 +379,7 @@ fn dormant_vault_accepts_only_a_reviving_borrow() {
 		// The deposit leg of the batch is now accepted.
 		let held_before = held(DOT, 1);
 		assert_ok!(deposit_collateral(1, DOT, STABLE, 1, 100));
+
 		assert_eq!(held(DOT, 1), held_before + 100);
 	});
 }

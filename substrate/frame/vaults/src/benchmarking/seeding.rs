@@ -38,6 +38,10 @@ impl<T: BenchmarkConfig>
 		fixtures::open_funded_vault::<T>(owner, vault)
 	}
 
+	fn queue_pool_cohorts() -> Result<Millis, DispatchError> {
+		fixtures::queue_pool_cohorts::<T>()
+	}
+
 	fn seed_redemption_targets(
 		count: u32,
 		elapsed: Millis,

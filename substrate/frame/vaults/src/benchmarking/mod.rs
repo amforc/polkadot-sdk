@@ -7,7 +7,8 @@
 //!   measured.
 //! - Vault calls first absorb a pending redistribution share, which moves collateral out of the
 //!   redistribution account.
-//! - Calls that issue interest find an hour of branch interest due.
+//! - Calls that issue interest find two due pool cohorts and active pool capital, so the yield
+//!   route activates both and distributes into the pool.
 //! - Payouts go to accounts that do not exist yet.
 //!
 //! Collateral is counted in collateral units and prices are quoted per unit (see
@@ -24,7 +25,7 @@ use crate::{
 		BalanceOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings, Pallet, StablecoinMarkets,
 		Vaults,
 	},
-	types::{BranchAdmins, BranchConfigUpdate, VaultStatus},
+	types::{BranchAdmins, BranchConfigUpdate, JitTerms, VaultStatus},
 	BenchmarkConfig,
 };
 use fixtures::*;
@@ -34,15 +35,36 @@ use frame::{
 	deps::sp_runtime::DispatchError,
 	traits::{
 		fungibles::{Inspect as FungiblesInspect, Mutate as FungiblesMutate},
-		Zero,
+		Time, Zero,
 	},
 };
 use frame_system::RawOrigin;
 use linked_list_interface::{Position, SortedListInterface};
-use stablecoin_primitives::{BenchmarkVault, OnBranchLifecycle, VaultInterface, MILLIS_PER_YEAR};
+use stablecoin_primitives::{
+	BenchmarkVault, OnBranchLifecycle, StabilityPoolInspect, VaultInterface, MILLIS_PER_YEAR,
+};
 
+/// Stability Pool entry delay of the `liquidate` benchmark. A day between the pool deposits and
+/// the liquidation lets the liquidated vault and its branch accrue non-zero interest.
+const LIQUIDATION_ENTRY_DELAY_MS: u64 = 24 * ONE_HOUR_MS;
+/// Stablecoin each non-redistribution leg of the `liquidate` waterfall absorbs: the active pool,
+/// the keeper JIT, and the pending pool.
+const LIQUIDATION_LEG_DEBT: u128 = 2_000_000;
+/// Debt of the liquidated vault. It exceeds the three legs, so redistribution takes the rest.
+const LIQUIDATION_VICTIM_DEBT: u128 = 10_000_000;
+/// Debt of each other vault in the `liquidate` branch.
+const LIQUIDATION_PEER_DEBT: u128 = 1_000_000;
+/// Collateral of the `liquidate` vaults in collateral units. At [`LIQUIDATION_PRICE`] the victim
+/// and the sacrifice sit below the MCR and the holders far above it, so they stay safe after
+/// absorbing both redistributions.
+const LIQUIDATION_VICTIM_COLL_UNITS: u128 = 6_000_000;
+const LIQUIDATION_SACRIFICE_COLL_UNITS: u128 = 600_000;
+const LIQUIDATION_HOLDER_COLL_UNITS: u128 = 50_000_000;
 /// Debt of the vault that keeps the `close_vault` branch alive.
 const CLOSE_BACKGROUND_DEBT: u128 = 1_000_000;
+/// Stablecoin value of one collateral unit once the `liquidate` benchmark crashes the price.
+const LIQUIDATION_PRICE: u128 = 1;
+
 fn vault_of<T: BenchmarkConfig>(
 	owner: &T::AccountId,
 ) -> Result<crate::Vault<BalanceOf<T>>, DispatchError> {
@@ -59,7 +81,7 @@ fn assert_insert_walk<T: BenchmarkConfig>(priority: FixedU128, hint: &Position<T
 }
 
 /// Registers the default branch and opens `owner`'s vault, leaves it a pending redistribution
-/// share, and lets an hour of interest accrue. Returns the branch's collateral.
+/// share, and makes two pool cohorts due. Returns the branch's collateral.
 fn seed_touched_vault<T: BenchmarkConfig>(
 	owner: &T::AccountId,
 	collateral_units: u128,
@@ -67,15 +89,16 @@ fn seed_touched_vault<T: BenchmarkConfig>(
 	let asset = register_default_branch::<T>()?;
 	open_funded_vault::<T>(owner, BenchmarkVault { collateral_units, ..default_vault::<T>() })?;
 	seed_pending_redistribution::<T>()?;
-	advance_time::<T>(ONE_HOUR_MS);
+	make_cohorts_due::<T>()?;
 	Ok(asset)
 }
 
-/// Registers the default branch with one default vault and lets a year of interest accrue. Returns
-/// the branch's collateral.
+/// Registers the default branch with one default vault, makes two pool cohorts due, and lets a
+/// year of interest accrue. Returns the branch's collateral.
 fn seed_accrued_market<T: BenchmarkConfig>() -> Result<CollateralIdOf<T>, DispatchError> {
 	let asset = register_default_branch::<T>()?;
 	open_funded_vault::<T>(&account("owner", 0, 0), default_vault::<T>())?;
+	make_cohorts_due::<T>()?;
 	advance_time::<T>(MILLIS_PER_YEAR);
 	Ok(asset)
 }
@@ -98,7 +121,7 @@ mod benchmarks {
 			T::VaultLists::repair_steps_needed(&rate_list::<T>(), new_rate, hint.clone()),
 			s,
 		);
-		advance_time::<T>(ONE_HOUR_MS);
+		make_cohorts_due::<T>()?;
 		frame_system::Pallet::<T>::reset_events();
 
 		#[extrinsic_call]
@@ -216,7 +239,7 @@ mod benchmarks {
 		let hint = seed_gap(&seeds, s);
 		assert_eq!(T::VaultLists::repair_steps_needed(&rate_list::<T>(), rate, hint.clone()), s);
 		seed_pending_redistribution::<T>()?;
-		advance_time::<T>(ONE_HOUR_MS);
+		make_cohorts_due::<T>()?;
 		let held = redistribution_held::<T>();
 		let recipient: T::AccountId = account("borrow_recipient", 0, 0);
 		let amount = balance::<T>(SEED_DEBT);
@@ -373,7 +396,7 @@ mod benchmarks {
 		open_funded_vault::<T>(&caller, default_vault::<T>())?;
 		// `close_vault` needs a debt-free vault with collateral still held.
 		redeem_debt_only::<T>(&caller)?;
-		advance_time::<T>(ONE_HOUR_MS);
+		make_cohorts_due::<T>()?;
 		let collateral = vault_of::<T>(&caller)?.collateral;
 		let recipient: T::AccountId = account("recipient", 0, 0);
 		assert!(collateral_balance::<T>(&recipient).is_zero());
@@ -409,19 +432,25 @@ mod benchmarks {
 		Ok(())
 	}
 
-	/// Entry behind a queued vault. No pending redistribution share: the first head needs a branch
-	/// with no other stake bearer.
+	/// Entry behind a queued vault, paying the keeper. No pending redistribution share: queuing
+	/// pool cohorts must precede the first recovery head (the pool would route the deposits into
+	/// a recovery offset), the share must precede the cohorts (pending capital would absorb the
+	/// sacrifice), and the first head needs a branch with no other stake bearer.
 	#[benchmark]
 	fn enter_final_recovery() -> Result<(), BenchmarkError> {
 		let asset = register_default_branch::<T>()?;
+		let cohorts_due = queue_pool_cohorts::<T>()?;
 		let prior = recovery_cycle::<T>(0, FixedU128::from_rational(5, 100))?;
 		let owner: T::AccountId = account("target", 0, 0);
 		let vault =
 			BenchmarkVault { collateral_units: RECOVERY_VAULT_COLL, ..default_vault::<T>() };
 		open_funded_vault::<T>(&owner, vault)?;
-		advance_time::<T>(ONE_HOUR_MS);
+		// Past the reward cooldown that `prior`'s entry started.
+		advance_to::<T>(cohorts_due.max(T::TimeProvider::now().saturating_add(ONE_HOUR_MS)));
 		set_unit_price::<T>(RECOVERY_TRIGGER_PRICE);
-		let caller: T::AccountId = whitelisted_caller();
+		// The entry reward creates the keeper's collateral account.
+		let caller: T::AccountId = account("keeper", 0, 0);
+		assert!(collateral_balance::<T>(&caller).is_zero());
 		frame_system::Pallet::<T>::reset_events();
 
 		#[extrinsic_call]
@@ -430,6 +459,7 @@ mod benchmarks {
 		assert_eq!(status_of::<T>(&owner), VaultStatus::FinalRecovery);
 		assert_eq!(T::VaultLists::count(&recovery_list::<T>()), 2);
 		assert_eq!(T::VaultLists::tail(&recovery_list::<T>()), Some(prior));
+		assert!(!collateral_balance::<T>(&caller).is_zero(), "the entry paid its keeper");
 		assert!(interest_issued::<T>());
 		Ok(())
 	}
@@ -439,13 +469,15 @@ mod benchmarks {
 	#[benchmark]
 	fn exit_final_recovery() -> Result<(), BenchmarkError> {
 		let asset = register_default_branch::<T>()?;
+		// Cohorts before any recovery head, or the pool routes the deposits into an offset.
+		let cohorts_due = queue_pool_cohorts::<T>()?;
 		let interior_rate = rate_bounds::<T>()?.interior();
 		let first = recovery_cycle::<T>(0, FixedU128::from_rational(5, 100))?;
 		let owner = recovery_cycle::<T>(1, interior_rate)?;
 		let _last = recovery_cycle::<T>(2, FixedU128::from_rational(5, 100))?;
 		let WorstCaseChain { seeds, interior_hint: hint, .. } = seed_worst_case_chain::<T>()?;
 		assert_insert_walk::<T>(interior_rate, &hint);
-		advance_time::<T>(ONE_HOUR_MS);
+		advance_to::<T>(cohorts_due);
 		let caller: T::AccountId = whitelisted_caller();
 		frame_system::Pallet::<T>::reset_events();
 
@@ -480,7 +512,7 @@ mod benchmarks {
 		seed_pending_redistribution::<T>()?;
 		let WorstCaseChain { seeds, interior_hint: hint, .. } = seed_worst_case_chain::<T>()?;
 		assert_insert_walk::<T>(interior_rate, &hint);
-		advance_time::<T>(ONE_HOUR_MS);
+		make_cohorts_due::<T>()?;
 		let before = vault_of::<T>(&owner)?;
 		assert!(before.debt.total().is_zero());
 		let held = redistribution_held::<T>();
@@ -500,6 +532,46 @@ mod benchmarks {
 				Pallet::<T>::branch_of(&asset, &stable::<T>())?.config.minimum_debt
 		);
 		assert_worst_case_touch::<T>(held);
+		Ok(())
+	}
+
+	#[benchmark]
+	fn nominate_dormant() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		let owner: T::AccountId = account("husk", 0, 0);
+		// Two repaid vaults split a liquidation into sub-minimum debt. Leave the allocation
+		// pending so nomination measures the collateral transfer as well as interest minting.
+		for who in [owner.clone(), account("husk", 1, 0)] {
+			open_funded_vault::<T>(&who, default_vault::<T>())?;
+			repay_in_full::<T>(&who, balance::<T>(SEED_DEBT))?;
+		}
+		redistribute::<T>(Sacrifice {
+			vault: BenchmarkVault {
+				collateral_units: RECOVERY_VAULT_COLL / 10,
+				debt: balance::<T>(SEED_DEBT / 10),
+				annual_rate: FixedU128::from_rational(1, 100),
+			},
+			liquidation_price: RECOVERY_TRIGGER_PRICE,
+			restored_price: ORACLE_PRICE,
+		})?;
+		make_cohorts_due::<T>()?;
+		advance_time::<T>(MILLIS_PER_YEAR);
+		let before = vault_of::<T>(&owner)?;
+		assert!(before.debt.total().is_zero());
+		let caller: T::AccountId = whitelisted_caller();
+		frame_system::Pallet::<T>::reset_events();
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(caller), asset.clone(), stable::<T>(), owner.clone());
+
+		let branch = Pallet::<T>::branch_of(&asset, &stable::<T>())?;
+		let after = vault_of::<T>(&owner)?;
+		assert_eq!(branch.state.dormant_redemption_target, Some(owner));
+		assert!(!after.debt.principal.is_zero());
+		assert!(!after.debt.interest.is_zero());
+		assert!(after.debt.total() < branch.config.minimum_debt);
+		assert!(after.collateral > before.collateral);
+		assert!(interest_issued::<T>());
 		Ok(())
 	}
 
@@ -592,8 +664,8 @@ mod benchmarks {
 		Ok(())
 	}
 
-	/// A live branch issuing a year of interest. A dead oracle would freeze the branch instead,
-	/// which issues nothing.
+	/// A live branch issuing a year of interest into a pool with two due cohorts. A dead oracle
+	/// would freeze the branch instead, which the pool answers without distributing.
 	#[benchmark]
 	fn refresh_branch() -> Result<(), BenchmarkError> {
 		let asset = seed_accrued_market::<T>()?;
@@ -646,6 +718,96 @@ mod benchmarks {
 		assert!(branch.state.frozen.is_some());
 		assert!(fee_balance::<T>() > fees);
 		assert!(interest_issued::<T>());
+		Ok(())
+	}
+
+	/// Worst-case liquidation: every waterfall leg is non-zero and every lazy settlement is due.
+	///
+	/// - The active pool leg first rolls a due cohort, then is depleted into a new epoch.
+	/// - The keeper burns JIT stablecoin and receives its share and the capped reward into a
+	///   collateral account it did not have.
+	/// - The pending pool leg is depleted behind it; redistribution takes the remainder.
+	/// - The victim first absorbs a pending redistribution share and a day of interest. That mint
+	///   lands after the offset emptied the active leg, so the pool takes no yield; the call's
+	///   weight carries headroom for the remaining depletion difference.
+	/// - The victim sits mid-list, so its removal relinks both neighbours.
+	#[benchmark]
+	fn liquidate() -> Result<(), BenchmarkError> {
+		let asset = register_default_branch::<T>()?;
+		let holder = |annual_rate| BenchmarkVault {
+			collateral_units: LIQUIDATION_HOLDER_COLL_UNITS,
+			debt: balance::<T>(LIQUIDATION_PEER_DEBT),
+			annual_rate,
+		};
+		open_funded_vault::<T>(
+			&account("holder_high", 0, 0),
+			holder(FixedU128::from_rational(8, 100)),
+		)?;
+		let victim: T::AccountId = account("victim", 0, 0);
+		let victim_vault = BenchmarkVault {
+			collateral_units: LIQUIDATION_VICTIM_COLL_UNITS,
+			debt: balance::<T>(LIQUIDATION_VICTIM_DEBT),
+			annual_rate: FixedU128::from_rational(5, 100),
+		};
+		open_funded_vault::<T>(&victim, victim_vault)?;
+		open_funded_vault::<T>(
+			&account("holder_low", 0, 0),
+			holder(FixedU128::from_rational(2, 100)),
+		)?;
+		// With the pool still empty, the sacrifice redistributes in full, leaving the victim a
+		// pending share to absorb when it is touched.
+		redistribute::<T>(Sacrifice {
+			vault: BenchmarkVault {
+				collateral_units: LIQUIDATION_SACRIFICE_COLL_UNITS,
+				debt: balance::<T>(LIQUIDATION_PEER_DEBT),
+				annual_rate: FixedU128::from_rational(1, 100),
+			},
+			liquidation_price: LIQUIDATION_PRICE,
+			restored_price: LIQUIDATION_PRICE,
+		})?;
+		// The keeper holds the JIT stablecoin but no collateral, so the payout creates its
+		// collateral account.
+		let keeper: T::AccountId = whitelisted_caller();
+		let jit = balance::<T>(LIQUIDATION_LEG_DEBT);
+		T::StableAssets::mint_into(stable::<T>(), &keeper, jit.saturating_mul(balance::<T>(2)))?;
+		assert!(collateral_balance::<T>(&keeper).is_zero());
+
+		seed_liquidation_pool::<T>(LIQUIDATION_ENTRY_DELAY_MS, jit)?;
+		// Keep the quote fresh after advancing time.
+		set_unit_price::<T>(LIQUIDATION_PRICE);
+		let branch = branch_snapshot::<T>()?;
+		let quote = T::StabilityPool::quote(&asset, &stable::<T>(), branch)
+			.ok_or(BenchmarkError::Stop("seeded pool has no capacity"))?;
+		let active_quote = T::StabilityPool::quote_active(&quote, jit);
+		let pending_quote = T::StabilityPool::quote_pending(&quote, jit, active_quote);
+		assert_eq!(active_quote, jit);
+		assert_eq!(pending_quote, jit);
+		let victim_debt = vault_of::<T>(&victim)?.debt.total();
+		assert!(victim_debt > jit.saturating_mul(balance::<T>(3)), "redistribution leg is empty");
+		let keeper_stable = T::StableAssets::balance(stable::<T>(), &keeper);
+		let held = redistribution_held::<T>();
+
+		#[extrinsic_call]
+		_(
+			RawOrigin::Signed(keeper.clone()),
+			asset.clone(),
+			stable::<T>(),
+			victim.clone(),
+			JitTerms { max_stable: jit, min_collateral_out: BalanceOf::<T>::zero() },
+		);
+
+		assert!(!Vaults::<T>::contains_key((&asset, stable::<T>(), &victim)));
+		let max = balance::<T>(u128::MAX);
+		let branch = branch_snapshot::<T>()?;
+		// A branch with no quote has no capacity left on either leg.
+		if let Some(quote) = T::StabilityPool::quote(&asset, &stable::<T>(), branch) {
+			assert!(T::StabilityPool::quote_active(&quote, max).is_zero());
+			assert!(T::StabilityPool::quote_pending(&quote, max, max).is_zero());
+		}
+		let stable_after = T::StableAssets::balance(stable::<T>(), &keeper);
+		assert_eq!(keeper_stable.saturating_sub(stable_after), jit);
+		assert!(!collateral_balance::<T>(&keeper).is_zero());
+		assert!(redistribution_held::<T>() != held);
 		Ok(())
 	}
 

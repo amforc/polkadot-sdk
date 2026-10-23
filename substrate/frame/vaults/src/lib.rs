@@ -20,6 +20,7 @@
 //!
 //! Vaults are ordered by rate for redemptions. Lower-rate vaults are redeemed first. A final
 //! recovery queue is served before the rate list when a branch has only one eligible vault left.
+//! Moving a vault into recovery may pay a keeper reward; see [`Call::enter_final_recovery`].
 //!
 //! A branch may enter safety mode when its total collateral ratio is low. It may also be frozen by
 //! an administrator or when its oracle price is unavailable.
@@ -31,6 +32,7 @@ extern crate alloc;
 mod context;
 mod dispatchable_impls;
 mod interfaces;
+mod liquidation;
 mod math;
 mod recovery;
 pub mod types;
@@ -53,9 +55,9 @@ pub use pallet::*;
 pub use stablecoin_primitives;
 pub use types::{
 	BoundViolation, BranchConfig, BranchConfigDefect, BranchConfigUpdate, BranchDebt, BranchMode,
-	BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState, LiquidationSettlement,
-	LiquidationSnapshot, RedistributionAccumulators, RedistributionStakeTotals,
-	StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
+	BranchState, DebtBreakdown, DebtCollateral, FrozenReason, FrozenState, JitTerms,
+	LiquidationConfig, LiquidationOutcome, LiquidationTouch, RedistributionAccumulators,
+	RedistributionStakeTotals, StablecoinDebtState, Vault, VaultListId, VaultRecord, VaultStatus,
 };
 pub use weights::WeightInfo;
 
@@ -74,7 +76,8 @@ pub trait BenchmarkHelper<CollateralId, StableId, AccountId> {
 	/// A runtime hook supports native and holder-backed assets that lack `fungibles::Create`.
 	fn ensure_collateral_asset(collateral_id: CollateralId);
 	/// Stages the costliest global debt-ceiling lookup after stablecoin creation.
-	/// The runtime owns external inputs, such as PSM debt rows; local-only ceilings need no setup.
+	/// The runtime owns external inputs, such as debt from other issuers of the stablecoin;
+	/// local-only ceilings need no setup.
 	fn stage_debt_ceiling(stable_id: StableId);
 	/// Funds native asset-account and storage deposits; `Config` exposes no native currency.
 	fn fund_native(who: &AccountId);
@@ -105,7 +108,7 @@ pub mod pallet {
 	use crate::{
 		context::VaultOp,
 		recovery,
-		types::{AdminLevel, BranchAdmins, BranchConfigBounds},
+		types::{AdminLevel, BranchAdmins, BranchConfigBounds, JitTerms},
 	};
 	use alloc::{vec, vec::Vec};
 	use frame::{
@@ -121,6 +124,7 @@ pub mod pallet {
 	use linked_list_interface::{Position, PriorityProvider, SortedListInterface};
 	use stablecoin_primitives::{
 		collateralization_ratio, CollateralRatio, OnBranchLifecycle, OnBranchYield, ProvidePrice,
+		StabilityPoolOffset,
 	};
 
 	/// Balance type used by collateral and stable assets.
@@ -220,6 +224,16 @@ pub mod pallet {
 			CollateralIdOf<Self>,
 			StableIdOf<Self>,
 			Self::AccountId,
+		>;
+
+		/// Sizes and settles liquidation offsets against an external provider of stable capital:
+		/// limit-aware capacity reads plus one exact settlement call.
+		type StabilityPool: StabilityPoolOffset<
+			CollateralIdOf<Self>,
+			StableIdOf<Self>,
+			BalanceOf<Self>,
+			CollateralCreditOf<Self>,
+			StableCreditOf<Self>,
 		>;
 
 		/// Provides UNIX time in milliseconds.
@@ -598,6 +612,60 @@ pub mod pallet {
 			/// Vault rate used for the redemption fee.
 			vault_annual_rate: FixedU128,
 		},
+		/// An unsafe vault was closed through the liquidation waterfall.
+		VaultLiquidated {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Owner of the liquidated vault.
+			owner: T::AccountId,
+			/// Account that executed the liquidation.
+			keeper: T::AccountId,
+			/// Debt and collateral allocated through the liquidation waterfall.
+			outcome: LiquidationOutcome<BalanceOf<T>>,
+		},
+		/// A keeper was paid for moving the last eligible vault into final recovery.
+		///
+		/// [`Event::VaultStatusChanged`] reports the entry itself. An entry that pays no reward
+		/// emits only that event.
+		FinalRecoveryRewardPaid {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Owner of the recovering vault.
+			owner: T::AccountId,
+			/// Account that moved the vault into final recovery.
+			keeper: T::AccountId,
+			/// Collateral paid from the vault to the keeper.
+			amount: BalanceOf<T>,
+		},
+		/// A dormant vault's dust was nominated for redemption.
+		DormantTargetNominated {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Owner of the nominated vault.
+			owner: T::AccountId,
+		},
+		/// A vault update realized the vault's share of earlier liquidations.
+		///
+		/// [`Event::VaultLiquidated`] reports the amounts a liquidation redistributes across the
+		/// branch. This is the part one vault absorbs, which its stake decides.
+		RedistributionApplied {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Vault owner.
+			owner: T::AccountId,
+			/// Principal added to the vault's debt.
+			debt: BalanceOf<T>,
+			/// Collateral moved from the redistribution account into the vault.
+			collateral: BalanceOf<T>,
+		},
 		/// Aggregate interest accrued since the branch's last update was issued as yield.
 		///
 		/// Every write to a branch issues the interest accrued since the previous one, so this
@@ -693,13 +761,11 @@ pub mod pallet {
 		ArithmeticOverflow,
 		/// An emergency administrator tried to increase risk.
 		DefensiveActionNotDefensive,
-		/// A liquidation supplied invalid debt or collateral amounts.
-		InvalidLiquidationSettlement,
+		/// Internal liquidation planning produced inconsistent value.
+		InvalidLiquidationPlan,
 		/// A redemption supplied invalid debt or collateral amounts.
 		InvalidRedemptionSettlement,
 		/// The last eligible vault cannot be liquidated.
-		///
-		/// Move it into final recovery instead.
 		LastVaultCannotBeLiquidated,
 		/// The liquidation would overflow redistribution accounting.
 		RedistributionWouldOverflow,
@@ -715,6 +781,8 @@ pub mod pallet {
 		NoDebt,
 		/// The vault is below the ratio required to leave final recovery.
 		CollateralizationRatioTooLow,
+		/// Nomination requires non-zero debt below the branch minimum.
+		DebtNotDust,
 	}
 
 	#[pallet::hooks]
@@ -1120,7 +1188,7 @@ pub mod pallet {
 		/// May be called by any signed account.
 		///
 		/// The vault must be the branch's last eligible vault and must be below the minimum
-		/// collateral ratio.
+		/// collateral ratio. Pays the liquidation reward unless the cooldown is active.
 		#[pallet::call_index(8)]
 		#[pallet::weight(T::WeightInfo::enter_final_recovery())]
 		pub fn enter_final_recovery(
@@ -1128,9 +1196,9 @@ pub mod pallet {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			owner: T::AccountId,
-		) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
-			Self::do_enter_final_recovery(owner, collateral_id, stable_id)
+		) -> DispatchResultWithPostInfo {
+			let keeper = ensure_signed(origin)?;
+			Self::do_enter_final_recovery(keeper, owner, collateral_id, stable_id)
 		}
 
 		/// Removes a safe vault from final recovery.
@@ -1355,17 +1423,79 @@ pub mod pallet {
 			T::CreateOrigin::ensure_origin(origin, &stable_id)?;
 			Self::do_set_global_debt_ceiling(stable_id, ceiling)
 		}
+
+		/// Liquidates an unsafe vault.
+		///
+		/// ## Dispatch Origin
+		///
+		/// Must be signed by the keeper executing the liquidation.
+		///
+		/// The vault must be below the branch's minimum collateralization ratio and must not be
+		/// the branch's last eligible vault. That vault enters final recovery through
+		/// [`Call::enter_final_recovery`] instead.
+		///
+		/// Active capital from [`Config::StabilityPool`] is used first, followed by the
+		/// keeper's optional direct contribution, that provider's pending capital, and
+		/// finally redistribution.
+		///
+		/// The caller's collateral legs — compensation and the JIT share — are paid only when the
+		/// caller's account can receive them; keeping such an account is the keeper's own
+		/// responsibility. An unpayable reward is planned into the waterfall and an unpayable JIT
+		/// share drops the trade, rather than failing the call. On collaterals whose minimum
+		/// balance exceeds the reward, a keeper holding none of the asset therefore goes unpaid
+		/// until it holds that minimum.
+		///
+		/// ## Parameters
+		///
+		/// - `jit.max_stable`: Maximum stable assets the keeper allows the call to burn for a
+		///   direct contribution. Zero disables the contribution; a non-zero allowance below the
+		///   branch's minimum JIT contribution skips JIT without blocking liquidation.
+		/// - `jit.min_collateral_out`: Minimum collateral allocated to an executed JIT slice,
+		///   excluding the keeper reward. This absolute floor is not scaled down for a partial JIT
+		///   execution, so it should reflect the smallest execution the keeper would accept. A
+		///   trade that would pay less is skipped and the liquidation proceeds without it.
+		#[pallet::call_index(19)]
+		// The benchmark depletes both pool legs. Depleting a leg across two scale changes writes
+		// one more pool-sums row per leg than the depletion it measures.
+		#[pallet::weight(T::WeightInfo::liquidate().saturating_add(T::DbWeight::get().writes(2)))]
+		pub fn liquidate(
+			origin: OriginFor<T>,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			owner: T::AccountId,
+			jit: JitTerms<BalanceOf<T>>,
+		) -> DispatchResult {
+			let keeper = ensure_signed(origin)?;
+			Self::do_liquidate(keeper, collateral_id, stable_id, owner, jit)
+		}
+
+		/// Nominates a dormant vault's dust as the branch's redemption target.
+		///
+		/// ## Dispatch Origin
+		///
+		/// May be called by any signed account.
+		///
+		/// After pending redistribution and interest, the vault must have non-zero debt below
+		/// the branch minimum and a collateral ratio of at least 100%. The branch must be
+		/// unfrozen with a live price. The single Dormant slot must be empty or already held by
+		/// this vault; final recovery retains priority.
+		#[pallet::call_index(20)]
+		#[pallet::weight(T::WeightInfo::nominate_dormant())]
+		pub fn nominate_dormant(
+			origin: OriginFor<T>,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			owner: T::AccountId,
+		) -> DispatchResult {
+			ensure_signed(origin)?;
+			Self::do_nominate_dormant(owner, collateral_id, stable_id)
+		}
 	}
 
 	/// Provides current vault rates to the sorted list.
-	impl<T: Config> PriorityProvider<VaultListId<CollateralIdOf<T>, StableIdOf<T>>, T::AccountId>
-		for Pallet<T>
-	{
+	impl<T: Config> PriorityProvider<VaultListIdOf<T>, T::AccountId> for Pallet<T> {
 		type Priority = FixedU128;
-		fn priority(
-			list_id: &VaultListId<CollateralIdOf<T>, StableIdOf<T>>,
-			item: &T::AccountId,
-		) -> Option<FixedU128> {
+		fn priority(list_id: &VaultListIdOf<T>, item: &T::AccountId) -> Option<FixedU128> {
 			match list_id {
 				VaultListId::Rate(collateral_id, stable_id) => {
 					Pallet::<T>::vault_of(collateral_id, stable_id, item)

@@ -226,6 +226,7 @@ impl pallet_vaults::Config for Test {
 	// Registration seeds the per-branch rows of both siblings. Redemptions comes first, so
 	// the config that prices recovery offsets always exists once the pool rows do.
 	type OnBranchLifecycle = (Redemptions, Stability);
+	type StabilityPool = Stability;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
 	// These suites assert raw balances; branch and vault deposits are the vaults suite's concern.
@@ -611,7 +612,17 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		maximum_borrow_rate: FixedU128::from_rational(100u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
-		redistribution_penalty: Permill::from_percent(5),
+		final_recovery_reward_cooldown: 3_600 * 1_000,
+		liquidation: pallet_vaults::LiquidationConfig {
+			offset_penalty: Permill::from_percent(5),
+			// The keeper is paid out of the offset penalty, which on the smallest
+			// vault here is 5% of a 200 debt.
+			keeper_flat_compensation_value: 10,
+			keeper_percent_compensation: Permill::from_rational(1u32, 1_000u32),
+			keeper_compensation_cap_value: 10_000,
+			minimum_jit_contribution: 100,
+			redistribution_penalty: Permill::from_percent(5),
+		},
 	}
 }
 
@@ -634,6 +645,16 @@ pub fn branch_config_for(
 		minimum_collateral: config.minimum_collateral.max(collateral_minimum),
 		..config
 	}
+}
+
+/// Keeper terms that make no just-in-time contribution.
+pub const NO_JIT: pallet_vaults::JitTerms<Balance> =
+	pallet_vaults::JitTerms { max_stable: 0, min_collateral_out: 0 };
+
+/// Liquidates the vault of `owner` in the `collateral`/[`STABLE`] branch, signed by `keeper`, with
+/// [`NO_JIT`] terms.
+pub fn liquidate(keeper: AccountId, collateral: AssetId, owner: AccountId) -> DispatchResult {
+	Vaults::liquidate(RuntimeOrigin::signed(keeper), collateral, STABLE, owner, NO_JIT)
 }
 
 /// Creates the `collateral`/[`STABLE`] branch as `origin`, with the default admins, branch
@@ -1204,7 +1225,12 @@ pub fn enter_final_recovery(
 	stable: StableId,
 	owner: AccountId,
 ) -> DispatchResult {
-	Vaults::enter_final_recovery(RuntimeOrigin::signed(99), collateral, stable, owner)
+	without_post_info(Vaults::enter_final_recovery(
+		RuntimeOrigin::signed(99),
+		collateral,
+		stable,
+		owner,
+	))
 }
 
 /// The stored debt of a vault, principal and settled interest together. Zero if it is absent.
