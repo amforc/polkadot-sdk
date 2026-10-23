@@ -19,36 +19,8 @@
 //! continuously by `build_and_execute`'s post-test check; these tests
 //! additionally prove that deliberate corruption is detected.
 
-use crate::{mock::*, ListMeta, ListMetas, ListNodes, Node, Position, SortedListInterface};
+use crate::{mock::*, ListMeta, ListMetas, ListNodes, Node};
 use frame::testing_prelude::assert_err;
-
-#[test]
-fn consistent_after_random_op_sequence() {
-	build_and_execute(|| {
-		// Mix of inserts/removes/re_inserts; the post-test `do_try_state` runs
-		// at the end via `build_and_execute`.
-		insert(1, 1, 90);
-		insert(1, 2, 50);
-		insert(1, 3, 70);
-		insert(1, 4, 30);
-		insert(2, 1, 100);
-		<LinkedList>::do_try_state().unwrap();
-
-		LinkedList::remove(&1, &3).unwrap();
-		LinkedList::re_insert(1, 2, 5, Position::endpoints_only()).unwrap();
-	});
-}
-
-#[test]
-fn corrupt_size_detected() {
-	build_and_execute_no_post_check(|| {
-		insert(1, 1, 50);
-		insert(1, 2, 30);
-		// Force the count to lie.
-		ListMetas::<Test>::mutate_extant(1, |m| m.len = 99);
-		assert_err!(<LinkedList>::do_try_state(), "forward walk count != ListMetas.len");
-	});
-}
 
 #[test]
 fn corrupt_near_max_size_is_caught_without_preallocating() {
