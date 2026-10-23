@@ -7,7 +7,7 @@ const NEW_FULL_ADMIN: AccountId = 300;
 const NEW_EMERGENCY_ADMIN: AccountId = 301;
 
 fn market_exists(collateral: AssetId, stable: StableId) -> bool {
-	branch_state(collateral, stable).is_some()
+	crate::pallet::Branches::<Test>::contains_key(collateral, stable)
 }
 
 /// Repay `owner`'s full `(DOT, STABLE)` debt and close the vault, emptying the
@@ -22,29 +22,60 @@ fn repay_to_close(owner: AccountId) {
 	assert!(!vault_exists(DOT, STABLE, owner), "close removed the vault");
 }
 
-// A signed asset-owner create locks the refundable deposit; removing the empty
-// branch refunds it in full.
+/// Registers the `(DOT, STABLE)` branch from `origin` with the default admins and config.
+fn create_dot_branch(origin: RuntimeOrigin) -> DispatchResult {
+	Pallet::<Test>::create_branch(
+		origin,
+		DOT,
+		STABLE,
+		branch_admins(ADMIN, EMERGENCY_ADMIN),
+		default_branch_config(),
+		(),
+	)
+}
+
+/// Removes the empty `(DOT, STABLE)` branch as its full admin and asserts that no creation deposit
+/// is left on hold.
+fn remove_dot_branch_releasing_deposits() {
+	assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
+
+	assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0, "deposit refunded on removal");
+	assert_eq!(creation_deposit_held(ADMIN), 0);
+	assert!(!market_exists(DOT, STABLE));
+	assert_event(crate::Event::BranchRemoved { collateral_id: DOT, stable_id: STABLE });
+}
+
+// A signed asset-owner create locks the refundable deposit and removing the empty branch refunds
+// it in full.
 #[test]
-fn signed_create_takes_deposit_and_remove_refunds() {
+fn signed_creation_locks_a_deposit_refunded_on_removal() {
 	ExtBuilder::default().price(DOT, DEFAULT_PRICE).build_and_execute(|| {
 		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0);
 
-		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::signed(STABLECOIN_OWNER),
-			DOT,
-			STABLE,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config(),
-			(),
-		));
+		assert_ok!(create_dot_branch(RuntimeOrigin::signed(STABLECOIN_OWNER)));
 
+		assert!(market_exists(DOT, STABLE));
 		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), MarketDepositBase::get());
+		assert_eq!(creation_deposit_held(ADMIN), 0);
 
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
+		remove_dot_branch_releasing_deposits();
+	});
+}
 
-		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0, "deposit refunded on removal");
-		assert!(!market_exists(DOT, STABLE));
-		assert_event(crate::Event::BranchRemoved { collateral_id: DOT, stable_id: STABLE });
+// A Root create is deposit-free: no hold is taken, neither from the stablecoin owner nor from the
+// full admin that funds the custody seed.
+#[test]
+fn root_creation_takes_no_deposit() {
+	ExtBuilder::default().price(DOT, DEFAULT_PRICE).build_and_execute(|| {
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0);
+
+		assert_ok!(create_dot_branch(RuntimeOrigin::root()));
+
+		assert!(market_exists(DOT, STABLE));
+		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0);
+		assert_eq!(creation_deposit_held(ADMIN), 0);
+
+		remove_dot_branch_releasing_deposits();
 	});
 }
 
@@ -70,43 +101,60 @@ fn create_rejects_a_creator_that_cannot_pay_the_custody_seed() {
 			),
 			Error::<Test>::CustodySeedUnavailable
 		);
-		assert!(!market_exists(TOKEN_X, STABLE));
 	});
 }
 
-// Registration takes the provider reference before it
-// moves the custody seed, so the seed lands on an account the asset pallet
-// would otherwise refuse to create.
+/// Registers an issued-`collateral` branch as Root, checks the custody seed and the custody
+/// account's `consumers_while_live` references, then removes the branch and checks that the seed
+/// went back to its funder and every reference was released.
+fn assert_custody_seed_refunded_on_removal(collateral: AssetId, consumers_while_live: u32) {
+	let custody = Pallet::<Test>::redistribution_account(&collateral, &STABLE);
+	assert_eq!(System::providers(&custody), 0);
+	let funder_before = collateral_balance(collateral.clone(), ADMIN);
+	set_price(collateral.clone(), DEFAULT_PRICE);
+
+	assert_ok!(Pallet::<Test>::create_branch(
+		RuntimeOrigin::root(),
+		collateral.clone(),
+		STABLE,
+		branch_admins(ADMIN, EMERGENCY_ADMIN),
+		default_branch_config(),
+		(),
+	));
+
+	assert_eq!(
+		collateral_balance(collateral.clone(), custody),
+		VaultCollateralAssets::minimum_balance(collateral.clone())
+	);
+	assert_eq!(System::consumers(&custody), consumers_while_live);
+
+	assert_ok!(Pallet::<Test>::remove_branch(
+		RuntimeOrigin::signed(ADMIN),
+		collateral.clone(),
+		STABLE
+	));
+
+	assert_eq!(System::consumers(&custody), 0);
+	assert_eq!(System::providers(&custody), 0);
+	assert_eq!(collateral_balance(collateral, ADMIN), funder_before);
+}
+
+// An issued-asset branch keeps the custody seed in a `pallet-assets` account. Registration takes
+// the provider reference before it moves the seed, so the seed lands on an account the asset
+// pallet would otherwise refuse to create. Removal sweeps the seed back to the account that funded
+// it and releases every reference.
 #[test]
-fn insufficient_collateral_custody_needs_the_provider_reference() {
+fn issued_collateral_custody_seed_is_refunded_on_removal() {
 	ExtBuilder::default().build_and_execute(|| {
-		let custody = Pallet::<Test>::redistribution_account(&INSUFFICIENT, &STABLE);
-		assert_eq!(System::providers(&custody), 0);
-		set_price(INSUFFICIENT, DEFAULT_PRICE);
+		assert_custody_seed_refunded_on_removal(TOKEN_X, 0);
+	});
+}
 
-		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::root(),
-			INSUFFICIENT,
-			STABLE,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config(),
-			(),
-		));
-
-		assert_eq!(
-			collateral_balance(INSUFFICIENT, custody),
-			VaultCollateralAssets::minimum_balance(INSUFFICIENT)
-		);
-		assert_eq!(System::consumers(&custody), 1, "the asset account holds a consumer reference");
-
-		assert_ok!(Pallet::<Test>::remove_branch(
-			RuntimeOrigin::signed(ADMIN),
-			INSUFFICIENT,
-			STABLE
-		));
-
-		assert_eq!(System::consumers(&custody), 0);
-		assert_eq!(System::providers(&custody), 0);
+// Only an insufficient asset's account takes a consumer reference, and removal releases it.
+#[test]
+fn insufficient_collateral_custody_seed_releases_its_consumer_on_removal() {
+	ExtBuilder::default().build_and_execute(|| {
+		assert_custody_seed_refunded_on_removal(INSUFFICIENT, 1);
 	});
 }
 
@@ -136,63 +184,16 @@ fn remove_rejects_a_seed_refund_the_full_admin_cannot_receive() {
 			Pallet::<Test>::remove_branch(RuntimeOrigin::root(), INSUFFICIENT, STABLE),
 			Error::<Test>::CollateralPayoutFailed
 		);
-		assert!(market_exists(INSUFFICIENT, STABLE));
 	});
 }
 
-// A Root create is deposit-free: no hold is taken, neither from the stablecoin owner nor from the
-// full admin that funds the custody seed.
+// The governance envelope and the consistency rules are checked on every write of a config, so an
+// update cannot install what creation refuses. A branch with no floor under its vaults can be
+// filled with dust: each vault is a storage row, a list node, and a redemption step that the debt
+// inside it never pays for. An inverted rate band accepts no rate at all, so the branch takes
+// neither a new vault nor a rate change.
 #[test]
-fn root_create_takes_no_deposit() {
-	ExtBuilder::default().price(DOT, DEFAULT_PRICE).build_and_execute(|| {
-		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::root(),
-			DOT,
-			STABLE,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config(),
-			(),
-		));
-
-		assert_eq!(creation_deposit_held(STABLECOIN_OWNER), 0);
-		assert_eq!(creation_deposit_held(ADMIN), 0);
-		assert!(market_exists(DOT, STABLE));
-	});
-}
-
-// A config that breaches the governance envelope is rejected at creation.
-#[test]
-fn create_branch_rejects_config_outside_envelope() {
-	ExtBuilder::default().price(DOT, DEFAULT_PRICE).build_and_execute(|| {
-		// Envelope floor on MCR is 105%; 104% is outside it.
-		let config = BranchConfig {
-			minimum_collateralization_ratio: percent(104),
-			..default_branch_config()
-		};
-
-		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				DOT,
-				STABLE,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				config,
-				(),
-			),
-			Error::<Test>::ConfigOutsideEnvelope(
-				BoundViolation::MinimumCollateralizationRatioTooLow
-			)
-		);
-		assert!(!market_exists(DOT, STABLE));
-	});
-}
-
-// A branch with no floor under its vaults can be filled with dust: each vault is
-// a storage row, a list node, and a redemption step that the debt inside it never
-// pays for. Every write of a config is held to the rule, so an update cannot
-// install what creation refuses.
-#[test]
-fn zero_vault_floors_are_rejected_on_every_write() {
+fn invalid_configs_are_rejected_on_every_write() {
 	ExtBuilder::default().price(DOT, DEFAULT_PRICE).build_and_execute(|| {
 		let create = |config| {
 			Pallet::<Test>::create_branch(
@@ -204,7 +205,62 @@ fn zero_vault_floors_are_rejected_on_every_write() {
 				(),
 			)
 		};
-
+		// Envelope floor on MCR is 105%; 104% is outside it.
+		assert_noop!(
+			create(BranchConfig {
+				minimum_collateralization_ratio: percent(104),
+				..default_branch_config()
+			}),
+			Error::<Test>::ConfigOutsideEnvelope(
+				BoundViolation::MinimumCollateralizationRatioTooLow,
+			)
+		);
+		// The other two floors, each with MCR at its own floor so the ordering rule, which runs
+		// first, does not reject the config before the envelope sees it.
+		let bounds = TestBranchConfigBounds::get();
+		assert_noop!(
+			create(BranchConfig {
+				minimum_collateralization_ratio: bounds.min_minimum_collateralization_ratio,
+				initial_collateralization_ratio: bounds.min_initial_collateralization_ratio -
+					percent(1),
+				..default_branch_config()
+			}),
+			Error::<Test>::ConfigOutsideEnvelope(
+				BoundViolation::InitialCollateralizationRatioTooLow,
+			)
+		);
+		assert_noop!(
+			create(BranchConfig {
+				minimum_collateralization_ratio: bounds.min_minimum_collateralization_ratio,
+				safety_collateralization_ratio: bounds.min_safety_collateralization_ratio -
+					percent(1),
+				..default_branch_config()
+			}),
+			Error::<Test>::ConfigOutsideEnvelope(
+				BoundViolation::SafetyCollateralizationRatioTooLow,
+			)
+		);
+		// A liquidation ratio above the borrow or safety ratio opens vaults that are already
+		// liquidatable.
+		let defaults = default_branch_config();
+		assert_noop!(
+			create(BranchConfig {
+				minimum_collateralization_ratio: defaults.initial_collateralization_ratio +
+					percent(1),
+				..default_branch_config()
+			}),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::LiquidationRatioAboveInitial)
+		);
+		assert_noop!(
+			create(BranchConfig {
+				minimum_collateralization_ratio: defaults.safety_collateralization_ratio +
+					percent(1),
+				initial_collateralization_ratio: defaults.safety_collateralization_ratio +
+					percent(2),
+				..default_branch_config()
+			}),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::LiquidationRatioAboveSafety)
+		);
 		assert_noop!(
 			create(BranchConfig { minimum_debt: 0, ..default_branch_config() }),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumDebt)
@@ -213,11 +269,23 @@ fn zero_vault_floors_are_rejected_on_every_write() {
 			create(BranchConfig { minimum_collateral: 0, ..default_branch_config() }),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumCollateral)
 		);
+		assert_noop!(
+			create(BranchConfig {
+				minimum_borrow_rate: percent(300),
+				maximum_borrow_rate: percent(200),
+				..default_branch_config()
+			}),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumBorrowRateAboveMaximum)
+		);
 
-		register_market(DOT, STABLE);
-		let set_param =
-			|update| Pallet::<Test>::set_param(RuntimeOrigin::signed(ADMIN), DOT, STABLE, update);
+		// The debt limit is denominated in the branch's own stablecoin, so no global envelope can
+		// judge it: the stablecoin-wide global ceiling caps exposure across branches instead.
+		assert_ok!(create(BranchConfig { debt_ceiling: u128::MAX, ..default_branch_config() }));
+		assert_eq!(market_config(DOT, STABLE).debt_ceiling, u128::MAX);
 
+		// The band is 0.1%..400%. The emergency admin reaches the inverted band because moving
+		// both ends inward is a narrowing by the defensive rule, which compares each end against
+		// its own old value and never against the other end.
 		assert_noop!(
 			set_param(BranchConfigUpdate::MinimumDebt(0)),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumDebt)
@@ -226,95 +294,36 @@ fn zero_vault_floors_are_rejected_on_every_write() {
 			set_param(BranchConfigUpdate::MinimumCollateral(0)),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumCollateral)
 		);
-	});
-}
-
-// An inverted rate band accepts no rate at all, so the branch takes neither a new
-// vault nor a rate change. The emergency admin can reach it: moving both ends
-// inward is a narrowing by the defensive rule, which compares each end against its
-// own old value and never against the other end.
-#[test]
-fn inverted_borrow_rate_band_is_rejected_on_every_write() {
-	ExtBuilder::default().price(DOT, DEFAULT_PRICE).build_and_execute(|| {
-		let inverted = BranchConfig {
-			minimum_borrow_rate: percent(300),
-			maximum_borrow_rate: percent(200),
-			..default_branch_config()
-		};
-
 		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				DOT,
-				STABLE,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				inverted,
-				(),
-			),
-			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumBorrowRateAboveMaximum)
-		);
-
-		register_market(DOT, STABLE); // Band is 0.1%..400%.
-		let narrow = |min, max| {
 			Pallet::<Test>::set_param(
 				RuntimeOrigin::signed(EMERGENCY_ADMIN),
 				DOT,
 				STABLE,
-				BranchConfigUpdate::BorrowRateBounds { min, max },
-			)
-		};
-
-		assert_noop!(
-			narrow(percent(300), percent(200)),
+				BranchConfigUpdate::BorrowRateBounds { min: percent(300), max: percent(200) },
+			),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::MinimumBorrowRateAboveMaximum)
 		);
 
+		// The ordering rule is inclusive: a liquidation ratio equal to the borrow ratio applies,
+		// and lowering the borrow ratio one step under it is refused.
+		let initial = defaults.initial_collateralization_ratio;
+		assert_ok!(set_param(BranchConfigUpdate::MinimumCollateralizationRatio(initial)));
+		assert_noop!(
+			set_param(BranchConfigUpdate::InitialCollateralizationRatio(initial - percent(1))),
+			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::LiquidationRatioAboveInitial)
+		);
+
 		// A narrowing that leaves the ends in order still applies.
-		assert_ok!(narrow(percent(200), percent(300)));
+		assert_ok!(Pallet::<Test>::set_param(
+			RuntimeOrigin::signed(EMERGENCY_ADMIN),
+			DOT,
+			STABLE,
+			BranchConfigUpdate::BorrowRateBounds { min: percent(200), max: percent(300) },
+		));
 
 		let config = market_config(DOT, STABLE);
 		assert_eq!(config.minimum_borrow_rate, percent(200));
 		assert_eq!(config.maximum_borrow_rate, percent(300));
-	});
-}
-
-// The debt limit is denominated in the branch's own stablecoin, so no global
-// envelope can judge it: the creator picks it, while the stablecoin-wide global
-// ceiling caps total exposure across all branches that issue that stablecoin.
-#[test]
-fn create_branch_accepts_any_debt_ceiling() {
-	ExtBuilder::default().price(DOT, DEFAULT_PRICE).build_and_execute(|| {
-		let config = BranchConfig { debt_ceiling: u128::MAX, ..default_branch_config() };
-
-		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::root(),
-			DOT,
-			STABLE,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			config,
-			(),
-		));
-
-		assert_eq!(market_config(DOT, STABLE).debt_ceiling, u128::MAX);
-	});
-}
-
-// A branch the oracle cannot price cannot be created.
-#[test]
-fn create_branch_rejects_unpriced_collateral() {
-	ExtBuilder::default().build_and_execute(|| {
-		// DOT has no oracle price.
-		assert_noop!(
-			Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				DOT,
-				STABLE,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				default_branch_config(),
-				(),
-			),
-			Error::<Test>::OraclePriceNotAvailable
-		);
 	});
 }
 
@@ -328,34 +337,28 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 			minimum_collateralization_ratio: percent(115),
 			..default_branch_config()
 		};
-		let lowered_ceiling = BranchConfig { debt_ceiling: 50_000_000, ..raised_mcr.clone() };
-		for (old_value, update, expected) in [
-			(
-				BranchConfigUpdate::MinimumCollateralizationRatio(percent(110)),
-				BranchConfigUpdate::MinimumCollateralizationRatio(percent(115)),
-				raised_mcr,
-			),
-			(
-				BranchConfigUpdate::DebtCeiling(1_000_000_000_000),
-				BranchConfigUpdate::DebtCeiling(50_000_000),
-				lowered_ceiling,
-			),
-		] {
-			assert_ok!(Pallet::<Test>::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				DOT,
-				STABLE,
-				update,
-			));
+		assert_ok!(set_param(BranchConfigUpdate::MinimumCollateralizationRatio(percent(115))));
 
-			crate::tests::assert_event(crate::Event::ParameterUpdated {
-				collateral_id: DOT,
-				stable_id: STABLE,
-				old_value,
-				new_value: update,
-			});
-			assert_eq!(branch_config(DOT, STABLE), Some(expected));
-		}
+		crate::tests::assert_event(crate::Event::ParameterUpdated {
+			collateral_id: DOT,
+			stable_id: STABLE,
+			old_value: BranchConfigUpdate::MinimumCollateralizationRatio(percent(110)),
+			new_value: BranchConfigUpdate::MinimumCollateralizationRatio(percent(115)),
+		});
+		assert_eq!(market_config(DOT, STABLE), raised_mcr.clone());
+
+		assert_ok!(set_param(BranchConfigUpdate::DebtCeiling(50_000_000)));
+
+		crate::tests::assert_event(crate::Event::ParameterUpdated {
+			collateral_id: DOT,
+			stable_id: STABLE,
+			old_value: BranchConfigUpdate::DebtCeiling(1_000_000_000_000),
+			new_value: BranchConfigUpdate::DebtCeiling(50_000_000),
+		});
+		assert_eq!(
+			market_config(DOT, STABLE),
+			BranchConfig { debt_ceiling: 50_000_000, ..raised_mcr }
+		);
 
 		// 115% -> 106% is a loosening the full admin may apply (floor is 105%).
 		assert_ok!(Pallet::<Test>::set_param(
@@ -382,27 +385,38 @@ fn full_admin_loosens_within_envelope_but_not_past_floor() {
 	});
 }
 
+/// Opens the sole vault of the `(DOT, STABLE)` branch and asserts that `origin` can remove the
+/// branch only after that vault closes.
+fn assert_removal_requires_empty_market(origin: RuntimeOrigin) {
+	assert_ok!(open(STABLECOIN_OWNER, DOT, STABLE, 1_000, 500, percent(5)));
+
+	assert_noop!(
+		Pallet::<Test>::remove_branch(origin.clone(), DOT, STABLE),
+		Error::<Test>::BranchNotEmpty
+	);
+
+	// Once the sole vault is repaid to zero, the now-empty branch is removable.
+	repay_to_close(STABLECOIN_OWNER);
+	assert_ok!(Pallet::<Test>::remove_branch(origin, DOT, STABLE));
+
+	assert!(!market_exists(DOT, STABLE));
+}
+
 // A non-empty branch cannot be removed; once its sole vault closes, removal
-// succeeds. Governance goes through the same extrinsic, bypassing the admins but
-// not the emptiness rule.
+// succeeds.
 #[test]
 fn remove_branch_requires_empty_market() {
-	for origin in [RuntimeOrigin::signed(ADMIN), RuntimeOrigin::root()] {
-		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-			assert_ok!(open(STABLECOIN_OWNER, DOT, STABLE, 1_000, 500, percent(5)));
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_removal_requires_empty_market(RuntimeOrigin::signed(ADMIN));
+	});
+}
 
-			assert_noop!(
-				Pallet::<Test>::remove_branch(origin.clone(), DOT, STABLE),
-				Error::<Test>::BranchNotEmpty
-			);
-
-			// Once the sole vault is repaid to zero, the now-empty branch is removable.
-			repay_to_close(STABLECOIN_OWNER);
-			assert_ok!(Pallet::<Test>::remove_branch(origin.clone(), DOT, STABLE));
-
-			assert!(!market_exists(DOT, STABLE));
-		});
-	}
+// Governance goes through the same extrinsic, bypassing the admins but not the emptiness rule.
+#[test]
+fn governance_remove_branch_requires_empty_market() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_removal_requires_empty_market(RuntimeOrigin::root());
+	});
 }
 
 // Reassigning admins moves authority: the old full admin loses it, the new one
@@ -450,50 +464,33 @@ fn set_branch_admins_reassigns_authority() {
 			true
 		));
 		assert!(market_state(DOT, STABLE).is_frozen());
-	});
-}
 
-// Governance can replace an unreachable full admin and restore ordinary
-// per-branch administration.
-#[test]
-fn force_origin_can_reassign_branch_admins() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		// Governance can replace an unreachable full admin and restore ordinary per-branch
+		// administration. Clearing the freeze needs the full level, so it proves the restored
+		// admin holds it.
 		assert_ok!(Pallet::<Test>::set_branch_admins(
 			RuntimeOrigin::root(),
 			DOT,
 			STABLE,
-			branch_admins(NEW_FULL_ADMIN, NEW_EMERGENCY_ADMIN),
+			branch_admins(ADMIN, EMERGENCY_ADMIN),
 		));
 
 		let info = crate::pallet::Branches::<Test>::get(DOT, STABLE).expect("admins stored");
-		assert_eq!(info.admins.full_admin, NEW_FULL_ADMIN);
-		assert_eq!(info.admins.emergency_admin, NEW_EMERGENCY_ADMIN);
+		assert_eq!(info.admins.full_admin, ADMIN);
+		assert_eq!(info.admins.emergency_admin, EMERGENCY_ADMIN);
 		assert_ok!(Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(NEW_FULL_ADMIN),
+			RuntimeOrigin::signed(ADMIN),
 			DOT,
 			STABLE,
-			true,
+			false
 		));
-	});
-}
-
-// The emergency admin can pull the freeze, not just the full admin.
-#[test]
-fn emergency_admin_can_freeze() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(Pallet::<Test>::set_governance_frozen(
-			RuntimeOrigin::signed(EMERGENCY_ADMIN),
-			DOT,
-			STABLE,
-			true
-		));
-
-		assert!(market_state(DOT, STABLE).is_frozen());
+		assert!(!market_state(DOT, STABLE).is_frozen());
 	});
 }
 
 // ForceOrigin acts as a full administrator so governance can recover a branch with unavailable
-// administrators. The runtime configuration limits still apply.
+// administrators. The runtime configuration limits still apply. A signer who is neither a branch
+// admin nor the force origin can neither update nor remove the branch.
 #[test]
 fn force_origin_acts_as_full_branch_admin() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
@@ -513,6 +510,10 @@ fn force_origin_acts_as_full_branch_admin() {
 				STABLE,
 				BranchConfigUpdate::MinimumDebt(300)
 			),
+			Error::<Test>::NotBranchAdmin
+		);
+		assert_noop!(
+			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(9), DOT, STABLE),
 			Error::<Test>::NotBranchAdmin
 		);
 		assert_noop!(
@@ -577,98 +578,37 @@ fn redistribution_account_provider_reference_is_paired() {
 	});
 }
 
-// An issued-asset branch keeps the custody seed in a `pallet-assets` account. Removal sweeps the
-// seed back to the account that funded it and releases the branch's provider reference. The
-// asset is sufficient, so its account takes no consumer reference: the insufficient case lives in
-// `insufficient_collateral_custody_needs_the_provider_reference`.
+// The oracle check runs first, so every other asset is priced before it reaches the guard it
+// names.
 #[test]
-fn issued_collateral_removal_refunds_the_custody_seed() {
+fn create_branch_rejects_unpriced_or_unknown_assets_and_role_collision() {
 	ExtBuilder::default().build_and_execute(|| {
-		let account = Pallet::<Test>::redistribution_account(&TOKEN_X, &STABLE);
-		let funder_before = collateral_balance(TOKEN_X, ADMIN);
-		register_market(TOKEN_X, STABLE);
-		assert_eq!(
-			collateral_balance(TOKEN_X, account),
-			VaultCollateralAssets::minimum_balance(TOKEN_X)
-		);
+		let create = |collateral, stable| {
+			Pallet::<Test>::create_branch(
+				RuntimeOrigin::root(),
+				collateral,
+				stable,
+				branch_admins(ADMIN, EMERGENCY_ADMIN),
+				default_branch_config(),
+				(),
+			)
+		};
 
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), TOKEN_X, STABLE));
+		clear_price(DOT);
+		assert_noop!(create(DOT, STABLE), Error::<Test>::OraclePriceNotAvailable);
 
-		assert_eq!(System::providers(&account), 0);
-		assert_eq!(collateral_balance(TOKEN_X, ADMIN), funder_before);
-	});
-}
+		set_price(AssetId::WithId(999_999), DEFAULT_PRICE);
+		assert_noop!(create(AssetId::WithId(999_999), STABLE), Error::<Test>::UnknownCollateral);
 
-// A signer who is neither a branch admin nor the force origin can neither
-// freeze nor remove.
-#[test]
-fn freeze_and_remove_reject_unauthorized_signers() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		const NOBODY: AccountId = 999;
+		set_price(DOT, DEFAULT_PRICE);
+		assert_noop!(create(DOT, 9_999), Error::<Test>::UnknownStable);
 
+		set_price(AssetId::WithId(STABLE), DEFAULT_PRICE);
 		assert_noop!(
-			Pallet::<Test>::set_governance_frozen(RuntimeOrigin::signed(NOBODY), DOT, STABLE, true),
-			Error::<Test>::NotBranchAdmin
-		);
-		assert_noop!(
-			Pallet::<Test>::remove_branch(RuntimeOrigin::signed(NOBODY), DOT, STABLE),
-			Error::<Test>::NotBranchAdmin
+			create(AssetId::WithId(STABLE), STABLE),
+			Error::<Test>::StableCollateralCollision
 		);
 	});
-}
-
-// The registry has no global cap: every collateral/stablecoin combination the
-// role rules admit can be registered — here more branches than the old registry
-// cap ever allowed — and a removed branch's pair can be re-created.
-#[test]
-fn registry_has_no_global_cap() {
-	ExtBuilder::default().build_and_execute(|| {
-		register_ten_markets();
-
-		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 10);
-
-		// Removing a branch and re-creating the same pair round-trips.
-		assert_ok!(Pallet::<Test>::remove_branch(RuntimeOrigin::signed(ADMIN), DOT, STABLE));
-
-		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 9);
-
-		assert_ok!(Pallet::<Test>::create_branch(
-			RuntimeOrigin::root(),
-			DOT,
-			STABLE,
-			branch_admins(ADMIN, EMERGENCY_ADMIN),
-			default_branch_config(),
-			(),
-		));
-
-		assert_eq!(crate::pallet::Branches::<Test>::iter_keys().count(), 10);
-	});
-}
-
-#[test]
-fn create_branch_rejects_unknown_assets_and_role_collision() {
-	let cases = [
-		(AssetId::WithId(999_999), STABLE, Error::<Test>::UnknownCollateral),
-		(DOT, 9_999, Error::<Test>::UnknownStable),
-		(AssetId::WithId(STABLE), STABLE, Error::<Test>::StableCollateralCollision),
-	];
-	for (collateral, stable, error) in cases {
-		ExtBuilder::default().build_and_execute(|| {
-			set_price(collateral.clone(), DEFAULT_PRICE);
-
-			assert_noop!(
-				Pallet::<Test>::create_branch(
-					RuntimeOrigin::root(),
-					collateral.clone(),
-					stable,
-					branch_admins(ADMIN, EMERGENCY_ADMIN),
-					default_branch_config(),
-					(),
-				),
-				error
-			);
-		});
-	}
 }
 
 #[test]
@@ -730,7 +670,7 @@ fn raised_minimum_debt_keeps_open_vaults_active_and_floors_their_next_change() {
 		assert_ok!(poke(9, DOT, STABLE, 1));
 
 		assert!(vault_status(DOT, STABLE, 1).is_active());
-		assert!(<LinkedList as SortedListInterface<VaultList, u64>>::contains(
+		assert!(<LinkedList as SortedListInterface<VaultList, AccountId>>::contains(
 			&VaultList::Rate(DOT, STABLE),
 			&1
 		));

@@ -7,25 +7,25 @@ use alloc::collections::BTreeMap;
 
 use crate as pallet_vaults;
 use crate::{
-	pallet::Branches,
+	pallet::{Branches, CollateralCreditOf, StableCreditOf},
 	types::{BranchConfigBounds, Vault},
-	BranchState, LiquidationSettlement, VaultListId,
+	BranchState, HoldReason, LiquidationSettlement, VaultListId,
 };
 pub use crate::{
-	pallet::{BalanceOf, CollateralCreditOf, StableCreditOf},
-	types::BranchAdmins,
-	BoundViolation, BranchConfig, BranchConfigDefect, BranchMode, Error, Event, HoldReason, Pallet,
+	types::BranchAdmins, BoundViolation, BranchConfig, BranchConfigDefect, BranchMode, Error,
+	Pallet,
 };
 pub use frame::{
-	arithmetic::{FixedPointNumber, FixedU128, Permill, Saturating},
-	prelude::{DispatchError, DispatchResult, DispatchResultWithPostInfo},
+	arithmetic::{FixedPointNumber, FixedU128, Permill},
+	prelude::{DispatchError, DispatchResult},
 	testing_prelude::{assert_err, assert_noop, assert_ok, assert_storage_noop, hypothetically},
 };
 use frame::{
 	deps::{
 		frame_support::transactional,
-		sp_runtime::traits::{Convert as ConvertTrait, ConvertInto},
+		sp_runtime::traits::{ConvertInto, ConvertToValue},
 	},
+	prelude::DispatchResultWithPostInfo,
 	testing_prelude::*,
 	traits::{
 		fungible::{HoldConsideration, ItemOf, NativeFromLeft, NativeOrWithId},
@@ -34,7 +34,7 @@ use frame::{
 			HoldConsideration as FungiblesHoldConsideration, Inspect as FungiblesInspect,
 			InspectHold, SufficientAssets,
 		},
-		tokens::{fungible, ConversionToAssetBalance, FallbackOnUnavailable},
+		tokens::fungible,
 		AsEnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
 	},
 };
@@ -43,7 +43,7 @@ use stablecoin_primitives::{
 	BranchSnapshot, OraclePriceConversion, RedemptionSettlement, VaultInterface,
 };
 
-pub type AccountId = u64;
+pub type AccountId = u128;
 pub type Balance = u128;
 pub type AssetIdForAssets = u32;
 /// Native or issued collateral asset ID.
@@ -76,12 +76,6 @@ pub const TOKEN_X: AssetId = AssetId::WithId(TOKEN_X_ID);
 /// Second issued collateral asset.
 pub const ETH_ID: AssetIdForAssets = 2;
 pub const ETH: AssetId = AssetId::WithId(ETH_ID);
-
-/// Extra issued collateral assets for registry tests.
-pub const COLL_C_ID: AssetIdForAssets = 3;
-pub const COLL_C: AssetId = AssetId::WithId(COLL_C_ID);
-pub const COLL_D_ID: AssetIdForAssets = 4;
-pub const COLL_D: AssetId = AssetId::WithId(COLL_D_ID);
 
 /// Default stable asset.
 pub const STABLE: StableId = 1_000;
@@ -164,13 +158,10 @@ impl pallet_timestamp::Config for Test {}
 impl pallet_balances::Config for Test {
 	type AccountStore = System;
 	type Balance = Balance;
-	type ExistentialDeposit = ConstU128<1>;
-	type RuntimeHoldReason = RuntimeHoldReason;
 }
 
 #[derive_impl(pallet_assets::config_preludes::TestDefaultConfig as pallet_assets::DefaultConfig)]
 impl pallet_assets::Config for Test {
-	type AssetId = AssetIdForAssets;
 	type CreateOrigin = AsEnsureOriginWithArg<frame_system::EnsureSigned<AccountId>>;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type Currency = Balances;
@@ -200,9 +191,6 @@ impl pallet_linked_list::Config for Test {
 pub type VaultCollateralAssets =
 	fungible::UnionOf<Balances, AssetsHolder, NativeFromLeft, AssetId, AccountId>;
 
-/// Interface for all test stable assets.
-pub type VaultStableAssets = Assets;
-
 parameter_types! {
 	pub const StableAssetId: AssetIdForAssets = STABLE;
 }
@@ -212,8 +200,8 @@ pub type Stable = ItemOf<Assets, StableAssetId, AccountId>;
 /// Test oracle with one price per collateral asset.
 pub struct MockOracle;
 parameter_types! {
-	pub static MockPrices: BTreeMap<AssetId, FixedU128> = BTreeMap::new();
-	pub static MockOracleAvailable: bool = true;
+	pub storage MockPrices: BTreeMap<AssetId, FixedU128> = BTreeMap::new();
+	pub storage MockOracleAvailable: bool = true;
 }
 impl stablecoin_primitives::ProvidePrice for MockOracle {
 	type AssetId = AssetId;
@@ -230,39 +218,30 @@ impl stablecoin_primitives::ProvidePrice for MockOracle {
 
 parameter_types! {
 	/// Share of each fee assigned to the Stability Pool.
-	pub static SpFeeShare: Permill = Permill::from_percent(75);
-}
-
-/// Routes all test stablecoin fee remainders to [`FEE_DEST`].
-pub struct FeeAccounts;
-impl ConvertTrait<StableId, AccountId> for FeeAccounts {
-	fn convert(_stable: StableId) -> AccountId {
-		FEE_DEST
-	}
+	pub storage SpFeeShare: Permill = Permill::from_percent(75);
+	/// Receives every test stablecoin's fee remainder.
+	pub const FeeDestAccount: AccountId = FEE_DEST;
 }
 
 /// Burns the test Stability Pool fee share and returns the remainder.
 pub struct MockYieldHook;
-impl stablecoin_primitives::OnBranchYield<AssetId, Credit<AccountId, VaultStableAssets>>
-	for MockYieldHook
-{
+impl stablecoin_primitives::OnBranchYield<AssetId, Credit<AccountId, Assets>> for MockYieldHook {
 	fn distribute_yield(
 		_: &AssetId,
 		branch: BranchSnapshot,
-		credit: Credit<AccountId, VaultStableAssets>,
-	) -> Credit<AccountId, VaultStableAssets> {
+		credit: Credit<AccountId, Assets>,
+	) -> Credit<AccountId, Assets> {
 		assert_eq!(branch.now, Timestamp::get(), "the engine passes its own clock");
 		let sp_share = SpFeeShare::get() * credit.peek();
 		let (sp_credit, residual) = credit.split(sp_share);
 		// The Stability Pool, not the branch, takes this share out of circulation.
-		record_external_issuance(sp_credit.asset(), -signed(sp_credit.peek()));
-		drop(sp_credit);
+		burn_external(sp_credit);
 		residual
 	}
 }
 
 /// The lifecycle hook a [`LifecycleLog`] entry records.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Encode, Decode)]
 pub enum Lifecycle {
 	Registered,
 	Deregistered,
@@ -270,11 +249,17 @@ pub enum Lifecycle {
 
 parameter_types! {
 	/// Recorded branch lifecycle calls, with the stablecoin branch count the hook was given.
-	pub static LifecycleLog: Vec<(AssetId, StableId, Lifecycle, u32)> = Vec::new();
+	pub storage LifecycleLog: Vec<(AssetId, StableId, Lifecycle, u32)> = Vec::new();
 	/// Makes branch registration fail in the lifecycle hook.
-	pub static FailOnRegistered: bool = false;
+	pub storage FailOnRegistered: bool = false;
 	/// Makes branch removal fail in the lifecycle hook.
-	pub static FailOnDeregistered: bool = false;
+	pub storage FailOnDeregistered: bool = false;
+}
+
+fn record_lifecycle(entry: (AssetId, StableId, Lifecycle, u32)) {
+	let mut log = LifecycleLog::get();
+	log.push(entry);
+	LifecycleLog::set(&log);
 }
 
 /// Records branch lifecycle calls and supports forced failures.
@@ -289,9 +274,12 @@ impl stablecoin_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for 
 		_config: Self::RegistrationConfig,
 		_funder: &AccountId,
 	) -> DispatchResult {
-		LifecycleLog::mutate(|l| {
-			l.push((collateral_id.clone(), *stable_id, Lifecycle::Registered, stablecoin_markets))
-		});
+		record_lifecycle((
+			collateral_id.clone(),
+			*stable_id,
+			Lifecycle::Registered,
+			stablecoin_markets,
+		));
 		if FailOnRegistered::get() {
 			return Err(DispatchError::Other("on_registered failure"));
 		}
@@ -303,14 +291,12 @@ impl stablecoin_primitives::OnBranchLifecycle<AssetId, StableId, AccountId> for 
 		remaining_stablecoin_markets: u32,
 		_funder: &AccountId,
 	) -> DispatchResult {
-		LifecycleLog::mutate(|l| {
-			l.push((
-				collateral_id.clone(),
-				*stable_id,
-				Lifecycle::Deregistered,
-				remaining_stablecoin_markets,
-			))
-		});
+		record_lifecycle((
+			collateral_id.clone(),
+			*stable_id,
+			Lifecycle::Deregistered,
+			remaining_stablecoin_markets,
+		));
 		if FailOnDeregistered::get() {
 			return Err(DispatchError::Other("on_deregistered failure"));
 		}
@@ -349,34 +335,17 @@ parameter_types! {
 		RuntimeHoldReason::Vaults(HoldReason::VaultCreationDeposit);
 	pub const VaultDepositBase: Balance = VAULT_DEPOSIT;
 	pub const NativeCollateral: AssetId = DOT;
-	/// Units of an asset that one native unit buys through the mock fallback quote.
-	pub static MockFallbackRate: Option<FixedU128> = Some(FixedU128::one());
 }
 
-pub struct MockFallbackConversion;
-impl ConversionToAssetBalance<Balance, AssetId, Balance> for MockFallbackConversion {
-	type Error = DispatchError;
-
-	fn to_asset_balance(balance: Balance, _asset: AssetId) -> Result<Balance, Self::Error> {
-		MockFallbackRate::get()
-			.map(|rate| rate.saturating_mul_int(balance))
-			.ok_or(DispatchError::Unavailable)
-	}
-}
-
-/// Settles in the collateral when it is native or sufficient, else in native; re-prices through
-/// the oracle first and the mock quote only when the oracle has no feed, never below the asset's
-/// minimum balance.
+/// Settles in the collateral when it is native or sufficient, else in native, re-priced through
+/// the oracle and never below the asset's minimum balance, as the runtimes compose it.
 pub type VaultDepositPolicy = AssetFootprintPrice<
 	SufficientAssets<VaultCollateralAssets, AccountId>,
 	NativeCollateral,
 	LinearStoragePrice<VaultDepositBase, ConstU128<0>, Balance>,
 	AtLeastMinimumBalance<
 		VaultCollateralAssets,
-		FallbackOnUnavailable<
-			OraclePriceConversion<MockOracle, NativeCollateral>,
-			MockFallbackConversion,
-		>,
+		OraclePriceConversion<MockOracle, NativeCollateral>,
 		AccountId,
 	>,
 >;
@@ -401,9 +370,9 @@ parameter_types! {
 impl pallet_vaults::Config for Test {
 	type StableToCollateralId = ConvertInto;
 	type CollateralAssets = VaultCollateralAssets;
-	type StableAssets = VaultStableAssets;
+	type StableAssets = Assets;
 	type Oracle = MockOracle;
-	type FeeAccount = FeeAccounts;
+	type FeeAccount = ConvertToValue<FeeDestAccount>;
 	type YieldHook = MockYieldHook;
 	type OnBranchLifecycle = RecordingLifecycle;
 	type TimeProvider = Timestamp;
@@ -438,9 +407,7 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for MockBenchmarkHelper {
 	}
 
 	fn clear_oracle_price(collateral_id: AssetId) {
-		MockPrices::mutate(|prices| {
-			prices.remove(&collateral_id);
-		});
+		clear_price(collateral_id);
 	}
 
 	fn advance_time(ms: u64) {
@@ -453,14 +420,10 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId> for MockBenchmarkHelper {
 
 /// Builds the test externalities: genesis balances, the oracle and pool knobs, and the branches a
 /// test starts from.
-///
-/// A build writes every thread-local mock knob, not only the ones a test changes. Several
-/// externalities can share one thread (table-driven tests, the benchmark suite), so a knob left
-/// from an earlier one would otherwise leak into the next.
 #[derive(Default)]
 pub struct ExtBuilder {
 	prices: BTreeMap<AssetId, FixedU128>,
-	branches: Vec<(AssetId, StableId)>,
+	branches: Vec<(AssetId, StableId, BranchConfig<Balance>)>,
 }
 
 impl ExtBuilder {
@@ -472,27 +435,35 @@ impl ExtBuilder {
 	}
 
 	/// Registers a branch with [`default_branch_config`] and the default global debt ceiling.
-	pub fn branch(mut self, collateral: AssetId, stable: StableId) -> Self {
-		self.branches.push((collateral, stable));
+	pub fn branch(self, collateral: AssetId, stable: StableId) -> Self {
+		self.branch_with(collateral, stable, default_branch_config())
+	}
+
+	/// Registers a branch with `config` and the default global debt ceiling.
+	pub fn branch_with(
+		mut self,
+		collateral: AssetId,
+		stable: StableId,
+		config: BranchConfig<Balance>,
+	) -> Self {
+		self.branches.push((collateral, stable, config));
 		self
 	}
 
 	/// Builds fresh storage with the configured branches registered at block 1.
-	pub fn build(self) -> TestState {
+	///
+	/// The native price defaults to [`DEFAULT_PRICE`]: vault deposits on non-native collateral
+	/// are re-priced from it, as in the runtimes.
+	pub fn build(mut self) -> TestState {
+		self.prices.entry(DOT).or_insert(DEFAULT_PRICE);
 		let mut ext: TestState = genesis_storage().into();
 		ext.execute_with(|| {
 			System::set_block_number(1);
 			Timestamp::set_timestamp(1_000);
-			MockPrices::set(self.prices.clone());
-			MockOracleAvailable::set(true);
-			LifecycleLog::set(Vec::new());
-			FailOnRegistered::set(false);
-			FailOnDeregistered::set(false);
-			MockFallbackRate::set(Some(FixedU128::one()));
-			SpFeeShare::set(Permill::from_percent(75));
-			for (collateral, stable) in self.branches {
+			MockPrices::set(&self.prices);
+			for (collateral, stable, config) in self.branches {
 				let price = self.prices.get(&collateral).copied().unwrap_or(DEFAULT_PRICE);
-				register_market_with(collateral, stable, price, default_branch_config());
+				register_market_with(collateral, stable, price, config);
 			}
 		});
 		ext
@@ -514,8 +485,6 @@ fn genesis_storage() -> frame::deps::sp_runtime::Storage {
 			assets: vec![
 				(TOKEN_X_ID, 1, true, 1),
 				(ETH_ID, 1, true, 1),
-				(COLL_C_ID, 1, true, 1),
-				(COLL_D_ID, 1, true, 1),
 				(STABLE, 1, true, 1),
 				(EUSD, 1, true, 1),
 				(USDX, 1, true, USDX_ED),
@@ -526,10 +495,10 @@ fn genesis_storage() -> frame::deps::sp_runtime::Storage {
 			// Native collateral is funded below; these are the issued collaterals. Only the branch
 			// creator holds the insufficient asset: an account of one takes a consumer reference,
 			// which changes what that account may spend down to.
-			accounts: (1u64..=10)
+			accounts: (1..=10)
 				.chain([ADMIN])
 				.flat_map(|who| {
-					[TOKEN_X_ID, ETH_ID, COLL_C_ID, COLL_D_ID]
+					[TOKEN_X_ID, ETH_ID]
 						.map(|asset| (asset, who, 1_000_000_000_000))
 						.into_iter()
 						.chain([(XBT_ID, who, 100_000_000 * XBT_UNIT)])
@@ -543,10 +512,7 @@ fn genesis_storage() -> frame::deps::sp_runtime::Storage {
 		balances: pallet_balances::GenesisConfig {
 			// The fee account needs native funds to pay its asset-account deposit.
 			// The full admin funds the custody seed of every Root-created branch.
-			balances: (1u64..=10u64)
-				.chain([FEE_DEST, ADMIN])
-				.map(|i| (i, 1_000_000_000_000))
-				.collect(),
+			balances: (1..=10).chain([FEE_DEST, ADMIN]).map(|i| (i, 1_000_000_000_000)).collect(),
 			..Default::default()
 		},
 	}
@@ -565,11 +531,23 @@ parameter_types! {
 ///
 /// Every supply change a test or test hook makes behind the pallet's back must pass here, or
 /// [`check_stable_supply`] reports it.
-pub fn record_external_issuance(stable: StableId, delta: i128) {
+fn record_external_issuance(stable: StableId, delta: i128) {
 	let mut ledger = ExternalStableIssuance::get();
 	let entry = ledger.entry(stable).or_default();
 	*entry = entry.checked_add(delta).expect("external issuance ledger overflow");
 	ExternalStableIssuance::set(&ledger);
+}
+
+/// Issues stablecoin outside branch debt, recorded so [`check_stable_supply`] still balances.
+fn issue_external(stable: StableId, amount: Balance) -> StableCreditOf<Test> {
+	record_external_issuance(stable, signed(amount));
+	<Assets as FungiblesBalanced<AccountId>>::issue(stable, amount)
+}
+
+/// Burns stablecoin outside branch debt, recorded so [`check_stable_supply`] still balances.
+fn burn_external(credit: StableCreditOf<Test>) {
+	record_external_issuance(credit.asset(), -signed(credit.peek()));
+	drop(credit);
 }
 
 /// Converts a balance into the ledger's signed domain.
@@ -612,9 +590,16 @@ pub fn check_stable_supply() {
 
 /// Sets the oracle price for a collateral asset.
 pub fn set_price(collateral: AssetId, price: FixedU128) {
-	MockPrices::mutate(|m| {
-		m.insert(collateral, price);
-	});
+	let mut prices = MockPrices::get();
+	prices.insert(collateral, price);
+	MockPrices::set(&prices);
+}
+
+/// Takes the oracle down for `collateral` until the next [`set_price`].
+pub fn clear_price(collateral: AssetId) {
+	let mut prices = MockPrices::get();
+	prices.remove(&collateral);
+	MockPrices::set(&prices);
 }
 
 /// Advances time without changing the block number.
@@ -680,15 +665,6 @@ pub fn register_market_with(
 /// Creates a branch with default settings and [`DEFAULT_PRICE`].
 pub fn register_market(collateral: AssetId, stable: StableId) {
 	register_market_with(collateral, stable, DEFAULT_PRICE, default_branch_config());
-}
-
-/// Creates all ten mock branches without global debt limits.
-pub fn register_ten_markets() {
-	for collateral in [DOT, TOKEN_X, ETH, COLL_C, COLL_D] {
-		for stable in [STABLE, EUSD] {
-			create_market(collateral.clone(), stable, DEFAULT_PRICE, default_branch_config());
-		}
-	}
 }
 
 /// Opens a vault using endpoint-only list hints.
@@ -1029,35 +1005,20 @@ pub fn settlement(
 	collateral_to_recipient: Balance,
 ) -> RedemptionSettlement<StableCreditOf<Test>, Balance> {
 	// Stands in for the redeemer's stablecoin, which the branch burns against the debt.
-	record_external_issuance(stable, signed(debt_to_cancel));
-	let debt_payment =
-		<VaultStableAssets as FungiblesBalanced<AccountId>>::issue(stable, debt_to_cancel);
+	let debt_payment = issue_external(stable, debt_to_cancel);
 	RedemptionSettlement { debt_payment, collateral_to_recipient }
-}
-
-/// Returns a branch's accounting state, or `None` if it is not registered.
-pub fn branch_state(
-	collateral: AssetId,
-	stable: StableId,
-) -> Option<BranchState<AccountId, Balance>> {
-	Branches::<Test>::get(collateral, stable).map(|branch| branch.state)
-}
-
-/// Returns a branch's settings, or `None` if it is not registered.
-pub fn branch_config(collateral: AssetId, stable: StableId) -> Option<BranchConfig<Balance>> {
-	Branches::<Test>::get(collateral, stable).map(|branch| branch.config)
 }
 
 /// Returns a registered branch's accounting state, failing the calling test if it is absent.
 #[track_caller]
 pub fn market_state(collateral: AssetId, stable: StableId) -> BranchState<AccountId, Balance> {
-	branch_state(collateral, stable).expect("branch is registered")
+	Branches::<Test>::get(collateral, stable).expect("branch is registered").state
 }
 
 /// Returns a registered branch's settings, failing the calling test if it is absent.
 #[track_caller]
 pub fn market_config(collateral: AssetId, stable: StableId) -> BranchConfig<Balance> {
-	branch_config(collateral, stable).expect("branch is registered")
+	Branches::<Test>::get(collateral, stable).expect("branch is registered").config
 }
 
 /// Updates branch state through the pallet's commit path.
@@ -1094,7 +1055,7 @@ pub fn collateral_balance(collateral: AssetId, who: AccountId) -> Balance {
 
 /// Returns an account's balance of one stable asset.
 pub fn stable_balance(stable: StableId, who: AccountId) -> Balance {
-	<VaultStableAssets as FungiblesInspect<AccountId>>::balance(stable, &who)
+	<Assets as FungiblesInspect<AccountId>>::balance(stable, &who)
 }
 
 /// Mints collateral through the fungible traits: the holder union has no minting side, so the
@@ -1115,15 +1076,13 @@ pub fn mint_collateral(collateral: AssetId, who: AccountId, amount: Balance) {
 /// Mints stable assets for liquidation and repayment tests.
 pub fn mint_stable(stable: StableId, who: AccountId, amount: Balance) {
 	record_external_issuance(stable, signed(amount));
-	<VaultStableAssets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(
-		stable, &who, amount,
-	)
-	.expect("mint stable");
+	<Assets as frame::traits::fungibles::Mutate<AccountId>>::mint_into(stable, &who, amount)
+		.expect("mint stable");
 }
 
 /// Returns the total issuance of one stable asset.
 pub fn total_stable(stable: StableId) -> Balance {
-	<VaultStableAssets as FungiblesInspect<AccountId>>::total_issuance(stable)
+	<Assets as FungiblesInspect<AccountId>>::total_issuance(stable)
 }
 
 /// Returns the branch creation deposit held from an account.

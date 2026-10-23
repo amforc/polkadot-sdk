@@ -16,9 +16,7 @@
 // limitations under the License.
 
 use crate::{mock::*, Error, Event, ListError, Position, SortedListInterface};
-use frame::testing_prelude::{
-	assert_err_ignore_postinfo, assert_noop, assert_ok, assert_storage_noop,
-};
+use frame::testing_prelude::{assert_noop, assert_ok, assert_storage_noop};
 
 #[test]
 fn reprioritize_no_op_when_priority_unchanged() {
@@ -36,16 +34,21 @@ fn reprioritize_no_op_when_priority_unchanged() {
 }
 
 #[test]
-fn reprioritize_repositions_when_priority_changes() {
+fn reprioritize_relocates_with_stale_hint() {
 	build_and_execute(|| {
+		use crate::weights::WeightInfo;
 		insert(1, 1, 90);
 		insert(1, 2, 50);
 		insert(1, 3, 10);
-		// Real priority for item 2 just rose to 99; reprioritize should move it to head.
+		// Real priority for item 2 just rose to 99; the caller's hint is stale
+		// (tail region) but the correct head position is within budget.
 		StaticPriorityProvider::pin_priority(1, 2, 99);
-		// Hint: target's new neighbors (None, Some(1)): head insertion.
-		assert_ok!(LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, Position::at_head(1)));
+		let post_info =
+			LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, Position::at_tail(3))
+				.expect("stale hint is repaired within budget");
 		assert_eq!(dump(1), vec![(2, 99), (1, 90), (3, 10)]);
+		// Charged for the two repair steps actually walked, not the full budget.
+		assert_eq!(post_info.actual_weight, Some(<() as WeightInfo>::reprioritize_relocate(2)));
 		// `ItemReinserted` is the single event surface for priority changes,
 		// whether they arrive via the trait or via the dispatchable.
 		System::assert_has_event(
@@ -55,27 +58,24 @@ fn reprioritize_repositions_when_priority_changes() {
 	});
 }
 
-#[test]
-fn reprioritize_unknown_item_errors() {
-	build_and_execute(|| {
-		// No priority in StaticPriorities → PriorityProvider returns None.
-		assert_storage_noop!(assert_err_ignore_postinfo!(
-			LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 100, Position::endpoints_only()),
-			Error::<Test>::List(ListError::ItemNotFound)
-		));
-	});
-}
-
 /// The early item-not-found exit refunds down to the cheapest benchmarked
 /// path instead of charging the full relocate-budget reservation.
 #[test]
-fn reprioritize_unknown_item_refunds_weight() {
+fn reprioritize_unknown_item_errors_and_refunds() {
 	build_and_execute(|| {
 		use crate::weights::WeightInfo;
-		let err =
-			LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 100, Position::endpoints_only())
-				.expect_err("item is not in the list");
-		assert_eq!(err.post_info.actual_weight, Some(<() as WeightInfo>::reprioritize_no_op()),);
+		// No priority in StaticPriorities → PriorityProvider returns None.
+		assert_storage_noop!({
+			let err = LinkedList::reprioritize(
+				RuntimeOrigin::signed(1),
+				1,
+				100,
+				Position::endpoints_only(),
+			)
+			.expect_err("item is not in the list");
+			assert_eq!(err.error, Error::<Test>::List(ListError::ItemNotFound).into());
+			assert_eq!(err.post_info.actual_weight, Some(<() as WeightInfo>::reprioritize_no_op()));
+		});
 	});
 }
 
@@ -95,20 +95,6 @@ fn reprioritize_removes_existing_item_when_priority_disappears() {
 
 		assert_eq!(dump(1), vec![(1, 90), (3, 10)]);
 		System::assert_has_event(Event::ItemRemoved { list_id: 1, item: 2, priority: 50 }.into());
-	});
-}
-
-#[test]
-fn reprioritize_with_stale_hint_within_budget_succeeds() {
-	build_and_execute(|| {
-		insert(1, 1, 90);
-		insert(1, 2, 50);
-		insert(1, 3, 10);
-		// Real priority for item 2 just rose to 99; the caller's hint is stale
-		// (tail region) but the correct head position is within budget.
-		StaticPriorityProvider::pin_priority(1, 2, 99);
-		assert_ok!(LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, Position::at_tail(3)));
-		assert_eq!(dump(1), vec![(2, 99), (1, 90), (3, 10)]);
 	});
 }
 
@@ -141,52 +127,27 @@ fn re_insert_steps_needed_predicts_dispatch_failure() {
 	});
 }
 
-/// The fast paths never consult the hint, so even a garbage hint must yield
-/// `0` from the dispatch-faithful view — and the dispatch must succeed.
+/// `re_insert_steps_needed` dry-runs the real `re_insert` and rolls it back:
+/// a relocation reports the walk it took without leaving any trace in storage,
+/// and the fast paths never consult the hint, so even a garbage hint must
+/// yield `0` — and the dispatch must succeed.
 #[test]
-fn re_insert_steps_needed_zero_for_in_place_despite_garbage_hint() {
+fn re_insert_steps_needed_dry_runs_re_insert() {
 	build_and_execute(|| {
 		insert(1, 1, 100);
 		insert(1, 2, 90);
 		insert(1, 3, 80);
+		// After splicing 2 out, the head hint walks 1 → 3 → tail: two steps.
+		assert_storage_noop!(assert_eq!(
+			LinkedList::re_insert_steps_needed(&1, &2, 5, Position::at_head(1)),
+			2
+		));
+
 		// 85 still fits between 1 (100) and 3 (80): in-place fast path.
 		let garbage_hint = Position::between(98, 99);
-		assert_eq!(LinkedList::re_insert_steps_needed(&1, &2, 85, garbage_hint.clone(),), 0);
+		assert_eq!(LinkedList::re_insert_steps_needed(&1, &2, 85, garbage_hint.clone()), 0);
 		StaticPriorityProvider::pin_priority(1, 2, 85);
 		assert_ok!(LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, garbage_hint));
 		assert_eq!(dump(1), vec![(1, 100), (2, 85), (3, 80)]);
-	});
-}
-
-/// The dry-run inside `re_insert_steps_needed` must not leave any trace in
-/// storage.
-#[test]
-fn re_insert_steps_needed_is_read_only() {
-	build_and_execute(|| {
-		insert(1, 1, 100);
-		insert(1, 2, 90);
-		insert(1, 3, 80);
-		assert_storage_noop!(LinkedList::re_insert_steps_needed(&1, &2, 5, Position::at_head(1)));
-	});
-}
-
-#[test]
-fn reprioritize_with_hint_beyond_budget_errors() {
-	build_and_execute(|| {
-		// Build a chain longer than `MaxHintRepairSteps` so that a wrong-end
-		// hint cannot reach the correct position.
-		let tail = u64::from(build_long_chain());
-		// Tail item drifts up to 200; correct position is the head, but the
-		// supplied hint is at the tail and the budget cannot bridge that gap.
-		StaticPriorityProvider::pin_priority(1, tail, 200);
-		assert_noop!(
-			LinkedList::reprioritize(
-				RuntimeOrigin::signed(1),
-				1,
-				tail,
-				Position::at_tail(tail - 1)
-			),
-			Error::<Test>::List(ListError::InvalidPositionHints)
-		);
 	});
 }

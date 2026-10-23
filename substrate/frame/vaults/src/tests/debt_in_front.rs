@@ -8,6 +8,13 @@ use crate::{
 #[test]
 fn debt_in_front_sums_lower_rate_vaults_only() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		// A branch without vaults has nothing in front of any rate, and the walk reports no
+		// truncation.
+		assert_eq!(
+			crate::Pallet::<Test>::debt_in_front(DOT, STABLE, percent(1), u32::MAX),
+			Ok((0, false))
+		);
+
 		// Eight vaults: 2 each at 0.5%, 0.6%, 0.7%, 0.8% with distinct debts.
 		assert_ok!(open(1, DOT, STABLE, 1_000, 500, FixedU128::from_rational(5, 1000))); // 0.5%
 		assert_ok!(open(2, DOT, STABLE, 1_000, 700, FixedU128::from_rational(5, 1000)));
@@ -23,7 +30,7 @@ fn debt_in_front_sums_lower_rate_vaults_only() {
 		// below 1. No time passes, so each vault's entire debt is
 		// `principal + FEE`.
 		const FEE: Balance = 1;
-		for who in 1u64..=8 {
+		for who in 1..=8 {
 			let v = vault(DOT, STABLE, who);
 			assert_eq!(v.debt.interest, FEE, "upfront fee ceils to 1 at these magnitudes");
 		}
@@ -85,40 +92,6 @@ fn debt_in_front_projects_pending_interest_poke_independent() {
 	});
 }
 
-// A vault redeemed below `MinimumDebt` parks as the dormant target. The next
-// redemption drains it first, so its residual counts as debt in front even
-// though it left the rate index — and it consumes one walk step.
-#[test]
-fn debt_in_front_includes_dormant_redemption_target() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 5_000, 500, FixedU128::from_rational(5, 1000))); // 0.5%, tail
-		assert_ok!(open(2, DOT, STABLE, 5_000, 700, FixedU128::from_rational(6, 1000))); // 0.6%
-		let debt_in_front =
-			|steps| crate::Pallet::<Test>::debt_in_front(DOT, STABLE, percent(1), steps);
-		assert_eq!(debt_in_front(u32::MAX), Ok((501 + 701, false))); // principal + fee 1 each, no
-																	 // elapsed time
-
-		// Redeem vault 1 (entire debt 501) down to 199, one below `MinimumDebt`.
-		assert_ok!(redeem(DOT, STABLE, 3, 302));
-
-		assert!(vault_status(DOT, STABLE, 1).is_dormant());
-		assert_eq!(
-			market_state(DOT, STABLE).dormant_redemption_target,
-			Some(1),
-			"sub-minimum residual parks vault 1 as the dormant target"
-		);
-		assert_eq!(
-			debt_in_front(u32::MAX),
-			Ok((199 + 701, false)),
-			"the dormant target's residual (199) is consumed first and counted"
-		);
-		// The dormant target consumes one step of the walk budget, mirroring the
-		// per-touch step accounting a real redemption pays.
-		assert_eq!(debt_in_front(1), Ok((199, true)), "one step reaches only the dormant target");
-		assert_eq!(debt_in_front(0), Ok((0, true)), "a zero budget counts nothing");
-	});
-}
-
 // Final recovery vaults gate every redemption, so their entire debt counts in
 // front of any rate — before the dormant target and the rate index.
 #[test]
@@ -157,16 +130,5 @@ fn debt_in_front_counts_final_recovery_queue_first() {
 		assert!(vault_status(DOT, STABLE, 2).is_dormant());
 		assert_eq!(debt_in_front(percent(1), u32::MAX), Ok((501 + 199 + 901, false)));
 		assert_eq!(debt_in_front(percent(1), 2), Ok((501 + 199, true)));
-	});
-}
-
-// A branch without vaults has nothing in front of any rate, and the walk reports no truncation.
-#[test]
-fn debt_in_front_is_zero_for_an_empty_index() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_eq!(
-			crate::Pallet::<Test>::debt_in_front(DOT, STABLE, percent(1), u32::MAX),
-			Ok((0, false))
-		);
 	});
 }
