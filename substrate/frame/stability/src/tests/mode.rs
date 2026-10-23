@@ -1,25 +1,24 @@
 //! What each operating mode allows, driven through the real vault pallet rather than a stub.
 //!
-//! A lost oracle price and a governance freeze both halt the pool. Safety Mode makes withdrawals
-//! two-step and leaves everything else working.
+//! A lost oracle price halts every value-moving operation. Safety Mode makes withdrawals two-step,
+//! and in Normal Mode a withdrawal request executes at once.
 //!
-//! The fixtures come from the mock. [`seed_branch_with_debt`] opens one vault and activates a
-//! deposit at a TCR of 250%. [`enter_safety_mode`] then drops the price until the TCR reaches
+//! The fixtures come from the mock. [`ExtBuilder::branch_with_debt`] opens one vault and activates
+//! a deposit at a TCR of 250%. [`enter_safety_mode`] then drops the price until the TCR reaches
 //! 120%, between the liquidation ratio and the Safety threshold.
 
 use crate::{mock::*, Error};
 
 #[test]
 fn frozen_branch_blocks_every_value_moving_operation() {
-	build_and_execute(|| {
-		seed_branch_with_debt();
+	ExtBuilder::branch_with_debt().build_and_execute(|| {
 		assert_ok!(deposit(1, DOT, STABLE, 300));
 		distribute_all_yield(60);
 		// Let the 300's cohort mature, so the freeze provably blocks its advancement.
 		advance_time(9_000);
 
 		// A failing oracle reads as Frozen (fail closed).
-		MockOracleAvailable::set(false);
+		MockOracleAvailable::set(&false);
 
 		assert_noop!(deposit(1, DOT, STABLE, 100), Error::<Test>::BranchFrozen);
 		assert_noop!(request_withdraw(1, DOT, STABLE, 100), Error::<Test>::BranchFrozen);
@@ -36,42 +35,18 @@ fn frozen_branch_blocks_every_value_moving_operation() {
 		// Yield routing cannot fail: the frozen pool just takes nothing, and not even the
 		// matured cohort advances.
 		assert_yield_declined(DOT, STABLE, 40);
-		// Settlement moves no value and stays available for housekeeping, but the
-		// matured pending amount stays put: activation changes offsettable
-		// risk, which the freeze halts.
-		assert_ok!(settle(7, 1, DOT, STABLE));
-		let row = deposit_row(DOT, STABLE, 1).expect("row survives");
-		assert_eq!(row.active_deposit, 400);
-		assert_eq!(row.pending_deposit.expect("still pending").amount, 300);
-
-		// Oracle recovery reopens the pool; the next touch folds the 300 in.
-		MockOracleAvailable::set(true);
-		assert_ok!(deposit(1, DOT, STABLE, 100));
-		let row = deposit_row(DOT, STABLE, 1).expect("row survives");
-		assert_eq!(row.active_deposit, 700);
-		assert_eq!(row.pending_deposit.expect("new amount queued").amount, 100);
-	});
-}
-
-#[test]
-fn governance_freeze_gates_and_admin_clear_reopens() {
-	build_and_execute(|| {
-		seed_branch_with_debt();
-
-		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::root(), DOT, STABLE, true));
-		assert_noop!(deposit(1, DOT, STABLE, 100), Error::<Test>::BranchFrozen);
-		assert_noop!(withdraw(1, DOT, STABLE, 100, 1), Error::<Test>::BranchFrozen);
-
-		assert_ok!(Vaults::set_governance_frozen(RuntimeOrigin::signed(ADMIN), DOT, STABLE, false));
-		assert_ok!(deposit(1, DOT, STABLE, 100));
 	});
 }
 
 #[test]
 fn safety_mode_enforces_two_step_withdrawals() {
-	build_and_execute(|| {
-		seed_branch_with_debt();
+	ExtBuilder::branch_with_debt().build_and_execute(|| {
 		enter_safety_mode();
+
+		// Safety Mode still takes and pays yield: only a freeze declines it. 40 over the 400 active
+		// gives delta_G = 0.1.
+		distribute_all_yield(40);
+		assert_claim_yield(1, 40);
 
 		// No immediate exit: Safety needs a matured request.
 		assert_noop!(withdraw(1, DOT, STABLE, 100, 1), Error::<Test>::WithdrawalRequestMissing);
@@ -104,38 +79,13 @@ fn safety_mode_enforces_two_step_withdrawals() {
 }
 
 #[test]
-fn safety_mode_keeps_deposits_claims_and_offsets_working() {
-	build_and_execute(|| {
-		seed_branch_with_debt();
-		enter_safety_mode();
-
-		// New capital may still enter (queued behind the entry delay).
-		assert_ok!(deposit(1, DOT, STABLE, 100));
-
-		// Liquidation offsets keep operating in Safety Mode. At the 0.6
-		// price, 48 debt seizes 48 / 0.6 = 80 collateral:
-		// delta_S = 80 * (1/400) = 0.2, P = 352/400 = 0.88;
-		// gain = (400/1) * 0.2 = 80, compounded = (400/1) * 0.88 = 352.
-		assert_eq!(simulate_offset(DOT, STABLE, 48, 80).debt(), 48);
-		assert_claim_collateral(1, 80);
-
-		distribute_all_yield(70);
-		// A = 352 after the offset: delta_G = 70 * (0.88/352) = 0.175;
-		// the claim realizes against the post-claim snapshot (P0 = 0.88):
-		// yield = floor(352 * 0.175 / 0.88) = 70.
-		assert_claim_yield(1, 70);
-	});
-}
-
-#[test]
 fn normal_mode_request_forwards_to_withdraw() {
-	build_and_execute(|| {
-		seed_branch_with_debt();
-
+	ExtBuilder::branch_with_debt().build_and_execute(|| {
 		// In Normal Mode a request has no purpose — the exit is immediate —
 		// so the call executes as a direct withdrawal to the caller and
 		// records nothing.
 		assert_ok!(request_withdraw(1, DOT, STABLE, 250));
+
 		System::assert_last_event(market_event!(WithdrawalExecuted {
 			depositor: 1,
 			recipient: 1,

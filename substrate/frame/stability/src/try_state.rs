@@ -1,15 +1,19 @@
 //! `try-runtime` checks for stability-pool accounting invariants.
 //!
-//! These checks protect four contracts:
+//! These checks protect five contracts:
 //!
 //! - Accumulators stay within the configured precision limits.
+//! - Each leg's sums rows run gap-free within an epoch and never lead the leg's coordinates.
 //! - Pool custody equals the recorded stablecoin and collateral totals.
-//! - The sum of user positions does not exceed each pool total.
+//! - The sum of user positions does not exceed each pool total, and no stored row is empty.
 //! - Cohort aggregates and checkpoints cover all member rows that reference them.
 
 use crate::{
-	pallet::{BalanceOf, CohortCheckpoints, Config, Deposits, Pallet, PoolSumsStore, Pools},
-	types::{CohortId, Leg},
+	pallet::{
+		BalanceOf, CohortCheckpoints, CollateralIdOf, Config, Deposits, Pallet, PoolSumsStore,
+		Pools, StableIdOf,
+	},
+	types::{CohortId, Leg, LegCoords},
 };
 use alloc::collections::BTreeMap;
 use frame::{
@@ -50,15 +54,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				)),
 				"current `(epoch, scale)` has no sums row"
 			);
-		}
-		// Pending deposits earn no yield. Sharing the row type with the active leg must never let
-		// a yield sum in through the back door.
-		for (_, sums) in PoolSumsStore::<T>::iter_prefix((
-			collateral_id.clone(),
-			stable_id.clone(),
-			Leg::Pending,
-		)) {
-			ensure!(sums.g_yield.is_zero(), "pending sums row carries a nonzero `G`");
+			check_sums_rows::<T>(&collateral_id, &stable_id, leg, coords.position())?;
 		}
 
 		// This holds as an equality, not as an inequality: every stablecoin that enters or leaves
@@ -251,6 +247,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		let state = Pools::<T>::get(&collateral_id, &stable_id)
 			.ok_or("deposit row without a pool row")?
 			.state;
+		// The deposit commit removes a row once it holds no value, so none may be stored.
+		ensure!(!deposit.is_empty(), "empty deposit row was not removed");
 		ensure!(
 			deposit.snapshot.coords.epoch <= state.coords.epoch,
 			"deposit snapshot epoch ahead of the pool"
@@ -294,6 +292,42 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			Pools::<T>::contains_key(&collateral_id, &stable_id),
 			"cohort checkpoint without a pool row"
 		);
+	}
+	Ok(())
+}
+
+/// Checks the sums rows of one leg against the leg's current `position`.
+///
+/// Within each epoch the scales must run from zero to their maximum without a gap, because
+/// `Pallet::sums_window` ends a settlement window at the first absent scale: a gap would silently
+/// drop the gains recorded beyond it. Offsets only ever seed rows up to the coordinates they move
+/// the leg to, so no row may lie ahead of `position`.
+fn check_sums_rows<T: Config>(
+	collateral_id: &CollateralIdOf<T>,
+	stable_id: &StableIdOf<T>,
+	leg: Leg,
+	position: LegCoords,
+) -> Result<(), TryRuntimeError> {
+	// Row iteration is hashed, so collect each epoch's highest scale and row count first.
+	let mut epochs = BTreeMap::<u32, (u32, u32)>::new();
+	for ((epoch, scale), sums) in
+		PoolSumsStore::<T>::iter_prefix((collateral_id.clone(), stable_id.clone(), leg))
+	{
+		ensure!(LegCoords { epoch, scale } <= position, "sums row ahead of the leg's coordinates");
+		match leg {
+			// Pending deposits earn no yield. Sharing the row type with the active leg must never
+			// let a yield sum in through the back door.
+			Leg::Pending => {
+				ensure!(sums.g_yield.is_zero(), "pending sums row carries a nonzero `G`");
+			},
+			Leg::Active => {},
+		}
+		let (scale_max, count) = epochs.entry(epoch).or_default();
+		*scale_max = (*scale_max).max(scale);
+		count.saturating_accrue(1);
+	}
+	for (scale_max, count) in epochs.values() {
+		ensure!(scale_max.checked_add(1) == Some(*count), "sums rows of an epoch have a scale gap");
 	}
 	Ok(())
 }

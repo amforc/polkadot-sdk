@@ -583,61 +583,61 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn config_validation_accepts_reference_and_boundary_parameters() {
-		// The reference sits on the product boundary: p_min * scale_factor = 1e-9 * 1e9 = 1.
-		assert!(valid_config().is_valid());
-		// Zero delays are legitimate governance choices (they disable the
-		// respective protection), zero yield share as well.
+	/// The reference configuration with `mutate` applied.
+	fn valid_config_with(
+		mutate: impl FnOnce(&mut StabilityPoolConfig<u128>),
+	) -> StabilityPoolConfig<u128> {
 		let mut config = valid_config();
-		config.entry_delay = 0;
-		config.safety_withdrawal_delay = 0;
-		config.yield_share = Permill::zero();
-		assert!(config.is_valid());
-
-		// The smallest useful rescale: 1e-9 * 1e3 = 1e-6 <= 1.
-		let mut config = valid_config();
-		config.precision.scale_factor = 1_000;
-		assert!(config.is_valid());
-
-		// The largest rescale the u128 overflow guard allows. `p_min` drops to 1e-11 so that
-		// the product stays at 1e-11 * 1e10 = 0.1 <= 1.
-		let mut config = valid_config();
-		config.precision.p_min = FixedU128::from_inner(10_000_000);
-		config.precision.scale_factor = 10_000_000_000;
-		assert!(config.is_valid());
+		mutate(&mut config);
+		config
 	}
 
 	#[test]
-	fn config_validation_rejects_broken_parameters() {
-		let mut config = valid_config();
-		config.minimum_deposit = 0;
-		assert!(!config.is_valid());
+	fn config_validation_accepts_the_boundaries() {
+		// The reference sits on the product boundary: p_min * scale_factor = 1e-9 * 1e9 = 1.
+		assert!(valid_config().is_valid());
+		// Zero delays are legitimate governance choices (they disable the respective
+		// protection), zero yield share as well.
+		assert!(valid_config_with(|config| {
+			config.entry_delay = 0;
+			config.safety_withdrawal_delay = 0;
+			config.yield_share = Permill::zero();
+		})
+		.is_valid());
+		// The smallest useful rescale: 1e-9 * 1e3 = 1e-6 <= 1.
+		assert!(valid_config_with(|config| config.precision.scale_factor = 1_000).is_valid());
+		// The largest rescale the u128 overflow guard allows. `p_min` drops to 1e-11 so that the
+		// product stays at 1e-11 * 1e10 = 0.1 <= 1.
+		assert!(valid_config_with(|config| {
+			config.precision.p_min = FixedU128::from_inner(10_000_000);
+			config.precision.scale_factor = 10_000_000_000;
+		})
+		.is_valid());
+	}
 
-		let mut config = valid_config();
-		config.minimum_active_pool_balance = 0;
-		assert!(!config.is_valid());
+	#[test]
+	fn config_validation_rejects_zero_minimums() {
+		assert!(!valid_config_with(|config| config.minimum_deposit = 0).is_valid());
+		assert!(!valid_config_with(|config| config.minimum_active_pool_balance = 0).is_valid());
+		assert!(!valid_config_with(|config| config.precision.p_min = FixedU128::zero()).is_valid());
+	}
 
-		let mut config = valid_config();
-		config.precision.p_min = FixedU128::zero();
-		assert!(!config.is_valid());
-
+	#[test]
+	fn config_validation_rejects_unsupported_rescales() {
 		// Below the minimum useful rescale. The product 1e-9 * 999 stays under one, so only the
 		// lower bound can reject it.
-		let mut config = valid_config();
-		config.precision.scale_factor = 999;
-		assert!(!config.is_valid());
-
+		assert!(!valid_config_with(|config| config.precision.scale_factor = 999).is_valid());
 		// Above the u128 overflow guard (1e10). With `p_min` at 1e-11 the product is
 		// 1e-11 * (1e10 + 1) = 0.10000000001 <= 1, so only the upper bound can reject it.
-		let mut config = valid_config();
-		config.precision.p_min = FixedU128::from_inner(10_000_000);
-		config.precision.scale_factor = 10_000_000_001;
-		assert!(!config.is_valid());
-
+		assert!(!valid_config_with(|config| {
+			config.precision.p_min = FixedU128::from_inner(10_000_000);
+			config.precision.scale_factor = 10_000_000_001;
+		})
+		.is_valid());
 		// A rescale would push P above one: p_min * scale_factor > 1.
-		let mut config = valid_config();
-		config.precision.p_min = FixedU128::from_inner(2_000_000_000);
-		assert!(!config.is_valid());
+		assert!(!valid_config_with(|config| {
+			config.precision.p_min = FixedU128::from_inner(2_000_000_000);
+		})
+		.is_valid());
 	}
 }
