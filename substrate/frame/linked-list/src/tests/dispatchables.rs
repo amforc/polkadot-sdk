@@ -20,17 +20,11 @@ use frame::testing_prelude::{
 	assert_err_ignore_postinfo, assert_noop, assert_ok, assert_storage_noop,
 };
 
-/// Drift the authoritative priority of `item` away from its stored one, so `reprioritize` has
-/// something to correct.
-fn set_real_priority(list_id: ListId, item: ItemId, priority: Priority) {
-	StaticPriorityProvider::pin_priority(list_id, item, priority);
-}
-
 #[test]
 fn reprioritize_no_op_when_priority_unchanged() {
 	build_and_execute(|| {
 		insert(1, 100, 50);
-		set_real_priority(1, 100, 50);
+		StaticPriorityProvider::pin_priority(1, 100, 50);
 		assert_ok!(LinkedList::reprioritize(
 			RuntimeOrigin::signed(1),
 			1,
@@ -48,7 +42,7 @@ fn reprioritize_repositions_when_priority_changes() {
 		insert(1, 2, 50);
 		insert(1, 3, 10);
 		// Real priority for item 2 just rose to 99; reprioritize should move it to head.
-		set_real_priority(1, 2, 99);
+		StaticPriorityProvider::pin_priority(1, 2, 99);
 		// Hint: target's new neighbors (None, Some(1)): head insertion.
 		assert_ok!(LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, Position::at_head(1)));
 		assert_eq!(dump(1), vec![(2, 99), (1, 90), (3, 10)]);
@@ -112,7 +106,7 @@ fn reprioritize_with_stale_hint_within_budget_succeeds() {
 		insert(1, 3, 10);
 		// Real priority for item 2 just rose to 99; the caller's hint is stale
 		// (tail region) but the correct head position is within budget.
-		set_real_priority(1, 2, 99);
+		StaticPriorityProvider::pin_priority(1, 2, 99);
 		assert_ok!(LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, Position::at_tail(3)));
 		assert_eq!(dump(1), vec![(2, 99), (1, 90), (3, 10)]);
 	});
@@ -139,7 +133,7 @@ fn re_insert_steps_needed_predicts_dispatch_failure() {
 		let re_insert_steps = LinkedList::re_insert_steps_needed(&1, &2, 55, hint.clone());
 		assert!(re_insert_steps > MaxHintRepairSteps::get());
 		// And the dispatch agrees with it, not with `repair_steps_needed`.
-		set_real_priority(1, 2, 55);
+		StaticPriorityProvider::pin_priority(1, 2, 55);
 		assert_noop!(
 			LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, hint),
 			Error::<Test>::List(ListError::InvalidPositionHints)
@@ -158,7 +152,7 @@ fn re_insert_steps_needed_zero_for_in_place_despite_garbage_hint() {
 		// 85 still fits between 1 (100) and 3 (80): in-place fast path.
 		let garbage_hint = Position::between(98, 99);
 		assert_eq!(LinkedList::re_insert_steps_needed(&1, &2, 85, garbage_hint.clone(),), 0);
-		set_real_priority(1, 2, 85);
+		StaticPriorityProvider::pin_priority(1, 2, 85);
 		assert_ok!(LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, garbage_hint));
 		assert_eq!(dump(1), vec![(1, 100), (2, 85), (3, 80)]);
 	});
@@ -184,7 +178,7 @@ fn reprioritize_with_hint_beyond_budget_errors() {
 		let tail = u64::from(build_long_chain());
 		// Tail item drifts up to 200; correct position is the head, but the
 		// supplied hint is at the tail and the budget cannot bridge that gap.
-		set_real_priority(1, tail, 200);
+		StaticPriorityProvider::pin_priority(1, tail, 200);
 		assert_noop!(
 			LinkedList::reprioritize(
 				RuntimeOrigin::signed(1),
