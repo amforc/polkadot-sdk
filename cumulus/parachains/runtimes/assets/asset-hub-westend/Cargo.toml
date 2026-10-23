@@ -49,6 +49,7 @@ pallet-delegated-staking = { workspace = true }
 pallet-election-provider-multi-block = { workspace = true }
 pallet-fast-unstake = { workspace = true }
 pallet-indices = { workspace = true }
+pallet-linked-list = { workspace = true }
 pallet-meta-tx = { workspace = true }
 pallet-migrations = { workspace = true }
 pallet-multi-asset-bounties = { workspace = true }
@@ -64,10 +65,12 @@ pallet-preimage = { workspace = true }
 pallet-proxy = { workspace = true }
 pallet-psm = { workspace = true }
 pallet-recovery = { workspace = true }
+pallet-redemptions = { workspace = true }
 pallet-referenda = { workspace = true }
 pallet-revive = { workspace = true }
 pallet-scheduler = { workspace = true }
 pallet-session = { workspace = true }
+pallet-stability = { workspace = true }
 pallet-staking = { workspace = true }
 pallet-staking-async = { workspace = true }
 pallet-staking-async-rc-client = { workspace = true, features = ["xcm-sender"] }
@@ -80,6 +83,7 @@ pallet-transaction-payment-rpc-runtime-api = { workspace = true }
 pallet-treasury = { workspace = true }
 pallet-uniques = { workspace = true }
 pallet-utility = { workspace = true }
+pallet-vaults = { workspace = true }
 pallet-verify-signature = { workspace = true }
 pallet-vesting = { workspace = true }
 pallet-vesting-precompiles = { workspace = true }
@@ -142,6 +146,7 @@ pallet-dap = { workspace = true }
 pallet-message-queue = { workspace = true }
 parachain-info = { workspace = true }
 parachains-common = { workspace = true }
+stablecoin-primitives = { workspace = true }
 testnet-parachains-constants = { features = ["westend"], workspace = true }
 
 # Bridges
@@ -205,6 +210,7 @@ runtime-benchmarks = [
 	"pallet-election-provider-multi-block/runtime-benchmarks",
 	"pallet-fast-unstake/runtime-benchmarks",
 	"pallet-indices/runtime-benchmarks",
+	"pallet-linked-list/runtime-benchmarks",
 	"pallet-message-queue/runtime-benchmarks",
 	"pallet-meta-tx/runtime-benchmarks",
 	"pallet-migrations/runtime-benchmarks",
@@ -219,10 +225,12 @@ runtime-benchmarks = [
 	"pallet-proxy/runtime-benchmarks",
 	"pallet-psm/runtime-benchmarks",
 	"pallet-recovery/runtime-benchmarks",
+	"pallet-redemptions/runtime-benchmarks",
 	"pallet-referenda/runtime-benchmarks",
 	"pallet-revive/runtime-benchmarks",
 	"pallet-scheduler/runtime-benchmarks",
 	"pallet-session/runtime-benchmarks",
+	"pallet-stability/runtime-benchmarks",
 	"pallet-staking-async-rc-client/runtime-benchmarks",
 	"pallet-staking-async/runtime-benchmarks",
 	"pallet-staking/runtime-benchmarks",
@@ -233,6 +241,7 @@ runtime-benchmarks = [
 	"pallet-treasury/runtime-benchmarks",
 	"pallet-uniques/runtime-benchmarks",
 	"pallet-utility/runtime-benchmarks",
+	"pallet-vaults/runtime-benchmarks",
 	"pallet-verify-signature/runtime-benchmarks",
 	"pallet-vesting-precompiles/runtime-benchmarks",
 	"pallet-vesting/runtime-benchmarks",
@@ -250,6 +259,7 @@ runtime-benchmarks = [
 	"snowbridge-runtime-common/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
 	"sp-staking/runtime-benchmarks",
+	"stablecoin-primitives/runtime-benchmarks",
 	"westend-runtime-constants/runtime-benchmarks",
 	"westend-runtime/runtime-benchmarks",
 	"xcm-builder/runtime-benchmarks",
@@ -292,6 +302,7 @@ try-runtime = [
 	"pallet-election-provider-multi-block/try-runtime",
 	"pallet-fast-unstake/try-runtime",
 	"pallet-indices/try-runtime",
+	"pallet-linked-list/try-runtime",
 	"pallet-message-queue/try-runtime",
 	"pallet-meta-tx/try-runtime",
 	"pallet-migrations/try-runtime",
@@ -305,10 +316,12 @@ try-runtime = [
 	"pallet-proxy/try-runtime",
 	"pallet-psm/try-runtime",
 	"pallet-recovery/try-runtime",
+	"pallet-redemptions/try-runtime",
 	"pallet-referenda/try-runtime",
 	"pallet-revive/try-runtime",
 	"pallet-scheduler/try-runtime",
 	"pallet-session/try-runtime",
+	"pallet-stability/try-runtime",
 	"pallet-staking-async-rc-client/try-runtime",
 	"pallet-staking-async/try-runtime",
 	"pallet-staking/try-runtime",
@@ -319,6 +332,7 @@ try-runtime = [
 	"pallet-treasury/try-runtime",
 	"pallet-uniques/try-runtime",
 	"pallet-utility/try-runtime",
+	"pallet-vaults/try-runtime",
 	"pallet-verify-signature/try-runtime",
 	"pallet-vesting-precompiles/try-runtime",
 	"pallet-vesting/try-runtime",
@@ -333,6 +347,7 @@ try-runtime = [
 	"snowbridge-pallet-system-frontend/try-runtime",
 	"snowbridge-runtime-common/try-runtime",
 	"sp-runtime/try-runtime",
+	"stablecoin-primitives/try-runtime",
 	"westend-runtime/try-runtime",
 ]
 std = [
@@ -384,6 +399,7 @@ std = [
 	"pallet-election-provider-multi-block/std",
 	"pallet-fast-unstake/std",
 	"pallet-indices/std",
+	"pallet-linked-list/std",
 	"pallet-message-queue/std",
 	"pallet-meta-tx/std",
 	"pallet-migrations/std",
@@ -400,10 +416,12 @@ std = [
 	"pallet-proxy/std",
 	"pallet-psm/std",
 	"pallet-recovery/std",
+	"pallet-redemptions/std",
 	"pallet-referenda/std",
 	"pallet-revive/std",
 	"pallet-scheduler/std",
 	"pallet-session/std",
+	"pallet-stability/std",
 	"pallet-staking-async-rc-client/std",
 	"pallet-staking-async/std",
 	"pallet-staking-runtime-api/std",
@@ -416,6 +434,7 @@ std = [
 	"pallet-treasury/std",
 	"pallet-uniques/std",
 	"pallet-utility/std",
+	"pallet-vaults/std",
 	"pallet-verify-signature/std",
 	"pallet-vesting-precompiles/std",
 	"pallet-vesting/std",
@@ -458,6 +477,7 @@ std = [
 	"sp-storage/std",
 	"sp-transaction-pool/std",
 	"sp-version/std",
+	"stablecoin-primitives/std",
 	"substrate-wasm-builder",
 	"testnet-parachains-constants/std",
 	"tracing/std",
