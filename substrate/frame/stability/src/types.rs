@@ -54,7 +54,7 @@ impl Accumulators {
 	/// Returns loss-free coordinates with `P = 1`, epoch zero, and scale zero.
 	///
 	/// A new pool leg uses these coordinates so its first deposit has no prior loss.
-	pub fn fresh() -> Self {
+	pub(crate) fn fresh() -> Self {
 		Self { p: FixedU128::one(), epoch: 0, scale: 0 }
 	}
 
@@ -79,6 +79,17 @@ pub enum Leg {
 impl Leg {
 	/// Both legs in risk-priority order.
 	pub const ALL: [Self; 2] = [Self::Active, Self::Pending];
+
+	/// Returns `true` for the leg whose capital is grouped into maturity cohorts.
+	///
+	/// Cohort reserves round up against this leg's total, so its offsets must keep every reserve
+	/// funded and revalue the reserves at the new coordinates.
+	pub(crate) const fn holds_cohorts(self) -> bool {
+		match self {
+			Self::Active => false,
+			Self::Pending => true,
+		}
+	}
 }
 
 /// Gains per deposit unit at one `(epoch, scale)` coordinate.
@@ -104,7 +115,7 @@ pub struct DepositSnapshot {
 	pub sums: PoolSums,
 }
 
-/// Stable identifier of one maturity cohort in one market.
+/// Stable identifier of one maturity cohort in one branch.
 ///
 /// Identifiers increase from zero, and the pallet does not reuse them. The identifier remains
 /// valid if governance causes a cohort deadline to move later.
@@ -140,10 +151,11 @@ pub struct OpenCohort<Balance> {
 	pub deadline: Millis,
 	/// Deposit rows that reference this cohort.
 	pub members: u32,
-	/// Aggregate capital at `coords`, with upward rounding.
+	/// Aggregate capital at the live pending coordinates, with upward rounding.
 	///
 	/// It is not less than the sum of the member claims. Thus, activation cannot create an
-	/// underfunded active deposit. The rounding difference remains unowned in the pool totals.
+	/// underfunded active deposit. Pending offsets also keep the sum of cohort reserves within
+	/// the pending total. The rounding difference remains unowned in the pool totals.
 	pub amount: Balance,
 	/// Pending-leg coordinates of `amount`. A member snapshot cannot be ahead of these
 	/// coordinates.
@@ -161,7 +173,7 @@ pub type MaxOpenCohorts = ConstU32<2>;
 
 impl<Balance: FixedPointOperand> OpenCohort<Balance> {
 	/// Returns an empty cohort at `deadline` and the current pending coordinates.
-	pub fn fresh(id: CohortId, deadline: Millis, coords: Accumulators) -> Self {
+	pub(crate) fn fresh(id: CohortId, deadline: Millis, coords: Accumulators) -> Self {
 		Self { id, deadline, members: 0, amount: Balance::zero(), coords }
 	}
 
@@ -169,7 +181,7 @@ impl<Balance: FixedPointOperand> OpenCohort<Balance> {
 	///
 	/// Upward rounding keeps the aggregate sufficient for all downward-rounded member claims. The
 	/// coordinate update also keeps each member snapshot at or behind the aggregate.
-	pub fn revalue(&mut self, live: &Accumulators, sf_int: u128) {
+	pub(crate) fn revalue(&mut self, live: &Accumulators, sf_int: u128) {
 		self.amount = math::compound_ceil(self.amount, &self.coords, live, sf_int);
 		self.coords = *live;
 	}
@@ -185,7 +197,7 @@ pub struct CohortCheckpoint<Balance> {
 	pub pending_end: DepositSnapshot,
 	/// Start of each member's active phase.
 	pub active_start: DepositSnapshot,
-	/// Cohort value at activation, before the pool-total clamp.
+	/// Capital moved from pending to active at activation.
 	///
 	/// This value is an upper bound for all member claims and keeps their sum at or below
 	/// activated capital.
@@ -198,7 +210,7 @@ pub struct CohortCheckpoint<Balance> {
 ///
 /// A deposit can lag by `math::SCALE_SPAN` scale boundaries. Settlement includes each applicable
 /// row so the depositor keeps all supported gains.
-pub struct SumsWindow {
+pub(crate) struct SumsWindow {
 	/// The row at the coordinates of the snapshot.
 	pub snap: PoolSums,
 	/// The rows at the scales that follow, in order. An absent row reads as zero.
@@ -254,9 +266,9 @@ impl PoolPrecision {
 
 /// Settlement result for a deposit at the current accumulators.
 #[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
-pub struct Realized<Balance> {
+pub(crate) struct Realized<Balance> {
 	/// Deposit principal that remains after all applicable offsets.
-	pub compounded: Balance,
+	pub remaining_principal: Balance,
 	/// The collateral it earned.
 	pub collateral_gain: Balance,
 	/// The stablecoin yield it earned.
@@ -265,7 +277,7 @@ pub struct Realized<Balance> {
 
 /// Effect of an offset on `P`.
 #[cfg_attr(any(test, feature = "test-utils"), derive(PartialEq, Debug))]
-pub enum PUpdate {
+pub(crate) enum PUpdate {
 	/// The leg remains with a smaller `P`. `scales_crossed` counts the rescale operations that
 	/// keep `P` at or above `p_min`.
 	Updated { new_p: FixedU128, scales_crossed: u32 },
@@ -273,7 +285,7 @@ pub enum PUpdate {
 	Depleted,
 }
 
-/// Position of one account in one market.
+/// Position of one account in one branch.
 ///
 /// `active_deposit` is the amount at the last settlement. Each row operation must first apply the
 /// current loss and gain accumulators.
@@ -299,7 +311,7 @@ pub struct Deposit<Balance> {
 
 impl<Balance: Zero> Deposit<Balance> {
 	/// Returns an empty position at the specified snapshot.
-	pub fn fresh(snapshot: DepositSnapshot) -> Self {
+	pub(crate) fn fresh(snapshot: DepositSnapshot) -> Self {
 		Self {
 			active_deposit: Balance::zero(),
 			snapshot,
@@ -386,12 +398,12 @@ impl<Balance> PoolState<Balance> {
 	}
 
 	/// Returns the open cohort with `id` for mutation.
-	pub fn cohort_mut(&mut self, id: CohortId) -> Option<&mut OpenCohort<Balance>> {
+	pub(crate) fn cohort_mut(&mut self, id: CohortId) -> Option<&mut OpenCohort<Balance>> {
 		self.open_cohorts.iter_mut().find(|cohort| cohort.id == id)
 	}
 
 	/// Removes the open cohort with `id`.
-	pub fn remove_cohort(&mut self, id: CohortId) {
+	pub(crate) fn remove_cohort(&mut self, id: CohortId) {
 		self.open_cohorts.retain(|cohort| cohort.id != id);
 	}
 
@@ -415,7 +427,7 @@ impl<Balance> PoolState<Balance> {
 	}
 
 	/// Returns the current coordinates of `leg` for mutation.
-	pub fn coords_mut(&mut self, leg: Leg) -> &mut Accumulators {
+	pub(crate) fn coords_mut(&mut self, leg: Leg) -> &mut Accumulators {
 		match leg {
 			Leg::Active => &mut self.coords,
 			Leg::Pending => &mut self.pending_coords,
@@ -423,7 +435,7 @@ impl<Balance> PoolState<Balance> {
 	}
 
 	/// Returns the deposit total of `leg` for mutation.
-	pub fn total_mut(&mut self, leg: Leg) -> &mut Balance {
+	pub(crate) fn total_mut(&mut self, leg: Leg) -> &mut Balance {
 		match leg {
 			Leg::Active => &mut self.total_active_deposits,
 			Leg::Pending => &mut self.total_pending_deposits,
@@ -431,7 +443,7 @@ impl<Balance> PoolState<Balance> {
 	}
 
 	/// Returns a snapshot of `leg` with its current coordinates and `sums`.
-	pub fn snapshot(&self, leg: Leg, sums: &PoolSums) -> DepositSnapshot {
+	pub(crate) fn snapshot(&self, leg: Leg, sums: &PoolSums) -> DepositSnapshot {
 		DepositSnapshot { coords: *self.coords(leg), sums: *sums }
 	}
 }
@@ -448,7 +460,7 @@ impl<Balance: Copy> PoolState<Balance> {
 
 impl<Balance: Zero> PoolState<Balance> {
 	/// Returns an empty pool state with `P = 1` on both legs.
-	pub fn fresh() -> Self {
+	pub(crate) fn fresh() -> Self {
 		Self {
 			total_active_deposits: Balance::zero(),
 			total_pending_deposits: Balance::zero(),
@@ -463,10 +475,29 @@ impl<Balance: Zero> PoolState<Balance> {
 }
 
 impl<Balance: FixedPointOperand> PoolState<Balance> {
+	/// Whether the pending total covers every cohort's reserve at `live`.
+	///
+	/// At most two cohorts are open, so this check does not visit deposit rows.
+	pub(crate) fn cohorts_covered(
+		&self,
+		live: &Accumulators,
+		sf_int: u128,
+		mut available: Balance,
+	) -> bool {
+		for cohort in &self.open_cohorts {
+			let amount = math::compound_ceil(cohort.amount, &cohort.coords, live, sf_int);
+			if amount > available {
+				return false;
+			}
+			available = available.saturating_sub(amount);
+		}
+		true
+	}
+
 	/// Returns the increase of `S` or `G` for `distributed` over the active pool.
 	///
 	/// Returns `None` when the active pool is empty or the product overflows.
-	pub fn delta_sum(&self, distributed: Balance) -> Option<FixedU128> {
+	pub(crate) fn delta_sum(&self, distributed: Balance) -> Option<FixedU128> {
 		math::delta_sum(distributed, self.coords.p, self.total_active_deposits)
 	}
 
@@ -485,16 +516,24 @@ impl<Balance: FixedPointOperand> PoolState<Balance> {
 	}
 }
 
-/// Governance parameters of one market's stability pool.
+/// Governance parameters of one branch's stability pool.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct StabilityPoolConfig<Balance> {
 	/// Smallest accepted deposit. This limit prevents positions with storage cost above their
 	/// value.
+	///
+	/// Only the amount of each incoming [`crate::Pallet::deposit`] is checked, including a top-up
+	/// of an existing position. Partial withdrawals, offsets and compounding can leave a position
+	/// below the limit, and raising the limit leaves existing positions as they are.
 	pub minimum_deposit: Balance,
 	/// Smallest active balance that a partial offset can leave. A full offset can empty the pool.
 	/// This limit protects the precision of `P`.
+	///
+	/// Only offsets are checked against it; withdrawals can take the active pool below it. Raising
+	/// the limit above the current active total therefore leaves no room for a partial offset,
+	/// and only an offset that empties the active pool remains possible.
 	pub minimum_active_pool_balance: Balance,
 	/// Minimum time before new capital can join the active pool.
 	pub entry_delay: Millis,
@@ -502,7 +541,7 @@ pub struct StabilityPoolConfig<Balance> {
 	pub safety_withdrawal_delay: Millis,
 	/// Precision policy for `P`. It cannot change after registration.
 	pub precision: PoolPrecision,
-	/// Share of market yield for active depositors. The yield caller retains the remainder.
+	/// Share of branch yield for active depositors. The yield caller retains the remainder.
 	pub yield_share: Permill,
 }
 
@@ -522,7 +561,7 @@ impl<Balance: Zero> StabilityPoolConfig<Balance> {
 	}
 }
 
-/// Configuration and accounting state of one market's pool.
+/// Configuration and accounting state of one branch's pool.
 ///
 /// Both parts share one lifecycle so configuration cannot exist without its accounting state.
 ///
@@ -543,18 +582,6 @@ pub struct StabilityPool<Balance> {
 	pub custody_stable: Balance,
 	/// Collateral float held by the pool account on top of the tracked totals.
 	pub custody_collateral: Balance,
-}
-
-impl<Balance: Zero> StabilityPool<Balance> {
-	/// Returns a registered pool with the specified parameters, the custody float parked in its
-	/// account, and an empty [`PoolState`].
-	pub fn fresh(
-		config: StabilityPoolConfig<Balance>,
-		custody_stable: Balance,
-		custody_collateral: Balance,
-	) -> Self {
-		Self { config, state: PoolState::fresh(), custody_stable, custody_collateral }
-	}
 }
 
 /// Source of stablecoin for a recovery offset.
