@@ -30,7 +30,7 @@ pub mod vault_interface;
 pub mod yield_routing;
 
 pub use branch_interface::{BranchInterface, BranchMode, BranchSnapshot};
-pub use debit::{debit_preservation, reducible_debit, refine_debit};
+pub use debit::{debit_preservation, reducible_debit};
 pub use math::{collateralization_ratio, mul_div_floor, mul_div_rate_floor};
 pub use oracle::{OraclePriceConversion, ProvidePrice};
 pub use origin::EnsureStableOwnerOrRoot;
@@ -64,24 +64,35 @@ pub enum VaultStatus {
 impl VaultStatus {
 	/// Returns `true` for [`Self::Active`].
 	pub fn is_active(&self) -> bool {
-		matches!(self, Self::Active)
+		match self {
+			Self::Active => true,
+			Self::Dormant | Self::FinalRecovery => false,
+		}
 	}
 
 	/// Returns `true` for [`Self::Dormant`].
 	pub fn is_dormant(&self) -> bool {
-		matches!(self, Self::Dormant)
+		match self {
+			Self::Dormant => true,
+			Self::Active | Self::FinalRecovery => false,
+		}
 	}
 
 	/// Returns `true` for [`Self::FinalRecovery`].
 	pub fn is_final_recovery(&self) -> bool {
-		matches!(self, Self::FinalRecovery)
+		match self {
+			Self::FinalRecovery => true,
+			Self::Active | Self::Dormant => false,
+		}
 	}
 }
 
 /// A debt amount and its collateral, for live positions or settlement amounts.
 #[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DebtCollateral<Balance> {
+	/// Debt, in stablecoin planck.
 	pub debt: Balance,
+	/// Collateral, in collateral-asset planck.
 	pub collateral: Balance,
 }
 
@@ -122,7 +133,7 @@ impl PartialOrd<FixedU128> for CollateralRatio {
 	}
 }
 
-/// Returns the pallet sub-account for a `(collateral, stable)` market.
+/// Returns the pallet sub-account for a `(collateral, stable)` branch.
 ///
 /// The seed is the Blake2-256 hash of the encoded pair, so long asset IDs are never truncated;
 /// distinct `PalletId`s keep sibling pallets' sub-accounts apart.

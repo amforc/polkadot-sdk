@@ -59,7 +59,7 @@ where
 ///
 /// `preserved` is the `Preserve` reducible balance. `expendable` returns the `Expendable` one
 /// and is called only when `limit > preserved`.
-pub fn refine_debit<Balance: Ord + Copy>(
+fn refine_debit<Balance: Ord + Copy>(
 	limit: Balance,
 	preserved: Balance,
 	expendable: impl FnOnce() -> Balance,
@@ -124,47 +124,68 @@ mod tests {
 
 	#[test]
 	fn preserving_requests_pass_through() {
-		assert_eq!(reducible_debit::<Funded, _>((), &0, 0), (0, Preservation::Preserve));
-		assert_eq!(reducible_debit::<Funded, _>((), &0, 90), (90, Preservation::Preserve));
+		// `Funded` holds 100 with a minimum balance of 10.
+
+		let nothing = reducible_debit::<Funded, _>((), &0, 0);
+		let down_to_minimum = reducible_debit::<Funded, _>((), &0, 90);
+
+		assert_eq!(nothing, (0, Preservation::Preserve));
+		assert_eq!(down_to_minimum, (90, Preservation::Preserve));
 	}
 
 	#[test]
 	fn dead_zone_rounds_down_to_the_preserving_limit() {
-		// 91..=99 all leave a sub-minimum remainder; the amount caps at 90.
+		// 91..=99 all leave a sub-minimum remainder.
 		for limit in [91, 95, 99] {
-			assert_eq!(reducible_debit::<Funded, _>((), &0, limit), (90, Preservation::Preserve));
+			let debit = reducible_debit::<Funded, _>((), &0, limit);
+
+			// The amount caps at 90.
+			assert_eq!(debit, (90, Preservation::Preserve), "limit = {limit}");
 		}
 	}
 
 	#[test]
 	fn full_or_overshooting_requests_drain() {
+		// Limits at or beyond the full balance of 100.
 		for limit in [100, 101, u64::MAX] {
-			assert_eq!(
-				reducible_debit::<Funded, _>((), &0, limit),
-				(100, Preservation::Expendable)
-			);
+			let debit = reducible_debit::<Funded, _>((), &0, limit);
+
+			assert_eq!(debit, (100, Preservation::Expendable), "limit = {limit}");
 		}
 	}
 
 	#[test]
 	fn empty_account_yields_a_zero_drain() {
+		// An account holding nothing.
 		type Empty = OneAccount<0, 10>;
-		assert_eq!(reducible_debit::<Empty, _>((), &0, 5), (0, Preservation::Expendable));
-		assert_eq!(reducible_debit::<Empty, _>((), &0, 0), (0, Preservation::Preserve));
+
+		let positive_request = reducible_debit::<Empty, _>((), &0, 5);
+		let zero_request = reducible_debit::<Empty, _>((), &0, 0);
+
+		assert_eq!(positive_request, (0, Preservation::Expendable));
+		assert_eq!(zero_request, (0, Preservation::Preserve));
 	}
 
 	#[test]
 	fn preservation_expends_only_a_full_drain() {
-		// Below and inside the dead zone stay `Preserve`: the implementation
-		// then either succeeds exactly (90) or rejects outright (95), never
-		// folding dust.
-		for amount in [0, 90, 95, 99] {
-			assert_eq!(debit_preservation::<Funded, _>((), &0, amount), Preservation::Preserve);
-		}
+		// Amounts that keep the minimum balance, and amounts that would
+		// leave less than it, stay `Preserve`: the implementation then either
+		// succeeds exactly (90) or rejects outright (95), never folding dust.
 		// The full balance and overshoots may consume the account; overshoots
 		// fail at the implementation as plain insufficient balance.
-		for amount in [100, 101, u64::MAX] {
-			assert_eq!(debit_preservation::<Funded, _>((), &0, amount), Preservation::Expendable);
+		let cases = [
+			(0, Preservation::Preserve),
+			(90, Preservation::Preserve),
+			(95, Preservation::Preserve),
+			(99, Preservation::Preserve),
+			(100, Preservation::Expendable),
+			(101, Preservation::Expendable),
+			(u64::MAX, Preservation::Expendable),
+		];
+		for (amount, expected) in cases {
+			let preservation = debit_preservation::<Funded, _>((), &0, amount);
+
+			assert_eq!(preservation, expected, "amount = {amount}");
 		}
 	}
 }
