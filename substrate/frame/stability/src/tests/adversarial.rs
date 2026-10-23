@@ -99,6 +99,85 @@ fn stable_shortfall_quotes_nothing_and_refuses_settlement() {
 }
 
 #[test]
+fn try_state_counts_unsettled_gains_against_the_unclaimed_totals() {
+	ExtBuilder::default()
+		.default_branch()
+		.matured_deposit(1, 400)
+		.deposit(2, 200)
+		.build_and_execute(|| {
+			assert_ok!(offset_with(
+				(DOT, STABLE),
+				branch_snapshot(&DOT, &STABLE),
+				OffsetLegs { active: 200, pending: 100 },
+				OffsetLegs { active: (DOT, 100), pending: (DOT, 50) }
+			));
+			distribute_all_yield(40);
+
+			// Every gain still sits in the accumulators, not in a row: the check must realize the
+			// active and the pending leg to see that the 150 collateral and 40 yield are all owed.
+			for who in [1, 2] {
+				let row = deposit_row(DOT, STABLE, who).expect("both rows exist");
+				assert_eq!(row.claimable_collateral, 0);
+				assert_eq!(row.claimable_yield, 0);
+			}
+			let state = pool_state(DOT, STABLE);
+			assert_eq!(state.total_collateral_gains_unclaimed, 150);
+			assert_eq!(state.total_yield_unclaimed, 40);
+			assert_ok!(crate::try_state::do_try_state::<Test>());
+
+			// One unit less on either total leaves custody covered, so only the claims check sees
+			// that the rows would claim more than the pool has recorded.
+			hypothetically!({
+				mutate_pool_state(DOT, STABLE, |state| state.total_collateral_gains_unclaimed -= 1);
+				assert_err!(
+					crate::try_state::do_try_state::<Test>(),
+					"claimable collateral exceeds `total_collateral_gains_unclaimed`"
+				);
+			});
+			hypothetically!({
+				mutate_pool_state(DOT, STABLE, |state| state.total_yield_unclaimed -= 1);
+				assert_err!(
+					crate::try_state::do_try_state::<Test>(),
+					"claimable yield exceeds `total_yield_unclaimed`"
+				);
+			});
+		});
+}
+
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "Defensive failure has been triggered!"))]
+fn missing_sums_row_fails_settlement_instead_of_reading_zero() {
+	ExtBuilder::default()
+		.default_branch()
+		.matured_deposit(1, 400)
+		.build_and_execute(|| {
+			assert_ok!(offset_with(
+				(DOT, STABLE),
+				branch_snapshot(&DOT, &STABLE),
+				OffsetLegs { active: 200, pending: 0 },
+				OffsetLegs { active: (DOT, 100), pending: (DOT, 0) }
+			));
+
+			// No path removes a row a live snapshot still needs, so this is corruption. The
+			// invariant check must name the gap. Reading the row as zero would settle
+			// the claim against made-up sums, so the settlement trips the defensive
+			// check instead: a panic with debug assertions, the error without.
+			hypothetically!({
+				crate::PoolSumsStore::<Test>::remove((DOT, STABLE, Leg::Active, 0u32, 0u32));
+
+				assert_err!(
+					crate::try_state::do_try_state::<Test>(),
+					"current `(epoch, scale)` has no sums row"
+				);
+				assert_err!(
+					claim_collateral(1, DOT, STABLE, 1),
+					crate::Error::<Test>::AccumulatorRowMissing
+				);
+			});
+		});
+}
+
+#[test]
 fn safety_withdraw_after_offset_cannot_overdraw_stale_request() {
 	ExtBuilder::branch_with_debt().build_and_execute(|| {
 		enter_safety_mode();

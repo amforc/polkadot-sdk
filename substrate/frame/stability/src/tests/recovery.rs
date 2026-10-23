@@ -8,7 +8,11 @@
 //! The active pool is the 400 that account 1 deposits and matures while the branch is still
 //! Normal, which also fixes the standing timestamp and accrued-interest figures.
 
-use crate::{mock::*, types::RecoveryOffsetSource, Error};
+use crate::{
+	mock::*,
+	types::{PoolPrecision, RecoveryOffsetSource},
+	Error,
+};
 use frame::prelude::ArithmeticError;
 use pallet_vaults::DebtBreakdown;
 
@@ -171,6 +175,57 @@ fn recovery_offset_error_paths() {
 		MockOracleAvailable::set(&false);
 
 		assert_noop!(offset_recovery(DOT, STABLE, 300), Error::<Test>::BranchFrozen);
+	});
+}
+
+/// The 2e9 active pool behind the standing vault, under the coarsest precision the pool accepts.
+const COARSE_POOL_TOTAL: Balance = 2_000_000_000;
+
+/// Recovery sizes its burn by the floor alone, and only the accounting checks `P`. The coarsest
+/// precision the pool accepts, `p_min = 1e-3` and `scale_factor = 1e3`, lets `P` fall by at most
+/// `1e6` across the two supported crossings before it must stay at or above `p_min`.
+///
+/// One survivor in 2e9 needs `P = 1e6 / 2e9 = 5e-4`, under `p_min`. Two survivors land on `p_min`
+/// exactly, which the pool still represents.
+fn coarse_precision_recovery_branch() -> ExtBuilder {
+	let coarse = StabilityPoolConfig {
+		minimum_active_pool_balance: 1,
+		precision: PoolPrecision {
+			p_min: FixedU128::from_rational(1u128, 1_000u128),
+			scale_factor: 1_000,
+		},
+		..default_pool_config()
+	};
+	// The standing vault scaled by 1e7, so the head can absorb the whole pool.
+	recovery_branch()
+		.pool_config(coarse)
+		.vault(5, 10_000_000_000, 4_980_000_000)
+		.matured_deposit(1, COARSE_POOL_TOTAL)
+}
+
+#[test]
+fn recovery_offset_past_the_supported_scale_range_is_refused() {
+	coarse_precision_recovery_branch().build_and_execute(|| {
+		set_price(DOT, PRICE_AT_104_PERCENT);
+		assert_ok!(enter_final_recovery(DOT, STABLE, 5));
+
+		// One survivor would need `P` under `p_min`.
+		assert_noop!(
+			offset_recovery(DOT, STABLE, COARSE_POOL_TOTAL - 1),
+			Error::<Test>::UnsupportedOffsetPrecision
+		);
+	});
+}
+
+#[test]
+fn recovery_offset_at_the_edge_of_the_supported_scale_range_settles() {
+	coarse_precision_recovery_branch().build_and_execute(|| {
+		set_price(DOT, PRICE_AT_104_PERCENT);
+		assert_ok!(enter_final_recovery(DOT, STABLE, 5));
+
+		// Two survivors land `P` on `p_min` exactly.
+		assert_ok!(offset_recovery(DOT, STABLE, COARSE_POOL_TOTAL - 2));
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 2);
 	});
 }
 

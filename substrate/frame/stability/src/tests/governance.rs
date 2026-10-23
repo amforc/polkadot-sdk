@@ -61,8 +61,19 @@ fn branch_registration_seeds_rows_and_removal_tears_them_down() {
 		assert_eq!(default_market_rows(), (0, 0));
 		// The refund took the float's provider with it, and the release took the pallet's.
 		assert_eq!(System::providers(&pool), 0);
-		// A never-used pool holds no dust; the zero-dust path stays silent.
-		assert_eq!(stability_events_since_last_call(), vec![]);
+		// The float is one minimum of each asset, which goes back whole, and a never-used pool
+		// holds no dust.
+		assert_eq!(
+			stability_events_since_last_call(),
+			vec![crate::Event::PoolRemoved {
+				collateral_id: DOT,
+				stable_id: STABLE,
+				stable_refund: 1,
+				collateral_refund: 1,
+				stable_dust: 0,
+				collateral_dust: 0,
+			}]
+		);
 	});
 }
 
@@ -87,6 +98,15 @@ fn assert_custody_float_follows(origin: RuntimeOrigin, funder: AccountId) {
 		let registered = crate::Pools::<Test>::get(&HIGH_MIN, STABLE).expect("pool registered");
 		assert_eq!(registered.custody_stable, 1);
 		assert_eq!(registered.custody_collateral, 1_000);
+		assert_eq!(
+			stability_events_since_last_call(),
+			vec![crate::Event::PoolRegistered {
+				collateral_id: HIGH_MIN,
+				stable_id: STABLE,
+				custody_stable: 1,
+				custody_collateral: 1_000,
+			}]
+		);
 		assert_eq!(collateral_balance(HIGH_MIN, pool), 1_000);
 		assert_eq!(stable_balance(STABLE, pool), 1);
 		// Vaults' redistribution seed is the other 1_000 the funder paid.
@@ -100,8 +120,17 @@ fn assert_custody_float_follows(origin: RuntimeOrigin, funder: AccountId) {
 		assert_eq!(stable_balance(STABLE, pool), 0);
 		assert_eq!(collateral_balance(HIGH_MIN, funder), collateral_before);
 		assert_eq!(stable_balance(STABLE, funder), stable_before);
-		// The float went back whole, so no dust was swept.
-		assert_eq!(stability_events_since_last_call(), vec![]);
+		assert_eq!(
+			stability_events_since_last_call(),
+			vec![crate::Event::PoolRemoved {
+				collateral_id: HIGH_MIN,
+				stable_id: STABLE,
+				stable_refund: 1,
+				collateral_refund: 1_000,
+				stable_dust: 0,
+				collateral_dust: 0,
+			}]
+		);
 	});
 }
 
@@ -150,27 +179,167 @@ fn branch_registration_error_paths() {
 		});
 
 		hypothetically!({
-			// Whoever creates the branch funds its redistribution seed: the depositor when there
-			// is one, the full admin otherwise. The withdrawal preserves the payer, so it needs two
-			// minimum balances on hand.
-			mint_collateral(HIGH_MIN, 1, 2_000);
-			let pool = Stability::pool_account(&HIGH_MIN, &STABLE);
-			mint_collateral(HIGH_MIN, pool, 1_000);
-			set_price(HIGH_MIN, REGISTRATION_PRICE);
+			set_price(DOT, REGISTRATION_PRICE);
+			mint_collateral(DOT, 1, 3 * PoolCollateralAssets::minimum_balance(DOT));
+			mint_stable(STABLE, 1, 2);
+			// The pool account is derived, so anyone can fund it before registration, and the
+			// stablecoin freezer (account 1) can then block it. A pool that cannot receive its
+			// float could not receive depositor funds either.
+			let pool = Stability::pool_account(&DOT, &STABLE);
+			mint_stable(STABLE, pool, 7);
+			assert_ok!(Assets::block(RuntimeOrigin::signed(1), STABLE, pool));
 
 			assert_noop!(
-				create_branch_as(RuntimeOrigin::signed(1), HIGH_MIN),
-				Error::<Test>::PoolAccountNotEmpty
+				create_branch_as(RuntimeOrigin::signed(1), DOT),
+				Error::<Test>::PoolAccountNotReceivable
+			);
+		});
+	});
+}
+
+/// Donates to the `collateral` pool account before and after registration, then checks that no
+/// depositor ever owns the donations, that removal sweeps them to the dust destination, and that
+/// re-registration starts empty.
+fn assert_donations_remain_unowned_surplus(collateral: AssetId) {
+	ExtBuilder::default().build_and_execute(|| {
+		let pool = Stability::pool_account(&collateral, &STABLE);
+		let minimum = PoolCollateralAssets::minimum_balance(collateral.clone());
+		let donate = || {
+			mint_stable(STABLE, 2, 7);
+			assert_ok!(Assets::transfer(RuntimeOrigin::signed(2), STABLE, pool, 7));
+			mint_collateral(collateral.clone(), 2, minimum);
+			match &collateral {
+				AssetId::Native => {
+					assert_ok!(Balances::transfer_allow_death(
+						RuntimeOrigin::signed(2),
+						pool,
+						minimum
+					));
+				},
+				AssetId::WithId(id) => {
+					assert_ok!(Assets::transfer(RuntimeOrigin::signed(2), *id, pool, minimum));
+				},
+			}
+		};
+
+		donate();
+		register_branch(collateral.clone(), STABLE, branch_config_for(collateral.clone(), STABLE));
+		donate();
+
+		assert_ok!(crate::try_state::do_try_state::<Test>());
+		let state = pool_state(collateral.clone(), STABLE);
+		assert_eq!(state.total_active_deposits, 0);
+		assert_eq!(state.total_pending_deposits, 0);
+		assert_eq!(state.total_yield_unclaimed, 0);
+		assert_eq!(state.total_collateral_gains_unclaimed, 0);
+
+		mint_stable(STABLE, 3, 400);
+		assert_ok!(deposit_and_mature(3, collateral.clone(), STABLE, 400));
+		assert_ok!(withdraw(3, collateral.clone(), STABLE, 400, 3));
+
+		assert_eq!(stable_balance(STABLE, 3), 400);
+		assert_ok!(crate::try_state::do_try_state::<Test>());
+
+		let funder_stable = stable_balance(STABLE, 1);
+		let funder_collateral = PoolCollateralAssets::total_balance(collateral.clone(), &1);
+
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), collateral.clone(), STABLE));
+
+		assert_eq!(stable_balance(STABLE, 1), funder_stable + 1);
+		assert_eq!(
+			PoolCollateralAssets::total_balance(collateral.clone(), &1),
+			funder_collateral + 2 * minimum
+		);
+		assert_eq!(stable_balance(STABLE, DUST_DEST), 14);
+		assert_eq!(collateral_balance(collateral.clone(), DUST_DEST), 2 * minimum);
+		assert_eq!(stable_balance(STABLE, pool), 0);
+		assert_eq!(collateral_balance(collateral.clone(), pool), 0);
+
+		register_branch(collateral.clone(), STABLE, branch_config_for(collateral.clone(), STABLE));
+
+		assert_eq!(pool_stable_held(collateral.clone(), STABLE), 0);
+		assert_eq!(pool_collateral_held(collateral.clone(), STABLE), 0);
+	});
+}
+
+#[test]
+fn donations_to_a_native_collateral_pool_remain_unowned_surplus() {
+	assert_donations_remain_unowned_surplus(DOT);
+}
+
+#[test]
+fn donations_to_an_issued_collateral_pool_remain_unowned_surplus() {
+	assert_donations_remain_unowned_surplus(HIGH_MIN);
+}
+
+#[test]
+fn prefunding_with_an_unrelated_consumer_does_not_block_removal() {
+	ExtBuilder::default().build_and_execute(|| {
+		let pool = Stability::pool_account(&DOT, &STABLE);
+		assert_ok!(Balances::transfer_allow_death(RuntimeOrigin::signed(2), pool, 1));
+		assert_ok!(Assets::create(RuntimeOrigin::signed(2), 78, 2, 1));
+		assert_ok!(Assets::mint(RuntimeOrigin::signed(2), 78, pool, 1));
+		assert_eq!(System::consumers(&pool), 1);
+		register_branch(DOT, STABLE, default_branch_config());
+		assert_eq!(System::providers(&pool), 2);
+
+		assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, STABLE));
+
+		assert_eq!(stable_balance(STABLE, pool), 0);
+		assert_eq!(collateral_balance(DOT, pool), 0);
+		assert_eq!(Assets::balance(78, pool), 1);
+		assert_eq!(System::providers(&pool), 1);
+		assert_eq!(System::consumers(&pool), 1);
+	});
+}
+
+#[test]
+fn custody_invariants_still_reject_shortfalls() {
+	use frame::traits::{
+		fungibles::Mutate as _,
+		tokens::{Fortitude, Precision, Preservation},
+	};
+	ExtBuilder::default().default_branch().build_and_execute(|| {
+		let pool = Stability::pool_account(&DOT, &STABLE);
+		hypothetically!({
+			assert_ok!(Assets::burn_from(
+				STABLE,
+				&pool,
+				1,
+				Preservation::Expendable,
+				Precision::Exact,
+				Fortitude::Polite
+			));
+
+			assert_err!(
+				crate::try_state::do_try_state::<Test>(),
+				"pool stablecoin balance below tracked totals"
+			);
+		});
+		hypothetically!({
+			assert_ok!(PoolCollateralAssets::burn_from(
+				DOT,
+				&pool,
+				1,
+				Preservation::Expendable,
+				Precision::Exact,
+				Fortitude::Polite
+			));
+
+			assert_err!(
+				crate::try_state::do_try_state::<Test>(),
+				"pool collateral balance below tracked totals"
 			);
 		});
 	});
 }
 
 #[test]
-fn branch_removal_blocked_while_depositor_rows_exist() {
+fn branch_removal_error_paths() {
 	ExtBuilder::default()
 		.default_branch()
 		.matured_deposit(5, 400)
+		.stable_balance(1, 5)
 		.build_and_execute(|| {
 			assert_noop!(
 				Vaults::remove_branch(RuntimeOrigin::root(), DOT, STABLE),
@@ -180,6 +349,16 @@ fn branch_removal_blocked_while_depositor_rows_exist() {
 			// The full withdrawal prunes the only row, which unblocks the removal.
 			assert_ok!(withdraw(5, DOT, STABLE, 400, 5));
 			assert!(deposit_row(DOT, STABLE, 5).is_none());
+
+			// Account 1 paid the float at registration and is also the stablecoin freezer. Blocking
+			// its own stablecoin account leaves the refund nowhere to go.
+			assert_ok!(Assets::block(RuntimeOrigin::signed(1), STABLE, 1));
+			assert_noop!(
+				Vaults::remove_branch(RuntimeOrigin::root(), DOT, STABLE),
+				Error::<Test>::CustodyRefundFailed
+			);
+
+			assert_ok!(Assets::thaw(RuntimeOrigin::signed(1), STABLE, 1));
 			assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, STABLE));
 		});
 }
@@ -242,6 +421,7 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 			// checkpoint went with the last settlement of its cohort.
 			assert_eq!(default_market_rows(), (4, 0));
 
+			let float = crate::Pools::<Test>::get(DOT, STABLE).expect("pool registered");
 			stability_events_since_last_call();
 
 			assert_ok!(Vaults::remove_branch(RuntimeOrigin::root(), DOT, STABLE));
@@ -257,11 +437,13 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 			assert_eq!(collateral_balance(DOT, DUST_DEST), collateral_dust);
 			assert_eq!(
 				stability_events_since_last_call(),
-				vec![crate::Event::DustSwept {
+				vec![crate::Event::PoolRemoved {
 					collateral_id: DOT,
 					stable_id: STABLE,
-					stable_amount: stable_dust,
-					collateral_amount: collateral_dust,
+					stable_refund: float.custody_stable,
+					collateral_refund: float.custody_collateral,
+					stable_dust,
+					collateral_dust,
 				}]
 			);
 
@@ -300,6 +482,7 @@ fn set_stability_pool_config_origin_validation_and_storage() {
 		// The branch's full admin may update its pool config.
 		assert_ok!(set_config(RuntimeOrigin::signed(ADMIN), config.clone()));
 
+		let old = config.clone();
 		config.minimum_deposit = 300;
 		config.entry_delay = 10_000;
 		stability_events_since_last_call();
@@ -314,6 +497,8 @@ fn set_stability_pool_config_origin_validation_and_storage() {
 			vec![crate::Event::StabilityPoolConfigUpdated {
 				collateral_id: DOT,
 				stable_id: STABLE,
+				old,
+				new: config,
 			}]
 		);
 
@@ -341,6 +526,43 @@ fn set_stability_pool_config_origin_validation_and_storage() {
 			Error::<Test>::AccumulatorParamsImmutable
 		);
 	});
+}
+
+// Raising either minimum governs only what it gates from then on: a new deposit must clear the
+// deposit minimum, and an offset must leave the active pool at its floor. Open positions are not
+// re-checked, so a withdrawal may take a position under the deposit minimum and the pool under
+// its floor.
+#[test]
+fn raised_minimums_gate_new_deposits_and_offsets_but_not_open_positions() {
+	ExtBuilder::default()
+		.default_branch()
+		.matured_deposit(1, 400)
+		.matured_deposit(2, 400)
+		.stable_balance(1, 500)
+		.build_and_execute(|| {
+			set_pool_config(StabilityPoolConfig {
+				minimum_deposit: 500,
+				minimum_active_pool_balance: 700,
+				..default_pool_config()
+			});
+
+			assert_ok!(withdraw(1, DOT, STABLE, 300, 1));
+
+			assert_eq!(deposit_row(DOT, STABLE, 1).expect("row survives").active_deposit, 100);
+			assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 500);
+
+			// Under its floor, the pool takes no partial offset.
+			assert_eq!(
+				simulate_offset(DOT, STABLE, 100, 80),
+				SimulatedOffset { active: 0, pending: 0, leftover: 80 }
+			);
+			// Only an offset that empties the active pool remains possible.
+			assert_eq!(simulate_offset(DOT, STABLE, 500, 400).debt(), 500);
+			assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 0);
+			// A top-up is a new deposit, so it must clear the raised minimum on its own.
+			assert_noop!(deposit(1, DOT, STABLE, 499), Error::<Test>::DepositTooSmall);
+			assert_ok!(deposit(1, DOT, STABLE, 500));
+		});
 }
 
 #[test]
