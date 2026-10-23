@@ -177,7 +177,7 @@ impl<T: Config> Pallet<T> {
 	/// `credit` and holds it; a smaller one slashes the excess back into `credit`. Either way one
 	/// custody operation replaces the round trip through the owner's account. The credit that
 	/// comes back funds the other legs.
-	pub(crate) fn reconcile_redistribution_custody(
+	fn reconcile_redistribution_custody(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		mut credit: CollateralCreditOf<T>,
@@ -207,20 +207,6 @@ impl<T: Config> Pallet<T> {
 			},
 		}
 		Ok(credit)
-	}
-
-	/// Finalizes the vault and pays the owner's surplus as free balance.
-	///
-	/// The redistribution leg is already in custody: see
-	/// [`Self::reconcile_redistribution_custody`].
-	pub(crate) fn settle_liquidation_custody(
-		op: VaultOp<T>,
-		redistribution: DebtCollateral<BalanceOf<T>>,
-		owner_collateral: CollateralCreditOf<T>,
-	) -> DispatchResult {
-		let owner = op.owner().clone();
-		Self::resolve_collateral(&owner, owner_collateral)?;
-		op.finish_liquidation(redistribution)
 	}
 
 	fn settle_liquidation(
@@ -288,7 +274,9 @@ impl<T: Config> Pallet<T> {
 			owner_surplus: owner_surplus.peek(),
 			touch,
 		};
-		Self::settle_liquidation_custody(op, outcome.redistribution, owner_surplus)?;
+		// The redistribution leg is already in custody, so only the owner's surplus remains to pay.
+		Self::resolve_collateral(op.owner(), owner_surplus)?;
+		op.finish_liquidation(outcome.redistribution)?;
 		Ok(outcome)
 	}
 
@@ -707,92 +695,38 @@ mod tests {
 		assert_eq!(plan.collateral.active_pool, 510);
 	}
 
-	// A vault that opened under looser terms than the branch now configures must still leave the
-	// pool its principal cover. The penalty the vault itself carries is all the keeper can take.
-	#[test]
-	fn keeper_reward_never_outgrows_the_penalty_seized() {
-		let mut policy = config();
-		policy.keeper_flat_compensation_value = 100;
-		policy.keeper_percent_compensation = Permill::from_percent(10);
-		policy.keeper_compensation_cap_value = 10_000;
-		let debt = LiquidationSplit {
-			active_pool: 500,
-			keeper_jit: 0,
-			pending_pool: 0,
-			redistribution: 0,
-		};
-
-		// The configured 152 = 100 flat + floor(10% of 525) is larger than the 25 penalty this
-		// vault seizes, so the keeper takes the 25 and the pool still receives its whole 500.
-		let plan = plan(600, debt, FixedU128::one(), &policy).unwrap();
-
-		assert_eq!(plan.seized, 525);
-		assert_eq!(plan.keeper_reward, 25);
-		assert_eq!(plan.collateral.active_pool, 500);
-	}
-
 	// Each reward bound must independently cap keeper compensation so it cannot exceed seized
-	// collateral, the penalty funding it, or policy limits.
+	// collateral, the penalty funding it, or policy limits. The final-recovery entry quote goes
+	// through the same plan, so this covers both rewards.
 	#[test]
 	fn keeper_reward_takes_the_binding_minimum() {
-		let reward = |flat: u128, percent: Permill, cap: u128, budget: u128, seized: u128| {
-			let mut policy = config();
-			policy.keeper_flat_compensation_value = flat;
-			policy.keeper_percent_compensation = percent;
-			policy.keeper_compensation_cap_value = cap;
-			keeper_reward(seized, budget, FixedU128::one(), &policy)
-		};
-		let percent_per_mille = Permill::from_rational(1u32, 1_000u32);
-
-		// Flat plus percent binds: 100 + floor(0.1% of 584) = 100.
-		assert_eq!(reward(100, percent_per_mille, 10_000, 10_000, 584), Some(100));
-		// The cap binds: flat 5_000 clamped to 300.
-		assert_eq!(reward(5_000, Permill::zero(), 300, 10_000, 584), Some(300));
-		// The seized lot binds: everything else is larger.
-		assert_eq!(reward(5_000, Permill::zero(), 10_000, 10_000, 584), Some(584));
-		// The penalty this seizure carries binds: everything else is larger.
-		assert_eq!(reward(5_000, Permill::zero(), 10_000, 29, 584), Some(29));
-		// Percent contributes above the flat: 100 + floor(10% of 500) = 150.
-		assert_eq!(reward(100, Permill::from_percent(10), 10_000, 10_000, 500), Some(150));
-	}
-
-	// The final-recovery entry reward on every bound it can take.
-	#[test]
-	fn final_recovery_reward_takes_the_binding_minimum() {
 		let mut terms = config();
 		terms.keeper_flat_compensation_value = 10;
 		terms.keeper_percent_compensation = Permill::from_percent(1);
 		terms.keeper_compensation_cap_value = 10_000;
 		let one = FixedU128::one();
-		let cases = [
-			// Flat plus percent binds: 10 + floor(1% of 525) = 15.
-			(600, 500, one, terms, 15),
-			// Below par the seized lot is the whole collateral: 10 + floor(1% of 400) = 14.
-			(400, 500, one, terms, 14),
-			// The cap binds.
-			(600, 500, one, LiquidationConfig { keeper_compensation_cap_value: 12, ..terms }, 12),
-			// The penalty this vault carries (25) binds on terms sized for a larger debt.
-			(
-				600,
-				500,
-				one,
-				LiquidationConfig {
-					keeper_flat_compensation_value: 100,
-					keeper_percent_compensation: Permill::from_percent(10),
-					..terms
-				},
-				25,
-			),
-			// Values convert at the price: flat ceil(10 / 0.1) = 100, plus floor(1% of 1_000).
-			(1_000, 501, FixedU128::from_rational(1, 10), terms, 110),
-		];
 
-		for (collateral, debt, price, policy, expected) in cases {
-			assert_eq!(
-				final_recovery_keeper_reward(collateral, debt, price, &policy),
-				Some(expected)
-			);
-		}
+		// Flat plus percent binds: 10 + floor(1% of 525) = 15.
+		assert_eq!(final_recovery_keeper_reward(600, 500, one, &terms), Some(15));
+		// Below par the seized lot is the whole collateral: 10 + floor(1% of 400) = 14.
+		assert_eq!(final_recovery_keeper_reward(400, 500, one, &terms), Some(14));
+		// The cap binds.
+		let capped = LiquidationConfig { keeper_compensation_cap_value: 12, ..terms };
+		assert_eq!(final_recovery_keeper_reward(600, 500, one, &capped), Some(12));
+		// The penalty this vault carries (25) binds on terms sized for a larger debt.
+		let generous = LiquidationConfig {
+			keeper_flat_compensation_value: 100,
+			keeper_percent_compensation: Permill::from_percent(10),
+			..terms
+		};
+		assert_eq!(final_recovery_keeper_reward(600, 500, one, &generous), Some(25));
+		// The seized lot binds: below par only 20 is held, under the 25 penalty and the 5_000 flat
+		// fee, and floor(1% of 20) adds nothing.
+		let expensive = LiquidationConfig { keeper_flat_compensation_value: 5_000, ..terms };
+		assert_eq!(final_recovery_keeper_reward(20, 500, one, &expensive), Some(20));
+		// Values convert at the price: flat ceil(10 / 0.1) = 100, plus floor(1% of 1_000).
+		let tenth = FixedU128::from_rational(1, 10);
+		assert_eq!(final_recovery_keeper_reward(1_000, 501, tenth, &terms), Some(110));
 	}
 
 	// Separate penalties must make redistribution harsher than an offset. Zero penalties must

@@ -51,12 +51,11 @@ fn nomination_settles_multiple_redistribution_recipients_serially() {
 			owner: 1,
 		});
 
-		// Re-nomination is allowed, but nobody can displace this holder. The failed nomination
-		// must also roll back the second recipient's pending redistribution and collateral hold.
+		// Re-nomination is allowed, but nobody can displace this holder.
 		assert_ok!(nominate_dormant(8, DOT, STABLE, 1));
+		// The failed nomination also rolls back the second recipient's pending redistribution and
+		// collateral hold.
 		assert_noop!(nominate_dormant(9, DOT, STABLE, 2), Error::<Test>::DormantTargetOccupied);
-		assert_eq!(vault(DOT, STABLE, 2).debt.total(), 0);
-		assert_eq!(held(DOT, 2), 1_000);
 
 		assert_eq!(redeem(DOT, STABLE, 4, 100).expect("nominated dust settles"), 1);
 		assert_eq!(Vaults::next_redemption_target(&DOT, &STABLE, None), None);
