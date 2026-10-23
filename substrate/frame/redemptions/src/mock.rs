@@ -607,7 +607,7 @@ impl RedeemCall {
 					assert_eq!(collateral_id, self.collateral);
 					assert_eq!(stable_id, self.stable);
 					assert_eq!(recipient, self.recipient, "the vaults pay the named recipient");
-					vault_debt_cancelled += debt_cancelled;
+					vault_debt_cancelled += debt_cancelled.total();
 					vault_collateral_out += collateral_to_recipient;
 					continue;
 				},

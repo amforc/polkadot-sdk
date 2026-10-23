@@ -1,6 +1,6 @@
 //! Lets the Stability Pool cancel debt against the `FinalRecovery` FIFO head at the same pricing
-//! as recovery redemptions. The redemptions pallet owns that pricing and implements this, so the
-//! two paths cannot diverge.
+//! as recovery redemptions. The implementer is the owner of that pricing, so the two paths cannot
+//! diverge.
 
 use frame::deps::sp_runtime::DispatchError;
 
@@ -20,12 +20,16 @@ pub enum RecoveryOffsetResult<Balance> {
 /// Like redemptions, each call stops after one head, so it never crosses into another recovery
 /// price.
 pub trait RecoveryOffsetInterface {
+	/// Collateral asset identifier; with the payment's asset it names the branch.
 	type CollateralId;
+	/// Account type of the collateral recipient.
 	type AccountId;
+	/// Amount type; [`RecoveryOffsetResult::Applied`] reports collateral planck in it.
 	type Balance;
+	/// Branch stablecoin credit that pays for the offset.
 	type Credit;
 
-	/// Cancels head debt in the market of `collateral_id` and the payment's asset, spending up to
+	/// Cancels head debt in the branch of `collateral_id` and the payment's asset, spending up to
 	/// the payment, and sends the priced collateral to `collateral_recipient`. No redemption fee.
 	///
 	/// Returns the outcome and the unspent change; `NoTarget` and `BelowPar` return the whole
