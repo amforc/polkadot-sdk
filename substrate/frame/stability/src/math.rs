@@ -121,7 +121,7 @@ pub fn cohort_deadline(now: Millis, entry_delay: Millis) -> Millis {
 ///
 /// Within its current epoch, a deposit compounds across at most [`SCALE_SPAN`] boundaries.
 ///
-/// `compounded = floor(d0 * P / (P0 * scale_factor^k))`.
+/// `remaining_principal = floor(d0 * P / (P0 * scale_factor^k))`.
 ///
 /// An earlier epoch or a distance above [`SCALE_SPAN`] leaves no principal. The gain formula
 /// preserves gains earned before the principal reached zero.
@@ -141,15 +141,15 @@ pub fn realize<Balance: FixedPointOperand>(
 	debug_assert!(window.snap.g_yield >= snapshot.sums.g_yield);
 	if d0.is_zero() {
 		return Realized {
-			compounded: Balance::zero(),
+			remaining_principal: Balance::zero(),
 			collateral_gain: Balance::zero(),
 			yield_gain: Balance::zero(),
 		};
 	}
 	let sf_int = precision.scale_factor();
 
-	let compounded = compound(d0, &snapshot.coords, current, sf_int, Rounding::Down);
-	debug_assert!(compounded <= d0);
+	let remaining_principal = compound(d0, &snapshot.coords, current, sf_int, Rounding::Down);
+	debug_assert!(remaining_principal <= d0);
 
 	let collateral_gain = gain(
 		d0,
@@ -168,7 +168,7 @@ pub fn realize<Balance: FixedPointOperand>(
 		snapshot.coords.p,
 	);
 
-	Realized { compounded, collateral_gain, yield_gain }
+	Realized { remaining_principal, collateral_gain, yield_gain }
 }
 
 /// Applies the gain formula of [`realize`] to collateral sum `S` or yield sum `G`:
@@ -335,8 +335,10 @@ mod tests {
 		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
 		let current = accumulators(FixedU128::from_inner(333_333_333_333_333_333), 0, 0);
 		let sums = window(FixedU128::from_inner(333_333_333_333_333_333), FixedU128::zero());
+
 		let got = realize::<u128>(3, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got.compounded, 0);
+
+		assert_eq!(got.remaining_principal, 0);
 		assert_eq!(got.collateral_gain, 0);
 		assert_eq!(got.yield_gain, 0);
 	}
@@ -348,6 +350,7 @@ mod tests {
 		let snap =
 			snapshot(FixedU128::from_rational(1, 2), FixedU128::zero(), FixedU128::zero(), 0, 3);
 		let current = accumulators(FixedU128::from_rational(4, 5), 0, 4);
+
 		let got = realize::<u128>(
 			1_000_000_000_000,
 			&snap,
@@ -355,7 +358,8 @@ mod tests {
 			&window(FixedU128::zero(), FixedU128::zero()),
 			&PRECISION,
 		);
-		assert_eq!(got.compounded, 1_600);
+
+		assert_eq!(got.remaining_principal, 1_600);
 	}
 
 	#[test]
@@ -383,10 +387,12 @@ mod tests {
 				PoolSums { s_collateral: FixedU128::from_u32(500), g_yield: FixedU128::zero() },
 			],
 		};
+
 		let got = realize::<u128>(1_000_000_000_000_000_000, &snap, &current, &sums, &PRECISION);
+
 		assert_eq!(got.collateral_gain, 600_000_600_000_001_000);
 		// compounded = floor(1e18 * 0.8 / (0.5 * 1e18)) = 1.
-		assert_eq!(got.compounded, 1);
+		assert_eq!(got.remaining_principal, 1);
 	}
 
 	#[test]
@@ -397,8 +403,10 @@ mod tests {
 		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
 		let current = accumulators(FixedU128::from_rational(1, 2), 0, 3);
 		let sums = window(FixedU128::from_rational(1, 4), FixedU128::zero());
+
 		let got = realize::<u128>(4_000_000_000_000_000_000, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got.compounded, 0);
+
+		assert_eq!(got.remaining_principal, 0);
 		// gain = floor(4e18 * 0.25 / 1) = 1e18.
 		assert_eq!(got.collateral_gain, 1_000_000_000_000_000_000);
 	}
@@ -408,8 +416,10 @@ mod tests {
 		let snap = snapshot(FixedU128::one(), FixedU128::zero(), FixedU128::zero(), 0, 0);
 		let current = accumulators(FixedU128::one(), 0, 0);
 		let sums = window(FixedU128::from_u32(5), FixedU128::from_u32(5));
+
 		let got = realize::<u128>(0, &snap, &current, &sums, &PRECISION);
-		assert_eq!(got, Realized { compounded: 0, collateral_gain: 0, yield_gain: 0 });
+
+		assert_eq!(got, Realized { remaining_principal: 0, collateral_gain: 0, yield_gain: 0 });
 	}
 
 	#[test]
@@ -488,7 +498,9 @@ mod tests {
 		// A=1e28, new_total=1: even after two crossings the candidate is
 		// floor(1e18 * 1e18 * 1 / 1e28) = 1e8 < p_min → None.
 		let total = 10_000_000_000_000_000_000_000_000_000u128;
+
 		let got = update_p_after_offset::<u128>(FixedU128::one(), total, total - 1, &PRECISION);
+
 		assert_eq!(got, None);
 	}
 
@@ -542,6 +554,7 @@ mod tests {
 		// for a cohort aggregate.
 		let from = accumulators(FixedU128::from_rational(3, 10), 0, 0);
 		let to = accumulators(FixedU128::from_rational(1, 5), 0, 0);
+
 		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Down), 666);
 		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Up), 667);
 		// An exact ratio neither gains nor loses under either rounding.
@@ -556,6 +569,7 @@ mod tests {
 		let from = accumulators(FixedU128::one(), 0, 0);
 		let half = FixedU128::from_rational(1, 2);
 		let sf = SF as u128;
+
 		// One scale behind at P = 0.5 with sf = 1e9: floor(2e12 * 0.5 / 1e9) = 1000.
 		let to = accumulators(half, 0, 1);
 		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Down), 1_000);
@@ -597,6 +611,7 @@ mod tests {
 			claims += compound(amount, &joined, &end, sf, Rounding::Down);
 		}
 		let activated = compound::<u128>(aggregate, &coords, &end, sf, Rounding::Up);
+
 		assert!(claims <= activated);
 		// Each ceiling and each floor costs less than one raw unit of dust.
 		assert!(activated - claims <= 2 * amounts.len() as u128);

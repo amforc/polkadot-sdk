@@ -27,7 +27,7 @@ impl<T: Config> OnBranchYield<CollateralIdOf<T>, StableCreditOf<T>> for Pallet<T
 		branch: BranchSnapshot,
 		credit: StableCreditOf<T>,
 	) -> StableCreditOf<T> {
-		// The asset of the credit names the market; an unregistered pair has no pool row, and the
+		// The asset of the credit names the branch; an unregistered pair has no pool row, and the
 		// credit comes back whole.
 		let stable_id = &credit.asset();
 		let Some(pool) = Pools::<T>::get(collateral_id, stable_id) else {
@@ -60,7 +60,7 @@ pub(crate) struct OffsetReservation<Balance> {
 impl<T: Config> Pallet<T> {
 	/// Returns the pool available for an offset.
 	///
-	/// A missing or frozen market returns `None`. This result gives zero capacity and prevents
+	/// A missing or frozen branch returns `None`. This result gives zero capacity and prevents
 	/// settlement.
 	fn offset_pool(
 		collateral_id: &CollateralIdOf<T>,
@@ -110,7 +110,7 @@ impl<T: Config> Pallet<T> {
 	}
 }
 
-/// One market as its offset quotes read it: the pool with due cohorts activated in memory and its
+/// One branch as its offset quotes read it: the pool with due cohorts activated in memory and its
 /// stablecoin custody.
 pub struct OffsetQuote<T: Config> {
 	pool: StabilityPoolOf<T>,
