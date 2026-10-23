@@ -1,14 +1,12 @@
-//! The preconditions every depositor call shares: a registered market, then an existing row.
+//! The preconditions every depositor call shares: a registered branch, then an existing row.
 
 use crate::{mock::*, Error};
 
 #[test]
 fn every_call_requires_a_pool_then_a_row() {
-	build_and_execute(|| {
-		mint_stable(STABLE, 1, 1_000);
-
+	ExtBuilder::default().stable_balance(1, 1_000).build_and_execute(|| {
 		// Nothing is registered, so nothing can be dispatched. A refused call leaves no trace.
-		// The calls that issue market interest first are refused by the vault engine.
+		// The calls that issue branch interest first are refused by the vault engine.
 		let branch_calls: [fn() -> DispatchResult; 5] = [
 			|| deposit(1, DOT, STABLE, 400),
 			|| request_withdraw(1, DOT, STABLE, 100),
@@ -36,6 +34,7 @@ fn every_call_requires_a_pool_then_a_row() {
 
 		// With the pool registered, every call that acts on a row still needs one to exist.
 		register_branch(DOT, STABLE, default_branch_config());
+
 		let row_calls: [fn() -> DispatchResult; 6] = [
 			|| request_withdraw(1, DOT, STABLE, 100),
 			|| withdraw(1, DOT, STABLE, 100, 1),
