@@ -102,10 +102,6 @@ pub(crate) fn balance<T: BenchmarkConfig>(value: u128) -> BalanceOf<T> {
 	value.saturated_into()
 }
 
-pub(crate) fn rate(numerator: u128, denominator: u128) -> FixedU128 {
-	FixedU128::from_rational(numerator, denominator)
-}
-
 /// Minimum balance in planck; scaling collateral and prices preserves stablecoin amounts
 /// across runtimes.
 pub(crate) fn collateral_unit<T: BenchmarkConfig>() -> BalanceOf<T> {
@@ -163,14 +159,14 @@ pub(crate) fn default_branch_config<T: BenchmarkConfig>() -> BranchConfig<Balanc
 	// Vault floors must also clear production asset minimum balances.
 	let minimum_debt = balance::<T>(200).max(T::StableAssets::minimum_balance(stable::<T>()));
 	BranchConfig {
-		minimum_collateralization_ratio: rate(110, 100),
-		initial_collateralization_ratio: rate(120, 100),
-		safety_collateralization_ratio: rate(130, 100),
+		minimum_collateralization_ratio: FixedU128::from_rational(110, 100),
+		initial_collateralization_ratio: FixedU128::from_rational(120, 100),
+		safety_collateralization_ratio: FixedU128::from_rational(130, 100),
 		debt_ceiling: balance::<T>(100_000_000),
 		minimum_debt,
 		minimum_collateral: collateral_unit::<T>(),
-		minimum_borrow_rate: rate(1, 1_000),
-		maximum_borrow_rate: rate(100, 100),
+		minimum_borrow_rate: FixedU128::from_rational(1, 1_000),
+		maximum_borrow_rate: FixedU128::from_rational(100, 100),
 		upfront_fee_period: 7 * DAY_MS,
 		rate_adjustment_cooldown: DAY_MS,
 		final_recovery_reward_cooldown: ONE_HOUR_MS,
@@ -185,7 +181,7 @@ pub(crate) fn default_branch_config<T: BenchmarkConfig>() -> BranchConfig<Balanc
 	}
 }
 
-/// One market per stablecoin makes this the first lifecycle registration.
+/// One branch per stablecoin makes this the first lifecycle registration.
 pub(crate) fn first_market_lifecycle_config<T: BenchmarkConfig>() -> RegistrationConfigOf<T> {
 	T::OnBranchLifecycle::benchmark_registration_config(1)
 }
@@ -213,7 +209,7 @@ pub(crate) fn full_admin_origin<T: BenchmarkConfig>() -> T::RuntimeOrigin {
 	RawOrigin::Signed(branch_admin_accounts::<T>().0).into()
 }
 
-/// A market creation ready to dispatch: its collateral, origin, and the account charged its
+/// A branch creation ready to dispatch: its collateral, origin, and the account charged its
 /// deposit and custody seeds.
 pub(crate) struct BranchRegistration<T: Config> {
 	pub asset: CollateralIdOf<T>,
@@ -246,7 +242,7 @@ pub(crate) fn prepare_branch_registration<T: BenchmarkConfig>(
 	Ok(BranchRegistration { asset, origin, funder, signed })
 }
 
-/// Registers the default market and lifts the global debt ceiling out of the way.
+/// Registers the default branch and lifts the global debt ceiling out of the way.
 pub(crate) fn register_default_branch<T: BenchmarkConfig>(
 ) -> Result<CollateralIdOf<T>, DispatchError> {
 	let BranchRegistration { asset, origin, .. } = prepare_branch_registration::<T>()?;
@@ -297,7 +293,7 @@ pub(crate) fn default_vault<T: BenchmarkConfig>() -> BenchmarkVault<BalanceOf<T>
 	BenchmarkVault {
 		collateral_units: SEED_COLL,
 		debt: balance::<T>(SEED_DEBT),
-		annual_rate: rate(5, 100),
+		annual_rate: FixedU128::from_rational(5, 100),
 	}
 }
 
@@ -460,7 +456,7 @@ pub(crate) fn redeem_debt_only<T: BenchmarkConfig>(owner: &T::AccountId) -> Disp
 /// Opens `vault` for `owner`, crashes the price to [`RECOVERY_TRIGGER_PRICE`] so `keeper` can push
 /// it into the FinalRecovery FIFO, and leaves the price crashed.
 ///
-/// The vault must be the market's only stake bearer when it enters.
+/// The vault must be the branch's only stake bearer when it enters.
 fn enter_recovery<T: BenchmarkConfig>(
 	owner: &T::AccountId,
 	vault: BenchmarkVault<BalanceOf<T>>,
@@ -485,7 +481,7 @@ fn enter_recovery<T: BenchmarkConfig>(
 /// Opens a fresh vault at `annual_rate` that [`RECOVERY_TRIGGER_PRICE`] makes unsafe, pushes it
 /// into the FinalRecovery FIFO, and restores the default price.
 ///
-/// The vault must be the market's only stake bearer when it enters.
+/// The vault must be the branch's only stake bearer when it enters.
 pub(crate) fn recovery_cycle<T: BenchmarkConfig>(
 	seed_index: u32,
 	annual_rate: FixedU128,
@@ -541,7 +537,7 @@ pub(crate) fn seed_pending_redistribution<T: BenchmarkConfig>() -> DispatchResul
 	redistribute::<T>(Sacrifice {
 		vault: BenchmarkVault {
 			collateral_units: RECOVERY_VAULT_COLL,
-			annual_rate: rate(1, 100),
+			annual_rate: FixedU128::from_rational(1, 100),
 			..default_vault::<T>()
 		},
 		liquidation_price: RECOVERY_TRIGGER_PRICE,
@@ -593,7 +589,7 @@ pub(crate) fn make_cohorts_due<T: BenchmarkConfig>() -> DispatchResult {
 
 /// Seed the Stability Pool so the next offset rolls a due cohort into the active leg and still
 /// finds pending capital behind it. Leaves the clock one millisecond before the pending deadline,
-/// a full entry delay after the last market accrual.
+/// a full entry delay after the last branch accrual.
 pub(crate) fn seed_liquidation_pool<T: BenchmarkConfig>(
 	entry_delay: u64,
 	deposit: BalanceOf<T>,
@@ -605,7 +601,7 @@ pub(crate) fn seed_liquidation_pool<T: BenchmarkConfig>(
 	Ok(())
 }
 
-/// The market as the engine hands it to the pool, read the way `liquidate` reads it.
+/// The branch as the engine hands it to the pool, read the way `liquidate` reads it.
 pub(crate) fn branch_snapshot<T: BenchmarkConfig>() -> Result<BranchSnapshot, DispatchError> {
 	let mode = Pallet::<T>::current_mode(&collateral::<T>(), &stable::<T>())?;
 	Ok(BranchSnapshot { mode, now: T::TimeProvider::now() })
@@ -645,7 +641,7 @@ pub(crate) fn fee_balance<T: BenchmarkConfig>() -> BalanceOf<T> {
 	T::StableAssets::balance(stable::<T>(), &T::FeeAccount::convert(stable::<T>()))
 }
 
-/// Whether an `InterestIssued` event with a non-zero amount was deposited for the market since
+/// Whether an `InterestIssued` event with a non-zero amount was deposited for the branch since
 /// the events were last reset.
 pub(crate) fn interest_issued<T: BenchmarkConfig>() -> bool {
 	frame_system::Pallet::<T>::read_events_for_pallet::<Event<T>>()

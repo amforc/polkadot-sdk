@@ -202,7 +202,7 @@ impl<T: Config> Pallet<T> {
 					defensive!("redistribution custody fell short of the retained share");
 					return Err(DispatchError::Corruption);
 				}
-				// Both credits are the market's collateral, so the merge cannot fail.
+				// Both credits are the branch's collateral, so the merge cannot fail.
 				credit.subsume(released).map_err(|_| DispatchError::Corruption)?;
 			},
 		}
@@ -368,7 +368,7 @@ impl<T: Config> Pallet<T> {
 			.checked_add(&plan.debt.pending_pool)
 			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		// The pool must give up exactly the debt it cancels, or the supply would drift.
-		let given_up = burned.as_ref().map_or_else(Zero::zero, |credit| credit.peek());
+		let given_up = burned.peek();
 		ensure!(given_up == pool_debt, DispatchError::Corruption);
 		// Dropping the credit burns it: the offset cancelled exactly this debt.
 		drop(burned);
@@ -411,7 +411,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	// Limits keeper JIT to stablecoin that the keeper can burn. The limit uses residual debt, the
-	// allowance, and reducible balance. An allowance or funding shortfall below the market minimum
+	// allowance, and reducible balance. An allowance or funding shortfall below the branch minimum
 	// skips JIT so an optional contribution cannot block liquidation. The minimum never binds on
 	// the system's residual ask, which the keeper did not select: a small residual still executes
 	// against a minimum-clearing allowance and funding.
@@ -471,7 +471,7 @@ impl<T: Config> LiquidationQuoter<'_, T> {
 	// Quotes debt, converts that exact waterfall split into a collateral-conserving plan, and plans
 	// compensation out when the keeper cannot receive it: the reward is the one leg paid to an
 	// account the protocol does not control, and an unpaid keeper is preferable to an unsafe vault
-	// left in the market. Everything here is read-only, so the caller can discard a candidate
+	// left in the branch. Everything here is read-only, so the caller can discard a candidate
 	// without unwinding state.
 	fn quote_payable(
 		&self,
@@ -613,8 +613,8 @@ fn plan<Balance: FixedPointOperand + AtLeast32BitUnsigned>(
 	let seized = total_collateral.min(max_seizable);
 	let owner_surplus = total_collateral.checked_sub(&seized)?;
 	// The penalty a full seizure holds above the debt it resolves, which is all the keeper is
-	// ever paid from. A vault can owe less than the `minimum_debt` its market sized the
-	// compensation against, since a market may raise that floor after the vault opened, so the
+	// ever paid from. A vault can owe less than the `minimum_debt` its branch sized the
+	// compensation against, since a branch may raise that floor after the vault opened, so the
 	// vault in hand caps the reward rather than the configuration.
 	let penalty_budget =
 		max_seizable.checked_sub(&collateral_for_value_ceil(debt.checked_total()?, price)?)?;
@@ -664,7 +664,9 @@ mod tests {
 			pending_pool: 100,
 			redistribution: 200,
 		};
+
 		let plan = plan(600, debt, FixedU128::from_rational(2, 1), &config()).unwrap();
+
 		assert_eq!(plan.seized, 530);
 		assert_eq!(plan.owner_surplus, 70);
 		assert_eq!(
@@ -693,17 +695,19 @@ mod tests {
 			pending_pool: 0,
 			redistribution: 0,
 		};
+
 		// The reward 15 = 10 flat + floor(1% of 525) comes out of the seized
 		// lot before allocation — the penalty is gross of keeper compensation,
 		// so the pool receives 510, not 525.
 		let plan = plan(600, debt, FixedU128::one(), &policy).unwrap();
+
 		assert_eq!(plan.seized, 525);
 		assert_eq!(plan.keeper_reward, 15);
 		assert_eq!(plan.owner_surplus, 75);
 		assert_eq!(plan.collateral.active_pool, 510);
 	}
 
-	// A vault that opened under looser terms than the market now configures must still leave the
+	// A vault that opened under looser terms than the branch now configures must still leave the
 	// pool its principal cover. The penalty the vault itself carries is all the keeper can take.
 	#[test]
 	fn keeper_reward_never_outgrows_the_penalty_seized() {
@@ -717,9 +721,11 @@ mod tests {
 			pending_pool: 0,
 			redistribution: 0,
 		};
+
 		// The configured 152 = 100 flat + floor(10% of 525) is larger than the 25 penalty this
 		// vault seizes, so the keeper takes the 25 and the pool still receives its whole 500.
 		let plan = plan(600, debt, FixedU128::one(), &policy).unwrap();
+
 		assert_eq!(plan.seized, 525);
 		assert_eq!(plan.keeper_reward, 25);
 		assert_eq!(plan.collateral.active_pool, 500);
@@ -737,6 +743,7 @@ mod tests {
 			keeper_reward(seized, budget, FixedU128::one(), &policy)
 		};
 		let percent_per_mille = Permill::from_rational(1u32, 1_000u32);
+
 		// Flat plus percent binds: 100 + floor(0.1% of 584) = 100.
 		assert_eq!(reward(100, percent_per_mille, 10_000, 10_000, 584), Some(100));
 		// The cap binds: flat 5_000 clamped to 300.
@@ -779,6 +786,7 @@ mod tests {
 			// Values convert at the price: flat ceil(10 / 0.1) = 100, plus floor(1% of 1_000).
 			(1_000, 501, FixedU128::from_rational(1, 10), terms, 110),
 		];
+
 		for (collateral, debt, price, policy, expected) in cases {
 			assert_eq!(
 				final_recovery_keeper_reward(collateral, debt, price, &policy),
@@ -800,14 +808,17 @@ mod tests {
 			};
 			max_seizable_collateral(debt, FixedU128::one(), policy)
 		};
+
 		// All-offset debt carries the milder 5% penalty, all-redistribution
 		// the harsher 10%: 1_050 against 1_100 of value at par.
 		assert_eq!(seizable(1_000, 0, &config()), Some(1_050));
 		assert_eq!(seizable(0, 1_000, &config()), Some(1_100));
+
 		// Zero penalties seize exactly the debt value.
 		let mut zero = config();
 		zero.offset_penalty = Permill::zero();
 		zero.redistribution_penalty = Permill::zero();
+
 		assert_eq!(seizable(600, 400, &zero), Some(1_000));
 	}
 
@@ -817,7 +828,9 @@ mod tests {
 	fn zero_debt_plan_seizes_nothing() {
 		let debt =
 			LiquidationSplit { active_pool: 0, keeper_jit: 0, pending_pool: 0, redistribution: 0 };
+
 		let plan = plan(600, debt, FixedU128::one(), &config()).unwrap();
+
 		assert_eq!(plan.seized, 0);
 		assert_eq!(plan.keeper_reward, 0);
 		assert_eq!(plan.owner_surplus, 600);
