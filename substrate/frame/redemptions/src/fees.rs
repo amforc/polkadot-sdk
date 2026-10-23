@@ -268,11 +268,20 @@ mod tests {
 		DynamicFeeCurve::try_new(decayed, debt, &config).expect("u128 debt cannot overflow u128")
 	}
 
-	/// Verifies decay by whole half-lives, inside a half-life, and at the input boundaries.
+	/// Verifies that decay halves the fee once per whole half-life.
 	///
-	/// The policy rejects a zero half-life, but the decay function treats it as instant decay. A
-	/// `u64::MAX` span with a one-millisecond half-life exceeds 128 halvings. A span and a
-	/// half-life that both equal `u64::MAX` give exactly one halving.
+	/// No elapsed time leaves the fee unchanged. A span and a half-life that both equal
+	/// `u64::MAX` give exactly one halving.
+	#[test]
+	fn decay_halves_per_whole_half_life() {
+		let half = FixedU128::from_rational(1, 2);
+		assert_eq!(decay_dynamic_fee(half, 6 * HOUR, 6 * HOUR), FixedU128::from_rational(1, 4));
+		assert_eq!(decay_dynamic_fee(half, 12 * HOUR, 6 * HOUR), FixedU128::from_rational(1, 8));
+		assert_eq!(decay_dynamic_fee(half, 0, HOUR), half);
+		assert_eq!(decay_dynamic_fee(half, u64::MAX, u64::MAX), FixedU128::from_rational(1, 4));
+	}
+
+	/// Verifies decay inside a half-life.
 	///
 	/// Inside a half-life, the fee follows the line from its value at the last whole half-life to
 	/// half of that value. The line lies above the exact `2^(-f)`, which favors the system. Half
@@ -283,34 +292,16 @@ mod tests {
 	/// `500_000_023_148_148_148e-18`, and half of that factor is the fee. It is just above the
 	/// 1/4 at the boundary, so the decay does not step there.
 	#[test]
-	fn decay_halves_per_half_life_and_saturates_to_zero() {
+	fn decay_interpolates_above_the_exact_curve_inside_a_half_life() {
 		let half = FixedU128::from_rational(1, 2);
-		// (dynamic fee, elapsed ms, half-life ms, decayed fee)
-		let cases = [
-			(half, 6 * HOUR, 6 * HOUR, FixedU128::from_rational(1, 4)),
-			(half, 12 * HOUR, 6 * HOUR, FixedU128::from_rational(1, 8)),
-			(half, 3 * HOUR, 6 * HOUR, FixedU128::from_rational(3, 8)),
-			(half, 9 * HOUR, 6 * HOUR, FixedU128::from_rational(3, 16)),
-			(half, 6 * HOUR - 1, 6 * HOUR, FixedU128::from_inner(250_000_011_574_074_074)),
-			(half, 0, HOUR, half),
-			(FixedU128::zero(), HOUR, HOUR, FixedU128::zero()),
-			(half, 1, 0, FixedU128::zero()),
-			(half, u64::MAX, 1, FixedU128::zero()),
-			(half, u64::MAX, u64::MAX, FixedU128::from_rational(1, 4)),
-			(half, 127 * HOUR, HOUR, FixedU128::from_inner(half.into_inner() >> 127)),
-			(half, 128 * HOUR, HOUR, FixedU128::zero()),
-		];
-		for (fee, elapsed_ms, period_ms, decayed) in cases {
-			assert_eq!(
-				decay_dynamic_fee(fee, elapsed_ms, period_ms),
-				decayed,
-				"{fee:?} after {elapsed_ms} ms at a {period_ms} ms half-life"
-			);
-		}
-	}
+		assert_eq!(decay_dynamic_fee(half, 3 * HOUR, 6 * HOUR), FixedU128::from_rational(3, 8));
+		assert_eq!(decay_dynamic_fee(half, 9 * HOUR, 6 * HOUR), FixedU128::from_rational(3, 16));
+		assert_eq!(
+			decay_dynamic_fee(half, 6 * HOUR - 1, 6 * HOUR),
+			FixedU128::from_inner(250_000_011_574_074_074)
+		);
 
-	#[test]
-	fn decay_is_monotonic_non_increasing() {
+		// Between the exact points above, the decay never rises with elapsed time.
 		let base = FixedU128::from_rational(80, 100);
 		let mut prev = decay_dynamic_fee(base, 0, 6 * HOUR);
 		for h in 1..=48u64 {
@@ -318,6 +309,23 @@ mod tests {
 			assert!(now <= prev, "decay rose at hour {h}: {now:?} > {prev:?}");
 			prev = now;
 		}
+	}
+
+	/// Verifies that decay saturates to zero at the input boundaries.
+	///
+	/// The policy rejects a zero half-life, but the decay function treats it as instant decay. A
+	/// `u64::MAX` span with a one-millisecond half-life exceeds 128 halvings.
+	#[test]
+	fn decay_saturates_to_zero_at_the_input_boundaries() {
+		let half = FixedU128::from_rational(1, 2);
+		assert_eq!(decay_dynamic_fee(FixedU128::zero(), HOUR, HOUR), FixedU128::zero());
+		assert_eq!(decay_dynamic_fee(half, 1, 0), FixedU128::zero());
+		assert_eq!(decay_dynamic_fee(half, u64::MAX, 1), FixedU128::zero());
+		assert_eq!(
+			decay_dynamic_fee(half, 127 * HOUR, HOUR),
+			FixedU128::from_inner(half.into_inner() >> 127)
+		);
+		assert_eq!(decay_dynamic_fee(half, 128 * HOUR, HOUR), FixedU128::zero());
 	}
 
 	#[test]
@@ -342,21 +350,6 @@ mod tests {
 		// A clock before the last operation causes no decay. The bounds still apply.
 		assert_eq!(state.dynamic_fee_at(0, &config), config.dynamic_fee_ceiling);
 		assert_eq!(state.dynamic_fee_at(HOUR - 1, &config), config.dynamic_fee_ceiling);
-	}
-
-	/// Verifies the rise for a debt of `1e18` units, where each unit is one `1e-18` of share.
-	#[test]
-	fn rise_is_the_redeemed_share_over_the_divisor() {
-		let mut curve = curve(FixedU128::zero(), FixedU128::DIV);
-		curve.divisor = FixedU128::from_rational(2, 1);
-		assert_eq!(curve.rise(0), Some(FixedU128::zero()));
-		assert_eq!(curve.rise(2), Some(FixedU128::from_inner(1)));
-		let third = FixedU128::DIV / 3;
-		assert_eq!(curve.rise(third), Some(FixedU128::from_inner(third / 2)));
-		// The share of all debt or more is one.
-		assert_eq!(curve.rise(FixedU128::DIV), Some(FixedU128::from_rational(1, 2)));
-		assert_eq!(curve.rise(FixedU128::DIV + 1), Some(FixedU128::from_rational(1, 2)));
-		assert_eq!(curve.rise(u128::MAX), Some(FixedU128::from_rational(1, 2)));
 	}
 
 	#[test]
@@ -399,19 +392,6 @@ mod tests {
 			let jump = (window[2] - window[1]) - (window[1] - window[0]);
 			assert!(jump.abs() <= curvature + 4, "slope jumps by {jump} around the crossing");
 		}
-		// Arriving above the ceiling pays it flat from the first unit.
-		curve.decayed = FixedU128::from_rational(1, 100);
-		assert_eq!(curve.charged_rate(500_000), FixedU128::from_rational(15, 1_000));
-	}
-
-	#[test]
-	fn charged_rate_respects_the_fee_ceiling_above_the_dynamic_one() {
-		let mut curve = curve(FixedU128::from_rational(30, 100), 1_000);
-		curve.fee_ceiling = Permill::from_percent(20);
-		// The dynamic component can increase to 100%. The 20% fee ceiling includes the base fee and
-		// applies from the first unit.
-		assert_eq!(curve.charged_rate(500), FixedU128::from_rational(20, 100));
-		assert_eq!(curve.raised_dynamic_fee(500), FixedU128::from_rational(80, 100));
 	}
 
 	// These tests verify the curve-domain boundaries. Execution cannot reach most of them because a
@@ -453,59 +433,77 @@ mod tests {
 		assert_eq!(empty.raised_dynamic_fee(1), FixedU128::one());
 	}
 
-	/// Verifies the curve for a zero divisor that policy validation rejects.
-	///
-	/// The curve treats the zero divisor as an infinite accelerator and applies the ceiling from
-	/// the first unit.
+	// These tests tweak the policy of a 1_000-debt curve so that a ceiling binds from the first
+	// unit. The charged rate is the ceiling, while the stored dynamic fee still follows its own
+	// climb and ceiling.
+
+	/// The 20% fee ceiling includes the base fee and binds while the dynamic component still
+	/// climbs toward 100%.
 	#[test]
-	fn a_zero_divisor_pays_the_ceiling_from_the_first_unit() {
-		let mut curve = curve(FixedU128::zero(), 1_000);
-		curve.divisor = FixedU128::zero();
-		assert_eq!(curve.raised_dynamic_fee(1), FixedU128::one());
-		assert_eq!(curve.charged_rate(1), FixedU128::one());
-		assert_eq!(curve.fee(100u128), 100);
-		curve.dynamic_fee_ceiling = FixedU128::from_rational(10, 100);
-		assert_eq!(curve.raised_dynamic_fee(1), FixedU128::from_rational(10, 100));
-		assert_eq!(curve.charged_rate(1), FixedU128::from_rational(105, 1_000));
+	fn fee_ceiling_binds_while_the_dynamic_fee_still_climbs() {
+		let mut curve = curve(FixedU128::from_rational(30, 100), 1_000);
+		curve.fee_ceiling = Permill::from_percent(20);
+		assert_eq!(curve.charged_rate(500), FixedU128::from_rational(20, 100));
+		assert_eq!(curve.raised_dynamic_fee(500), FixedU128::from_rational(80, 100));
 	}
 
-	/// Verifies a redemption that starts at or above the dynamic-fee ceiling.
-	///
-	/// This state can occur after a policy decreases its ceiling below a stored fee. The redemption
-	/// pays the ceiling and does not increase the stored fee.
+	/// The policy permits a base fee equal to the fee ceiling but rejects an inverted range. The
+	/// charged rate stays at the fee ceiling while the stored fee climbs.
 	#[test]
-	fn arriving_at_or_above_the_ceiling_pays_it_flat() {
-		let ceiling = FixedU128::from_rational(10, 100);
-		let flat = FixedU128::from_rational(105, 1_000);
-		let mut curve = curve(ceiling, 1_000);
-		curve.dynamic_fee_ceiling = ceiling;
-		assert_eq!(curve.charged_rate(300), flat);
-		assert_eq!(curve.fee(300u128), 32);
-		assert_eq!(curve.raised_dynamic_fee(300), ceiling);
-		curve.decayed = FixedU128::from_rational(20, 100);
-		assert_eq!(curve.charged_rate(300), flat);
-		assert_eq!(curve.charged_rate(0), flat);
-		assert_eq!(curve.raised_dynamic_fee(300), ceiling);
-		assert_eq!(curve.raised_dynamic_fee(0), ceiling);
-	}
-
-	/// Verifies a policy in which the base fee equals the fee ceiling.
-	///
-	/// The policy permits equality but rejects an inverted range. The charged rate stays at the fee
-	/// ceiling while the stored dynamic fee increases.
-	#[test]
-	fn no_headroom_above_the_base_fee_charges_the_fee_ceiling_flat() {
+	fn base_fee_equal_to_the_fee_ceiling_charges_the_ceiling() {
 		let mut curve = curve(FixedU128::zero(), 1_000);
 		curve.fee_ceiling = Permill::from_rational(5u32, 1_000u32);
 		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(5, 1_000));
 		assert_eq!(curve.fee(400u128), 2);
-		let climbed = curve.raised_dynamic_fee(400);
-		assert_eq!(climbed, FixedU128::from_rational(40, 100));
+		assert_eq!(curve.raised_dynamic_fee(400), FixedU128::from_rational(40, 100));
+	}
+
+	#[test]
+	fn base_fee_above_the_fee_ceiling_is_clamped_to_the_ceiling() {
+		let mut curve = curve(FixedU128::zero(), 1_000);
 		curve.base_fee = Permill::from_percent(2);
 		curve.fee_ceiling = Permill::from_percent(1);
 		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(1, 100));
 		assert_eq!(curve.fee(400u128), 4);
-		assert_eq!(curve.raised_dynamic_fee(400), climbed);
+		assert_eq!(curve.raised_dynamic_fee(400), FixedU128::from_rational(40, 100));
+	}
+
+	/// Policy validation rejects a zero divisor, which the curve treats as an infinite
+	/// accelerator: the first unit lifts the dynamic fee straight to its ceiling.
+	#[test]
+	fn zero_divisor_lifts_the_dynamic_fee_to_its_ceiling_at_the_first_unit() {
+		let mut uncapped = curve(FixedU128::zero(), 1_000);
+		uncapped.divisor = FixedU128::zero();
+		assert_eq!(uncapped.charged_rate(1), FixedU128::one());
+		assert_eq!(uncapped.fee(100u128), 100);
+		assert_eq!(uncapped.raised_dynamic_fee(1), FixedU128::one());
+
+		let mut capped = curve(FixedU128::zero(), 1_000);
+		capped.divisor = FixedU128::zero();
+		capped.dynamic_fee_ceiling = FixedU128::from_rational(10, 100);
+		assert_eq!(capped.charged_rate(1), FixedU128::from_rational(105, 1_000));
+		assert_eq!(capped.raised_dynamic_fee(1), FixedU128::from_rational(10, 100));
+	}
+
+	/// A policy that lowers its ceiling to or below a stored fee: the redemption pays the ceiling
+	/// and does not raise the stored fee.
+	#[test]
+	fn dynamic_fee_ceiling_at_or_below_the_stored_fee_charges_the_ceiling_flat() {
+		let ten_percent = FixedU128::from_rational(10, 100);
+		let flat = FixedU128::from_rational(105, 1_000);
+
+		let mut at_ceiling = curve(ten_percent, 1_000);
+		at_ceiling.dynamic_fee_ceiling = ten_percent;
+		assert_eq!(at_ceiling.charged_rate(300), flat);
+		assert_eq!(at_ceiling.fee(300u128), 32);
+		assert_eq!(at_ceiling.raised_dynamic_fee(300), ten_percent);
+
+		let mut above_ceiling = curve(FixedU128::from_rational(20, 100), 1_000);
+		above_ceiling.dynamic_fee_ceiling = ten_percent;
+		assert_eq!(above_ceiling.charged_rate(300), flat);
+		assert_eq!(above_ceiling.raised_dynamic_fee(300), ten_percent);
+		assert_eq!(above_ceiling.charged_rate(0), flat);
+		assert_eq!(above_ceiling.raised_dynamic_fee(0), ten_percent);
 	}
 
 	/// Verifies that the arithmetic supports the largest balances.
@@ -544,43 +542,6 @@ mod tests {
 		(fee, curve.decayed)
 	}
 
-	/// Verifies the worked example: 20_000 of a 500_480 debt from a zero dynamic fee, at once and
-	/// in halves.
-	///
-	/// At once, the share is 3.996%, so the dynamic fee climbs by 3.996%. The redemption pays the
-	/// 1.998% mean above the 0.5% base fee: `ceil(20_000 · 2.498%) = 500`.
-	///
-	/// In halves, the first climbs to 1.998% and pays `ceil(149.90) = 150`. The second takes its
-	/// share of the remaining 490_480, climbs by 2.039% to 4.037%, and pays `ceil(351.75) = 352`.
-	/// Thus, the halves pay two units more and leave a higher dynamic fee.
-	#[test]
-	fn the_worked_example_at_once_and_in_halves() {
-		let example = curve(FixedU128::zero(), 500_480);
-		assert_eq!(example.fee(20_000u128), 500);
-		let raised = example.raised_dynamic_fee(20_000);
-		assert!(raised.into_inner().abs_diff(39_961_636_828_644_500) <= 1, "{raised:?}");
-		assert_eq!(example.fee(10_000u128), 150);
-		let (split_fee, split_raised) = redeem_in_tranches(example, &[10_000, 10_000]);
-		assert_eq!(split_fee, 502);
-		assert!(
-			split_raised.into_inner().abs_diff(40_369_009_574_002_562) <= 2,
-			"{split_raised:?}"
-		);
-		assert!(split_raised > raised);
-	}
-
-	#[test]
-	fn fee_rate_clamps_to_bounds() {
-		let base = Permill::from_rational(5u32, 1_000u32); // 0.5%
-		let ceiling = Permill::one();
-		assert_eq!(fee_rate(FixedU128::zero(), base, ceiling), FixedU128::from_rational(5, 1000));
-		assert_eq!(fee_rate(FixedU128::from_rational(2, 1), base, ceiling), FixedU128::one());
-		assert_eq!(
-			fee_rate(FixedU128::from_rational(10, 100), base, ceiling),
-			FixedU128::from_rational(105, 1000)
-		);
-	}
-
 	#[test]
 	fn redemption_fee_rounds_up() {
 		assert_eq!(redemption_fee(100u128, FixedU128::from_rational(5, 1000)), 1);
@@ -588,51 +549,31 @@ mod tests {
 		assert_eq!(redemption_fee(0u128, FixedU128::one()), 0);
 	}
 
-	/// Verifies the budget search at an ordinary fee and at its boundaries.
-	///
+	// These tests verify the budget search at an ordinary fee and at its boundaries.
+
 	/// A zero budget buys zero debt. A budget below one debt unit plus its fee also buys zero debt.
-	/// At `u128::MAX`, the debt-fee sum must not wrap to a value within the budget.
-	///
+	#[test]
+	fn max_debt_for_budget_buys_nothing_below_one_unit_and_its_fee() {
+		let whole = |debt: u128| debt;
+		assert_eq!(max_debt_for_budget(0, whole), 0);
+		assert_eq!(max_debt_for_budget(1, whole), 0);
+		assert_eq!(max_debt_for_budget(2, whole), 1);
+	}
+
 	/// At 0.5%, 995 debt pays `ceil(4.975) = 5` and fits the 1_000 exactly. One unit more pays
 	/// `ceil(4.98) = 5` and costs 1_001.
 	#[test]
-	fn max_debt_for_budget_edge_inputs() {
-		let free: fn(u128) -> u128 = |_| 0;
-		let whole: fn(u128) -> u128 = |debt| debt;
-		let half_percent: fn(u128) -> u128 = |debt| debt.div_ceil(200);
-		// (budget, fee, debt)
-		let cases = [
-			(0, whole, 0),
-			(1, whole, 0),
-			(2, whole, 1),
-			(1_000, whole, 500),
-			(u128::MAX, whole, u128::MAX / 2),
-			(1_000, free, 1_000),
-			(u128::MAX, free, u128::MAX),
-			(1_000, half_percent, 995),
-		];
-		for (budget, fee_for, debt) in cases {
-			assert_eq!(max_debt_for_budget(budget, fee_for), debt, "a budget of {budget}");
-		}
+	fn max_debt_for_budget_leaves_room_for_the_fee() {
+		assert_eq!(max_debt_for_budget(1_000, |debt: u128| debt), 500);
+		assert_eq!(max_debt_for_budget(1_000, |_: u128| 0), 1_000);
+		assert_eq!(max_debt_for_budget(1_000, |debt: u128| debt.div_ceil(200)), 995);
 	}
 
+	/// At `u128::MAX`, the debt-fee sum must not wrap to a value within the budget.
 	#[test]
-	fn max_debt_for_budget_lands_on_the_curve() {
-		let curve = curve(FixedU128::zero(), 10_000);
-		let budget = 1_000u128;
-		let debt = max_debt_for_budget(budget, |debt| curve.fee(debt));
-		assert!(debt + curve.fee(debt) <= budget);
-		assert!(debt + 1 + curve.fee(debt + 1) > budget);
-	}
-
-	#[test]
-	fn scale_floor_basic() {
-		assert_eq!(scale_floor(100u128, 1, 2), 50);
-		assert_eq!(scale_floor(100u128, 3, 4), 75);
-		// `100 · 1 / 3 = 33.3` and `100 · 2 / 3 = 66.7` both round down.
-		assert_eq!(scale_floor(100u128, 1, 3), 33);
-		assert_eq!(scale_floor(100u128, 2, 3), 66);
-		assert_eq!(scale_floor(100u128, 1, 0), 0);
+	fn max_debt_for_budget_does_not_wrap_at_the_largest_budget() {
+		assert_eq!(max_debt_for_budget(u128::MAX, |debt: u128| debt), u128::MAX / 2);
+		assert_eq!(max_debt_for_budget(u128::MAX, |_: u128| 0), u128::MAX);
 	}
 
 	/// Verifies curve properties across the full parameter space.

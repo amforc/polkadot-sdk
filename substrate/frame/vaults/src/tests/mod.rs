@@ -39,19 +39,14 @@ pub fn vault_status(
 }
 
 /// Asserts that the pallet emitted `event` in the current block.
+#[track_caller]
 pub fn assert_event(event: crate::Event<Test>) {
 	System::assert_has_event(RuntimeEvent::Vaults(event));
 }
 
 /// Returns every pallet event emitted in the current block, in order.
 pub fn vault_events() -> Vec<crate::Event<Test>> {
-	System::events()
-		.into_iter()
-		.filter_map(|record| match record.event {
-			RuntimeEvent::Vaults(event) => Some(event),
-			_ => None,
-		})
-		.collect()
+	System::read_events_for_pallet::<crate::Event<Test>>()
 }
 
 /// Asserts success and checks accounting before any subsequent operation can repair it.

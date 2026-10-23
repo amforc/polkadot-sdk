@@ -5,6 +5,8 @@
 //!
 //! The `test-utils` feature exposes this runtime to other crates.
 
+use alloc::collections::BTreeMap;
+
 use crate as pallet_redemptions;
 use crate::types::RedemptionConfig;
 pub use frame::{
@@ -13,13 +15,13 @@ pub use frame::{
 	testing_prelude::{assert_noop, assert_ok, assert_storage_noop, hypothetically, BadOrigin},
 };
 use frame::{
-	deps::sp_runtime::traits::ConvertInto,
+	deps::sp_runtime::traits::{ConvertInto, ConvertToValue},
 	testing_prelude::*,
 	traits::{
-		fungible::{HoldConsideration, NativeFromLeft, NativeOrWithId},
+		fungible::{NativeFromLeft, NativeOrWithId},
 		fungibles::{Inspect as FungiblesInspect, InspectHold, Mutate as FungiblesMutate},
 		tokens::{fungible, imbalance::ResolveAssetTo},
-		AsEnsureOriginWithArg, IdentityLookup, LinearStoragePrice,
+		AsEnsureOriginWithArg, IdentityLookup,
 	},
 };
 use pallet_linked_list::Position;
@@ -83,24 +85,17 @@ impl frame_system::Config for Test {
 	type Lookup = IdentityLookup<Self::AccountId>;
 }
 
+#[derive_impl(pallet_timestamp::config_preludes::TestDefaultConfig)]
+impl pallet_timestamp::Config for Test {}
+
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig as pallet_balances::DefaultConfig)]
 impl pallet_balances::Config for Test {
 	type AccountStore = System;
 	type Balance = Balance;
-	type ExistentialDeposit = ConstU128<1>;
-	type RuntimeHoldReason = RuntimeHoldReason;
-}
-
-impl pallet_timestamp::Config for Test {
-	type Moment = Moment;
-	type OnTimestampSet = ();
-	type MinimumPeriod = ConstU64<1>;
-	type WeightInfo = ();
 }
 
 #[derive_impl(pallet_assets::config_preludes::TestDefaultConfig as pallet_assets::DefaultConfig)]
 impl pallet_assets::Config for Test {
-	type AssetId = AssetIdForAssets;
 	type CreateOrigin = AsEnsureOriginWithArg<frame_system::EnsureSigned<AccountId>>;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type Currency = Balances;
@@ -114,7 +109,6 @@ impl pallet_assets_holder::Config for Test {
 }
 
 parameter_types! {
-	pub const MaxHintRepairSteps: u32 = 16;
 	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
 }
 
@@ -123,7 +117,7 @@ impl pallet_linked_list::Config for Test {
 	type ListId = VaultList;
 	type ItemId = AccountId;
 	type Priority = FixedU128;
-	type MaxHintRepairSteps = MaxHintRepairSteps;
+	type MaxHintRepairSteps = ConstU32<16>;
 	type PriorityProvider = pallet_vaults::Pallet<Test>;
 }
 
@@ -136,37 +130,30 @@ pub type VaultCollateralAssets =
 /// stablecoin is at par.
 pub struct MockOracle;
 parameter_types! {
-	pub static MockPrices: alloc::collections::BTreeMap<AssetId, FixedU128> =
-		alloc::collections::BTreeMap::new();
+	/// In storage so that every externality, and so every benchmark, starts unpriced.
+	pub storage MockPrices: BTreeMap<AssetId, FixedU128> = BTreeMap::new();
 }
 impl ProvidePrice for MockOracle {
 	type AssetId = AssetId;
 
 	fn provide_price(collateral_id: &AssetId) -> Result<FixedU128, DispatchError> {
-		MockPrices::get()
-			.get(collateral_id)
-			.copied()
-			.ok_or(DispatchError::Other("no price"))
+		// Production adapters report a missing price as `Unavailable`. The pallet propagates the
+		// oracle's error, so a pallet error here would let tests assert what no runtime returns.
+		MockPrices::get().get(collateral_id).copied().ok_or(DispatchError::Unavailable)
 	}
 }
 
 pub fn set_price(collateral: AssetId, price: FixedU128) {
-	MockPrices::mutate(|m| {
-		m.insert(collateral, price);
-	});
+	let mut prices = MockPrices::get();
+	prices.insert(collateral, price);
+	MockPrices::set(&prices);
 }
 
 /// Takes the oracle down for `collateral` until the next [`set_price`].
 pub fn clear_price(collateral: AssetId) {
-	MockPrices::mutate(|m| {
-		m.remove(&collateral);
-	});
-}
-
-parameter_types! {
-	pub const MarketDepositReason: RuntimeHoldReason =
-		RuntimeHoldReason::Vaults(pallet_vaults::HoldReason::BranchCreationDeposit);
-	pub const MarketDepositBase: Balance = 1_000;
+	let mut prices = MockPrices::get();
+	prices.remove(&collateral);
+	MockPrices::set(&prices);
 }
 
 /// Genesis owner of every test stablecoin, so [`EnsureAssetOwner`] admits it. It administers no
@@ -190,14 +177,6 @@ pub fn branch_admins(
 /// anyone else is rejected.
 pub type EnsureAssetOwner = stablecoin_primitives::EnsureStableOwnerOrRoot<Assets, AccountId>;
 
-/// Flat 1_000-unit refundable creation deposit, held in native balance.
-pub type VaultsConsideration = HoldConsideration<
-	AccountId,
-	Balances,
-	MarketDepositReason,
-	LinearStoragePrice<MarketDepositBase, ConstU128<0>, Balance>,
->;
-
 parameter_types! {
 	/// Governance bounds that [`default_branch_config`] sits inside.
 	pub TestBranchConfigBounds: pallet_vaults::types::BranchConfigBounds =
@@ -214,13 +193,14 @@ impl pallet_vaults::Config for Test {
 	type CollateralAssets = VaultCollateralAssets;
 	type StableAssets = Assets;
 	type Oracle = MockOracle;
-	type FeeAccount = FeeAccounts;
+	type FeeAccount = ConvertToValue<VaultFeeDestAccount>;
 	type YieldHook = ();
 	// Registering a market seeds this pallet's redemption config via `on_registered`.
 	type OnBranchLifecycle = Redemptions;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = EnsureAssetOwner;
-	type BranchConsideration = VaultsConsideration;
+	// Branch and vault deposits are the vaults suite's concern; these suites assert raw balances.
+	type BranchConsideration = ();
 	type VaultConsideration = ();
 	type BranchConfigBounds = TestBranchConfigBounds;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
@@ -287,20 +267,10 @@ impl Convert<StableId, AccountId> for InsuranceFundAccounts {
 /// Receives the vault fees of every test stablecoin.
 pub const VAULT_FEE_DEST: AccountId = 887;
 
-pub struct FeeAccounts;
-impl Convert<StableId, AccountId> for FeeAccounts {
-	fn convert(_stable: StableId) -> AccountId {
-		VAULT_FEE_DEST
-	}
-}
-
 parameter_types! {
 	pub const FeeDestAccount: AccountId = FEE_DEST;
+	pub const VaultFeeDestAccount: AccountId = VAULT_FEE_DEST;
 }
-
-/// The redemption config spans every market on a coin, so the coin's owner or Root sets it, not
-/// a market admin.
-pub type RedemptionsUpdateOrigin = EnsureAssetOwner;
 
 /// The redemption config that [`register_branch`] seeds on a stablecoin's first market.
 pub fn default_redemption_config() -> RedemptionConfig<Balance> {
@@ -323,7 +293,9 @@ impl pallet_redemptions::Config for Test {
 	type InsuranceFundAccount = InsuranceFundAccounts;
 	type FeeHandler = ResolveAssetTo<FeeDestAccount, Assets>;
 	type TimeProvider = Timestamp;
-	type UpdateOrigin = RedemptionsUpdateOrigin;
+	// The redemption config spans every market on a coin, so the coin's owner or Root sets it,
+	// not a market admin.
+	type UpdateOrigin = EnsureAssetOwner;
 	type MaxRedemptionSteps = ConstU32<20>;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
@@ -405,7 +377,6 @@ pub fn new_test_ext() -> TestState {
 	ext.execute_with(|| {
 		System::set_block_number(1);
 		Timestamp::set_timestamp(1_000);
-		MockPrices::set(alloc::collections::BTreeMap::new());
 		// The custody seed of a TOKEN_X market.
 		mint_collateral(TOKEN_X_ID, ADMIN, 1_000_000_000_000);
 	});
@@ -531,42 +502,20 @@ impl RedeemOptions {
 
 /// Dispatches `redeem` signed by `options.who` and returns the settlement its events report.
 pub fn redeem(options: RedeemOptions) -> Result<Settlement, DispatchError> {
-	let RedeemOptions {
-		who,
-		collateral,
-		stable,
-		max_stable_to_spend,
-		min_collateral_out,
-		recipient,
-		max_steps,
-	} = options;
-	let call = RedeemCall {
-		who,
-		collateral: collateral.clone(),
-		stable,
-		recipient,
-		events_before: System::events().len(),
-	};
+	let events_before = System::events().len();
 	Redemptions::redeem(
-		RuntimeOrigin::signed(who),
-		collateral,
-		stable,
-		crate::RedemptionTerms { max_stable_to_spend, min_collateral_out },
-		recipient,
-		max_steps,
+		RuntimeOrigin::signed(options.who),
+		options.collateral.clone(),
+		options.stable,
+		crate::RedemptionTerms {
+			max_stable_to_spend: options.max_stable_to_spend,
+			min_collateral_out: options.min_collateral_out,
+		},
+		options.recipient,
+		options.max_steps,
 	)
 	.map_err(|failed| failed.error)?;
-	Ok(call.read_settlement())
-}
-
-/// The parties and market that one `redeem` call's events must report.
-struct RedeemCall {
-	who: AccountId,
-	collateral: AssetId,
-	stable: StableId,
-	recipient: AccountId,
-	/// Event count before dispatch; the call's events follow.
-	events_before: usize,
+	Ok(redeem_settlement(&options, events_before))
 }
 
 /// One ordinary or recovery settlement, as its event reports it.
@@ -587,93 +536,88 @@ impl Settlement {
 	}
 }
 
-impl RedeemCall {
-	/// Reads the call's single settlement event and checks it against the per-step
-	/// `VaultRedeemed` events: both pallets must agree on what was settled, where, and for whom.
-	fn read_settlement(&self) -> Settlement {
-		let mut vault_debt_cancelled = 0;
-		let mut vault_collateral_out = 0;
-		let mut settlement = None;
-		for record in System::events().into_iter().skip(self.events_before) {
-			let (collateral_id, stable_id, redeemer, settled) = match record.event {
-				RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed {
-					collateral_id,
-					stable_id,
-					recipient,
-					debt_cancelled,
-					collateral_to_recipient,
-					..
-				}) => {
-					assert_eq!(collateral_id, self.collateral);
-					assert_eq!(stable_id, self.stable);
-					assert_eq!(recipient, self.recipient, "the vaults pay the named recipient");
-					vault_debt_cancelled += debt_cancelled.total();
-					vault_collateral_out += collateral_to_recipient;
-					continue;
+/// Reads the single settlement event of the [`redeem`] call that `options` describes, and checks
+/// it against the per-step `VaultRedeemed` events: both pallets must agree on what was settled,
+/// where, and for whom.
+fn redeem_settlement(options: &RedeemOptions, events_before: usize) -> Settlement {
+	let mut vault_debt_cancelled = 0;
+	let mut vault_collateral_out = 0;
+	let mut settlement = None;
+	for record in System::events().into_iter().skip(events_before) {
+		let (collateral_id, stable_id, redeemer, settled) = match record.event {
+			RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed {
+				collateral_id,
+				stable_id,
+				recipient,
+				debt_cancelled,
+				collateral_to_recipient,
+				..
+			}) => {
+				assert_eq!(collateral_id, options.collateral);
+				assert_eq!(stable_id, options.stable);
+				assert_eq!(recipient, options.recipient, "the vaults pay the named recipient");
+				vault_debt_cancelled += debt_cancelled.total();
+				vault_collateral_out += collateral_to_recipient;
+				continue;
+			},
+			RuntimeEvent::Redemptions(pallet_redemptions::Event::OrdinaryRedemptionExecuted {
+				collateral_id,
+				stable_id,
+				redeemer,
+				stable_burned,
+				collateral_out,
+				fee,
+				steps,
+			}) => (
+				collateral_id,
+				stable_id,
+				redeemer,
+				Settlement {
+					stable_burned,
+					insurance_cover: 0,
+					fee,
+					collateral_out,
+					ordinary_steps: Some(steps),
 				},
-				RuntimeEvent::Redemptions(
-					pallet_redemptions::Event::OrdinaryRedemptionExecuted {
-						collateral_id,
-						stable_id,
-						redeemer,
-						stable_burned,
-						collateral_out,
-						fee,
-						steps,
-					},
-				) => (
-					collateral_id,
-					stable_id,
-					redeemer,
-					Settlement {
-						stable_burned,
-						insurance_cover: 0,
-						fee,
-						collateral_out,
-						ordinary_steps: Some(steps),
-					},
-				),
-				RuntimeEvent::Redemptions(
-					pallet_redemptions::Event::RecoveryRedemptionExecuted {
-						collateral_id,
-						stable_id,
-						redeemer,
-						stable_burned,
-						insurance_cover,
-						collateral_out,
-						..
-					},
-				) => (
-					collateral_id,
-					stable_id,
-					redeemer,
-					Settlement {
-						stable_burned,
-						insurance_cover,
-						fee: 0,
-						collateral_out,
-						ordinary_steps: None,
-					},
-				),
-				_ => continue,
-			};
-			assert_eq!(collateral_id, self.collateral);
-			assert_eq!(stable_id, self.stable);
-			assert_eq!(redeemer, self.who);
-			assert!(settlement.replace(settled).is_none(), "one redemption settles per call");
-		}
-		let settled = settlement.expect("a successful redemption settles");
-		assert_eq!(
-			vault_debt_cancelled,
-			settled.stable_burned + settled.insurance_cover,
-			"the redeemer and the insurance cover cancel the vaults' debt between them"
-		);
-		assert_eq!(
-			vault_collateral_out, settled.collateral_out,
-			"the event totals the collateral that the vaults paid"
-		);
-		settled
+			),
+			RuntimeEvent::Redemptions(pallet_redemptions::Event::RecoveryRedemptionExecuted {
+				collateral_id,
+				stable_id,
+				redeemer,
+				stable_burned,
+				insurance_cover,
+				collateral_out,
+				..
+			}) => (
+				collateral_id,
+				stable_id,
+				redeemer,
+				Settlement {
+					stable_burned,
+					insurance_cover,
+					fee: 0,
+					collateral_out,
+					ordinary_steps: None,
+				},
+			),
+			_ => continue,
+		};
+		assert_eq!(collateral_id, options.collateral);
+		assert_eq!(stable_id, options.stable);
+		assert_eq!(redeemer, options.who);
+		assert!(settlement.replace(settled).is_none(), "one redemption settles per call");
 	}
+	let settled = settlement.expect("a successful redemption settles");
+	assert_eq!(
+		vault_debt_cancelled,
+		settled.stable_burned + settled.insurance_cover,
+		"the redeemer and the insurance cover cancel the vaults' debt between them"
+	);
+	assert_eq!(
+		vault_collateral_out, settled.collateral_out,
+		"the event totals the collateral that the vaults paid"
+	);
+	settled
 }
 
 /// Parks `owner`'s vault in `FinalRecovery`. Any account may sign the call; the caller sets up
