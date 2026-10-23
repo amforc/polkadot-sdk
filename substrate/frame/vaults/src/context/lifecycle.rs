@@ -56,9 +56,14 @@ impl<T: Config> VaultOp<T> {
 	/// Moves an active vault to its new rate-list position.
 	pub(super) fn reindex(&self, hint: ListPosition<T::AccountId>) -> DispatchResult {
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
-		T::VaultLists::re_insert(self.rate_list(), self.owner.clone(), self.vault.annual_rate, hint)
-			.map(|_| ())
-			.map_err(|e| Pallet::<T>::map_error(e).into())
+		T::VaultLists::re_insert(
+			self.ctx.rate_list(),
+			self.owner.clone(),
+			self.vault.annual_rate,
+			hint,
+		)
+		.map(|_| ())
+		.map_err(|e| Pallet::<T>::map_error(e).into())
 	}
 
 	/// Moves an unsafe last eligible vault into final recovery.
@@ -227,7 +232,7 @@ impl<T: Config> VaultOp<T> {
 				DispatchError::Corruption
 			);
 			// Neither the aggregate remainder nor interest charged ahead of it has a liability
-			// owner once the market is empty.
+			// owner once the branch is empty.
 			self.ctx.branch.state.debt.aggregate_interest_remainder = 0;
 			self.ctx.branch.state.debt.interest_minted_ahead = Zero::zero();
 		}

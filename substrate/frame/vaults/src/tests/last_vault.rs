@@ -1,11 +1,10 @@
-use crate::{mock::*, tests::rate_pct, types::LiquidationSettlement};
+use crate::{mock::*, tests::percent, types::LiquidationSettlement};
 use frame::traits::fungibles::Balanced;
 
 #[test]
 fn liquidate_only_vault_returns_last_vault_error() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		// Drop the price so the vault is severely undercollateralized — but
 		// `execute_liquidation` still rejects on the last-vault rule before any
 		// allocation is built.
@@ -16,10 +15,9 @@ fn liquidate_only_vault_returns_last_vault_error() {
 
 #[test]
 fn execute_liquidation_rejects_healthy_vault() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 		// Price 10 → CR = 1000 * 10 / 500 = 20 ≫ MCR 1.1.
 		assert_noop!(liquidate(DOT, STABLE, 1), crate::Error::<Test>::VaultNotLiquidatable);
 	});
@@ -27,9 +25,8 @@ fn execute_liquidation_rejects_healthy_vault() {
 
 #[test]
 fn execute_liquidation_rejects_final_recovery_vault() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		assert_ok!(enter_final_recovery(99, DOT, STABLE, 1));
 		assert_noop!(liquidate(DOT, STABLE, 1), crate::Error::<Test>::VaultInFinalRecovery);
@@ -38,10 +35,9 @@ fn execute_liquidation_rejects_final_recovery_vault() {
 
 #[test]
 fn execute_liquidation_rejects_frozen_branch() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
 		assert_noop!(liquidate(DOT, STABLE, 1), crate::Error::<Test>::BranchFrozen);
 	});
@@ -49,10 +45,9 @@ fn execute_liquidation_rejects_frozen_branch() {
 
 #[test]
 fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 
 		assert_noop!(
@@ -81,10 +76,9 @@ fn execute_liquidation_rejects_offset_debt_above_post_touch_debt() {
 // back atomically.
 #[test]
 fn execute_liquidation_rejects_collateral_payout_above_held() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
-		assert_ok!(open(2, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 		set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 		assert_noop!(
 			Pallet::<Test>::execute_liquidation(&DOT, &STABLE, &1, |_snapshot, owner_surplus| {
@@ -112,10 +106,9 @@ fn execute_liquidation_pays_recipients_and_derives_redistributed_debt() {
 	for (full_offset, offset_collateral, keeper_collateral, redistribution_collateral, surplus) in
 		[(false, 300, 50, 650, 0), (true, 500, 0, 0, 500)]
 	{
-		build_and_execute(|| {
-			register_market(DOT, STABLE);
-			assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
-			assert_ok!(open(2, DOT, STABLE, 1_000, 500, rate_pct(5, 100)));
+		ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+			assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+			assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
 			set_price(DOT, FixedU128::from_rational(5u128, 100u128));
 
 			let owner_pre = collateral_balance(DOT, 1);
@@ -157,10 +150,9 @@ fn execute_liquidation_pays_recipients_and_derives_redistributed_debt() {
 // pointer along with the row, or it dangles at a missing vault.
 #[test]
 fn liquidating_parked_dormant_owner_clears_pointer() {
-	build_and_execute(|| {
-		register_market(DOT, STABLE);
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, rate_pct(1, 100)));
-		assert_ok!(open(2, DOT, STABLE, 1_000, 500, rate_pct(2, 100)));
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(1)));
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(2)));
 		// Partial redemption drains vault 1 below MinimumDebt → Dormant, and
 		// parks it as the next redemption target.
 		assert_ok!(redeem(DOT, STABLE, 3, 350));
