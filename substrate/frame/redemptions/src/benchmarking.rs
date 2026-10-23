@@ -6,7 +6,7 @@
 use crate::{
 	pallet::{
 		BalanceOf, Call, CollateralIdOf, Config, Event, Millis, Pallet, RedemptionConfigOf,
-		RedemptionConfigs, StableIdOf,
+		StableIdOf, Stablecoins,
 	},
 	types::{RecoveryRegime, RedemptionConfig, RedemptionTerms},
 };
@@ -225,7 +225,10 @@ mod benchmarks {
 		let (_, stable_id) = T::Vaults::register_market()?;
 		let config =
 			RedemptionConfig { base_fee: Permill::from_percent(1), ..registration_config::<T>() };
-		assert!(RedemptionConfigs::<T>::get(&stable_id).is_some_and(|stored| stored != config));
+		let old_config = Stablecoins::<T>::get(&stable_id)
+			.map(|info| info.config)
+			.ok_or(BenchmarkError::Stop("registration seeded no redemption config"))?;
+		assert!(old_config != config);
 		// A stablecoin owner's signed origin, where the runtime admits one, reads the owner too.
 		let origin = T::UpdateOrigin::try_successful_origin(&stable_id)
 			.map_err(|_| BenchmarkError::Weightless)?;
@@ -234,10 +237,17 @@ mod benchmarks {
 		#[extrinsic_call]
 		_(origin as T::RuntimeOrigin, stable_id.clone(), config.clone());
 
-		assert_eq!(RedemptionConfigs::<T>::get(&stable_id), Some(config));
-		assert_eq!(pallet_events::<T>(), [Event::RedemptionConfigUpdated { stable_id }]);
+		assert_eq!(Stablecoins::<T>::get(&stable_id).map(|info| info.config), Some(config.clone()));
+		assert_eq!(
+			pallet_events::<T>(),
+			[Event::RedemptionConfigUpdated { stable_id, old_config, new_config: config }]
+		);
 		Ok(())
 	}
 
-	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);
+	impl_benchmark_test_suite!(
+		Pallet,
+		crate::mock::ExtBuilder::default().build(),
+		crate::mock::Test
+	);
 }
