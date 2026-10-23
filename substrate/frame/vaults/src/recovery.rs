@@ -9,7 +9,7 @@ use crate::{
 	types::VaultListId,
 };
 use frame::prelude::*;
-use linked_list_interface::{fifo_append, SortedListInterface};
+use linked_list_interface::{fifo_append, ListError, SortedListInterface};
 
 /// The per-branch FIFO list id.
 pub fn list_id<T: Config>(
@@ -27,7 +27,7 @@ pub fn append<T: Config>(
 	owner: T::AccountId,
 ) -> DispatchResult {
 	fifo_append::<_, _, T::VaultLists>(list_id::<T>(collateral_id, stable_id), owner)
-		.map_err(|_| Error::<T>::FinalRecoveryInvariantBroken)?;
+		.map_err(map_error::<T>)?;
 	Ok(())
 }
 
@@ -38,8 +38,26 @@ pub fn remove<T: Config>(
 	owner: &T::AccountId,
 ) -> DispatchResult {
 	T::VaultLists::remove(&list_id::<T>(collateral_id, stable_id), owner)
-		.map_err(|_| Error::<T>::FinalRecoveryInvariantBroken)?;
+		.map_err(map_error::<T>)?;
 	Ok(())
+}
+
+/// Translates a FIFO failure into [`Error::FinalRecoveryInvariantBroken`].
+///
+/// The pallet derives every FIFO position itself, so any failure other than the length
+/// counter or the transactional limit means the queue and the vault records disagree: storage
+/// corruption, reported defensively.
+fn map_error<T: Config>(e: ListError) -> Error<T> {
+	match e {
+		ListError::ItemNotFound |
+		ListError::ItemAlreadyExists |
+		ListError::CorruptList |
+		ListError::InvalidPositionHints => {
+			defensive!("final recovery queue disagrees with the vault records", e);
+		},
+		ListError::ListTooLong | ListError::Internal => {},
+	}
+	Error::<T>::FinalRecoveryInvariantBroken
 }
 
 /// Peek the head of the FIFO, if any.

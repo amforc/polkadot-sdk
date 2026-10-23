@@ -9,17 +9,17 @@ use crate::{
 		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings, HoldReason,
 		Millis, Pallet, StableIdOf, StablecoinDebt, StablecoinMarkets, VaultListIdOf, Vaults,
 	},
-	types::VaultListId,
+	types::{AssetMinimums, VaultListId},
 	utility_impls::BranchContribution,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 use frame::{
-	arithmetic::{CheckedAdd, Saturating, Zero},
+	arithmetic::{CheckedAdd, CheckedSub, Zero},
 	deps::{sp_core::U256, sp_runtime::TryRuntimeError},
 	prelude::ensure,
 	traits::{
 		fungibles::{Inspect as FungiblesInspect, InspectHold},
-		Convert, Time,
+		Convert, Get, Time,
 	},
 };
 use linked_list_interface::SortedListInterface;
@@ -40,7 +40,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		let markets = stablecoin_markets
 			.entry(T::StableToCollateralId::convert(stable_id.clone()))
 			.or_default();
-		*markets = markets.checked_add(1).ok_or("stablecoin market count overflow")?;
+		*markets = markets.checked_add(1).ok_or("stablecoin branch count overflow")?;
 		let branch_outstanding = branch.state.debt.outstanding();
 		let stable_entry = stablecoin_debt.entry(stable_id.clone()).or_default();
 		stable_entry.outstanding = stable_entry
@@ -61,6 +61,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			)
 			.ok_or("stablecoin pending-interest numerator overflow")?;
 		let (collateral_id, stable_id) = (&collateral_id, &stable_id);
+		check_branch_config::<T>(collateral_id, stable_id, &branch)?;
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 		let recovery_list = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
 		check_branch_identities::<T>(
@@ -89,11 +90,39 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 
 	check_owner_holds::<T>(owner_collateral)?;
 	check_stablecoin_markets::<T>(&collaterals, stablecoin_markets)?;
+	// No `StablecoinMarkets` entry is required per ceiling: governance sets a stablecoin's
+	// ceiling independently of its branches, before the first registers and after the last is
+	// removed, so an orphan ceiling is ordinary state.
 	ensure!(
 		GlobalDebtCeilings::<T>::iter_values().all(|ceiling| !ceiling.is_zero()),
 		"zero GlobalDebtCeilings record stored"
 	);
 	check_stablecoin_debt::<T>(stablecoin_debt, now)?;
+	Ok(())
+}
+
+/// The stored config must still pass the checks every config write passed.
+///
+/// Both are re-judged against today's inputs, not the ones at write time: a runtime upgrade that
+/// tightens [`Config::BranchConfigBounds`], or an asset whose minimum balance rises, leaves stored
+/// branches the dispatchables would now refuse, so such a change needs a migration of their
+/// configs.
+fn check_branch_config<T: Config>(
+	collateral_id: &CollateralIdOf<T>,
+	stable_id: &StableIdOf<T>,
+	branch: &BranchOf<T>,
+) -> Result<(), TryRuntimeError> {
+	let minimums = AssetMinimums {
+		collateral: T::CollateralAssets::minimum_balance(collateral_id.clone()),
+		stable: T::StableAssets::minimum_balance(stable_id.clone()),
+	};
+	branch
+		.config
+		.ensure_consistent(&minimums)
+		.map_err(|_| "stored branch config contradicts itself or its assets")?;
+	T::BranchConfigBounds::get()
+		.ensure_within(&branch.config)
+		.map_err(|_| "stored branch config is outside BranchConfigBounds")?;
 	Ok(())
 }
 
@@ -149,7 +178,7 @@ fn check_stablecoin_markets<T: Config>(
 ) -> Result<(), TryRuntimeError> {
 	ensure!(
 		!counts.keys().any(|stable_key| collaterals.contains(stable_key)),
-		"asset used as both collateral and stablecoin across markets"
+		"asset used as both collateral and stablecoin across branches"
 	);
 	let stored: BTreeMap<CollateralIdOf<T>, u32> = StablecoinMarkets::<T>::iter().collect();
 	ensure!(stored == counts, "StablecoinMarkets diverges from its recomputation over Branches");
@@ -158,7 +187,7 @@ fn check_stablecoin_markets<T: Config>(
 
 /// Owner-hold invariant: per `(owner, collateral C)`, the owner's
 /// `VaultCollateral` hold on `C` equals the sum of `vault.collateral` across
-/// every stablecoin market on `C`. The sum is accumulated in `check_branch_identities`'
+/// every stablecoin branch on `C`. The sum is accumulated in `check_branch_identities`'
 /// single vault pass; here we only compare it against the on-chain hold. With one
 /// stablecoin per collateral this collapses to a single term.
 fn check_owner_holds<T: Config>(
@@ -170,7 +199,7 @@ fn check_owner_holds<T: Config>(
 			&HoldReason::VaultCollateral.into(),
 			&owner,
 		);
-		ensure!(sum == held, "Σ vault.collateral over a collateral's markets != owner hold");
+		ensure!(sum == held, "Σ vault.collateral over a collateral's branches != owner hold");
 	}
 	Ok(())
 }
@@ -245,7 +274,7 @@ fn check_branch_identities<T: Config>(
 		let in_rate_index = T::VaultLists::contains(rate_list, &owner);
 		let in_recovery = T::VaultLists::contains(recovery_list, &owner);
 		ensure!(!(in_rate_index && in_recovery), "vault in both rate index and recovery FIFO");
-		// The row carries this market's share of the owner's hold; the cross-market
+		// The row carries this branch's share of the owner's hold; the cross-branch
 		// owner-hold invariant (`Σ_stablecoins vault.collateral == hold`) is
 		// accumulated here and checked once, globally, in `do_try_state`.
 		let owner_entry =
@@ -255,7 +284,7 @@ fn check_branch_identities<T: Config>(
 			.ok_or("owner collateral sum overflow")?;
 		sum_market_collateral = sum_market_collateral
 			.checked_add(&vault.collateral)
-			.ok_or("market collateral sum overflow")?;
+			.ok_or("branch collateral sum overflow")?;
 		// Every row — FinalRecovery included — keeps its debt attached to the
 		// branch aggregates; only the stake is detached while in the FIFO.
 		sum_principal = sum_principal
@@ -304,7 +333,8 @@ fn check_branch_identities<T: Config>(
 			let unclaimed = state
 				.redistribution
 				.principal_per_stake
-				.saturating_sub(vault.redistribution_checkpoint.principal_per_stake);
+				.checked_sub(&vault.redistribution_checkpoint.principal_per_stake)
+				.ok_or("vault redistribution checkpoint is ahead of branch totals")?;
 			let claimable = math::claimable_accrual_rate(stake_accrual_rate, unclaimed)
 				.ok_or("claimable redistribution accrual rate overflow")?;
 			sum_claimable_accrual_rate = sum_claimable_accrual_rate
@@ -344,7 +374,7 @@ fn check_branch_identities<T: Config>(
 		state.stakes.collateral_basis == expected_basis,
 		"stake collateral basis != eligible rows + pending collateral"
 	);
-	// The pool is posted rounded down and claimed rounded up, so the market never projects
+	// The pool is posted rounded down and claimed rounded up, so the branch never projects
 	// interest on an accrual rate that its vaults will not claim.
 	ensure!(
 		state.debt.pending_redistribution_accrual_rate <= sum_claimable_accrual_rate,
