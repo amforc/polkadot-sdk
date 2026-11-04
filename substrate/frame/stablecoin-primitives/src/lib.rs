@@ -62,8 +62,8 @@ pub const MILLIS_PER_YEAR: Millis = 31_557_600_000;
 pub enum VaultStatus {
 	/// Debt at or above `MinimumDebt`; in the rate index.
 	Active,
-	/// Debt below `MinimumDebt` (possibly zero) after redemption; out of the rate index.
-	/// May be revived to `Active`.
+	/// Debt below `MinimumDebt` (possibly zero); out of the rate index.
+	/// May retain collateral with no debt, or be revived to `Active`.
 	Dormant,
 	/// Below-MCR last eligible vault, queued in the FIFO for recovery redemptions and offsets.
 	FinalRecovery,
