@@ -253,9 +253,8 @@ fn exit_final_recovery_below_minimum_parks_dormant_once() {
 		// Push both FR vaults below MinimumDebt (200) but non-zero, so they stay in the FR FIFO.
 		assert_ok!(redeem_from(DOT, STABLE, 1, 99, 350));
 		assert_ok!(redeem_from(DOT, STABLE, 2, 98, 350));
-		let v = vault(DOT, STABLE, 1);
-		assert!(v.debt.total() > 0);
-		assert!(v.debt.total() < 200);
+		assert_eq!(vault(DOT, STABLE, 1).debt.total(), 151); // 501 - 350, below MinimumDebt 200
+		assert_eq!(vault(DOT, STABLE, 2).debt.total(), 151);
 
 		// The Dormant-exit branch never re-inserts into the rate index, so the
 		// hint is ignored. Pass a deliberately invalid one to prove it.
