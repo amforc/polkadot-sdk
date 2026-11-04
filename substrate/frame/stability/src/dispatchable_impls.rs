@@ -373,8 +373,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Applies a stablecoin deposit to recovery debt and then to the stability pool.
 	///
-	/// Always charged in full: a head that cannot be offset reports `NoTarget` on this layer, so an
-	/// empty-queue refund cannot be told apart from it.
+	/// Refunds to `deposit_no_recovery` only when the `FinalRecovery` queue was empty: any queued
+	/// head is read and priced, whether or not it can be settled.
 	pub(crate) fn do_deposit(
 		who: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
@@ -402,12 +402,20 @@ impl<T: Config> Pallet<T> {
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
 		// The settlement runs before the row loads: settling the head re-enters this pallet
 		// through the vault's yield hook, and a row loaded earlier would commit over that yield.
-		let (result, change) =
-			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
-		let collateral_out = match result {
+		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
+			&collateral_id,
+			payment,
+			amount,
+			&pool_account,
+		)?;
+		let (queue_empty, collateral_out) = match result {
 			RecoveryOffsetResult::NoTarget => {
 				debug_assert_eq!(change.peek(), amount);
-				BalanceOf::<T>::zero()
+				(true, BalanceOf::<T>::zero())
+			},
+			RecoveryOffsetResult::NotOffsettable => {
+				debug_assert_eq!(change.peek(), amount);
+				(false, BalanceOf::<T>::zero())
 			},
 			RecoveryOffsetResult::BelowPar => {
 				// The dropped change unwinds with the failing extrinsic.
@@ -419,7 +427,7 @@ impl<T: Config> Pallet<T> {
 					stable_id: stable_id.clone(),
 					source: RecoveryOffsetSource::IncomingDeposit,
 				});
-				collateral_out
+				(false, collateral_out)
 			},
 		};
 
@@ -445,7 +453,7 @@ impl<T: Config> Pallet<T> {
 			amount,
 			pending_amount,
 		});
-		Ok(().into())
+		Ok(queue_empty.then(T::WeightInfo::deposit_no_recovery).into())
 	}
 
 	/// Returns the open cohort that can satisfy the `required` activation deadline.
@@ -518,11 +526,19 @@ impl<T: Config> Pallet<T> {
 			Preservation::Preserve,
 			Fortitude::Polite,
 		)?;
-		let (result, change) =
-			T::RecoveryOffsets::execute_recovery_offset(&collateral_id, payment, &pool_account)?;
+		let max_partial_debt = pool
+			.state
+			.total_active_deposits
+			.saturating_sub(pool.config.minimum_active_pool_balance);
+		let (result, change) = T::RecoveryOffsets::execute_recovery_offset(
+			&collateral_id,
+			payment,
+			max_partial_debt,
+			&pool_account,
+		)?;
 		let collateral_out = match result {
 			// The dropped change unwinds with the failing extrinsic.
-			RecoveryOffsetResult::NoTarget => {
+			RecoveryOffsetResult::NoTarget | RecoveryOffsetResult::NotOffsettable => {
 				return Err(Error::<T>::RecoveryVaultNotFound.into());
 			},
 			RecoveryOffsetResult::BelowPar => {
