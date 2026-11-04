@@ -516,16 +516,13 @@ mod tests {
 		assert_eq!(vast.fee(1u128), 1);
 		assert_eq!(vast.raised_dynamic_fee(1), FixedU128::zero());
 		let nearly_all = u128::MAX - 1;
-		let rate = vast.charged_rate(nearly_all);
+		assert_eq!(vast.raised_dynamic_fee(nearly_all), FixedU128::from_inner(FixedU128::DIV - 1));
+		// The capped fraction rounds to 0.995, matching a full redemption's 50.49875% rate.
 		let small = curve(FixedU128::zero(), 1_000).charged_rate(1_000);
-		assert!(rate.into_inner().abs_diff(small.into_inner()) <= 4, "{rate:?} vs {small:?}");
-		let fee = vast.fee(nearly_all);
-		assert!(fee <= nearly_all);
-		assert!(fee > nearly_all / 2);
-		let full = FixedU128::one();
-		let raised = vast.raised_dynamic_fee(nearly_all);
-		assert!(raised.into_inner().abs_diff(full.into_inner()) <= 1, "{raised:?}");
-		assert_eq!(vast.raised_dynamic_fee(u128::MAX), full);
+		assert_eq!(vast.charged_rate(nearly_all), small);
+		// The fee is `ceil((u128::MAX − 1) · 0.5049875)`.
+		assert_eq!(vast.fee(nearly_all), 171_838_341_765_487_412_318_210_884_570_450_049_682);
+		assert_eq!(vast.raised_dynamic_fee(u128::MAX), FixedU128::one());
 	}
 
 	/// Applies `tranches` in sequence against the debt that each prior tranche leaves.
