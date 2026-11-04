@@ -170,6 +170,7 @@ std = [
 	"pallet-tx-pause?/std",
 	"pallet-uniques?/std",
 	"pallet-utility?/std",
+	"pallet-vaults?/std",
 	"pallet-verify-signature?/std",
 	"pallet-vesting-precompiles?/std",
 	"pallet-vesting?/std",
@@ -238,6 +239,7 @@ std = [
 	"sp-virtualization?/std",
 	"sp-wasm-interface?/std",
 	"sp-weights?/std",
+	"stablecoin-primitives?/std",
 	"staging-parachain-info?/std",
 	"staging-xcm-builder?/std",
 	"staging-xcm-executor?/std",
@@ -364,6 +366,7 @@ runtime-benchmarks = [
 	"pallet-tx-pause?/runtime-benchmarks",
 	"pallet-uniques?/runtime-benchmarks",
 	"pallet-utility?/runtime-benchmarks",
+	"pallet-vaults?/runtime-benchmarks",
 	"pallet-verify-signature?/runtime-benchmarks",
 	"pallet-vesting-precompiles?/runtime-benchmarks",
 	"pallet-vesting?/runtime-benchmarks",
@@ -388,6 +391,7 @@ runtime-benchmarks = [
 	"sc-service?/runtime-benchmarks",
 	"sp-runtime?/runtime-benchmarks",
 	"sp-staking?/runtime-benchmarks",
+	"stablecoin-primitives?/runtime-benchmarks",
 	"staging-node-inspect?/runtime-benchmarks",
 	"staging-xcm-builder?/runtime-benchmarks",
 	"staging-xcm-executor?/runtime-benchmarks",
@@ -518,6 +522,7 @@ try-runtime = [
 	"pallet-tx-pause?/try-runtime",
 	"pallet-uniques?/try-runtime",
 	"pallet-utility?/try-runtime",
+	"pallet-vaults?/try-runtime",
 	"pallet-verify-signature?/try-runtime",
 	"pallet-vesting-precompiles?/try-runtime",
 	"pallet-vesting?/try-runtime",
@@ -535,6 +540,7 @@ try-runtime = [
 	"polkadot-sdk-frame?/try-runtime",
 	"polkadot-service?/try-runtime",
 	"sp-runtime?/try-runtime",
+	"stablecoin-primitives?/try-runtime",
 	"staging-parachain-info?/try-runtime",
 ]
 serde = [
@@ -753,6 +759,7 @@ runtime-full = [
 	"pallet-tx-pause",
 	"pallet-uniques",
 	"pallet-utility",
+	"pallet-vaults",
 	"pallet-verify-signature",
 	"pallet-vesting",
 	"pallet-vesting-precompiles",
@@ -823,6 +830,7 @@ runtime-full = [
 	"sp-virtualization",
 	"sp-wasm-interface",
 	"sp-weights",
+	"stablecoin-primitives",
 	"staging-parachain-info",
 	"staging-xcm",
 	"staging-xcm-builder",
@@ -1058,6 +1066,10 @@ node = [
 tuples-96 = [
 	"frame-support-procedural?/tuples-96",
 	"frame-support?/tuples-96",
+]
+tuples-128 = [
+	"frame-support-procedural?/tuples-128",
+	"frame-support?/tuples-128",
 ]
 
 [package.edition]
@@ -1902,6 +1914,11 @@ default-features = false
 optional = true
 path = "../substrate/frame/utility"
 
+[dependencies.pallet-vaults]
+default-features = false
+optional = true
+path = "../substrate/frame/vaults"
+
 [dependencies.pallet-verify-signature]
 default-features = false
 optional = true
@@ -2251,6 +2268,11 @@ path = "../substrate/primitives/wasm-interface"
 default-features = false
 optional = true
 path = "../substrate/primitives/weights"
+
+[dependencies.stablecoin-primitives]
+default-features = false
+optional = true
+path = "../substrate/frame/stablecoin-primitives"
 
 [dependencies.staging-parachain-info]
 default-features = false

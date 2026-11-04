@@ -1,0 +1,61 @@
+//! `pallet-vaults` test suite.
+
+mod basic_ops;
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmark_seeding;
+mod borrower_operations;
+mod critical_threshold;
+mod debt_in_front;
+mod final_recovery;
+mod governance;
+mod hint_helpers;
+mod interest_rate;
+mod last_vault;
+mod lifecycle;
+mod multi_market;
+mod rate_index;
+mod realistic_scale;
+mod redemptions;
+mod redistribution_accounting;
+mod risk_controls;
+mod stablecoin_markets;
+mod vault_deposit;
+
+use crate::mock::{AccountId, AssetId, FixedU128, Moment, RuntimeEvent, StableId, System, Test};
+
+pub const ONE_DAY_MS: Moment = 24 * 3_600 * 1_000;
+pub const ONE_YEAR_MS: Moment = stablecoin_primitives::MILLIS_PER_YEAR;
+
+/// `n` percent, exactly.
+pub const fn percent(n: u128) -> FixedU128 {
+	FixedU128::from_inner(n * (<FixedU128 as frame::arithmetic::FixedPointNumber>::DIV / 100))
+}
+
+pub fn vault_status(
+	collateral: AssetId,
+	stable: StableId,
+	owner: AccountId,
+) -> crate::types::VaultStatus {
+	assert!(crate::Vaults::<Test>::contains_key((&collateral, &stable, &owner)), "vault exists");
+	crate::Pallet::<Test>::vault_status_of(&collateral, &stable, &owner)
+}
+
+/// Asserts that the pallet emitted `event` in the current block.
+#[track_caller]
+pub fn assert_event(event: crate::Event<Test>) {
+	System::assert_has_event(RuntimeEvent::Vaults(event));
+}
+
+/// Returns every pallet event emitted in the current block, in order.
+pub fn vault_events() -> Vec<crate::Event<Test>> {
+	System::read_events_for_pallet::<crate::Event<Test>>()
+}
+
+/// Asserts success and checks accounting before any subsequent operation can repair it.
+#[track_caller]
+pub fn assert_ok_and_invariants<R: core::fmt::Debug>(
+	result: Result<R, frame::prelude::DispatchError>,
+) {
+	frame::testing_prelude::assert_ok!(result);
+	crate::mock::check_invariants();
+}
