@@ -75,16 +75,23 @@ impl<T: Config> Pallet<T> {
 		// A deposit needs no price and only lowers risk, so a frozen branch still accepts it.
 		let mut op = VaultOp::<T>::load(collateral_id, stable_id, &owner)?;
 		op.add_collateral(amount)?;
-		T::CollateralAssets::transfer_and_hold(
+		// Avoid folding an unrecorded sub-minimum remainder into the hold.
+		let preservation =
+			debit_preservation::<T::CollateralAssets, _>(op.collateral_id().clone(), &from, amount);
+		let moved = T::CollateralAssets::transfer_and_hold(
 			op.collateral_id().clone(),
 			&HoldReason::VaultCollateral.into(),
 			&from,
 			&owner,
 			amount,
 			Precision::Exact,
-			Preservation::Expendable,
+			preservation,
 			Fortitude::Polite,
 		)?;
+		if moved != amount {
+			defensive!("an exact deposit holds exactly the requested amount");
+			return Err(DispatchError::Corruption);
+		}
 
 		Self::deposit_event(Event::CollateralDeposited {
 			collateral_id: op.collateral_id().clone(),

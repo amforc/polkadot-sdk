@@ -609,7 +609,7 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		minimum_debt: 200,
 		minimum_collateral: 1,
 		minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
-		maximum_borrow_rate: FixedU128::from_rational(100u128, 100u128),
+		maximum_borrow_rate: FixedU128::from_rational(400u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
 		rate_adjustment_cooldown: 24 * 3_600 * 1_000,
 		final_recovery_reward_cooldown: 3_600 * 1_000,

@@ -151,7 +151,12 @@ mod tests {
 	fn mul_div_rate_floor_overflow_boundary() {
 		// Past the `FixedU128` limit the function fails rather than wrapping.
 		assert_eq!(mul_div_rate_floor(u128::MAX / 2, FixedU128::one(), 1), None);
-		assert!(mul_div_rate_floor(u128::MAX / (FixedU128::DIV * 2), FixedU128::one(), 1).is_some());
+		// `value · DIV` fits within half the u128 range; a rate of one preserves it.
+		let value = u128::MAX / (FixedU128::DIV * 2);
+		assert_eq!(
+			mul_div_rate_floor(value, FixedU128::one(), 1),
+			Some(FixedU128::from_inner(value * FixedU128::DIV)),
+		);
 		// The complete formula fits although `value / denominator` does not fit in
 		// `FixedU128`, so a two-step computation would reject it.
 		assert_eq!(

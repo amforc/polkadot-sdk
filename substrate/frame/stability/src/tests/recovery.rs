@@ -1,9 +1,9 @@
 //! Recovery offsets against a real vault in `FinalRecovery`, priced by the real redemptions
 //! pallet, so an offset and a recovery redemption cannot be priced differently.
 //!
-//! The standing figures: the vault holds 1000 collateral against 500 debt, which is 499 borrowed
-//! plus a 1 upfront fee. At the parked price of 0.52 its CR is 104%, so the recovery bonus is 3%
-//! and cancelling debt `D` pays `floor(floor(D * 1.03) / 0.52)` collateral.
+//! The vault holds 1000 collateral against 500 debt: 498 borrowed + 1 upfront fee + 1 interest.
+//! At price 0.52, CR is 104% and the recovery bonus is 3%; cancelling debt `D` pays
+//! `floor(floor(D * 1.03) / 0.52)` collateral.
 //!
 //! The active pool is the 400 that account 1 deposits and matures while the branch is still
 //! Normal, which also fixes the standing timestamp and accrued-interest figures.

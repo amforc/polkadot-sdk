@@ -714,12 +714,22 @@ impl<T: Config> Pallet<T> {
 
 	/// Resolves a fee credit to the configured fee account.
 	///
+	/// Recreates a removed asset account so it can receive sub-minimum credits.
 	/// A failure aborts the transaction because the credit backs a recorded liability.
 	fn resolve_fee_credit(stable_id: &StableIdOf<T>, credit: StableCreditOf<T>) -> DispatchResult {
 		if credit.peek().is_zero() {
 			return Ok(());
 		}
 		let fee_account = T::FeeAccount::convert(stable_id.clone());
+		let Err(credit) = T::StableAssets::resolve(&fee_account, credit) else {
+			return Ok(());
+		};
+		<T::StableAssets as AccountTouch<_, _>>::touch(
+			stable_id.clone(),
+			&fee_account,
+			&fee_account,
+		)
+		.map_err(|_| Error::<T>::FeeResolutionFailed)?;
 		T::StableAssets::resolve(&fee_account, credit).map_err(|credit| {
 			drop(credit);
 			Error::<T>::FeeResolutionFailed
