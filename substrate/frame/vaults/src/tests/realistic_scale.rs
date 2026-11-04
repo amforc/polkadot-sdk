@@ -17,6 +17,7 @@ use frame::{
 	prelude::TokenError,
 	traits::{
 		fungible::Inspect as FungibleInspect,
+		fungibles::Mutate as FungiblesMutate,
 		tokens::{Fortitude, Preservation},
 		AccountTouch,
 	},
@@ -434,6 +435,35 @@ fn liquidation_jit_rounds_dead_zone_to_preserving_limit() {
 		assert_eq!(stable_balance(USDX, 3), USDX_ED, "keeper account survives at ED");
 		assert_eq!(issuance_before - total_stable(USDX), funded, "exact rounded burn");
 		assert!(!vault_exists(XBT, USDX, 1));
+	});
+}
+
+// A removed fee account must not block a sub-minimum interest payout.
+#[test]
+fn liquidation_recreates_a_removed_fee_account() {
+	ExtBuilder::default().build_and_execute(|| {
+		// A funded fee account needs no touch at registration, so draining it removes it.
+		mint_stable(USDX, FEE_DEST, USDX_ED);
+		register_realistic_market();
+		SpFeeShare::set(&Permill::zero());
+		assert_ok!(open(2, XBT, USDX, 4_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+		assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+		assert_ok!(<Assets as FungiblesMutate<AccountId>>::transfer(
+			USDX,
+			&FEE_DEST,
+			&9,
+			stable_balance(USDX, FEE_DEST),
+			Preservation::Expendable,
+		));
+		set_price(XBT, FixedU128::from_rational(54u128, 100_000u128));
+		advance_time(1_000);
+
+		assert_ok!(liquidate(4, XBT, USDX, 3, 0, 0));
+
+		assert!(!crate::pallet::Vaults::<Test>::contains_key((XBT, USDX, 3)));
+		let fee = stable_balance(USDX, FEE_DEST);
+		assert!(fee > 0);
+		assert!(fee < USDX_ED, "the credit is sub-minimum, so only the touch lets it land");
 	});
 }
 
