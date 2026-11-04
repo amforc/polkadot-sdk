@@ -12,6 +12,7 @@ use frame::{
 	prelude::TokenError,
 	traits::{
 		fungible::Inspect as FungibleInspect,
+		fungibles::Mutate as FungiblesMutate,
 		tokens::{Fortitude, Preservation},
 		AccountTouch,
 	},
@@ -372,5 +373,45 @@ fn excess_repay_rejects_leaving_the_payer_below_minimum_balance() {
 fn full_repay_rejects_leaving_the_payer_below_minimum_balance() {
 	ExtBuilder::default().build_and_execute(|| {
 		assert_repay_rejects_a_sub_ed_remainder(None);
+	});
+}
+
+/// Deposits `amount` from a fresh payer holding exactly `wallet` XBT.
+fn deposit_from_fresh_payer(wallet: Balance, amount: Balance) -> DispatchResult {
+	register_realistic_market();
+	assert_ok!(open(3, XBT, USDX, 1_000 * XBT_UNIT, 5_000 * USD, percent(5)));
+	assert_ok!(<Assets as FungiblesMutate<AccountId>>::transfer(
+		XBT_ID,
+		&2,
+		&40,
+		wallet,
+		Preservation::Preserve,
+	));
+	deposit_collateral(40, XBT, USDX, 3, amount)
+}
+
+// Held collateral must match the vault's recorded amount.
+#[test]
+fn third_party_deposit_rejects_leaving_the_payer_below_minimum_balance() {
+	ExtBuilder::default().build_and_execute(|| {
+		let amount = 10 * XBT_UNIT;
+
+		let result = deposit_from_fresh_payer(amount + XBT_ED / 2, amount);
+
+		assert_eq!(result, Err(pallet_assets::Error::<Test>::BalanceLow.into()));
+		assert_eq!(held(XBT, 3), 1_000 * XBT_UNIT);
+	});
+}
+
+#[test]
+fn third_party_deposit_of_the_whole_wallet_holds_exactly_the_amount() {
+	ExtBuilder::default().build_and_execute(|| {
+		let amount = 10 * XBT_UNIT;
+
+		assert_ok!(deposit_from_fresh_payer(amount, amount));
+
+		assert_eq!(collateral_balance(XBT, 40), 0);
+		assert_eq!(held(XBT, 3), 1_000 * XBT_UNIT + amount);
+		assert_eq!(xbt_vault(3).collateral, 1_000 * XBT_UNIT + amount);
 	});
 }
