@@ -130,6 +130,9 @@ fn batch_all_deposit_lifting_branch_out_of_safety_allows_borrow() {
 		assert!(branch_tcr() > tcr_before);
 		assert_eq!(vault(&owner).collateral, 2_000 * WND);
 		assert_eq!(vault(&owner).debt.total(), 1_000 * DOTUSD);
+		assert_eq!(collateral_on_hold(&get_native_id(), &owner), 2_000 * WND);
+		// No upfront fee: both 500 borrows pay out in full.
+		assert_eq!(dotusd_balance(&owner), 1_000 * DOTUSD);
 	});
 }
 

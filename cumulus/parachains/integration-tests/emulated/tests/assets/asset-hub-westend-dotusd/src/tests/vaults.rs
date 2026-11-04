@@ -15,8 +15,8 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
-	dotusd_config::VaultsBranchCreationDeposit, governance, Assets, Balances, Redemptions,
-	RuntimeHoldReason, Stability, TrustBackedAssetsInstance, Vaults,
+	dotusd_config::VaultsBranchCreationDeposit, governance, AssetAccountDeposit, Assets, Balances,
+	Redemptions, RuntimeHoldReason, Stability, TrustBackedAssetsInstance, Vaults,
 };
 use frame_support::{
 	assert_noop, hypothetically_ok,
@@ -92,7 +92,7 @@ fn signed_user_registers_a_native_collateral_market() {
 			<Assets as Refund<AccountId>>::deposit_held(DOTUSD_ID, fee_account.clone())
 				.expect("registration touched the fee account");
 		assert_eq!(depositor, fee_account, "the stablecoin-wide account owns its deposit");
-		assert!(deposit > 0);
+		assert_eq!(deposit, AssetAccountDeposit::get());
 		// The account exists but is empty. It can now receive a credit of any size.
 		assert_eq!(dotusd_balance(&fee_account), 0);
 
@@ -148,10 +148,8 @@ fn signed_user_registers_a_native_collateral_market() {
 	});
 }
 
-/// The runtime routes each update origin: branch freezes take Root through
-/// `ForceOrigin`, stablecoin-wide redemption settings take the asset owner, and
-/// the pool configuration takes the branch full admin or Root but not the
-/// emergency admin.
+/// Freezes require a branch admin or Root; redemption settings require the asset owner or Root.
+/// Pool settings require the full admin or Root.
 #[test]
 fn runtime_update_origins_route_to_owner_admin_or_root() {
 	AssetHubWestend::execute_with(|| {
@@ -168,13 +166,16 @@ fn runtime_update_origins_route_to_owner_admin_or_root() {
 				emergency_admin: MultiAddress::Id(emergency_admin.clone()),
 			},
 		));
-		// Root holds no admin role, so only `ForceOrigin` can admit it.
-		hypothetically_ok!(Vaults::set_governance_frozen(
-			RuntimeOrigin::root(),
-			get_native_id(),
-			DOTUSD_ID,
-			true,
-		));
+		// The asset owner has no branch role; Root is admitted through `ForceOrigin`.
+		let freeze = |origin: RuntimeOrigin| {
+			Vaults::set_governance_frozen(origin, get_native_id(), DOTUSD_ID, true)
+		};
+		assert_noop!(
+			freeze(RuntimeOrigin::signed(admin())),
+			pallet_vaults::Error::<Runtime>::NotBranchAdmin,
+		);
+		hypothetically_ok!(freeze(RuntimeOrigin::signed(emergency_admin.clone())));
+		hypothetically_ok!(freeze(RuntimeOrigin::root()));
 
 		// The redemption policy takes the stablecoin owner or Root.
 		let redemption_config = pallet_redemptions::Stablecoins::<Runtime>::get(DOTUSD_ID)
@@ -190,6 +191,11 @@ fn runtime_update_origins_route_to_owner_admin_or_root() {
 		);
 		hypothetically_ok!(Redemptions::set_redemption_config(
 			RuntimeOrigin::signed(admin()),
+			DOTUSD_ID,
+			redemption_config.clone(),
+		));
+		hypothetically_ok!(Redemptions::set_redemption_config(
+			RuntimeOrigin::root(),
 			DOTUSD_ID,
 			redemption_config,
 		));
