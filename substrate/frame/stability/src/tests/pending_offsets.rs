@@ -222,5 +222,13 @@ fn pending_deposit_offset_is_shared_pro_rata() {
 			let state = pool_state(DOT, STABLE);
 			assert_eq!(state.total_pending_deposits, 400);
 			assert_eq!(state.total_collateral_gains_unclaimed, 1);
+
+			// Activation moves ceil(1_400 * 2/7) = 400 into active deposits: 398 owned + 2 dust.
+			// Offsets burn dust; branch removal sends the remainder to `StableDustHandler`.
+			advance_time(9_000);
+			assert_ok!(settle(1, 1, DOT, STABLE));
+			let state = pool_state(DOT, STABLE);
+			assert_eq!(state.total_pending_deposits, 0);
+			assert_eq!(state.total_active_deposits, 400);
 		});
 }
