@@ -810,6 +810,55 @@ fn recovery_bonus_improves_vault_cr() {
 		});
 }
 
+/// From par through `100% + buffer`, the recovery bonus is zero and settlement is at face value.
+#[test]
+fn recovery_bonus_is_zero_from_par_through_the_buffer() {
+	// (price, CR, face-value collateral for 200 debt, CR after cancelling it).
+	let cases = [
+		// At par: floor(200 / 0.6) = 333; the remaining CR is floor(667 · 0.6) / 400 = 1.
+		(percent(60), percent(100), 333, percent(100)),
+		// floor(200 / 0.603) = 331 leaves floor(669 · 0.603) / 400 = 403 / 400.
+		(
+			FixedU128::from_rational(603, 1_000),
+			FixedU128::from_rational(1_005, 1_000),
+			331,
+			FixedU128::from_rational(10_075, 10_000),
+		),
+		// At the buffer: floor(200 / 0.606) = 330; remaining CR = floor(670 · 0.606) / 400.
+		(
+			FixedU128::from_rational(606, 1_000),
+			percent(101),
+			330,
+			FixedU128::from_rational(1_015, 1_000),
+		),
+	];
+	for (price, cr_before, collateral_out, cr_after) in cases {
+		ExtBuilder::default()
+			.default_branch()
+			.final_recovery_vault(1, 1_000, 599, price)
+			.stable_balance(STABLE, REDEEMER, 1_000_000)
+			.build_and_execute(|| {
+				assert_eq!(vault_debt(DOT, STABLE, 1), 600);
+				assert_eq!(vault_cr(1, price), cr_before);
+				let recipient_before = collateral_balance(DOT, RECIPIENT);
+
+				let settled = redeem(RedeemOptions::spend(200)).expect("redemption succeeds");
+
+				assert_eq!(settled.figures(), (200, 0, collateral_out));
+				assert_eq!(settled.kind, RECOVERY_BONUS);
+				assert_eq!(collateral_balance(DOT, RECIPIENT) - recipient_before, collateral_out);
+				assert_eq!(
+					redemption_events_since_last_call(),
+					vec![recovery_executed(200, 0, collateral_out, RecoveryRegime::RecoveryBonus)]
+				);
+				assert_eq!(vault_cr(1, price), cr_after);
+				if cr_before > percent(100) {
+					assert!(cr_after > cr_before, "inside the band the CR strictly improves");
+				}
+			});
+	}
+}
+
 /// The head settles at a bonus up to the 120% ICR, even above the 110% MCR where it could
 /// already exit, so redeemers push it out with a margin rather than one tick above the MCR.
 /// Above the ICR, redemptions refuse it and offsets see no target. Once out, it is ordinary.
@@ -874,10 +923,10 @@ fn recovery_stops_above_icr() {
 		});
 }
 
-/// A sub-minimum head past the gate may be unable to exit while another vault
+/// A sub-minimum head above the ICR may be unable to exit while another vault
 /// holds the Dormant slot, so it stays settleable, at face value.
 #[test]
-fn recovery_sub_minimum_head_above_mcr_settles_at_face_value() {
+fn recovery_sub_minimum_head_above_icr_settles_at_face_value() {
 	ExtBuilder::default()
 		.default_branch()
 		.final_recovery_vault(1, 1_000, 500, RECOVERY_PRICE_ABOVE_PAR)
@@ -1276,27 +1325,32 @@ fn insurance_fund_paying_its_own_cover_refuses_settlement() {
 
 #[test]
 fn ordinary_allowed_in_safety_mode() {
-	// The branch sits in Safety mode (TCR below 130%) while the vault stays above par.
+	// CR = 1_000 · 0.65 / 501 ≈ 129.7%: above ICR (120%), below the Safety threshold (130%).
 	ExtBuilder::default()
 		.default_branch()
 		.vault(1, 1_000, 500, percent(5))
-		.price(DOT, FixedU128::from_rational(6u128, 10u128))
+		.price(DOT, FixedU128::from_rational(65u128, 100u128))
 		.stable_balance(STABLE, REDEEMER, 1_000_000)
 		.build_and_execute(|| {
 			assert!(
 				branch_tcr(DOT, STABLE) < FixedU128::from_rational(130u128, 100u128),
 				"fixture must put the branch below the safety threshold"
 			);
+			// Withdrawal stays above ICR but worsens TCR, so Safety mode rejects it.
+			assert_noop!(
+				Vaults::withdraw_collateral(RuntimeOrigin::signed(1), DOT, STABLE, 1, None),
+				pallet_vaults::Error::<Test>::SafetyModeTcrWorsening
+			);
 			let debt_before = vault_debt(DOT, STABLE, 1);
 			let tcr_before = branch_tcr(DOT, STABLE);
 
 			// 223 buys 201 of the 501 coin debt, a 40.12% share, so the dynamic fee rises
-			// 20.06% and the fee is `ceil(201 · (10.03% + 0.5%)) = 22`. At 0.6, 201 debt pays
-			// `floor(201 / 0.6) = 335` collateral.
+			// 20.06% and the fee is `ceil(201 · (10.03% + 0.5%)) = 22`. At 0.65, 201 debt pays
+			// `floor(201 / 0.65) = 309` collateral.
 			let settled = redeem(RedeemOptions::spend(223)).expect("redemption succeeds");
 
 			assert_eq!(debt_before - vault_debt(DOT, STABLE, 1), 201);
-			assert_eq!(settled.figures(), (201, 22, 335));
+			assert_eq!(settled.figures(), (201, 22, 309));
 			// A face-value redemption removes debt and at most equal-value collateral, so a TCR
 			// above 1 can only rise: why Safety mode still permits it.
 			assert!(branch_tcr(DOT, STABLE) > tcr_before, "redemption must raise TCR");
