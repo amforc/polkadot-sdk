@@ -3104,6 +3104,9 @@ mod runtime {
 
 	#[runtime::pallet_index(100)]
 	pub type Vaults = pallet_vaults::Pallet<Runtime>;
+
+	#[runtime::pallet_index(101)]
+	pub type Redemptions = pallet_redemptions::Pallet<Runtime>;
 }
 
 /// The address format for describing accounts.
@@ -3285,6 +3288,31 @@ parameter_types! {
 	pub PsmHoldReason: RuntimeHoldReason = RuntimeHoldReason::Psm(pallet_psm::HoldReason::CreationDeposit);
 }
 
+parameter_types! {
+	/// No debt ceiling: maximum possible issuance.
+	pub const NoVaultsCeiling: Balance = Balance::MAX;
+}
+
+/// EnsureOrigin implementation for PSM management that supports privilege levels.
+pub struct EnsurePsmManager;
+impl frame_support::traits::EnsureOrigin<RuntimeOrigin> for EnsurePsmManager {
+	type Success = pallet_psm::PsmManagerLevel;
+
+	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
+		use frame_system::RawOrigin;
+
+		match o.clone().into() {
+			Ok(RawOrigin::Root) => Ok(pallet_psm::PsmManagerLevel::Full),
+			_ => Err(o),
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn try_successful_origin() -> Result<RuntimeOrigin, ()> {
+		Ok(RuntimeOrigin::root())
+	}
+}
+
 #[cfg(feature = "runtime-benchmarks")]
 pub struct PsmBenchmarkHelper;
 #[cfg(feature = "runtime-benchmarks")]
@@ -3433,7 +3461,7 @@ impl pallet_vaults::Config for Runtime {
 	type Oracle = VaultsOracleAdapter;
 	type FeeAccount = VaultsFeeAccount;
 	type YieldHook = ();
-	type OnBranchLifecycle = ();
+	type OnBranchLifecycle = Redemptions;
 	type TimeProvider = Timestamp;
 	type CreateOrigin = VaultsCreateOrigin;
 	type BranchConsideration = HoldConsideration<
@@ -3495,6 +3523,55 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountI
 		<Balances as FungibleMutate<AccountId>>::mint_into(who, 1_000 * DOLLARS)
 			.expect("minting native to a benchmark account cannot overflow the issuance; qed");
 	}
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+fn fund_vaults_benchmark_collateral(
+	asset_id: VaultsCollateralId,
+	who: &AccountId,
+	amount: Balance,
+) {
+	use frame_support::traits::{fungibles::Balanced as FungiblesBalanced, tokens::Precision};
+
+	if System::providers(who) == 0 {
+		System::inc_providers(who);
+	}
+	let debt = <VaultsCollateral as FungiblesBalanced<AccountId>>::deposit(
+		asset_id,
+		who,
+		amount,
+		Precision::Exact,
+	)
+	.expect("fund collateral for benchmark account");
+	drop(debt);
+}
+
+parameter_types! {
+	pub const InsurancePalletId: PalletId = PalletId(*b"py/insur");
+}
+
+/// Isolates each stablecoin's Insurance Fund cover in a separate account.
+pub struct StableInsuranceAccount;
+impl traits::Convert<VaultsStableId, AccountId> for StableInsuranceAccount {
+	fn convert(stable_id: VaultsStableId) -> AccountId {
+		InsurancePalletId::get().into_sub_account_truncating(stable_id)
+	}
+}
+
+parameter_types! {
+	pub const RedemptionsMaxSteps: u32 = 16;
+}
+
+impl pallet_redemptions::Config for Runtime {
+	type StableAssets = Assets;
+	type Oracle = VaultsOracleAdapter;
+	type Vaults = Vaults;
+	type InsuranceFundAccount = StableInsuranceAccount;
+	type FeeHandler = ResolveAssetTo<TreasuryAccount, Assets>;
+	type TimeProvider = Timestamp;
+	type UpdateOrigin = VaultsCreateOrigin;
+	type MaxRedemptionSteps = RedemptionsMaxSteps;
+	type WeightInfo = pallet_redemptions::weights::SubstrateWeight<Runtime>;
 }
 
 /// MMR helper types.
@@ -3649,6 +3726,7 @@ mod benches {
 		[pallet_psm, Psm]
 		[pallet_linked_list, LinkedList]
 		[pallet_vaults, Vaults]
+		[pallet_redemptions, Redemptions]
 	);
 }
 

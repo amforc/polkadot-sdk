@@ -134,7 +134,7 @@ mod tests {
 	}
 
 	#[test]
-	fn dead_zone_rounds_down_to_the_preserving_limit() {
+	fn requests_leaving_less_than_the_minimum_balance_round_down_to_keep_it() {
 		// 91..=99 all leave a sub-minimum remainder.
 		for limit in [91, 95, 99] {
 			let debit = reducible_debit::<Funded, _>((), &0, limit);
