@@ -1,20 +1,7 @@
 //! Stability Pool offset interfaces for liquidation settlement.
 
 use crate::BranchSnapshot;
-use frame::deps::{
-	frame_support::{
-		defensive,
-		pallet_prelude::DispatchError,
-		traits::{
-			tokens::{
-				fungibles::{HandleImbalanceDrop, Imbalance},
-				AssetId, Balance as TokenBalance,
-			},
-			TryDrop,
-		},
-	},
-	sp_runtime::traits::Zero,
-};
+use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::traits::Zero};
 
 /// Per-leg values of a Stability Pool offset: debt amounts or collateral credits.
 pub struct OffsetLegs<T> {
@@ -65,8 +52,7 @@ pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit,
 	/// - `debt.pending == Self::quote_pending(&quote, debt.pending, debt.active)`
 	///
 	/// Returns the cancelled stablecoin as a credit, zero if both debts are zero. Dropping it
-	/// burns it; a caller minting stablecoin in the same transaction may mint from it instead,
-	/// netting the supply changes. The caller reduces vault debt by the same amounts.
+	/// burns it. The caller reduces vault debt by the same amounts.
 	///
 	/// Pass the `branch` the quotes were taken under so capital is classified the same way. Pool
 	/// collateral custody is prepared at branch registration.
@@ -96,8 +82,7 @@ pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit,
 	) -> Result<crate::Millis, DispatchError>;
 }
 
-/// No-op pool for runtimes without one: nothing is reducible, and an offset succeeds only when
-/// all debts and credits are zero.
+/// No-op pool inspection for runtimes without a pool.
 impl<CollateralId, StableId, Balance: Zero> StabilityPoolInspect<CollateralId, StableId, Balance>
 	for ()
 {
@@ -113,55 +98,5 @@ impl<CollateralId, StableId, Balance: Zero> StabilityPoolInspect<CollateralId, S
 
 	fn quote_pending(_: &(), _: Balance, _: Balance) -> Balance {
 		Balance::zero()
-	}
-}
-
-/// The zero credit names the stablecoin, so this impl is limited to `fungibles` credits.
-impl<CollateralId, Balance, CollateralCredit, StableId, StableBalance, OnDrop, OppositeOnDrop>
-	StabilityPoolOffset<
-		CollateralId,
-		StableId,
-		Balance,
-		CollateralCredit,
-		Imbalance<StableId, StableBalance, OnDrop, OppositeOnDrop>,
-	> for ()
-where
-	Balance: Zero,
-	CollateralCredit: TryDrop,
-	StableId: AssetId,
-	StableBalance: TokenBalance,
-	OnDrop: HandleImbalanceDrop<StableId, StableBalance>,
-	OppositeOnDrop: HandleImbalanceDrop<StableId, StableBalance>,
-{
-	fn offset(
-		_: &CollateralId,
-		stable_id: &StableId,
-		_: BranchSnapshot,
-		debt: OffsetLegs<Balance>,
-		collateral: OffsetLegs<CollateralCredit>,
-	) -> Result<Imbalance<StableId, StableBalance, OnDrop, OppositeOnDrop>, DispatchError> {
-		let debt_is_zero = debt.active.is_zero() && debt.pending.is_zero();
-		// `TryDrop` succeeds only on zero credits, so a nonzero credit cannot vanish here.
-		let active_is_zero = collateral.active.try_drop().is_ok();
-		let pending_is_zero = collateral.pending.try_drop().is_ok();
-		if debt_is_zero && active_is_zero && pending_is_zero {
-			Ok(Imbalance::zero(stable_id.clone()))
-		} else {
-			// `quote` is always `None` here, so a caller following the contract never sizes a
-			// nonzero leg.
-			defensive!("offset sized without a Stability Pool quote");
-			Err(DispatchError::Other("no Stability Pool to offset against"))
-		}
-	}
-
-	#[cfg(feature = "runtime-benchmarks")]
-	fn benchmark_queue_deposit(
-		_: &CollateralId,
-		_: &StableId,
-		_: u32,
-		_: crate::Millis,
-		_: Balance,
-	) -> Result<crate::Millis, DispatchError> {
-		Err(DispatchError::Other("no stability pool to seed"))
 	}
 }
