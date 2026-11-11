@@ -5,10 +5,12 @@
 //!
 //! Register the branch before seeding. Setup order matters:
 //!
-//! - Do not run vault operations after `seed_redemption_targets`: they would absorb the pending
-//!   redistribution shares it stages.
-//! - The `stage_recovery_head` head must be the only stake-bearing vault. Use `elapsed` to accrue
-//!   time; advancing time afterwards would invalidate its exact-par price.
+//! - `seed_redemption_targets` needs a Stability Pool. Do not run vault operations afterwards: they
+//!   would activate the staged cohorts.
+//! - Queue cohorts before `stage_recovery_head`, or deposits can route into recovery offsets. The
+//!   head must be the only stake-bearing vault. Use `elapsed` to pass cohort deadlines; advancing
+//!   time afterwards would invalidate its exact-par price.
+//! - When queuing cohorts separately, advance past their deadline as the last setup step.
 
 use crate::Millis;
 use alloc::vec::Vec;
@@ -68,8 +70,13 @@ pub trait BenchmarkVaults<CollateralId, StableId, AccountId, Balance> {
 	/// Funds `owner` and opens `vault` for it at its rate-list position.
 	fn open_vault(owner: &AccountId, vault: BenchmarkVault<Balance>) -> DispatchResult;
 
-	/// Opens `count` active vaults ordered for the redemption walk and leaves each a pending
-	/// redistribution share. Advances by `elapsed`, pricing the branch last.
+	/// Queues two pool cohorts with a non-zero entry delay and returns the time from which both
+	/// are due. The clock is left before the first deadline.
+	fn queue_pool_cohorts() -> Result<Millis, DispatchError>;
+
+	/// Opens `count` active vaults ordered for the redemption walk, leaves each a pending
+	/// redistribution share, and queues two pool cohorts. Advances until both cohorts are due,
+	/// then by `elapsed`, pricing the branch last. Needs a Stability Pool.
 	fn seed_redemption_targets(
 		count: u32,
 		elapsed: Millis,

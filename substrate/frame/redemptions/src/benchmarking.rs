@@ -18,7 +18,10 @@ use frame::{
 		frame_support::traits::EnsureOriginWithArg,
 		sp_runtime::traits::{Convert, One, Saturating, Zero},
 	},
-	traits::fungibles::{Inspect as FungiblesInspect, Mutate as FungiblesMutate},
+	traits::{
+		fungibles::{Inspect as FungiblesInspect, Mutate as FungiblesMutate},
+		Time,
+	},
 };
 use frame_system::RawOrigin;
 use stablecoin_primitives::{recovery_pricing, BenchmarkVaults, ProvidePrice, VaultInterface};
@@ -90,8 +93,9 @@ mod benchmarks {
 
 	/// An ordinary walk over `s` active vaults, each fully redeemed.
 	///
-	/// Every target carries a pending redistribution share and accrued interest, the recipient
-	/// is fresh, and the budget leaves change to refund.
+	/// Every target carries a pending redistribution share and accrued interest, the pool has
+	/// two due cohorts for the first step's yield route, the recipient is fresh, and the budget
+	/// leaves change to refund.
 	///
 	/// Not staged: a step that closes its vault. Only a target at exactly 100% collateralization
 	/// gives up all of its collateral, which [`BenchmarkVaults`] cannot stage per target. Such a
@@ -155,11 +159,13 @@ mod benchmarks {
 	///
 	/// The redeemer pays every planck it holds and the Insurance Fund pays its whole balance,
 	/// so both stablecoin accounts are drained, all collateral goes to a fresh recipient and the
-	/// vault closes. The head accrued interest.
+	/// vault closes. The head accrued interest past two due pool cohorts.
 	#[benchmark]
 	fn redeem_recovery() -> Result<(), BenchmarkError> {
 		let (collateral_id, stable_id) = T::Vaults::register_market()?;
-		let head = T::Vaults::stage_recovery_head(ELAPSED_MS)?;
+		let cohorts_due = T::Vaults::queue_pool_cohorts()?;
+		let elapsed = cohorts_due.saturating_sub(T::TimeProvider::now()).saturating_add(ELAPSED_MS);
+		let head = T::Vaults::stage_recovery_head(elapsed)?;
 		T::Vaults::set_unit_price(BELOW_PAR_UNIT_PRICE);
 		let price = T::Oracle::provide_price(&collateral_id)?;
 		let collateral_value = recovery_pricing::collateral_value_ceil(head.collateral, price)

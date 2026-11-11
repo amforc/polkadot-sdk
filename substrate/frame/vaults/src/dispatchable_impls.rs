@@ -10,10 +10,10 @@ use crate::{
 		AdminLevel, AssetMinimums, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode,
 		BranchState, FrozenReason, FrozenState,
 	},
-	utility_impls::Issuance,
 	weights::WeightInfo,
 };
 use frame::{
+	deps::frame_support::storage::with_storage_layer,
 	prelude::{
 		storage::{StorageDoubleMap as _, StorageNMap as _},
 		*,
@@ -27,7 +27,9 @@ use frame::{
 	},
 };
 use linked_list_interface::Position;
-use stablecoin_primitives::{debit_preservation, BranchSnapshot, OnBranchLifecycle, ProvidePrice};
+use stablecoin_primitives::{
+	debit_preservation, BranchSnapshot, OnBranchLifecycle, ProvidePrice, StabilityPoolOffset,
+};
 
 impl<T: Config> Pallet<T> {
 	/// Opens a vault with collateral, debt, and an interest rate.
@@ -256,13 +258,39 @@ impl<T: Config> Pallet<T> {
 
 	/// Moves the last unsafe eligible vault into final recovery.
 	pub(crate) fn do_enter_final_recovery(
+		keeper: T::AccountId,
 		owner: T::AccountId,
 		collateral_id: CollateralIdOf<T>,
 		stable_id: StableIdOf<T>,
-	) -> DispatchResult {
-		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
-		op.enter_final_recovery()?;
-		op.commit(Commit::Exempt)
+	) -> DispatchResultWithPostInfo {
+		if Self::vault_status_of(&collateral_id, &stable_id, &owner).is_final_recovery() {
+			return Ok(Pays::Yes.into());
+		}
+		let mut op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), &owner)?;
+		let keeper_reward = op.enter_final_recovery(&keeper)?;
+		if !keeper_reward.is_zero() {
+			Self::deposit_event(Event::FinalRecoveryRewardPaid {
+				collateral_id: op.collateral_id().clone(),
+				stable_id: op.stable_id().clone(),
+				owner,
+				keeper,
+				amount: keeper_reward,
+			});
+		}
+		op.commit(Commit::Exempt)?;
+		// Pool settlement must not block recovery entry.
+		let settlement = with_storage_layer(|| {
+			T::StabilityPool::offset_recovery_head(&collateral_id, &stable_id)
+		});
+		if let Err(error) = settlement {
+			// The rollback took the pool's events with it, so this one reports the failure.
+			Self::deposit_event(Event::FinalRecoveryOffsetFailed {
+				collateral_id,
+				stable_id,
+				error,
+			});
+		}
+		Ok(Pays::No.into())
 	}
 
 	/// Removes a vault from final recovery.
@@ -288,6 +316,22 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let mut op = VaultOp::<T>::load_unfrozen(collateral_id, stable_id, &owner)?;
 		op.activate(hint)?;
+		op.commit(Commit::Exempt)
+	}
+
+	/// Nominates a collateralized dormant vault's dust for redemption. Anyone may call this.
+	pub(crate) fn do_nominate_dormant(
+		owner: T::AccountId,
+		collateral_id: CollateralIdOf<T>,
+		stable_id: StableIdOf<T>,
+	) -> DispatchResult {
+		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		op.nominate_dormant()?;
+		Self::deposit_event(Event::DormantTargetNominated {
+			collateral_id: op.collateral_id().clone(),
+			stable_id: op.stable_id().clone(),
+			owner,
+		});
 		op.commit(Commit::Exempt)
 	}
 
@@ -606,8 +650,7 @@ impl<T: Config> Pallet<T> {
 			})?;
 		// Mint interest only after storing the updated branch. The yield route sees the mode just
 		// stored: a freeze sends the whole mint to the fee account.
-		let mut issuance = Issuance::minted(stable_id.clone());
-		Self::issue_interest(collateral_id, stable_id, branch, minted, &mut issuance)?;
+		Self::issue_interest(collateral_id, stable_id, branch, minted)?;
 		let new_mode = branch.mode;
 		Self::deposit_event(Event::ModeChanged {
 			collateral_id: collateral_id.clone(),

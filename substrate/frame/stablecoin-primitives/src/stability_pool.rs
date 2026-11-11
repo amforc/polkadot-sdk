@@ -1,7 +1,10 @@
-//! Stability Pool offset interfaces for liquidation settlement.
+//! Stability Pool offset interfaces for liquidation and recovery settlement.
 
 use crate::BranchSnapshot;
-use frame::deps::{frame_support::pallet_prelude::DispatchError, sp_runtime::traits::Zero};
+use frame::deps::{
+	frame_support::pallet_prelude::{DispatchError, DispatchResult},
+	sp_runtime::traits::Zero,
+};
 
 /// Per-leg values of a Stability Pool offset: debt amounts or collateral credits.
 pub struct OffsetLegs<T> {
@@ -66,6 +69,14 @@ pub trait StabilityPoolOffset<CollateralId, StableId, Balance, CollateralCredit,
 		debt: OffsetLegs<Balance>,
 		collateral: OffsetLegs<CollateralCredit>,
 	) -> Result<StableCredit, DispatchError>;
+
+	/// Gives the pool the first opportunity to receive the recovery bonus on queue entry.
+	///
+	/// The pool can decline settlement without an error so recovery entry remains possible.
+	///
+	/// Settlement calls the branch engine again. The caller must store the entry and close all
+	/// vault operations first to prevent changes based on stale state.
+	fn offset_recovery_head(collateral_id: &CollateralId, stable_id: &StableId) -> DispatchResult;
 
 	/// Sets the branch's entry delay to `entry_delay` and queues `amount` of freshly minted
 	/// stablecoin as benchmark `depositor`'s pending deposit.

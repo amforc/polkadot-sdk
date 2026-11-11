@@ -111,43 +111,29 @@ mod tests {
 	fn conversion_rounds_up_and_preserves_feed_errors() {
 		// The reference asset 0 is quoted at 10.
 		type Conversion = OraclePriceConversion<Prices, Reference<0>>;
-		for (balance, asset, expected) in [
-			(7u64, 1, Ok(18)), // 7 * 10 / 4 = 17.5, rounded up.
-			(8, 1, Ok(20)),
-			(7, 9, Err(DispatchError::Unavailable)),
-			(7, 2, Err(ZERO_ORACLE_PRICE)),
-		] {
-			let converted = Conversion::to_asset_balance(balance, asset);
-
-			assert_eq!(converted, expected, "balance = {balance}, asset = {asset}");
-		}
+		// 7 * 10 / 4 = 17.5, rounded up.
+		assert_eq!(Conversion::to_asset_balance(7u64, 1), Ok(18));
+		assert_eq!(Conversion::to_asset_balance(8u64, 1), Ok(20));
+		assert_eq!(Conversion::to_asset_balance(7u64, 9), Err(DispatchError::Unavailable));
+		assert_eq!(Conversion::to_asset_balance(7u64, 2), Err(ZERO_ORACLE_PRICE));
 	}
 
 	#[test]
 	fn unusable_feed_wins_over_missing_feed_and_identity_skips_quotes() {
 		// A reference asset without a quote.
 		type MissingReference = OraclePriceConversion<Prices, Reference<9>>;
-		for (asset, expected) in [
-			(3, Err(DispatchError::Other("stale"))),
-			(8, Err(DispatchError::Unavailable)),
-			(2, Err(ZERO_ORACLE_PRICE)),
-			(9, Ok(7)), // Identity succeeds even without a quote.
-		] {
-			let converted = MissingReference::to_asset_balance(7u64, asset);
-
-			assert_eq!(converted, expected, "missing reference, asset = {asset}");
-		}
+		assert_eq!(MissingReference::to_asset_balance(7u64, 3), Err(DispatchError::Other("stale")));
+		assert_eq!(MissingReference::to_asset_balance(7u64, 8), Err(DispatchError::Unavailable));
+		assert_eq!(MissingReference::to_asset_balance(7u64, 2), Err(ZERO_ORACLE_PRICE));
+		// Identity succeeds even without a quote.
+		assert_eq!(MissingReference::to_asset_balance(7u64, 9), Ok(7));
 
 		// A reference asset quoted at zero.
 		type ZeroReference = OraclePriceConversion<Prices, Reference<2>>;
-		for (asset, expected) in [
-			(9, Err(ZERO_ORACLE_PRICE)), // Missing asset cannot hide a zero reference.
-			(1, Err(ZERO_ORACLE_PRICE)),
-			(2, Ok(7)), // Identity does not consult the zero quote.
-		] {
-			let converted = ZeroReference::to_asset_balance(7u64, asset);
-
-			assert_eq!(converted, expected, "zero reference, asset = {asset}");
-		}
+		// Missing asset cannot hide a zero reference.
+		assert_eq!(ZeroReference::to_asset_balance(7u64, 9), Err(ZERO_ORACLE_PRICE));
+		assert_eq!(ZeroReference::to_asset_balance(7u64, 1), Err(ZERO_ORACLE_PRICE));
+		// Identity does not consult the zero quote.
+		assert_eq!(ZeroReference::to_asset_balance(7u64, 2), Ok(7));
 	}
 }
