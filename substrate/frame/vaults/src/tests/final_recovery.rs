@@ -85,6 +85,24 @@ fn enter_final_recovery_is_an_idempotent_noop() {
 	});
 }
 
+#[test]
+fn final_recovery_entry_hands_the_branch_to_the_pool_once() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		enter_recovery(1, percent(5));
+		assert_eq!(RecoveryHeadOffsets::get(), vec![(DOT, STABLE)]);
+
+		assert_ok!(enter_final_recovery(KEEPER, DOT, STABLE, 1));
+		set_price(DOT, DEFAULT_PRICE);
+		assert_ok!(open(2, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_noop!(
+			enter_final_recovery(KEEPER, DOT, STABLE, 2),
+			crate::Error::<Test>::CollateralizationRatioTooHealthy
+		);
+
+		assert_eq!(RecoveryHeadOffsets::get(), vec![(DOT, STABLE)]);
+	});
+}
+
 // Entering final recovery is the resolution a liquidation could not deliver, so it pays the
 // keeper the liquidation reward out of the vault, and the vault keeps only the rest.
 #[test]

@@ -248,7 +248,7 @@ impl pallet_vaults::BenchmarkHelper<AssetId, StableId, AccountId> for VaultsBenc
 	}
 }
 
-/// No Stability Pool: nothing absorbs a liquidation, so it redistributes, exactly as with `()`.
+/// No Stability Pool: nothing absorbs a liquidation, so it redistributes.
 ///
 /// The benchmarks still queue pool cohorts, which a real pool needs for its yield route; this
 /// pool accepts them as deadlines only, so the same staging runs here and on a real runtime.
@@ -273,21 +273,20 @@ impl StabilityPoolInspect<AssetId, StableId, Balance> for BenchmarkSeedablePool 
 impl StabilityPoolOffset<AssetId, StableId, Balance, CollateralCreditOf<Test>, StableCreditOf<Test>>
 	for BenchmarkSeedablePool
 {
-	// Forwarded so that `()`'s defensive check on a nonzero leg still runs.
 	fn offset(
-		collateral_id: &AssetId,
+		_: &AssetId,
 		stable_id: &StableId,
-		branch: BranchSnapshot,
+		_: BranchSnapshot,
 		debt: OffsetLegs<Balance>,
 		collateral: OffsetLegs<CollateralCreditOf<Test>>,
 	) -> Result<StableCreditOf<Test>, DispatchError> {
-		<() as StabilityPoolOffset<_, _, _, _, _>>::offset(
-			collateral_id,
-			stable_id,
-			branch,
-			debt,
-			collateral,
-		)
+		assert_eq!((debt.active, debt.pending), (0, 0));
+		assert_eq!((collateral.active.peek(), collateral.pending.peek()), (0, 0));
+		Ok(StableCreditOf::<Test>::zero(*stable_id))
+	}
+
+	fn offset_recovery_head(_: &AssetId, _: &StableId) -> DispatchResult {
+		Ok(())
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]

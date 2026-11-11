@@ -367,6 +367,9 @@ parameter_types! {
 	pub storage PendingSpCapacity: Balance = 0;
 	/// Benchmark-queued pending deposits as `(activation deadline, amount)`.
 	pub storage PendingSpCohorts: Vec<(u64, Balance)> = Vec::new();
+	/// Branches the engine asked the mocked Stability Pool to settle a recovery head for, in call
+	/// order.
+	pub storage RecoveryHeadOffsets: Vec<(AssetId, StableId)> = Vec::new();
 	pub const VaultsPalletId: PalletId = PalletId(*b"py/vault");
 	pub TestBranchConfigBounds: BranchConfigBounds = BranchConfigBounds {
 		min_minimum_collateralization_ratio: FixedU128::from_rational(105u128, 100u128),
@@ -463,6 +466,14 @@ impl
 			return Ok(StableCreditOf::<Test>::zero(*stable_id));
 		}
 		Ok(issue_external(*stable_id, given_up))
+	}
+
+	// Stability tests cover settlement. This mock checks the calls from Vaults.
+	fn offset_recovery_head(collateral_id: &AssetId, stable_id: &StableId) -> DispatchResult {
+		let mut calls = RecoveryHeadOffsets::get();
+		calls.push((collateral_id.clone(), *stable_id));
+		RecoveryHeadOffsets::set(&calls);
+		Ok(())
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]

@@ -432,15 +432,16 @@ mod benchmarks {
 		Ok(())
 	}
 
-	/// Entry behind a queued vault, paying the keeper. No pending redistribution share: queuing
-	/// pool cohorts must precede the first recovery head (the pool would route the deposits into
-	/// a recovery offset), the share must precede the cohorts (pending capital would absorb the
-	/// sacrifice), and the first head needs a branch with no other stake bearer.
+	/// The head is above par and both cohorts are due to include pool activation and settlement.
+	/// A pending redistribution share is not possible here. Deposits after recovery entry would
+	/// settle the head. Pending capital would absorb the sacrifice needed for redistribution.
+	/// Recovery entry requires a single stake bearer.
 	#[benchmark]
 	fn enter_final_recovery() -> Result<(), BenchmarkError> {
 		let asset = register_default_branch::<T>()?;
 		let cohorts_due = queue_pool_cohorts::<T>()?;
-		let prior = recovery_cycle::<T>(0, FixedU128::from_rational(5, 100))?;
+		let prior =
+			recovery_cycle_of::<T>(0, FixedU128::from_rational(5, 100), PAR_BAND_VAULT_COLL)?;
 		let owner: T::AccountId = account("target", 0, 0);
 		let vault =
 			BenchmarkVault { collateral_units: RECOVERY_VAULT_COLL, ..default_vault::<T>() };
@@ -448,6 +449,9 @@ mod benchmarks {
 		// Past the reward cooldown that `prior`'s entry started.
 		advance_to::<T>(cohorts_due.max(T::TimeProvider::now().saturating_add(ONE_HOUR_MS)));
 		set_unit_price::<T>(RECOVERY_TRIGGER_PRICE);
+		ensure_offsettable_head::<T>(&prior, RECOVERY_TRIGGER_PRICE)?;
+		assert_eq!(T::VaultLists::count(&recovery_list::<T>()), 1);
+		assert_eq!(T::VaultLists::tail(&recovery_list::<T>()), Some(prior));
 		// The entry reward creates the keeper's collateral account.
 		let caller: T::AccountId = account("keeper", 0, 0);
 		assert!(collateral_balance::<T>(&caller).is_zero());
@@ -456,9 +460,8 @@ mod benchmarks {
 		#[extrinsic_call]
 		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), owner.clone());
 
+		// Queue length depends on whether the runtime connects the pool to recovery settlement.
 		assert_eq!(status_of::<T>(&owner), VaultStatus::FinalRecovery);
-		assert_eq!(T::VaultLists::count(&recovery_list::<T>()), 2);
-		assert_eq!(T::VaultLists::tail(&recovery_list::<T>()), Some(prior));
 		assert!(!collateral_balance::<T>(&caller).is_zero(), "the entry paid its keeper");
 		assert!(interest_issued::<T>());
 		Ok(())
