@@ -460,6 +460,7 @@ members = [
 	"substrate/frame/session",
 	"substrate/frame/session/benchmarking",
 	"substrate/frame/society",
+	"substrate/frame/stability",
 	"substrate/frame/stablecoin-primitives",
 	"substrate/frame/staking",
 	"substrate/frame/staking-async",
@@ -1091,6 +1092,7 @@ pallet-session = { path = "substrate/frame/session", default-features = false }
 pallet-session-benchmarking = { path = "substrate/frame/session/benchmarking", default-features = false }
 pallet-skip-feeless-payment = { path = "substrate/frame/transaction-payment/skip-feeless-payment", default-features = false }
 pallet-society = { path = "substrate/frame/society", default-features = false }
+pallet-stability = { path = "substrate/frame/stability", default-features = false }
 pallet-staking = { path = "substrate/frame/staking", default-features = false }
 pallet-staking-async = { path = "substrate/frame/staking-async", default-features = false }
 pallet-staking-async-ah-client = { path = "substrate/frame/staking-async/ah-client", default-features = false }
