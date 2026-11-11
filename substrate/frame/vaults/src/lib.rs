@@ -680,6 +680,18 @@ pub mod pallet {
 			/// Stablecoin issued to the yield hook.
 			amount: BalanceOf<T>,
 		},
+		/// The Stability Pool's settlement on a final recovery entry failed.
+		///
+		/// The entry stands. The attempt was rolled back, and the pool's own events with it. A
+		/// pool that declines to settle is not a failure and emits nothing.
+		FinalRecoveryOffsetFailed {
+			/// Collateral asset ID.
+			collateral_id: CollateralIdOf<T>,
+			/// Stable asset ID.
+			stable_id: StableIdOf<T>,
+			/// Why the settlement failed.
+			error: DispatchError,
+		},
 	}
 
 	#[pallet::error]
@@ -1189,6 +1201,10 @@ pub mod pallet {
 		///
 		/// The vault must be the branch's last eligible vault and must be below the minimum
 		/// collateral ratio. Pays the liquidation reward unless the cooldown is active.
+		///
+		/// Settlement on entry gives [`Config::StabilityPool`] the first opportunity to receive the
+		/// recovery bonus. Settlement errors roll back only the pool attempt so entry remains
+		/// possible; [`Event::FinalRecoveryOffsetFailed`] reports them.
 		#[pallet::call_index(8)]
 		#[pallet::weight(T::WeightInfo::enter_final_recovery())]
 		pub fn enter_final_recovery(

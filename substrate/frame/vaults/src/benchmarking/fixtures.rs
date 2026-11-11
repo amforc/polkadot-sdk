@@ -53,6 +53,9 @@ pub(crate) const SEED_DEBT: u128 = 3_000;
 pub(crate) const RECOVERY_TRIGGER_PRICE: u128 = 1;
 /// Collateral units of a vault that [`RECOVERY_TRIGGER_PRICE`] makes unsafe.
 pub(crate) const RECOVERY_VAULT_COLL: u128 = 2_000;
+/// At [`RECOVERY_TRIGGER_PRICE`], the ratio is about 106% against [`SEED_DEBT`].
+/// This permits recovery entry and pool settlement.
+pub(crate) const PAR_BAND_VAULT_COLL: u128 = 3_200;
 /// Enough to accrue non-zero interest at the default 5% rate.
 pub(crate) const ONE_HOUR_MS: u64 = 60 * 60 * 1_000;
 /// Shorter than the rate-adjustment cooldown, so changing rates after activation still pays a fee.
@@ -486,15 +489,41 @@ pub(crate) fn recovery_cycle<T: BenchmarkConfig>(
 	seed_index: u32,
 	annual_rate: FixedU128,
 ) -> Result<T::AccountId, DispatchError> {
+	recovery_cycle_of::<T>(seed_index, annual_rate, RECOVERY_VAULT_COLL)
+}
+
+pub(crate) fn recovery_cycle_of<T: BenchmarkConfig>(
+	seed_index: u32,
+	annual_rate: FixedU128,
+	collateral_units: u128,
+) -> Result<T::AccountId, DispatchError> {
 	let owner: T::AccountId = account("rec", seed_index, 0);
-	let vault = BenchmarkVault {
-		collateral_units: RECOVERY_VAULT_COLL,
-		annual_rate,
-		..default_vault::<T>()
-	};
+	let vault = BenchmarkVault { collateral_units, annual_rate, ..default_vault::<T>() };
 	enter_recovery::<T>(&owner, vault, whitelisted_caller())?;
 	set_unit_price::<T>(ORACLE_PRICE);
 	Ok(owner)
+}
+
+pub(crate) fn ensure_offsettable_head<T: BenchmarkConfig>(
+	owner: &T::AccountId,
+	unit_price: u128,
+) -> DispatchResult {
+	let head = <Pallet<T> as VaultInterface>::project_redemption_snapshot(
+		&collateral::<T>(),
+		&stable::<T>(),
+		owner,
+	)?;
+	let ratio = stablecoin_primitives::collateralization_ratio(
+		&head.position(),
+		self::unit_price::<T>(unit_price),
+	)
+	.map_err(|_| "recovery head ratio overflowed")?;
+	let CollateralRatio::Ratio(ratio) = ratio else {
+		return Err("recovery head carries no debt".into());
+	};
+	ensure!(ratio >= FixedU128::one(), "recovery head is below par");
+	ensure!(ratio <= head.initial_collateralization_ratio, "recovery head is past its exit");
+	Ok(())
 }
 
 /// A vault opened only to be liquidated into the empty pool, so its debt and collateral are

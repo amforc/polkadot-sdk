@@ -61,6 +61,9 @@
 //! [`Config::RecoveryOffsets`] owns the settlement policy for vaults in `FinalRecovery`. This
 //! authority keeps the recovery price policy consistent for all callers.
 //!
+//! Settlement on queue entry gives the pool the first opportunity to receive the recovery bonus.
+//! Settlement errors roll back only the pool attempt so entry remains possible.
+//!
 //! Any signed account can use [`Pallet::offset_recovery`] to settle active pool stablecoin against
 //! the queue head when its price is at or above par. The active depositors receive the collateral.
 //!

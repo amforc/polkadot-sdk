@@ -13,6 +13,7 @@ use crate::{
 	weights::WeightInfo,
 };
 use frame::{
+	deps::frame_support::storage::with_storage_layer,
 	prelude::{
 		storage::{StorageDoubleMap as _, StorageNMap as _},
 		*,
@@ -26,7 +27,9 @@ use frame::{
 	},
 };
 use linked_list_interface::Position;
-use stablecoin_primitives::{debit_preservation, BranchSnapshot, OnBranchLifecycle, ProvidePrice};
+use stablecoin_primitives::{
+	debit_preservation, BranchSnapshot, OnBranchLifecycle, ProvidePrice, StabilityPoolOffset,
+};
 
 impl<T: Config> Pallet<T> {
 	/// Opens a vault with collateral, debt, and an interest rate.
@@ -263,7 +266,7 @@ impl<T: Config> Pallet<T> {
 		if Self::vault_status_of(&collateral_id, &stable_id, &owner).is_final_recovery() {
 			return Ok(Pays::Yes.into());
 		}
-		let mut op = VaultOp::<T>::load_priced(collateral_id, stable_id, &owner)?;
+		let mut op = VaultOp::<T>::load_priced(collateral_id.clone(), stable_id.clone(), &owner)?;
 		let keeper_reward = op.enter_final_recovery(&keeper)?;
 		if !keeper_reward.is_zero() {
 			Self::deposit_event(Event::FinalRecoveryRewardPaid {
@@ -275,6 +278,18 @@ impl<T: Config> Pallet<T> {
 			});
 		}
 		op.commit(Commit::Exempt)?;
+		// Pool settlement must not block recovery entry.
+		let settlement = with_storage_layer(|| {
+			T::StabilityPool::offset_recovery_head(&collateral_id, &stable_id)
+		});
+		if let Err(error) = settlement {
+			// The rollback took the pool's events with it, so this one reports the failure.
+			Self::deposit_event(Event::FinalRecoveryOffsetFailed {
+				collateral_id,
+				stable_id,
+				error,
+			});
+		}
 		Ok(Pays::No.into())
 	}
 
