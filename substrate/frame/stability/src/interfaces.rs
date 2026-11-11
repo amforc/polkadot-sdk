@@ -223,6 +223,27 @@ impl<T: Config>
 		Ok(burned)
 	}
 
+	fn offset_recovery_head(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+	) -> DispatchResult {
+		// A missing or frozen pool has no capacity, as its quote reports.
+		let mode = Self::branch_mode_or_frozen(collateral_id, stable_id);
+		let Some(pool) = Self::offset_pool(collateral_id, stable_id, mode) else {
+			return Ok(());
+		};
+		// The pool enforces its balance limits, so the caller needs no separate limit.
+		Self::try_offset_recovery(
+			collateral_id.clone(),
+			stable_id.clone(),
+			pool,
+			mode,
+			BalanceOf::<T>::max_value(),
+		)?;
+		// Recovery entry must remain possible when the pool cannot settle the head.
+		Ok(())
+	}
+
 	#[cfg(feature = "runtime-benchmarks")]
 	fn benchmark_queue_deposit(
 		collateral_id: &CollateralIdOf<T>,

@@ -17,9 +17,18 @@ const PRICE_AT_104_PERCENT: FixedU128 = FixedU128::from_rational(52, 100);
 /// The price that parks the standing vault at a CR of 80%, below par.
 const PRICE_AT_80_PERCENT: FixedU128 = FixedU128::from_rational(4, 10);
 
+/// Branch configuration for recovery settlement tests, with no entry compensation.
+/// These tests price the collateral available to settle the head.
+fn recovery_branch_config() -> pallet_vaults::BranchConfig<Balance> {
+	let mut config = default_branch_config();
+	config.liquidation.keeper_flat_compensation_value = 0;
+	config.liquidation.keeper_percent_compensation = Permill::zero();
+	config
+}
+
 /// The recovery branch, without the standing vault.
 fn recovery_branch() -> ExtBuilder {
-	ExtBuilder::default().default_branch()
+	ExtBuilder::default().default_branch().branch_config(recovery_branch_config())
 }
 
 /// The recovery branch with the standing vault (owner 5) open.
@@ -152,6 +161,71 @@ fn recovery_offset_can_fully_deplete_the_pool() {
 }
 
 #[test]
+fn final_recovery_entry_settles_the_head_as_an_unbounded_offset() {
+	standing_head_with_active_pool().build_and_execute(|| {
+		assert_standing_debt();
+		let settled = || {
+			(pool_state(DOT, STABLE), vault_debt(DOT, STABLE, 5), pool_collateral_held(DOT, STABLE))
+		};
+		let keeper_offset = hypothetically!({
+			park_head_at(PRICE_AT_104_PERCENT);
+			assert_ok!(offset_recovery(DOT, STABLE, Balance::MAX));
+			settled()
+		});
+
+		set_price(DOT, PRICE_AT_104_PERCENT);
+		assert_ok!(enter_final_recovery(DOT, STABLE, 5));
+
+		assert_eq!(settled(), keeper_offset);
+		// The recovery bonus gives floor(floor(400 * 1.03) / 0.52) = 792 collateral units.
+		assert_eq!(pool_state(DOT, STABLE).total_active_deposits, 0);
+		assert_eq!(vault_debt(DOT, STABLE, 5), 100);
+		assert_eq!(pool_collateral_held(DOT, STABLE), 792);
+		assert_recovery_applied();
+		assert!(!System::events().iter().any(|record| matches!(
+			record.event,
+			RuntimeEvent::Vaults(pallet_vaults::Event::FinalRecoveryOffsetFailed { .. })
+		)));
+	});
+}
+
+#[test]
+fn recovery_head_settlement_declines_without_moving_value() {
+	use stablecoin_primitives::StabilityPoolOffset;
+
+	let settle_head = || Stability::offset_recovery_head(&DOT, &STABLE);
+	let pool_value = || {
+		let state = pool_state(DOT, STABLE);
+		// Cohort activation changes each deposit total but must preserve their sum.
+		(
+			state.total_active_deposits + state.total_pending_deposits,
+			state.coords,
+			pool_stable_held(DOT, STABLE),
+			pool_collateral_held(DOT, STABLE),
+		)
+	};
+
+	recovery_branch()
+		.stable_balance(1, 600)
+		.matured_deposit(1, 400)
+		.build_and_execute(|| {
+			let before = pool_value();
+			assert_ok!(settle_head());
+			assert_eq!(pool_value(), before);
+		});
+	standing_vault().build_and_execute(|| {
+		park_head_at(PRICE_AT_104_PERCENT);
+		assert_storage_noop!(assert_ok!(settle_head()));
+	});
+	standing_head_with_active_pool().build_and_execute(|| {
+		park_standing_head_at(PRICE_AT_80_PERCENT);
+		let before = (pool_value(), vault_debt(DOT, STABLE, 5));
+		assert_ok!(settle_head());
+		assert_eq!((pool_value(), vault_debt(DOT, STABLE, 5)), before);
+	});
+}
+
+#[test]
 fn recovery_offset_error_paths() {
 	recovery_branch().build_and_execute(|| {
 		// No active capital to burn. The pool is sized before the head is looked up, so the empty
@@ -187,7 +261,7 @@ const SCALE_EDGE_POOL_TOTAL: Balance = 2_000_000_000_000_000_000;
 /// One survivor in `2e18` needs `floor(1e9 * 1e18 * 1 / 2e18) = 5e8 < P_MIN`. Two survivors land
 /// on `P_MIN` exactly, which the pool still represents.
 fn scale_edge_recovery_branch() -> ExtBuilder {
-	let mut branch = default_branch_config();
+	let mut branch = recovery_branch_config();
 	branch.debt_ceiling = 10_000_000_000_000_000_000;
 	let pool = StabilityPoolConfig { minimum_active_pool_balance: 1, ..default_pool_config() };
 	ExtBuilder::default()
@@ -239,6 +313,47 @@ fn recovery_rolls_back_when_accounting_fails_after_settlement() {
 		.stable_balance(2, 200)
 		.deposit(2, 100)
 		.build_and_execute(|| {
+			// A pool accounting error must not block recovery entry.
+			hypothetically!({
+				use frame::traits::fungibles::Inspect;
+
+				set_price(DOT, PRICE_AT_104_PERCENT);
+				mutate_pool_state(DOT, STABLE, |state| {
+					state.total_collateral_gains_unclaimed = Balance::MAX;
+				});
+				let pool_before = pool_state(DOT, STABLE);
+				let stable_before = pool_stable_held(DOT, STABLE);
+				let collateral_before = pool_collateral_held(DOT, STABLE);
+				let issuance_before = Assets::total_issuance(STABLE);
+
+				assert_ok!(enter_final_recovery(DOT, STABLE, 5));
+
+				let (vault, status) = Vaults::vault_after_touch(DOT, STABLE, 5)
+					.expect("the vault remains in recovery");
+				assert_eq!(status, pallet_vaults::VaultStatus::FinalRecovery);
+				assert_eq!(vault.debt.total(), 500);
+				assert_eq!(vault.collateral, 1_000);
+				assert_eq!(pool_state(DOT, STABLE), pool_before);
+				assert_eq!(pool_stable_held(DOT, STABLE), stable_before);
+				assert_eq!(pool_collateral_held(DOT, STABLE), collateral_before);
+				// Entry issues one unit of interest. The failed offset must not burn stablecoin.
+				assert_eq!(Assets::total_issuance(STABLE), issuance_before + 1);
+				assert!(!System::events().iter().any(|record| matches!(
+					record.event,
+					RuntimeEvent::Stability(crate::Event::RecoveryOffsetApplied { .. }) |
+						RuntimeEvent::Vaults(pallet_vaults::Event::VaultRedeemed { .. })
+				)));
+				// The rollback removed the pool's events, so Vaults reports the failure.
+				System::assert_has_event(RuntimeEvent::Vaults(
+					pallet_vaults::Event::FinalRecoveryOffsetFailed {
+						collateral_id: DOT,
+						stable_id: STABLE,
+						error: ArithmeticError::Overflow.into(),
+					},
+				));
+				assert_noop!(offset_recovery(DOT, STABLE, Balance::MAX), ArithmeticError::Overflow);
+			});
+
 			park_standing_head_at(PRICE_AT_104_PERCENT);
 
 			// Active pool: the pool's gain total overflows after the vault settled.
