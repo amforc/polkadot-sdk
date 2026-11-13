@@ -69,6 +69,8 @@ use std::{
 	time::Duration,
 };
 
+pub(crate) const RELAY_CHAIN_SLOT_DURATION_MILLIS: u64 = 6000;
+
 // Override default idle connection timeout of 10 seconds to give IPFS clients more
 // time to query data over Bitswap. This is needed when manually adding our node
 // to a swarm of an IPFS node, because the IPFS node doesn't keep any active
@@ -633,7 +635,7 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 				Arc::new(move |hash, data| sync_service.announce_block(hash, data))
 			};
 
-			let relay_chain_slot_duration = Duration::from_secs(6);
+			let relay_chain_slot_duration = Duration::from_millis(RELAY_CHAIN_SLOT_DURATION_MILLIS);
 
 			let overseer_handle = relay_chain_interface
 				.overseer_handle()

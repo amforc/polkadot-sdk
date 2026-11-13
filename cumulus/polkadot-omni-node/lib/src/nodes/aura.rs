@@ -21,7 +21,7 @@ use crate::{
 		rpc::{BuildParachainRpcExtensions, BuildRpcExtensions},
 		spec::{
 			BaseNodeSpec, BuildImportQueue, ClientBlockImport, DynNodeSpec, InitBlockImport,
-			NodeSpec, StartConsensus,
+			NodeSpec, StartConsensus, RELAY_CHAIN_SLOT_DURATION_MILLIS,
 		},
 		types::{
 			AccountId, Balance, Hash, Nonce, ParachainBackend, ParachainBlockImport,
@@ -30,7 +30,7 @@ use crate::{
 		ConstructNodeRuntimeApi, NodeBlock, NodeExtraArgs,
 	},
 };
-use codec::Encode;
+use codec::{Decode, Encode};
 use cumulus_client_collator::service::{
 	CollatorService, ServiceInterface as CollatorServiceInterface,
 };
@@ -48,20 +48,23 @@ use cumulus_client_consensus_aura::{
 use cumulus_client_consensus_relay_chain::Verifier as RelayChainVerifier;
 use cumulus_client_parachain_inherent::MockValidationDataInherentDataProvider;
 use cumulus_primitives_core::{
-	relay_chain::ValidationCode, CollectCollationInfo, GetParachainInfo, ParaId,
-	RelayParentOffsetApi, TargetBlockRate,
+	relay_chain::{self, ValidationCode},
+	CollectCollationInfo, GetParachainInfo, ParaId, RelayParentOffsetApi, TargetBlockRate,
 };
 use cumulus_relay_chain_interface::{OverseerHandle, RelayChainInterface};
 use futures::{prelude::*, FutureExt};
 use polkadot_primitives::{CollatorPair, UpgradeGoAhead};
 use prometheus_endpoint::Registry;
-use sc_client_api::{Backend, BlockchainEvents};
+use sc_client_api::{Backend, BlockchainEvents, StorageKey, StorageProvider};
 use sc_client_db::DbHash;
 use sc_consensus::{
 	import_queue::{BasicQueue, Verifier as VerifierT},
 	BlockImportParams, DefaultImportQueue, LongestChain,
 };
-use sc_consensus_manual_seal::consensus::aura::AuraConsensusDataProvider;
+use sc_consensus_manual_seal::{
+	consensus::aura::AuraConsensusDataProvider,
+	rpc::{ManualSeal, ManualSealApiServer},
+};
 use sc_network::{config::FullNetworkConfiguration, NotificationMetrics, PeerId};
 use sc_service::{Configuration, Error, PartialComponents, TaskManager};
 use sc_storage_chain_sync::StorageChainBlockImport;
@@ -226,6 +229,7 @@ where
 			ref storage_monitor,
 			ref hop,
 			collator_reserved_slots: _,
+			dev_timestamp_step_ms,
 		} = node_extra_args;
 
 		// Warn about args that have no effect in dev mode (collation-specific).
@@ -356,10 +360,14 @@ where
 
 		let para_id =
 			Self::parachain_id(&client, &config).ok_or("Failed to retrieve the parachain id")?;
-		let create_inherent_data_providers =
-			Self::create_dev_node_inherent_data_providers(client.clone(), para_id, slot_duration);
+		let create_inherent_data_providers = Self::create_dev_node_inherent_data_providers(
+			client.clone(),
+			para_id,
+			slot_duration,
+			dev_timestamp_step_ms,
+		);
 
-		match mode {
+		let manual_seal_rpc_sink = match mode {
 			DevSealMode::InstantSeal => {
 				let params = sc_consensus_manual_seal::InstantSealParams {
 					block_import: client.clone(),
@@ -377,26 +385,17 @@ where
 					None,
 					authorship_future,
 				);
+				None
 			},
-			DevSealMode::ManualSeal(block_time) => {
+			DevSealMode::ManualSeal(_) | DevSealMode::ManualSealOnRequest => {
 				let (manual_seal_sink, manual_seal_stream) = futures::channel::mpsc::channel(1024);
-				let mut manual_seal_sink_clone = manual_seal_sink.clone();
-				task_manager
-					.spawn_essential_handle()
-					.spawn("block_authoring", None, async move {
-						loop {
-							futures_timer::Delay::new(std::time::Duration::from_millis(block_time))
-								.await;
-							manual_seal_sink_clone
-								.try_send(sc_consensus_manual_seal::EngineCommand::SealNewBlock {
-									create_empty: true,
-									finalize: true,
-									parent_hash: None,
-									sender: None,
-								})
-								.unwrap();
-						}
-					});
+				if let DevSealMode::ManualSeal(block_time_ms) = mode {
+					Self::spawn_dev_node_block_timer(
+						&task_manager,
+						manual_seal_sink.clone(),
+						block_time_ms,
+					);
+				}
 
 				let params = sc_consensus_manual_seal::ManualSealParams {
 					block_import: client.clone(),
@@ -415,8 +414,11 @@ where
 					None,
 					authorship_future,
 				);
+				// `engine_createBlock` is served in both modes: a timer does not preclude a
+				// request.
+				Some(manual_seal_sink)
 			},
-		}
+		};
 		let hop_pool = hop
 			.as_ref()
 			.map(|params| {
@@ -447,7 +449,7 @@ where
 			let hop_pool = hop_pool.clone();
 
 			Box::new(move |_| {
-				let module = Self::BuildRpcExtensions::build_rpc_extensions(
+				let mut module = Self::BuildRpcExtensions::build_rpc_extensions(
 					client.clone(),
 					backend_for_rpc.clone(),
 					transaction_pool.clone(),
@@ -455,6 +457,11 @@ where
 					hop_pool.clone(),
 					spawn_handle.clone(),
 				)?;
+				if let Some(sink) = &manual_seal_rpc_sink {
+					module
+						.merge(ManualSeal::new(sink.clone()).into_rpc())
+						.map_err(|e| sc_service::Error::Application(Box::new(e) as Box<_>))?;
+				}
 				Ok(module)
 			})
 		};
@@ -499,6 +506,32 @@ where
 	RuntimeApi::RuntimeApi: AuraRuntimeApi<Block, AuraId>,
 	AuraId: AuraIdT + Sync,
 {
+	/// Requests an empty-allowed, finalized dev block every `block_time_ms`, forever.
+	fn spawn_dev_node_block_timer(
+		task_manager: &TaskManager,
+		mut manual_seal_sink: futures::channel::mpsc::Sender<
+			sc_consensus_manual_seal::EngineCommand<Block::Hash>,
+		>,
+		block_time_ms: u64,
+	) {
+		task_manager
+			.spawn_essential_handle()
+			.spawn("block_authoring", None, async move {
+				loop {
+					futures_timer::Delay::new(std::time::Duration::from_millis(block_time_ms))
+						.await;
+					manual_seal_sink
+						.try_send(sc_consensus_manual_seal::EngineCommand::SealNewBlock {
+							create_empty: true,
+							finalize: true,
+							parent_hash: None,
+							sender: None,
+						})
+						.unwrap();
+				}
+			});
+	}
+
 	/// Creates the inherent data providers for manual and instant seal consensus.
 	///
 	/// This function sets up the timestamp and parachain validation data providers
@@ -507,6 +540,7 @@ where
 		client: Arc<ParachainClient<Block, RuntimeApi>>,
 		para_id: ParaId,
 		slot_duration: sp_consensus_aura::SlotDuration,
+		timestamp_step_ms: Option<u64>,
 	) -> impl Fn(
 		Hash,
 		(),
@@ -517,8 +551,6 @@ where
 		>,
 	> + Send
 	       + Sync {
-		const RELAY_CHAIN_SLOT_DURATION_MILLIS: u64 = 6000;
-
 		// Start 2 hours in the past to avoid timestamps immediately running into the future.
 		let initial_relay_slot = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
@@ -551,13 +583,47 @@ where
 			let relay_blocks_per_para_block =
 				(slot_duration.as_millis() / RELAY_CHAIN_SLOT_DURATION_MILLIS).max(1) as u32;
 
-			// Each para block gets a unique relay slot: initial_relay_slot +
-			// relay_blocks_per_para_block * block_number
-			let target_relay_slot = initial_relay_slot +
-				u64::from(current_block_number) * u64::from(relay_blocks_per_para_block);
-
-			let relay_offset = (target_relay_slot as u32)
-				.saturating_sub(relay_blocks_per_para_block * current_block_number);
+			let (timestamp, relay_blocks_per_para_block, relay_offset, additional_key_values) =
+				match timestamp_step_ms {
+					Some(step_ms) => {
+						let clock = match Self::dev_node_stepped_clock(&client, block, step_ms) {
+							Ok(clock) => clock,
+							Err(error) => return futures::future::ready(Err(error)),
+						};
+						// A fork's relay block number differs from its slot. Preserve both and
+						// its host configuration so relay time and runtime limits stay consistent.
+						(
+							clock.timestamp_ms,
+							0,
+							clock.relay_parent_number,
+							Some(vec![
+								(
+									relay_chain::well_known_keys::CURRENT_SLOT.to_vec(),
+									relay_chain::Slot::from(clock.relay_slot).encode(),
+								),
+								(
+									relay_chain::well_known_keys::ACTIVE_CONFIG.to_vec(),
+									clock.host_configuration,
+								),
+							]),
+						)
+					},
+					// Each para block gets a unique relay slot: initial_relay_slot +
+					// relay_blocks_per_para_block * block_number
+					None => {
+						let target_relay_slot = initial_relay_slot +
+							u64::from(current_block_number) *
+								u64::from(relay_blocks_per_para_block);
+						let relay_offset = (target_relay_slot as u32)
+							.saturating_sub(relay_blocks_per_para_block * current_block_number);
+						(
+							target_relay_slot * RELAY_CHAIN_SLOT_DURATION_MILLIS,
+							relay_blocks_per_para_block,
+							relay_offset,
+							None,
+						)
+					},
+				};
 
 			let mocked_parachain = MockValidationDataInherentDataProvider::<()> {
 				current_para_block: current_block_number,
@@ -567,6 +633,7 @@ where
 				relay_offset,
 				relay_parent_offset,
 				para_blocks_per_relay_epoch: 10,
+				additional_key_values,
 				upgrade_go_ahead: should_send_go_ahead.then(|| {
 					log::info!("Detected pending validation code, sending go-ahead signal.");
 					UpgradeGoAhead::GoAhead
@@ -574,13 +641,84 @@ where
 				..Default::default()
 			};
 
-			let timestamp = target_relay_slot * RELAY_CHAIN_SLOT_DURATION_MILLIS;
-
 			let timestamp_provider = sp_timestamp::InherentDataProvider::new(timestamp.into());
 
 			futures::future::ready(Ok((timestamp_provider, mocked_parachain)))
 		}
 	}
+
+	/// Advances time from an initialized fork without a jump in its relay block number.
+	fn dev_node_stepped_clock(
+		client: &ParachainClient<Block, RuntimeApi>,
+		parent: Hash,
+		step_ms: u64,
+	) -> Result<DevNodeSteppedClock, Box<dyn std::error::Error + Send + Sync>> {
+		let parent_ms: u64 = Self::dev_node_parent_value(client, parent, "Timestamp", "Now")?;
+		let parent_relay_number: u32 = Self::dev_node_parent_value(
+			client,
+			parent,
+			"ParachainSystem",
+			"LastRelayChainBlockNumber",
+		)?;
+		let timestamp_ms =
+			parent_ms.checked_add(step_ms).ok_or("Dev timestamp overflows `u64`.")?;
+		let relay_slot = timestamp_ms / RELAY_CHAIN_SLOT_DURATION_MILLIS;
+		let parent_relay_slot = parent_ms / RELAY_CHAIN_SLOT_DURATION_MILLIS;
+		let relay_slots_passed = u32::try_from(relay_slot - parent_relay_slot)?;
+		let relay_parent_number = parent_relay_number
+			.checked_add(relay_slots_passed)
+			.ok_or("Dev relay parent number overflows `u32`.")?;
+		let host_configuration =
+			Self::dev_node_parent_bytes(client, parent, "ParachainSystem", "HostConfiguration")?;
+		Ok(DevNodeSteppedClock {
+			timestamp_ms,
+			relay_slot,
+			relay_parent_number,
+			host_configuration,
+		})
+	}
+
+	/// The decoded value of the plain storage item `pallet::item` at `parent`.
+	fn dev_node_parent_value<T: Decode>(
+		client: &ParachainClient<Block, RuntimeApi>,
+		parent: Hash,
+		pallet: &str,
+		item: &str,
+	) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+		let bytes = Self::dev_node_parent_bytes(client, parent, pallet, item)?;
+		Ok(T::decode(&mut &bytes[..])?)
+	}
+
+	/// The encoded value of the plain storage item `pallet::item` at `parent`.
+	///
+	/// Fails when the runtime has no such item, instead of guessing a value.
+	fn dev_node_parent_bytes(
+		client: &ParachainClient<Block, RuntimeApi>,
+		parent: Hash,
+		pallet: &str,
+		item: &str,
+	) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+		let key = StorageKey(
+			[
+				sp_crypto_hashing::twox_128(pallet.as_bytes()),
+				sp_crypto_hashing::twox_128(item.as_bytes()),
+			]
+			.concat(),
+		);
+		let value = client
+			.storage(parent, &key)?
+			.ok_or_else(|| format!("`{pallet}::{item}` is absent at the parent block."))?;
+		Ok(value.0)
+	}
+}
+
+/// What a dev block's inherents state when chain time advances a fixed step per block.
+struct DevNodeSteppedClock {
+	timestamp_ms: u64,
+	relay_slot: u64,
+	relay_parent_number: u32,
+	/// The encoded `AbridgedHostConfiguration` the mocked relay chain reports.
+	host_configuration: Vec<u8>,
 }
 
 pub fn new_aura_node_spec<Block, RuntimeApi, AuraId>(

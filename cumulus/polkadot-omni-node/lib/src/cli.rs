@@ -184,6 +184,28 @@ pub struct Cli<Config: CliConfig> {
 	#[arg(long, conflicts_with = "dev_block_time")]
 	pub instant_seal: bool,
 
+	/// Start a dev node that produces a block only when asked to.
+	///
+	/// This is a dev option. No block is authored on a timer or on transaction arrival: every
+	/// block is requested through the `engine_createBlock` RPC, which returns once the block is
+	/// imported. A caller can therefore submit everything that belongs in a block and then seal
+	/// it, independently of wall-clock time.
+	#[arg(long, conflicts_with_all = ["dev_block_time", "instant_seal"])]
+	pub dev_seal_on_request: bool,
+
+	/// Chain time each dev block advances, in milliseconds.
+	///
+	/// Requires an initialized fork with timestamp, relay block number and host configuration
+	/// in storage. A dev block's timestamp is its parent's on-chain timestamp plus this step,
+	/// whatever the wall-clock interval between the two blocks, and the mocked relay
+	/// chain slot follows that timestamp. Without it the timestamp is derived from the block
+	/// number and advances by a whole parachain slot per block.
+	///
+	/// The step must respect the runtime's block velocity: too many blocks inside one relay
+	/// chain slot make the runtime reject the block.
+	#[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+	pub dev_timestamp_step_ms: Option<u64>,
+
 	/// DEPRECATED: This feature has been stabilized, pLease use `--authoring slot-based` instead.
 	///
 	/// Use slot-based collator which can handle elastic scaling.
@@ -369,6 +391,8 @@ pub(crate) enum DevSealMode {
 	/// Produces blocks at fixed time intervals.
 	/// The u64 parameter represents the block time in milliseconds.
 	ManualSeal(u64),
+	/// Produces a block for each `engine_createBlock` RPC request, and at no other time.
+	ManualSealOnRequest,
 }
 
 /// Collator implementation to use.
@@ -425,6 +449,7 @@ impl<Config: CliConfig> Cli<Config> {
 			storage_monitor: self.storage_monitor.clone(),
 			collator_reserved_slots: self.collator_reserved_slots,
 			hop: self.hop.enabled.then(|| self.hop.clone()),
+			dev_timestamp_step_ms: self.dev_timestamp_step_ms,
 		}
 	}
 
@@ -432,6 +457,8 @@ impl<Config: CliConfig> Cli<Config> {
 	pub(crate) fn dev_mode(&self) -> Option<DevSealMode> {
 		if self.instant_seal {
 			Some(DevSealMode::InstantSeal)
+		} else if self.dev_seal_on_request {
+			Some(DevSealMode::ManualSealOnRequest)
 		} else if let Some(dev_block_time) = self.dev_block_time {
 			Some(DevSealMode::ManualSeal(dev_block_time))
 		} else if self.run.base.is_dev().unwrap_or(false) {
