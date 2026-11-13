@@ -147,6 +147,10 @@ pub struct NodeExtraArgs {
 	/// HOP (Hand-Off Protocol) configuration parameters.
 	/// `None` disables HOP.
 	pub hop: Option<sc_hop::HopParams>,
+
+	/// Chain time each dev block advances, in milliseconds.
+	/// `None` derives dev timestamps from the block number.
+	pub dev_timestamp_step_ms: Option<u64>,
 }
 
 /// Maximum safety margin, in blocks, subtracted from the runtime's transaction-storage
