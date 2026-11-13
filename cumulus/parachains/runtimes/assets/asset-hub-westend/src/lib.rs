@@ -32,6 +32,8 @@ pub mod xcm_config;
 // Configurations for next functionality.
 mod bag_thresholds;
 pub mod dotusd_config;
+#[cfg(feature = "try-runtime")]
+pub mod dotusd_try_state;
 pub mod governance;
 #[cfg(not(feature = "runtime-benchmarks"))]
 mod migrations;
@@ -2421,6 +2423,13 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 			// NOTE: intentional unwrap: we don't want to propagate the error backwards, and want to
 			// have a backtrace here.
 			Executive::try_execute_block(block, state_root_check, signature_check, select).unwrap()
+		}
+	}
+
+	#[cfg(feature = "try-runtime")]
+	impl dotusd_try_state::DotUsdTryStateApi<Block> for Runtime {
+		fn try_state() -> Result<(), alloc::string::String> {
+			dotusd_try_state::check()
 		}
 	}
 
