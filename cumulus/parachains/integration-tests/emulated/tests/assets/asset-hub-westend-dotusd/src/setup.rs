@@ -469,13 +469,6 @@ pub(crate) fn dotusd_balance(who: &AccountId) -> Balance {
 	<Assets as Inspect<AccountId>>::balance(DOTUSD_ID, who)
 }
 
-/// Branch-level accounting for the native-WND branch.
-pub(crate) fn branch_state() -> pallet_vaults::types::BranchState<AccountId, Balance> {
-	pallet_vaults::Branches::<Runtime>::get(get_native_id(), DOTUSD_ID)
-		.expect("branch registered")
-		.state
-}
-
 pub(crate) fn native_balance(who: &AccountId) -> Balance {
 	<Balances as FungibleInspect<AccountId>>::balance(who)
 }

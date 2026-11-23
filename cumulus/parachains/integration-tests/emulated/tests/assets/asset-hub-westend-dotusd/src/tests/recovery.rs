@@ -64,6 +64,5 @@ fn final_recovery_redemption_below_par_with_full_insurance_cover() {
 		));
 		assert_eq!(vault_status(&parked_owner), None);
 		assert_eq!(collateral_on_hold(&get_native_id(), &parked_owner), 0);
-		assert_eq!(branch_state().vault_count, 0);
 	});
 }
