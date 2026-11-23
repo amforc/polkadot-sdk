@@ -178,6 +178,11 @@ fn psm_debt_consumes_and_releases_vault_headroom() {
 		));
 		lift_global_ceiling(1_000 * DOTUSD);
 
+		// Fund the reserve so the USDt backing the fee can stay above the asset minimum.
+		let reserve = Psm::reserve_account(internal.clone());
+		let reserve_minimum = <Assets as Inspect<AccountId>>::minimum_balance(USDT_ID);
+		assert_ok!(<Assets as Mutate<AccountId>>::mint_into(USDT_ID, &reserve, reserve_minimum));
+
 		// Redeeming the PSM debt returns its headroom to vault borrowers at
 		// once. The live one-basis-point fee goes to the Insurance Fund, so
 		// the user burns 299.97 and 0.03 stays in circulation as fee revenue.
@@ -193,6 +198,10 @@ fn psm_debt_consumes_and_releases_vault_headroom() {
 		assert_eq!(dotusd_balance(&user), 0);
 		assert_eq!(dotusd_balance(&insurance_account()), fee);
 		assert_eq!(<Assets as Inspect<AccountId>>::balance(USDT_ID, &user), 300 * USDT - fee);
+		assert_eq!(
+			<Assets as Inspect<AccountId>>::balance(USDT_ID, &reserve),
+			reserve_minimum + fee
+		);
 		assert_eq!(pallet_psm::PsmDebt::<Runtime>::get(&internal, &external), fee);
 
 		// Vaults regain all but the fee's worth of headroom: 1_000 − 600 − 0.03.
@@ -205,13 +214,8 @@ fn psm_debt_consumes_and_releases_vault_headroom() {
 	});
 }
 
-// The one basis point fee on a one dotUSD redemption is 0.0001 dotUSD, under
-// the coin's 0.01 minimum balance, so it cannot open the Insurance Fund's
-// account. At launch that account is empty: until a redemption of at least
-// 100 dotUSD (or a deposit) opens it, every redemption under 100 dotUSD fails
-// with a token error rather than a PSM one.
 #[test]
-fn redemption_fee_cannot_open_an_empty_insurance_fund() {
+fn redemption_waives_fee_until_insurance_fund_can_receive_it() {
 	AssetHubWestend::execute_with(|| {
 		let (internal, external) = launch_dotusd_psm();
 		let user = acct(2);
@@ -234,10 +238,13 @@ fn redemption_fee_cannot_open_an_empty_insurance_fund() {
 		};
 
 		assert_eq!(dotusd_balance(&insurance_account()), 0);
-		assert_noop!(redeem(DOTUSD), sp_runtime::TokenError::BelowMinimum);
+		// The fee is below the minimum needed to open the Insurance Fund's account.
+		assert_ok!(redeem(DOTUSD));
+		assert_eq!(dotusd_balance(&insurance_account()), 0);
+		assert_eq!(<Assets as Inspect<AccountId>>::balance(USDT_ID, &user), USDT);
+		assert_eq!(pallet_psm::PsmDebt::<Runtime>::get(&internal, &external), 199 * DOTUSD);
 
-		// A 100 dotUSD redemption pays exactly the minimum balance in fees and
-		// opens the account; the one dotUSD redemption then goes through.
+		// A 100 dotUSD redemption opens the account, which can then receive smaller fees.
 		assert_ok!(redeem(100 * DOTUSD));
 		assert_eq!(dotusd_balance(&insurance_account()), DOTUSD_MIN_BALANCE);
 		assert_ok!(redeem(DOTUSD));
