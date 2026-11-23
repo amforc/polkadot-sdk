@@ -3,7 +3,7 @@
 use crate::{DebtCollateral, VaultStatus};
 use frame::deps::{
 	frame_support::pallet_prelude::{DispatchError, DispatchResult},
-	sp_runtime::Permill,
+	sp_runtime::{FixedU128, Permill},
 };
 
 /// Settlement consumed by [`VaultInterface::redeem_step`].
@@ -21,7 +21,7 @@ pub struct RedemptionSettlement<Credit, Balance> {
 /// Fully accrued snapshot of a redemption target, used to size and price a step.
 ///
 /// `status` selects the pricing: face value for `Active` and `Dormant`, recovery settlement for
-/// `FinalRecovery`.
+/// `FinalRecovery`. The last three fields are read only by recovery pricing.
 pub struct RedemptionStepSnapshot<Balance> {
 	/// Lifecycle status.
 	pub status: VaultStatus,
@@ -31,6 +31,11 @@ pub struct RedemptionStepSnapshot<Balance> {
 	pub collateral: Balance,
 	/// Branch redistribution penalty; caps the recovery bonus.
 	pub redistribution_penalty: Permill,
+	/// Branch ICR, the upper bound of recovery settlement; a vault above it must exit instead.
+	pub initial_collateralization_ratio: FixedU128,
+	/// Branch minimum debt. Below it an occupied Dormant slot can block the exit, so the vault
+	/// stays settleable.
+	pub minimum_debt: Balance,
 }
 
 impl<Balance: Copy> RedemptionStepSnapshot<Balance> {

@@ -3246,7 +3246,7 @@ mod runtime {
 	#[runtime::pallet_index(105)]
 	pub type Vaults = pallet_vaults::Pallet<Runtime>;
 
-	#[runtime::pallet_index(98)]
+	#[runtime::pallet_index(101)]
 	pub type Redemptions = pallet_redemptions::Pallet<Runtime>;
 }
 
