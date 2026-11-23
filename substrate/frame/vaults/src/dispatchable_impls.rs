@@ -524,29 +524,58 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Sets or clears an administrative freeze.
-	///
-	/// Freezing does nothing if the branch is already frozen. Clearing only removes an
-	/// administrative freeze.
 	pub(crate) fn do_set_governance_frozen(
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		frozen: bool,
 	) -> DispatchResult {
-		let state = Self::branch_of(collateral_id, stable_id)?.state;
-		match (state.frozen, frozen) {
-			(None, true) => {
-				Self::transition_frozen(collateral_id, stable_id, Some(FrozenReason::Governance))
-			},
-			(Some(current), false) => {
-				if current.reason.is_cleared_by_admin() {
-					Self::transition_frozen(collateral_id, stable_id, None)
-				} else {
-					Ok(())
-				}
-			},
-			(None, false) | (Some(_), true) => Ok(()),
+		let current = Self::branch_of(collateral_id, stable_id)?.state.frozen_reason();
+		if (current == Some(FrozenReason::Governance)) == frozen {
+			return Ok(());
 		}
+		Self::sync_freeze(collateral_id, stable_id, current, frozen)?;
+		Ok(())
+	}
+
+	/// Returns whether the stored freeze changed.
+	fn sync_freeze(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		current: Option<FrozenReason>,
+		governance: bool,
+	) -> Result<bool, DispatchError> {
+		let target = if governance {
+			Some(FrozenReason::Governance)
+		} else if T::Oracle::provide_price(collateral_id).is_ok() {
+			None
+		} else {
+			Some(FrozenReason::OracleFailure)
+		};
+		if current == target {
+			return Ok(false);
+		}
+		match (current, target) {
+			(Some(_), Some(reason)) => Self::retag_freeze(collateral_id, stable_id, reason)?,
+			(None, _) | (_, None) => Self::transition_frozen(collateral_id, stable_id, target)?,
+		}
+		Ok(true)
+	}
+
+	/// The original start time prevents interest charges for any part of the frozen period.
+	/// The mode stays Frozen, so no mode change event is needed.
+	fn retag_freeze(
+		collateral_id: &CollateralIdOf<T>,
+		stable_id: &StableIdOf<T>,
+		reason: FrozenReason,
+	) -> DispatchResult {
+		Self::try_mutate_branch_state(collateral_id, stable_id, |_, state, _| {
+			let Some(frozen) = state.frozen.as_mut() else {
+				defensive!("callers gate on the current frozen state");
+				return Err(DispatchError::Corruption);
+			};
+			frozen.reason = reason;
+			Ok(())
+		})
 	}
 
 	/// Sets the global debt limit across every branch issuing one stable asset.
@@ -624,21 +653,15 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 	) -> DispatchResult {
-		let state = Self::branch_of(collateral_id, stable_id)?.state;
-		let oracle_ok = T::Oracle::provide_price(collateral_id).is_ok();
-		match (state.frozen, oracle_ok) {
-			(Some(frozen), true) => {
-				if frozen.reason.is_cleared_by_oracle() {
-					Self::transition_frozen(collateral_id, stable_id, None)
-				} else {
-					Ok(())
-				}
-			},
-			(None, false) => {
-				Self::transition_frozen(collateral_id, stable_id, Some(FrozenReason::OracleFailure))
-			},
-			(None, true) => Self::accrue_branch_interest(collateral_id, stable_id),
-			(Some(_), false) => Ok(()),
+		let current = Self::branch_of(collateral_id, stable_id)?.state.frozen_reason();
+		let governance = current == Some(FrozenReason::Governance);
+		if Self::sync_freeze(collateral_id, stable_id, current, governance)? {
+			return Ok(());
+		}
+		if current.is_some() {
+			Ok(())
+		} else {
+			Self::accrue_branch_interest(collateral_id, stable_id)
 		}
 	}
 }

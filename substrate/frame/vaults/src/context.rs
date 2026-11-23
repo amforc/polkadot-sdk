@@ -107,7 +107,7 @@ impl<T: Config> Context<T> {
 	}
 
 	fn ensure_not_frozen(&self) -> DispatchResult {
-		ensure!(!self.branch.state.is_frozen(), Error::<T>::BranchFrozen);
+		ensure!(self.branch.state.frozen_reason().is_none(), Error::<T>::BranchFrozen);
 		Ok(())
 	}
 
@@ -136,7 +136,7 @@ impl<T: Config> Context<T> {
 	/// here. A price the oracle cannot give, or a ratio that does not compute, reports `Frozen`:
 	/// the pool then declines, which is what it does for a branch it cannot classify.
 	fn branch_snapshot(&self) -> BranchSnapshot {
-		let mode = if self.branch.state.is_frozen() {
+		let mode = if self.branch.state.frozen_reason().is_some() {
 			BranchMode::Frozen
 		} else {
 			let price = match self.price {

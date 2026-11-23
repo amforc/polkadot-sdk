@@ -882,7 +882,7 @@ pub mod pallet {
 			annual_rate: FixedU128,
 		) -> Result<BalanceOf<T>, DispatchError> {
 			let (config, mut state, now) = Self::accrued_branch_view(&collateral_id, &stable_id)?;
-			ensure!(!state.is_frozen(), Error::<T>::BranchFrozen);
+			ensure!(state.frozen_reason().is_none(), Error::<T>::BranchFrozen);
 			Self::validate_rate(&config, annual_rate)?;
 			let mut scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
 			Self::apply_borrow_unchecked(
@@ -909,7 +909,7 @@ pub mod pallet {
 			maybe_new_rate: Option<FixedU128>,
 		) -> Result<BalanceOf<T>, DispatchError> {
 			let mut draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
-			ensure!(!draft.state.is_frozen(), Error::<T>::BranchFrozen);
+			ensure!(draft.state.frozen_reason().is_none(), Error::<T>::BranchFrozen);
 			let new_rate = maybe_new_rate.unwrap_or(draft.vault.annual_rate);
 			Self::validate_rate(&draft.config, new_rate)?;
 			Self::apply_borrow_unchecked(
@@ -1226,8 +1226,11 @@ pub mod pallet {
 		/// Freezing requires [`Config::ForceOrigin`] or a branch administrator. Unfreezing requires
 		/// [`Config::ForceOrigin`] or the branch's full administrator.
 		///
-		/// The call does nothing if the requested administrative state is already satisfied. Oracle
-		/// freezes are managed by [`Pallet::refresh_branch`].
+		/// An administrative freeze remains in effect when the oracle price returns.
+		/// If the price is unavailable when the administrator clears the freeze, the branch stays
+		/// frozen. [`Pallet::refresh_branch`] clears the oracle freeze when the price returns.
+		///
+		/// The call does nothing if the requested administrative state is already satisfied.
 		#[pallet::call_index(12)]
 		#[pallet::weight(T::WeightInfo::set_governance_frozen())]
 		pub fn set_governance_frozen(

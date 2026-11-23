@@ -47,7 +47,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			.outstanding
 			.checked_add(&branch_outstanding)
 			.ok_or("stablecoin outstanding-debt sum overflow")?;
-		if !branch.state.is_frozen() {
+		if branch.state.frozen_reason().is_none() {
 			stable_entry.active_accrual_rate = stable_entry
 				.active_accrual_rate
 				.checked_add(branch.state.debt.accrual_rate)

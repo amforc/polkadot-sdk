@@ -302,7 +302,7 @@ impl<T: Config> Pallet<T> {
 		Ok(BranchContribution {
 			outstanding: state.debt.outstanding(),
 			pending_interest: Self::branch_pending_interest(state, now)?,
-			active_accrual_rate: if state.is_frozen() {
+			active_accrual_rate: if state.frozen_reason().is_some() {
 				U256::zero()
 			} else {
 				state.debt.accrual_rate
@@ -445,7 +445,7 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		now: Millis,
 	) -> Result<BranchMode, DispatchError> {
-		if state.is_frozen() {
+		if state.frozen_reason().is_some() {
 			return Ok(BranchMode::Frozen);
 		}
 		// A failing oracle is what `do_refresh_branch` would persist as
@@ -468,7 +468,7 @@ impl<T: Config> Pallet<T> {
 		price: FixedU128,
 		now: Millis,
 	) -> Result<BranchMode, DispatchError> {
-		if state.is_frozen() {
+		if state.frozen_reason().is_some() {
 			return Ok(BranchMode::Frozen);
 		}
 		let tcr = Self::compute_tcr(state, price, now)?;

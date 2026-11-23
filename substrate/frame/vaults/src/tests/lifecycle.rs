@@ -394,16 +394,19 @@ fn oracle_freeze_is_reported_persisted_and_cleared_only_by_refresh() {
 		// Oracle still down, so a second refresh is a no-op for the same reason.
 		assert_ok!(refresh_branch(99, DOT, STABLE));
 
-		assert!(market_state(DOT, STABLE).is_frozen());
+		assert!(market_state(DOT, STABLE).frozen_reason().is_some());
 
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, false));
 
-		assert!(market_state(DOT, STABLE).is_frozen(), "governance cannot clear an oracle freeze");
+		assert!(
+			market_state(DOT, STABLE).frozen_reason().is_some(),
+			"governance cannot clear an oracle freeze"
+		);
 
 		MockOracleAvailable::set(&true);
 		assert_ok!(refresh_branch(99, DOT, STABLE));
 
-		assert!(!market_state(DOT, STABLE).is_frozen());
+		assert!(market_state(DOT, STABLE).frozen_reason().is_none());
 	});
 }
 
@@ -420,7 +423,7 @@ fn governance_freeze_pins_interest_across_refresh_and_poke() {
 		assert_ok!(refresh_branch(99, DOT, STABLE));
 
 		let after = market_state(DOT, STABLE);
-		assert!(after.is_frozen());
+		assert!(after.frozen_reason().is_some());
 		assert_eq!(after.debt.minted_interest, before.debt.minted_interest, "no mint while frozen");
 
 		assert_ok!(poke(9, DOT, STABLE, 1));
@@ -431,7 +434,60 @@ fn governance_freeze_pins_interest_across_refresh_and_poke() {
 			after.debt.last_interest_time, before.debt.last_interest_time,
 			"interest clock pinned across the frozen window"
 		);
-		assert!(after.is_frozen(), "poke does not clear Frozen");
+		assert!(after.frozen_reason().is_some(), "poke does not clear Frozen");
+	});
+}
+
+#[test]
+fn governance_freeze_takes_over_an_oracle_freeze() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		MockOracleAvailable::set(&false);
+		assert_ok!(refresh_branch(99, DOT, STABLE));
+		let entered_at = market_state(DOT, STABLE).frozen.expect("oracle freeze").entered_at;
+		advance_time(ONE_DAY_MS);
+
+		assert_ok!(set_governance_frozen(EMERGENCY_ADMIN, DOT, STABLE, true));
+
+		MockOracleAvailable::set(&true);
+		assert_ok!(refresh_branch(99, DOT, STABLE));
+
+		assert_eq!(
+			market_state(DOT, STABLE).frozen,
+			Some(crate::FrozenState { reason: crate::FrozenReason::Governance, entered_at }),
+			"the returning price does not lift a governance freeze"
+		);
+	});
+}
+
+#[test]
+fn clearing_a_governance_freeze_without_a_price_leaves_an_oracle_freeze() {
+	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
+		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
+		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, true));
+		let before = market_state(DOT, STABLE);
+		let entered_at = before.frozen.expect("governance freeze").entered_at;
+		MockOracleAvailable::set(&false);
+		advance_time(ONE_DAY_MS);
+
+		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, false));
+
+		assert_eq!(
+			market_state(DOT, STABLE).frozen,
+			Some(crate::FrozenState { reason: crate::FrozenReason::OracleFailure, entered_at }),
+		);
+
+		advance_time(ONE_DAY_MS);
+		MockOracleAvailable::set(&true);
+		assert_ok!(refresh_branch(99, DOT, STABLE));
+		assert_ok!(poke(9, DOT, STABLE, 1));
+
+		let after = market_state(DOT, STABLE);
+		assert!(after.frozen_reason().is_none());
+		assert_eq!(
+			after.debt.minted_interest, before.debt.minted_interest,
+			"neither day of the frozen window is charged"
+		);
 	});
 }
 
@@ -440,7 +496,7 @@ fn governance_clear_clears_governance_frozen() {
 	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
 		// The emergency admin can pull the freeze but cannot clear it. That needs the full admin.
 		assert_ok!(set_governance_frozen(EMERGENCY_ADMIN, DOT, STABLE, true));
-		assert!(market_state(DOT, STABLE).is_frozen());
+		assert!(market_state(DOT, STABLE).frozen_reason().is_some());
 
 		assert_noop!(
 			set_governance_frozen(EMERGENCY_ADMIN, DOT, STABLE, false),
@@ -450,7 +506,7 @@ fn governance_clear_clears_governance_frozen() {
 		// Full clears governance Frozen.
 		assert_ok!(set_governance_frozen(ADMIN, DOT, STABLE, false));
 
-		assert!(!market_state(DOT, STABLE).is_frozen());
+		assert!(market_state(DOT, STABLE).frozen_reason().is_none());
 		crate::tests::assert_event(crate::Event::ModeChanged {
 			collateral_id: DOT,
 			stable_id: STABLE,

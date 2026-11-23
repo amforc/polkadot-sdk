@@ -66,34 +66,15 @@ pub struct LiquidationSnapshot<Balance> {
 }
 
 /// Reason a branch is frozen.
+///
+/// A branch stores one reason. [`Self::Governance`] takes priority so a valid oracle price cannot
+/// clear an administrative freeze.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrozenReason {
-	/// The oracle has no valid price.
+	/// The oracle has no valid price, and no administrator froze the branch.
 	OracleFailure,
-	/// An authorized origin froze the branch.
+	/// An authorized origin froze the branch. The oracle may also have no valid price.
 	Governance,
-}
-
-impl FrozenReason {
-	/// Returns whether an administrator may lift a freeze with this reason.
-	///
-	/// An oracle freeze reflects a missing price, which no administrator can supply.
-	pub(crate) const fn is_cleared_by_admin(self) -> bool {
-		match self {
-			Self::OracleFailure => false,
-			Self::Governance => true,
-		}
-	}
-
-	/// Returns whether a returning oracle price lifts a freeze with this reason.
-	///
-	/// A governance freeze stays until an administrator lifts it, whatever the price does.
-	pub(crate) const fn is_cleared_by_oracle(self) -> bool {
-		match self {
-			Self::OracleFailure => true,
-			Self::Governance => false,
-		}
-	}
 }
 
 /// Stored state for a frozen branch.
@@ -559,9 +540,9 @@ impl<AccountId, Balance: Default + Zero> BranchState<AccountId, Balance> {
 }
 
 impl<AccountId, Balance> BranchState<AccountId, Balance> {
-	/// Returns whether the branch is frozen.
-	pub const fn is_frozen(&self) -> bool {
-		self.frozen.is_some()
+	/// Returns why the branch is frozen, or `None` if it is not.
+	pub fn frozen_reason(&self) -> Option<FrozenReason> {
+		self.frozen.map(|frozen| frozen.reason)
 	}
 
 	/// Returns branch interest time at `now`.

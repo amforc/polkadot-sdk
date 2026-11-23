@@ -452,7 +452,7 @@ fn refresh_branch_issues_pending_aggregate_interest() {
 		assert_eq!(state.debt.pending_interest_attribution, expected);
 		assert_eq!(state.debt.aggregate_interest_remainder, 0);
 		assert_eq!(state.debt.last_interest_time, state.interest_time(Timestamp::get()));
-		assert!(!state.is_frozen());
+		assert!(state.frozen_reason().is_none());
 		assert_eq!(vault(DOT, STABLE, 1), vault_1_pre, "the refresh writes no vault row");
 		assert_eq!(vault(DOT, STABLE, 2), vault_2_pre, "the refresh writes no vault row");
 

@@ -463,7 +463,7 @@ fn set_branch_admins_reassigns_authority() {
 			STABLE,
 			true
 		));
-		assert!(market_state(DOT, STABLE).is_frozen());
+		assert!(market_state(DOT, STABLE).frozen_reason().is_some());
 
 		// Governance can replace an unreachable full admin and restore ordinary per-branch
 		// administration. Clearing the freeze needs the full level, so it proves the restored
@@ -484,7 +484,7 @@ fn set_branch_admins_reassigns_authority() {
 			STABLE,
 			false
 		));
-		assert!(!market_state(DOT, STABLE).is_frozen());
+		assert!(market_state(DOT, STABLE).frozen_reason().is_none());
 	});
 }
 
@@ -531,14 +531,14 @@ fn force_origin_acts_as_full_branch_admin() {
 
 		// Root is not a branch admin, yet the kill switch passes both ways.
 		assert_ok!(Pallet::<Test>::set_governance_frozen(RuntimeOrigin::root(), DOT, STABLE, true));
-		assert!(market_state(DOT, STABLE).is_frozen());
+		assert!(market_state(DOT, STABLE).frozen_reason().is_some());
 		assert_ok!(Pallet::<Test>::set_governance_frozen(
 			RuntimeOrigin::root(),
 			DOT,
 			STABLE,
 			false
 		));
-		assert!(!market_state(DOT, STABLE).is_frozen());
+		assert!(market_state(DOT, STABLE).frozen_reason().is_none());
 	});
 }
 

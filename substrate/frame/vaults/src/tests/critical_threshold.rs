@@ -13,7 +13,7 @@ fn enter_safety_mode_single_vault() {
 	assert_ok!(open(1, DOT, STABLE, 1_000, 5_000, percent(5)));
 	set_price(DOT, FixedU128::from_rational(63u128, 10u128));
 	// Sanity: `state.frozen` must remain `None`; mode is *derived* from TCR.
-	assert!(!market_state(DOT, STABLE).is_frozen());
+	assert!(market_state(DOT, STABLE).frozen_reason().is_none());
 	// Verify the branch really entered Safety mode rather than trusting the
 	// hand-picked price — the mode is derived from live TCR.
 	assert_eq!(
