@@ -1862,7 +1862,7 @@ construct_runtime!(
 		PoolAssetsFreezer: pallet_assets_freezer::<Instance3> = 59,
 		Revive: pallet_revive = 60,
 		AssetsHolder: pallet_assets_holder::<Instance1> = 66,
-		ForeignAssetsHolder: pallet_assets_holder::<Instance2> = 67,
+		ForeignAssetsHolder: pallet_assets_holder::<Instance2> = 68,
 
 		AssetRewards: pallet_asset_rewards = 61,
 		AssetsPrecompiles: pallet_assets_precompiles::pallet = 62,
