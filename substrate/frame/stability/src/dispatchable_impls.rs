@@ -91,25 +91,28 @@ struct DepositOp<'a, T: Config> {
 }
 
 impl<'a, T: Config> DepositOp<'a, T> {
-	/// Loads the stored row of `owner`, which must exist.
+	/// Loads and settles the stored row of `owner`, which must exist.
 	fn load(
 		collateral_id: &'a CollateralIdOf<T>,
 		stable_id: &'a StableIdOf<T>,
 		owner: &'a T::AccountId,
 		pool: StabilityPoolOf<T>,
+		branch: BranchSnapshot,
 	) -> Result<Self, DispatchError> {
 		let deposit = Deposits::<T>::get((collateral_id, stable_id, owner))
 			.ok_or(Error::<T>::DepositNotFound)?;
-		Ok(Self { collateral_id, stable_id, owner, pool, deposit })
+		Self { collateral_id, stable_id, owner, pool, deposit }.refresh(branch)
 	}
 
-	/// Loads the stored row of `owner`. A depositor without a row starts from an empty row at the
-	/// current active coordinates, so it carries no share of earlier gains or losses.
+	/// Loads and settles the stored row of `owner`. A depositor without a row starts from an
+	/// empty row at the current active coordinates, so it carries no share of earlier gains or
+	/// losses.
 	fn load_or_fresh(
 		collateral_id: &'a CollateralIdOf<T>,
 		stable_id: &'a StableIdOf<T>,
 		owner: &'a T::AccountId,
 		pool: StabilityPoolOf<T>,
+		branch: BranchSnapshot,
 	) -> Result<Self, DispatchError> {
 		let deposit = match Deposits::<T>::get((collateral_id, stable_id, owner)) {
 			Some(deposit) => deposit,
@@ -123,12 +126,12 @@ impl<'a, T: Config> DepositOp<'a, T> {
 				Deposit::fresh(pool.state.snapshot(Leg::Active, &current))
 			},
 		};
-		Ok(Self { collateral_id, stable_id, owner, pool, deposit })
+		Self { collateral_id, stable_id, owner, pool, deposit }.refresh(branch)
 	}
 
 	/// Settles the row at `branch.now`. Due cohorts activate first so the settlement uses the
 	/// current risk classification.
-	fn refresh(&mut self, branch: BranchSnapshot) -> DispatchResult {
+	fn refresh(mut self, branch: BranchSnapshot) -> Result<Self, DispatchError> {
 		Pallet::<T>::advance_cohorts(self.collateral_id, self.stable_id, &mut self.pool, branch)?;
 		Pallet::<T>::realize_deposit(
 			self.collateral_id,
@@ -142,7 +145,8 @@ impl<'a, T: Config> DepositOp<'a, T> {
 			self.owner,
 			&mut self.pool,
 			&mut self.deposit,
-		)
+		)?;
+		Ok(self)
 	}
 
 	/// Credits the collateral of an incoming recovery settlement to the row.
@@ -162,51 +166,113 @@ impl<'a, T: Config> DepositOp<'a, T> {
 	}
 
 	/// Adds funded stablecoin to pending capital.
-	///
-	/// The caller must first use [`Self::refresh`]. This requirement updates the current pending
-	/// amount before the merge.
-	///
 	/// A merge restarts the entry delay for all pending capital of the depositor.
 	fn queue_pending(&mut self, pending_amount: BalanceOf<T>, now: Millis) -> DispatchResult {
 		debug_assert!(!pending_amount.is_zero());
-		let pool = &mut self.pool;
-		let deposit = &mut self.deposit;
-		if pool.config.entry_delay == 0 {
+		if self.pool.config.entry_delay == 0 {
 			// There is no wait to enforce: the capital is active from the start. The refresh
 			// already reset the row snapshot to the live active coordinates.
-			deposit.active_deposit.ensure_add_assign(pending_amount)?;
-			pool.state.total_active_deposits.ensure_add_assign(pending_amount)?;
+			self.deposit.active_deposit.ensure_add_assign(pending_amount)?;
+			self.pool.state.total_active_deposits.ensure_add_assign(pending_amount)?;
 			return Ok(());
 		}
 
 		// A merge pulls the old tranche out of its cohort first. Its snapshot stands at the live
 		// coordinates, so the revalued aggregate carries exactly `pending.amount` for it.
-		let sf_int = pool.config.precision.scale_factor();
-		let live = pool.state.pending_coords;
-		let merged = match deposit.pending_deposit.take() {
+		let sf_int = self.pool.config.precision.scale_factor();
+		let live = self.pool.state.pending_coords;
+		let merged = match self.deposit.pending_deposit.take() {
 			Some(pending) => {
-				let cohort = pool.state.revalued_cohort(pending.cohort, &live, sf_int)?;
+				let cohort = self.pool.state.revalued_cohort(pending.cohort, &live, sf_int)?;
 				cohort.amount.ensure_sub_assign(pending.amount)?;
-				pool.state.drop_member(pending.cohort);
+				self.pool.state.drop_member(pending.cohort);
 				pending.amount.ensure_add(pending_amount)?
 			},
 			None => pending_amount,
 		};
 
-		let deadline = math::cohort_deadline(now, pool.config.entry_delay);
+		let deadline = math::cohort_deadline(now, self.pool.config.entry_delay);
 		let snapshot = {
 			let current =
 				Pallet::<T>::sums_at(self.collateral_id, self.stable_id, Leg::Pending, &live)?;
-			pool.state.snapshot(Leg::Pending, &current)
+			self.pool.state.snapshot(Leg::Pending, &current)
 		};
-		let cohort = Pallet::<T>::join_cohort(&mut pool.state, deadline, live)?;
+		let cohort = Pallet::<T>::join_cohort(&mut self.pool.state, deadline, live)?;
 		cohort.revalue(&live, sf_int);
 		cohort.members.ensure_add_assign(1)?;
 		cohort.amount.ensure_add_assign(merged)?;
-		deposit.pending_deposit =
+		self.deposit.pending_deposit =
 			Some(PendingDeposit { amount: merged, cohort: cohort.id, snapshot });
-		pool.state.total_pending_deposits.ensure_add_assign(pending_amount)?;
+		self.pool.state.total_pending_deposits.ensure_add_assign(pending_amount)?;
 		Ok(())
+	}
+
+	/// Debits the active stablecoin that `mode` authorizes, up to `amount`, and returns it.
+	///
+	/// The debit is bounded by the realized active deposit, which rounding keeps at or below the
+	/// pool total.
+	fn take_withdrawal(
+		&mut self,
+		mode: UnfrozenMode,
+		now: Millis,
+		amount: BalanceOf<T>,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let take = match mode {
+			UnfrozenMode::Normal => amount.min(self.deposit.active_deposit),
+			UnfrozenMode::Safety => {
+				let request = self
+					.deposit
+					.withdrawal_request
+					.as_mut()
+					.ok_or(Error::<T>::WithdrawalRequestMissing)?;
+				ensure!(now >= request.executable_at, Error::<T>::SafetyWithdrawalDelayActive);
+				let take = amount.min(request.amount).min(self.deposit.active_deposit);
+				request.amount.saturating_reduce(take);
+				if request.amount.is_zero() {
+					self.deposit.withdrawal_request = None;
+				}
+				take
+			},
+		};
+		self.deposit.active_deposit.ensure_sub_assign(take)?;
+		self.pool.state.total_active_deposits.ensure_sub_assign(take)?;
+		Ok(take)
+	}
+
+	/// Removes the claimable balance of `kind` and the same amount from its pool obligation.
+	///
+	/// An underflow indicates that the user claim exceeds the recorded pool obligation.
+	fn take_claim(&mut self, kind: ClaimKind) -> Result<BalanceOf<T>, DispatchError> {
+		let (claimable, unclaimed_total, empty_error) = match kind {
+			ClaimKind::Collateral => (
+				&mut self.deposit.claimable_collateral,
+				&mut self.pool.state.total_collateral_gains_unclaimed,
+				Error::<T>::NoClaimableCollateral,
+			),
+			ClaimKind::Yield => (
+				&mut self.deposit.claimable_yield,
+				&mut self.pool.state.total_yield_unclaimed,
+				Error::<T>::NoClaimableYield,
+			),
+		};
+		ensure!(!claimable.is_zero(), empty_error);
+		let amount = core::mem::take(claimable);
+		unclaimed_total.ensure_sub_assign(amount)?;
+		Ok(amount)
+	}
+
+	/// Moves claimable yield into the active deposit, up to `amount`, and returns it.
+	///
+	/// The row snapshot is current, so the moved amount receives no gains from before
+	/// compounding.
+	fn compound_yield(&mut self, amount: BalanceOf<T>) -> Result<BalanceOf<T>, DispatchError> {
+		let take = amount.min(self.deposit.claimable_yield);
+		self.deposit.claimable_yield.ensure_sub_assign(take)?;
+		self.deposit.active_deposit.ensure_add_assign(take)?;
+		self.pool.state.total_active_deposits.ensure_add_assign(take)?;
+		// An underflow would mean a row claiming more than the pool tracks.
+		self.pool.state.total_yield_unclaimed.ensure_sub_assign(take)?;
+		Ok(take)
 	}
 
 	/// Writes both drafts. An empty row is removed rather than stored so storage only holds
@@ -425,8 +491,8 @@ impl<T: Config> Pallet<T> {
 
 		let now = T::TimeProvider::now();
 		let pool = Self::load_pool(&collateral_id, &stable_id)?;
-		let mut op = DepositOp::<T>::load_or_fresh(&collateral_id, &stable_id, &who, pool)?;
-		op.refresh(BranchSnapshot { mode: mode.into(), now })?;
+		let branch = BranchSnapshot { mode: mode.into(), now };
+		let mut op = DepositOp::<T>::load_or_fresh(&collateral_id, &stable_id, &who, pool, branch)?;
 		op.credit_recovery_collateral(collateral_out)?;
 		// The settlement can only spend value the credit carried, so the rest is still to queue.
 		let pending_amount = change.peek();
@@ -594,10 +660,9 @@ impl<T: Config> Pallet<T> {
 			},
 			UnfrozenMode::Safety => {},
 		}
-		let mut op = DepositOp::<T>::load(&collateral_id, &stable_id, &who, pool)?;
-
 		let now = T::TimeProvider::now();
-		op.refresh(BranchSnapshot { mode: mode.into(), now })?;
+		let branch = BranchSnapshot { mode: mode.into(), now };
+		let mut op = DepositOp::<T>::load(&collateral_id, &stable_id, &who, pool, branch)?;
 
 		let executable_at = now.saturating_add(op.pool.config.safety_withdrawal_delay);
 		op.deposit.withdrawal_request = Some(WithdrawalRequest { amount, executable_at });
@@ -622,23 +687,18 @@ impl<T: Config> Pallet<T> {
 		recipient: T::AccountId,
 	) -> DispatchResultWithPostInfo {
 		let pool = Self::load_pool(&collateral_id, &stable_id)?;
-		let mut op = DepositOp::<T>::load(&collateral_id, &stable_id, &who, pool)?;
 		ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
 
 		let mode = Self::ensure_not_frozen(&collateral_id, &stable_id)?;
 		let now = T::TimeProvider::now();
-		op.refresh(BranchSnapshot { mode: mode.into(), now })?;
+		let branch = BranchSnapshot { mode: mode.into(), now };
+		let mut op = DepositOp::<T>::load(&collateral_id, &stable_id, &who, pool, branch)?;
 
-		let take = Self::resolve_withdrawal(mode, now, amount, &mut op.deposit)?;
+		let take = op.take_withdrawal(mode, now, amount)?;
 		ensure!(
 			!take.is_zero(),
 			Error::<T>::NoActiveDeposit.with_weight(T::WeightInfo::withdraw_exhausted())
 		);
-
-		// `resolve_withdrawal` bounds `take` by the realized active deposit, which rounding keeps
-		// at or below the pool total.
-		op.deposit.active_deposit.ensure_sub_assign(take)?;
-		op.pool.state.total_active_deposits.ensure_sub_assign(take)?;
 
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
 		Self::pay_claim::<T::StableAssets>(stable_id.clone(), &pool_account, &recipient, take)?;
@@ -666,37 +726,22 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let mut op = Self::open_op(&who, &collateral_id, &stable_id, FrozenCheck::Reject)?;
 
+		let amount = op.take_claim(kind)?;
 		let pool_account = Self::pool_account(&collateral_id, &stable_id);
-		let amount = match kind {
-			ClaimKind::Collateral => {
-				let amount = Self::take_claim(
-					&mut op.deposit.claimable_collateral,
-					&mut op.pool.state.total_collateral_gains_unclaimed,
-					Error::<T>::NoClaimableCollateral,
-				)?;
-				Self::pay_claim::<T::CollateralAssets>(
-					collateral_id.clone(),
-					&pool_account,
-					&recipient,
-					amount,
-				)?;
-				amount
-			},
-			ClaimKind::Yield => {
-				let amount = Self::take_claim(
-					&mut op.deposit.claimable_yield,
-					&mut op.pool.state.total_yield_unclaimed,
-					Error::<T>::NoClaimableYield,
-				)?;
-				Self::pay_claim::<T::StableAssets>(
-					stable_id.clone(),
-					&pool_account,
-					&recipient,
-					amount,
-				)?;
-				amount
-			},
-		};
+		match kind {
+			ClaimKind::Collateral => Self::pay_claim::<T::CollateralAssets>(
+				collateral_id.clone(),
+				&pool_account,
+				&recipient,
+				amount,
+			)?,
+			ClaimKind::Yield => Self::pay_claim::<T::StableAssets>(
+				stable_id.clone(),
+				&pool_account,
+				&recipient,
+				amount,
+			)?,
+		}
 
 		op.commit();
 		Self::deposit_event(match kind {
@@ -799,18 +844,22 @@ impl<T: Config> Pallet<T> {
 		max_debt: BalanceOf<T>,
 		reserved: BalanceOf<T>,
 	) -> Option<BalanceOf<T>> {
-		let mut minimum = pool.config.minimum_active_pool_balance;
-		if leg.holds_cohorts() {
-			// Every nonzero cohort needs at least one unit for its rounded-up reserve.
-			let cohorts: BalanceOf<T> = pool
-				.state
-				.open_cohorts
-				.iter()
-				.filter(|cohort| !cohort.amount.is_zero())
-				.count()
-				.saturated_into();
-			minimum = minimum.max(cohorts);
-		}
+		let minimum = {
+			let base = pool.config.minimum_active_pool_balance;
+			if leg.holds_cohorts() {
+				// Every nonzero cohort needs at least one unit for its rounded-up reserve.
+				let cohorts: BalanceOf<T> = pool
+					.state
+					.open_cohorts
+					.iter()
+					.filter(|cohort| !cohort.amount.is_zero())
+					.count()
+					.saturated_into();
+				base.max(cohorts)
+			} else {
+				base
+			}
+		};
 		let accounting_cap = math::clamp_offset_debt(max_debt, pool.state.total(leg), minimum);
 		if accounting_cap.is_zero() {
 			return None;
@@ -821,20 +870,6 @@ impl<T: Config> Pallet<T> {
 			return None;
 		}
 		Some(debt)
-	}
-
-	/// Removes a claimable balance and the same amount from its pool obligation.
-	///
-	/// An underflow indicates that the user claim exceeds the recorded pool obligation.
-	fn take_claim(
-		claimable: &mut BalanceOf<T>,
-		unclaimed_total: &mut BalanceOf<T>,
-		empty_error: Error<T>,
-	) -> Result<BalanceOf<T>, DispatchError> {
-		ensure!(!claimable.is_zero(), empty_error);
-		let amount = core::mem::take(claimable);
-		unclaimed_total.ensure_sub_assign(amount)?;
-		Ok(amount)
 	}
 
 	/// Pays an exact claim from the pool account.
@@ -1150,13 +1185,8 @@ impl<T: Config> Pallet<T> {
 	) -> DispatchResult {
 		let mut op = Self::open_op(&who, &collateral_id, &stable_id, FrozenCheck::Reject)?;
 
-		let take = amount.min(op.deposit.claimable_yield);
+		let take = op.compound_yield(amount)?;
 		ensure!(!take.is_zero(), Error::<T>::NoYieldToCompound);
-		op.deposit.claimable_yield.ensure_sub_assign(take)?;
-		op.deposit.active_deposit.ensure_add_assign(take)?;
-		op.pool.state.total_active_deposits.ensure_add_assign(take)?;
-		// An underflow would mean a row claiming more than the pool tracks.
-		op.pool.state.total_yield_unclaimed.ensure_sub_assign(take)?;
 
 		op.commit();
 		Self::deposit_event(Event::YieldCompounded {
@@ -1197,10 +1227,8 @@ impl<T: Config> Pallet<T> {
 			FrozenCheck::Reject => Self::ensure_not_frozen(collateral_id, stable_id)?.into(),
 			FrozenCheck::Skip => Self::branch_mode_or_frozen(collateral_id, stable_id),
 		};
-		let mut op = DepositOp::<T>::load(collateral_id, stable_id, owner, pool)?;
-
-		op.refresh(BranchSnapshot { mode, now: T::TimeProvider::now() })?;
-		Ok(op)
+		let branch = BranchSnapshot { mode, now: T::TimeProvider::now() };
+		DepositOp::<T>::load(collateral_id, stable_id, owner, pool, branch)
 	}
 
 	/// Returns the row that [`Pallet::do_settle_deposit`] would store, without storing it.
@@ -1232,34 +1260,6 @@ impl<T: Config> Pallet<T> {
 			Self::roll_due_cohorts(&mut pool, T::TimeProvider::now())?;
 		}
 		Ok(pool.state)
-	}
-
-	/// Returns the stablecoin amount authorized by the current operating mode.
-	///
-	/// - `Normal` permits up to the active deposit and ignores a prior Safety-mode request.
-	/// - `Safety` requires a request at or after `executable_at` and reduces its authorized amount.
-	fn resolve_withdrawal(
-		mode: UnfrozenMode,
-		now: Millis,
-		amount: BalanceOf<T>,
-		deposit: &mut DepositOf<T>,
-	) -> Result<BalanceOf<T>, DispatchError> {
-		match mode {
-			UnfrozenMode::Normal => Ok(amount.min(deposit.active_deposit)),
-			UnfrozenMode::Safety => {
-				let request = deposit
-					.withdrawal_request
-					.as_mut()
-					.ok_or(Error::<T>::WithdrawalRequestMissing)?;
-				ensure!(now >= request.executable_at, Error::<T>::SafetyWithdrawalDelayActive);
-				let take = amount.min(request.amount).min(deposit.active_deposit);
-				request.amount.saturating_reduce(take);
-				if request.amount.is_zero() {
-					deposit.withdrawal_request = None;
-				}
-				Ok(take)
-			},
-		}
 	}
 
 	/// Returns the current mode, counting a branch whose mode cannot be read as frozen.
@@ -1408,7 +1408,7 @@ impl<T: Config> Pallet<T> {
 		stable_id: &StableIdOf<T>,
 		pool: &mut StabilityPoolOf<T>,
 		deposit: &mut DepositOf<T>,
-		mut pending: PendingDeposit<BalanceOf<T>>,
+		pending: PendingDeposit<BalanceOf<T>>,
 	) -> Result<Option<PendingDeposit<BalanceOf<T>>>, DispatchError> {
 		let live = pool.state.pending_coords;
 		let joined = pending.snapshot.coords;
@@ -1434,9 +1434,11 @@ impl<T: Config> Pallet<T> {
 			pool.state.drop_member(pending.cohort);
 			return Ok(None);
 		}
-		pending.amount = realized.remaining_principal;
-		pending.snapshot = snapshot;
-		Ok(Some(pending))
+		Ok(Some(PendingDeposit {
+			amount: realized.remaining_principal,
+			cohort: pending.cohort,
+			snapshot,
+		}))
 	}
 
 	/// Removes one member reference and deletes an unused checkpoint.
