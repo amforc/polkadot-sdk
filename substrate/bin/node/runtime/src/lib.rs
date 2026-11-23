@@ -3240,10 +3240,10 @@ mod runtime {
 	#[runtime::pallet_index(103)]
 	pub type LinkedList = pallet_linked_list::Pallet<Runtime>;
 
-	#[runtime::pallet_index(96)]
+	#[runtime::pallet_index(104)]
 	pub type AssetsHolder = pallet_assets_holder::Pallet<Runtime, Instance1>;
 
-	#[runtime::pallet_index(97)]
+	#[runtime::pallet_index(105)]
 	pub type Vaults = pallet_vaults::Pallet<Runtime>;
 }
 
