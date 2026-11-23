@@ -41,17 +41,54 @@ impl<T: Config> VaultOp<T> {
 			self.vault.debt.total() >= self.ctx.branch.config.minimum_debt,
 			Error::<T>::DebtBelowMinimum
 		);
-		self.activate_dormant_unchecked(hint)
+		self.join_rate_index(hint)
 	}
 
-	pub(super) fn activate_dormant_unchecked(
-		&mut self,
-		hint: ListPosition<T::AccountId>,
-	) -> DispatchResult {
-		debug_assert!(self.status.is_dormant());
+	pub(super) fn join_rate_index(&mut self, hint: ListPosition<T::AccountId>) -> DispatchResult {
+		self.leave_position()?;
 		self.index_insert(hint)?;
-		self.ctx.branch.state.release_dormant_target(&self.owner);
 		self.set_status(VaultStatus::Active)
+	}
+
+	fn go_dormant(&mut self) -> DispatchResult {
+		self.leave_position()?;
+		self.sync_dormant_target()?;
+		self.set_status(VaultStatus::Dormant)
+	}
+
+	fn join_recovery_queue(&mut self) -> DispatchResult {
+		self.leave_position()?;
+		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
+		self.set_status(VaultStatus::FinalRecovery)
+	}
+
+	fn set_status(&mut self, new_status: VaultStatus) -> DispatchResult {
+		let old_status = core::mem::replace(&mut self.status, new_status);
+		if old_status == new_status {
+			return Ok(());
+		}
+		self.sync_stake()?;
+		Pallet::<T>::deposit_event(Event::VaultStatusChanged {
+			collateral_id: self.ctx.collateral_id.clone(),
+			stable_id: self.ctx.stable_id.clone(),
+			owner: self.owner.clone(),
+			old_status,
+			new_status,
+		});
+		Ok(())
+	}
+
+	fn leave_position(&mut self) -> DispatchResult {
+		match self.status {
+			VaultStatus::Active => self.index_remove(),
+			VaultStatus::FinalRecovery => {
+				recovery::remove::<T>(self.collateral_id(), self.stable_id(), &self.owner)
+			},
+			VaultStatus::Dormant => {
+				self.ctx.branch.state.release_dormant_target(&self.owner);
+				Ok(())
+			},
+		}
 	}
 
 	/// Moves an active vault to its new rate-list position.
@@ -75,9 +112,7 @@ impl<T: Config> VaultOp<T> {
 		ensure!(self.status.is_active(), Error::<T>::InvalidVaultStatus);
 		self.ctx.ensure_below_mcr(&self.vault.position())?;
 		ensure!(self.is_only_stake_bearer(), Error::<T>::NotLastEligibleVault);
-		self.index_remove()?;
-		recovery::append::<T>(self.collateral_id(), self.stable_id(), self.owner.clone())?;
-		self.set_status(VaultStatus::FinalRecovery)
+		self.join_recovery_queue()
 	}
 
 	/// Removes a safe vault from final recovery.
@@ -87,44 +122,27 @@ impl<T: Config> VaultOp<T> {
 	) -> DispatchResult {
 		ensure!(self.status.is_final_recovery(), Error::<T>::InvalidVaultStatus);
 		self.ctx.ensure_at_or_above_mcr(&self.vault.position())?;
-		let new_status = if self.vault.debt.total() >= self.ctx.branch.config.minimum_debt {
-			VaultStatus::Active
+		if self.vault.debt.total() >= self.ctx.branch.config.minimum_debt {
+			self.join_rate_index(hint)
 		} else {
-			VaultStatus::Dormant
-		};
-		recovery::remove::<T>(self.collateral_id(), self.stable_id(), &self.owner)?;
-		if new_status.is_active() {
-			self.index_insert(hint)?;
-		} else {
-			self.sync_dormant_target()?;
+			self.go_dormant()
 		}
-		self.set_status(new_status)
 	}
 
-	/// Updates the vault status after its debt falls.
+	/// FinalRecovery debt stays available for recovery redemption, even below the debt minimum.
 	pub(crate) fn reconcile_after_debt_reduction(&mut self) -> DispatchResult {
 		let total = self.vault.debt.total();
-		let below_minimum = total < self.ctx.branch.config.minimum_debt;
-		match self.status {
-			VaultStatus::Active if below_minimum => {
-				self.index_remove()?;
-				self.sync_dormant_target()?;
-				self.set_status(VaultStatus::Dormant)?;
+		let dormant = match self.status {
+			VaultStatus::Active | VaultStatus::Dormant => {
+				total < self.ctx.branch.config.minimum_debt
 			},
-			VaultStatus::Dormant if below_minimum => {
-				self.sync_dormant_target()?;
-				if total.is_zero() {
-					self.sync_stake()?;
-				}
-			},
-			VaultStatus::FinalRecovery if total.is_zero() => {
-				recovery::remove::<T>(self.collateral_id(), self.stable_id(), &self.owner)?;
-				self.sync_dormant_target()?;
-				self.set_status(VaultStatus::Dormant)?;
-			},
-			_ => {},
+			VaultStatus::FinalRecovery => total.is_zero(),
+		};
+		if dormant {
+			self.go_dormant()
+		} else {
+			Ok(())
 		}
-		Ok(())
 	}
 
 	/// Parks a dormant vault that still owes debt as the redemption target and releases a
@@ -141,17 +159,6 @@ impl<T: Config> VaultOp<T> {
 		Ok(())
 	}
 
-	fn remove_from_lifecycle(&self) -> DispatchResult {
-		match self.status {
-			VaultStatus::Active => self.index_remove()?,
-			VaultStatus::FinalRecovery => {
-				recovery::remove::<T>(self.collateral_id(), self.stable_id(), &self.owner)?;
-			},
-			VaultStatus::Dormant => {},
-		}
-		Ok(())
-	}
-
 	fn is_only_stake_bearer(&self) -> bool {
 		self.ctx.branch.state.stakes.total == self.vault.redistribution_stake
 	}
@@ -160,9 +167,8 @@ impl<T: Config> VaultOp<T> {
 	///
 	/// `collateral_out` is the collateral that leaves the branch with the vault.
 	fn detach(&mut self, collateral_out: BalanceOf<T>) -> DispatchResult {
-		self.remove_from_lifecycle()?;
+		self.leave_position()?;
 		self.ctx.branch.state.replace_vault(Some(&self.vault), None)?;
-		self.ctx.branch.state.release_dormant_target(&self.owner);
 		self.ctx
 			.branch
 			.state
@@ -252,23 +258,6 @@ impl<T: Config> VaultOp<T> {
 			Commit::Checked | Commit::Exempt => {},
 		}
 		self.persist(true, None)
-	}
-
-	fn set_status(&mut self, new_status: VaultStatus) -> DispatchResult {
-		let old_status = self.status;
-		if old_status == new_status {
-			return Ok(());
-		}
-		self.status = new_status;
-		self.sync_stake()?;
-		Pallet::<T>::deposit_event(Event::VaultStatusChanged {
-			collateral_id: self.ctx.collateral_id.clone(),
-			stable_id: self.ctx.stable_id.clone(),
-			owner: self.owner.clone(),
-			old_status,
-			new_status,
-		});
-		Ok(())
 	}
 
 	/// Recomputes redistribution stake from the latest liquidation snapshot.

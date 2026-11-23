@@ -633,7 +633,7 @@ impl<T: Config> VaultOp<T> {
 				self.vault.debt.total() >= self.ctx.branch.config.minimum_debt,
 				"the checked principal floor implies the total-debt floor"
 			);
-			self.activate_dormant_unchecked(hint)?;
+			self.join_rate_index(hint)?;
 		} else if rate_changed {
 			self.reindex(hint)?;
 		}
