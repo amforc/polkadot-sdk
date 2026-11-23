@@ -18,23 +18,32 @@
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
-	dotusd_config::{TrustBackedAssetLocation, VaultsCollateral},
-	Vaults,
+	dotusd_config::{
+		sepolia_usdt_location, TrustBackedAssetLocation, VaultsCollateral, VaultsOracleAdapter,
+	},
+	Balances, ForeignAssets, Vaults,
 };
-use emulated_integration_tests_common::{snowbridge::SEPOLIA_ID, USDT_ID};
+use emulated_integration_tests_common::{snowbridge::SEPOLIA_ID, RESERVABLE_ASSET_ID, USDT_ID};
 use frame_support::{
 	assert_noop,
-	traits::tokens::{Fortitude, Preservation},
+	traits::{
+		fungibles::Create,
+		tokens::{Fortitude, Preservation},
+	},
 };
 use sp_runtime::{traits::MaybeEquivalence, TokenError};
+use stablecoin_primitives::ProvidePrice;
 use xcm::v5::{Junction::GlobalConsensus, Location, NetworkId};
 
-const ETH: Balance = 1_000_000_000_000_000_000;
 const USDT: Balance = 1_000_000;
 
-/// Ether bridged to live Westend Asset Hub, rounded down. Vault sizes stay inside
-/// it, so the live chain could fund the scenario.
-const ETHER_SUPPLY_LIVE: Balance = 21 * ETH;
+/// Asset Hub Westend registers this token as insufficient with a minimum balance of one.
+/// The tests mint the collateral used by each scenario.
+fn register_bridged_usdt() -> VaultsCollateralId {
+	let id = sepolia_usdt_location();
+	assert_ok!(<ForeignAssets as Create<AccountId>>::create(id.clone(), admin(), false, 1));
+	id
+}
 
 /// Sepolia ETH on Asset Hub. The emulated genesis registers it.
 fn eth_id() -> VaultsCollateralId {
@@ -45,11 +54,7 @@ fn usdt_id() -> VaultsCollateralId {
 	TrustBackedAssetLocation::convert_back(&USDT_ID).expect("trust-backed ids have a location")
 }
 
-fn eth_price(dotusd_per_eth: u128) -> FixedU128 {
-	FixedU128::from_rational(dotusd_per_eth * DOTUSD, ETH)
-}
-
-/// One stablecoin, three branches: native WND, trust-backed USDT, bridged ETH.
+/// One stablecoin, three branches: native WND, trust-backed USDT, bridged USDT.
 ///
 /// Each vault pledges 20,000 dotUSD of value against 10,000 dotUSD of debt. The
 /// three differ only in the collateral pallet and the decimals.
@@ -59,31 +64,61 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 		feed_price(dot_price(2, 1));
 		create_branch(&BranchSpec::default());
 
-		feed_price_for(usdt_id(), FixedU128::from_rational(DOTUSD, USDT)); // at par
+		feed_price_for(usdt_id(), FixedU128::from_u32(1));
 		create_market_signed(usdt_id(), &BranchSpec::default());
 
-		feed_price_for(eth_id(), eth_price(2_000));
-		create_market_signed(eth_id(), &BranchSpec::default());
+		// Both USDT assets use the same published price.
+		let bridged = register_bridged_usdt();
+		create_market_signed(bridged.clone(), &BranchSpec::default());
+
+		let unmapped = TrustBackedAssetLocation::convert_back(&RESERVABLE_ASSET_ID)
+			.expect("trust-backed ids have a location; qed");
+		assert_eq!(
+			VaultsOracleAdapter::provide_price(&unmapped),
+			Err(sp_runtime::DispatchError::Unavailable)
+		);
+		// Sepolia ETH exists in genesis. The oracle has no ETH/USD pair.
+		assert_eq!(
+			VaultsOracleAdapter::provide_price(&eth_id()),
+			Err(sp_runtime::DispatchError::Unavailable)
+		);
+		assert_noop!(
+			Vaults::create_branch(
+				RuntimeOrigin::root(),
+				eth_id(),
+				DOTUSD_ID,
+				branch_admins(),
+				branch_config(&eth_id(), &BranchSpec::default()),
+				registration_config(),
+			),
+			pallet_vaults::Error::<Runtime>::OraclePriceNotAvailable
+		);
 
 		let native_owner = acct(1);
 		open_vault(&native_owner, 10_000 * WND, 10_000 * DOTUSD, FixedU128::zero());
 		let usdt_owner = acct(2);
 		open_vault_on(usdt_id(), &usdt_owner, 20_000 * USDT, 10_000 * DOTUSD, FixedU128::zero());
-		let eth_owner = acct(3);
-		open_vault_on(eth_id(), &eth_owner, 10 * ETH, 10_000 * DOTUSD, FixedU128::zero());
+		let bridged_owner = acct(3);
+		open_vault_on(
+			bridged.clone(),
+			&bridged_owner,
+			20_000 * USDT,
+			10_000 * DOTUSD,
+			FixedU128::zero(),
+		);
 
 		assert_eq!(vault(&native_owner).collateral, 10_000 * WND);
 		assert_eq!(vault_on(&usdt_id(), &usdt_owner).collateral, 20_000 * USDT);
-		assert_eq!(vault_on(&eth_id(), &eth_owner).collateral, 10 * ETH);
+		assert_eq!(vault_on(&bridged, &bridged_owner).collateral, 20_000 * USDT);
 		// Same debt, same stablecoin, three collaterals.
 		assert_eq!(dotusd_balance(&native_owner), 10_000 * DOTUSD);
 		assert_eq!(dotusd_balance(&usdt_owner), 10_000 * DOTUSD);
-		assert_eq!(dotusd_balance(&eth_owner), 10_000 * DOTUSD);
+		assert_eq!(dotusd_balance(&bridged_owner), 10_000 * DOTUSD);
 
 		// Each asset pallet holds exactly the vault collateral. The minimum-balance float
 		// is free but not reducible while the hold keeps the account alive.
 		for (collateral_id, owner) in
-			[(get_native_id(), native_owner), (usdt_id(), usdt_owner), (eth_id(), eth_owner)]
+			[(get_native_id(), native_owner), (usdt_id(), usdt_owner), (bridged, bridged_owner)]
 		{
 			assert_eq!(
 				collateral_on_hold(&collateral_id, &owner),
@@ -106,20 +141,19 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 	});
 }
 
-/// 6 ETH against 10,000 dotUSD debt: CR 240% at 4,000, 120% at 2,000. seized =
-/// min(6, 10,000 × 1.05 / 2,000) = 5.25 ETH; half of the 20,000 dotUSD deposit burns,
-/// so P halves. Both vaults stay under the ether bridged to Westend.
+/// 15,000 bridged USDT against 10,000 dotUSD debt: CR 150% at par, 120% at 0.80.
+/// The pool receives 13,125 USDT and burns half of its 20,000 dotUSD deposit.
 #[test]
 fn foreign_collateral_liquidation_offsets_and_claims_out() {
 	AssetHubWestend::execute_with(|| {
 		liquidate_and_claim_out(LiquidationOptions {
-			collateral_id: eth_id(),
-			price_open: eth_price(4_000),
-			collateral: 6 * ETH,
-			price_crash: eth_price(2_000),
-			filler_collateral: ETHER_SUPPLY_LIVE - 6 * ETH,
+			collateral_id: register_bridged_usdt(),
+			price_open: FixedU128::from_u32(1),
+			collateral: 15_000 * USDT,
+			price_crash: FixedU128::from_rational(80, 100),
+			filler_collateral: 30_000 * USDT,
 			pool_deposit: 20_000 * DOTUSD,
-			seized: 5_250_000_000_000_000_000,
+			seized: 13_125 * USDT,
 			active_deposit_after: 10_000 * DOTUSD,
 		});
 	});
@@ -133,9 +167,9 @@ fn trust_backed_collateral_liquidation_offsets_and_claims_out() {
 	AssetHubWestend::execute_with(|| {
 		liquidate_and_claim_out(LiquidationOptions {
 			collateral_id: usdt_id(),
-			price_open: FixedU128::from_rational(DOTUSD, USDT), // at par
+			price_open: FixedU128::from_u32(1),
 			collateral: 14_000 * USDT,
-			price_crash: FixedU128::from_rational(84 * DOTUSD, 100 * USDT),
+			price_crash: FixedU128::from_rational(84, 100),
 			filler_collateral: 1_000_000 * USDT,
 			pool_deposit: 25_000 * DOTUSD,
 			seized: 12_500 * USDT,
@@ -163,7 +197,7 @@ struct LiquidationOptions {
 ///
 /// Seizure caps at debt × 1.05 in value and this spec pays the keeper nothing,
 /// so the whole seizure moves from the vault hold into the pool, the surplus and
-/// the in-asset storage deposit return to the owner, and the sole depositor
+/// the storage deposit return to the owner, and the sole depositor
 /// claims all of the pool's gain.
 fn liquidate_and_claim_out(options: LiquidationOptions) {
 	let id = options.collateral_id;
@@ -183,7 +217,6 @@ fn liquidate_and_claim_out(options: LiquidationOptions) {
 	);
 	// The deposit is priced at open; the price move below does not re-price the ticket.
 	let (deposit_asset, deposit) = expected_vault_deposit(&id, &liquidated_owner);
-	assert_eq!(deposit_asset, id);
 	let filler_owner = acct(2);
 	open_vault_on(
 		id.clone(),
@@ -193,20 +226,25 @@ fn liquidate_and_claim_out(options: LiquidationOptions) {
 		FixedU128::zero(),
 	);
 
-	// The depositor holds none of the collateral. A stablecoin deposit is enough
-	// to earn collateral gains.
+	// The depositor holds no collateral. WND provides the account reference needed to
+	// receive an insufficient foreign asset.
 	let depositor = acct(3);
+	assert_ok!(<Balances as FungibleMutate<AccountId>>::mint_into(&depositor, get_native_ed()));
 	sp_deposit_matured_on(id.clone(), &depositor, options.pool_deposit);
 	assert_eq!(collateral_free(&id, &depositor), 0);
 
 	feed_price_for(id.clone(), options.price_crash); // below MCR 125%
 	let owner_free_before = collateral_free(&id, &liquidated_owner);
+	let native_before = native_balance(&liquidated_owner);
 	liquidate_on(id.clone(), &liquidated_owner);
 
 	assert_eq!(
 		collateral_free(&id, &liquidated_owner) - owner_free_before,
-		options.collateral - options.seized + deposit,
+		options.collateral - options.seized + if deposit_asset == id { deposit } else { 0 },
 	);
+	if deposit_asset == get_native_id() {
+		assert_eq!(native_balance(&liquidated_owner) - native_before, deposit);
+	}
 	// The pool burns the full 10,000 dotUSD debt and receives the whole seizure,
 	// on top of the custody float of one minimum per asset.
 	let pool = pool_account_on(&id);
@@ -221,31 +259,19 @@ fn liquidate_and_claim_out(options: LiquidationOptions) {
 	assert_eq!(deposit_row_on(&id, &depositor).active_deposit, options.active_deposit_after);
 }
 
-/// Trust-backed asset registered without `is_sufficient`, the kind whose accounts need a
-/// native provider.
-fn reservable_id() -> VaultsCollateralId {
-	use emulated_integration_tests_common::RESERVABLE_ASSET_ID;
-	TrustBackedAssetLocation::convert_back(&RESERVABLE_ASSET_ID)
-		.expect("trust-backed ids have a location")
-}
-
 /// The runtime deposit policy over real sufficiency flags and decimals: a
 /// sufficient collateral carries its own vault deposit, priced from the oracle
-/// (WND at 2 dotUSD and USDT at par, so one WND of deposit costs two USDT). An
-/// insufficient collateral cannot carry it, so WND does. Without a WND feed and
-/// without a WND/USDT pool, a sufficient collateral's deposit cannot be priced and
-/// the open fails rather than silently charging WND.
+/// (WND at 2 dotUSD and USDT at par, so one WND of deposit costs two USDT).
+/// Opening the vault requires both prices.
 #[test]
 fn vault_deposit_asset_follows_runtime_policy() {
 	AssetHubWestend::execute_with(|| {
 		create_dotusd();
 		// No WND feed yet: branch creation needs only the collateral's own price.
-		feed_price_for(usdt_id(), FixedU128::from_rational(DOTUSD, USDT)); // at par
+		feed_price_for(usdt_id(), FixedU128::from_u32(1));
 		create_market_signed(usdt_id(), &BranchSpec::default());
-		feed_price_for(eth_id(), eth_price(2_000));
-		create_market_signed(eth_id(), &BranchSpec::default());
-		feed_price_for(reservable_id(), dot_price(2, 1));
-		create_market_signed(reservable_id(), &BranchSpec::default());
+		let bridged = register_bridged_usdt();
+		create_market_signed(bridged.clone(), &BranchSpec::default());
 
 		let usdt_owner = acct(1);
 		fund_collateral(&usdt_id(), &usdt_owner, 20_000 * USDT);
@@ -260,37 +286,35 @@ fn vault_deposit_asset_follows_runtime_policy() {
 				pallet_linked_list::Position::endpoints_only(),
 			)
 		};
-		assert_noop!(open_usdt(), sp_runtime::DispatchError::Unavailable);
+		assert_noop!(open_usdt(), sp_runtime::DispatchError::Other("oracle price unavailable"));
 
-		// A WND-settled deposit needs no WND price.
-		let reservable_owner = acct(3);
-		let (deposit_asset, deposit) = expected_vault_deposit(&reservable_id(), &reservable_owner);
+		// Insufficient collateral requires a WND deposit even without a WND price.
+		let owner = acct(3);
+		let (deposit_asset, deposit) = expected_vault_deposit(&bridged, &owner);
 		assert_eq!(deposit_asset, get_native_id());
-		// Settled in WND, but sized for the reservable asset's longer id: strictly above the
-		// deposit of a native vault.
-		let (_, native_deposit) = expected_vault_deposit(&get_native_id(), &reservable_owner);
+		// The bridged asset's longer location increases the vault footprint.
+		let (_, native_deposit) = expected_vault_deposit(&get_native_id(), &owner);
 		assert!(deposit > native_deposit);
-		// The collateral alone cannot pay a WND-settled deposit.
-		fund_collateral(&reservable_id(), &reservable_owner, 10_000 * WND);
-		let open_reservable = || {
+
+		fund_collateral(&bridged, &owner, 20_000 * USDT);
+		let open = || {
 			Vaults::open_vault(
-				RuntimeOrigin::signed(reservable_owner.clone()),
-				reservable_id(),
+				RuntimeOrigin::signed(owner.clone()),
+				bridged.clone(),
 				DOTUSD_ID,
-				10_000 * WND,
+				20_000 * USDT,
 				10_000 * DOTUSD,
 				FixedU128::zero(),
 				pallet_linked_list::Position::endpoints_only(),
 			)
 		};
-		assert_noop!(open_reservable(), TokenError::FundsUnavailable);
-		fund_vault_deposit(&reservable_id(), &reservable_owner);
-		assert_ok!(open_reservable());
-		assert_eq!(vault_deposit_on_hold(&get_native_id(), &reservable_owner), deposit);
-		assert_eq!(vault_deposit_on_hold(&reservable_id(), &reservable_owner), 0);
+		assert_noop!(open(), TokenError::FundsUnavailable);
+		fund_vault_deposit(&bridged, &owner);
+		assert_ok!(open());
+		assert_eq!(vault_deposit_on_hold(&get_native_id(), &owner), deposit);
+		assert_eq!(vault_deposit_on_hold(&bridged, &owner), 0);
 
 		feed_price(dot_price(2, 1));
-		let eth_owner = acct(2);
 		let (native_deposit_asset, native_deposit) =
 			expected_vault_deposit(&get_native_id(), &usdt_owner);
 		assert_eq!(native_deposit_asset, get_native_id());
@@ -302,20 +326,11 @@ fn vault_deposit_asset_follows_runtime_policy() {
 		let usdt_quoted = (native_deposit * 2 * USDT).div_ceil(WND);
 		assert!(usdt_deposit >= usdt_quoted.max(collateral_min_balance(&usdt_id())));
 		assert!(usdt_deposit <= (usdt_quoted * 11).div_ceil(10));
-		let (eth_deposit_asset, eth_deposit) = expected_vault_deposit(&eth_id(), &eth_owner);
-		assert_eq!(eth_deposit_asset, eth_id());
-		let eth_quoted = (native_deposit * 2 * ETH).div_ceil(2_000 * WND);
-		assert!(eth_deposit >= eth_quoted.max(collateral_min_balance(&eth_id())));
-		assert!(eth_deposit <= (eth_quoted * 11).div_ceil(10));
 
 		// The open refused above succeeds once the deposit can be priced.
 		fund_vault_deposit(&usdt_id(), &usdt_owner);
 		assert_ok!(open_usdt());
 		assert_eq!(vault_deposit_on_hold(&usdt_id(), &usdt_owner), usdt_deposit);
 		assert_eq!(vault_deposit_on_hold(&get_native_id(), &usdt_owner), 0);
-
-		open_vault_on(eth_id(), &eth_owner, 10 * ETH, 10_000 * DOTUSD, FixedU128::zero());
-		assert_eq!(vault_deposit_on_hold(&eth_id(), &eth_owner), eth_deposit);
-		assert_eq!(vault_deposit_on_hold(&get_native_id(), &eth_owner), 0);
 	});
 }

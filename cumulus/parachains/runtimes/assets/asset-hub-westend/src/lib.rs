@@ -38,7 +38,6 @@ pub mod governance;
 mod migrations;
 pub mod staking;
 
-use dotusd_config::pallet_mock_oracle;
 use governance::{pallet_custom_origins, GeneralAdmin, StakingAdmin};
 
 extern crate alloc;
@@ -1903,7 +1902,6 @@ construct_runtime!(
 		Dap: pallet_dap = 100,
 
 		// Generic Stablecoin Framework.
-		MockOracle: pallet_mock_oracle = 101,
 		LinkedList: pallet_linked_list = 102,
 		Vaults: pallet_vaults = 103,
 		Redemptions: pallet_redemptions = 104,

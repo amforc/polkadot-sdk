@@ -23,11 +23,12 @@ use frame_support::traits::{
 		HoldConsideration as FungiblesHoldConsideration, SufficientAssets,
 	},
 	tokens::imbalance::ResolveAssetTo,
-	EitherOf, LinearStoragePrice,
+	EitherOf, LinearStoragePrice, PriceProvider,
 };
 use pallet_vaults::stablecoin_primitives::OraclePriceConversion;
+use sp_price_oracle::PairId;
 use sp_runtime::{
-	traits::{AccountIdConversion, Convert, MaybeEquivalence},
+	traits::{AccountIdConversion, BlockNumberProvider, Convert, MaybeEquivalence},
 	FixedU128,
 };
 
@@ -53,58 +54,6 @@ pub type StabilityCollateral = NativeAndNonPoolAssets;
 /// names it.
 pub type TrustBackedAssetLocation =
 	AssetIdForTrustBackedAssetsConvert<TrustBackedAssetsPalletLocation, xcm::v5::Location>;
-
-/// Root-settable price feed standing in for a real oracle integration.
-///
-/// Deliberately minimal: no operator set, no aggregation, no staleness window.
-/// Swap for a production oracle before any mainnet deployment.
-#[frame_support::pallet]
-pub mod pallet_mock_oracle {
-	use frame_support::pallet_prelude::*;
-	use frame_system::pallet_prelude::*;
-	use sp_runtime::FixedU128;
-
-	#[pallet::pallet]
-	pub struct Pallet<T>(_);
-
-	#[pallet::config]
-	pub trait Config: frame_system::Config {
-		/// Collateral identifier the feeds are keyed by.
-		type AssetId: Parameter + Member + MaxEncodedLen;
-	}
-
-	/// Price of one collateral unit in stablecoin units, keyed by collateral.
-	#[pallet::storage]
-	pub type Prices<T: Config> =
-		StorageMap<_, Blake2_128Concat, <T as Config>::AssetId, FixedU128, OptionQuery>;
-
-	#[pallet::call]
-	impl<T: Config> Pallet<T> {
-		#[pallet::call_index(0)]
-		#[pallet::weight(T::DbWeight::get().writes(1))]
-		pub fn set_price(
-			origin: OriginFor<T>,
-			key: <T as Config>::AssetId,
-			price: FixedU128,
-		) -> DispatchResult {
-			ensure_root(origin)?;
-			Prices::<T>::insert(key, price);
-			Ok(())
-		}
-
-		#[pallet::call_index(1)]
-		#[pallet::weight(T::DbWeight::get().writes(1))]
-		pub fn clear_price(origin: OriginFor<T>, key: <T as Config>::AssetId) -> DispatchResult {
-			ensure_root(origin)?;
-			Prices::<T>::remove(key);
-			Ok(())
-		}
-	}
-}
-
-impl pallet_mock_oracle::Config for Runtime {
-	type AssetId = VaultsCollateralId;
-}
 
 parameter_types! {
 	pub const LinkedListMaxHintRepairSteps: u32 = 16;
@@ -149,16 +98,65 @@ parameter_types! {
 		};
 }
 
-/// Bridges the mock oracle to the vault pallet's `ProvidePrice` surface.
+/// Test Tether USD registered as a foreign asset on Westend.
+pub fn sepolia_usdt_location() -> VaultsCollateralId {
+	xcm::v5::Location::new(
+		2,
+		[
+			xcm::v5::Junction::GlobalConsensus(EthereumNetwork::get()),
+			xcm::v5::Junction::AccountKey20 {
+				network: None,
+				key: hex_literal::hex!("7169d38820dfd117c3fa1f22a697dba58d90ba06"),
+			},
+		],
+	)
+}
+
+/// Maximum age of a published dotUSD collateral price in relay-chain blocks (about 54 seconds).
+const MAX_ORACLE_PRICE_AGE: BlockNumber = 9;
+
+/// Converts whole-token USD quotes to six-decimal dotUSD base units per collateral base unit.
 pub struct VaultsOracleAdapter;
+
+impl VaultsOracleAdapter {
+	/// The USD pair to configure on the oracle and the divisor for its whole-token price.
+	pub fn collateral_feed(collateral: &VaultsCollateralId) -> Option<(PairId, u128)> {
+		// WND uses DOT/USD on Westend. WND has 12 decimals.
+		if collateral == &VaultsNativeCollateralId::get() {
+			return Some((PairId(2), 1_000_000));
+		}
+		// Both Westend test USDT assets use USDT/USD and have the same decimals as dotUSD.
+		if TrustBackedAssetLocation::convert_back(&1984).as_ref() == Some(collateral) ||
+			collateral == &sepolia_usdt_location()
+		{
+			return Some((PairId(3), 1));
+		}
+		None
+	}
+}
+
 impl stablecoin_primitives::ProvidePrice for VaultsOracleAdapter {
 	type AssetId = VaultsCollateralId;
 
 	fn provide_price(
 		collateral_id: &VaultsCollateralId,
 	) -> Result<FixedU128, sp_runtime::DispatchError> {
-		pallet_mock_oracle::Prices::<Runtime>::get(collateral_id)
-			.ok_or(sp_runtime::DispatchError::Unavailable)
+		use sp_runtime::DispatchError;
+
+		let (pair, divisor) =
+			Self::collateral_feed(collateral_id).ok_or(DispatchError::Unavailable)?;
+		let point =
+			PriceOracle::price(pair).ok_or(DispatchError::Other("oracle price unavailable"))?;
+		let now =
+			<Runtime as pallet_price_oracle::Config>::BlockNumberProvider::current_block_number();
+		if now.checked_sub(point.updated_at).is_none_or(|age| age > MAX_ORACLE_PRICE_AGE) {
+			return Err(DispatchError::Other("stale oracle price"));
+		}
+		let price = point.price.into_inner() / divisor;
+		if price == 0 {
+			return Err(DispatchError::Other("zero oracle price"));
+		}
+		Ok(FixedU128::from_inner(price))
 	}
 }
 
@@ -341,20 +339,6 @@ use frame_support::traits::Get as _;
 #[cfg(feature = "runtime-benchmarks")]
 const BENCHMARK_COLLATERAL_MIN_BALANCE: Balance = 10_000_000;
 
-/// Sufficient foreign collateral exercises Location keys, holder custody and oracle repricing.
-/// Sufficiency allows payouts to fresh accounts; non-sufficient collateral uses a cheaper
-/// native deposit hold.
-#[cfg(feature = "runtime-benchmarks")]
-fn benchmark_collateral_id() -> VaultsCollateralId {
-	xcm::v5::Location::new(
-		2,
-		[
-			xcm::v5::Junction::GlobalConsensus(EthereumNetwork::get()),
-			xcm::v5::Junction::AccountKey20 { network: None, key: [0xee; 20] },
-		],
-	)
-}
-
 #[cfg(feature = "runtime-benchmarks")]
 pub struct VaultsBenchmarkHelper;
 
@@ -363,11 +347,26 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountI
 	for VaultsBenchmarkHelper
 {
 	fn collateral_asset_id() -> VaultsCollateralId {
-		benchmark_collateral_id()
+		sepolia_usdt_location()
 	}
 
 	fn set_oracle_price(asset_id: VaultsCollateralId, price: FixedU128) {
-		pallet_mock_oracle::Prices::<Runtime>::insert(asset_id, price);
+		let (pair, scale) = VaultsOracleAdapter::collateral_feed(&asset_id)
+			.expect("both benchmark assets have a feed; qed");
+		let whole_unit_price = price
+			.into_inner()
+			.checked_mul(scale)
+			.expect("benchmark prices fit after conversion to whole asset units; qed");
+		let updated_at =
+			<Runtime as pallet_price_oracle::Config>::BlockNumberProvider::current_block_number();
+		pallet_price_oracle::Prices::<Runtime>::insert(
+			pair,
+			frame_support::traits::PricePoint {
+				price: FixedU128::from_inner(whole_unit_price),
+				updated_at,
+				signers: 1,
+			},
+		);
 	}
 
 	// Writes the moment directly: `set_timestamp` runs Aura's `on_timestamp_set`, which rejects a
@@ -417,10 +416,7 @@ impl pallet_vaults::BenchmarkHelper<VaultsCollateralId, VaultsStableId, AccountI
 			collateral_id.clone()
 		));
 		assert!(<VaultsCollateral as FungiblesInspect<AccountId>>::is_sufficient(collateral_id));
-		pallet_mock_oracle::Prices::<Runtime>::insert(
-			native,
-			FixedU128::from_rational(10, ExistentialDeposit::get()),
-		);
+		Self::set_oracle_price(native, FixedU128::from_rational(10, ExistentialDeposit::get()));
 	}
 
 	fn fund_native(who: &AccountId) {

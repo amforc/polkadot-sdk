@@ -13,20 +13,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared setup for a six-decimal stablecoin, runtime asset branches, and a Root-fed oracle.
+//! Shared setup for a six-decimal stablecoin and its collateral branches on Asset Hub Westend.
 
 use crate::imports::*;
 use asset_hub_westend_runtime::{
 	dotusd_config::{
 		StabilityCollateral, StableInsuranceAccount, VaultsCollateral, VaultsDepositPolicy,
-		VaultsNativeCollateralId,
+		VaultsNativeCollateralId, VaultsOracleAdapter,
 	},
-	governance, Assets, AuraExt, Balances, MockOracle, Redemptions, Runtime, RuntimeHoldReason,
-	Stability, Timestamp, Vaults,
+	governance, Assets, AuraExt, Balances, Redemptions, Runtime, RuntimeHoldReason, Stability,
+	Timestamp, Vaults,
 };
-use frame_support::{assert_noop, assert_storage_noop};
+use frame_support::{assert_noop, assert_storage_noop, traits::PricePoint};
 use pallet_redemptions::RedemptionTerms;
 use pallet_vaults::JitTerms;
+use sp_runtime::traits::BlockNumberProvider;
 use stablecoin_primitives::VaultStatus;
 
 pub(crate) const WND: Balance = 1_000_000_000_000;
@@ -66,9 +67,9 @@ pub(crate) fn admin() -> AccountId {
 	acct(0xAD)
 }
 
-/// Returns a dotUSD/WND price as dotUSD base units per WND planck.
+/// USD per whole WND, as quoted by the price oracle.
 pub(crate) fn dot_price(dotusd_num: u128, dotusd_den: u128) -> FixedU128 {
-	FixedU128::from_rational(dotusd_num * DOTUSD, dotusd_den * WND)
+	FixedU128::from_rational(dotusd_num, dotusd_den)
 }
 
 pub(crate) fn feed_price(price: FixedU128) {
@@ -77,7 +78,14 @@ pub(crate) fn feed_price(price: FixedU128) {
 
 pub(crate) fn feed_price_for(collateral_id: VaultsCollateralId, price: FixedU128) {
 	advance_time(0);
-	assert_ok!(MockOracle::set_price(RuntimeOrigin::root(), collateral_id, price));
+	let (pair, _) = VaultsOracleAdapter::collateral_feed(&collateral_id)
+		.expect("the scenario collateral has a configured USD pair; qed");
+	let updated_at =
+		<Runtime as pallet_price_oracle::Config>::BlockNumberProvider::current_block_number();
+	pallet_price_oracle::Prices::<Runtime>::insert(
+		pair,
+		PricePoint { price, updated_at, signers: 1 },
+	);
 }
 
 /// Settings that vary between scenarios. [`branch_config`] supplies the other settings.

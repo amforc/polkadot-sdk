@@ -55,7 +55,7 @@ decl_test_parachains! {
 			AssetConversion: asset_hub_westend_runtime::AssetConversion,
 			SnowbridgeSystemFrontend: asset_hub_westend_runtime::SnowbridgeSystemFrontend,
 			Revive: asset_hub_westend_runtime::Revive,
-			MockOracle: asset_hub_westend_runtime::MockOracle,
+			PriceOracle: asset_hub_westend_runtime::PriceOracle,
 			Vaults: asset_hub_westend_runtime::Vaults,
 			Redemptions: asset_hub_westend_runtime::Redemptions,
 			Stability: asset_hub_westend_runtime::Stability,
