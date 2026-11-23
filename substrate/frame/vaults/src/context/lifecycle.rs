@@ -6,7 +6,7 @@ use crate::{
 	recovery,
 	types::{DebtCollateral, LiquidationSnapshot, Vault, VaultStatus},
 };
-use frame::{prelude::*, traits::DefensiveOption};
+use frame::prelude::*;
 use linked_list_interface::{Outcome, Position as ListPosition, SortedListInterface};
 use stablecoin_primitives::RedemptionStepSnapshot;
 
@@ -162,13 +162,6 @@ impl<T: Config> VaultOp<T> {
 	fn detach(&mut self, collateral_out: BalanceOf<T>) -> DispatchResult {
 		self.remove_from_lifecycle()?;
 		self.ctx.branch.state.replace_vault(Some(&self.vault), None)?;
-		self.ctx.branch.state.vault_count = self
-			.ctx
-			.branch
-			.state
-			.vault_count
-			.checked_sub(1)
-			.defensive_ok_or(DispatchError::Corruption)?;
 		self.ctx.branch.state.release_dormant_target(&self.owner);
 		self.ctx
 			.branch

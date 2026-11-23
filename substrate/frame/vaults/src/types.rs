@@ -510,8 +510,6 @@ pub struct BranchState<AccountId, Balance> {
 	pub redistribution: RedistributionAccumulators,
 	/// Redistributed collateral held by the branch account until vaults materialize it.
 	pub pending_redistribution_collateral: Balance,
-	/// Number of vault rows in this branch.
-	pub vault_count: u32,
 	/// Wall-clock origin used to calculate branch interest time.
 	///
 	/// Frozen periods move this value forward so interest does not accrue while frozen.
@@ -531,7 +529,6 @@ impl<AccountId, Balance: Default + Zero> BranchState<AccountId, Balance> {
 			stakes: RedistributionStakeTotals::default(),
 			redistribution: RedistributionAccumulators::default(),
 			pending_redistribution_collateral: Balance::zero(),
-			vault_count: 0,
 			interest_epoch: now,
 			dormant_redemption_target: None,
 			frozen: None,

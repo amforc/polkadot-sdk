@@ -241,13 +241,11 @@ fn check_branch_identities<T: Config>(
 	let mut sum_stake_accrual_rate = U256::zero();
 	let mut sum_claimable_accrual_rate = U256::zero();
 	let mut sum_eligible_collateral = BalanceOf::<T>::zero();
-	let mut vault_count: u32 = 0;
 	let mut rate_members: u32 = 0;
 	let mut recovery_members: u32 = 0;
 
 	for (owner, record) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
 		let vault = record.vault;
-		vault_count = vault_count.checked_add(1).ok_or("branch vault count overflow")?;
 		ensure!(
 			vault.last_interest_time <= tau,
 			"vault last_interest_time ahead of interest_time(now)"
@@ -351,7 +349,6 @@ fn check_branch_identities<T: Config>(
 				.ok_or("claimable redistribution accrual rate sum overflow")?;
 		}
 	}
-	ensure!(state.vault_count == vault_count, "branch vault_count != number of vault rows");
 	// Each member counted above is a distinct vault row, so equal counts leave no list node
 	// without a row: an orphan would be redeemed against, or recovered, with nothing behind it.
 	ensure!(

@@ -400,16 +400,11 @@ impl<T: Config> Context<T> {
 	///
 	/// Its upfront fee may already be recorded.
 	fn attach_new(
-		mut self,
+		self,
 		owner: &T::AccountId,
 		vault: Vault<BalanceOf<T>>,
 		deposit: T::VaultConsideration,
 	) -> Result<VaultOp<T>, DispatchError> {
-		self.branch
-			.state
-			.vault_count
-			.ensure_add_assign(1)
-			.map_err(|_| Error::<T>::ArithmeticOverflow)?;
 		let mut op = VaultOp {
 			ctx: self,
 			owner: owner.clone(),

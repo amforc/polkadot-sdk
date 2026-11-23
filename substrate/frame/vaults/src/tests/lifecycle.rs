@@ -258,7 +258,6 @@ fn assert_repayment_closes_empty_vault_one() {
 		&1
 	));
 	let after = market_state(DOT, STABLE);
-	assert_eq!(after.vault_count, before.vault_count - 1);
 	assert_eq!(after.total_collateral, before.total_collateral);
 	assert_eq!(after.frozen, before.frozen);
 	assert_eq!(after.dormant_redemption_target, None);
