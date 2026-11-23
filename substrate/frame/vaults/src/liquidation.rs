@@ -17,7 +17,7 @@ use crate::{
 		BalanceOf, CollateralCreditOf, CollateralIdOf, Config, Error, Event, HoldReason, Pallet,
 		StableIdOf,
 	},
-	types::{DebtCollateral, JitTerms, LiquidationConfig, LiquidationOutcome},
+	types::{DebtCollateral, JitTerms, LiquidationConfig, LiquidationOutcome, LiquidationTouch},
 };
 use core::cmp::Ordering;
 use frame::{
@@ -125,17 +125,16 @@ impl<T: Config> Pallet<T> {
 		owner: T::AccountId,
 		jit: JitTerms<BalanceOf<T>>,
 	) -> DispatchResult {
-		let op =
+		let (op, touch) =
 			VaultOp::<T>::load_for_liquidation(collateral_id.clone(), stable_id.clone(), &owner)?;
 		let snapshot = op.prepare_liquidation()?;
 		let branch = op.branch_snapshot();
 		// The touch left the vault's redistribution share in custody, so the owner holds that much
 		// less than the vault records.
-		let retained = op.retained_redistribution();
 		let held = op
 			.vault()
 			.collateral
-			.checked_sub(&retained)
+			.checked_sub(&touch.redistribution.collateral)
 			.defensive_ok_or(DispatchError::Corruption)?;
 
 		let (collateral, shortfall) = T::CollateralAssets::slash(
@@ -158,7 +157,7 @@ impl<T: Config> Pallet<T> {
 			jit,
 			snapshot,
 			collateral,
-			retained,
+			touch,
 		)?;
 
 		Self::deposit_event(Event::VaultLiquidated {
@@ -218,9 +217,10 @@ impl<T: Config> Pallet<T> {
 		jit: JitTerms<BalanceOf<T>>,
 		snapshot: LiquidationSnapshot<BalanceOf<T>>,
 		collateral: CollateralCreditOf<T>,
-		retained: BalanceOf<T>,
+		touch: LiquidationTouch<BalanceOf<T>>,
 	) -> Result<LiquidationOutcome<BalanceOf<T>>, DispatchError> {
 		debug_assert!(snapshot.config.offset_penalty <= snapshot.config.redistribution_penalty);
+		let retained = touch.redistribution.collateral;
 		let collateral_total =
 			collateral.peek().checked_add(&retained).ok_or(Error::<T>::ArithmeticOverflow)?;
 		debug_assert_eq!(collateral_total, op.vault().collateral);
@@ -264,7 +264,6 @@ impl<T: Config> Pallet<T> {
 		// Every leg but the owner's surplus has left the seized credit.
 		resolution.drop_zero().map_err(|_| DispatchError::Corruption)?;
 		let leg = |debt, collateral| DebtCollateral { debt, collateral };
-		let touch = op.liquidation_touch()?;
 		let outcome = LiquidationOutcome {
 			active_pool: leg(plan.debt.active_pool, plan.collateral.active_pool),
 			keeper_jit: leg(plan.debt.keeper_jit, plan.collateral.keeper_jit),
