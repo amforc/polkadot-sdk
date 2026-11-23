@@ -151,6 +151,10 @@ pub struct NodeExtraArgs {
 
 	/// Whether to run the price oracle service.
 	pub price_oracle: bool,
+
+	/// Chain time each dev block advances, in milliseconds.
+	/// `None` derives dev timestamps from the block number.
+	pub dev_timestamp_step_ms: Option<u64>,
 }
 
 /// Maximum safety margin, in blocks, subtracted from the runtime's transaction-storage
