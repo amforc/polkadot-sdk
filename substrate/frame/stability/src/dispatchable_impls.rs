@@ -226,6 +226,10 @@ impl<'a, T: Config> DepositOp<'a, T> {
 					.as_mut()
 					.ok_or(Error::<T>::WithdrawalRequestMissing)?;
 				ensure!(now >= request.executable_at, Error::<T>::SafetyWithdrawalDelayActive);
+				ensure!(
+					!request.lapsed(now, self.pool.config.safety_withdrawal_delay),
+					Error::<T>::WithdrawalRequestExpired
+				);
 				let take = amount.min(request.amount).min(self.deposit.active_deposit);
 				request.amount.saturating_reduce(take);
 				if request.amount.is_zero() {

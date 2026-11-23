@@ -49,7 +49,8 @@
 //!
 //! - `Normal` permits immediate withdrawals.
 //! - `Safety` requires [`Pallet::request_withdraw`] and a `safety_withdrawal_delay`. The delay
-//!   keeps capital available while the branch is under stress.
+//!   keeps capital available while the branch is under stress. Requests expire to prevent
+//!   indefinite reuse across Safety periods.
 //! - `Frozen` blocks value movement and cohort activation. Local settlement remains available so
 //!   committed losses and gains do not depend on branch recovery.
 //!
@@ -497,6 +498,8 @@ pub mod pallet {
 		PoolNotEmpty,
 		/// A sums row required by the pool's accumulator coordinates is absent.
 		AccumulatorRowMissing,
+		/// The withdrawal request expired. A new [`Pallet::request_withdraw`] is required.
+		WithdrawalRequestExpired,
 	}
 
 	#[pallet::hooks]
@@ -575,8 +578,9 @@ pub mod pallet {
 		///
 		/// ## Details
 		///
-		/// Safety mode records a request that becomes valid after `safety_withdrawal_delay`. A new
-		/// request replaces the current request.
+		/// In Safety mode, a request becomes executable after `safety_withdrawal_delay`. It expires
+		/// after another delay of the same length. A zero delay disables expiry.
+		/// A new request replaces the current request.
 		///
 		/// Normal mode does not need a request, so this call immediately pays the caller.
 		#[pallet::call_index(1)]
@@ -605,7 +609,7 @@ pub mod pallet {
 		/// ## Details
 		///
 		/// Normal mode pays immediately. Safety mode requires a [`Pallet::request_withdraw`] that
-		/// has completed its delay.
+		/// has completed its delay and has not expired.
 		///
 		/// The call pays the smaller of `amount` and the current active deposit. This limit permits
 		/// a successful withdrawal after a liquidation reduces the deposit.

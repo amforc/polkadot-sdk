@@ -353,7 +353,8 @@ pub struct PendingDeposit<Balance> {
 
 /// Withdrawal request subject to the Safety-mode delay.
 ///
-/// Only Safety mode stores this request. Normal mode permits a withdrawal without one.
+/// Normal mode leaves stored requests unchanged. Expiry prevents indefinite reuse across Safety
+/// periods.
 #[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
 #[cfg_attr(any(test, feature = "test-utils"), derive(Clone, PartialEq, Debug))]
 pub struct WithdrawalRequest<Balance> {
@@ -361,6 +362,16 @@ pub struct WithdrawalRequest<Balance> {
 	pub amount: Balance,
 	/// Earliest time of the withdrawal.
 	pub executable_at: Millis,
+}
+
+impl<Balance> WithdrawalRequest<Balance> {
+	pub(crate) const fn lapsed(&self, now: Millis, delay: Millis) -> bool {
+		// With a zero delay, expiry would permit execution only at the request time.
+		if delay == 0 {
+			return false;
+		}
+		now > self.executable_at.saturating_add(delay)
+	}
 }
 
 /// Aggregate balances and accumulator positions of one pool.
@@ -538,6 +549,9 @@ pub struct StabilityPoolConfig<Balance> {
 	/// Minimum time before new capital can join the active pool.
 	pub entry_delay: Millis,
 	/// Delay between a Safety-mode withdrawal request and its execution.
+	///
+	/// The request remains executable for the same duration after this delay. Zero disables
+	/// both the delay and expiry.
 	pub safety_withdrawal_delay: Millis,
 	/// Precision policy for `P`. It cannot change after registration.
 	pub precision: PoolPrecision,
