@@ -146,7 +146,7 @@ pub(crate) fn corrupt_node(
 /// Items in `list_id` head-to-tail.
 pub(crate) fn dump(list_id: ListId) -> alloc::vec::Vec<(ItemId, Priority)> {
 	use pallet_linked_list::SortedListInterface;
-	let total = pallet_linked_list::ListNodes::<Test>::iter_key_prefix(list_id).count();
+	let total = pallet_linked_list::ListNodes::<Test>::iter_prefix_values(list_id).count();
 	let mut out = alloc::vec::Vec::with_capacity(total);
 	let mut cursor = LinkedList::head(&list_id);
 	while let Some(item) = cursor {

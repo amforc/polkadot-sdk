@@ -131,12 +131,16 @@ pub mod pallet {
 	}
 
 	/// Nodes of the per-list sorted list.
+	///
+	/// Both keys use non-concat `Blake2_128`: `ListNodes` is never iterated by key in production,
+	/// and hashing without concatenation avoids repeating large `ListId` keys (e.g. XCM locations)
+	/// in every node's key, and so in its PoV size bound.
 	#[pallet::storage]
 	pub type ListNodes<T: Config> = StorageDoubleMap<
 		_,
-		Blake2_128Concat,
+		Blake2_128,
 		T::ListId,
-		Blake2_128Concat,
+		Blake2_128,
 		T::ItemId,
 		Node<T::ItemId, T::Priority>,
 		OptionQuery,
@@ -156,9 +160,9 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type BenchAuthoritativePriority<T: Config> = StorageDoubleMap<
 		_,
-		Blake2_128Concat,
+		Blake2_128,
 		T::ListId,
-		Blake2_128Concat,
+		Blake2_128,
 		T::ItemId,
 		T::Priority,
 		OptionQuery,

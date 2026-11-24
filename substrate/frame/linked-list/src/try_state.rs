@@ -33,36 +33,59 @@
 
 use crate::{pallet::*, ListMeta};
 use alloc::vec::Vec;
-use frame::{deps::sp_runtime::TryRuntimeError, prelude::*};
+use frame::{
+	deps::{
+		frame_support::storage::{generator::StorageDoubleMap as _, StoragePrefixedMap as _},
+		sp_io, sp_runtime::TryRuntimeError,
+	},
+	prelude::*,
+};
 
 /// Cap on the walk vector's initial capacity so a huge list grows incrementally
 /// rather than over-allocating up front.
 const MAX_WALK_PREALLOC: usize = 1 << 12;
 
+/// Count raw storage keys under `prefix` without decoding keys or values, so
+/// non-concat (`Blake2_128`) maps and even undecodable rows are counted faithfully.
+fn count_raw_keys(prefix: &[u8]) -> usize {
+	let mut count = 0usize;
+	let mut key = prefix.to_vec();
+	while let Some(next) = sp_io::storage::next_key(&key) {
+		if !next.starts_with(prefix) {
+			break;
+		}
+		count = count.saturating_add(1);
+		key = next;
+	}
+	count
+}
+
 impl<T: Config> Pallet<T> {
 	/// Run the per-list invariant checks across every list with stored state.
 	/// Returns the first violation found.
 	pub fn do_try_state() -> Result<(), TryRuntimeError> {
+		let mut reachable_nodes = 0usize;
 		// `try_state_list` only reads storage, so running it mid-iteration is
 		// safe. Keys rather than `iter()`, which would silently skip a row that
 		// fails to decode.
 		for list_id in ListMetas::<T>::iter_keys() {
 			let meta = ListMetas::<T>::get(&list_id).ok_or("ListMetas row fails to decode")?;
-			Self::try_state_list(&list_id, meta)?;
+			let list_len = Self::try_state_list(&list_id, meta)?;
+			reachable_nodes = reachable_nodes.saturating_add(list_len);
 		}
-		// The other half of the all-or-nothing invariant: no node rows without
-		// their list's meta row.
-		for (list_id, _) in ListNodes::<T>::iter_keys() {
-			ensure!(ListMetas::<T>::contains_key(&list_id), "ListNodes present without ListMetas");
-		}
+		// The other half of the all-or-nothing invariant: every `ListNodes` row
+		// across all lists must have been visited through a live `ListMetas` row.
+		let total_rows = count_raw_keys(&ListNodes::<T>::final_prefix());
+		ensure!(total_rows == reachable_nodes, "ListNodes present without ListMetas");
 		Ok(())
 	}
 
 	fn try_state_list(
 		list_id: &T::ListId,
 		meta: ListMeta<T::ItemId>,
-	) -> Result<(), TryRuntimeError> {
-		let total_nodes = ListNodes::<T>::iter_key_prefix(list_id).count();
+	) -> Result<usize, TryRuntimeError> {
+		let prefix = ListNodes::<T>::storage_double_map_final_key1(list_id);
+		let total_nodes = count_raw_keys(&prefix);
 		ensure!(total_nodes > 0, "ListMetas present without ListNodes");
 
 		let ListMeta { head: head_id, tail: tail_id } = meta;
@@ -118,6 +141,6 @@ impl<T: Config> Pallet<T> {
 			"orphan ListNodes rows: total count differs from chain length"
 		);
 
-		Ok(())
+		Ok(forward.len())
 	}
 }

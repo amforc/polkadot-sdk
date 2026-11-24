@@ -72,3 +72,11 @@ fn orphan_unreachable_node_detected() {
 		);
 	});
 }
+
+#[test]
+fn list_nodes_without_meta_detected() {
+	build_and_execute_no_post_check(|| {
+		ListNodes::<Test>::insert(1, 1u64, Node { prev: None, next: None, priority: 50u32 });
+		assert_err!(<LinkedList>::do_try_state(), "ListNodes present without ListMetas");
+	});
+}
