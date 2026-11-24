@@ -483,9 +483,7 @@ impl ExtBuilder {
 		let mut ext = genesis_ext(&self.stable_balances);
 		ext.execute_with(|| {
 			if let Some((collateral, stable)) = self.branch {
-				let config = self
-					.branch_config
-					.unwrap_or_else(|| branch_config_for(collateral.clone(), stable));
+				let config = self.branch_config.unwrap_or_else(|| branch_config_for(stable));
 				let pool_config = self.pool_config.unwrap_or_else(default_pool_config);
 				register_branch_with_pool(collateral, stable, config, pool_config);
 			}
@@ -606,7 +604,6 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 		// fixtures use. A test about the ceiling sets its own.
 		debt_ceiling: 1_000_000_000_000,
 		minimum_debt: 200,
-		minimum_collateral: 1,
 		minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
 		maximum_borrow_rate: FixedU128::from_rational(400u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,
@@ -615,31 +612,21 @@ pub fn default_branch_config() -> pallet_vaults::BranchConfig<Balance> {
 	}
 }
 
-/// [`default_branch_config`], with the floors raised to clear the minimum balances of a given
-/// pair.
+/// [`default_branch_config`], with the debt floor raised to clear the stablecoin's minimum balance.
 ///
-/// The 1-unit defaults only clear them for the 1-unit assets. Everything else is left alone, so a
+/// The default floor only clears it for a 1-unit stablecoin. Everything else is left alone, so a
 /// test still reads as the default.
-pub fn branch_config_for(
-	collateral: AssetId,
-	stable: StableId,
-) -> pallet_vaults::BranchConfig<Balance> {
+pub fn branch_config_for(stable: StableId) -> pallet_vaults::BranchConfig<Balance> {
 	use frame::traits::fungibles::Inspect as FungiblesInspect;
 	let stable_minimum = <Assets as FungiblesInspect<AccountId>>::minimum_balance(stable);
-	let collateral_minimum =
-		<PoolCollateralAssets as FungiblesInspect<AccountId>>::minimum_balance(collateral);
 	let config = default_branch_config();
-	pallet_vaults::BranchConfig {
-		minimum_debt: config.minimum_debt.max(stable_minimum),
-		minimum_collateral: config.minimum_collateral.max(collateral_minimum),
-		..config
-	}
+	pallet_vaults::BranchConfig { minimum_debt: config.minimum_debt.max(stable_minimum), ..config }
 }
 
 /// Creates the `collateral`/[`STABLE`] branch as `origin`, with the default admins, branch
 /// parameters and registration.
 pub fn create_branch_as(origin: RuntimeOrigin, collateral: AssetId) -> DispatchResult {
-	let config = branch_config_for(collateral.clone(), STABLE);
+	let config = branch_config_for(STABLE);
 	create_branch_with(origin, collateral, STABLE, config, default_pool_config())
 }
 

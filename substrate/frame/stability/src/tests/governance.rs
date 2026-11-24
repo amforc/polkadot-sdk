@@ -223,7 +223,7 @@ fn assert_donations_remain_unowned_surplus(collateral: AssetId) {
 		};
 
 		donate();
-		register_branch(collateral.clone(), STABLE, branch_config_for(collateral.clone(), STABLE));
+		register_branch(collateral.clone(), STABLE, branch_config_for(STABLE));
 		donate();
 
 		assert_ok!(crate::try_state::do_try_state::<Test>());
@@ -255,7 +255,7 @@ fn assert_donations_remain_unowned_surplus(collateral: AssetId) {
 		assert_eq!(stable_balance(STABLE, pool), 0);
 		assert_eq!(collateral_balance(collateral.clone(), pool), 0);
 
-		register_branch(collateral.clone(), STABLE, branch_config_for(collateral.clone(), STABLE));
+		register_branch(collateral.clone(), STABLE, branch_config_for(STABLE));
 
 		assert_eq!(pool_stable_held(collateral.clone(), STABLE), 0);
 		assert_eq!(pool_collateral_held(collateral.clone(), STABLE), 0);
