@@ -24,9 +24,9 @@ use crate::{
 	math,
 	pallet::{
 		BalanceOf, Call, CohortCheckpoints, CollateralIdOf, Config, DepositOf, Deposits, Error,
-		Event, Pallet, PoolSumsStore, Pools, StabilityPoolOf, StableIdOf,
+		Pallet, PoolSumsStore, Pools, StabilityPoolOf, StableIdOf, MAX_PRUNE_SUMS,
 	},
-	types::{Accumulators, CohortId, DepositSnapshot, Leg, WithdrawalRequest},
+	types::{Accumulators, CohortId, DepositSnapshot, Leg, PoolSums, WithdrawalRequest},
 	weights::WeightInfo,
 };
 use frame::{
@@ -369,12 +369,13 @@ fn advance_to<T: BenchmarkConfig>(deadline: Millis) {
 	assert!(T::TimeProvider::now() >= deadline);
 }
 
-/// [`stage_refresh`] with a vault whose interest feeds the yield route, then moves the clock to
-/// [`RefreshSeed::due`] as the last setup step and checks the mode the call runs in.
+/// Stages the costliest settlement of a depositor row, opens a vault whose interest feeds the
+/// yield route, moves the clock to [`RefreshSeed::due`] as the last setup step, and checks the
+/// mode the call runs in.
 fn seed_refresh<T: BenchmarkConfig>(
 	principal: Principal,
 ) -> Result<RefreshSeed<T>, BenchmarkError> {
-	let seed = stage_refresh::<T>(true, principal)?;
+	let seed = stage_refresh::<T>(principal)?;
 	advance_to::<T>(seed.due);
 	assert_refresh_staged::<T>(&seed)?;
 	let market = &seed.market;
@@ -385,22 +386,16 @@ fn seed_refresh<T: BenchmarkConfig>(
 
 /// Stages the costliest settlement of a depositor row, see the module docs. The clock is left
 /// before [`RefreshSeed::due`].
-///
-/// `accrual_vault` opens a vault whose interest feeds the yield route at every later operation.
-/// Leave it out to stage a recovery head afterwards, which must be the only vault.
 fn stage_refresh<T: BenchmarkConfig>(
-	accrual_vault: bool,
 	principal: Principal,
 ) -> Result<RefreshSeed<T>, BenchmarkError> {
 	let market = Market::<T>::register()?;
-	if accrual_vault {
-		let vault = BenchmarkVault {
-			collateral_units: ACCRUAL_VAULT_COLLATERAL_UNITS,
-			debt: balance::<T>(ACCRUAL_VAULT_DEBT),
-			annual_rate: ACCRUAL_VAULT_RATE,
-		};
-		Seeder::<T>::open_vault(&account("accrual_vault", 0, 0), vault)?;
-	}
+	let vault = BenchmarkVault {
+		collateral_units: ACCRUAL_VAULT_COLLATERAL_UNITS,
+		debt: balance::<T>(ACCRUAL_VAULT_DEBT),
+		annual_rate: ACCRUAL_VAULT_RATE,
+	};
+	Seeder::<T>::open_vault(&account("accrual_vault", 0, 0), vault)?;
 	let owner: T::AccountId = account("owner", 0, 0);
 	let member: T::AccountId = account("member", 0, 0);
 	// Allows cohort activation without refreshing the owner's row.
@@ -525,54 +520,10 @@ fn assert_refreshed<T: Config>(seed: &RefreshSeed<T>) -> Result<(), BenchmarkErr
 mod benchmarks {
 	use super::*;
 
-	/// The deposit first routes the head's interest into the pool, then settles an above-par
-	/// `FinalRecovery` head in full, which closes its vault, then settles the depositor's
-	/// checkpointed tranche, activates two cohorts and queues the change. It spends the
-	/// depositor's whole balance.
+	/// The deposit routes pending branch interest into the pool, settles the depositor's
+	/// checkpointed tranche, activates two cohorts, and queues the new deposit.
 	#[benchmark]
 	fn deposit() -> Result<(), BenchmarkError> {
-		let seed = stage_refresh::<T>(false, Principal::None)?;
-		let market = &seed.market;
-		// Staging the head prices the branch last, so it also carries the clock to the cohorts.
-		let elapsed = seed.due.saturating_sub(T::TimeProvider::now()).max(RECOVERY_ACCRUAL_MS);
-		let head = Seeder::<T>::stage_recovery_head(elapsed)?;
-		assert!(T::TimeProvider::now() >= seed.due);
-		assert_refresh_staged::<T>(&seed)?;
-		let change = balance::<T>(COHORT_DEPOSIT);
-		let amount = head.debt.saturating_add(change);
-		T::StableAssets::mint_into(market.stable_id.clone(), &seed.owner, amount)?;
-		assert_eq!(market.stable_balance(&seed.owner), amount);
-		let claimable_before = market.settled_row(&seed.owner)?.claimable_collateral;
-		let yield_before = market.live_yield_sum()?;
-
-		#[extrinsic_call]
-		_(
-			RawOrigin::Signed(seed.owner.clone()),
-			market.collateral_id.clone(),
-			market.stable_id.clone(),
-			amount,
-		);
-
-		assert_refreshed::<T>(&seed)?;
-		assert!(market.live_yield_sum()? > yield_before);
-		let row = market.deposit_row(&seed.owner)?;
-		assert_eq!(row.claimable_collateral, claimable_before.saturating_add(head.collateral));
-		assert_eq!(row.pending_deposit.map(|pending| pending.amount), Some(change));
-		assert!(market.stable_balance(&seed.owner).is_zero());
-		frame_system::Pallet::<T>::assert_has_event(
-			Event::<T>::RecoveryOffsetApplied {
-				collateral_id: market.collateral_id.clone(),
-				stable_id: market.stable_id.clone(),
-				source: crate::types::RecoveryOffsetSource::IncomingDeposit,
-			}
-			.into(),
-		);
-		Ok(())
-	}
-
-	/// [`deposit`](Pallet::deposit) with an empty `FinalRecovery` queue, which it refunds to.
-	#[benchmark]
-	fn deposit_no_recovery() -> Result<(), BenchmarkError> {
 		let seed = seed_refresh::<T>(Principal::None)?;
 		let market = &seed.market;
 		let amount = balance::<T>(COHORT_DEPOSIT);
@@ -581,7 +532,7 @@ mod benchmarks {
 		let yield_before = market.live_yield_sum()?;
 
 		#[extrinsic_call]
-		deposit(
+		_(
 			RawOrigin::Signed(seed.owner.clone()),
 			market.collateral_id.clone(),
 			market.stable_id.clone(),
@@ -598,26 +549,32 @@ mod benchmarks {
 		Ok(())
 	}
 
-	/// In Normal mode the request pays out at once, as a full withdrawal.
+	/// Safety mode commits the full settlement and records a withdrawal request.
 	#[benchmark]
 	fn request_withdraw() -> Result<(), BenchmarkError> {
-		let seed = seed_refresh::<T>(Principal::Pending)?;
+		let seed = seed_refresh::<T>(Principal::None)?;
 		let market = &seed.market;
-		assert!(market.stable_balance(&seed.owner).is_zero());
-		let yield_before = market.live_yield_sum()?;
+		market.enter_safety();
+		assert!(market.settled_row(&seed.owner)?.active_deposit.is_zero());
+		let amount = BalanceOf::<T>::max_value();
+		let executable_at =
+			T::TimeProvider::now().saturating_add(market.pool()?.config.safety_withdrawal_delay);
 
 		#[extrinsic_call]
 		_(
 			RawOrigin::Signed(seed.owner.clone()),
 			market.collateral_id.clone(),
 			market.stable_id.clone(),
-			BalanceOf::<T>::max_value(),
+			amount,
 		);
 
 		assert_refreshed::<T>(&seed)?;
-		assert!(market.deposit_row(&seed.owner)?.active_deposit.is_zero());
-		assert!(!market.stable_balance(&seed.owner).is_zero());
-		assert!(market.live_yield_sum()? > yield_before);
+		let row = market.deposit_row(&seed.owner)?;
+		assert!(row.active_deposit.is_zero());
+		let request = row.withdrawal_request.ok_or("no request recorded")?;
+		assert_eq!(request.amount, amount);
+		assert_eq!(request.executable_at, executable_at);
+		assert!(market.stable_balance(&seed.owner).is_zero());
 		Ok(())
 	}
 
@@ -674,65 +631,6 @@ mod benchmarks {
 		assert_eq!(market.live_yield_sum()?, yield_before);
 		assert_refresh_staged::<T>(&seed)?;
 		assert!(market.stable_balance(&recipient).is_zero());
-		Ok(())
-	}
-
-	/// Normal mode reaches the exhausted withdrawal through the request's own pool and mode
-	/// checks, so measure the complete wrapper as well.
-	#[benchmark]
-	fn request_withdraw_exhausted() -> Result<(), BenchmarkError> {
-		let seed = seed_refresh::<T>(Principal::None)?;
-		let market = &seed.market;
-		assert!(market.settled_row(&seed.owner)?.active_deposit.is_zero());
-		let yield_before = market.live_yield_sum()?;
-
-		#[block]
-		{
-			assert_eq!(
-				Pallet::<T>::request_withdraw(
-					RawOrigin::Signed(seed.owner.clone()).into(),
-					market.collateral_id.clone(),
-					market.stable_id.clone(),
-					BalanceOf::<T>::max_value(),
-				),
-				Err(Error::<T>::NoActiveDeposit
-					.with_weight(T::WeightInfo::request_withdraw_exhausted()))
-			);
-		}
-
-		assert_eq!(market.live_yield_sum()?, yield_before);
-		assert_refresh_staged::<T>(&seed)?;
-		Ok(())
-	}
-
-	/// Safety mode commits the full settlement and records a request even without principal.
-	#[benchmark]
-	fn request_withdraw_safety() -> Result<(), BenchmarkError> {
-		let seed = seed_refresh::<T>(Principal::None)?;
-		let market = &seed.market;
-		market.enter_safety();
-		assert!(market.settled_row(&seed.owner)?.active_deposit.is_zero());
-		let yield_before = market.live_yield_sum()?;
-		let amount = BalanceOf::<T>::max_value();
-		let executable_at =
-			T::TimeProvider::now().saturating_add(market.pool()?.config.safety_withdrawal_delay);
-
-		#[extrinsic_call]
-		request_withdraw(
-			RawOrigin::Signed(seed.owner.clone()),
-			market.collateral_id.clone(),
-			market.stable_id.clone(),
-			amount,
-		);
-
-		assert_refreshed::<T>(&seed)?;
-		let row = market.deposit_row(&seed.owner)?;
-		assert!(row.active_deposit.is_zero());
-		let request = row.withdrawal_request.ok_or("no request recorded")?;
-		assert_eq!(request.amount, amount);
-		assert_eq!(request.executable_at, executable_at);
-		assert!(market.stable_balance(&seed.owner).is_zero());
-		assert!(market.live_yield_sum()? > yield_before);
 		Ok(())
 	}
 
@@ -822,7 +720,7 @@ mod benchmarks {
 		market.offset_legs(balance::<T>(near_floor), BalanceOf::<T>::zero())?;
 		let (collateral_id, stable_id) = (&market.collateral_id, &market.stable_id);
 		let pool = market.pool()?;
-		let p_min = pool.config.precision.p_min;
+		let p_min = math::P_MIN;
 		assert!(pool.state.coords.p >= p_min);
 		assert!(
 			pool.state.coords.p < p_min.saturating_mul(FixedU128::from_rational(10_002, 10_000))
@@ -896,6 +794,46 @@ mod benchmarks {
 		let stored = market.pool()?.config;
 		assert_eq!(stored.yield_share, Permill::from_percent(50));
 		assert_eq!(stored.entry_delay, ENTRY_DELAY_MS);
+		Ok(())
+	}
+
+	/// Removes `n` historical `PoolSumsStore` rows from an empty pool, preserving both live rows.
+	#[benchmark]
+	fn prune_pool_sums(n: Linear<1, MAX_PRUNE_SUMS>) -> Result<(), BenchmarkError> {
+		let market = Market::<T>::register()?;
+		let (collateral_id, stable_id) = (&market.collateral_id, &market.stable_id);
+		Pools::<T>::try_mutate(collateral_id, stable_id, |maybe_pool| {
+			let pool = maybe_pool.as_mut().ok_or(Error::<T>::PoolNotRegistered)?;
+			pool.state.coords.epoch = n;
+			Ok::<_, DispatchError>(())
+		})?;
+		for epoch in 0..=n {
+			PoolSumsStore::<T>::insert(
+				(collateral_id, stable_id, Leg::Active, epoch, 0u32),
+				PoolSums::default(),
+			);
+		}
+		let expected = usize::try_from(n)
+			.expect("u32 fits usize on every supported target; qed")
+			.saturating_add(2);
+		assert_eq!(
+			PoolSumsStore::<T>::iter_key_prefix((collateral_id, stable_id)).count(),
+			expected
+		);
+		let caller: T::AccountId = whitelisted_caller();
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(caller), collateral_id.clone(), stable_id.clone(), n);
+
+		assert_eq!(PoolSumsStore::<T>::iter_key_prefix((collateral_id, stable_id)).count(), 2);
+		assert!(PoolSumsStore::<T>::contains_key((collateral_id, stable_id, Leg::Active, n, 0u32)));
+		assert!(PoolSumsStore::<T>::contains_key((
+			collateral_id,
+			stable_id,
+			Leg::Pending,
+			0u32,
+			0u32
+		)));
 		Ok(())
 	}
 

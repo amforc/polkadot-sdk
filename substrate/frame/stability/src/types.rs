@@ -2,7 +2,7 @@
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame::{
-	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Permill, Saturating, Zero},
+	arithmetic::{FixedPointOperand, FixedU128, One, Permill, Zero},
 	prelude::{BoundedVec, ConstU32, DispatchError},
 	traits::{DefensiveOption, DefensiveSaturating},
 };
@@ -181,8 +181,8 @@ impl<Balance: FixedPointOperand> OpenCohort<Balance> {
 	///
 	/// Upward rounding keeps the aggregate sufficient for all downward-rounded member claims. The
 	/// coordinate update also keeps each member snapshot at or behind the aggregate.
-	pub(crate) fn revalue(&mut self, live: &Accumulators, sf_int: u128) {
-		self.amount = math::compound_ceil(self.amount, &self.coords, live, sf_int);
+	pub(crate) fn revalue(&mut self, live: &Accumulators) {
+		self.amount = math::compound_ceil(self.amount, &self.coords, live);
 		self.coords = *live;
 	}
 }
@@ -215,53 +215,6 @@ pub(crate) struct SumsWindow {
 	pub snap: PoolSums,
 	/// The rows at the scales that follow, in order. An absent row reads as zero.
 	pub ahead: [PoolSums; math::SCALE_SPAN as usize],
-}
-
-/// Precision parameters for the product accumulator `P`.
-///
-/// These parameters cannot change after registration. Stored snapshots depend on the original
-/// `scale_factor`, and a different value would produce incorrect deposit amounts.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
-)]
-pub struct PoolPrecision {
-	/// The value of `P` that triggers a rescale.
-	pub p_min: FixedU128,
-	/// Factor that a rescale applies to `P`.
-	///
-	/// [`PoolPrecision::scale_factor`] converts this value for accumulator arithmetic and protects
-	/// division from corrupt zero values.
-	pub scale_factor: u64,
-}
-
-impl PoolPrecision {
-	/// Returns `true` when the parameters keep accumulator arithmetic within its limits.
-	///
-	/// `scale_factor` must be between `math::SCALE_FACTOR_INT_MIN` and
-	/// `math::SCALE_FACTOR_INT_MAX`. A rescale must also leave `P` at or below one, which requires
-	/// `p_min * scale_factor <= 1`.
-	pub fn is_valid(&self) -> bool {
-		if self.p_min.is_zero() {
-			return false;
-		}
-		if self.scale_factor < math::SCALE_FACTOR_INT_MIN {
-			return false;
-		}
-		if self.scale_factor > math::SCALE_FACTOR_INT_MAX {
-			return false;
-		}
-		self.p_min.saturating_mul(FixedU128::saturating_from_integer(self.scale_factor)) <=
-			FixedU128::one()
-	}
-
-	/// Returns `scale_factor` as a `u128` for accumulator arithmetic.
-	///
-	/// The result is at least one, which prevents division by zero after corrupt storage input.
-	pub fn scale_factor(&self) -> u128 {
-		debug_assert!(self.scale_factor >= math::SCALE_FACTOR_INT_MIN);
-		debug_assert!(self.scale_factor <= math::SCALE_FACTOR_INT_MAX);
-		u128::from(self.scale_factor).max(1)
-	}
 }
 
 /// Settlement result for a deposit at the current accumulators.
@@ -489,14 +442,9 @@ impl<Balance: FixedPointOperand> PoolState<Balance> {
 	/// Whether the pending total covers every cohort's reserve at `live`.
 	///
 	/// At most two cohorts are open, so this check does not visit deposit rows.
-	pub(crate) fn cohorts_covered(
-		&self,
-		live: &Accumulators,
-		sf_int: u128,
-		mut available: Balance,
-	) -> bool {
+	pub(crate) fn cohorts_covered(&self, live: &Accumulators, mut available: Balance) -> bool {
 		for cohort in &self.open_cohorts {
-			let amount = math::compound_ceil(cohort.amount, &cohort.coords, live, sf_int);
+			let amount = math::compound_ceil(cohort.amount, &cohort.coords, live);
 			if amount > available {
 				return false;
 			}
@@ -519,10 +467,9 @@ impl<Balance: FixedPointOperand> PoolState<Balance> {
 		&mut self,
 		id: CohortId,
 		live: &Accumulators,
-		sf_int: u128,
 	) -> Result<&mut OpenCohort<Balance>, DispatchError> {
 		let cohort = self.cohort_mut(id).defensive_ok_or(DispatchError::Corruption)?;
-		cohort.revalue(live, sf_int);
+		cohort.revalue(live);
 		Ok(cohort)
 	}
 }
@@ -553,8 +500,6 @@ pub struct StabilityPoolConfig<Balance> {
 	/// The request remains executable for the same duration after this delay. Zero disables
 	/// both the delay and expiry.
 	pub safety_withdrawal_delay: Millis,
-	/// Precision policy for `P`. It cannot change after registration.
-	pub precision: PoolPrecision,
 	/// Share of branch yield for active depositors. The yield caller retains the remainder.
 	pub yield_share: Permill,
 }
@@ -562,8 +507,7 @@ pub struct StabilityPoolConfig<Balance> {
 impl<Balance: Zero> StabilityPoolConfig<Balance> {
 	/// Returns `true` when the parameters satisfy all pool invariants.
 	///
-	/// `minimum_deposit` and `minimum_active_pool_balance` must be nonzero. The precision
-	/// parameters must satisfy [`PoolPrecision::is_valid`].
+	/// `minimum_deposit` and `minimum_active_pool_balance` must be nonzero.
 	pub fn is_valid(&self) -> bool {
 		if self.minimum_deposit.is_zero() {
 			return false;
@@ -571,7 +515,7 @@ impl<Balance: Zero> StabilityPoolConfig<Balance> {
 		if self.minimum_active_pool_balance.is_zero() {
 			return false;
 		}
-		self.precision.is_valid()
+		true
 	}
 }
 
@@ -598,14 +542,6 @@ pub struct StabilityPool<Balance> {
 	pub custody_collateral: Balance,
 }
 
-/// Source of stablecoin for a recovery offset.
-#[derive(Encode, Decode, DecodeWithMemTracking, TypeInfo, Clone, PartialEq, Eq, Debug)]
-pub enum RecoveryOffsetSource {
-	/// The active pool paid, so its depositors receive the collateral through `S`.
-	ActivePool,
-	/// An incoming deposit paid, so that depositor receives the collateral directly.
-	IncomingDeposit,
-}
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -616,10 +552,6 @@ mod tests {
 			minimum_active_pool_balance: 100,
 			entry_delay: 5_000,
 			safety_withdrawal_delay: 600_000,
-			precision: PoolPrecision {
-				p_min: FixedU128::from_inner(1_000_000_000),
-				scale_factor: 1_000_000_000,
-			},
 			yield_share: Permill::from_percent(75),
 		}
 	}
@@ -635,7 +567,6 @@ mod tests {
 
 	#[test]
 	fn config_validation_accepts_the_boundaries() {
-		// The reference sits on the product boundary: p_min * scale_factor = 1e-9 * 1e9 = 1.
 		assert!(valid_config().is_valid());
 		// Zero delays are legitimate governance choices (they disable the respective
 		// protection), zero yield share as well.
@@ -645,40 +576,11 @@ mod tests {
 			config.yield_share = Permill::zero();
 		})
 		.is_valid());
-		// The smallest useful rescale: 1e-9 * 1e3 = 1e-6 <= 1.
-		assert!(valid_config_with(|config| config.precision.scale_factor = 1_000).is_valid());
-		// The largest rescale the u128 overflow guard allows. `p_min` drops to 1e-11 so that the
-		// product stays at 1e-11 * 1e10 = 0.1 <= 1.
-		assert!(valid_config_with(|config| {
-			config.precision.p_min = FixedU128::from_inner(10_000_000);
-			config.precision.scale_factor = 10_000_000_000;
-		})
-		.is_valid());
 	}
 
 	#[test]
 	fn config_validation_rejects_zero_minimums() {
 		assert!(!valid_config_with(|config| config.minimum_deposit = 0).is_valid());
 		assert!(!valid_config_with(|config| config.minimum_active_pool_balance = 0).is_valid());
-		assert!(!valid_config_with(|config| config.precision.p_min = FixedU128::zero()).is_valid());
-	}
-
-	#[test]
-	fn config_validation_rejects_unsupported_rescales() {
-		// Below the minimum useful rescale. The product 1e-9 * 999 stays under one, so only the
-		// lower bound can reject it.
-		assert!(!valid_config_with(|config| config.precision.scale_factor = 999).is_valid());
-		// Above the u128 overflow guard (1e10). With `p_min` at 1e-11 the product is
-		// 1e-11 * (1e10 + 1) = 0.10000000001 <= 1, so only the upper bound can reject it.
-		assert!(!valid_config_with(|config| {
-			config.precision.p_min = FixedU128::from_inner(10_000_000);
-			config.precision.scale_factor = 10_000_000_001;
-		})
-		.is_valid());
-		// A rescale would push P above one: p_min * scale_factor > 1.
-		assert!(!valid_config_with(|config| {
-			config.precision.p_min = FixedU128::from_inner(2_000_000_000);
-		})
-		.is_valid());
 	}
 }

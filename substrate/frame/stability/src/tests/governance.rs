@@ -421,6 +421,25 @@ fn branch_removal_sweeps_dust_and_reregistration_starts_clean() {
 			// checkpoint went with the last settlement of its cohort.
 			assert_eq!(default_market_rows(), (4, 0));
 
+			// Historical sums rows must be pruned in bounded steps before branch removal.
+			assert_noop!(
+				Vaults::remove_branch(RuntimeOrigin::root(), DOT, STABLE),
+				Error::<Test>::PoolSumsNotCleared
+			);
+			assert_storage_noop!(assert_ok!(prune_pool_sums(1, DOT, STABLE, 0)));
+			// Prune one historical row at a time: both live rows stay intact and `remove_branch`
+			// stays blocked until only the live rows remain.
+			assert_ok!(prune_pool_sums(1, DOT, STABLE, 1));
+			assert_eq!(default_market_rows(), (3, 0));
+			assert_ok!(crate::try_state::do_try_state::<Test>());
+			assert_noop!(
+				Vaults::remove_branch(RuntimeOrigin::root(), DOT, STABLE),
+				Error::<Test>::PoolSumsNotCleared
+			);
+			assert_ok!(prune_pool_sums(1, DOT, STABLE, 10));
+			assert_eq!(default_market_rows(), (2, 0));
+			assert_ok!(crate::try_state::do_try_state::<Test>());
+
 			let float = crate::Pools::<Test>::get(DOT, STABLE).expect("pool registered");
 			stability_events_since_last_call();
 
@@ -508,23 +527,13 @@ fn set_stability_pool_config_origin_validation_and_storage() {
 			set_config(RuntimeOrigin::root(), config),
 			Error::<Test>::InvalidStabilityPoolConfig
 		);
+	});
+}
 
-		// Still a valid config on its own (0.5e-9 * 1e9 = 0.5 <= 1), so it
-		// reaches the immutability check rather than failing validation.
-		let mut config = default_pool_config();
-		config.precision.p_min = FixedU128::from_inner(500_000_000);
-		assert_noop!(
-			set_config(RuntimeOrigin::root(), config),
-			Error::<Test>::AccumulatorParamsImmutable
-		);
-
-		// Same for the scale factor (1e8 is inside the validity bounds).
-		let mut config = default_pool_config();
-		config.precision.scale_factor = 100_000_000;
-		assert_noop!(
-			set_config(RuntimeOrigin::root(), config),
-			Error::<Test>::AccumulatorParamsImmutable
-		);
+#[test]
+fn prune_pool_sums_rejects_non_empty_pool() {
+	ExtBuilder::single_depositor().build_and_execute(|| {
+		assert_noop!(prune_pool_sums(1, DOT, STABLE, 10), Error::<Test>::PoolNotEmpty);
 	});
 }
 

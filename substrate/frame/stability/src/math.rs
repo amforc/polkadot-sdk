@@ -6,7 +6,7 @@
 //! User payouts round down. The pool keeps each remainder so recorded obligations do not exceed
 //! custody.
 
-use crate::types::{Accumulators, DepositSnapshot, PUpdate, PoolPrecision, Realized, SumsWindow};
+use crate::types::{Accumulators, DepositSnapshot, PUpdate, Realized, SumsWindow};
 use frame::{
 	arithmetic::{FixedPointNumber, FixedPointOperand, FixedU128, One, Rounding, Saturating, Zero},
 	traits::Defensive,
@@ -21,40 +21,43 @@ use stablecoin_primitives::{
 /// More crossings indicate that `minimum_active_pool_balance` is too small relative to the pool.
 pub const MAX_SCALE_CROSSINGS: u32 = 2;
 
-/// Smallest permitted `scale_factor`. A smaller factor does not restore sufficient precision.
-pub const SCALE_FACTOR_INT_MIN: u64 = 1_000;
+/// Value of `P` that triggers a rescale (`1e-9`).
+pub const P_MIN: FixedU128 = FixedU128::from_inner(1_000_000_000);
 
-/// Largest permitted `scale_factor`.
+/// Factor applied to `P` on each rescale (`1e9`).
 ///
-/// It keeps the worst case of [`update_p_after_offset`] inside `u128`:
-/// `P.inner * scale_factor^MAX_SCALE_CROSSINGS <= 1e18 * 1e20 = 1e38`.
-pub const SCALE_FACTOR_INT_MAX: u64 = 10_000_000_000;
+/// Keeps the worst case of [`update_p_after_offset`] and [`compound`] inside `u128`:
+/// `P.inner * SCALE_FACTOR^2 <= 1e18 * 1e18 = 1e36`, and `P_MIN * SCALE_FACTOR == 1`.
+pub const SCALE_FACTOR: u128 = 1_000_000_000;
 
 /// Maximum scale distance at which a deposit retains compounded principal.
 ///
-/// Each scale adds a `scale_factor` divisor. Beyond this span, the deposit is worth less than one
-/// part in 1e6 of its initial value.
+/// Each scale adds a [`SCALE_FACTOR`] divisor. Beyond this span, the deposit is worth less than
+/// one part in `1e18` of its initial value.
 ///
 /// The finite span also bounds the accumulator rows required for one settlement.
 pub const SCALE_SPAN: u32 = 2;
 
-/// Returns `true` when `P = 1` times `SCALE_FACTOR_INT_MAX^exp` fits in a `u128` inner value.
+/// Returns `true` when `P = 1` times `SCALE_FACTOR^exp` fits in a `u128` inner value.
 const fn fits_with_unit_p(exp: u32) -> bool {
-	// Widening `u64` to `u128` is lossless; `u128::from` is not usable in a const context.
-	let scale_factor_max = SCALE_FACTOR_INT_MAX as u128;
-	match scale_factor_max.checked_pow(exp) {
+	match SCALE_FACTOR.checked_pow(exp) {
 		Some(factor) => factor.checked_mul(<FixedU128 as FixedPointNumber>::DIV).is_some(),
 		None => false,
 	}
 }
 
-// The worst case of `update_p_after_offset` multiplies `P` by `scale_factor^MAX_SCALE_CROSSINGS`.
+// A rescale must leave `P` at or below one: `P_MIN * SCALE_FACTOR <= 1`.
+const _: () = assert!(matches!(
+	P_MIN.into_inner().checked_mul(SCALE_FACTOR),
+	Some(product) if product <= <FixedU128 as FixedPointNumber>::DIV
+));
+// The worst case of `update_p_after_offset` multiplies `P` by `SCALE_FACTOR^MAX_SCALE_CROSSINGS`.
 const _: () = assert!(fits_with_unit_p(MAX_SCALE_CROSSINGS));
-// The worst case of `compound` divides by `P0 * scale_factor^SCALE_SPAN`.
+// The worst case of `compound` divides by `P0 * SCALE_FACTOR^SCALE_SPAN`.
 const _: () = assert!(fits_with_unit_p(SCALE_SPAN));
 
 /// Applies the principal formula used by [`realize`] and cohort aggregates:
-/// `amount * p_to / (p_from * scale_factor^behind)`, rounded per `rounding`.
+/// `amount * p_to / (p_from * SCALE_FACTOR^behind)`, rounded per `rounding`.
 ///
 /// An earlier epoch or a distance above [`SCALE_SPAN`] leaves no principal. Within the supported
 /// span, the result cannot exceed `amount`, even with upward rounding.
@@ -62,7 +65,6 @@ fn compound<Balance: FixedPointOperand>(
 	amount: Balance,
 	from: &Accumulators,
 	to: &Accumulators,
-	sf_int: u128,
 	rounding: Rounding,
 ) -> Balance {
 	debug_assert!(!from.p.is_zero());
@@ -74,10 +76,10 @@ fn compound<Balance: FixedPointOperand>(
 	if from.epoch != to.epoch {
 		return Balance::zero();
 	}
-	// Each boundary behind adds a `scale_factor` divisor. The `is_valid` bounds keep the worst
-	// case, `1e18 * (1e10)^SCALE_SPAN = 1e38`, inside `u128`.
+	// Each boundary behind adds a `SCALE_FACTOR` divisor. The worst case,
+	// `1e18 * (1e9)^SCALE_SPAN = 1e36`, stays inside `u128`.
 	let denominator = match to.scale.checked_sub(from.scale) {
-		Some(behind) if behind <= SCALE_SPAN => sf_int
+		Some(behind) if behind <= SCALE_SPAN => SCALE_FACTOR
 			.checked_pow(behind)
 			.and_then(|factor| from.p.into_inner().checked_mul(factor)),
 		Some(_) | None => None,
@@ -101,9 +103,8 @@ pub fn compound_ceil<Balance: FixedPointOperand>(
 	amount: Balance,
 	from: &Accumulators,
 	to: &Accumulators,
-	sf_int: u128,
 ) -> Balance {
-	compound(amount, from, to, sf_int, Rounding::Up)
+	compound(amount, from, to, Rounding::Up)
 }
 
 /// Returns `now + entry_delay`, rounded up to the next multiple of `entry_delay`.
@@ -132,7 +133,6 @@ pub fn realize<Balance: FixedPointOperand>(
 	snapshot: &DepositSnapshot,
 	current: &Accumulators,
 	window: &SumsWindow,
-	precision: &PoolPrecision,
 ) -> Realized<Balance> {
 	debug_assert!(!snapshot.coords.p.is_zero());
 	debug_assert!(current.p <= FixedU128::one());
@@ -146,9 +146,8 @@ pub fn realize<Balance: FixedPointOperand>(
 			yield_gain: Balance::zero(),
 		};
 	}
-	let sf_int = precision.scale_factor();
 
-	let remaining_principal = compound(d0, &snapshot.coords, current, sf_int, Rounding::Down);
+	let remaining_principal = compound(d0, &snapshot.coords, current, Rounding::Down);
 	debug_assert!(remaining_principal <= d0);
 
 	let collateral_gain = gain(
@@ -156,7 +155,6 @@ pub fn realize<Balance: FixedPointOperand>(
 		window.snap.s_collateral,
 		snapshot.sums.s_collateral,
 		window.ahead.map(|row| row.s_collateral),
-		sf_int,
 		snapshot.coords.p,
 	);
 	let yield_gain = gain(
@@ -164,7 +162,6 @@ pub fn realize<Balance: FixedPointOperand>(
 		window.snap.g_yield,
 		snapshot.sums.g_yield,
 		window.ahead.map(|row| row.g_yield),
-		sf_int,
 		snapshot.coords.p,
 	);
 
@@ -172,26 +169,23 @@ pub fn realize<Balance: FixedPointOperand>(
 }
 
 /// Applies the gain formula of [`realize`] to collateral sum `S` or yield sum `G`:
-/// `floor(d * ((sum_snap - sum0) + Σ ahead[k] / sf_int^(k+1)) / p0)`.
+/// `floor(d * ((sum_snap - sum0) + Σ ahead[k] / SCALE_FACTOR^(k+1)) / p0)`.
 fn gain<Balance: FixedPointOperand>(
 	d: Balance,
 	sum_snap: FixedU128,
 	sum0: FixedU128,
 	ahead: [FixedU128; SCALE_SPAN as usize],
-	sf_int: u128,
 	p0: FixedU128,
 ) -> Balance {
-	// `scale_factor` keeps `1 <= sf_int <= 1e10`, so the largest divisor, `sf_int^SCALE_SPAN =
-	// 1e20`, stays inside `u128`.
-	debug_assert!(sf_int >= 1);
+	// The largest divisor, `SCALE_FACTOR^SCALE_SPAN = 1e18`, stays inside `u128`.
 	let mut delta = sum_snap.saturating_sub(sum0);
-	let mut divisor = sf_int;
+	let mut divisor = SCALE_FACTOR;
 	for row in ahead {
 		// A deposit at the live coordinates carries no look-ahead rows. Skip their divisions.
 		if !row.is_zero() {
 			delta = delta.saturating_add(FixedU128::from_inner(row.into_inner() / divisor));
 		}
-		divisor = divisor.saturating_mul(sf_int);
+		divisor = divisor.saturating_mul(SCALE_FACTOR);
 	}
 	if delta.is_zero() {
 		return Balance::zero();
@@ -248,9 +242,9 @@ pub fn delta_sum<Balance: FixedPointOperand>(
 ///
 /// Each rescale uses one division to prevent an intermediate loss of precision. Candidate `k` is:
 ///
-/// `floor(P.inner * scale_factor^k * new_total / total)`.
+/// `floor(P.inner * SCALE_FACTOR^k * new_total / total)`.
 ///
-/// The function selects the first candidate at or above `p_min`, for `k` from zero through
+/// The function selects the first candidate at or above [`P_MIN`], for `k` from zero through
 /// [`MAX_SCALE_CROSSINGS`].
 ///
 /// Returns `None` when the offset needs more crossings than the pallet supports, when an
@@ -260,7 +254,6 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 	p: FixedU128,
 	total_active: Balance,
 	offset_debt: Balance,
-	precision: &PoolPrecision,
 ) -> Option<PUpdate> {
 	debug_assert!(!p.is_zero());
 	debug_assert!(p <= FixedU128::one());
@@ -274,7 +267,6 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 		return Some(PUpdate::Updated { new_p: p, scales_crossed: 0 });
 	}
 	let new_total = total_active.saturating_sub(offset_debt);
-	let sf_int = precision.scale_factor();
 
 	let mut factor: u128 = 1;
 	for scales_crossed in 0..=MAX_SCALE_CROSSINGS {
@@ -284,13 +276,13 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 			FixedU128::from_inner(scaled_p),
 			total_active,
 		)?;
-		if new_p >= precision.p_min {
-			// A crossing lands `P` in `[p_min, p_min * scale_factor]`, and `is_valid` keeps
-			// `p_min * scale_factor` at or below one.
+		if new_p >= P_MIN {
+			// A crossing lands `P` in `[P_MIN, P_MIN * SCALE_FACTOR]`, and
+			// `P_MIN * SCALE_FACTOR == 1`.
 			debug_assert!(new_p <= FixedU128::one());
 			return Some(PUpdate::Updated { new_p, scales_crossed });
 		}
-		factor = factor.checked_mul(sf_int)?;
+		factor = factor.checked_mul(SCALE_FACTOR)?;
 	}
 	None
 }
@@ -299,10 +291,6 @@ pub fn update_p_after_offset<Balance: FixedPointOperand + Ord>(
 mod tests {
 	use super::*;
 	use crate::types::PoolSums;
-
-	const SF: u64 = 1_000_000_000;
-	const P_MIN: FixedU128 = FixedU128::from_inner(1_000_000_000);
-	const PRECISION: PoolPrecision = PoolPrecision { p_min: P_MIN, scale_factor: SF };
 
 	fn accumulators(p: FixedU128, epoch: u32, scale: u32) -> Accumulators {
 		Accumulators { p, epoch, scale }
@@ -336,7 +324,7 @@ mod tests {
 		let current = accumulators(FixedU128::from_inner(333_333_333_333_333_333), 0, 0);
 		let sums = window(FixedU128::from_inner(333_333_333_333_333_333), FixedU128::zero());
 
-		let got = realize::<u128>(3, &snap, &current, &sums, &PRECISION);
+		let got = realize::<u128>(3, &snap, &current, &sums);
 
 		assert_eq!(got.remaining_principal, 0);
 		assert_eq!(got.collateral_gain, 0);
@@ -369,7 +357,7 @@ mod tests {
 			],
 		};
 
-		let got = realize::<u128>(1_000_000_000_000_000_000, &snap, &current, &sums, &PRECISION);
+		let got = realize::<u128>(1_000_000_000_000_000_000, &snap, &current, &sums);
 
 		assert_eq!(got.collateral_gain, 600_000_600_000_001_000);
 		// compounded = floor(1e18 * 0.8 / (0.5 * 1e18)) = 1.
@@ -402,12 +390,7 @@ mod tests {
 		// P=2e-9 (inner 2e9), A=1000, L=750: the unscaled candidate is
 		// floor(2e9 * 250 / 1000) = 5e8 < p_min. One crossing:
 		// floor(2e9 * 1e9 * 250 / 1000) = 5e17 → P = 0.5.
-		let got = update_p_after_offset::<u128>(
-			FixedU128::from_inner(2_000_000_000),
-			1_000,
-			750,
-			&PRECISION,
-		);
+		let got = update_p_after_offset::<u128>(FixedU128::from_inner(2_000_000_000), 1_000, 750);
 		assert_eq!(
 			got,
 			Some(PUpdate::Updated { new_p: FixedU128::from_rational(1, 2), scales_crossed: 1 })
@@ -417,7 +400,7 @@ mod tests {
 		// candidate is floor(1e9 * 999_999 / 1e6) = 999_999_000 < p_min. One crossing:
 		// floor(1e9 * 1e9 * 999_999 / 1e6) = 999_999e12 → P = 0.999999, just below
 		// p_min * scale_factor = 1.
-		let got = update_p_after_offset::<u128>(P_MIN, 1_000_000, 1, &PRECISION);
+		let got = update_p_after_offset::<u128>(P_MIN, 1_000_000, 1);
 		assert_eq!(
 			got,
 			Some(PUpdate::Updated {
@@ -430,23 +413,23 @@ mod tests {
 	#[test]
 	fn update_p_floor_sizing_rule_needs_ceiling_division() {
 		// The `minimum_active_pool_balance` doc rule: a floor of F raw units
-		// protects pools up to F * scale_factor^2, worst case P = p_min.
+		// protects pools up to F * SCALE_FACTOR^2, worst case P = P_MIN.
 		// At exactly 1e18 a floor of 1 survives: the k=2 candidate is
-		// floor(1e9 * 1e18 * 1 / 1e18) = 1e9 = p_min.
+		// floor(1e9 * 1e18 * 1 / 1e18) = 1e9 = P_MIN.
 		let total = 1_000_000_000_000_000_000u128;
-		let got = update_p_after_offset::<u128>(P_MIN, total, total - 1, &PRECISION);
+		let got = update_p_after_offset::<u128>(P_MIN, total, total - 1);
 		assert_eq!(got, Some(PUpdate::Updated { new_p: P_MIN, scales_crossed: 2 }));
 
 		// One raw unit past, the bound is ceil((1e18 + 1) / 1e18) = 2. A
 		// floor of 1 is refused: floor(1e9 * 1e18 * 1 / (1e18 + 1)) =
-		// 999_999_999 < p_min even after both crossings...
+		// 999_999_999 < P_MIN even after both crossings...
 		let total = total + 1;
-		let got = update_p_after_offset::<u128>(P_MIN, total, total - 1, &PRECISION);
+		let got = update_p_after_offset::<u128>(P_MIN, total, total - 1);
 		assert_eq!(got, None);
 
 		// ...while the ceiling floor of 2 is accepted:
-		// floor(1e9 * 1e18 * 2 / (1e18 + 1)) = 1_999_999_999 >= p_min.
-		let got = update_p_after_offset::<u128>(P_MIN, total, total - 2, &PRECISION);
+		// floor(1e9 * 1e18 * 2 / (1e18 + 1)) = 1_999_999_999 >= P_MIN.
+		let got = update_p_after_offset::<u128>(P_MIN, total, total - 2);
 		assert_eq!(
 			got,
 			Some(PUpdate::Updated {
@@ -459,14 +442,14 @@ mod tests {
 	#[test]
 	fn update_p_full_depletion_and_bad_inputs() {
 		assert_eq!(
-			update_p_after_offset::<u128>(FixedU128::one(), 1_000, 1_000, &PRECISION),
+			update_p_after_offset::<u128>(FixedU128::one(), 1_000, 1_000),
 			Some(PUpdate::Depleted)
 		);
 		// Offsets above the pool must be clamped by the caller first.
-		assert_eq!(update_p_after_offset::<u128>(FixedU128::one(), 1_000, 1_001, &PRECISION), None);
+		assert_eq!(update_p_after_offset::<u128>(FixedU128::one(), 1_000, 1_001), None);
 		// A zero offset is the identity.
 		assert_eq!(
-			update_p_after_offset::<u128>(FixedU128::one(), 1_000, 0, &PRECISION),
+			update_p_after_offset::<u128>(FixedU128::one(), 1_000, 0),
 			Some(PUpdate::Updated { new_p: FixedU128::one(), scales_crossed: 0 })
 		);
 	}
@@ -478,33 +461,32 @@ mod tests {
 		let from = accumulators(FixedU128::from_rational(3, 10), 0, 0);
 		let to = accumulators(FixedU128::from_rational(1, 5), 0, 0);
 
-		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Down), 666);
-		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Up), 667);
+		assert_eq!(compound::<u128>(1_000, &from, &to, Rounding::Down), 666);
+		assert_eq!(compound::<u128>(1_000, &from, &to, Rounding::Up), 667);
 		// An exact ratio neither gains nor loses under either rounding.
 		let to = accumulators(FixedU128::from_rational(3, 20), 0, 0);
-		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Down), 500);
-		assert_eq!(compound::<u128>(1_000, &from, &to, SF as u128, Rounding::Up), 500);
-		assert_eq!(compound::<u128>(0, &from, &to, SF as u128, Rounding::Up), 0);
+		assert_eq!(compound::<u128>(1_000, &from, &to, Rounding::Down), 500);
+		assert_eq!(compound::<u128>(1_000, &from, &to, Rounding::Up), 500);
+		assert_eq!(compound::<u128>(0, &from, &to, Rounding::Up), 0);
 	}
 
 	#[test]
 	fn compound_divides_per_scale_behind_and_truncates_outside_the_window() {
 		let from = accumulators(FixedU128::one(), 0, 0);
 		let half = FixedU128::from_rational(1, 2);
-		let sf = SF as u128;
 
-		// One scale behind at P = 0.5 with sf = 1e9: floor(2e12 * 0.5 / 1e9) = 1000.
+		// One scale behind at P = 0.5 with SCALE_FACTOR = 1e9: floor(2e12 * 0.5 / 1e9) = 1000.
 		let to = accumulators(half, 0, 1);
-		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Down), 1_000);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, Rounding::Down), 1_000);
 		// Two behind: the floor drops the last sliver, the ceiling still carries it.
 		let to = accumulators(half, 0, 2);
-		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Down), 0);
-		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Up), 1);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, Rounding::Down), 0);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, Rounding::Up), 1);
 		// Beyond the span, or into a later epoch, nothing is left under either rounding.
 		let to = accumulators(half, 0, 3);
-		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Up), 0);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, Rounding::Up), 0);
 		let to = accumulators(half, 1, 0);
-		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, sf, Rounding::Up), 0);
+		assert_eq!(compound::<u128>(2_000_000_000_000, &from, &to, Rounding::Up), 0);
 	}
 
 	/// A cohort aggregate uses upward rounding at each update. Thus, it cannot fall below the sum
@@ -522,18 +504,17 @@ mod tests {
 			accumulators(FixedU128::from_rational(1, 3), 0, 1),
 		];
 		let end = accumulators(FixedU128::from_rational(1, 4), 0, 1);
-		let sf = SF as u128;
 
 		let mut aggregate: u128 = 0;
 		let mut coords = joins[0];
 		let mut claims: u128 = 0;
 		for (amount, joined) in amounts.into_iter().zip(joins) {
 			// The revaluation a join performs, then the member claim as `realize` floors it.
-			aggregate = compound(aggregate, &coords, &joined, sf, Rounding::Up) + amount;
+			aggregate = compound(aggregate, &coords, &joined, Rounding::Up) + amount;
 			coords = joined;
-			claims += compound(amount, &joined, &end, sf, Rounding::Down);
+			claims += compound(amount, &joined, &end, Rounding::Down);
 		}
-		let activated = compound::<u128>(aggregate, &coords, &end, sf, Rounding::Up);
+		let activated = compound::<u128>(aggregate, &coords, &end, Rounding::Up);
 
 		assert!(claims <= activated);
 		// Each ceiling and each floor costs less than one raw unit of dust.

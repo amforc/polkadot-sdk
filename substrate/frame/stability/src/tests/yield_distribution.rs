@@ -238,11 +238,6 @@ fn withdraw_issues_pending_branch_interest_first() {
 }
 
 #[test]
-fn request_withdraw_issues_pending_branch_interest_first() {
-	assert_issues_pending_branch_interest_first(|| request_withdraw(1, DOT, STABLE, 400));
-}
-
-#[test]
 fn claim_yield_issues_pending_branch_interest_first() {
 	assert_issues_pending_branch_interest_first(|| claim_yield(1, DOT, STABLE, 1));
 }

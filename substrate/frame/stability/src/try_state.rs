@@ -40,10 +40,32 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		let state = &pool.state;
 		let config = &pool.config;
 		ensure!(config.is_valid(), "stored stability-pool config fails `is_valid`");
+		let mut active_min_scales = BTreeMap::<u32, u32>::new();
+		let mut pending_min_scales = BTreeMap::<u32, u32>::new();
+		let record_min = |map: &mut BTreeMap<u32, u32>, pos: LegCoords| {
+			map.entry(pos.epoch)
+				.and_modify(|min| *min = (*min).min(pos.scale))
+				.or_insert(pos.scale);
+		};
+		record_min(&mut active_min_scales, state.coords.position());
+		record_min(&mut pending_min_scales, state.pending_coords.position());
+		for (_, deposit) in Deposits::<T>::iter_prefix((collateral_id.clone(), stable_id.clone())) {
+			record_min(&mut active_min_scales, deposit.snapshot.coords.position());
+			if let Some(pending) = &deposit.pending_deposit {
+				record_min(&mut pending_min_scales, pending.snapshot.coords.position());
+			}
+		}
+		for (_, checkpoint) in
+			CohortCheckpoints::<T>::iter_prefix((collateral_id.clone(), stable_id.clone()))
+		{
+			record_min(&mut pending_min_scales, checkpoint.pending_end.coords.position());
+			record_min(&mut active_min_scales, checkpoint.active_start.coords.position());
+		}
+
 		for leg in Leg::ALL {
 			let coords = state.coords(leg);
 			ensure!(coords.p <= FixedU128::one(), "`P` above one");
-			ensure!(coords.p >= config.precision.p_min, "`P` below the configured precision floor");
+			ensure!(coords.p >= crate::math::P_MIN, "`P` below the precision floor");
 			ensure!(
 				PoolSumsStore::<T>::contains_key((
 					&collateral_id,
@@ -54,7 +76,11 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				)),
 				"current `(epoch, scale)` has no sums row"
 			);
-			check_sums_rows::<T>(&collateral_id, &stable_id, leg, coords.position())?;
+			let min_scales = match leg {
+				Leg::Active => &active_min_scales,
+				Leg::Pending => &pending_min_scales,
+			};
+			check_sums_rows::<T>(&collateral_id, &stable_id, leg, coords.position(), min_scales)?;
 		}
 
 		// Direct transfers can add unowned surplus at any time. Obligations and the refundable
@@ -158,7 +184,6 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 							pending.amount,
 							&pending.snapshot,
 							&checkpoint.pending_end,
-							&config.precision,
 						)
 						.map_err(|_| "checkpoint window has no sums row")?;
 						ensure!(
@@ -225,11 +250,7 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 		// step with the rows, and the ceiling-compounded aggregate never falls below the floored
 		// member claims it will have to pay at advancement.
 		ensure!(
-			state.cohorts_covered(
-				&state.pending_coords,
-				config.precision.scale_factor(),
-				state.total_pending_deposits,
-			),
+			state.cohorts_covered(&state.pending_coords, state.total_pending_deposits),
 			"cohort reserves exceed total pending deposits"
 		);
 		for cohort in &state.open_cohorts {
@@ -237,12 +258,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 				tallies.members.get(&cohort.id).copied().unwrap_or(0) == cohort.members,
 				"open cohort member count diverges from its rows"
 			);
-			let cover = crate::math::compound_ceil(
-				cohort.amount,
-				&cohort.coords,
-				&state.pending_coords,
-				config.precision.scale_factor(),
-			);
+			let cover =
+				crate::math::compound_ceil(cohort.amount, &cohort.coords, &state.pending_coords);
 			let claims =
 				tallies.claims.get(&cohort.id).copied().unwrap_or_else(BalanceOf::<T>::zero);
 			ensure!(claims <= cover, "member claims exceed the cohort aggregate");
@@ -329,7 +346,8 @@ pub(crate) fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 
 /// Checks the sums rows of one leg against the leg's current `position`.
 ///
-/// Within each epoch the scales must run from zero to their maximum without a gap, because
+/// Within each epoch referenced by the live leg or a stored deposit/checkpoint, scales must run
+/// without a gap from the minimum referenced scale to the epoch's highest stored scale, because
 /// `Pallet::sums_window` ends a settlement window at the first absent scale: a gap would silently
 /// drop the gains recorded beyond it. Offsets only ever seed rows up to the coordinates they move
 /// the leg to, so no row may lie ahead of `position`.
@@ -338,9 +356,10 @@ fn check_sums_rows<T: Config>(
 	stable_id: &StableIdOf<T>,
 	leg: Leg,
 	position: LegCoords,
+	min_referenced_scales: &BTreeMap<u32, u32>,
 ) -> Result<(), TryRuntimeError> {
-	// Row iteration is hashed, so collect each epoch's highest scale and row count first.
-	let mut epochs = BTreeMap::<u32, (u32, u32)>::new();
+	// Row iteration is hashed, so collect each epoch's stored scales first.
+	let mut epochs = BTreeMap::<u32, alloc::collections::BTreeSet<u32>>::new();
 	for ((epoch, scale), sums) in
 		PoolSumsStore::<T>::iter_prefix((collateral_id.clone(), stable_id.clone(), leg))
 	{
@@ -353,12 +372,18 @@ fn check_sums_rows<T: Config>(
 			},
 			Leg::Active => {},
 		}
-		let (scale_max, count) = epochs.entry(epoch).or_default();
-		*scale_max = (*scale_max).max(scale);
-		count.saturating_accrue(1);
+		epochs.entry(epoch).or_default().insert(scale);
 	}
-	for (scale_max, count) in epochs.values() {
-		ensure!(scale_max.checked_add(1) == Some(*count), "sums rows of an epoch have a scale gap");
+	for (&epoch, &min_scale) in min_referenced_scales {
+		let Some(scales) = epochs.get(&epoch) else {
+			return Err("sums rows of an epoch have a scale gap".into());
+		};
+		let Some(&scale_max) = scales.last() else {
+			return Err("sums rows of an epoch have a scale gap".into());
+		};
+		for scale in min_scale..=scale_max {
+			ensure!(scales.contains(&scale), "sums rows of an epoch have a scale gap");
+		}
 	}
 	Ok(())
 }

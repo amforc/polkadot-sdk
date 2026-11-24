@@ -50,18 +50,16 @@ use frame::weights_prelude::*;
 /// Weight functions needed for `pallet_stability`.
 pub trait WeightInfo {
 	fn deposit() -> Weight;
-	fn deposit_no_recovery() -> Weight;
 	fn request_withdraw() -> Weight;
 	fn withdraw() -> Weight;
 	fn withdraw_exhausted() -> Weight;
-	fn request_withdraw_exhausted() -> Weight;
-	fn request_withdraw_safety() -> Weight;
 	fn claim_collateral() -> Weight;
 	fn claim_yield() -> Weight;
 	fn compound_yield() -> Weight;
 	fn offset_recovery() -> Weight;
 	fn settle_deposit() -> Weight;
 	fn set_stability_pool_config() -> Weight;
+	fn prune_pool_sums(n: u32) -> Weight;
 }
 
 /// Weights for `pallet_stability` using the Substrate node and recommended hardware.
@@ -117,49 +115,6 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
 	fn deposit() -> Weight {
 		// Proof Size summary in bytes:
-		//  Measured:  `7268`
-		//  Estimated: `35772`
-		// Minimum execution time: 576_470_000 picoseconds.
-		Weight::from_parts(602_990_000, 35772)
-			.saturating_add(T::DbWeight::get().reads(38_u64))
-			.saturating_add(T::DbWeight::get().writes(25_u64))
-	}
-	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
-	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
-	/// Storage: `Timestamp::Now` (r:1 w:0)
-	/// Proof: `Timestamp::Now` (`max_values`: Some(1), `max_size`: Some(8), added: 503, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::Branches` (r:1 w:1)
-	/// Proof: `Vaults::Branches` (`max_values`: None, `max_size`: Some(1387), added: 3862, mode: `MaxEncodedLen`)
-	/// Storage: `MockOracle::Prices` (r:1 w:0)
-	/// Proof: `MockOracle::Prices` (`max_values`: None, `max_size`: Some(634), added: 3109, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::StablecoinDebt` (r:1 w:1)
-	/// Proof: `Vaults::StablecoinDebt` (`max_values`: None, `max_size`: Some(108), added: 2583, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Asset` (r:1 w:1)
-	/// Proof: `Assets::Asset` (`max_values`: None, `max_size`: Some(210), added: 2685, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Pools` (r:1 w:1)
-	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::PoolSumsStore` (r:11 w:1)
-	/// Proof: `Stability::PoolSumsStore` (`max_values`: None, `max_size`: Some(687), added: 3162, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Account` (r:3 w:3)
-	/// Proof: `Assets::Account` (`max_values`: None, `max_size`: Some(134), added: 2609, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsHolder::BalancesOnHold` (r:1 w:1)
-	/// Proof: `AssetsHolder::BalancesOnHold` (`max_values`: None, `max_size`: Some(84), added: 2559, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsFreezer::FrozenBalances` (r:1 w:1)
-	/// Proof: `AssetsFreezer::FrozenBalances` (`max_values`: None, `max_size`: Some(84), added: 2559, mode: `MaxEncodedLen`)
-	/// Storage: `System::Account` (r:1 w:1)
-	/// Proof: `System::Account` (`max_values`: None, `max_size`: Some(128), added: 2603, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsFreezer::Freezes` (r:1 w:1)
-	/// Proof: `AssetsFreezer::Freezes` (`max_values`: None, `max_size`: Some(123), added: 2598, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsHolder::Holds` (r:1 w:1)
-	/// Proof: `AssetsHolder::Holds` (`max_values`: None, `max_size`: Some(483), added: 2958, mode: `MaxEncodedLen`)
-	/// Storage: `LinkedList::ListMetas` (r:2 w:0)
-	/// Proof: `LinkedList::ListMetas` (`max_values`: None, `max_size`: Some(693), added: 3168, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Deposits` (r:1 w:1)
-	/// Proof: `Stability::Deposits` (`max_values`: None, `max_size`: Some(880), added: 3355, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::CohortCheckpoints` (r:1 w:3)
-	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
-	fn deposit_no_recovery() -> Weight {
-		// Proof Size summary in bytes:
 		//  Measured:  `5737`
 		//  Estimated: `35772`
 		// Minimum execution time: 382_300_000 picoseconds.
@@ -167,42 +122,14 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(30_u64))
 			.saturating_add(T::DbWeight::get().writes(17_u64))
 	}
-	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
-	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
-	/// Storage: `Timestamp::Now` (r:1 w:0)
-	/// Proof: `Timestamp::Now` (`max_values`: Some(1), `max_size`: Some(8), added: 503, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::Branches` (r:1 w:1)
-	/// Proof: `Vaults::Branches` (`max_values`: None, `max_size`: Some(1387), added: 3862, mode: `MaxEncodedLen`)
-	/// Storage: `MockOracle::Prices` (r:1 w:0)
-	/// Proof: `MockOracle::Prices` (`max_values`: None, `max_size`: Some(634), added: 3109, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::StablecoinDebt` (r:1 w:1)
-	/// Proof: `Vaults::StablecoinDebt` (`max_values`: None, `max_size`: Some(108), added: 2583, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Asset` (r:1 w:1)
-	/// Proof: `Assets::Asset` (`max_values`: None, `max_size`: Some(210), added: 2685, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Pools` (r:1 w:1)
-	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::PoolSumsStore` (r:9 w:1)
-	/// Proof: `Stability::PoolSumsStore` (`max_values`: None, `max_size`: Some(687), added: 3162, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Account` (r:3 w:3)
-	/// Proof: `Assets::Account` (`max_values`: None, `max_size`: Some(134), added: 2609, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Deposits` (r:1 w:1)
-	/// Proof: `Stability::Deposits` (`max_values`: None, `max_size`: Some(880), added: 3355, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::CohortCheckpoints` (r:1 w:3)
-	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsHolder::BalancesOnHold` (r:1 w:0)
-	/// Proof: `AssetsHolder::BalancesOnHold` (`max_values`: None, `max_size`: Some(84), added: 2559, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsFreezer::FrozenBalances` (r:1 w:0)
-	/// Proof: `AssetsFreezer::FrozenBalances` (`max_values`: None, `max_size`: Some(84), added: 2559, mode: `MaxEncodedLen`)
-	/// Storage: `System::Account` (r:1 w:1)
-	/// Proof: `System::Account` (`max_values`: None, `max_size`: Some(128), added: 2603, mode: `MaxEncodedLen`)
 	fn request_withdraw() -> Weight {
 		// Proof Size summary in bytes:
-		//  Measured:  `5277`
-		//  Estimated: `29448`
-		// Minimum execution time: 328_310_000 picoseconds.
-		Weight::from_parts(339_930_000, 29448)
-			.saturating_add(T::DbWeight::get().reads(24_u64))
-			.saturating_add(T::DbWeight::get().writes(13_u64))
+		//  Measured:  `4294`
+		//  Estimated: `35772`
+		// Minimum execution time: 277_889_000 picoseconds.
+		Weight::from_parts(292_410_000, 35772)
+			.saturating_add(T::DbWeight::get().reads(22_u64))
+			.saturating_add(T::DbWeight::get().writes(11_u64))
 	}
 	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
 	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
@@ -270,67 +197,6 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 		// Minimum execution time: 268_329_000 picoseconds.
 		Weight::from_parts(281_390_000, 35772)
 			.saturating_add(T::DbWeight::get().reads(22_u64))
-	}
-	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
-	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
-	/// Storage: `Timestamp::Now` (r:1 w:0)
-	/// Proof: `Timestamp::Now` (`max_values`: Some(1), `max_size`: Some(8), added: 503, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::Branches` (r:1 w:0)
-	/// Proof: `Vaults::Branches` (`max_values`: None, `max_size`: Some(1387), added: 3862, mode: `MaxEncodedLen`)
-	/// Storage: `MockOracle::Prices` (r:1 w:0)
-	/// Proof: `MockOracle::Prices` (`max_values`: None, `max_size`: Some(634), added: 3109, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::StablecoinDebt` (r:1 w:0)
-	/// Proof: `Vaults::StablecoinDebt` (`max_values`: None, `max_size`: Some(108), added: 2583, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Asset` (r:1 w:0)
-	/// Proof: `Assets::Asset` (`max_values`: None, `max_size`: Some(210), added: 2685, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Pools` (r:1 w:0)
-	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::PoolSumsStore` (r:11 w:0)
-	/// Proof: `Stability::PoolSumsStore` (`max_values`: None, `max_size`: Some(687), added: 3162, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Account` (r:2 w:0)
-	/// Proof: `Assets::Account` (`max_values`: None, `max_size`: Some(134), added: 2609, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Deposits` (r:1 w:0)
-	/// Proof: `Stability::Deposits` (`max_values`: None, `max_size`: Some(880), added: 3355, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::CohortCheckpoints` (r:1 w:0)
-	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
-	fn request_withdraw_exhausted() -> Weight {
-		// Proof Size summary in bytes:
-		//  Measured:  `4294`
-		//  Estimated: `35772`
-		// Minimum execution time: 277_061_000 picoseconds.
-		Weight::from_parts(292_851_000, 35772)
-			.saturating_add(T::DbWeight::get().reads(22_u64))
-	}
-	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
-	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
-	/// Storage: `Timestamp::Now` (r:1 w:0)
-	/// Proof: `Timestamp::Now` (`max_values`: Some(1), `max_size`: Some(8), added: 503, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::Branches` (r:1 w:1)
-	/// Proof: `Vaults::Branches` (`max_values`: None, `max_size`: Some(1387), added: 3862, mode: `MaxEncodedLen`)
-	/// Storage: `MockOracle::Prices` (r:1 w:0)
-	/// Proof: `MockOracle::Prices` (`max_values`: None, `max_size`: Some(634), added: 3109, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::StablecoinDebt` (r:1 w:1)
-	/// Proof: `Vaults::StablecoinDebt` (`max_values`: None, `max_size`: Some(108), added: 2583, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Asset` (r:1 w:1)
-	/// Proof: `Assets::Asset` (`max_values`: None, `max_size`: Some(210), added: 2685, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Pools` (r:1 w:1)
-	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::PoolSumsStore` (r:11 w:1)
-	/// Proof: `Stability::PoolSumsStore` (`max_values`: None, `max_size`: Some(687), added: 3162, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Account` (r:2 w:2)
-	/// Proof: `Assets::Account` (`max_values`: None, `max_size`: Some(134), added: 2609, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Deposits` (r:1 w:1)
-	/// Proof: `Stability::Deposits` (`max_values`: None, `max_size`: Some(880), added: 3355, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::CohortCheckpoints` (r:1 w:3)
-	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
-	fn request_withdraw_safety() -> Weight {
-		// Proof Size summary in bytes:
-		//  Measured:  `4294`
-		//  Estimated: `35772`
-		// Minimum execution time: 277_889_000 picoseconds.
-		Weight::from_parts(292_410_000, 35772)
-			.saturating_add(T::DbWeight::get().reads(22_u64))
-			.saturating_add(T::DbWeight::get().writes(11_u64))
 	}
 	/// Storage: `Stability::Pools` (r:1 w:1)
 	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
@@ -522,6 +388,12 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(2_u64))
 			.saturating_add(T::DbWeight::get().writes(1_u64))
 	}
+	fn prune_pool_sums(n: u32) -> Weight {
+		Weight::from_parts(25_000_000, 10_000)
+			.saturating_add(Weight::from_parts(5_000_000, 3_162).saturating_mul(n.into()))
+			.saturating_add(T::DbWeight::get().reads(4_u64.saturating_add(n.into())))
+			.saturating_add(T::DbWeight::get().writes(n.into()))
+	}
 }
 
 // For backwards compatibility and tests.
@@ -576,49 +448,6 @@ impl WeightInfo for () {
 	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
 	fn deposit() -> Weight {
 		// Proof Size summary in bytes:
-		//  Measured:  `7268`
-		//  Estimated: `35772`
-		// Minimum execution time: 576_470_000 picoseconds.
-		Weight::from_parts(602_990_000, 35772)
-			.saturating_add(RocksDbWeight::get().reads(38_u64))
-			.saturating_add(RocksDbWeight::get().writes(25_u64))
-	}
-	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
-	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
-	/// Storage: `Timestamp::Now` (r:1 w:0)
-	/// Proof: `Timestamp::Now` (`max_values`: Some(1), `max_size`: Some(8), added: 503, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::Branches` (r:1 w:1)
-	/// Proof: `Vaults::Branches` (`max_values`: None, `max_size`: Some(1387), added: 3862, mode: `MaxEncodedLen`)
-	/// Storage: `MockOracle::Prices` (r:1 w:0)
-	/// Proof: `MockOracle::Prices` (`max_values`: None, `max_size`: Some(634), added: 3109, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::StablecoinDebt` (r:1 w:1)
-	/// Proof: `Vaults::StablecoinDebt` (`max_values`: None, `max_size`: Some(108), added: 2583, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Asset` (r:1 w:1)
-	/// Proof: `Assets::Asset` (`max_values`: None, `max_size`: Some(210), added: 2685, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Pools` (r:1 w:1)
-	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::PoolSumsStore` (r:11 w:1)
-	/// Proof: `Stability::PoolSumsStore` (`max_values`: None, `max_size`: Some(687), added: 3162, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Account` (r:3 w:3)
-	/// Proof: `Assets::Account` (`max_values`: None, `max_size`: Some(134), added: 2609, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsHolder::BalancesOnHold` (r:1 w:1)
-	/// Proof: `AssetsHolder::BalancesOnHold` (`max_values`: None, `max_size`: Some(84), added: 2559, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsFreezer::FrozenBalances` (r:1 w:1)
-	/// Proof: `AssetsFreezer::FrozenBalances` (`max_values`: None, `max_size`: Some(84), added: 2559, mode: `MaxEncodedLen`)
-	/// Storage: `System::Account` (r:1 w:1)
-	/// Proof: `System::Account` (`max_values`: None, `max_size`: Some(128), added: 2603, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsFreezer::Freezes` (r:1 w:1)
-	/// Proof: `AssetsFreezer::Freezes` (`max_values`: None, `max_size`: Some(123), added: 2598, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsHolder::Holds` (r:1 w:1)
-	/// Proof: `AssetsHolder::Holds` (`max_values`: None, `max_size`: Some(483), added: 2958, mode: `MaxEncodedLen`)
-	/// Storage: `LinkedList::ListMetas` (r:2 w:0)
-	/// Proof: `LinkedList::ListMetas` (`max_values`: None, `max_size`: Some(693), added: 3168, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Deposits` (r:1 w:1)
-	/// Proof: `Stability::Deposits` (`max_values`: None, `max_size`: Some(880), added: 3355, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::CohortCheckpoints` (r:1 w:3)
-	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
-	fn deposit_no_recovery() -> Weight {
-		// Proof Size summary in bytes:
 		//  Measured:  `5737`
 		//  Estimated: `35772`
 		// Minimum execution time: 382_300_000 picoseconds.
@@ -626,42 +455,14 @@ impl WeightInfo for () {
 			.saturating_add(RocksDbWeight::get().reads(30_u64))
 			.saturating_add(RocksDbWeight::get().writes(17_u64))
 	}
-	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
-	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
-	/// Storage: `Timestamp::Now` (r:1 w:0)
-	/// Proof: `Timestamp::Now` (`max_values`: Some(1), `max_size`: Some(8), added: 503, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::Branches` (r:1 w:1)
-	/// Proof: `Vaults::Branches` (`max_values`: None, `max_size`: Some(1387), added: 3862, mode: `MaxEncodedLen`)
-	/// Storage: `MockOracle::Prices` (r:1 w:0)
-	/// Proof: `MockOracle::Prices` (`max_values`: None, `max_size`: Some(634), added: 3109, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::StablecoinDebt` (r:1 w:1)
-	/// Proof: `Vaults::StablecoinDebt` (`max_values`: None, `max_size`: Some(108), added: 2583, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Asset` (r:1 w:1)
-	/// Proof: `Assets::Asset` (`max_values`: None, `max_size`: Some(210), added: 2685, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Pools` (r:1 w:1)
-	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::PoolSumsStore` (r:9 w:1)
-	/// Proof: `Stability::PoolSumsStore` (`max_values`: None, `max_size`: Some(687), added: 3162, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Account` (r:3 w:3)
-	/// Proof: `Assets::Account` (`max_values`: None, `max_size`: Some(134), added: 2609, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Deposits` (r:1 w:1)
-	/// Proof: `Stability::Deposits` (`max_values`: None, `max_size`: Some(880), added: 3355, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::CohortCheckpoints` (r:1 w:3)
-	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsHolder::BalancesOnHold` (r:1 w:0)
-	/// Proof: `AssetsHolder::BalancesOnHold` (`max_values`: None, `max_size`: Some(84), added: 2559, mode: `MaxEncodedLen`)
-	/// Storage: `AssetsFreezer::FrozenBalances` (r:1 w:0)
-	/// Proof: `AssetsFreezer::FrozenBalances` (`max_values`: None, `max_size`: Some(84), added: 2559, mode: `MaxEncodedLen`)
-	/// Storage: `System::Account` (r:1 w:1)
-	/// Proof: `System::Account` (`max_values`: None, `max_size`: Some(128), added: 2603, mode: `MaxEncodedLen`)
 	fn request_withdraw() -> Weight {
 		// Proof Size summary in bytes:
-		//  Measured:  `5277`
-		//  Estimated: `29448`
-		// Minimum execution time: 328_310_000 picoseconds.
-		Weight::from_parts(339_930_000, 29448)
-			.saturating_add(RocksDbWeight::get().reads(24_u64))
-			.saturating_add(RocksDbWeight::get().writes(13_u64))
+		//  Measured:  `4294`
+		//  Estimated: `35772`
+		// Minimum execution time: 277_889_000 picoseconds.
+		Weight::from_parts(292_410_000, 35772)
+			.saturating_add(RocksDbWeight::get().reads(22_u64))
+			.saturating_add(RocksDbWeight::get().writes(11_u64))
 	}
 	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
 	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
@@ -729,67 +530,6 @@ impl WeightInfo for () {
 		// Minimum execution time: 268_329_000 picoseconds.
 		Weight::from_parts(281_390_000, 35772)
 			.saturating_add(RocksDbWeight::get().reads(22_u64))
-	}
-	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
-	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
-	/// Storage: `Timestamp::Now` (r:1 w:0)
-	/// Proof: `Timestamp::Now` (`max_values`: Some(1), `max_size`: Some(8), added: 503, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::Branches` (r:1 w:0)
-	/// Proof: `Vaults::Branches` (`max_values`: None, `max_size`: Some(1387), added: 3862, mode: `MaxEncodedLen`)
-	/// Storage: `MockOracle::Prices` (r:1 w:0)
-	/// Proof: `MockOracle::Prices` (`max_values`: None, `max_size`: Some(634), added: 3109, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::StablecoinDebt` (r:1 w:0)
-	/// Proof: `Vaults::StablecoinDebt` (`max_values`: None, `max_size`: Some(108), added: 2583, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Asset` (r:1 w:0)
-	/// Proof: `Assets::Asset` (`max_values`: None, `max_size`: Some(210), added: 2685, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Pools` (r:1 w:0)
-	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::PoolSumsStore` (r:11 w:0)
-	/// Proof: `Stability::PoolSumsStore` (`max_values`: None, `max_size`: Some(687), added: 3162, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Account` (r:2 w:0)
-	/// Proof: `Assets::Account` (`max_values`: None, `max_size`: Some(134), added: 2609, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Deposits` (r:1 w:0)
-	/// Proof: `Stability::Deposits` (`max_values`: None, `max_size`: Some(880), added: 3355, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::CohortCheckpoints` (r:1 w:0)
-	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
-	fn request_withdraw_exhausted() -> Weight {
-		// Proof Size summary in bytes:
-		//  Measured:  `4294`
-		//  Estimated: `35772`
-		// Minimum execution time: 277_061_000 picoseconds.
-		Weight::from_parts(292_851_000, 35772)
-			.saturating_add(RocksDbWeight::get().reads(22_u64))
-	}
-	/// Storage: `AuraExt::RelaySlotInfo` (r:1 w:0)
-	/// Proof: `AuraExt::RelaySlotInfo` (`max_values`: Some(1), `max_size`: Some(12), added: 507, mode: `MaxEncodedLen`)
-	/// Storage: `Timestamp::Now` (r:1 w:0)
-	/// Proof: `Timestamp::Now` (`max_values`: Some(1), `max_size`: Some(8), added: 503, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::Branches` (r:1 w:1)
-	/// Proof: `Vaults::Branches` (`max_values`: None, `max_size`: Some(1387), added: 3862, mode: `MaxEncodedLen`)
-	/// Storage: `MockOracle::Prices` (r:1 w:0)
-	/// Proof: `MockOracle::Prices` (`max_values`: None, `max_size`: Some(634), added: 3109, mode: `MaxEncodedLen`)
-	/// Storage: `Vaults::StablecoinDebt` (r:1 w:1)
-	/// Proof: `Vaults::StablecoinDebt` (`max_values`: None, `max_size`: Some(108), added: 2583, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Asset` (r:1 w:1)
-	/// Proof: `Assets::Asset` (`max_values`: None, `max_size`: Some(210), added: 2685, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Pools` (r:1 w:1)
-	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::PoolSumsStore` (r:11 w:1)
-	/// Proof: `Stability::PoolSumsStore` (`max_values`: None, `max_size`: Some(687), added: 3162, mode: `MaxEncodedLen`)
-	/// Storage: `Assets::Account` (r:2 w:2)
-	/// Proof: `Assets::Account` (`max_values`: None, `max_size`: Some(134), added: 2609, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::Deposits` (r:1 w:1)
-	/// Proof: `Stability::Deposits` (`max_values`: None, `max_size`: Some(880), added: 3355, mode: `MaxEncodedLen`)
-	/// Storage: `Stability::CohortCheckpoints` (r:1 w:3)
-	/// Proof: `Stability::CohortCheckpoints` (`max_values`: None, `max_size`: Some(770), added: 3245, mode: `MaxEncodedLen`)
-	fn request_withdraw_safety() -> Weight {
-		// Proof Size summary in bytes:
-		//  Measured:  `4294`
-		//  Estimated: `35772`
-		// Minimum execution time: 277_889_000 picoseconds.
-		Weight::from_parts(292_410_000, 35772)
-			.saturating_add(RocksDbWeight::get().reads(22_u64))
-			.saturating_add(RocksDbWeight::get().writes(11_u64))
 	}
 	/// Storage: `Stability::Pools` (r:1 w:1)
 	/// Proof: `Stability::Pools` (`max_values`: None, `max_size`: Some(971), added: 3446, mode: `MaxEncodedLen`)
@@ -980,5 +720,11 @@ impl WeightInfo for () {
 		Weight::from_parts(29_621_000, 4852)
 			.saturating_add(RocksDbWeight::get().reads(2_u64))
 			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	fn prune_pool_sums(n: u32) -> Weight {
+		Weight::from_parts(25_000_000, 10_000)
+			.saturating_add(Weight::from_parts(5_000_000, 3_162).saturating_mul(n.into()))
+			.saturating_add(RocksDbWeight::get().reads(4_u64.saturating_add(n.into())))
+			.saturating_add(RocksDbWeight::get().writes(n.into()))
 	}
 }

@@ -32,11 +32,7 @@ fn deposit_moves_funds_and_queues_pending() {
 			assert_eq!(state.total_pending_deposits, 400);
 			assert_eq!(state.total_active_deposits, 0);
 
-			System::assert_last_event(market_event!(DepositReceived {
-				depositor: 1,
-				amount: 400,
-				pending_amount: 400,
-			}));
+			System::assert_last_event(market_event!(DepositReceived { depositor: 1, amount: 400 }));
 		});
 }
 
@@ -81,11 +77,7 @@ fn second_deposit_merges_and_resets_delay() {
 			);
 			assert_eq!(state.total_pending_deposits, 900);
 
-			System::assert_last_event(market_event!(DepositReceived {
-				depositor: 1,
-				amount: 300,
-				pending_amount: 300,
-			}));
+			System::assert_last_event(market_event!(DepositReceived { depositor: 1, amount: 300 }));
 		});
 }
 

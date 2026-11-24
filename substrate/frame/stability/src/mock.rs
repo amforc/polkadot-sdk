@@ -11,7 +11,6 @@
 use alloc::collections::BTreeMap;
 
 use crate as pallet_stability;
-use crate::types::PoolPrecision;
 pub use crate::types::{
 	Accumulators, CohortId, Deposit, DepositSnapshot, Leg, PendingDeposit, PoolSums,
 	StabilityPoolConfig,
@@ -583,10 +582,6 @@ pub fn default_pool_config() -> StabilityPoolConfig<Balance> {
 		minimum_active_pool_balance: 100,
 		entry_delay: 5_000,
 		safety_withdrawal_delay: 600_000,
-		precision: PoolPrecision {
-			p_min: FixedU128::from_inner(1_000_000_000),
-			scale_factor: 1_000_000_000,
-		},
 		yield_share: Permill::from_percent(75),
 	}
 }
@@ -827,7 +822,7 @@ pub fn deposit(
 	stable: StableId,
 	amount: Balance,
 ) -> DispatchResult {
-	without_post_info(Stability::deposit(RuntimeOrigin::signed(who), collateral, stable, amount))
+	Stability::deposit(RuntimeOrigin::signed(who), collateral, stable, amount)
 }
 
 /// Requests a withdrawal, signed by `who`.
@@ -837,12 +832,17 @@ pub fn request_withdraw(
 	stable: StableId,
 	amount: Balance,
 ) -> DispatchResult {
-	without_post_info(Stability::request_withdraw(
-		RuntimeOrigin::signed(who),
-		collateral,
-		stable,
-		amount,
-	))
+	Stability::request_withdraw(RuntimeOrigin::signed(who), collateral, stable, amount)
+}
+
+/// Prunes up to `limit` historical `PoolSumsStore` rows of an empty pool.
+pub fn prune_pool_sums(
+	who: AccountId,
+	collateral: AssetId,
+	stable: StableId,
+	limit: u32,
+) -> DispatchResult {
+	Stability::prune_pool_sums(RuntimeOrigin::signed(who), collateral, stable, limit)
 }
 
 /// Withdraws to a named recipient, signed by `who`.

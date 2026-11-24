@@ -38,8 +38,7 @@
 //! [`Pallet::compound_yield`] to expose it to pool risk again.
 //!
 //! Branch interest accrues lazily and is shared out when it is issued. Before a deposit,
-//! withdrawal request, withdrawal, yield claim, or compounding changes the active capital, the
-//! pallet asks
+//! withdrawal, yield claim, or compounding changes the active capital, the pallet asks
 //! [`Config::BranchInterface`] to issue the interest accrued so far, so it reaches the capital
 //! that earned it.
 //!
@@ -67,11 +66,8 @@
 //!
 //! Any signed account can use [`Pallet::offset_recovery`] to settle active pool stablecoin against
 //! the queue head when its price is at or above par. The active depositors receive the collateral.
-//!
-//! [`Pallet::deposit`] applies the same policy before it adds the unused stablecoin to the pool.
-//! The depositor receives collateral for the settled part. A below-par queue head disables pool
-//! recovery offsets and rejects deposits because discounted settlement belongs to the redemption
-//! path.
+//! A below-par queue head disables pool recovery offsets because discounted settlement belongs to
+//! the redemption path.
 //!
 //! ## Pallet API
 //!
@@ -90,8 +86,6 @@
 //! because they have different risk priority.
 //!
 //! Scale and epoch boundaries protect precision when offsets make `P` small or consume a pool.
-//! Governance cannot change precision parameters after registration because stored deposit
-//! snapshots depend on them.
 //!
 //! ### Custody and rounding
 //!
@@ -137,7 +131,7 @@ pub mod pallet {
 		dispatchable_impls::ClaimKind,
 		types::{
 			CohortCheckpoint, CohortId, Deposit, Leg, LegCoords, PoolState, PoolSums,
-			RecoveryOffsetSource, StabilityPool, StabilityPoolConfig,
+			StabilityPool, StabilityPoolConfig,
 		},
 	};
 	#[cfg(feature = "runtime-benchmarks")]
@@ -157,6 +151,10 @@ pub mod pallet {
 	use stablecoin_primitives::{
 		BranchInterface, Millis, OnBranchLifecycle, RecoveryOffsetInterface,
 	};
+
+	/// Maximum number of historical `PoolSumsStore` rows pruned by one [`Pallet::prune_pool_sums`]
+	/// call.
+	pub const MAX_PRUNE_SUMS: u32 = 64;
 
 	/// Balance type shared by the stablecoin and collateral asset systems.
 	pub type BalanceOf<T> =
@@ -321,15 +319,13 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// Stablecoin entered the pool. `pending_amount` entered the pending deposit or the active
-		/// pool when the delay was zero. The rest of `amount` settled `FinalRecovery` debt, which
-		/// [`Event::RecoveryOffsetApplied`] marks.
+		/// Stablecoin entered the pool (either the pending deposit or the active pool when the
+		/// entry delay was zero).
 		DepositReceived {
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			depositor: T::AccountId,
 			amount: BalanceOf<T>,
-			pending_amount: BalanceOf<T>,
 		},
 		/// A maturity cohort passed its deadline, and the capital that remained joined the active
 		/// pool. Member rows record their shares later. See [`Event::PendingDepositActivated`].
@@ -406,16 +402,11 @@ pub mod pallet {
 			active: Option<LegCoords>,
 			pending: Option<LegCoords>,
 		},
-		/// Stablecoin settled the head of the `FinalRecovery` queue. `source` identifies the
-		/// capital that paid and therefore the owner of the collateral gain.
+		/// Active pool stablecoin settled the head of the `FinalRecovery` queue.
 		///
 		/// The branch engine reports the settled vault, the debt burned, and the collateral
 		/// gained.
-		RecoveryOffsetApplied {
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			source: RecoveryOffsetSource,
-		},
+		RecoveryOffsetApplied { collateral_id: CollateralIdOf<T>, stable_id: StableIdOf<T> },
 		/// An authorized origin replaced the pool parameters of a branch.
 		StabilityPoolConfigUpdated {
 			collateral_id: CollateralIdOf<T>,
@@ -476,9 +467,8 @@ pub mod pallet {
 		OffsetSettlementFailed,
 		/// This branch has no vault in `FinalRecovery`.
 		RecoveryVaultNotFound,
-		/// The head of the `FinalRecovery` queue is below par, so the pool rejects deposits and
-		/// offers no recovery offset. Settlement at a discount stays exclusive to the redemption
-		/// path.
+		/// The head of the `FinalRecovery` queue is below par, so the pool offers no recovery
+		/// offset. Settlement at a discount stays exclusive to the redemption path.
 		RecoveryOffsetBelowPar,
 		/// The recovery offset is zero because the active pool is empty, the floor applies, or the
 		/// request is zero.
@@ -494,15 +484,18 @@ pub mod pallet {
 		CustodySeedUnavailable,
 		/// The branch creator cannot receive the custody float back at branch removal.
 		CustodyRefundFailed,
-		/// The `precision` parameters differ from their registered values. Stored snapshots depend
-		/// on those values and would produce incorrect amounts after a change.
-		AccumulatorParamsImmutable,
 		/// The pool still has deposit rows. Remove all user positions before branch removal.
 		PoolNotEmpty,
 		/// A sums row required by the pool's accumulator coordinates is absent.
 		AccumulatorRowMissing,
 		/// The withdrawal request expired. A new [`Pallet::request_withdraw`] is required.
 		WithdrawalRequestExpired,
+		/// Withdrawal requests are only needed in Safety mode; call [`Pallet::withdraw`] directly
+		/// in Normal mode.
+		NotInSafetyMode,
+		/// Historical `PoolSumsStore` rows remain for this branch. Call
+		/// [`Pallet::prune_pool_sums`] before branch removal.
+		PoolSumsNotCleared,
 	}
 
 	#[pallet::hooks]
@@ -554,26 +547,22 @@ pub mod pallet {
 		///
 		/// ## Details
 		///
-		/// The call first applies [`Config::RecoveryOffsets`] to the queue head. The settled part
-		/// gives claimable collateral to the depositor and does not enter the pool.
-		///
-		/// The remainder enters a maturity cohort. Its activation wait is in
+		/// The deposit enters a maturity cohort. Its activation wait is in
 		/// `[entry_delay, 2 * entry_delay)`, unless the delay is zero. A new deposit restarts the
 		/// wait for all pending capital of the depositor.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::deposit().max(T::WeightInfo::deposit_no_recovery()))]
+		#[pallet::weight(T::WeightInfo::deposit())]
 		pub fn deposit(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
-		) -> DispatchResultWithPostInfo {
+		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_deposit(who, collateral_id, stable_id, amount)
 		}
 
-		/// Request a withdrawal of up to `amount` active stablecoin.
+		/// Request a Safety-mode withdrawal of up to `amount` active stablecoin.
 		///
 		/// ## Dispatch Origin
 		///
@@ -585,21 +574,16 @@ pub mod pallet {
 		/// after another delay of the same length. A zero delay disables expiry.
 		/// A new request replaces the current request.
 		///
-		/// Normal mode does not need a request, so this call immediately pays the caller.
+		/// Normal mode requires no request; call [`Pallet::withdraw`] directly.
 		#[pallet::call_index(1)]
-		#[pallet::weight(
-			T::WeightInfo::request_withdraw()
-				.max(T::WeightInfo::request_withdraw_exhausted())
-				.max(T::WeightInfo::request_withdraw_safety())
-		)]
+		#[pallet::weight(T::WeightInfo::request_withdraw())]
 		pub fn request_withdraw(
 			origin: OriginFor<T>,
 			collateral_id: CollateralIdOf<T>,
 			stable_id: StableIdOf<T>,
 			amount: BalanceOf<T>,
-		) -> DispatchResultWithPostInfo {
+		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_request_withdraw(who, collateral_id, stable_id, amount)
 		}
 
@@ -629,7 +613,6 @@ pub mod pallet {
 		) -> DispatchResultWithPostInfo {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
-			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_withdraw(who, collateral_id, stable_id, amount, recipient)
 		}
 
@@ -677,7 +660,6 @@ pub mod pallet {
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 			let recipient = recipient.unwrap_or_else(|| who.clone());
-			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_claim(who, collateral_id, stable_id, recipient, ClaimKind::Yield)
 		}
 
@@ -726,7 +708,6 @@ pub mod pallet {
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			T::BranchInterface::accrue_interest(&collateral_id, &stable_id)?;
 			Self::do_compound_yield(who, collateral_id, stable_id, amount)
 		}
 
@@ -760,11 +741,6 @@ pub mod pallet {
 		/// ## Dispatch Origin
 		///
 		/// The dispatch origin of this call must satisfy [`Config::UpdateOrigin`] for the branch.
-		///
-		/// ## Details
-		///
-		/// The `precision` parameters must equal the registered values. Stored deposit snapshots
-		/// depend on those values. See [`Error::AccumulatorParamsImmutable`].
 		#[pallet::call_index(8)]
 		#[pallet::weight(T::WeightInfo::set_stability_pool_config())]
 		pub fn set_stability_pool_config(
@@ -775,6 +751,30 @@ pub mod pallet {
 		) -> DispatchResult {
 			T::UpdateOrigin::ensure_origin(origin, &(collateral_id.clone(), stable_id.clone()))?;
 			Self::do_set_stability_pool_config(collateral_id, stable_id, config)
+		}
+
+		/// Remove up to `limit` (capped at [`MAX_PRUNE_SUMS`]) historical [`PoolSumsStore`] rows
+		/// of an empty pool so branch removal stays bounded.
+		///
+		/// ## Dispatch Origin
+		///
+		/// The dispatch origin of this call must be signed. Any account may call it.
+		///
+		/// ## Details
+		///
+		/// Requires the branch to hold no deposit rows so no stored snapshot can refer to any
+		/// historical sums row. Both live `(epoch, scale)` rows are preserved so the pool remains
+		/// operational if new deposits arrive before branch removal.
+		#[pallet::call_index(9)]
+		#[pallet::weight(T::WeightInfo::prune_pool_sums((*limit).min(MAX_PRUNE_SUMS)))]
+		pub fn prune_pool_sums(
+			origin: OriginFor<T>,
+			collateral_id: CollateralIdOf<T>,
+			stable_id: StableIdOf<T>,
+			limit: u32,
+		) -> DispatchResult {
+			ensure_signed(origin)?;
+			Self::do_prune_pool_sums(collateral_id, stable_id, limit)
 		}
 	}
 
@@ -964,20 +964,31 @@ pub mod pallet {
 				)?;
 
 			Pools::<T>::remove(collateral_id, stable_id);
-			// Safe to clear in full: with no deposit rows, no snapshot on either leg can still
-			// refer to a sums row, and no row can reference a cohort checkpoint.
-			let removal = PoolSumsStore::<T>::clear_prefix(
-				(collateral_id.clone(), stable_id.clone()),
-				u32::MAX,
-				None,
+			// Remove the two live sums rows in O(1); any historical rows must be pruned beforehand
+			// with `prune_pool_sums` so branch removal stays bounded.
+			for leg in Leg::ALL {
+				let coords = pool.state.coords(leg);
+				PoolSumsStore::<T>::remove((
+					collateral_id,
+					stable_id,
+					leg,
+					coords.epoch,
+					coords.scale,
+				));
+			}
+			ensure!(
+				!PoolSumsStore::<T>::contains_prefix((collateral_id.clone(), stable_id.clone())),
+				Error::<T>::PoolSumsNotCleared
 			);
-			debug_assert!(removal.maybe_cursor.is_none());
-			let removal = CohortCheckpoints::<T>::clear_prefix(
-				(collateral_id.clone(), stable_id.clone()),
-				u32::MAX,
-				None,
+			// Every checkpoint counts at least one stored deposit row, so an empty deposit map
+			// implies no checkpoints remain.
+			ensure!(
+				!CohortCheckpoints::<T>::contains_prefix((
+					collateral_id.clone(),
+					stable_id.clone(),
+				)),
+				Error::<T>::PoolNotEmpty
 			);
-			debug_assert!(removal.maybe_cursor.is_none());
 
 			if frame_system::Pallet::<T>::providers(&pool_account) > 0 {
 				// The release emptied the branch's own assets, but a third party may have parked
@@ -999,9 +1010,6 @@ pub mod pallet {
 		}
 
 		/// Returns valid parameters that do not add unrelated limits to a benchmark.
-		///
-		/// `p_min * scale_factor` equals one, which is the maximum product that
-		/// [`types::PoolPrecision::is_valid`] accepts.
 		#[cfg(feature = "runtime-benchmarks")]
 		fn benchmark_registration_config(_stablecoin_markets: u32) -> Self::RegistrationConfig {
 			StabilityPoolConfig {
@@ -1009,10 +1017,6 @@ pub mod pallet {
 				minimum_active_pool_balance: BalanceOf::<T>::one(),
 				entry_delay: 0,
 				safety_withdrawal_delay: 0,
-				precision: crate::types::PoolPrecision {
-					p_min: FixedU128::from_inner(1_000_000_000),
-					scale_factor: 1_000_000_000,
-				},
 				yield_share: Permill::from_percent(75),
 			}
 		}
