@@ -570,6 +570,34 @@ mod benchmarks {
 		Ok(())
 	}
 
+	/// [`deposit`](Pallet::deposit) with an empty `FinalRecovery` queue, which it refunds to.
+	#[benchmark]
+	fn deposit_no_recovery() -> Result<(), BenchmarkError> {
+		let seed = seed_refresh::<T>(Principal::None)?;
+		let market = &seed.market;
+		let amount = balance::<T>(COHORT_DEPOSIT);
+		assert!(market.stable_balance(&seed.owner).is_zero());
+		T::StableAssets::mint_into(market.stable_id.clone(), &seed.owner, amount)?;
+		let yield_before = market.live_yield_sum()?;
+
+		#[extrinsic_call]
+		deposit(
+			RawOrigin::Signed(seed.owner.clone()),
+			market.collateral_id.clone(),
+			market.stable_id.clone(),
+			amount,
+		);
+
+		assert_refreshed::<T>(&seed)?;
+		let (cohort, _) = market.pending_cohort(&seed.owner)?;
+		assert!(!seed.due_cohorts.contains(&cohort));
+		let row = market.deposit_row(&seed.owner)?;
+		assert_eq!(row.pending_deposit.map(|pending| pending.amount), Some(amount));
+		assert!(market.stable_balance(&seed.owner).is_zero());
+		assert!(market.live_yield_sum()? > yield_before);
+		Ok(())
+	}
+
 	/// In Normal mode the request pays out at once, as a full withdrawal.
 	#[benchmark]
 	fn request_withdraw() -> Result<(), BenchmarkError> {
