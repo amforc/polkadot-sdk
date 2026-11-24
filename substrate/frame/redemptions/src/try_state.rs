@@ -37,9 +37,7 @@ mod tests {
 	use super::do_try_state;
 	use crate::{mock::*, RedemptionInfo, Stablecoins};
 	use frame::{
-		arithmetic::{FixedU128, Zero},
-		deps::sp_runtime::DispatchError,
-		testing_prelude::hypothetically,
+		arithmetic::Permill, deps::sp_runtime::DispatchError, testing_prelude::hypothetically,
 	};
 
 	// Each corruption that no write path can produce must trip its own check, with the message
@@ -85,10 +83,7 @@ mod tests {
 	fn detects_a_stored_invalid_config() {
 		assert_detects("stored redemption config fails `is_valid`", || {
 			Stablecoins::<Test>::mutate(STABLE, |info| {
-				info.as_mut().expect("STABLE is registered").config.dynamic_fee_ceiling =
-					FixedU128::zero();
-				info.as_mut().expect("STABLE is registered").config.dynamic_fee_floor =
-					FixedU128::from_rational(1, 100);
+				info.as_mut().expect("STABLE is registered").config.fee_ceiling = Permill::zero();
 			})
 		});
 	}

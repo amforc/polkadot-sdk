@@ -40,7 +40,7 @@ fn decay_dynamic_fee(dynamic_fee: FixedU128, elapsed_ms: u64, period_ms: u64) ->
 }
 
 impl RedemptionState {
-	/// Gets the dynamic fee at `now` after time decay and application of the policy bounds.
+	/// Gets the dynamic fee at `now` after time decay, within the policy's current ceiling.
 	pub(crate) fn dynamic_fee_at<Balance>(
 		&self,
 		now: Millis,
@@ -51,8 +51,7 @@ impl RedemptionState {
 			now.saturating_sub(self.last_fee_operation),
 			config.dynamic_fee_decay_period,
 		)
-		.max(config.dynamic_fee_floor)
-		.min(config.dynamic_fee_ceiling)
+		.min(config.dynamic_fee_ceiling())
 	}
 }
 /// The model behind an ordinary redemption's fee.
@@ -63,18 +62,16 @@ impl RedemptionState {
 /// is the arrival rate plus half of the rise, applied to the whole amount.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DynamicFeeCurve {
-	/// Dynamic fee at the start of the redemption, after decay and policy bounds.
+	/// Dynamic fee at the start of the redemption, after decay and within the ceiling.
 	decayed: FixedU128,
 	/// Stablecoin-wide debt before the redemption.
 	debt: u128,
 	/// Divisor applied to the redeemed share before that share increases the dynamic fee.
 	divisor: FixedU128,
-	/// Caps the stored dynamic fee.
+	/// Caps the dynamic fee, stored and charged: the fee ceiling less the base fee.
 	dynamic_fee_ceiling: FixedU128,
 	/// Constant component that each unit pays.
 	base_fee: Permill,
-	/// Maximum charged rate, including the base fee.
-	fee_ceiling: Permill,
 }
 
 impl DynamicFeeCurve {
@@ -91,9 +88,8 @@ impl DynamicFeeCurve {
 			decayed,
 			debt: debt.try_into().map_err(|_| ArithmeticError::Overflow)?,
 			divisor: config.dynamic_fee_increase_divisor,
-			dynamic_fee_ceiling: config.dynamic_fee_ceiling,
+			dynamic_fee_ceiling: config.dynamic_fee_ceiling(),
 			base_fee: config.base_fee,
-			fee_ceiling: config.fee_ceiling,
 		})
 	}
 
@@ -120,7 +116,7 @@ impl DynamicFeeCurve {
 		self.decayed.checked_add(&self.rise(redeemed)?)
 	}
 
-	/// Returns the dynamic fee at the start of the redemption, after decay and policy bounds.
+	/// Returns the dynamic fee at the start of the redemption, after decay and within the ceiling.
 	pub fn decayed_dynamic_fee(&self) -> FixedU128 {
 		self.decayed
 	}
@@ -134,19 +130,16 @@ impl DynamicFeeCurve {
 
 	/// Calculates the rate that `redeemed` pays.
 	///
-	/// The rate is the base fee plus the mean dynamic fee during the redemption, limited by the fee
-	/// ceiling.
+	/// The rate is the base fee plus the mean dynamic fee during the redemption. The dynamic
+	/// ceiling keeps it within the fee ceiling.
 	fn charged_rate(&self, redeemed: u128) -> FixedU128 {
-		// The dynamic component uses the lower of its ceiling and the fee-ceiling space above the
-		// base fee.
-		let ceiling = self
-			.dynamic_fee_ceiling
-			.min(self.fee_ceiling.saturating_sub(self.base_fee).into());
 		let average = match self.dynamic_fee_after(redeemed) {
-			Some(terminal) if terminal <= ceiling => midpoint(self.decayed, terminal),
-			_ => self.capped_average_dynamic_fee(redeemed, ceiling),
+			Some(terminal) if terminal <= self.dynamic_fee_ceiling => {
+				midpoint(self.decayed, terminal)
+			},
+			_ => self.capped_average_dynamic_fee(redeemed),
 		};
-		fee_rate(average, self.base_fee, self.fee_ceiling)
+		fee_rate(average, self.base_fee)
 	}
 
 	/// Calculates the fee that `redeemed` pays and rounds it up.
@@ -154,11 +147,12 @@ impl DynamicFeeCurve {
 		redemption_fee(redeemed, self.charged_rate(redeemed.unique_saturated_into()))
 	}
 
-	/// Calculates the mean dynamic fee when redemption of `redeemed` reaches `ceiling`.
+	/// Calculates the mean dynamic fee when redemption of `redeemed` reaches the ceiling.
 	///
 	/// The dynamic fee reaches the ceiling after the fraction `(ceiling − decayed) / rise` of the
 	/// redemption. That fraction pays the mean of its climb, and the rest pays the ceiling.
-	fn capped_average_dynamic_fee(&self, redeemed: u128, ceiling: FixedU128) -> FixedU128 {
+	fn capped_average_dynamic_fee(&self, redeemed: u128) -> FixedU128 {
+		let ceiling = self.dynamic_fee_ceiling;
 		let headroom = ceiling.saturating_sub(self.decayed);
 		// A zero divisor reaches the ceiling at once. An arrival at or above the ceiling has no
 		// climb.
@@ -178,11 +172,12 @@ fn midpoint(a: FixedU128, b: FixedU128) -> FixedU128 {
 	FixedU128::from_inner(a.into_inner().midpoint(b.into_inner()))
 }
 
-/// Calculates `min(dynamic_fee + base_fee, fee_ceiling)`.
+/// Calculates `dynamic_fee + base_fee`.
 ///
-/// The `Permill` bounds convert without loss to the fixed-point domain of the dynamic fee.
-pub fn fee_rate(dynamic_fee: FixedU128, base_fee: Permill, fee_ceiling: Permill) -> FixedU128 {
-	dynamic_fee.saturating_add(base_fee.into()).min(fee_ceiling.into())
+/// A dynamic fee within its ceiling keeps the sum within the fee ceiling. The `Permill` base fee
+/// converts without loss to the fixed-point domain of the dynamic fee.
+pub fn fee_rate(dynamic_fee: FixedU128, base_fee: Permill) -> FixedU128 {
+	dynamic_fee.saturating_add(base_fee.into())
 }
 
 fn redemption_fee<Balance: FixedPointOperand>(
@@ -253,13 +248,12 @@ mod tests {
 
 	/// Builds the default test policy.
 	///
-	/// The policy uses each unit's full share, a 0.5% base fee, and 100% ceilings that do not bind.
+	/// The policy uses each unit's full share, a 0.5% base fee, and a 100% fee ceiling, which
+	/// leaves the dynamic fee a 99.5% ceiling.
 	fn curve(decayed: FixedU128, debt: u128) -> DynamicFeeCurve {
 		let config = RedemptionConfig {
 			minimum_redemption_amount: 1,
 			dynamic_fee_decay_period: 6 * HOUR,
-			dynamic_fee_floor: FixedU128::zero(),
-			dynamic_fee_ceiling: FixedU128::one(),
 			base_fee: Permill::from_rational(5u32, 1_000u32),
 			fee_ceiling: Permill::one(),
 			dynamic_fee_increase_divisor: FixedU128::one(),
@@ -333,10 +327,8 @@ mod tests {
 		let config = RedemptionConfig {
 			minimum_redemption_amount: 1u128,
 			dynamic_fee_decay_period: 6 * HOUR,
-			dynamic_fee_floor: FixedU128::from_rational(1, 10),
-			dynamic_fee_ceiling: FixedU128::from_rational(2, 5),
 			base_fee: Permill::zero(),
-			fee_ceiling: Permill::one(),
+			fee_ceiling: Permill::from_percent(40),
 			dynamic_fee_increase_divisor: FixedU128::one(),
 			final_recovery_bonus_buffer: Permill::zero(),
 		};
@@ -346,10 +338,9 @@ mod tests {
 		};
 
 		assert_eq!(state.dynamic_fee_at(7 * HOUR, &config), FixedU128::from_rational(1, 4));
-		assert_eq!(state.dynamic_fee_at(19 * HOUR, &config), config.dynamic_fee_floor);
 		// A clock before the last operation causes no decay. The bounds still apply.
-		assert_eq!(state.dynamic_fee_at(0, &config), config.dynamic_fee_ceiling);
-		assert_eq!(state.dynamic_fee_at(HOUR - 1, &config), config.dynamic_fee_ceiling);
+		assert_eq!(state.dynamic_fee_at(0, &config), FixedU128::from_rational(2, 5));
+		assert_eq!(state.dynamic_fee_at(HOUR - 1, &config), FixedU128::from_rational(2, 5));
 	}
 
 	#[test]
@@ -406,9 +397,9 @@ mod tests {
 	#[test]
 	fn full_and_over_full_redemptions_rise_by_the_divisor_reciprocal() {
 		let mut curve = curve(FixedU128::zero(), 1_000);
-		assert_eq!(curve.raised_dynamic_fee(1_000), FixedU128::one());
-		assert_eq!(curve.raised_dynamic_fee(2_000), FixedU128::one());
 		// The fee ceiling stops the dynamic climb at 99.5%, so the whole coin pays 50.49875%.
+		assert_eq!(curve.raised_dynamic_fee(1_000), FixedU128::from_rational(995, 1_000));
+		assert_eq!(curve.raised_dynamic_fee(2_000), FixedU128::from_rational(995, 1_000));
 		assert_eq!(curve.charged_rate(1_000), FixedU128::from_rational(40_399, 80_000));
 		assert_eq!(curve.fee(1_000u128), 505);
 		assert_eq!(curve.charged_rate(2_000), curve.charged_rate(1_000));
@@ -430,42 +421,7 @@ mod tests {
 		assert_eq!(empty.raised_dynamic_fee(0), whole.raised_dynamic_fee(1_000));
 		assert_eq!(empty.charged_rate(1), whole.charged_rate(1_000));
 		assert_eq!(empty.fee(1_000u128), whole.fee(1_000u128));
-		assert_eq!(empty.raised_dynamic_fee(1), FixedU128::one());
-	}
-
-	// These tests tweak the policy of a 1_000-debt curve so that a ceiling binds from the first
-	// unit. The charged rate is the ceiling, while the stored dynamic fee still follows its own
-	// climb and ceiling.
-
-	/// The 20% fee ceiling includes the base fee and binds while the dynamic component still
-	/// climbs toward 100%.
-	#[test]
-	fn fee_ceiling_binds_while_the_dynamic_fee_still_climbs() {
-		let mut curve = curve(FixedU128::from_rational(30, 100), 1_000);
-		curve.fee_ceiling = Permill::from_percent(20);
-		assert_eq!(curve.charged_rate(500), FixedU128::from_rational(20, 100));
-		assert_eq!(curve.raised_dynamic_fee(500), FixedU128::from_rational(80, 100));
-	}
-
-	/// The policy permits a base fee equal to the fee ceiling but rejects an inverted range. The
-	/// charged rate stays at the fee ceiling while the stored fee climbs.
-	#[test]
-	fn base_fee_equal_to_the_fee_ceiling_charges_the_ceiling() {
-		let mut curve = curve(FixedU128::zero(), 1_000);
-		curve.fee_ceiling = Permill::from_rational(5u32, 1_000u32);
-		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(5, 1_000));
-		assert_eq!(curve.fee(400u128), 2);
-		assert_eq!(curve.raised_dynamic_fee(400), FixedU128::from_rational(40, 100));
-	}
-
-	#[test]
-	fn base_fee_above_the_fee_ceiling_is_clamped_to_the_ceiling() {
-		let mut curve = curve(FixedU128::zero(), 1_000);
-		curve.base_fee = Permill::from_percent(2);
-		curve.fee_ceiling = Permill::from_percent(1);
-		assert_eq!(curve.charged_rate(400), FixedU128::from_rational(1, 100));
-		assert_eq!(curve.fee(400u128), 4);
-		assert_eq!(curve.raised_dynamic_fee(400), FixedU128::from_rational(40, 100));
+		assert_eq!(empty.raised_dynamic_fee(1), FixedU128::from_rational(995, 1_000));
 	}
 
 	/// Policy validation rejects a zero divisor, which the curve treats as an infinite
@@ -476,7 +432,7 @@ mod tests {
 		uncapped.divisor = FixedU128::zero();
 		assert_eq!(uncapped.charged_rate(1), FixedU128::one());
 		assert_eq!(uncapped.fee(100u128), 100);
-		assert_eq!(uncapped.raised_dynamic_fee(1), FixedU128::one());
+		assert_eq!(uncapped.raised_dynamic_fee(1), FixedU128::from_rational(995, 1_000));
 
 		let mut capped = curve(FixedU128::zero(), 1_000);
 		capped.divisor = FixedU128::zero();
@@ -485,10 +441,9 @@ mod tests {
 		assert_eq!(capped.raised_dynamic_fee(1), FixedU128::from_rational(10, 100));
 	}
 
-	/// A policy that lowers its ceiling to or below a stored fee: the redemption pays the ceiling
-	/// and does not raise the stored fee.
+	/// An arrival at the ceiling pays the ceiling and does not raise the stored fee.
 	#[test]
-	fn dynamic_fee_ceiling_at_or_below_the_stored_fee_charges_the_ceiling_flat() {
+	fn arrival_at_the_dynamic_fee_ceiling_charges_the_ceiling_flat() {
 		let ten_percent = FixedU128::from_rational(10, 100);
 		let flat = FixedU128::from_rational(105, 1_000);
 
@@ -497,13 +452,6 @@ mod tests {
 		assert_eq!(at_ceiling.charged_rate(300), flat);
 		assert_eq!(at_ceiling.fee(300u128), 32);
 		assert_eq!(at_ceiling.raised_dynamic_fee(300), ten_percent);
-
-		let mut above_ceiling = curve(FixedU128::from_rational(20, 100), 1_000);
-		above_ceiling.dynamic_fee_ceiling = ten_percent;
-		assert_eq!(above_ceiling.charged_rate(300), flat);
-		assert_eq!(above_ceiling.raised_dynamic_fee(300), ten_percent);
-		assert_eq!(above_ceiling.charged_rate(0), flat);
-		assert_eq!(above_ceiling.raised_dynamic_fee(0), ten_percent);
 	}
 
 	/// Verifies that the arithmetic supports the largest balances.
@@ -516,13 +464,13 @@ mod tests {
 		assert_eq!(vast.fee(1u128), 1);
 		assert_eq!(vast.raised_dynamic_fee(1), FixedU128::zero());
 		let nearly_all = u128::MAX - 1;
-		assert_eq!(vast.raised_dynamic_fee(nearly_all), FixedU128::from_inner(FixedU128::DIV - 1));
-		// The capped fraction rounds to 0.995, matching a full redemption's 50.49875% rate.
+		// The dynamic fee stops at its 99.5% ceiling, matching a full redemption's 50.49875% rate.
+		assert_eq!(vast.raised_dynamic_fee(nearly_all), FixedU128::from_rational(995, 1_000));
 		let small = curve(FixedU128::zero(), 1_000).charged_rate(1_000);
 		assert_eq!(vast.charged_rate(nearly_all), small);
 		// The fee is `ceil((u128::MAX − 1) · 0.5049875)`.
 		assert_eq!(vast.fee(nearly_all), 171_838_341_765_487_412_318_210_884_570_450_049_682);
-		assert_eq!(vast.raised_dynamic_fee(u128::MAX), FixedU128::one());
+		assert_eq!(vast.raised_dynamic_fee(u128::MAX), FixedU128::from_rational(995, 1_000));
 	}
 
 	/// Applies `tranches` in sequence against the debt that each prior tranche leaves.
@@ -624,9 +572,8 @@ mod tests {
 			fn curve_and_redemption()(
 				decayed_ppm in 0u128..=200_000,
 				divisor_x100 in 50u128..=2_000,
-				dynamic_ceiling_ppm in 1_000u128..=1_000_000,
+				dynamic_ceiling_ppm in 1_000u128..=980_000,
 				base_fee_ppm in 0u32..=20_000,
-				fee_ceiling_ppm in 0u32..=1_000_000,
 				redeemed in log_uniform_amount(),
 				remaining in log_uniform_amount(),
 			) -> (DynamicFeeCurve, u128) {
@@ -636,7 +583,6 @@ mod tests {
 					divisor: FixedU128::from_rational(divisor_x100, 100),
 					dynamic_fee_ceiling: FixedU128::from_rational(dynamic_ceiling_ppm, 1_000_000),
 					base_fee: Permill::from_parts(base_fee_ppm),
-					fee_ceiling: Permill::from_parts(fee_ceiling_ppm),
 				};
 				(curve, redeemed)
 			}
@@ -652,17 +598,11 @@ mod tests {
 			}
 		}
 
-		/// Calculates the cap for the dynamic component of the charged rate.
-		fn dynamic_cap(curve: &DynamicFeeCurve) -> FixedU128 {
-			let headroom = FixedU128::from(curve.fee_ceiling.saturating_sub(curve.base_fee));
-			curve.dynamic_fee_ceiling.min(headroom)
-		}
-
 		/// Calculates the debt at which a curve's dynamic fee reaches its cap.
 		///
 		/// The debt is `(cap − decayed) · divisor · debt`.
 		fn cap_crossing(curve: &DynamicFeeCurve) -> u128 {
-			let headroom = dynamic_cap(curve).saturating_sub(curve.decayed);
+			let headroom = curve.dynamic_fee_ceiling.saturating_sub(curve.decayed);
 			headroom.saturating_mul(curve.divisor).saturating_mul_int(curve.debt)
 		}
 
@@ -674,7 +614,7 @@ mod tests {
 			(curve_and_redemption(), 0u128..1_000_000).prop_filter_map(
 				"the dynamic fee reaches its cap inside the debt",
 				|((mut curve, _), arrival_ppm)| {
-					let cap = dynamic_cap(&curve);
+					let cap = curve.dynamic_fee_ceiling;
 					curve.decayed =
 						cap.saturating_mul(FixedU128::from_rational(arrival_ppm, 1_000_000));
 					let crossing = cap_crossing(&curve);

@@ -277,16 +277,17 @@ pub mod pallet {
 	impl<T: Config> Pallet<T> {
 		/// Returns the fee rate at which an ordinary redemption of the stablecoin starts now.
 		///
-		/// The rate is `min(base_fee + dynamic fee, fee_ceiling)`, with the dynamic fee decayed
-		/// to now and nothing persisted. A redemption raises the rate while it cancels debt, so
-		/// every size pays at least this rate. A dry run of [`Pallet::redeem`] gives the result
-		/// of a given size, and its event carries the amounts.
+		/// The rate is `base_fee + dynamic fee`, at most `fee_ceiling`, with the dynamic fee
+		/// decayed to now and nothing persisted. A redemption raises the rate while it
+		/// cancels debt, so every size pays at least this rate. A dry run of
+		/// [`Pallet::redeem`] gives the result of a given size, and its event carries the
+		/// amounts.
 		///
 		/// Returns `None` when no branch issues the stablecoin.
 		pub fn current_fee_rate(stable_id: StableIdOf<T>) -> Option<FixedU128> {
 			let RedemptionInfo { config, fee_state } = Stablecoins::<T>::get(&stable_id)?;
 			let dynamic_fee = fee_state.dynamic_fee_at(T::TimeProvider::now(), &config);
-			Some(fees::fee_rate(dynamic_fee, config.base_fee, config.fee_ceiling))
+			Some(fees::fee_rate(dynamic_fee, config.base_fee))
 		}
 	}
 

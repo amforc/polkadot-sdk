@@ -1037,8 +1037,6 @@ fn config_update_stores_and_validates() {
 		let cfg = RedemptionConfig {
 			minimum_redemption_amount: 250,
 			dynamic_fee_decay_period: 12 * HOUR_MS,
-			dynamic_fee_floor: percent(1),
-			dynamic_fee_ceiling: percent(50),
 			base_fee: Permill::from_percent(1),
 			fee_ceiling: Permill::from_percent(60),
 			dynamic_fee_increase_divisor: FixedU128::from_u32(4),
@@ -1064,11 +1062,6 @@ fn config_update_stores_and_validates() {
 				Error::<Test>::InvalidRedemptionConfig
 			);
 		};
-		assert_invalid(RedemptionConfig {
-			dynamic_fee_floor: FixedU128::one(),
-			dynamic_fee_ceiling: FixedU128::zero(),
-			..cfg.clone()
-		});
 		assert_invalid(RedemptionConfig { minimum_redemption_amount: 0, ..cfg.clone() });
 		assert_invalid(RedemptionConfig { dynamic_fee_decay_period: 0, ..cfg.clone() });
 		assert_invalid(RedemptionConfig {
@@ -1619,8 +1612,6 @@ fn offset_payment_asset_selects_market() {
 /// The default config with every fee component zeroed.
 fn zero_fee_redemption_config() -> RedemptionConfig<Balance> {
 	RedemptionConfig {
-		dynamic_fee_floor: FixedU128::zero(),
-		dynamic_fee_ceiling: FixedU128::zero(),
 		base_fee: Permill::zero(),
 		fee_ceiling: Permill::zero(),
 		..default_redemption_config()
@@ -1699,10 +1690,11 @@ fn min_balance_kept_by_ordinary_redemption() {
 }
 
 /// A recovery redemption may spend the whole balance: its single, fee-free debit can consume the
-/// account. A spend that would leave a sub-minimum remainder stops at the minimum instead.
+/// account, and the request always fills.
 ///
-/// A spend the balance cannot fund at all reports the balance, not the queue: at exactly the
-/// minimum balance, a smaller request can neither preserve nor consume the account.
+/// A remainder below the minimum balance cannot stay in the account. As in `pallet-psm`, it
+/// goes to the fee destination rather than being burned, so the issuance falls by exactly the
+/// debt cancelled.
 #[test]
 fn min_balance_may_be_consumed_by_recovery() {
 	ExtBuilder::default()
@@ -1711,37 +1703,38 @@ fn min_balance_may_be_consumed_by_recovery() {
 		.build_and_execute(|| {
 			let debt_before = vault_debt(DOT, USDX, 1);
 			let request = 200 * USDX_UNIT;
-			let assert_recovery_burns = |balance: Balance, burned: Balance| {
+			let assert_recovery_leaves = |balance: Balance, left: Balance, dust: Balance| {
 				hypothetically!({
 					mint_stable(USDX, REDEEMER, balance);
+					// A live fee destination can receive a remainder below the minimum balance.
+					mint_stable(USDX, FEE_DEST, USDX_MIN_BALANCE);
+					let issuance_before = Assets::total_supply(USDX);
+					let fees_before = Assets::balance(USDX, FEE_DEST);
 
 					let settled =
 						redeem(RedeemOptions { stable: USDX, ..RedeemOptions::spend(request) })
 							.expect("redemption succeeds");
 
 					assert_eq!(settled.kind, RECOVERY_BONUS);
-					assert_eq!(settled.stable_burned, burned);
-					assert_eq!(debt_before - vault_debt(DOT, USDX, 1), burned);
-					assert_eq!(Assets::balance(USDX, REDEEMER), balance - burned);
+					assert_eq!(settled.stable_burned, request);
+					assert_eq!(debt_before - vault_debt(DOT, USDX, 1), request);
+					assert_eq!(issuance_before - Assets::total_supply(USDX), request);
+					assert_eq!(Assets::balance(USDX, REDEEMER), left, "balance {balance}");
+					assert_eq!(Assets::balance(USDX, FEE_DEST) - fees_before, dust);
 				});
 			};
 			// The request is the whole balance and drains the account.
-			assert_recovery_burns(request, request);
+			assert_recovery_leaves(request, 0, 0);
+			// The request leaves exactly the minimum balance, which stays.
+			assert_recovery_leaves(request + USDX_MIN_BALANCE, USDX_MIN_BALANCE, 0);
 			// The request would leave 4_000 raw units, less than the 10_000-unit minimum, so the
-			// spend stops at the minimum instead.
-			assert_recovery_burns(request + 4_000, request - 6_000);
+			// account is drained and the remainder goes to the fee destination.
+			assert_recovery_leaves(request + 4_000, 0, 4_000);
 
-			hypothetically!({
-				mint_stable(USDX, REDEEMER, USDX_MIN_BALANCE);
-
-				assert_noop!(
-					redeem(RedeemOptions {
-						stable: USDX,
-						..RedeemOptions::spend(USDX_MIN_BALANCE / 2)
-					}),
-					Error::<Test>::InsufficientStableBalance
-				);
-			});
+			assert_noop!(
+				redeem(RedeemOptions { stable: USDX, ..RedeemOptions::spend(request) }),
+				Error::<Test>::InsufficientStableBalance
+			);
 		});
 }
 

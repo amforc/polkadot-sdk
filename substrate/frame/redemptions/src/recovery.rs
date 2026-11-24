@@ -22,52 +22,16 @@ use stablecoin_primitives::{
 
 /// One authoritative price for a `FinalRecovery` head.
 ///
-/// Redemption execution and Stability Pool offsets both consume this plan. Re-price with a
-/// smaller budget when the payer cannot fund it in full.
-pub(crate) enum RecoveryPlan<Balance> {
-	AbovePar {
-		debt: Balance,
-		collateral: Balance,
-	},
-	BelowPar {
-		debt: Balance,
-		collateral: Balance,
-		/// Insurance Fund payment for a full settlement.
-		///
-		/// A partial settlement must not draw from the fund.
-		insurance_cover: Balance,
-	},
-}
-
-impl<Balance: Copy + Zero> RecoveryPlan<Balance> {
-	pub(crate) fn debt(&self) -> Balance {
-		match self {
-			Self::AbovePar { debt, .. } | Self::BelowPar { debt, .. } => *debt,
-		}
-	}
-
-	pub(crate) fn collateral(&self) -> Balance {
-		match self {
-			Self::AbovePar { collateral, .. } | Self::BelowPar { collateral, .. } => *collateral,
-		}
-	}
-
-	pub(crate) fn regime(&self) -> RecoveryRegime {
-		match self {
-			Self::AbovePar { .. } => RecoveryRegime::RecoveryBonus,
-			Self::BelowPar { .. } => RecoveryRegime::InsuranceAdjusted,
-		}
-	}
-
-	/// Returns the Insurance Fund payment for a full settlement.
-	///
-	/// Returns zero for a partial settlement because the vault remains in the FIFO.
-	pub(crate) fn insurance_cover(&self) -> Balance {
-		match self {
-			Self::AbovePar { .. } => Balance::zero(),
-			Self::BelowPar { insurance_cover, .. } => *insurance_cover,
-		}
-	}
+/// Redemption execution and Stability Pool offsets both consume this plan.
+pub(crate) struct RecoveryPlan<Balance> {
+	/// Debt the payer cancels.
+	pub(crate) debt: Balance,
+	/// Collateral paid for that debt.
+	pub(crate) collateral: Balance,
+	pub(crate) regime: RecoveryRegime,
+	/// Insurance Fund payment, nonzero only for a full below-par settlement: a partial one
+	/// leaves the vault in the FIFO and must not draw from the fund.
+	pub(crate) insurance_cover: Balance,
 }
 
 enum OffsetDecision<AccountId, Balance> {
@@ -85,6 +49,21 @@ impl<T: Config> Pallet<T> {
 		budget: BalanceOf<T>,
 		config: &RedemptionConfigOf<T>,
 	) -> Result<RecoveryPlan<BalanceOf<T>>, Error<T>> {
+		match Self::price_at_or_above_par(snapshot, price, budget, config)? {
+			Some(plan) => Ok(plan),
+			None => Self::price_below_par(stable_id, snapshot, price, budget)
+				.ok_or(Error::<T>::NoRedeemableVault),
+		}
+	}
+
+	/// Price a head at or above par. `None` marks a below-par head, which needs the Insurance
+	/// Fund's balance to price and which only a redemption settles.
+	fn price_at_or_above_par(
+		snapshot: &SnapshotOf<T>,
+		price: FixedU128,
+		budget: BalanceOf<T>,
+		config: &RedemptionConfigOf<T>,
+	) -> Result<Option<RecoveryPlan<BalanceOf<T>>>, Error<T>> {
 		ensure!(
 			snapshot.status.is_final_recovery(),
 			Self::unexpected("both callers price only a head looked up as FinalRecovery")
@@ -98,6 +77,9 @@ impl<T: Config> Pallet<T> {
 					return Err(Error::<T>::NoRedeemableVault)
 				},
 			};
+		if ratio < FixedU128::one() {
+			return Ok(None);
+		}
 		// The bonus keeps settlement attractive past MCR, so redeemers push the head up to ICR
 		// and it exits with the buffer a borrower opens with rather than one tick above the
 		// liquidation line. Above ICR only the exit remains, unless a sub-minimum debt could be
@@ -105,11 +87,6 @@ impl<T: Config> Pallet<T> {
 		let past_settlement = ratio > snapshot.initial_collateralization_ratio;
 		if past_settlement {
 			ensure!(snapshot.debt < snapshot.minimum_debt, Error::<T>::FinalRecoveryExitRequired);
-		}
-
-		if ratio < FixedU128::one() {
-			return Self::price_below_par(stable_id, snapshot, price, budget)
-				.ok_or(Error::<T>::NoRedeemableVault);
 		}
 		let bonus = if past_settlement {
 			FixedU128::zero()
@@ -124,7 +101,12 @@ impl<T: Config> Pallet<T> {
 		let collateral = recovery_pricing::recovery_bonus_collateral_out(debt, bonus, price)
 			.ok_or(Error::<T>::NoRedeemableVault)?
 			.min(snapshot.collateral);
-		Ok(RecoveryPlan::AbovePar { debt, collateral })
+		Ok(Some(RecoveryPlan {
+			debt,
+			collateral,
+			regime: RecoveryRegime::RecoveryBonus,
+			insurance_cover: BalanceOf::<T>::zero(),
+		}))
 	}
 
 	/// Returns `None` if a calculation overflows.
@@ -144,9 +126,10 @@ impl<T: Config> Pallet<T> {
 		if budget >= split.market_cancel_debt {
 			// The market debt buys the whole collateral by definition and the cover cancels the
 			// rest, so the settlement leaves neither debt nor collateral behind.
-			return Some(RecoveryPlan::BelowPar {
+			return Some(RecoveryPlan {
 				debt: split.market_cancel_debt,
 				collateral: snapshot.collateral,
+				regime: RecoveryRegime::InsuranceAdjusted,
 				insurance_cover: split.effective_cover,
 			});
 		}
@@ -159,7 +142,12 @@ impl<T: Config> Pallet<T> {
 			snapshot.collateral,
 			split.market_cancel_debt,
 		)?;
-		Some(RecoveryPlan::BelowPar { debt, collateral, insurance_cover: BalanceOf::<T>::zero() })
+		Some(RecoveryPlan {
+			debt,
+			collateral,
+			regime: RecoveryRegime::InsuranceAdjusted,
+			insurance_cover: BalanceOf::<T>::zero(),
+		})
 	}
 
 	fn insurance_fund_cover(stable_id: &StableIdOf<T>, shortfall: BalanceOf<T>) -> BalanceOf<T> {
@@ -210,17 +198,19 @@ impl<T: Config> Pallet<T> {
 			.config;
 		let price = Self::collateral_price(collateral_id)?;
 		let snapshot = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?;
-		let plan = Self::price_recovery(stable_id, &snapshot, price, max_debt_to_cancel, &config);
+		// An offset never draws Insurance Fund cover, so a below-par head is refused before the
+		// fund's balance is read.
+		let plan = Self::price_at_or_above_par(&snapshot, price, max_debt_to_cancel, &config);
 		Ok(match plan {
 			// An unpriceable or exitable head is no offset target; the pool sees an empty FIFO.
 			Err(Error::<T>::NoRedeemableVault | Error::<T>::FinalRecoveryExitRequired) => {
 				OffsetDecision::NoTarget
 			},
 			Err(error) => return Err(error.into()),
-			Ok(RecoveryPlan::BelowPar { .. }) => OffsetDecision::BelowPar,
-			Ok(RecoveryPlan::AbovePar { debt, .. }) if debt.is_zero() => OffsetDecision::NoTarget,
-			Ok(RecoveryPlan::AbovePar { debt, collateral }) => {
-				OffsetDecision::Available { owner, debt, collateral }
+			Ok(None) => OffsetDecision::BelowPar,
+			Ok(Some(plan)) if plan.debt.is_zero() => OffsetDecision::NoTarget,
+			Ok(Some(plan)) => {
+				OffsetDecision::Available { owner, debt: plan.debt, collateral: plan.collateral }
 			},
 		})
 	}

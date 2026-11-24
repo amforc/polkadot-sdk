@@ -22,8 +22,8 @@ use frame::{
 	},
 };
 use stablecoin_primitives::{
-	math::collateral_for_value_floor, reducible_debit, CollateralRatio, ProvidePrice,
-	RedemptionSettlement, VaultInterface,
+	math::collateral_for_value_floor, CollateralRatio, ProvidePrice, RedemptionSettlement,
+	VaultInterface,
 };
 
 /// Fee inputs read only for an ordinary redemption.
@@ -132,47 +132,34 @@ impl<T: Config> Pallet<T> {
 			context.stable_id,
 			&owner,
 		)?;
-		// Recovery charges no fee, so its single debit may consume the account: a spend that
-		// would leave less than the minimum balance is repriced below to the amount that keeps it.
-		let expendable =
+		// Recovery refunds nothing, so its single debit may consume the account.
+		let spendable =
 			Self::reducible_stable(context.stable_id, context.redeemer, Preservation::Expendable);
-		let budget = terms.max_stable_to_spend.min(expendable);
+		let budget = terms.max_stable_to_spend.min(spendable);
 		let plan =
 			Self::price_recovery(context.stable_id, &snapshot, context.price, budget, config)?;
-		let (plan, preservation) = if plan.debt().is_zero() {
-			(plan, None)
-		} else {
-			let (funded, preservation) =
-				Self::fundable_budget(context.stable_id, context.redeemer, plan.debt())?;
-			let plan = if funded < plan.debt() {
-				Self::price_recovery(context.stable_id, &snapshot, context.price, funded, config)?
+		if plan.debt.is_zero() {
+			// Only Insurance Fund cover settles without the redeemer's stable. Without it, an
+			// empty plan is the balance's fault when nothing is spendable, else the queue's.
+			let empty_plan = if spendable.is_zero() {
+				Error::<T>::InsufficientStableBalance
 			} else {
-				plan
+				Error::<T>::NoRedeemableVault
 			};
-			(plan, Some(preservation))
-		};
-
-		let insurance_cover = plan.insurance_cover();
-		ensure!(
-			!plan.debt().is_zero() || !insurance_cover.is_zero(),
-			Error::<T>::NoRedeemableVault
-		);
+			ensure!(!plan.insurance_cover.is_zero(), empty_plan);
+		}
 		// Recovery charges no fee, so the debt is the whole spend.
 		let scaled_min =
-			fees::scale_floor(terms.min_collateral_out, plan.debt(), terms.max_stable_to_spend);
-		ensure!(plan.collateral() >= scaled_min, Error::<T>::SlippageExceeded);
+			fees::scale_floor(terms.min_collateral_out, plan.debt, terms.max_stable_to_spend);
+		ensure!(plan.collateral >= scaled_min, Error::<T>::SlippageExceeded);
 
-		let mut debt_payment = match preservation {
-			Some(preservation) => Self::debit_redeemer(
-				context.stable_id,
-				context.redeemer,
-				plan.debt(),
-				preservation,
-			)?,
-			None => StableCreditOf::<T>::zero(context.stable_id.clone()),
+		let mut debt_payment = if plan.debt.is_zero() {
+			StableCreditOf::<T>::zero(context.stable_id.clone())
+		} else {
+			Self::debit_redeemer_expendable(context.stable_id, context.redeemer, plan.debt)?
 		};
-		if !insurance_cover.is_zero() {
-			let cover = Self::withdraw_insurance_cover(context.stable_id, insurance_cover)?;
+		if !plan.insurance_cover.is_zero() {
+			let cover = Self::withdraw_insurance_cover(context.stable_id, plan.insurance_cover)?;
 			// Refusing the settlement lets the dispatch roll back the withdrawal.
 			debt_payment
 				.subsume(cover)
@@ -184,17 +171,17 @@ impl<T: Config> Pallet<T> {
 			context.stable_id,
 			&owner,
 			context.recipient,
-			RedemptionSettlement { debt_payment, collateral_to_recipient: plan.collateral() },
+			RedemptionSettlement { debt_payment, collateral_to_recipient: plan.collateral },
 		)?;
 
 		Self::deposit_event(Event::RecoveryRedemptionExecuted {
 			collateral_id: context.collateral_id.clone(),
 			stable_id: context.stable_id.clone(),
 			redeemer: context.redeemer.clone(),
-			stable_burned: plan.debt(),
-			insurance_cover,
-			collateral_out: plan.collateral(),
-			regime: plan.regime(),
+			stable_burned: plan.debt,
+			insurance_cover: plan.insurance_cover,
+			collateral_out: plan.collateral,
+			regime: plan.regime,
 		});
 		Ok(())
 	}
@@ -226,7 +213,6 @@ impl<T: Config> Pallet<T> {
 			context.stable_id,
 			context.redeemer,
 			debt_budget.ensure_add(planned_fee)?,
-			Preservation::Preserve,
 		)?;
 		let result = Self::execute_ordinary_walk(
 			context,
@@ -366,32 +352,42 @@ impl<T: Config> Pallet<T> {
 		Ok(Step::Redeem { debt, collateral })
 	}
 
-	/// The part of `need` one debit can take from the redeemer, and its preservation. A
-	/// shortfall is returned for re-pricing only when `need` would leave less than the minimum
-	/// balance and something is still payable; any other shortfall is an insufficient balance.
-	fn fundable_budget(
-		stable_id: &StableIdOf<T>,
-		redeemer: &T::AccountId,
-		need: BalanceOf<T>,
-	) -> Result<(BalanceOf<T>, Preservation), Error<T>> {
-		let (funded, preservation) =
-			reducible_debit::<T::StableAssets, _>(stable_id.clone(), redeemer, need);
-		if funded < need {
-			ensure!(preservation == Preservation::Preserve, Error::<T>::InsufficientStableBalance);
-			ensure!(!funded.is_zero(), Error::<T>::InsufficientStableBalance);
-		}
-		Ok((funded, preservation))
-	}
-
-	/// Withdraws exactly `amount` of the stablecoin from the redeemer as a credit.
+	/// Withdraws exactly `amount` of the stablecoin from the redeemer as a credit, keeping the
+	/// account alive.
 	fn debit_redeemer(
 		stable_id: &StableIdOf<T>,
 		redeemer: &T::AccountId,
 		amount: BalanceOf<T>,
-		preservation: Preservation,
 	) -> Result<StableCreditOf<T>, DispatchError> {
-		let credit = Self::withdraw_stable(stable_id, redeemer, amount, preservation)?;
+		let credit = Self::withdraw_stable(stable_id, redeemer, amount, Preservation::Preserve)?;
 		Self::exact_credit(credit, amount)
+	}
+
+	/// Withdraws exactly `amount` of the stablecoin from a redeemer who may spend its whole
+	/// balance.
+	///
+	/// A remainder below the minimum balance cannot stay in the account, and an expendable debit
+	/// would burn it without cancelling any debt. As in `pallet-psm`, it goes to the fee handler
+	/// instead, so the redeemer's spend is never repriced around the minimum balance.
+	fn debit_redeemer_expendable(
+		stable_id: &StableIdOf<T>,
+		redeemer: &T::AccountId,
+		amount: BalanceOf<T>,
+	) -> Result<StableCreditOf<T>, DispatchError> {
+		let preserved = Self::reducible_stable(stable_id, redeemer, Preservation::Preserve);
+		if amount <= preserved {
+			return Self::debit_redeemer(stable_id, redeemer, amount);
+		}
+		let spendable = Self::reducible_stable(stable_id, redeemer, Preservation::Expendable);
+		ensure!(amount <= spendable, Error::<T>::InsufficientStableBalance);
+		let withdrawn =
+			Self::withdraw_stable(stable_id, redeemer, spendable, Preservation::Expendable)?;
+		let mut withdrawn = Self::exact_credit(withdrawn, spendable)?;
+		let payment = Self::exact_credit(withdrawn.extract(amount), amount)?;
+		if !withdrawn.peek().is_zero() {
+			T::FeeHandler::on_unbalanced(withdrawn);
+		}
+		Ok(payment)
 	}
 
 	/// Withdraws `amount` of the stablecoin from `who` as a credit, exactly and politely.
