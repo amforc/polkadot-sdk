@@ -9,7 +9,7 @@ use crate::{
 	types::VaultListId,
 };
 use frame::prelude::*;
-use linked_list_interface::{fifo_append, ListError, SortedListInterface};
+use linked_list_interface::{ListError, Position, SortedListInterface};
 
 /// The per-branch FIFO list id.
 pub fn list_id<T: Config>(
@@ -19,15 +19,29 @@ pub fn list_id<T: Config>(
 	VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone())
 }
 
-/// Append `owner` to the per-branch FIFO (see [`fifo_append`] for the
-/// ordering discipline). Errors when already present.
+/// Append `owner` to the per-branch FIFO.
+///
+/// Assigns one raw unit above the current head's priority (starting at zero when empty), placing
+/// the new member at the head so tail-first iteration is FIFO across arbitrary join/leave
+/// interleavings and the total order remains encoded in the stored priorities. Errors when already
+/// present.
 pub fn append<T: Config>(
 	collateral_id: &CollateralIdOf<T>,
 	stable_id: &StableIdOf<T>,
 	owner: T::AccountId,
 ) -> DispatchResult {
-	fifo_append::<_, _, T::VaultLists>(list_id::<T>(collateral_id, stable_id), owner)
-		.map_err(map_error::<T>)?;
+	let list = list_id::<T>(collateral_id, stable_id);
+	let head = T::VaultLists::head(&list);
+	let priority = match &head {
+		Some(head_item) => T::VaultLists::priority(&list, head_item)
+			.and_then(|p| p.checked_add(&FixedU128::from_inner(1)))
+			.ok_or(ListError::CorruptList)
+			.map_err(map_error::<T>)?,
+		None => FixedU128::zero(),
+	};
+
+	let hint = Position { prev: None, next: head };
+	T::VaultLists::insert(list, owner, priority, hint).map_err(map_error::<T>)?;
 	Ok(())
 }
 
