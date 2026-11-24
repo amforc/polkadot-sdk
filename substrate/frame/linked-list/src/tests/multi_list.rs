@@ -26,11 +26,8 @@ fn lists_are_independent() {
 		insert(2, 200, 30);
 		assert_eq!(dump(1), vec![(100, 50)]);
 		assert_eq!(dump(2), vec![(100, 70), (200, 30)]);
-		// `dump` walks from `head` and only bounds the walk by `count`, so the
-		// `tail` accessor (read by callers such as pallet-vaults) and an
-		// over-reported `count` need their own checks.
+		// `dump` walks from `head`, so check the `tail` accessor directly as well.
 		assert_eq!(LinkedList::tail(&2), Some(200));
-		assert_eq!(LinkedList::count(&2), 2);
 
 		assert_ok!(LinkedList::remove(&1, &100));
 		assert_eq!(dump(1), vec![]);

@@ -117,37 +117,6 @@ fn remove_at_missing_meta_row_is_defensive() {
 }
 
 #[test]
-#[cfg_attr(
-	debug_assertions,
-	should_panic = "ListMetas.len incompatible with removed node topology"
-)]
-fn remove_endpoint_with_undercounted_len_is_defensive() {
-	build_and_execute_no_post_check(|| {
-		insert(1, 100, 90);
-		insert(1, 200, 50);
-		// Two linked nodes but `len == 1`: removing an endpoint would drop the meta
-		// row and orphan the survivor. The topology check rejects it.
-		ListMetas::<Test>::mutate_extant(1, |meta| meta.len = 1);
-		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
-	});
-}
-
-#[test]
-#[cfg_attr(
-	debug_assertions,
-	should_panic = "ListMetas.len incompatible with removed node topology"
-)]
-fn remove_sole_node_with_overcounted_len_is_defensive() {
-	build_and_execute_no_post_check(|| {
-		insert(1, 100, 50);
-		// A lone node but `len == 2`: removing it would leave an empty meta row
-		// (`len == 1`, no nodes). The topology check rejects it.
-		ListMetas::<Test>::mutate_extant(1, |meta| meta.len = 2);
-		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
-	});
-}
-
-#[test]
 #[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
 fn pop_tail_with_missing_tail_node_is_defensive() {
 	build_and_execute_no_post_check(|| {
@@ -172,17 +141,5 @@ fn remove_at_aliased_neighbors_is_defensive() {
 			n.next = Some(100);
 		});
 		assert_err!(LinkedList::remove(&1, &200), ListError::CorruptList);
-	});
-}
-
-#[test]
-#[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
-fn pop_tail_with_none_tail_on_present_meta_is_defensive() {
-	build_and_execute_no_post_check(|| {
-		insert(1, 100, 50);
-		// A present meta row with `tail: None` is corruption, not an empty
-		// list; `pop_tail` must not silently report `Ok(None)`.
-		ListMetas::<Test>::mutate_extant(1, |meta| meta.tail = None);
-		assert_err!(LinkedList::pop_tail(&1), ListError::CorruptList);
 	});
 }

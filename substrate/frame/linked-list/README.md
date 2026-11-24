@@ -74,9 +74,9 @@ value by simulating expected contention against their list cardinality.
 - `ListNodes[(list_id, item)] -> Node { prev, next, priority }` — the per-item
   record. `prev`/`next` are `None` at endpoints; `priority` is cached so
   position checks do not need to consult the consumer's source of truth.
-- `ListMetas[list_id] -> ListMeta { head, tail, len }` — the per-list head
-  pointer, tail pointer, and node count in one row (the row is removed when
-  the list empties).
+- `ListMetas[list_id] -> ListMeta { head, tail }` — the per-list head
+  and tail pointers in one row (the row is removed when the list empties).
+  Interior inserts, removes, and relocations do not touch `ListMetas`.
 
 ## Public surface
 
@@ -92,15 +92,15 @@ Consumer pallets use [`SortedListInterface`]:
   splices out and re-inserts at the supplied hint inside a transactional layer
   so a budget-exhaustion failure rolls back cleanly.
 - **`iter_from_tail`** — bounded tail-first iteration.
-- Read helpers: `head`, `tail`, `count`, `contains`, `neighbors`, `priority`,
+- Read helpers: `head`, `tail`, `contains`, `neighbors`, `priority`,
   `node` (priority + neighbors in one read), `find_position`,
   `find_re_insert_position`, `repair_steps_needed`.
 
 Off-chain clients get view functions only for the reads that cost more than a
 storage lookup: `node`, `iter_from_tail`, `find_position`,
-`find_re_insert_position`. `head`, `tail`, and the item count are the
-`ListMetas` row itself. A client unsure whether a hint is stale fetches a fresh
-one instead of measuring the repair it would need.
+`find_re_insert_position`. `head` and `tail` are the `ListMetas` row itself.
+A client unsure whether a hint is stale fetches a fresh one instead of
+measuring the repair it would need.
 
 Mutating operations fail with [`ListError`], a standalone enum consumer
 pallets can match on or nest directly in their own `#[pallet::error]` (it
@@ -130,7 +130,7 @@ that simplicity.
 
 `try_state` (active under `try-runtime`) checks, for each list:
 
-1. Every present node implies a `ListMetas` row with `len >= 1`.
+1. Every present node implies a `ListMetas` row, and vice versa.
 2. The `ListMetas` head/tail pointers agree with the node graph at both
    endpoints.
 3. The chain from head to tail visits every node exactly once.

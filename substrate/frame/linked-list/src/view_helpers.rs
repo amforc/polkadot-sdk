@@ -34,10 +34,11 @@ fn infeasible_sentinel<T: Config>() -> u32 {
 /// logically removed. Walks from the head until `prev.priority >= priority >
 /// next.priority` holds. Endpoints encoded as `None`.
 ///
-/// The walk is capped at `len + 1` visited nodes so that corrupt (cyclic)
-/// storage terminates instead of looping forever; the cap-exhausted result
-/// then fails insert-time validation as [`ListError::CorruptList`] rather
-/// than hanging the caller.
+/// Each visited node's `prev` back-link is checked against the actual previous
+/// node in the walk so that corrupt (cyclic) storage terminates immediately in
+/// O(1) memory instead of looping forever; the broken result then fails
+/// insert-time validation as [`ListError::CorruptList`] rather than hanging
+/// the caller.
 ///
 /// O(list size). Off-chain helper; not for hot paths.
 fn find_position_skipping<T: Config>(
@@ -45,17 +46,17 @@ fn find_position_skipping<T: Config>(
 	priority: T::Priority,
 	skip: Option<&T::ItemId>,
 ) -> Position<T::ItemId> {
-	let (head, len) = ListMetas::<T>::get(list_id).map_or((None, 0), |m| (m.head, m.len));
+	let head = ListMetas::<T>::get(list_id).map(|m| m.head);
 	let mut prev: Option<T::ItemId> = None;
+	let mut expected_prev: Option<T::ItemId> = None;
 	let mut cursor = head;
-	let mut visited: u64 = 0;
 	while let Some(item) = cursor {
-		if visited > u64::from(len) {
-			crate::log!(warn, "find_position: walk exceeded ListMetas.len (cycle?)");
+		let Some(node) = ListNodes::<T>::get(list_id, &item) else { break };
+		if node.prev != expected_prev {
+			crate::log!(warn, "find_position: node.prev disagrees with walk (cycle?)");
 			break;
 		}
-		visited += 1;
-		let Some(node) = ListNodes::<T>::get(list_id, &item) else { break };
+		expected_prev = Some(item.clone());
 		if skip == Some(&item) {
 			cursor = node.next;
 			continue;

@@ -142,8 +142,8 @@ pub mod pallet {
 		OptionQuery,
 	>;
 
-	/// Per-list head, tail, and item count. Dropped when a list empties; a
-	/// missing row means the empty list.
+	/// Per-list head and tail pointers. Dropped when a list empties; a missing
+	/// row means the empty list.
 	#[pallet::storage]
 	pub type ListMetas<T: Config> =
 		StorageMap<_, Blake2_128Concat, T::ListId, ListMeta<T::ItemId>, OptionQuery>;

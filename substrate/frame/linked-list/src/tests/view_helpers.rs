@@ -39,8 +39,8 @@ fn find_position_orders_by_priority_with_ties_on_tail_side() {
 	});
 }
 
-/// A cyclic corrupt list must terminate the head→tail walk (capped at
-/// `len + 1` visits) instead of hanging the caller.
+/// A cyclic corrupt list must terminate the head→tail walk via the back-link
+/// check instead of hanging the caller.
 #[test]
 fn find_position_terminates_on_cyclic_corruption() {
 	build_and_execute_no_post_check(|| {

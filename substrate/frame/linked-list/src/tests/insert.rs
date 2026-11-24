@@ -15,10 +15,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-	mock::*, Event, ListError, ListMeta, ListMetas, ListNodes, Position, SortedListInterface,
-};
-use frame::testing_prelude::{assert_err, assert_noop};
+use crate::{mock::*, Event, ListError, ListMetas, Position, SortedListInterface};
+use frame::testing_prelude::{assert_noop, assert_ok};
 
 #[test]
 fn insert_into_empty_list_creates_list() {
@@ -107,35 +105,28 @@ fn insert_existing_item_errors_before_hint_repair() {
 }
 
 #[test]
-fn insert_does_not_saturate_size_counter() {
-	// Manually corrupts `ListMetas.len` to exercise the saturation guard, so we
-	// skip the post-test invariant check.
+fn interior_operations_do_not_touch_list_meta() {
 	build_and_execute_no_post_check(|| {
-		ListMetas::<Test>::insert(1, ListMeta { len: u32::MAX, ..Default::default() });
-		assert_noop!(
-			LinkedList::insert(1, 100, 50, Position::endpoints_only()),
-			ListError::ListTooLong
-		);
-		assert!(!ListNodes::<Test>::contains_key(1, 100));
-		assert!(LinkedList::head(&1).is_none());
-		assert!(LinkedList::tail(&1).is_none());
-	});
-}
+		insert(1, 1, 90);
+		insert(1, 2, 70);
+		insert(1, 3, 50);
+		insert(1, 4, 30);
+		insert(1, 5, 10);
 
-#[test]
-#[cfg_attr(debug_assertions, should_panic = "neighbor hint into absent list metadata")]
-fn insert_interior_into_absent_meta_is_defensive() {
-	build_and_execute_no_post_check(|| {
-		insert(1, 100, 90);
-		insert(1, 200, 50);
-		// Drop the meta row but keep both linked nodes. The hint's interior sides
-		// never consult meta, so `walk_repair` accepts it; the insert must still
-		// reject this as corruption, not treat the missing row as an empty list
-		// and build metadata over the orphans.
+		// Drop the meta row: interior insert, interior-to-interior re-insert,
+		// and interior remove must neither consult nor recreate `ListMetas`.
 		ListMetas::<Test>::remove(1);
-		assert_err!(
-			LinkedList::insert(1, 150, 70, Position::between(100, 200)),
-			ListError::CorruptList
+
+		assert_eq!(LinkedList::insert(1, 99, 60, Position::between(2, 3)), Ok(0));
+		assert!(!ListMetas::<Test>::contains_key(1));
+
+		assert_eq!(
+			LinkedList::re_insert(1, 99, 40, Position::between(3, 4)),
+			Ok(crate::Outcome::Relocated { steps: 0 })
 		);
+		assert!(!ListMetas::<Test>::contains_key(1));
+
+		assert_ok!(LinkedList::remove(&1, &99));
+		assert!(!ListMetas::<Test>::contains_key(1));
 	});
 }

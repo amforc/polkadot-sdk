@@ -99,9 +99,7 @@ pub enum ListError {
 	ItemNotFound,
 	/// `(list_id, item)` is already in the list.
 	ItemAlreadyExists,
-	/// The list's size counter cannot represent one more item.
-	ListTooLong,
-	/// Stored links or counters are internally inconsistent.
+	/// Stored links or pointers are internally inconsistent.
 	CorruptList,
 	/// The supplied hint could not be repaired within `MaxHintRepairSteps`.
 	InvalidPositionHints,

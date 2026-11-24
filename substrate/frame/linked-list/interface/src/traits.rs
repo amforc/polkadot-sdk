@@ -101,7 +101,6 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// # Errors
 	///
 	/// - [`ListError::ItemAlreadyExists`] if `(list_id, item)` is already in the list.
-	/// - [`ListError::ListTooLong`] if the list's size counter would overflow.
 	/// - [`ListError::InvalidPositionHints`] if the hint cannot be repaired within the budget.
 	///   Stale hints (a removed neighbor, no-longer-adjacent neighbors, a drifted priority bracket)
 	///   are repaired transparently and are NOT errors while the budget lasts.
@@ -163,9 +162,6 @@ pub trait SortedListInterface<ListId, ItemId> {
 
 	/// Lowest-priority item in `list_id`, or `None` if empty.
 	fn tail(list_id: &ListId) -> Option<ItemId>;
-
-	/// Number of items in `list_id`.
-	fn count(list_id: &ListId) -> u32;
 
 	/// Returns `true` if `(list_id, item)` is in the list.
 	fn contains(list_id: &ListId, item: &ItemId) -> bool;

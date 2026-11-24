@@ -23,10 +23,7 @@
 
 use crate::{list, pallet::*, view_helpers, ListError, Outcome, Position, SortedListInterface};
 use frame::{
-	deps::{
-		codec::MaxEncodedLen,
-		frame_support::{storage::with_storage_layer, traits::DefensiveOption},
-	},
+	deps::{codec::MaxEncodedLen, frame_support::storage::with_storage_layer},
 	prelude::*,
 	traits::Footprint,
 };
@@ -79,9 +76,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 
 	fn pop_tail(list_id: &T::ListId) -> Result<Option<(T::ItemId, T::Priority)>, ListError> {
 		let Some(meta) = ListMetas::<T>::get(list_id) else { return Ok(None) };
-		// A present meta row always carries a tail pointer; `None` here is
-		// corruption, not an empty list.
-		let item = meta.tail.defensive_ok_or(ListError::CorruptList)?;
+		let item = meta.tail;
 		let (priority, list_removed) =
 			list::remove_at::<T>(list_id, &item).map_err(|e| match e {
 				// The item id came from the meta row, so a missing node row is
@@ -116,7 +111,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		// rows double as the in-place admissibility inputs and the unlink
 		// splice below.
 		let existing_position = existing.into_position();
-		let (prev_node, next_node) =
+		let (prev_node, next_node, meta) =
 			list::linked_neighbors::<T>(&list_id, &item, &existing_position)?;
 
 		// Fast path: existing neighbors still admit the new priority, mutate in place.
@@ -150,7 +145,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 			// `ListRemoved`/`ListCreated` here would churn a single-item relocate.
 			// The rows validated above are unchanged, so unlink with them
 			// rather than re-reading and re-validating through `remove_at`.
-			list::unlink::<T>(&list_id, &item, existing_position, prev_node, next_node)?;
+			list::unlink::<T>(&list_id, &item, existing_position, prev_node, next_node, meta)?;
 			let valid = list::walk_repair::<T>(&list_id, &new_priority, hint)?;
 			let steps = valid.steps;
 			list::insert_at_inner::<T>(&list_id, &item, new_priority, valid)?;
@@ -161,15 +156,11 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 	}
 
 	fn head(list_id: &T::ListId) -> Option<T::ItemId> {
-		ListMetas::<T>::get(list_id).and_then(|m| m.head)
+		ListMetas::<T>::get(list_id).map(|m| m.head)
 	}
 
 	fn tail(list_id: &T::ListId) -> Option<T::ItemId> {
-		ListMetas::<T>::get(list_id).and_then(|m| m.tail)
-	}
-
-	fn count(list_id: &T::ListId) -> u32 {
-		ListMetas::<T>::get(list_id).map_or(0, |m| m.len)
+		ListMetas::<T>::get(list_id).map(|m| m.tail)
 	}
 
 	fn contains(list_id: &T::ListId, item: &T::ItemId) -> bool {

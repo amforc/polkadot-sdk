@@ -21,9 +21,9 @@
 //!
 //! 1. The meta row and the node rows are all-or-nothing (`ListMetas[list_id]` present iff at least
 //!    one `ListNodes` row exists for `list_id`).
-//! 2. When the meta row exists, its `head`/`tail` are both `Some(_)` and `len >= 1`; the head node
-//!    has `prev = None` and the tail node has `next = None`.
-//! 3. The forward walk visits exactly `meta.len` nodes (capped at `len + 1` so cyclic corruption
+//! 2. When the meta row exists, its `head` and `tail` nodes exist; the head node has `prev = None`
+//!    and the tail node has `next = None`.
+//! 3. The forward walk visits every stored node (bounded by `total_nodes + 1` so cyclic corruption
 //!    terminates), every visited node's `prev` matches the walk, and the reverse walk is the
 //!    forward walk reversed (checked step by step, so it is bounded by the forward walk).
 //!    Self-loops, dangling neighbor references, and cross-list references all surface through these
@@ -33,14 +33,10 @@
 
 use crate::{pallet::*, ListMeta};
 use alloc::vec::Vec;
-use frame::{
-	deps::{frame_support::storage::StorageDoubleMap as _, sp_runtime::TryRuntimeError},
-	prelude::*,
-};
+use frame::{deps::sp_runtime::TryRuntimeError, prelude::*};
 
-/// Cap on the walk vector's initial capacity. `meta.len` is the value we are
-/// checking, so a corrupt near-`u32::MAX` len must not size a huge allocation.
-/// A longer list just grows its vector.
+/// Cap on the walk vector's initial capacity so a huge list grows incrementally
+/// rather than over-allocating up front.
 const MAX_WALK_PREALLOC: usize = 1 << 12;
 
 impl<T: Config> Pallet<T> {
@@ -66,12 +62,10 @@ impl<T: Config> Pallet<T> {
 		list_id: &T::ListId,
 		meta: ListMeta<T::ItemId>,
 	) -> Result<(), TryRuntimeError> {
-		ensure!(ListNodes::<T>::contains_prefix(list_id), "ListMetas present without ListNodes");
+		let total_nodes = ListNodes::<T>::iter_key_prefix(list_id).count();
+		ensure!(total_nodes > 0, "ListMetas present without ListNodes");
 
-		let ListMeta { head, tail, len: stored_size } = meta;
-		let head_id = head.ok_or("ListMetas.head is None")?;
-		let tail_id = tail.ok_or("ListMetas.tail is None")?;
-		ensure!(stored_size != 0, "ListMetas.len is zero on present row");
+		let ListMeta { head: head_id, tail: tail_id } = meta;
 		let head_node = ListNodes::<T>::get(list_id, &head_id)
 			.ok_or("ListMetas.head points to missing node")?;
 		let tail_node = ListNodes::<T>::get(list_id, &tail_id)
@@ -83,19 +77,14 @@ impl<T: Config> Pallet<T> {
 		// missing, or self-looping neighbor links are all caught by the
 		// `node.prev == prev` check, the next iteration's failed fetch, or
 		// the walk cap; per-node `contains_key` probes would be redundant.
-		// `cap` bounds the walk (cycle detection); `prealloc` is the capped
-		// capacity.
-		let cap: usize = stored_size.saturating_add(1).saturated_into();
-		let prealloc = cap.min(MAX_WALK_PREALLOC);
+		let cap = total_nodes.saturating_add(1);
+		let prealloc = total_nodes.min(MAX_WALK_PREALLOC);
 		let mut forward: Vec<T::ItemId> = Vec::with_capacity(prealloc);
 		let mut prev: Option<T::ItemId> = None;
 		let mut cursor = Some(head_id);
 		let mut last_priority: Option<T::Priority> = None;
 		while let Some(cur) = cursor {
-			ensure!(
-				forward.len() < cap,
-				"forward walk exceeded ListMetas.len + 1 (cycle or undercounted len)"
-			);
+			ensure!(forward.len() < cap, "forward walk exceeded ListNodes count (cycle?)");
 			let node = ListNodes::<T>::get(list_id, &cur).ok_or("forward walk: missing node")?;
 			ensure!(node.prev == prev, "forward walk: node.prev != expected");
 			ensure!(
@@ -107,10 +96,6 @@ impl<T: Config> Pallet<T> {
 			cursor = node.next;
 			forward.push(cur);
 		}
-		ensure!(
-			u32::try_from(forward.len()) == Ok(stored_size),
-			"forward walk count != ListMetas.len"
-		);
 
 		// Reverse walk must match the reverse of the forward walk. Checked
 		// against `forward` as it goes, so a mismatch (including a reverse walk
@@ -128,7 +113,6 @@ impl<T: Config> Pallet<T> {
 		ensure!(expected.next().is_none(), "reverse walk length != forward walk length");
 
 		// Catch unreachable nodes: total rows must equal chain length.
-		let total_nodes = ListNodes::<T>::iter_key_prefix(list_id).count();
 		ensure!(
 			total_nodes == forward.len(),
 			"orphan ListNodes rows: total count differs from chain length"

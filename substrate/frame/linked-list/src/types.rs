@@ -19,31 +19,19 @@
 //! ([`Position`](crate::Position), [`ListError`](crate::ListError),
 //! [`Outcome`](crate::Outcome)) live in `linked-list-interface`.
 //!
-//! [`ListMeta`] bundles the head pointer, tail pointer, and item count of a
-//! single list into one storage row so they can be read/written together.
+//! [`ListMeta`] bundles the head and tail pointers of a single list into one
+//! storage row so they can be read/written together.
 
 use frame::prelude::*;
 
-/// Per-list head/tail/length triple, stored as a single row in
-/// [`crate::ListMetas`]. Absence of the row encodes the empty list.
+/// Per-list head/tail pair, stored as a single row in [`crate::ListMetas`].
+/// Absence of the row encodes the empty list.
 #[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	MaxEncodedLen,
-	TypeInfo,
-	Clone,
-	PartialEq,
-	Eq,
-	Debug,
-	DefaultNoBound,
+	Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug,
 )]
 pub struct ListMeta<ItemId> {
-	/// Highest-priority item, or `None` only as a transient state during mutation.
-	pub head: Option<ItemId>,
-	/// Lowest-priority item, or `None` only as a transient state during mutation.
-	pub tail: Option<ItemId>,
-	/// Number of items in the list. `0` only as a transient state during mutation;
-	/// rows with `len == 0` are removed.
-	pub len: u32,
+	/// Highest-priority item in the list.
+	pub head: ItemId,
+	/// Lowest-priority item in the list.
+	pub tail: ItemId,
 }

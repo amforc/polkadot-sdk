@@ -23,28 +23,6 @@ use crate::{mock::*, ListMeta, ListMetas, ListNodes, Node};
 use frame::testing_prelude::assert_err;
 
 #[test]
-fn corrupt_near_max_size_is_caught_without_preallocating() {
-	build_and_execute_no_post_check(|| {
-		insert(1, 1, 50);
-		insert(1, 2, 30);
-		// A near-`u32::MAX` `len` must be caught by the count check, not size a
-		// huge walk-vector before the walk runs.
-		ListMetas::<Test>::mutate_extant(1, |m| m.len = u32::MAX);
-		assert_err!(<LinkedList>::do_try_state(), "forward walk count != ListMetas.len");
-	});
-}
-
-#[test]
-fn corrupt_head_tail_mismatch_detected() {
-	build_and_execute_no_post_check(|| {
-		insert(1, 1, 50);
-		// Tail set without head.
-		ListMetas::<Test>::mutate_extant(1, |m| m.head = None);
-		assert_err!(<LinkedList>::do_try_state(), "ListMetas.head is None");
-	});
-}
-
-#[test]
 fn corrupt_link_cycle_detected() {
 	build_and_execute_no_post_check(|| {
 		insert(1, 1, 50);
@@ -54,17 +32,16 @@ fn corrupt_link_cycle_detected() {
 		// Patch the meta to match. The forged tail (1) still links onward, so
 		// the tail-endpoint check catches the cycle before the walk starts.
 		ListMetas::<Test>::mutate_extant(1, |m| {
-			m.len = 99;
-			m.tail = Some(1);
+			m.tail = 1;
 		});
 		assert_err!(<LinkedList>::do_try_state(), "tail node has non-None next");
 	});
 }
 
 #[test]
-fn empty_list_with_stale_size_detected() {
+fn empty_list_with_stale_meta_detected() {
 	build_and_execute_no_post_check(|| {
-		ListMetas::<Test>::insert(1, ListMeta { len: 5, ..Default::default() });
+		ListMetas::<Test>::insert(1, ListMeta { head: 1, tail: 1 });
 		assert_err!(<LinkedList>::do_try_state(), "ListMetas present without ListNodes");
 	});
 }
@@ -86,8 +63,8 @@ fn orphan_unreachable_node_detected() {
 		insert(1, 1, 50);
 		insert(1, 2, 30);
 		// Add a row not on the head→tail chain. The forward/reverse walks
-		// still see exactly the 2 reachable nodes and `ListMetas.len` agrees,
-		// so only the total-node-count check catches this.
+		// still see exactly the 2 reachable nodes, so only the total-node-count
+		// check catches this.
 		ListNodes::<Test>::insert(1, 999u64, Node { prev: None, next: None, priority: 100u32 });
 		assert_err!(
 			<LinkedList>::do_try_state(),

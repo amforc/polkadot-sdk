@@ -146,12 +146,11 @@ pub(crate) fn corrupt_node(
 /// Items in `list_id` head-to-tail.
 pub(crate) fn dump(list_id: ListId) -> alloc::vec::Vec<(ItemId, Priority)> {
 	use pallet_linked_list::SortedListInterface;
-	let count = LinkedList::count(&list_id);
-	let count = usize::try_from(count).expect("u32 fits in usize on test targets; qed");
-	let mut out = alloc::vec::Vec::with_capacity(count);
+	let total = pallet_linked_list::ListNodes::<Test>::iter_key_prefix(list_id).count();
+	let mut out = alloc::vec::Vec::with_capacity(total);
 	let mut cursor = LinkedList::head(&list_id);
 	while let Some(item) = cursor {
-		assert!(out.len() <= count, "dump: walk exceeded count (cycle?)");
+		assert!(out.len() <= total, "dump: walk exceeded node count (cycle?)");
 		let node = pallet_linked_list::ListNodes::<Test>::get(list_id, item)
 			.expect("listed items are stored; qed");
 		out.push((item, node.priority));
