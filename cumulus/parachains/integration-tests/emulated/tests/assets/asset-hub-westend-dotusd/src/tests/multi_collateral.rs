@@ -88,7 +88,7 @@ fn native_trust_backed_and_foreign_collateral_markets_coexist() {
 				eth_id(),
 				DOTUSD_ID,
 				branch_admins(),
-				branch_config(&eth_id(), &BranchSpec::default()),
+				branch_config(&BranchSpec::default()),
 				registration_config(),
 			),
 			pallet_vaults::Error::<Runtime>::OraclePriceNotAvailable

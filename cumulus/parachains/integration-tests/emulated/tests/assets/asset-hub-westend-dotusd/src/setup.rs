@@ -145,7 +145,7 @@ pub(crate) fn create_branch(spec: &BranchSpec) {
 		get_native_id(),
 		DOTUSD_ID,
 		branch_admins(),
-		branch_config(&get_native_id(), spec),
+		branch_config(spec),
 		registration_config(),
 	));
 	lift_global_ceiling(SCENARIO_GLOBAL_CEILING);
@@ -199,7 +199,7 @@ pub(crate) fn create_market_signed(collateral_id: VaultsCollateralId, spec: &Bra
 		collateral_id.clone(),
 		DOTUSD_ID,
 		branch_admins(),
-		branch_config(&collateral_id, spec),
+		branch_config(spec),
 		registration_config(),
 	));
 	lift_global_ceiling(SCENARIO_GLOBAL_CEILING);
@@ -256,19 +256,13 @@ pub(crate) fn branch_admins() -> pallet_vaults::types::BranchAdmins<MultiAddress
 	}
 }
 
-/// The collateral floor comes from the collateral's own minimum balance, so one
-/// spec suits every collateral.
-pub(crate) fn branch_config(
-	collateral_id: &VaultsCollateralId,
-	spec: &BranchSpec,
-) -> pallet_vaults::BranchConfig<Balance> {
+pub(crate) fn branch_config(spec: &BranchSpec) -> pallet_vaults::BranchConfig<Balance> {
 	pallet_vaults::BranchConfig {
 		minimum_collateralization_ratio: spec.mcr,
 		initial_collateralization_ratio: spec.icr,
 		safety_collateralization_ratio: spec.scr,
 		debt_ceiling: 100_000_000 * DOTUSD,
 		minimum_debt: spec.minimum_debt,
-		minimum_collateral: collateral_min_balance(collateral_id),
 		minimum_borrow_rate: FixedU128::zero(),
 		maximum_borrow_rate: FixedU128::from_rational(400, 100),
 		upfront_fee_period: spec.upfront_fee_period_ms,

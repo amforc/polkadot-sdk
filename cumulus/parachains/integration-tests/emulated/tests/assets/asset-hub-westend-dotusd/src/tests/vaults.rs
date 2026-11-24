@@ -63,7 +63,7 @@ fn signed_user_registers_a_native_collateral_market() {
 				full_admin: MultiAddress::Id(full_admin.clone()),
 				emergency_admin: MultiAddress::Id(emergency_admin.clone()),
 			},
-			branch_config(&get_native_id(), &BranchSpec::default()),
+			branch_config(&BranchSpec::default()),
 			registration_config(),
 		));
 
@@ -119,7 +119,7 @@ fn signed_user_registers_a_native_collateral_market() {
 				get_native_id(),
 				DOTUSD_ID,
 				branch_admins(),
-				branch_config(&get_native_id(), &BranchSpec::default()),
+				branch_config(&BranchSpec::default()),
 				registration_config(),
 			),
 			sp_runtime::DispatchError::BadOrigin,
