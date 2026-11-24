@@ -16,7 +16,7 @@ use crate::{
 use frame::{
 	prelude::*,
 	traits::{
-		fungibles::MutateHold as FungiblesMutateHold,
+		fungibles::{Inspect as FungiblesInspect, MutateHold as FungiblesMutateHold},
 		tokens::{Fortitude, Precision, Restriction},
 		Consideration, Convert, DefensiveOption, Time,
 	},
@@ -264,16 +264,20 @@ impl<T: Config> Context<T> {
 			Error::<T>::VaultAlreadyExists
 		);
 		ensure!(
-			initial_collateral >= self.branch.config.minimum_collateral,
+			initial_collateral >= T::CollateralAssets::minimum_balance(self.collateral_id.clone()),
 			Error::<T>::InsufficientCollateral
 		);
-		let mut vault = Pallet::<T>::open_scratch_row(
-			&self.branch.state,
-			annual_rate,
+		self.ensure_borrow_limits(initial_debt, initial_debt, annual_rate)?;
+		let (vault, upfront_fee) = Pallet::<T>::build_opened_vault(
+			&mut self.branch.state,
+			&self.branch.config,
 			initial_collateral,
+			initial_debt,
+			annual_rate,
 			self.now,
-		);
-		let upfront_fee = self.apply_checked_borrow(&mut vault, initial_debt, annual_rate)?;
+		)?;
+		self.ensure_global_ceiling()?;
+		self.ensure_above_icr(&vault.position())?;
 		self.branch
 			.state
 			.total_collateral
@@ -296,23 +300,18 @@ impl<T: Config> Context<T> {
 			owner,
 			Pallet::<T>::vault_footprint(&self.collateral_id, &self.stable_id, owner),
 		)?;
-		let mut op = self.attach_new(owner, vault, deposit)?;
+		let mut op = self.attach_new(owner, vault, deposit);
 		op.index_insert(hint)?;
 		Ok(op)
 	}
 
-	fn apply_checked_borrow(
-		&mut self,
-		vault: &mut Vault<BalanceOf<T>>,
+	fn ensure_borrow_limits(
+		&self,
+		vault_principal_after: BalanceOf<T>,
 		amount: BalanceOf<T>,
 		new_rate: FixedU128,
-	) -> Result<BalanceOf<T>, DispatchError> {
+	) -> DispatchResult {
 		self.ensure_valid_rate(new_rate)?;
-		let vault_principal_after = vault
-			.debt
-			.principal
-			.checked_add(&amount)
-			.ok_or(Error::<T>::ArithmeticOverflow)?;
 		ensure!(
 			vault_principal_after >= self.branch.config.minimum_debt,
 			Error::<T>::DebtBelowMinimum
@@ -329,6 +328,21 @@ impl<T: Config> Context<T> {
 			principal_after <= self.branch.config.debt_ceiling,
 			Error::<T>::DebtCeilingExceeded
 		);
+		Ok(())
+	}
+
+	fn apply_checked_borrow(
+		&mut self,
+		vault: &mut Vault<BalanceOf<T>>,
+		amount: BalanceOf<T>,
+		new_rate: FixedU128,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let vault_principal_after = vault
+			.debt
+			.principal
+			.checked_add(&amount)
+			.ok_or(Error::<T>::ArithmeticOverflow)?;
+		self.ensure_borrow_limits(vault_principal_after, amount, new_rate)?;
 		let upfront_fee = self.apply_borrow_transition(vault, amount, new_rate)?;
 		self.ensure_global_ceiling()?;
 		self.ensure_above_icr(&vault.position())?;
@@ -398,23 +412,22 @@ impl<T: Config> Context<T> {
 
 	/// Attaches a new vault without touching an existing row.
 	///
-	/// Its upfront fee may already be recorded.
+	/// Its accounting contribution (including stake and upfront fee) is already recorded in the
+	/// branch state.
 	fn attach_new(
 		self,
 		owner: &T::AccountId,
 		vault: Vault<BalanceOf<T>>,
 		deposit: T::VaultConsideration,
-	) -> Result<VaultOp<T>, DispatchError> {
-		let mut op = VaultOp {
+	) -> VaultOp<T> {
+		VaultOp {
 			ctx: self,
 			owner: owner.clone(),
 			vault,
 			deposit,
 			status: VaultStatus::Active,
 			hint_repair_steps: 0,
-		};
-		op.sync_stake()?;
-		Ok(op)
+		}
 	}
 }
 

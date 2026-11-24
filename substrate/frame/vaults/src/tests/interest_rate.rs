@@ -71,12 +71,6 @@ fn change_rate_post_cooldown_full_state() {
 		);
 
 		let now_before_call = Timestamp::get();
-		assert_eq!(
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 0, Some(percent(75)))
-				.expect("registered branch and vault"),
-			0,
-			"post-cooldown rate change should quote no upfront fee",
-		);
 
 		System::reset_events();
 		assert_ok!(change_rate(1, DOT, STABLE, percent(75)));
@@ -117,22 +111,19 @@ fn change_rate_premature_increases_recorded_debt_by_fee() {
 		assert_ok!(poke(1, DOT, STABLE, 1));
 		let v_pre = vault(DOT, STABLE, 1);
 
-		let predicted =
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 0, Some(percent(75)))
-				.expect("registered branch and vault");
 		// The sole vault's new 75% is the average: ceil(2_000 · 75% · 7d / 365.25d) = 29.
-		assert_eq!(predicted, 29, "premature change at debt=2000 must charge a fee");
+		let expected_fee = 29;
 
 		assert_ok!(change_rate(1, DOT, STABLE, percent(75)));
 
 		let v_post = vault(DOT, STABLE, 1);
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal);
-		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted);
+		assert_eq!(v_post.debt.interest, v_pre.debt.interest + expected_fee);
 		assert_event(crate::Event::UpfrontFeeCharged {
 			collateral_id: DOT,
 			stable_id: STABLE,
 			owner: 1,
-			amount: 29,
+			amount: expected_fee,
 		});
 		assert_event(crate::Event::BorrowRateChanged {
 			collateral_id: DOT,
@@ -159,16 +150,8 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 		// The rate change is premature, so the fee covers all 2_500 of the vault's principal, at
 		// the post-borrow *average* rate (2_500 · 5% + 2_000 · 10% + 2_000 · 30%) / 6_500 ≈ 14.23%,
 		// not the vault's own 5%: ceil(2_500 · 14.23% · 7d / 365.25d) = ceil(6.82) = 7, where the
-		// own rate would give 3. The dispatch below must then charge exactly the quote.
-		let predicted = crate::Pallet::<Test>::predict_borrow_upfront_fee(
-			DOT,
-			STABLE,
-			1,
-			500,
-			Some(percent(5)),
-		)
-		.expect("registered branch and vault");
-		assert_eq!(predicted, 7);
+		// own rate would give 3.
+		let expected_fee = 7;
 		let now_before_call = Timestamp::get();
 
 		assert_ok!(borrow(1, DOT, STABLE, 500, Some(percent(5))));
@@ -177,7 +160,7 @@ fn borrow_with_new_rate_updates_rate_reorders_index_and_charges_predicted_fee() 
 		assert_eq!(v_post.annual_rate, percent(5));
 		assert_eq!(v_post.last_rate_update, now_before_call);
 		assert_eq!(v_post.debt.principal, v_pre.debt.principal + 500);
-		assert_eq!(v_post.debt.interest, v_pre.debt.interest + predicted);
+		assert_eq!(v_post.debt.interest, v_pre.debt.interest + expected_fee);
 		let order = LinkedList::iter_from_tail(VaultList::Rate(DOT, STABLE), 10);
 		assert_eq!(order, alloc::vec![1, 2, 3]);
 		System::assert_has_event(RuntimeEvent::Vaults(crate::Event::BorrowRateChanged {
@@ -203,18 +186,6 @@ fn borrow_with_unchanged_rate_charges_no_rate_change_fee() {
 		// Advance only part-way into the rate-adjustment cooldown so a (buggy)
 		// rate-change fee would still apply if the rate were treated as changed.
 		advance_time(ONE_DAY_MS / 2);
-
-		let fee_pure = crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 500, None)
-			.expect("registered branch and vault");
-		let fee_same_rate = crate::Pallet::<Test>::predict_borrow_upfront_fee(
-			DOT,
-			STABLE,
-			1,
-			500,
-			Some(percent(20)),
-		)
-		.expect("registered branch and vault");
-		assert_eq!(fee_pure, fee_same_rate, "an unchanged rate must not add a rate-change fee");
 
 		System::reset_events();
 		assert_ok!(borrow(1, DOT, STABLE, 500, Some(percent(20))));
@@ -317,11 +288,6 @@ fn open_records_debt_mints_borrow_and_emits_events() {
 		let rate = percent(37);
 		// ceil(2_000 × 37% × 7 / 365.25) = 15.
 		let fee = 15;
-		assert_eq!(
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, STABLE, 2_000, rate)
-				.expect("registered branch"),
-			fee
-		);
 
 		assert_ok!(open(1, DOT, STABLE, 1_000, 2_000, rate));
 
@@ -374,15 +340,9 @@ fn open_fee_is_charged_at_the_post_open_average_rate() {
 		// The average after the open is (100_000 · 5% + 100_000 · 15%) / 200_000 = 10%, so the
 		// fee is ceil(100_000 · 10% · 7d / 365.25d) = ceil(191.65) = 192. The opener's own 15%
 		// would give ceil(287.47) = 288.
-		assert_eq!(
-			crate::Pallet::<Test>::predict_open_upfront_fee(DOT, STABLE, 100_000, percent(15))
-				.expect("registered branch"),
-			192
-		);
-
 		assert_ok!(open(2, DOT, STABLE, 20_000, 100_000, percent(15)));
 
-		assert_eq!(vault(DOT, STABLE, 2).debt.interest, 192, "charged fee matches the quote");
+		assert_eq!(vault(DOT, STABLE, 2).debt.interest, 192);
 	});
 }
 

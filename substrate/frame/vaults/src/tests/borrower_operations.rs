@@ -59,12 +59,6 @@ fn change_rate_to_same_rate_is_no_op() {
 		let pre = vault(DOT, STABLE, 1);
 		advance_time(ONE_DAY_MS); // one day of pending interest
 		let now = Timestamp::get();
-		assert_eq!(
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 0, Some(percent(5)))
-				.expect("registered branch and vault"),
-			0,
-			"the quote must reflect that an unchanged rate is a no-op"
-		);
 
 		assert_ok!(change_rate(1, DOT, STABLE, percent(5)));
 

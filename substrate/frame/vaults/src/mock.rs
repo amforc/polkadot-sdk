@@ -618,7 +618,6 @@ pub fn default_branch_config() -> BranchConfig<Balance> {
 		safety_collateralization_ratio: FixedU128::from_rational(130u128, 100u128),
 		debt_ceiling: 1_000_000_000_000,
 		minimum_debt: 200,
-		minimum_collateral: 1,
 		minimum_borrow_rate: FixedU128::from_rational(1u128, 1_000u128),
 		maximum_borrow_rate: FixedU128::from_rational(400u128, 100u128),
 		upfront_fee_period: 7 * 24 * 3_600 * 1_000,

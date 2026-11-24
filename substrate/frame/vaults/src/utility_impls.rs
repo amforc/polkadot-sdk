@@ -45,7 +45,6 @@ pub(crate) struct TouchedVaultDraft<AccountId, Balance> {
 	pub(crate) state: BranchState<AccountId, Balance>,
 	pub(crate) vault: Vault<Balance>,
 	pub(crate) status: VaultStatus,
-	pub(crate) now: Millis,
 }
 
 /// Stablecoin one commit issues, drawn first from stablecoin the same operation burns.
@@ -885,9 +884,15 @@ impl<T: Config> Pallet<T> {
 		accrued_state: &BranchState<T::AccountId, BalanceOf<T>>,
 		now: Millis,
 	) -> Result<BalanceOf<T>, DispatchError> {
-		let mut state = accrued_state.clone();
-		let (vault, _) = Self::touched_row(collateral_id, stable_id, owner, &mut state, now)?;
-		Ok(vault.debt.total())
+		let vault = Self::vault_of(collateral_id, stable_id, owner)?;
+		let pending = Self::pending_touch_for(&vault, accrued_state, now)?;
+		vault
+			.debt
+			.principal
+			.ensure_add(vault.debt.interest)
+			.and_then(|debt| debt.ensure_add(pending.interest))
+			.and_then(|debt| debt.ensure_add(pending.redistribution.debt))
+			.map_err(|_| Error::<T>::ArithmeticOverflow.into())
 	}
 
 	/// Reads one vault row with its status and touches it against `state`, accrued to `now`.
@@ -904,28 +909,31 @@ impl<T: Config> Pallet<T> {
 		Ok((vault, status))
 	}
 
-	/// A zero-debt, zero-stake vault row: the pre-borrow shape an open feeds
-	/// to [`Self::apply_borrow_unchecked`], so the open fee is priced by the same
-	/// code path as every borrow. The stake MUST be zero here — the borrow update
-	/// swaps the row's full aggregate contribution, and the open's stake
-	/// enters the aggregates when the operation synchronizes the stake after
-	/// the borrow is applied.
-	pub(crate) fn open_scratch_row(
-		state: &BranchState<T::AccountId, BalanceOf<T>>,
-		annual_rate: FixedU128,
+	/// Builds a new vault, adds its full contribution (principal and stake) to `state` in one
+	/// update, and charges its upfront fee.
+	pub(crate) fn build_opened_vault(
+		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
+		config: &BranchConfig<BalanceOf<T>>,
 		collateral: BalanceOf<T>,
+		initial_debt: BalanceOf<T>,
+		annual_rate: FixedU128,
 		now: Millis,
-	) -> Vault<BalanceOf<T>> {
-		Vault {
+	) -> Result<(Vault<BalanceOf<T>>, BalanceOf<T>), DispatchError> {
+		let redistribution_stake =
+			state.stake_for(collateral).ok_or(Error::<T>::ArithmeticOverflow)?;
+		let mut vault = Vault {
 			collateral,
-			debt: DebtBreakdown::default(),
+			debt: DebtBreakdown { principal: initial_debt, interest: BalanceOf::<T>::zero() },
 			annual_rate,
 			last_interest_time: state.interest_time(now),
 			interest_prepaid: 0,
 			last_rate_update: now,
-			redistribution_stake: Zero::zero(),
+			redistribution_stake,
 			redistribution_checkpoint: state.redistribution,
-		}
+		};
+		state.replace_vault(None, Some(&vault))?;
+		let fee = Self::apply_upfront_fee(state, config, &mut vault, initial_debt)?;
+		Ok((vault, fee))
 	}
 
 	fn avg_rate(state: &BranchState<T::AccountId, BalanceOf<T>>) -> FixedU128 {
@@ -936,7 +944,31 @@ impl<T: Config> Pallet<T> {
 		)
 	}
 
-	/// Apply a borrow to a branch/vault draft pair and return the upfront fee.
+	/// Prices and applies the upfront fee for `fee_base` onto `vault` and `state`.
+	fn apply_upfront_fee(
+		state: &mut BranchState<T::AccountId, BalanceOf<T>>,
+		config: &BranchConfig<BalanceOf<T>>,
+		vault: &mut Vault<BalanceOf<T>>,
+		fee_base: BalanceOf<T>,
+	) -> Result<BalanceOf<T>, DispatchError> {
+		let avg = Self::avg_rate(state);
+		let fee = math::simple_interest_ceil(fee_base, avg, config.upfront_fee_period);
+		if !fee.is_zero() {
+			vault
+				.debt
+				.interest
+				.ensure_add_assign(fee)
+				.map_err(|_| Error::<T>::ArithmeticOverflow)?;
+			state
+				.debt
+				.minted_interest
+				.ensure_add_assign(fee)
+				.map_err(|_| Error::<T>::ArithmeticOverflow)?;
+		}
+		Ok(fee)
+	}
+
+	/// Apply a borrow to an existing branch/vault draft pair and return the upfront fee.
 	///
 	/// A borrow that also changes the rate inside the cooldown charges the
 	/// upfront fee over both the debt increase and the existing principal. A
@@ -967,22 +999,12 @@ impl<T: Config> Pallet<T> {
 			vault.last_rate_update = now;
 		}
 		state.replace_vault(Some(&before), Some(vault))?;
-		let avg = Self::avg_rate(state);
-		let fee = math::simple_interest_ceil(
+		Self::apply_upfront_fee(
+			state,
+			config,
+			vault,
 			debt_increase.saturating_add(rate_change_fee_base),
-			avg,
-			config.upfront_fee_period,
-		);
-		if !fee.is_zero() {
-			let before_fee = vault.clone();
-			vault
-				.debt
-				.interest
-				.ensure_add_assign(fee)
-				.map_err(|_| Error::<T>::ArithmeticOverflow)?;
-			state.replace_vault(Some(&before_fee), Some(vault))?;
-		}
-		Ok(fee)
+		)
 	}
 
 	/// The single target that preempts the rate index, with its status: the
@@ -1062,6 +1084,6 @@ impl<T: Config> Pallet<T> {
 	) -> Result<TouchedVaultDraft<T::AccountId, BalanceOf<T>>, DispatchError> {
 		let (config, mut state, now) = Self::accrued_branch_view(collateral_id, stable_id)?;
 		let (vault, status) = Self::touched_row(collateral_id, stable_id, owner, &mut state, now)?;
-		Ok(TouchedVaultDraft { config, state, vault, status, now })
+		Ok(TouchedVaultDraft { config, state, vault, status })
 	}
 }

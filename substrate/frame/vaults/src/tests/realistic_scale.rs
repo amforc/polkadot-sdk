@@ -38,11 +38,7 @@ fn register_realistic_market() {
 		XBT,
 		USDX,
 		FixedU128::from_rational(1u128, 1_000u128),
-		BranchConfig {
-			debt_ceiling: 100_000_000 * USD,
-			minimum_collateral: XBT_ED,
-			..usdx_branch_config()
-		},
+		BranchConfig { debt_ceiling: 100_000_000 * USD, ..usdx_branch_config() },
 	);
 }
 
@@ -84,13 +80,14 @@ fn fee_account_pays_its_own_asset_account_deposit() {
 	});
 }
 
-// A vault floor has to clear its asset's minimum balance, or the smallest vault the branch admits
-// could never be paid what it borrows or hold what it pledges. The floor is judged against the
-// coin, not against a number: the same 9_999 that is dust to six-decimal USDX is a fine floor for
-// STABLE, whose minimum balance is one unit. Neither floor can be walked back after creation: the
-// branch that admits a vault is the branch that has to carry it.
+// A vault has to clear its assets' minimum balances, or the smallest vault the branch admits
+// could never be paid what it borrows or hold what it pledges. The debt floor is judged against
+// the coin, not against a number: the same 9_999 that is dust to six-decimal USDX is a fine floor
+// for STABLE, whose minimum balance is one unit. It cannot be walked back after creation: the
+// branch that admits a vault is the branch that has to carry it. The collateral floor is the
+// asset's own minimum balance, checked when a vault opens.
 #[test]
-fn vault_floors_below_asset_minimums_are_rejected_on_every_write() {
+fn vaults_below_asset_minimums_are_rejected() {
 	ExtBuilder::default().price(TOKEN_X, DEFAULT_PRICE).build_and_execute(|| {
 		let dust_debt = BranchConfig { minimum_debt: USDX_ED - 1, ..usdx_branch_config() };
 
@@ -115,36 +112,11 @@ fn vault_floors_below_asset_minimums_are_rejected_on_every_write() {
 			(),
 		));
 
-		set_price(XBT, FixedU128::from_rational(1u128, 1_000u128));
-		let dust_collateral =
-			BranchConfig { minimum_collateral: XBT_ED - 1, ..usdx_branch_config() };
-
-		assert_noop!(
-			crate::Pallet::<Test>::create_branch(
-				RuntimeOrigin::root(),
-				XBT,
-				USDX,
-				branch_admins(ADMIN, EMERGENCY_ADMIN),
-				dust_collateral,
-				(),
-			),
-			Error::<Test>::InvalidBranchConfig(
-				BranchConfigDefect::MinimumCollateralBelowCollateralMinimum
-			)
-		);
-
 		register_realistic_market();
 
 		assert_noop!(
-			crate::Pallet::<Test>::set_param(
-				RuntimeOrigin::signed(ADMIN),
-				XBT,
-				USDX,
-				BranchConfigUpdate::MinimumCollateral(XBT_ED - 1)
-			),
-			Error::<Test>::InvalidBranchConfig(
-				BranchConfigDefect::MinimumCollateralBelowCollateralMinimum
-			)
+			open(1, XBT, USDX, XBT_ED - 1, 200 * USD, percent(5)),
+			Error::<Test>::InsufficientCollateral
 		);
 		assert_noop!(
 			crate::Pallet::<Test>::set_param(

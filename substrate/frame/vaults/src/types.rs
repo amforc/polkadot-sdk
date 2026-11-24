@@ -269,8 +269,6 @@ pub struct BranchConfig<Balance> {
 	pub debt_ceiling: Balance,
 	/// Minimum debt for an active vault.
 	pub minimum_debt: Balance,
-	/// Minimum collateral required to open a vault.
-	pub minimum_collateral: Balance,
 	/// Lowest annual rate allowed for a vault.
 	pub minimum_borrow_rate: FixedU128,
 	/// Highest annual rate allowed for a vault.
@@ -281,19 +279,6 @@ pub struct BranchConfig<Balance> {
 	pub rate_adjustment_cooldown: Millis,
 	/// Collateral penalty applied during liquidation.
 	pub redistribution_penalty: Permill,
-}
-
-/// The smallest balance each of a branch's two assets can hold.
-///
-/// A branch's own amounts mean nothing on their own: a six-decimal stablecoin and an
-/// eighteen-decimal one disagree about what "one" is. Both agree that a balance under the
-/// asset's minimum cannot be held, which is what makes it the one floor every branch can be
-/// judged against.
-pub(crate) struct AssetMinimums<Balance> {
-	/// Smallest collateral balance an account can hold.
-	pub(crate) collateral: Balance,
-	/// Smallest stablecoin balance an account can hold.
-	pub(crate) stable: Balance,
 }
 
 /// A way one [`BranchConfig`] contradicts itself or the assets it names.
@@ -308,27 +293,21 @@ pub enum BranchConfigDefect {
 	MinimumBorrowRateAboveMaximum,
 	/// The debt floor is zero, so a vault could open owing nothing and never be dormant.
 	ZeroMinimumDebt,
-	/// The collateral floor is zero, so every vault could open on dust.
-	ZeroMinimumCollateral,
 	/// The debt floor is under the stablecoin's minimum balance, so the smallest vault could
 	/// not be paid what it borrows.
 	MinimumDebtBelowStableMinimum,
-	/// The collateral floor is under the collateral's minimum balance, so the smallest vault
-	/// could hold less than an account can carry.
-	MinimumCollateralBelowCollateralMinimum,
 }
 
 impl<Balance: AtLeast32BitUnsigned + Copy> BranchConfig<Balance> {
 	/// Checks this configuration is consistent, returning the first way it contradicts itself.
 	///
-	/// Every amount here is denominated in the branch's own assets, so its
-	/// magnitude is the creator's choice; `minimums` is the one yardstick those
-	/// assets themselves provide. This rejects only the combinations that
-	/// contradict each other and so cannot describe a working branch.
-	/// Runtime-owned floors live in [`BranchConfigBounds::ensure_within`].
+	/// Every amount here is denominated in the branch's own assets, so its magnitude is the
+	/// creator's choice; `stable_minimum` is the one yardstick the stablecoin itself provides.
+	/// This rejects only the combinations that contradict each other and so cannot describe a
+	/// working branch. Runtime-owned floors live in [`BranchConfigBounds::ensure_within`].
 	pub(crate) fn ensure_consistent(
 		&self,
-		minimums: &AssetMinimums<Balance>,
+		stable_minimum: Balance,
 	) -> Result<(), BranchConfigDefect> {
 		// A liquidation ratio above the borrow or safety ratio would open
 		// vaults that are already liquidatable.
@@ -346,30 +325,22 @@ impl<Balance: AtLeast32BitUnsigned + Copy> BranchConfig<Balance> {
 			self.minimum_borrow_rate <= self.maximum_borrow_rate,
 			BranchConfigDefect::MinimumBorrowRateAboveMaximum
 		);
-		self.ensure_vault_floors(minimums)
+		self.ensure_vault_floors(stable_minimum)
 	}
 
-	/// Checks the vault floors describe a vault worth carrying.
+	/// Checks the debt floor describes a vault worth carrying.
 	///
-	/// The floors are all that stands between a branch and unbounded dust vaults. Each vault is
+	/// The floor is all that stands between a branch and unbounded dust vaults. Each vault is
 	/// a storage row, a sorted-list node, and a step a redemption may walk, and a vault owing
 	/// less than the stablecoin's minimum balance pays for none of it. Measuring against the
-	/// assets' own minimums holds every branch to the same rule rather than the same number.
-	fn ensure_vault_floors(
-		&self,
-		minimums: &AssetMinimums<Balance>,
-	) -> Result<(), BranchConfigDefect> {
+	/// stablecoin's own minimum holds every branch to the same rule rather than the same number.
+	fn ensure_vault_floors(&self, stable_minimum: Balance) -> Result<(), BranchConfigDefect> {
 		// A zero debt floor also makes every husk active, since a vault is dormant exactly
 		// while it owes less than the floor.
 		ensure!(!self.minimum_debt.is_zero(), BranchConfigDefect::ZeroMinimumDebt);
-		ensure!(!self.minimum_collateral.is_zero(), BranchConfigDefect::ZeroMinimumCollateral);
 		ensure!(
-			self.minimum_debt >= minimums.stable,
+			self.minimum_debt >= stable_minimum,
 			BranchConfigDefect::MinimumDebtBelowStableMinimum
-		);
-		ensure!(
-			self.minimum_collateral >= minimums.collateral,
-			BranchConfigDefect::MinimumCollateralBelowCollateralMinimum
 		);
 		Ok(())
 	}
@@ -771,10 +742,6 @@ pub enum BranchConfigUpdate<Balance> {
 	/// becomes dormant if collateral remains, or closes if empty. Its partial repayments must
 	/// leave at least the new minimum, and its borrows must raise the principal to it.
 	MinimumDebt(Balance),
-	/// Sets the minimum collateral required to open a vault.
-	///
-	/// Only opening checks it: existing vaults below the new minimum are unaffected.
-	MinimumCollateral(Balance),
 	/// Sets the allowed annual rate range.
 	BorrowRateBounds {
 		/// Lowest allowed rate.
@@ -799,7 +766,6 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::SafetyCollateralizationRatio(v) => config.safety_collateralization_ratio = v,
 			Self::DebtCeiling(v) => config.debt_ceiling = v,
 			Self::MinimumDebt(v) => config.minimum_debt = v,
-			Self::MinimumCollateral(v) => config.minimum_collateral = v,
 			Self::BorrowRateBounds { min, max } => {
 				config.minimum_borrow_rate = min;
 				config.maximum_borrow_rate = max;
@@ -826,7 +792,6 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			},
 			Self::DebtCeiling(_) => Self::DebtCeiling(config.debt_ceiling),
 			Self::MinimumDebt(_) => Self::MinimumDebt(config.minimum_debt),
-			Self::MinimumCollateral(_) => Self::MinimumCollateral(config.minimum_collateral),
 			Self::BorrowRateBounds { .. } => Self::BorrowRateBounds {
 				min: config.minimum_borrow_rate,
 				max: config.maximum_borrow_rate,
@@ -850,7 +815,6 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 			Self::DebtCeiling(_) |
 			Self::BorrowRateBounds { .. } => AdminLevel::Emergency,
 			Self::MinimumDebt(_) |
-			Self::MinimumCollateral(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
 			Self::RedistributionPenalty(_) => AdminLevel::Full,
@@ -876,7 +840,6 @@ impl<Balance: PartialOrd + Copy> BranchConfigUpdate<Balance> {
 				*max <= config.maximum_borrow_rate && *min >= config.minimum_borrow_rate
 			},
 			Self::MinimumDebt(_) |
-			Self::MinimumCollateral(_) |
 			Self::UpfrontFeePeriod(_) |
 			Self::RateAdjustmentCooldown(_) |
 			Self::RedistributionPenalty(_) => false,

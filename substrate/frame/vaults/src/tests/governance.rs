@@ -266,10 +266,6 @@ fn invalid_configs_are_rejected_on_every_write() {
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumDebt)
 		);
 		assert_noop!(
-			create(BranchConfig { minimum_collateral: 0, ..default_branch_config() }),
-			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumCollateral)
-		);
-		assert_noop!(
 			create(BranchConfig {
 				minimum_borrow_rate: percent(300),
 				maximum_borrow_rate: percent(200),
@@ -289,10 +285,6 @@ fn invalid_configs_are_rejected_on_every_write() {
 		assert_noop!(
 			set_param(BranchConfigUpdate::MinimumDebt(0)),
 			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumDebt)
-		);
-		assert_noop!(
-			set_param(BranchConfigUpdate::MinimumCollateral(0)),
-			Error::<Test>::InvalidBranchConfig(BranchConfigDefect::ZeroMinimumCollateral)
 		);
 		assert_noop!(
 			Pallet::<Test>::set_param(
@@ -684,26 +676,6 @@ fn raised_minimum_debt_keeps_open_vaults_active_and_floors_their_next_change() {
 		mint_stable(STABLE, 1, vault(DOT, STABLE, 1).debt.total());
 		assert_ok!(repay(1, DOT, STABLE, 1, None));
 		assert_eq!(vault(DOT, STABLE, 1).debt.total(), 0);
-	});
-}
-
-// Raising the collateral floor reaches only new vaults: an open vault under it keeps withdrawing
-// down to what its ratio allows.
-#[test]
-fn raised_minimum_collateral_binds_only_new_vaults() {
-	ExtBuilder::default().branch(DOT, STABLE).build_and_execute(|| {
-		assert_ok!(open(1, DOT, STABLE, 1_000, 500, percent(5)));
-
-		assert_ok!(set_param(BranchConfigUpdate::MinimumCollateral(2_000)));
-
-		assert!(vault_status(DOT, STABLE, 1).is_active());
-		assert_ok!(withdraw_collateral(1, DOT, STABLE, 100, None));
-		assert_eq!(vault(DOT, STABLE, 1).collateral, 900);
-		assert_noop!(
-			open(2, DOT, STABLE, 1_999, 500, percent(5)),
-			Error::<Test>::InsufficientCollateral
-		);
-		assert_ok!(open(2, DOT, STABLE, 2_000, 500, percent(5)));
 	});
 }
 

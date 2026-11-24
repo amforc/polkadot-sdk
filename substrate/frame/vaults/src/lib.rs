@@ -670,8 +670,6 @@ pub mod pallet {
 		BranchFrozen,
 		/// The oracle has no valid price for this collateral asset.
 		OraclePriceNotAvailable,
-		/// The oracle price is too old. Reserved for runtime oracle adapters.
-		OracleStale,
 		/// The rate-list hint is too far from the correct position.
 		///
 		/// Fetch a new hint from the [`Config::VaultLists`] views for [`VaultListId::Rate`] and
@@ -870,56 +868,6 @@ pub mod pallet {
 				total.ensure_add_assign(debt).map_err(|_| Error::<T>::ArithmeticOverflow)?;
 			}
 			Ok((total, in_front.next().is_some()))
-		}
-
-		/// Estimates the upfront fee for opening a vault.
-		///
-		/// Uses the same accrued branch draft and fee transition as execution.
-		pub fn predict_open_upfront_fee(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			initial_debt: BalanceOf<T>,
-			annual_rate: FixedU128,
-		) -> Result<BalanceOf<T>, DispatchError> {
-			let (config, mut state, now) = Self::accrued_branch_view(&collateral_id, &stable_id)?;
-			ensure!(state.frozen_reason().is_none(), Error::<T>::BranchFrozen);
-			Self::validate_rate(&config, annual_rate)?;
-			let mut scratch = Self::open_scratch_row(&state, annual_rate, Zero::zero(), now);
-			Self::apply_borrow_unchecked(
-				&mut state,
-				&config,
-				&mut scratch,
-				initial_debt,
-				annual_rate,
-				now,
-			)
-		}
-
-		/// Estimates the upfront fee for borrowing from a vault, changing its annual rate, or
-		/// both.
-		///
-		/// Applies the same pending touch as execution before pricing the fee. A zero
-		/// `debt_increase` with a new rate prices [`Pallet::change_rate`], which charges nothing
-		/// once the rate-change cooldown has passed.
-		pub fn predict_borrow_upfront_fee(
-			collateral_id: CollateralIdOf<T>,
-			stable_id: StableIdOf<T>,
-			owner: T::AccountId,
-			debt_increase: BalanceOf<T>,
-			maybe_new_rate: Option<FixedU128>,
-		) -> Result<BalanceOf<T>, DispatchError> {
-			let mut draft = Self::touched_vault_draft(&collateral_id, &stable_id, &owner)?;
-			ensure!(draft.state.frozen_reason().is_none(), Error::<T>::BranchFrozen);
-			let new_rate = maybe_new_rate.unwrap_or(draft.vault.annual_rate);
-			Self::validate_rate(&draft.config, new_rate)?;
-			Self::apply_borrow_unchecked(
-				&mut draft.state,
-				&draft.config,
-				&mut draft.vault,
-				debt_increase,
-				new_rate,
-				draft.now,
-			)
 		}
 	}
 

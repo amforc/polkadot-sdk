@@ -9,7 +9,7 @@ use crate::{
 		BalanceOf, BranchOf, Branches, CollateralIdOf, Config, GlobalDebtCeilings, HoldReason,
 		Millis, Pallet, StableIdOf, StablecoinDebt, StablecoinMarkets, VaultListIdOf, Vaults,
 	},
-	types::{AssetMinimums, VaultListId},
+	types::VaultListId,
 	utility_impls::BranchContribution,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -61,7 +61,7 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 			)
 			.ok_or("stablecoin pending-interest numerator overflow")?;
 		let (collateral_id, stable_id) = (&collateral_id, &stable_id);
-		check_branch_config::<T>(collateral_id, stable_id, &branch)?;
+		check_branch_config::<T>(stable_id, &branch)?;
 		let rate_list = VaultListId::Rate(collateral_id.clone(), stable_id.clone());
 		let recovery_list = VaultListId::FinalRecovery(collateral_id.clone(), stable_id.clone());
 		check_branch_identities::<T>(
@@ -108,17 +108,13 @@ pub fn do_try_state<T: Config>() -> Result<(), TryRuntimeError> {
 /// branches the dispatchables would now refuse, so such a change needs a migration of their
 /// configs.
 fn check_branch_config<T: Config>(
-	collateral_id: &CollateralIdOf<T>,
 	stable_id: &StableIdOf<T>,
 	branch: &BranchOf<T>,
 ) -> Result<(), TryRuntimeError> {
-	let minimums = AssetMinimums {
-		collateral: T::CollateralAssets::minimum_balance(collateral_id.clone()),
-		stable: T::StableAssets::minimum_balance(stable_id.clone()),
-	};
+	let stable_minimum = T::StableAssets::minimum_balance(stable_id.clone());
 	branch
 		.config
-		.ensure_consistent(&minimums)
+		.ensure_consistent(stable_minimum)
 		.map_err(|_| "stored branch config contradicts itself or its assets")?;
 	T::BranchConfigBounds::get()
 		.ensure_within(&branch.config)

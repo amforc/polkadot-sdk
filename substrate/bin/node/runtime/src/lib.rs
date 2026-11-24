@@ -3538,7 +3538,7 @@ impl stablecoin_primitives::ProvidePrice for VaultsOracleAdapter {
 		// a stalled feed instead of pricing against stale data.
 		let now = pallet_timestamp::Pallet::<Runtime>::get();
 		if now.saturating_sub(v.timestamp) > VaultsOraclePriceMaxAge::get() {
-			return Err(pallet_vaults::Error::<Runtime>::OracleStale.into());
+			return Err(sp_runtime::DispatchError::Other("stale oracle price"));
 		}
 		Ok(FixedU128::from_inner(v.value))
 	}

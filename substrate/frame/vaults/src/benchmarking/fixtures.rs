@@ -153,7 +153,6 @@ pub(crate) fn default_branch_config<T: BenchmarkConfig>() -> BranchConfig<Balanc
 		safety_collateralization_ratio: FixedU128::from_rational(130, 100),
 		debt_ceiling: balance::<T>(100_000_000),
 		minimum_debt,
-		minimum_collateral: collateral_unit::<T>(),
 		minimum_borrow_rate: FixedU128::from_rational(1, 1_000),
 		maximum_borrow_rate: FixedU128::from_rational(400, 100),
 		upfront_fee_period: 7 * DAY_MS,

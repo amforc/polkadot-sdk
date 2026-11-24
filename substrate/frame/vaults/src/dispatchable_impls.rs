@@ -7,8 +7,8 @@ use crate::{
 		Pallet, RegistrationConfigOf, StableIdOf, StablecoinMarkets, Vaults,
 	},
 	types::{
-		AdminLevel, AssetMinimums, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode,
-		BranchState, FrozenReason, FrozenState,
+		AdminLevel, BranchAdmins, BranchConfig, BranchConfigUpdate, BranchMode, BranchState,
+		FrozenReason, FrozenState,
 	},
 	utility_impls::Issuance,
 	weights::WeightInfo,
@@ -343,18 +343,16 @@ impl<T: Config> Pallet<T> {
 	/// with a dozen of them across the two checks, a single opaque error would leave a branch
 	/// creator guessing.
 	///
-	/// Both assets must already exist: their minimum balances are the scale the branch's own
-	/// amounts are judged on, and an absent asset reports no minimum at all.
+	/// The stablecoin must already exist: its minimum balance is the scale the branch's debt
+	/// floor is judged on, and an absent asset reports no minimum at all.
 	fn ensure_config_allowed(
-		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		config: &BranchConfig<BalanceOf<T>>,
 	) -> DispatchResult {
-		let minimums = AssetMinimums {
-			collateral: T::CollateralAssets::minimum_balance(collateral_id.clone()),
-			stable: T::StableAssets::minimum_balance(stable_id.clone()),
-		};
-		config.ensure_consistent(&minimums).map_err(Error::<T>::InvalidBranchConfig)?;
+		let stable_minimum = T::StableAssets::minimum_balance(stable_id.clone());
+		config
+			.ensure_consistent(stable_minimum)
+			.map_err(Error::<T>::InvalidBranchConfig)?;
 		T::BranchConfigBounds::get()
 			.ensure_within(config)
 			.map_err(Error::<T>::ConfigOutsideEnvelope)?;
@@ -385,7 +383,7 @@ impl<T: Config> Pallet<T> {
 			Error::<T>::UnknownCollateral
 		);
 		ensure!(T::StableAssets::asset_exists(stable_id.clone()), Error::<T>::UnknownStable);
-		Self::ensure_config_allowed(&collateral_id, &stable_id, &config)?;
+		Self::ensure_config_allowed(&stable_id, &config)?;
 		let stablecoin_markets = Self::claim_stablecoin_market(&collateral_id, &stable_id)?;
 		let deposit = match depositor {
 			Some(who) => {
@@ -511,7 +509,7 @@ impl<T: Config> Pallet<T> {
 				}
 				let old_value = update.current_in(&branch.config);
 				update.apply_to(&mut branch.config);
-				Self::ensure_config_allowed(&collateral_id, &stable_id, &branch.config)?;
+				Self::ensure_config_allowed(&stable_id, &branch.config)?;
 				Ok(old_value)
 			},
 		)?;

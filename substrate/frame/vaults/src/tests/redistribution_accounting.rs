@@ -159,16 +159,7 @@ fn borrow_after_redistribution_keeps_accrual_rate_consistent() {
 		}));
 		set_price(DOT, FixedU128::from_rational(10u128, 1u128));
 
-		let interest_before = vault(DOT, STABLE, 1).debt.interest;
-		let predicted_fee =
-			crate::Pallet::<Test>::predict_borrow_upfront_fee(DOT, STABLE, 1, 200, None)
-				.expect("touch projection and fee calculation succeed");
 		assert_ok!(borrow(1, DOT, STABLE, 200, None));
-		assert_eq!(
-			vault(DOT, STABLE, 1).debt.interest,
-			interest_before + predicted_fee,
-			"the prediction and execution paths share the pending-touch kernel",
-		);
 		assert_ok!(poke(99, DOT, STABLE, 2));
 
 		let state = market_state(DOT, STABLE);
