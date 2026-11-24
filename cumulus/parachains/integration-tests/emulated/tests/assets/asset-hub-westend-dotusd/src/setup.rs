@@ -220,8 +220,6 @@ fn test_redemption_config() -> pallet_redemptions::RedemptionConfig<Balance> {
 	pallet_redemptions::RedemptionConfig {
 		minimum_redemption_amount: 100 * DOTUSD,
 		dynamic_fee_decay_period: 6 * 60 * 60 * 1_000,
-		dynamic_fee_floor: FixedU128::from_rational(0u128, 1u128),
-		dynamic_fee_ceiling: FixedU128::from_rational(1u128, 1u128),
 		base_fee: Permill::from_rational(5u32, 1_000u32),
 		fee_ceiling: Permill::one(),
 		dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
