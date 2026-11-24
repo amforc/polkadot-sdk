@@ -44,9 +44,8 @@ pub fn remove<T: Config>(
 
 /// Translates a FIFO failure into [`Error::FinalRecoveryInvariantBroken`].
 ///
-/// The pallet derives every FIFO position itself, so any failure other than the length
-/// counter or the transactional limit means the queue and the vault records disagree: storage
-/// corruption, reported defensively.
+/// The pallet derives every FIFO position itself, so any failure other than the transactional
+/// limit means the queue and the vault records disagree: storage corruption, reported defensively.
 fn map_error<T: Config>(e: ListError) -> Error<T> {
 	match e {
 		ListError::ItemNotFound |
@@ -55,7 +54,7 @@ fn map_error<T: Config>(e: ListError) -> Error<T> {
 		ListError::InvalidPositionHints => {
 			defensive!("final recovery queue disagrees with the vault records", e);
 		},
-		ListError::ListTooLong | ListError::Internal => {},
+		ListError::Internal => {},
 	}
 	Error::<T>::FinalRecoveryInvariantBroken
 }

@@ -114,9 +114,8 @@ impl<T: Config> Pallet<T> {
 				defensive!("rate index disagrees with the vault records", e);
 				Error::<T>::RateIndexInvariantBroken
 			},
-			// Neither is corruption: the length counter cannot realistically fill, and the
-			// transactional limit is environmental.
-			ListError::ListTooLong | ListError::Internal => Error::<T>::RateIndexInvariantBroken,
+			// The transactional limit is environmental, not storage corruption.
+			ListError::Internal => Error::<T>::RateIndexInvariantBroken,
 		}
 	}
 

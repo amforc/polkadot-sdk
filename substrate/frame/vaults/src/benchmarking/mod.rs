@@ -428,7 +428,7 @@ mod benchmarks {
 		_(RawOrigin::Signed(caller.clone()), asset.clone(), stable::<T>(), owner.clone());
 
 		assert_eq!(status_of::<T>(&owner), VaultStatus::FinalRecovery);
-		assert_eq!(T::VaultLists::count(&recovery_list::<T>()), 2);
+		assert_eq!(T::VaultLists::iter_from_tail(recovery_list::<T>()).count(), 2);
 		assert_eq!(T::VaultLists::tail(&recovery_list::<T>()), Some(prior));
 		assert!(interest_issued::<T>());
 		Ok(())
@@ -455,7 +455,7 @@ mod benchmarks {
 		assert_eq!(status_of::<T>(&owner), VaultStatus::Active);
 		let neighbours = T::VaultLists::neighbors(&rate_list::<T>(), &owner);
 		assert_eq!(neighbours, Some(seed_gap(&seeds, 0)));
-		assert_eq!(T::VaultLists::count(&recovery_list::<T>()), 2);
+		assert_eq!(T::VaultLists::iter_from_tail(recovery_list::<T>()).count(), 2);
 		let next =
 			<Pallet<T> as VaultInterface>::next_redemption_target(&asset, &stable::<T>(), None);
 		assert_eq!(next, Some((first, VaultStatus::FinalRecovery)));

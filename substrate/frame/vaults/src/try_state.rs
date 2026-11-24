@@ -241,8 +241,8 @@ fn check_branch_identities<T: Config>(
 	let mut sum_stake_accrual_rate = U256::zero();
 	let mut sum_claimable_accrual_rate = U256::zero();
 	let mut sum_eligible_collateral = BalanceOf::<T>::zero();
-	let mut rate_members: u32 = 0;
-	let mut recovery_members: u32 = 0;
+	let mut rate_members: usize = 0;
+	let mut recovery_members: usize = 0;
 
 	for (owner, record) in Vaults::<T>::iter_prefix((collateral_id, stable_id)) {
 		let vault = record.vault;
@@ -352,11 +352,11 @@ fn check_branch_identities<T: Config>(
 	// Each member counted above is a distinct vault row, so equal counts leave no list node
 	// without a row: an orphan would be redeemed against, or recovered, with nothing behind it.
 	ensure!(
-		T::VaultLists::count(rate_list) == rate_members,
+		T::VaultLists::iter_from_tail(rate_list.clone()).count() == rate_members,
 		"rate index holds a node with no vault row"
 	);
 	ensure!(
-		T::VaultLists::count(recovery_list) == recovery_members,
+		T::VaultLists::iter_from_tail(recovery_list.clone()).count() == recovery_members,
 		"recovery FIFO holds a node with no vault row"
 	);
 
