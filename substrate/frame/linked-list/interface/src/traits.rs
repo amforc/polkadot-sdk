@@ -18,10 +18,7 @@
 //! Consumer-facing trait surface for the sorted list.
 
 use crate::{ListError, Outcome, Position};
-use frame::{
-	arithmetic::{CheckedAdd, FixedU128, Zero},
-	traits::Footprint,
-};
+use frame::traits::Footprint;
 
 /// Authoritative source of the priority for `(list_id, item)`. Consulted by
 /// the list pallet's `reprioritize` dispatchable to detect drift against
@@ -50,38 +47,6 @@ pub trait PriorityProvider<ListId, ItemId> {
 	/// `(list_id, item)`.
 	#[cfg(feature = "runtime-benchmarks")]
 	fn set_priority(_list_id: &ListId, _item: &ItemId, _priority: Self::Priority) {}
-}
-
-/// Append `item` to a list driven under FIFO discipline: the insertion
-/// priority is one above the current head's, so it is strictly greater than
-/// every present priority — FIFO order holds across arbitrary join/leave
-/// interleavings, the stored priorities stay distinct (permissionless
-/// re-anchoring can never legally relocate a member), the oldest member is
-/// the list tail, and the sequence resets whenever the list empties.
-///
-/// A FIFO list's `PriorityProvider` must treat the stored priority as
-/// authoritative (FIFO priorities never drift).
-///
-/// # Errors
-///
-/// - Everything [`SortedListInterface::insert`] can return.
-/// - [`ListError::CorruptList`] if the head has no stored priority, or its priority cannot be
-///   incremented (unreachable in practice: `u128::MAX` consecutive occupied appends).
-pub fn fifo_append<ListId, ItemId, List>(list_id: ListId, item: ItemId) -> Result<(), ListError>
-where
-	List: SortedListInterface<ListId, ItemId, Priority = FixedU128>,
-{
-	let head = List::head(&list_id);
-	let priority = match &head {
-		Some(head_item) => List::priority(&list_id, head_item)
-			.and_then(|p| p.checked_add(&FixedU128::from_inner(1)))
-			.ok_or(ListError::CorruptList)?,
-		None => FixedU128::zero(),
-	};
-
-	let hint = Position { prev: None, next: head };
-	List::insert(list_id, item, priority, hint)?;
-	Ok(())
 }
 
 /// Mutation and query surface for consumer pallets.

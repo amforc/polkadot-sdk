@@ -30,7 +30,6 @@
 //! - [`Position`] — typed `(prev, next)` insertion hint.
 //! - [`ListError`] — failure modes of interface operations.
 //! - [`Outcome`] — which path a `re_insert` took.
-//! - [`fifo_append`] — FIFO-discipline append helper on top of the interface.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -39,5 +38,5 @@ extern crate alloc;
 mod traits;
 mod types;
 
-pub use traits::{fifo_append, PriorityProvider, SortedListInterface};
+pub use traits::{PriorityProvider, SortedListInterface};
 pub use types::{ListError, Outcome, Position};
