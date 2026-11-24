@@ -24,10 +24,10 @@ fn footprint_includes_vault_record_and_rate_list_node() {
 		let footprint = Vaults::vault_footprint(&DOT, &STABLE, &OWNER);
 
 		assert_eq!(footprint.asset, DOT);
-		// One item of 430 bytes: the 101-byte hashed vault key, the 176-byte max-encoded `Vault`,
-		// the 17-byte deposit ticket (1-byte asset plus 16-byte balance), and the 136-byte
+		// One item of 408 bytes: the 101-byte hashed vault key, the 176-byte max-encoded `Vault`,
+		// the 17-byte deposit ticket (1-byte asset plus 16-byte balance), and the 114-byte
 		// rate-list node.
-		assert_eq!(footprint.footprint, Footprint::from_parts(1, 430));
+		assert_eq!(footprint.footprint, Footprint::from_parts(1, 408));
 	});
 }
 
