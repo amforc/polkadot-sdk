@@ -233,10 +233,6 @@ fn test_stability_config() -> pallet_stability::types::StabilityPoolConfig<Balan
 		minimum_active_pool_balance: 100 * DOTUSD,
 		entry_delay: u64::from(RELAY_CHAIN_SLOT_DURATION_MILLIS),
 		safety_withdrawal_delay: 10 * 60 * 1_000,
-		precision: pallet_stability::types::PoolPrecision {
-			p_min: FixedU128::from_inner(1_000_000_000),
-			scale_factor: 1_000_000_000,
-		},
 		yield_share: Permill::from_percent(75),
 	}
 }
