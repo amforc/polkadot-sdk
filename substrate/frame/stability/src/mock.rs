@@ -306,8 +306,6 @@ pub fn default_redemption_config() -> pallet_redemptions::types::RedemptionConfi
 	pallet_redemptions::types::RedemptionConfig {
 		minimum_redemption_amount: 100,
 		dynamic_fee_decay_period: 6 * 3_600 * 1_000,
-		dynamic_fee_floor: FixedU128::zero(),
-		dynamic_fee_ceiling: FixedU128::one(),
 		base_fee: Permill::from_rational(5u32, 1_000u32),
 		fee_ceiling: Permill::one(),
 		dynamic_fee_increase_divisor: FixedU128::from_rational(2u128, 1u128),
