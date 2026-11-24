@@ -887,7 +887,7 @@ fn recovery_stops_above_icr() {
 				redeem(RedeemOptions::spend(200)),
 				Error::<Test>::FinalRecoveryExitRequired
 			);
-			assert_ok!(execute_offset(STABLE, 200), RecoveryOffsetResult::NoTarget);
+			assert_ok!(execute_offset(STABLE, 200), RecoveryOffsetResult::NotOffsettable);
 			assert_eq!(vault_debt(DOT, STABLE, 1), debt_before);
 
 			// CR = 619 · 0.56 / 301 ≈ 115.2%, above MCR but not ICR.
@@ -1447,7 +1447,7 @@ fn execute_offset_inner(
 		)?
 	};
 	let (result, change) = <Redemptions as RecoveryOffsetInterface>::execute_recovery_offset(
-		&DOT, payment, &RECIPIENT,
+		&DOT, payment, amount, &RECIPIENT,
 	)?;
 	if let Err(change) = change.drop_zero() {
 		<Assets as FungiblesBalanced<AccountId>>::resolve(&REDEEMER, change)
@@ -1479,7 +1479,7 @@ fn execute_recovery_offset_settles_only_an_offsettable_head() {
 			// A zero budget withdraws nothing, so it is a pure storage no-op even though a
 			// recovery bonus applies.
 			assert_storage_noop!({
-				assert_ok!(execute_offset(STABLE, 0), RecoveryOffsetResult::NoTarget);
+				assert_ok!(execute_offset(STABLE, 0), RecoveryOffsetResult::NotOffsettable);
 			});
 
 			let debt_before = vault_debt(DOT, STABLE, 1);

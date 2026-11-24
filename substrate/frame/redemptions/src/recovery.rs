@@ -36,8 +36,14 @@ pub(crate) struct RecoveryPlan<Balance> {
 
 enum OffsetDecision<AccountId, Balance> {
 	NoTarget,
+	/// A head is queued but offers nothing to offset.
+	NotOffsettable,
 	BelowPar,
-	Available { owner: AccountId, debt: Balance, collateral: Balance },
+	Available {
+		owner: AccountId,
+		debt: Balance,
+		collateral: Balance,
+	},
 }
 
 impl<T: Config> Pallet<T> {
@@ -189,6 +195,7 @@ impl<T: Config> Pallet<T> {
 		collateral_id: &CollateralIdOf<T>,
 		stable_id: &StableIdOf<T>,
 		max_debt_to_cancel: BalanceOf<T>,
+		max_partial_debt: BalanceOf<T>,
 	) -> Result<OffsetDecision<T::AccountId, BalanceOf<T>>, DispatchError> {
 		let Some(owner) = Self::final_recovery_head(collateral_id, stable_id) else {
 			return Ok(OffsetDecision::NoTarget);
@@ -198,17 +205,24 @@ impl<T: Config> Pallet<T> {
 			.config;
 		let price = Self::collateral_price(collateral_id)?;
 		let snapshot = T::Vaults::project_redemption_snapshot(collateral_id, stable_id, &owner)?;
+		// A head smaller than the payment cannot deplete the payer. Size its settlement
+		// within the partial-offset cap before pricing collateral or moving assets.
+		let budget = if snapshot.debt < max_debt_to_cancel {
+			max_debt_to_cancel.min(max_partial_debt)
+		} else {
+			max_debt_to_cancel
+		};
 		// An offset never draws Insurance Fund cover, so a below-par head is refused before the
 		// fund's balance is read.
-		let plan = Self::price_at_or_above_par(&snapshot, price, max_debt_to_cancel, &config);
+		let plan = Self::price_at_or_above_par(&snapshot, price, budget, &config);
 		Ok(match plan {
-			// An unpriceable or exitable head is no offset target; the pool sees an empty FIFO.
+			// A queued head costs lookup and pricing weight even when it cannot be offset.
 			Err(Error::<T>::NoRedeemableVault | Error::<T>::FinalRecoveryExitRequired) => {
-				OffsetDecision::NoTarget
+				OffsetDecision::NotOffsettable
 			},
 			Err(error) => return Err(error.into()),
 			Ok(None) => OffsetDecision::BelowPar,
-			Ok(Some(plan)) if plan.debt.is_zero() => OffsetDecision::NoTarget,
+			Ok(Some(plan)) if plan.debt.is_zero() => OffsetDecision::NotOffsettable,
 			Ok(Some(plan)) => {
 				OffsetDecision::Available { owner, debt: plan.debt, collateral: plan.collateral }
 			},
@@ -225,14 +239,16 @@ impl<T: Config> RecoveryOffsetInterface for Pallet<T> {
 	fn execute_recovery_offset(
 		collateral_id: &CollateralIdOf<T>,
 		mut payment: StableCreditOf<T>,
+		max_partial_debt: BalanceOf<T>,
 		collateral_recipient: &T::AccountId,
 	) -> Result<(RecoveryOffsetResult<BalanceOf<T>>, StableCreditOf<T>), DispatchError> {
 		// The payment's own asset names the branch: a coin mismatch is
 		// unrepresentable rather than an error. The decision is a pure read,
 		// so non-applied outcomes return the payment without touching storage.
 		let stable_id = payment.asset();
-		match Self::offset_decision(collateral_id, &stable_id, payment.peek())? {
+		match Self::offset_decision(collateral_id, &stable_id, payment.peek(), max_partial_debt)? {
 			OffsetDecision::NoTarget => Ok((RecoveryOffsetResult::NoTarget, payment)),
+			OffsetDecision::NotOffsettable => Ok((RecoveryOffsetResult::NotOffsettable, payment)),
 			OffsetDecision::BelowPar => Ok((RecoveryOffsetResult::BelowPar, payment)),
 			OffsetDecision::Available { owner, debt, collateral } => {
 				let debt_payment = Self::exact_credit(payment.extract(debt), debt)?;
