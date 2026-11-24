@@ -22,10 +22,7 @@ fn sub_minimum_first_gain_settles_into_seeded_pool_account() {
 		register_branch(
 			HIGH_MIN,
 			STABLE,
-			pallet_vaults::BranchConfig {
-				upfront_fee_period: 0,
-				..branch_config_for(HIGH_MIN, STABLE)
-			},
+			pallet_vaults::BranchConfig { upfront_fee_period: 0, ..branch_config_for(STABLE) },
 		);
 		for owner in [1, 2] {
 			mint_collateral(HIGH_MIN, owner, 5_000);
