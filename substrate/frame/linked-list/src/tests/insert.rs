@@ -84,10 +84,8 @@ fn insert_same_priority_lands_at_tail_side_of_cluster() {
 		insert(1, 2, 50);
 		insert(1, 3, 50);
 		assert_eq!(dump(1), vec![(1, 50), (2, 50), (3, 50)]);
+		// Tail-side placement makes tail-first iteration LIFO within the cluster.
 		assert_eq!(LinkedList::iter_from_tail(1, 3), vec![3, 2, 1]);
-		// Tail-side placement makes `pop_tail` LIFO within the cluster.
-		assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((3, 50)));
-		assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((2, 50)));
 	});
 }
 

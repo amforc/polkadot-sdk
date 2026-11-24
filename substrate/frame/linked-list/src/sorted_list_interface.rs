@@ -28,26 +28,6 @@ use frame::{
 	traits::Footprint,
 };
 
-impl<T: Config> Pallet<T> {
-	/// Shared event tail of every removal path: `ItemRemoved`, then
-	/// `ListRemoved` when the removal emptied the list.
-	fn deposit_removed(
-		list_id: &T::ListId,
-		item: &T::ItemId,
-		priority: T::Priority,
-		list_removed: bool,
-	) {
-		Self::deposit_event(Event::ItemRemoved {
-			list_id: list_id.clone(),
-			item: item.clone(),
-			priority,
-		});
-		if list_removed {
-			Self::deposit_event(Event::ListRemoved { list_id: list_id.clone() });
-		}
-	}
-}
-
 impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 	type Priority = T::Priority;
 
@@ -70,24 +50,15 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 
 	fn remove(list_id: &T::ListId, item: &T::ItemId) -> Result<(), ListError> {
 		let (priority, list_removed) = list::remove_at::<T>(list_id, item)?;
-		Self::deposit_removed(list_id, item, priority, list_removed);
+		Self::deposit_event(Event::ItemRemoved {
+			list_id: list_id.clone(),
+			item: item.clone(),
+			priority,
+		});
+		if list_removed {
+			Self::deposit_event(Event::ListRemoved { list_id: list_id.clone() });
+		}
 		Ok(())
-	}
-
-	fn pop_tail(list_id: &T::ListId) -> Result<Option<(T::ItemId, T::Priority)>, ListError> {
-		let Some(meta) = ListMetas::<T>::get(list_id) else { return Ok(None) };
-		let item = meta.tail;
-		let (priority, list_removed) =
-			list::remove_at::<T>(list_id, &item).map_err(|e| match e {
-				// The item id came from the meta row, so a missing node row is
-				// internal inconsistency, not a caller error.
-				ListError::ItemNotFound => {
-					list::corrupt("pop_tail: tail pointer names a missing node")
-				},
-				other => other,
-			})?;
-		Self::deposit_removed(list_id, &item, priority, list_removed);
-		Ok(Some((item, priority)))
 	}
 
 	fn re_insert(
@@ -189,6 +160,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		view_helpers::find_re_insert_position::<T>(list_id, item, new_priority)
 	}
 
+	#[cfg(feature = "runtime-benchmarks")]
 	fn repair_steps_needed(
 		list_id: &T::ListId,
 		priority: T::Priority,
@@ -197,6 +169,7 @@ impl<T: Config> SortedListInterface<T::ListId, T::ItemId> for Pallet<T> {
 		view_helpers::repair_steps_needed::<T>(list_id, priority, hint)
 	}
 
+	#[cfg(feature = "runtime-benchmarks")]
 	fn re_insert_steps_needed(
 		list_id: &T::ListId,
 		item: &T::ItemId,

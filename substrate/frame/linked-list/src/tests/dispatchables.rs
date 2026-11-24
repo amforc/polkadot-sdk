@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, Error, Event, ListError, Position, SortedListInterface};
+use crate::{mock::*, view_helpers, Error, Event, ListError, Position};
 use frame::testing_prelude::{assert_noop, assert_ok, assert_storage_noop};
 
 #[test]
@@ -113,10 +113,11 @@ fn re_insert_steps_needed_predicts_dispatch_failure() {
 		let hint = Position::between(2, 3);
 
 		// The insert-oriented view walks with item 2 still linked: 3 steps.
-		let insert_steps = LinkedList::repair_steps_needed(&1, 55, hint.clone());
+		let insert_steps = view_helpers::repair_steps_needed::<Test>(&1, 55, hint.clone());
 		assert_eq!(insert_steps, 3);
 		// The dispatch-faithful view sees the post-splice walk exceed the budget.
-		let re_insert_steps = LinkedList::re_insert_steps_needed(&1, &2, 55, hint.clone());
+		let re_insert_steps =
+			view_helpers::re_insert_steps_needed::<Test>(&1, &2, 55, hint.clone());
 		assert!(re_insert_steps > MaxHintRepairSteps::get());
 		// And the dispatch agrees with it, not with `repair_steps_needed`.
 		StaticPriorityProvider::pin_priority(1, 2, 55);
@@ -139,13 +140,16 @@ fn re_insert_steps_needed_dry_runs_re_insert() {
 		insert(1, 3, 80);
 		// After splicing 2 out, the head hint walks 1 → 3 → tail: two steps.
 		assert_storage_noop!(assert_eq!(
-			LinkedList::re_insert_steps_needed(&1, &2, 5, Position::at_head(1)),
+			view_helpers::re_insert_steps_needed::<Test>(&1, &2, 5, Position::at_head(1)),
 			2
 		));
 
 		// 85 still fits between 1 (100) and 3 (80): in-place fast path.
 		let garbage_hint = Position::between(98, 99);
-		assert_eq!(LinkedList::re_insert_steps_needed(&1, &2, 85, garbage_hint.clone()), 0);
+		assert_eq!(
+			view_helpers::re_insert_steps_needed::<Test>(&1, &2, 85, garbage_hint.clone()),
+			0
+		);
 		StaticPriorityProvider::pin_priority(1, 2, 85);
 		assert_ok!(LinkedList::reprioritize(RuntimeOrigin::signed(1), 1, 2, garbage_hint));
 		assert_eq!(dump(1), vec![(1, 100), (2, 85), (3, 80)]);

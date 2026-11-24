@@ -55,8 +55,8 @@ pub trait PriorityProvider<ListId, ItemId> {
 /// each field. Mutating methods fail with [`ListError`]; the hint-taking ones
 /// ([`Self::insert`], [`Self::re_insert`]) additionally return the number of
 /// hint-repair steps actually walked so callers can refund unused weight via
-/// `PostDispatchInfo::actual_weight` ([`Self::remove`] and [`Self::pop_tail`]
-/// take no hint and return no step count).
+/// `PostDispatchInfo::actual_weight` ([`Self::remove`] takes no hint and
+/// returns no step count).
 pub trait SortedListInterface<ListId, ItemId> {
 	/// Priority type used to order items within a list.
 	type Priority;
@@ -85,17 +85,6 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// - [`ListError::ItemNotFound`] if `(list_id, item)` is not in the list.
 	/// - [`ListError::CorruptList`] if the node exists but list metadata is inconsistent.
 	fn remove(list_id: &ListId, item: &ItemId) -> Result<(), ListError>;
-
-	/// Remove and return the current tail item of `list_id`, or `None` if the
-	/// list is empty.
-	///
-	/// This is the LIFO primitive for consumers that insert equal-priority items
-	/// and consume from the tail.
-	///
-	/// # Errors
-	///
-	/// - [`ListError::CorruptList`] if the tail pointer or list metadata is inconsistent.
-	fn pop_tail(list_id: &ListId) -> Result<Option<(ItemId, Self::Priority)>, ListError>;
 
 	/// Re-insert `(list_id, item)` at `new_priority`. Updates the priority in place
 	/// when the existing neighbors still admit it; otherwise splices the item
@@ -184,6 +173,7 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// [`Self::re_insert_steps_needed`] for those. (With `MaxHintRepairSteps
 	/// == u32::MAX` the infeasibility sentinel saturates to `u32::MAX` and
 	/// cannot exceed the budget.)
+	#[cfg(feature = "runtime-benchmarks")]
 	fn repair_steps_needed(
 		list_id: &ListId,
 		priority: Self::Priority,
@@ -198,6 +188,7 @@ pub trait SortedListInterface<ListId, ItemId> {
 	/// consults the hint), the post-splice walk length otherwise, and a value
 	/// greater than `MaxHintRepairSteps` when the same call would fail
 	/// (including when the item is not in the list).
+	#[cfg(feature = "runtime-benchmarks")]
 	fn re_insert_steps_needed(
 		list_id: &ListId,
 		item: &ItemId,

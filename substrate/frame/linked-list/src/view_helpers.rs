@@ -18,7 +18,10 @@
 //! Read-only helpers used by the [`crate::SortedListInterface`] impl and the
 //! `#[pallet::view_functions]` block in `lib.rs`.
 
-use crate::{list, pallet::*, ListError, Outcome, Position, SortedListInterface};
+#[cfg(any(test, feature = "runtime-benchmarks"))]
+use crate::{list, ListError, Outcome, SortedListInterface};
+use crate::{pallet::*, Position};
+#[cfg(any(test, feature = "runtime-benchmarks"))]
 use frame::{
 	deps::frame_support::storage::{with_transaction, TransactionOutcome},
 	prelude::*,
@@ -26,6 +29,7 @@ use frame::{
 
 /// One more than the repair budget: the documented "greater than
 /// `MaxHintRepairSteps`" infeasibility sentinel. Saturates at `u32::MAX`.
+#[cfg(any(test, feature = "runtime-benchmarks"))]
 fn infeasible_sentinel<T: Config>() -> u32 {
 	T::MaxHintRepairSteps::get().saturating_add(1)
 }
@@ -88,8 +92,8 @@ pub fn find_re_insert_position<T: Config>(
 }
 
 /// Steps the on-chain repair walk would take from `hint` to reach the insert
-/// position for a NEW item at `priority`. Faithful to `insert` only; see
-/// [`crate::SortedListInterface::repair_steps_needed`] for the full contract.
+/// position for a NEW item at `priority`. Faithful to `insert` only.
+#[cfg(any(test, feature = "runtime-benchmarks"))]
 pub fn repair_steps_needed<T: Config>(
 	list_id: &T::ListId,
 	priority: T::Priority,
@@ -103,8 +107,8 @@ pub fn repair_steps_needed<T: Config>(
 /// `new_priority` would need to repair `hint`. Dry-runs the real
 /// [`crate::SortedListInterface::re_insert`] inside an always-rolled-back
 /// transaction, so it is faithful to the dispatch by construction (the
-/// rollback also discards the deposited events); see the trait method for
-/// the full contract.
+/// rollback also discards the deposited events).
+#[cfg(any(test, feature = "runtime-benchmarks"))]
 pub fn re_insert_steps_needed<T: Config>(
 	list_id: &T::ListId,
 	item: &T::ItemId,

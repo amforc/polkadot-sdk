@@ -36,7 +36,8 @@ use alloc::vec::Vec;
 use frame::{
 	deps::{
 		frame_support::storage::{generator::StorageDoubleMap as _, StoragePrefixedMap as _},
-		sp_io, sp_runtime::TryRuntimeError,
+		sp_io,
+		sp_runtime::TryRuntimeError,
 	},
 	prelude::*,
 };

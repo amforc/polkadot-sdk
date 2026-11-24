@@ -8,8 +8,8 @@ of their cluster, so tail-first iteration is LIFO within a priority cluster.
 ## Overview
 
 Consumer pallets use the [`SortedListInterface`] trait — `insert`, `remove`,
-`re_insert`, `pop_tail`, `iter_from_tail`, and a handful of read helpers. A
-single permissionless dispatchable, `reprioritize`, refreshes an item's stored
+`re_insert`, `iter_from_tail`, and a handful of read helpers. A single
+permissionless dispatchable, `reprioritize`, refreshes an item's stored
 priority against the [`PriorityProvider`] when the consumer's authoritative
 priority has drifted.
 
@@ -85,8 +85,6 @@ Consumer pallets use [`SortedListInterface`]:
 - **`insert`** — places `item` at `priority` using a hint. O(1) on a valid
   hint; bounded otherwise.
 - **`remove`** — splices `item` out. O(1).
-- **`pop_tail`** — removes and returns the lowest-priority item. O(1). This is
-  the LIFO primitive for tail-side consumers.
 - **`re_insert`** — updates an item's priority. The fast path mutates in place
   when the existing neighbors still admit the new priority; otherwise it
   splices out and re-inserts at the supplied hint inside a transactional layer
@@ -94,7 +92,7 @@ Consumer pallets use [`SortedListInterface`]:
 - **`iter_from_tail`** — bounded tail-first iteration.
 - Read helpers: `head`, `tail`, `contains`, `neighbors`, `priority`,
   `node` (priority + neighbors in one read), `find_position`,
-  `find_re_insert_position`, `repair_steps_needed`.
+  `find_re_insert_position`.
 
 Off-chain clients get view functions only for the reads that cost more than a
 storage lookup: `node`, `iter_from_tail`, `find_position`,

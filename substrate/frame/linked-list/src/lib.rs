@@ -34,7 +34,6 @@
 //!
 //! - [`SortedListInterface::insert`]: O(1) with valid hints, otherwise a bounded repair walk.
 //! - [`SortedListInterface::remove`]: O(1) splice.
-//! - [`SortedListInterface::pop_tail`]: O(1) tail pop for LIFO consumers.
 //! - [`SortedListInterface::re_insert`]: in-place when the existing position still admits the new
 //!   priority, otherwise splice + repair + re-insert.
 //! - [`SortedListInterface::iter_from_tail`]: lazy tail-first iteration.
@@ -72,7 +71,7 @@ macro_rules! log {
 		frame::log::$level!(
 			target: $crate::LOG_TARGET,
 			concat!("[{:?}] [{}] ", $pattern),
-			<frame_system::Pallet<T>>::block_number(),
+			<frame::deps::frame_system::Pallet<T>>::block_number(),
 			<$crate::Pallet::<T> as frame::deps::frame_support::traits::PalletInfoAccess>::name()
 			$(, $values)*
 		)
@@ -158,15 +157,8 @@ pub mod pallet {
 	/// [`crate::BenchPriorityProvider`] or [`crate::BenchPriorityProviderWithPrimary`].
 	#[cfg(feature = "runtime-benchmarks")]
 	#[pallet::storage]
-	pub type BenchAuthoritativePriority<T: Config> = StorageDoubleMap<
-		_,
-		Blake2_128,
-		T::ListId,
-		Blake2_128,
-		T::ItemId,
-		T::Priority,
-		OptionQuery,
-	>;
+	pub type BenchAuthoritativePriority<T: Config> =
+		StorageDoubleMap<_, Blake2_128, T::ListId, Blake2_128, T::ItemId, T::Priority, OptionQuery>;
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]

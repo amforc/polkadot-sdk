@@ -15,8 +15,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, Event, ListError, ListMetas, ListNodes, Position, SortedListInterface};
-use frame::testing_prelude::{assert_err, assert_noop, assert_ok, assert_storage_noop};
+use crate::{mock::*, Event, ListError, ListMetas, Position, SortedListInterface};
+use frame::testing_prelude::{assert_err, assert_noop, assert_ok};
 
 #[test]
 fn remove_only_item_drops_meta_row() {
@@ -72,35 +72,6 @@ fn operations_on_absent_item_or_empty_list() {
 			LinkedList::re_insert(1, 100, 50, Position::endpoints_only()),
 			ListError::ItemNotFound
 		);
-		assert_storage_noop!(assert_eq!(LinkedList::pop_tail(&1), Ok(None)));
-	});
-}
-
-#[test]
-fn pop_tail_removes_lowest_priority_tail() {
-	build_and_execute(|| {
-		insert(1, 100, 90);
-		insert(1, 200, 50);
-		insert(1, 300, 10);
-
-		assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((300, 10)));
-		assert_eq!(dump(1), vec![(100, 90), (200, 50)]);
-		System::assert_last_event(
-			Event::ItemRemoved { list_id: 1, item: 300, priority: 10 }.into(),
-		);
-
-		// Draining the last item empties the list and tears down its metadata.
-		assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((200, 50)));
-		System::reset_events();
-		assert_eq!(LinkedList::pop_tail(&1).unwrap(), Some((100, 90)));
-		assert_eq!(
-			linked_list_events(),
-			vec![
-				Event::ItemRemoved { list_id: 1, item: 100, priority: 90 },
-				Event::ListRemoved { list_id: 1 },
-			]
-		);
-		assert!(!ListMetas::<Test>::contains_key(1));
 	});
 }
 
@@ -113,17 +84,6 @@ fn remove_at_missing_meta_row_is_defensive() {
 		// meta row violates the all-or-nothing invariant.
 		ListMetas::<Test>::remove(1);
 		assert_err!(LinkedList::remove(&1, &100), ListError::CorruptList);
-	});
-}
-
-#[test]
-#[cfg_attr(debug_assertions, should_panic = "Defensive failure has been triggered")]
-fn pop_tail_with_missing_tail_node_is_defensive() {
-	build_and_execute_no_post_check(|| {
-		insert(1, 100, 50);
-		// Remove the node but leave `ListMetas.tail` pointing at it.
-		ListNodes::<Test>::remove(1, 100);
-		assert_err!(LinkedList::pop_tail(&1), ListError::CorruptList);
 	});
 }
 

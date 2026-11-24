@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{mock::*, ListError, Position, SortedListInterface};
+use crate::{mock::*, view_helpers, ListError, Position, SortedListInterface};
 use frame::testing_prelude::{assert_err, assert_noop};
 
 fn build_chain(priorities: &[(ItemId, Priority)]) {
@@ -27,7 +27,7 @@ fn build_chain(priorities: &[(ItemId, Priority)]) {
 /// Dry-run `hint` through `repair_steps_needed`, then insert item 99 with it:
 /// the view must predict exactly the repair steps the insert spends.
 fn assert_view_matches_insert(priority: Priority, hint: Position<ItemId>) -> u32 {
-	let steps = LinkedList::repair_steps_needed(&1, priority, hint.clone());
+	let steps = view_helpers::repair_steps_needed::<Test>(&1, priority, hint.clone());
 	assert_eq!(LinkedList::insert(1, 99, priority, hint), Ok(steps));
 	steps
 }
@@ -85,7 +85,7 @@ fn repair_steps_needed_matches_insert_within_budget() {
 fn repair_steps_needed_exceeds_budget_and_insert_fails() {
 	build_and_execute(|| {
 		build_long_chain();
-		let steps = LinkedList::repair_steps_needed(&1, 5, Position::at_head(1));
+		let steps = view_helpers::repair_steps_needed::<Test>(&1, 5, Position::at_head(1));
 		assert!(steps > MaxHintRepairSteps::get());
 		assert_noop!(
 			LinkedList::insert(1, 99, 5, Position::at_head(1)),
