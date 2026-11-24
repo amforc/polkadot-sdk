@@ -1908,6 +1908,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "asset-hub-westend-dotusd-integration-tests"
+version = "1.0.0"
+dependencies = [
+ "emulated-integration-tests-common",
+ "frame-support",
+ "frame-system",
+ "pallet-assets",
+ "pallet-aura",
+ "pallet-balances",
+ "pallet-linked-list",
+ "pallet-price-oracle",
+ "pallet-psm",
+ "pallet-redemptions",
+ "pallet-stability",
+ "pallet-timestamp",
+ "pallet-utility",
+ "pallet-vaults",
+ "parachains-common",
+ "parity-scale-codec",
+ "sp-consensus-slots",
+ "sp-runtime 31.0.1",
+ "stablecoin-primitives",
+ "staging-xcm",
+ "westend-system-emulated-network",
+]
+
+[[package]]
 name = "asset-hub-westend-emulated-chain"
 version = "0.0.0"
 dependencies = [
@@ -2014,6 +2041,7 @@ dependencies = [
  "pallet-election-provider-multi-block",
  "pallet-fast-unstake",
  "pallet-indices",
+ "pallet-linked-list",
  "pallet-message-queue",
  "pallet-meta-tx",
  "pallet-migrations",
@@ -2031,11 +2059,13 @@ dependencies = [
  "pallet-proxy",
  "pallet-psm",
  "pallet-recovery",
+ "pallet-redemptions",
  "pallet-referenda",
  "pallet-revive",
  "pallet-revive-fixtures",
  "pallet-scheduler",
  "pallet-session",
+ "pallet-stability",
  "pallet-staking",
  "pallet-staking-async",
  "pallet-staking-async-points-converter",
@@ -2051,6 +2081,7 @@ dependencies = [
  "pallet-utility",
  "pallet-validator-collators",
  "pallet-validator-set-announcer",
+ "pallet-vaults",
  "pallet-verify-signature",
  "pallet-vesting",
  "pallet-vesting-precompiles",
@@ -2097,6 +2128,7 @@ dependencies = [
  "sp-transaction-pool",
  "sp-trie 29.0.0",
  "sp-version 29.0.0",
+ "stablecoin-primitives",
  "staging-parachain-info",
  "staging-xcm",
  "staging-xcm-builder",

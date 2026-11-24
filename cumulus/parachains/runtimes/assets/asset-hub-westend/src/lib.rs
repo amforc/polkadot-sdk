@@ -32,6 +32,7 @@ pub mod xcm_config;
 
 // Configurations for next functionality.
 mod bag_thresholds;
+pub mod dotusd_config;
 pub mod governance;
 #[cfg(not(feature = "runtime-benchmarks"))]
 mod migrations;
@@ -152,7 +153,7 @@ const BLOCK_PROCESSING_VELOCITY: u32 = 3;
 const UNINCLUDED_SEGMENT_CAPACITY: u32 = (3 + RELAY_PARENT_OFFSET) * BLOCK_PROCESSING_VELOCITY;
 
 /// Relay chain slot duration, in milliseconds.
-const RELAY_CHAIN_SLOT_DURATION_MILLIS: u32 = 6000;
+pub const RELAY_CHAIN_SLOT_DURATION_MILLIS: u32 = 6000;
 
 impl_opaque_keys! {
 	pub struct SessionKeys {
@@ -177,7 +178,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: alloc::borrow::Cow::Borrowed("westmint"),
 	impl_name: alloc::borrow::Cow::Borrowed("westmint"),
 	authoring_version: 1,
-	spec_version: 1_025_006,
+	spec_version: 1_026_001,
 	impl_version: 0,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 16,
@@ -366,6 +367,13 @@ impl pallet_assets_holder::Config<AssetsHolderInstance> for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 }
 
+// Allow Holds for the `ForeignAssets` pallet.
+pub type ForeignAssetsHolderInstance = pallet_assets_holder::Instance2;
+impl pallet_assets_holder::Config<ForeignAssetsHolderInstance> for Runtime {
+	type RuntimeHoldReason = RuntimeHoldReason;
+	type RuntimeEvent = RuntimeEvent;
+}
+
 parameter_types! {
 	pub const AssetConversionPalletId: PalletId = PalletId(*b"py/ascon");
 	pub LpFee: Permill = Permill::from_rational(3u32, 1_000u32); // 0.3%
@@ -434,6 +442,19 @@ pub type LocalAndForeignAssets = fungibles::UnionOf<
 pub type LocalAndForeignAssetsFreezer = fungibles::UnionOf<
 	AssetsFreezer,
 	ForeignAssetsFreezer,
+	LocalFromLeft<
+		AssetIdForTrustBackedAssetsConvert<TrustBackedAssetsPalletLocation, xcm::v5::Location>,
+		AssetIdForTrustBackedAssets,
+		xcm::v5::Location,
+	>,
+	xcm::v5::Location,
+	AccountId,
+>;
+
+/// Union fungibles implementation for `AssetsHolder` and `ForeignAssetsHolder`.
+pub type LocalAndForeignAssetsHolder = fungibles::UnionOf<
+	AssetsHolder,
+	ForeignAssetsHolder,
 	LocalFromLeft<
 		AssetIdForTrustBackedAssetsConvert<TrustBackedAssetsPalletLocation, xcm::v5::Location>,
 		AssetIdForTrustBackedAssets,
@@ -665,7 +686,7 @@ impl pallet_assets::Config<ForeignAssetsInstance> for Runtime {
 	type MetadataDepositPerByte = ForeignAssetsMetadataDepositPerByte;
 	type ApprovalDeposit = ForeignAssetsApprovalDeposit;
 	type StringLimit = ForeignAssetsAssetsStringLimit;
-	type Holder = ();
+	type Holder = ForeignAssetsHolder;
 	type Freezer = ForeignAssetsFreezer;
 	type Extra = ();
 	type WeightInfo = weights::pallet_assets_foreign::WeightInfo<Runtime>;
@@ -1090,6 +1111,9 @@ type ConsensusHook = cumulus_pallet_aura_ext::FixedVelocityConsensusHook<
 	BLOCK_PROCESSING_VELOCITY,
 	UNINCLUDED_SEGMENT_CAPACITY,
 >;
+
+/// Relay-chain-derived time source, advancing every relay chain slot.
+pub type RelayTimestamp = cumulus_pallet_aura_ext::RelayTimestamp<ConsensusHook>;
 
 impl parachain_info::Config for Runtime {}
 
@@ -1837,6 +1861,7 @@ construct_runtime!(
 		PoolAssetsFreezer: pallet_assets_freezer::<Instance3> = 59,
 		Revive: pallet_revive = 60,
 		AssetsHolder: pallet_assets_holder::<Instance1> = 66,
+		ForeignAssetsHolder: pallet_assets_holder::<Instance2> = 68,
 
 		AssetRewards: pallet_asset_rewards = 61,
 		AssetsPrecompiles: pallet_assets_precompiles::pallet = 62,
@@ -1875,6 +1900,12 @@ construct_runtime!(
 
 		// Dynamic Allocation Pool / Issuance Buffer
 		Dap: pallet_dap = 100,
+
+		// Generic Stablecoin Framework.
+		LinkedList: pallet_linked_list = 102,
+		Vaults: pallet_vaults = 103,
+		Redemptions: pallet_redemptions = 104,
+		Stability: pallet_stability = 105,
 
 		// TODO: the pallet instance should be removed once all pools have migrated
 		// to the new account IDs.
@@ -2116,11 +2147,15 @@ mod benches {
 		[pallet_psm, Psm]
 		[pallet_recovery, Recovery]
 		[pallet_referenda, Referenda]
+		[pallet_linked_list, LinkedList]
+		[pallet_redemptions, Redemptions]
+		[pallet_stability, Stability]
 		[pallet_session, SessionBench::<Runtime>]
 		[pallet_staking_async, Staking]
 		[pallet_staking_async_rc_client, StakingRcClientBench::<Runtime>]
 		[pallet_staking_async_points_converter, StakingPointsConverter]
 		[pallet_uniques, Uniques]
+		[pallet_vaults, Vaults]
 		[pallet_utility, Utility]
 		[pallet_meta_tx, MetaTx]
 		[pallet_verify_signature, VerifySignature]
