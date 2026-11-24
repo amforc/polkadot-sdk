@@ -1,0 +1,64 @@
+//! When the pending accumulators reset.
+//!
+//! The pending pair resets when an offset empties the pending stock, and not merely when the last
+//! pending deposit matures.
+//!
+//! `epoch_scale` covers the epoch and scale transitions, and `claimable_accrual` covers the
+//! depositor snapshots.
+
+use crate::mock::*;
+
+/// The pending pair resets only when an offset empties the pending stock. Emptying it any other
+/// way, such as every row maturing, leaves the accumulators where they stand, which is what makes
+/// the snapshot of a later deposit mean anything.
+#[test]
+fn pending_accumulators_reset_on_depletion_not_on_an_empty_queue() {
+	ExtBuilder::default().default_branch().deposit(1, 200).build_and_execute(|| {
+		// Burn 100 of the 200 pending: P_pending = 100/200 = 0.5 and
+		// delta_S = 50 * (1/200) = 0.25.
+		assert_eq!(simulate_offset(DOT, STABLE, 100, 50).debt(), 100);
+
+		let state = pool_state(DOT, STABLE);
+		assert_eq!(state.pending_coords.p, FixedU128::from_rational(1, 2));
+		assert_eq!(pending_sums(0, 0).s_collateral, FixedU128::from_rational(1, 4));
+
+		// The surviving floor(200 * 0.5) = 100 matures into the active pool.
+		// The pending stock is empty, yet nothing resets: no depletion
+		// happened. A settlement activates the cohort without adding an offset or a yield
+		// that would move the accumulators under examination.
+		advance_time(10_000);
+		assert_ok!(settle(7, 1, DOT, STABLE));
+
+		let state = pool_state(DOT, STABLE);
+		assert_eq!(state.total_pending_deposits, 0);
+		assert_eq!(state.total_active_deposits, 100);
+		assert_eq!(
+			state.pending_coords,
+			Accumulators { p: FixedU128::from_rational(1, 2), epoch: 0, scale: 0 }
+		);
+		assert_eq!(pending_sums(0, 0).s_collateral, FixedU128::from_rational(1, 4));
+
+		// A fresh deposit snapshots that `P_pending`, so it is measured from
+		// where the accumulators stand rather than from `P = 1`: untouched,
+		// it realizes its full 400.
+		seed_deposit(2, 400);
+
+		assert_eq!(pending_after_settlement(DOT, STABLE, 2), 400);
+
+		// Depletion is what resets the pair: a new epoch at `P = 1`, scale 0,
+		// with zeroed sums. The active leg is sized first and takes the matured 100, so it takes
+		// 500 to reach all 400 pending; the pending leg's slice is 100 * 400 / 500 = 80.
+		assert_eq!(
+			simulate_offset(DOT, STABLE, 500, 100),
+			SimulatedOffset { active: 100, pending: 400, leftover: 0 }
+		);
+
+		let state = pool_state(DOT, STABLE);
+		assert_eq!(state.total_pending_deposits, 0);
+		assert_eq!(state.pending_coords, Accumulators { p: FixedU128::one(), epoch: 1, scale: 0 });
+		assert_eq!(pending_sums(1, 0).s_collateral, FixedU128::zero());
+		// The closing epoch keeps its row: 0.25 + 80 * (0.5/400) = 0.35, the
+		// window user 2 still claims through.
+		assert_eq!(pending_sums(0, 0).s_collateral, FixedU128::from_rational(35, 100));
+	});
+}
